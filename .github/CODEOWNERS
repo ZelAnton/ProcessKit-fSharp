@@ -1,0 +1,7 @@
+# Code owners are requested for review automatically on pull requests.
+# Entries must reference real GitHub usernames or teams (not an org name) —
+# verify the owner below resolves to a user/team before relying on it, otherwise
+# GitHub silently ignores the rule.
+#
+# Uncomment and adjust:
+# * @ZelAnton

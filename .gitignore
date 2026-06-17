@@ -1,0 +1,158 @@
+## -------
+## .NET / MSBuild
+## -------
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Release pipeline scratch file — written by .github/workflows/release.yml
+release-notes.md
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]uild/
+[Oo]ut/
+msbuild.log
+msbuild.err
+msbuild.wrn
+
+# Test results
+TestResults/
+*.coverage
+*.coveragexml
+
+## -------
+## F# / FSI
+## -------
+# FSI / dotnet fsi load-script scratch
+.fake/
+*.fsx.lock
+
+## -------
+## Visual Studio
+## -------
+.vs/
+*.rsuser
+*.vsp
+*.vspx
+*.sap
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb
+ipch/
+*.aps
+*.pch
+*.vspscc
+*.vssscc
+.builds
+*.pidb
+*.svclog
+*.scc
+
+# Publish
+*.[Pp]ublish.xml
+*.azurePubxml
+*.pubxml
+*.publishproj
+
+# SSDT
+*.dbmdl
+*.dbproj.schemaview
+*.jfm
+
+## -------
+## Visual Studio Code
+## -------
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.code-workspace
+.history/
+
+## -------
+## JetBrains Rider / ReSharper / Ionide
+## -------
+.idea/
+*.sln.iml
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+.ionide/
+
+## -------
+## macOS
+## -------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+## -------
+## Secrets / local config
+## -------
+.env
+.env.local
+
+## -------
+## Windows
+## -------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+## -------
+## dotnet local tools — ship the manifest with the repo, even if a global
+## gitignore excludes .config (the manifest pins Fantomas).
+## -------
+!.config/
+.config/*
+!.config/dotnet-tools.json
+
+## -------
+## Claude Code — ship the shared settings with the repo, even if a global
+## gitignore excludes .claude. Personal overrides stay ignored.
+## -------
+!.claude/
+.claude/*
+!.claude/settings.json
+!.claude/settings.json.template
+.claude/settings.local.json
+
+# Keep agent-instruction files local — never push them.
+/AGENTS.md
+/CLAUDE.md
+/CLAUDE.local.md
+.claude/

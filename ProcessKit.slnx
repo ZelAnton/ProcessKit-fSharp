@@ -1,0 +1,8 @@
+<Solution>
+	<Folder Name="/Tests/">
+		<Project Path="tests/ProcessKit.Tests/ProcessKit.Tests.fsproj">
+			<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
+		</Project>
+	</Folder>
+	<Project Path="src/ProcessKit/ProcessKit.fsproj" />
+</Solution>

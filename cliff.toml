@@ -1,0 +1,45 @@
+# git-cliff configuration — used by the release workflow as a fallback when
+# CHANGELOG.md's [Unreleased] section has no manual entries. Manual entries
+# always take priority; this only fills in the blanks from git history.
+#
+# Commits since the previous tag are categorised by the first word of the
+# message into Keep a Changelog buckets:
+#   add..., feat...                                                      -> Added
+#   fix..., bug...                                                       -> Fixed
+#   remove..., delete..., drop...                                        -> Removed
+#   refactor..., update..., change..., rename..., perf..., ci..., ...    -> Changed
+#   doc..., chore..., test..., style...                                  -> skipped
+#   Release v..., Merge ...                                              -> skipped
+#   anything else                                                        -> Changed (fallback)
+#
+# Only the first line of each commit message is used.
+
+[changelog]
+header = ""
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | trim }}
+{%- endfor %}
+
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = false
+filter_unconventional = false
+sort_commits = "oldest"
+
+commit_parsers = [
+	{ message = "^[Rr]elease v?\\d", skip = true },
+	{ message = "^[Mm]erge ", skip = true },
+	{ message = "(?i)^(doc|docs|chore|test|tests|style)\\b", skip = true },
+	{ message = "(?i)^(feat|add)\\b", group = "Added" },
+	{ message = "(?i)^(fix|bug)\\b", group = "Fixed" },
+	{ message = "(?i)^(remove|delete|drop)\\b", group = "Removed" },
+	{ message = "(?i)^(refactor|change|update|rename|improv|enhance|perf|ci|cleanup|centralize|generate)\\b", group = "Changed" },
+	{ message = ".*", group = "Changed" },
+]

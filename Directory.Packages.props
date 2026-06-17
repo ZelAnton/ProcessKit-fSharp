@@ -1,0 +1,30 @@
+<Project>
+	<PropertyGroup>
+		<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+	</PropertyGroup>
+
+	<!--
+		Central Package Management. Declare every package version here once; individual
+		projects reference packages WITHOUT a Version attribute.
+
+		This is NOT a fixed allow-list — add the production and test dependencies your
+		project actually needs. The entries below are only the template's own dev/test
+		stack (test runner + SourceLink for packaging) and can be changed or removed.
+
+		FSharp.Core MUST be listed here under Central Package Management. The F# SDK adds
+		FSharp.Core as an implicit reference, but with ManagePackageVersionsCentrally the
+		implicit reference is dropped from the dependency graph unless a matching
+		PackageVersion exists — leaving the runtime unable to load FSharp.Core, so NUnit
+		silently discovers zero tests. Keep this aligned with the FSharp.Core that ships
+		with the SDK band pinned in global.json (10.0.3xx), whose bundled FSharp.Core is
+		10.1.300. The two are coupled: if you bump the global.json band, bump this pin to
+		the FSharp.Core that band bundles (and vice versa).
+	-->
+	<ItemGroup>
+		<PackageVersion Include="FSharp.Core" Version="10.1.300" />
+		<PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.6.0" />
+		<PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.300" />
+		<PackageVersion Include="NUnit" Version="4.6.1" />
+		<PackageVersion Include="NUnit3TestAdapter" Version="6.2.0" />
+	</ItemGroup>
+</Project>

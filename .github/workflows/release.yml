@@ -1,0 +1,436 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: 'patch'
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # RELEASE ORDERING INVARIANT (rationale repeated at each relevant step):
+      # publishing to NuGet.org is the single IRREVERSIBLE step, so it is the pivot.
+      # Everything before it is cheap and reversible (build/test/pack, plus a LOCAL
+      # commit+tag that is not yet pushed); everything after it (push the commit+tag
+      # to main, create the GitHub Release) is reversible/recreatable and is made
+      # idempotent + retried. A failure before the pivot leaves no trace on the
+      # remote or registry — just re-run. A failure after the pivot is recoverable
+      # by re-run, EXCEPT once the tag is on main (see the Release step's note).
+      #
+      # The "Push the release commit + tag" step pushes straight to main. If you
+      # protect main with a rule that requires pull requests or status checks, that
+      # push is rejected unless the pusher can bypass it. This workflow mints a
+      # short-lived GitHub App token (repo variable RELEASE_APP_ID + secret
+      # RELEASE_APP_PRIVATE_KEY) and checks out with it, so the push runs as the App
+      # — add that App to the ruleset's bypass list. Until it is configured the
+      # checkout falls back to GITHUB_TOKEN (fine while main is unprotected). Recipe:
+      # release-token-bypass.md.
+      # Actions are pinned to a full commit SHA (supply-chain hardening); the
+      # trailing comment records the human-readable version. Dependabot bumps the
+      # SHA and updates the comment on its weekly run.
+
+      # We always release from main. workflow_dispatch still shows GitHub's
+      # "Use workflow from" ref picker (it cannot be hidden), so reject any
+      # dispatch from a non-main ref up front: otherwise that branch's copy of
+      # this workflow file would run — against main, which the checkout below
+      # hard-pins — producing a confusing mismatch. Fail fast before any work.
+      - name: Guard — release only from main
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "::error::Release must be dispatched from main (got: ${{ github.ref }}). Re-run with 'Use workflow from: main'."
+            exit 1
+          fi
+          echo "Dispatched from main."
+
+      - name: Preflight — required secrets present before any external action
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Fail fast, before any irreversible publish or VCS push, if the publish
+          # credential is missing — otherwise a missing secret only surfaces at the
+          # publish step, after the cheap work has run. If you switch to NuGet
+          # Trusted Publishing (OIDC, see the publish step below), drop the
+          # NUGET_API_KEY check here and verify id-token availability instead.
+          if [[ -z "${NUGET_API_KEY:-}" ]]; then
+            echo "::error::NUGET_API_KEY secret is not set. Add it under Settings -> Secrets and variables -> Actions before releasing."
+            exit 1
+          fi
+          echo "Required secrets present."
+
+      # Mint a short-lived GitHub App installation token. Pushing the release commit
+      # to `main` with it makes the **App** the actor — and the App sits in the
+      # branch-protection ruleset's bypass list, so the push is allowed. The default
+      # `github-actions[bot]` CANNOT be granted a ruleset bypass (it's a system actor,
+      # not an App), and a PAT would expire; an App token is short-lived, auto-revoked,
+      # and needs no rotation. Configure repo variable `RELEASE_APP_ID` + secret
+      # `RELEASE_APP_PRIVATE_KEY`; until then this step is skipped and the push falls
+      # back to the default `GITHUB_TOKEN` (fine while `main` is unprotected). See the
+      # release-token-bypass.md recipe.
+      - name: Mint GitHub App token
+        id: app-token
+        if: ${{ vars.RELEASE_APP_ID != '' }}
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          # Persist the App token so the later `git push` to `main` runs as the App
+          # (and thus uses its ruleset bypass). Empty when the App isn't configured →
+          # fall back to the default token.
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Determine next version
+        id: version
+        run: |
+          set -euo pipefail
+          LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          if [[ -n "$LATEST_TAG" ]]; then
+            CURRENT="${LATEST_TAG#v}"
+            if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Could not parse current version from tag (got: '$CURRENT')"
+              exit 1
+            fi
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "${{ inputs.bump }}" in
+              major) NEW="$((MAJOR+1)).0.0" ;;
+              minor) NEW="${MAJOR}.$((MINOR+1)).0" ;;
+              patch) NEW="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
+            esac
+            echo "Latest release tag: $LATEST_TAG (current=$CURRENT); ${{ inputs.bump }} bump -> $NEW"
+          else
+            # First release: take the seed version straight from the .fsproj <Version>
+            # so the published version matches what the repo declares, instead of an
+            # implicit 0.0.1 from bumping a synthetic 0.0.0. The bump input is ignored.
+            CURRENT="0.0.0"
+            NEW=$(grep -oP '(?<=<Version>)[^<]+' src/ProcessKit/ProcessKit.fsproj | head -n1)
+            echo "No release tags found; seeding first release from .fsproj <Version>=$NEW (bump input ignored)."
+          fi
+          if [[ ! "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Computed version '$NEW' is not a valid MAJOR.MINOR.PATCH semver."
+            exit 1
+          fi
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag does not exist
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ steps.version.outputs.tag }} already exists"
+            exit 1
+          fi
+
+      # Only git-cliff (next step) needs the previous tag, and only LOCALLY, to bound
+      # its commit range. So when the previous tag is missing (the synthetic v0.0.0 of
+      # a first release) create it locally and DO NOT push it to origin. Pushing it
+      # would be a remote write before the irreversible publish pivot AND would break
+      # first-release re-run safety: a pushed v0.0.0 matches the version glob in
+      # "Determine next version", so a re-run after a pre-publish failure would bump
+      # 0.0.0 -> 0.0.1 instead of re-seeding the intended version from the .fsproj.
+      # Keeping it local means a re-run re-derives the same seed version. (Trade-off:
+      # the first release's "compare/v0.0.0...vX" changelog link 404s because v0.0.0
+      # is not on origin — harmless, as nothing precedes the first release.)
+      - name: Ensure previous tag exists (local only)
+        env:
+          PREV_TAG: v${{ steps.version.outputs.current }}
+        run: |
+          set -euo pipefail
+          if git rev-parse "$PREV_TAG" >/dev/null 2>&1; then
+            echo "Previous tag $PREV_TAG already exists."
+            exit 0
+          fi
+          ROOT=$(git rev-list --max-parents=0 HEAD | tail -n1)
+          echo "Previous tag $PREV_TAG does not exist; creating it locally at root commit $ROOT (not pushed)."
+          git tag "$PREV_TAG" "$ROOT"
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2
+        with:
+          tool: git-cliff@2
+
+      - name: Auto-fill [Unreleased] from git log if empty
+        env:
+          PREV_TAG: v${{ steps.version.outputs.current }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          prev_tag = os.environ["PREV_TAG"]
+          path = pathlib.Path("CHANGELOG.md")
+          text = path.read_text()
+
+          m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|\Z)", text, re.M | re.S)
+          if not m:
+              print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          body = m.group(1)
+          has_real_bullets = any(re.match(r"^-\s+\S", ln) for ln in body.splitlines())
+          if has_real_bullets:
+              print("[Unreleased] already has manual entries; skipping auto-fill.")
+              sys.exit(0)
+
+          print(f"[Unreleased] is empty; generating from git log since {prev_tag}...")
+          result = subprocess.run(
+              ["git-cliff", "--config", "cliff.toml", "--strip", "all", f"{prev_tag}..HEAD"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          generated = result.stdout.strip()
+          if not generated:
+              print(
+                  f"::error::No release-worthy commits found between {prev_tag} and HEAD. "
+                  "Either add a manual entry to [Unreleased] in CHANGELOG.md, or commit "
+                  "changes with a recognised prefix (Add/Fix/Refactor/Update/Remove/...).",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          new_text = text[: m.start(1)] + generated + "\n\n" + text[m.end(1) :]
+          path.write_text(new_text)
+          print("----- auto-generated [Unreleased] body -----")
+          print(generated)
+          print("--------------------------------------------")
+          PY
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|\Z)", text, re.M | re.S)
+          body = (m.group(1) if m else "").strip()
+
+          # Keep "### Header" only if it has at least one real bullet ("- text").
+          # Drop placeholder "-" lines and empty sections so notes are clean.
+          parts = re.split(r"(?m)(^### .+$)", body)
+          out = []
+          for i in range(1, len(parts), 2):
+              header = parts[i]
+              section = parts[i + 1] if i + 1 < len(parts) else ""
+              bullets = [ln for ln in section.splitlines() if re.match(r"^-\s+\S", ln)]
+              if bullets:
+                  if out:
+                      out.append("")
+                  out.append(header)
+                  out.extend(bullets)
+
+          result = "\n".join(out).strip()
+          if not result:
+              print(
+                  "::error::[Unreleased] section in CHANGELOG.md is empty. "
+                  "Add release notes before releasing.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          pathlib.Path("release-notes.md").write_text(result + "\n")
+          print("----- release-notes.md -----")
+          print(result)
+          print("----------------------------")
+          PY
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release /p:Version=${{ steps.version.outputs.version }}
+
+      - name: Test
+        run: dotnet test --no-build --configuration Release
+
+      - name: Pack
+        run: dotnet pack src/ProcessKit/ProcessKit.fsproj --no-build --configuration Release --output ./artifacts /p:Version=${{ steps.version.outputs.version }}
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd ./artifacts
+          files=(*.nupkg *.snupkg)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::No package files to hash in ./artifacts."
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Bump version in fsproj
+        run: sed -i -E "s|<Version>[^<]+</Version>|<Version>${{ steps.version.outputs.version }}</Version>|" src/ProcessKit/ProcessKit.fsproj
+
+      - name: Promote Unreleased section in CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PREV_TAG: v${{ steps.version.outputs.current }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+          from datetime import datetime, timezone
+
+          version = os.environ["VERSION"]
+          tag = os.environ["TAG"]
+          prev_tag = os.environ["PREV_TAG"]
+          date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+          repo = "https://github.com/ZelAnton/ProcessKit-fSharp"
+
+          path = pathlib.Path("CHANGELOG.md")
+          text = path.read_text()
+
+          new_unreleased = (
+              "## [Unreleased]\n\n"
+              "### Added\n-\n\n"
+              "### Changed\n-\n\n"
+              "### Fixed\n-\n\n"
+              f"## [{version}] - {date}"
+          )
+          text, n = re.subn(r"^## \[Unreleased\]$", new_unreleased, text, count=1, flags=re.M)
+          if n != 1:
+              print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          link_replacement = (
+              f"[Unreleased]: {repo}/compare/{tag}...HEAD\n"
+              f"[{version}]: {repo}/compare/{prev_tag}...{tag}"
+          )
+          text, n = re.subn(r"^\[Unreleased\]:.*$", link_replacement, text, count=1, flags=re.M)
+          if n != 1:
+              print("::error::Could not find '[Unreleased]: ...' reference link in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          path.write_text(text)
+          PY
+
+      # Create the release commit and tag LOCALLY, but do NOT push yet: the push is
+      # a VCS write and must happen AFTER the irreversible NuGet publish (the pivot
+      # below). Keeping it local means a failure before/at publish leaves nothing on
+      # the remote, so a fresh re-run starts clean.
+      - name: Commit and tag the release (local only)
+        run: |
+          set -euo pipefail
+          git config user.name "Anton Zhelezniakou"
+          git config user.email "github@zelanton.net"
+          git add src/ProcessKit/ProcessKit.fsproj CHANGELOG.md
+          git commit -m "Release ${{ steps.version.outputs.tag }}"
+          git tag "${{ steps.version.outputs.tag }}"
+
+      # === PIVOT: the single irreversible step ===
+      # NuGet publishing cannot be undone (a pushed version can only be unlisted,
+      # never re-pushed), so it is the pivot and every reversible action is ordered
+      # around it. It runs BEFORE the git push and the GitHub Release: if it fails,
+      # no tag/commit has reached the remote and no Release exists, so a re-run is
+      # safe and recomputes the SAME version (the latest tag has not moved).
+      # `--skip-duplicate` exits 0 when this exact version already exists on
+      # nuget.org (HTTP 409) — that is NuGet's own, version-scoped "already
+      # published == success" signal, so a re-run after a post-publish failure
+      # sails through instead of erroring. The loop retries only transient failures
+      # (network, registry blips).
+      #
+      # MORE SECURE ALTERNATIVE — NuGet Trusted Publishing (OIDC): instead of a
+      # long-lived NUGET_API_KEY secret, mint a short-lived key per run. Add
+      # `id-token: write` to this job's permissions, configure a trusted publisher
+      # policy on nuget.org for this repo+workflow, then replace the step below with
+      # the `NuGet/login` action to obtain a temporary key (and update the preflight
+      # step accordingly). See https://learn.microsoft.com/nuget/nuget-org/trusted-publishing
+      - name: Push to NuGet.org (irreversible pivot)
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if dotnet nuget push "./artifacts/*.nupkg" \
+                 --source "https://api.nuget.org/v3/index.json" \
+                 --api-key "$NUGET_API_KEY" \
+                 --skip-duplicate; then
+              echo "NuGet push succeeded (attempt $attempt)."
+              exit 0
+            fi
+            echo "::warning::NuGet push attempt $attempt failed; retrying after backoff..."
+            sleep $((attempt * 15))
+          done
+          echo "::error::NuGet push failed after 3 attempts. Nothing was pushed to the remote and no Release was created — it is safe to re-run this workflow."
+          exit 1
+
+      # Reversible VCS write, AFTER the pivot. --atomic guarantees the branch and
+      # tag move together (or neither does), so we never advance main while losing
+      # the tag. If this is rejected (e.g. branch protection — see the checkout
+      # note), the package is already on nuget.org; re-running recomputes the SAME
+      # version (the tag is not yet on the remote) and --skip-duplicate makes the
+      # republish a no-op, so the re-run completes the release.
+      - name: Push the release commit + tag (atomic)
+        run: git push --atomic origin HEAD:refs/heads/main "${{ steps.version.outputs.tag }}"
+
+      # Final, recreatable step, made idempotent (edit the Release if it already
+      # exists, else create it) and retried. By now the package is published AND the
+      # tag is on main, so a blind re-run of the WHOLE workflow would compute the
+      # NEXT version and orphan this release — hence the failure message tells the
+      # operator to finish by hand rather than re-running.
+      - name: Create or update the GitHub Release (idempotent)
+        env:
+          # Use the App token when configured (consistent with the push above and
+          # robust if the org restricts the default GITHUB_TOKEN); fall back to
+          # GITHUB_TOKEN otherwise. Creating a Release needs only contents: write,
+          # which both identities have.
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS)
+          for attempt in 1 2 3; do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              if gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md \
+                 && gh release upload "$TAG" "${assets[@]}" --clobber; then
+                echo "Updated existing Release $TAG (attempt $attempt)."
+                exit 0
+              fi
+            else
+              if gh release create "$TAG" --title "$TAG" --notes-file release-notes.md "${assets[@]}"; then
+                echo "Created Release $TAG (attempt $attempt)."
+                exit 0
+              fi
+            fi
+            echo "::warning::GitHub Release step attempt $attempt failed; retrying after backoff..."
+            sleep $((attempt * 10))
+          done
+          echo "::error::Failed to create/update the GitHub Release after 3 attempts. The package is ALREADY on nuget.org and the tag is ALREADY on main. Do NOT re-run this workflow (a re-run computes the NEXT version and orphans this release). Finish by hand: if the Release does not exist yet, 'gh release create $TAG --title $TAG --notes-file release-notes.md ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS'; if it already exists (likely, since a partial attempt may have created it), 'gh release edit $TAG --notes-file release-notes.md && gh release upload $TAG ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS --clobber'."
+          exit 1

@@ -1,0 +1,39 @@
+version: 2
+
+# Keep GitHub Actions and NuGet dependencies current. The nuget ecosystem reads
+# central package versions from Directory.Packages.props; the github-actions
+# ecosystem bumps the action tags pinned in .github/workflows/*.yml.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: CI
+    groups:
+      # One PR per weekly run for all action bumps, instead of one PR per action.
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: nuget
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: Update
+    # FSharp.Core is deliberately coupled to the .NET SDK band (see
+    # Directory.Packages.props): you bump it by moving global.json to a newer band
+    # and realigning the pin to that band's bundled FSharp.Core, not via an
+    # independent package bump. Let Dependabot leave it alone so the two stay in
+    # lockstep.
+    ignore:
+      - dependency-name: FSharp.Core
+    groups:
+      # One PR per weekly run for routine bumps keeps the changelog auto-fill tidy.
+      nuget-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

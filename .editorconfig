@@ -1,0 +1,60 @@
+root = true
+
+[*]
+indent_style = tab
+indent_size = 4
+tab_width = 4
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# F# source — SPACES, not tabs. The F# compiler rejects tab characters in
+# indentation (offside rule); a tab in a .fs file is a compile error. Fantomas
+# (the formatter, see .config/dotnet-tools.json) reads the fsharp_* keys below.
+[*.{fs,fsi,fsx}]
+indent_style = space
+indent_size = 4
+tab_width = 4
+max_line_length = 120
+fsharp_space_before_uppercase_invocation = false
+fsharp_space_before_class_constructor = false
+fsharp_space_before_member = false
+fsharp_space_before_colon = false
+fsharp_multiline_bracket_style = cramped
+fsharp_newline_between_type_definition_and_members = true
+fsharp_align_function_signature_to_indentation = false
+
+[*.{bat,cmd}]
+end_of_line = crlf
+tab_width = 2
+
+[*.{xml,fsproj,props,targets,slnx,config}]
+indent_style = tab
+indent_size = 2
+tab_width = 2
+
+[*.json]
+indent_style = tab
+indent_size = 2
+tab_width = 2
+
+[*.{ps1,psm1,psd1}]
+indent_style = space
+indent_size = 4
+tab_width = 4
+
+# Shell scripts (init.sh, check-env.sh) are space-indented (2). Without this they
+# fall under [*] = tabs, contradicting the actual files.
+[*.sh]
+indent_style = space
+indent_size = 2
+tab_width = 2
+
+[*.{yaml,yml}]
+indent_style = space
+indent_size = 2
+tab_width = 2
+
+[*.md]
+trim_trailing_whitespace = false

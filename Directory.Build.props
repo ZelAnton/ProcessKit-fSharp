@@ -1,0 +1,33 @@
+<Project>
+	<PropertyGroup>
+		<!-- Repository root — MSBuildThisFileDirectory is the directory containing this file (with trailing separator). -->
+		<RepoRoot>$(MSBuildThisFileDirectory)</RepoRoot>
+		<!-- Absolute path to the main library project directory. Reference it from any
+		     .fsproj/.props/.targets that needs a path outside its own directory instead
+		     of writing ..\..\ — see CLAUDE.md / AGENTS.md "MSBuild Path Properties". -->
+		<MainProjectDir>$(RepoRoot)src\ProcessKit\</MainProjectDir>
+	</PropertyGroup>
+
+	<PropertyGroup>
+		<LangVersion>latest</LangVersion>
+		<!-- F# nullable reference types (F# 9+). Real language feature, not the C#
+		     analyzer; it changes how the compiler treats `string` vs `string | null`. -->
+		<Nullable>enable</Nullable>
+		<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+		<!-- Surface the high-value opt-in F# warnings as part of warnings-as-errors:
+		     1182 = unused bindings/parameters. Drop the number if a project finds it noisy. -->
+		<OtherFlags>$(OtherFlags) --warnon:1182</OtherFlags>
+		<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+		<RepositoryType>git</RepositoryType>
+		<SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+		<!-- Audit direct AND transitive dependencies against the NuGet advisory
+		     database on restore. NU1901-1904 (vulnerability) findings stay
+		     warnings here on purpose: with TreatWarningsAsErrors a freshly
+		     disclosed CVE would otherwise break every build until a fix ships.
+		     Promote them to errors per project if you want a hard gate. -->
+		<NuGetAudit>true</NuGetAudit>
+		<NuGetAuditMode>all</NuGetAuditMode>
+		<WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+	</PropertyGroup>
+</Project>

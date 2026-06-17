@@ -1,0 +1,34 @@
+# yamllint configuration, tuned for GitHub Actions workflows.
+#
+# The default yamllint preset is calibrated for hand-written config, not CI
+# workflows: it caps lines at 80 columns and flags the workflow `on:` key as a
+# YAML 1.1 boolean. The overrides below keep the checks that catch real defects
+# (tabs, duplicate keys, bad indentation, trailing whitespace) while silencing
+# the rules that fight normal Actions YAML.
+#
+# Run locally with:  py -m yamllint .    (or: yamllint .)
+
+extends: default
+
+rules:
+  # Long `run:` commands, URLs, and ${{ ... }} expressions are routine in
+  # workflows and often can't be wrapped. Keep the check as a non-failing
+  # warning at a realistic width instead of an error at 80.
+  line-length:
+    max: 120
+    level: warning
+    allow-non-breakable-words: true
+
+  # `on:` is a required GitHub Actions key, but YAML 1.1 reads it as the boolean
+  # `true`. Don't check keys against the truthy rule (values are still checked).
+  truthy:
+    check-keys: false
+
+  # Workflows don't use a `---` document-start marker.
+  document-start: disable
+
+  # Allow a single space before inline comments, e.g. the `# v6` version note on
+  # a SHA-pinned action. (Default requires two.)
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable

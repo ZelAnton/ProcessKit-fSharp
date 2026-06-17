@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<AssemblyName>ProcessKit</AssemblyName>
+
+		<PackageId>ProcessKit</PackageId>
+		<Version>0.1.0</Version>
+		<Authors>Anton Zhelezniakou</Authors>
+		<Copyright>Copyright (c) 2026 Anton Zhelezniakou</Copyright>
+		<Description>F# async child-process management: whole-tree kill-on-drop (no orphans), streaming, pipelines, timeouts, and supervision.</Description>
+		<!-- <PackageTags>tag1;tag2</PackageTags> -->
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<PackageReleaseNotes Condition="Exists('$(RepoRoot)release-notes.md')">$([System.IO.File]::ReadAllText('$(RepoRoot)release-notes.md'))</PackageReleaseNotes>
+
+		<PackageProjectUrl>https://github.com/ZelAnton/ProcessKit-fSharp</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/ZelAnton/ProcessKit-fSharp</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<EmbedUntrackedSources>true</EmbedUntrackedSources>
+
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+		<Deterministic>true</Deterministic>
+		<ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+	</PropertyGroup>
+
+	<!-- F# COMPILE ORDER IS SIGNIFICANT. Files are compiled top-to-bottom; a type or
+	     function must be declared before its first use. This ordering IS the dependency
+	     graph — it is not cosmetic, and there is no globbing. Insert a new file after
+	     everything it depends on and before everything that depends on it. -->
+	<ItemGroup>
+		<Compile Include="Greeter.fs" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Include="$(RepoRoot)README.md" Pack="true" PackagePath="\" />
+		<None Include="$(RepoRoot)CHANGELOG.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- Explicit FSharp.Core reference (version from Directory.Packages.props). Under
+		     Central Package Management the F# SDK's implicit FSharp.Core reference is
+		     dropped from the dependency graph, so declare it here or the runtime cannot
+		     load FSharp.Core and NUnit discovers zero tests. -->
+		<PackageReference Include="FSharp.Core" />
+		<PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+	</ItemGroup>
+
+</Project>
