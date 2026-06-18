@@ -86,12 +86,12 @@ jobs:
       - name: Mint GitHub App token
         id: app-token
         if: ${{ vars.RELEASE_APP_ID != '' }}
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: main
           fetch-depth: 0
@@ -169,7 +169,7 @@ jobs:
           git tag "$PREV_TAG" "$ROOT"
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2
+        uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2
         with:
           tool: git-cliff@2
 
