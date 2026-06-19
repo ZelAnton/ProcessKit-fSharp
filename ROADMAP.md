@@ -157,6 +157,27 @@ a module. One stage, one confirmation gate.
   package: `AddProcessKit` registering `IProcessRunner` (and an `ILogger`-aware runner)
   for `Microsoft.Extensions.DependencyInjection` consumers.
 
+## Known limitations (tracked)
+
+Surfaced by the milestone reviews; deferred deliberately because they are internal
+(invisible to the frozen `Task` API) or are documented constraints, not correctness bugs:
+
+- **Blocking waits.** `waitWindows`/`waitPosix` block a thread-pool thread per running process
+  (Windows anonymous pipes are not overlapped, so reads are sync-over-async too). Under heavy
+  concurrency (large `WaitAll`, `Supervisor`, `output_all`) this pressures the thread pool. The
+  public API would not change when the internals move to overlapped/registered waits — a
+  dedicated async-I/O hardening pass owns this.
+- **One terminal consumption per `RunningProcess`.** `WaitForLine` → `StdoutLines` → `Finish`
+  compose; `OutputString`/`OutputBytes`/`Wait` are standalone. Mixing terminal verbs (e.g.
+  `OutputString` *and* `StdoutLines`) double-pumps the same pipe — documented, not yet guarded.
+- **Streaming backlog.** A streamed (`StdoutLines`/`OutputEvents`) consumer that stops draining
+  while the child floods grows the channel unbounded; the `OutputBufferPolicy` ceiling is applied
+  to the *buffered* verbs, and streaming is consumer-paced (pair with a `timeout`).
+- **Default UTF-8 decoding.** Captured text is decoded UTF-8 by default; Windows console programs
+  emitting a legacy OEM code page need an explicit `StdoutEncoding`. (Matches upstream.)
+- **POSIX pgid-reuse window.** The process-group teardown has a small reuse window on Unix; cgroup
+  v2 (in the `limits` feature, S3) closes it.
+
 ## Out of scope / deferred
 
 - **`mock` feature** — no equivalent; the `IProcessRunner` interface is the mock seam.
