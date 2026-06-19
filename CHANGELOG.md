@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Readiness probes on `RunningProcess`: `WaitForLine` (await a matching stdout line), `WaitForPort` (await a TCP port), `WaitFor` (poll a custom predicate); `ProcessError.NotReady` on timeout.
 - `RunningProcess.WaitAny` / `WaitAll` to race or await several started processes.
 - `Command.Timeout` / `TimeoutGrace` (kill the run at a deadline, reporting `Outcome.TimedOut`; graceful = SIGTERM→grace→SIGKILL on Unix, atomic on Windows), `Command.CancelOn` (tie a run to a `CancellationToken`), and `Command.Retry` (re-run on a retriable error); `ProcessError.NotReady` joined by per-run timeout handling.
+- Shell-free pipelines: `Command.Pipe(next)` builds a `Pipeline` that wires each stage's stdout into the next stage's stdin, running the whole chain in one kill-on-dispose group. The same verbs as a single command (`Run`/`RunUnit`/`OutputString`/`OutputBytes`/`ExitCode`/`Probe`) plus `Pipeline.Timeout`/`CancelOn`. The exit status follows shell **pipefail** (the rightmost checked stage that did not exit 0 decides the result); `Command.UncheckedInPipe()` lets a stage fail without failing the pipeline.
 
 ### Changed
 -

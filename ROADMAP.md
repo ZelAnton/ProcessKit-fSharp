@@ -117,7 +117,15 @@ of the phase.
   shutdown. A timeout is captured in the result where Rust captures it; a cancellation
   is always an error.
 - **M1.6 — Pipelines.** `Pipeline`, `Command::pipe` (and the `|` operator analog),
-  one shared group, pipefail outcome, `unchecked_in_pipe`.
+  one shared group, pipefail outcome, `unchecked_in_pipe`. *(Done — `Command.Pipe` →
+  `Pipeline` with the full verb set plus `Timeout`/`CancelOn`, all stages in one shared
+  kill-on-dispose group, stages wired stdout→stdin with **no shell**. Pipefail = the
+  rightmost **checked** stage that did not exit 0 (else the last checked stage), with
+  `Command.UncheckedInPipe()` opting a stage out. The `|` operator is **not** ported —
+  F# reserves `|`; the fluent `Pipe` / `Pipeline.create` / `Pipeline.pipe` cover it. An
+  early-exiting consumer closes the upstream read end so the producer gets a broken pipe
+  (SIGPIPE on POSIX) instead of blocking — Windows has no SIGPIPE, so that guarantee is
+  POSIX-only.)*
 - **M1.7 — Supervision.** `Supervisor` with `RestartPolicy`, backoff + `max_backoff` +
   `jitter`, `max_restarts`, `failure_threshold` / `failure_decay`, `storm_pause`,
   `stop_when` → `SupervisionOutcome` / `StopReason`.

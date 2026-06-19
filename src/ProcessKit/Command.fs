@@ -28,7 +28,8 @@ type internal CommandConfig =
       Timeout: TimeSpan option
       TimeoutGrace: TimeSpan option
       CancelOn: CancellationToken option
-      Retry: (int * TimeSpan * Func<ProcessError, bool>) option }
+      Retry: (int * TimeSpan * Func<ProcessError, bool>) option
+      UncheckedInPipe: bool }
 
 module internal CommandConfig =
 
@@ -52,7 +53,8 @@ module internal CommandConfig =
           Timeout = None
           TimeoutGrace = None
           CancelOn = None
-          Retry = None }
+          Retry = None
+          UncheckedInPipe = false }
 
 /// An immutable description of a process to run.
 ///
@@ -244,6 +246,11 @@ type Command internal (config: CommandConfig) =
                 Retry = Some(maxAttempts, delay, shouldRetry) }
         )
 
+    /// Inside a pipeline, do not let this stage's non-zero exit fail the pipeline (it is still
+    /// reported in the stage outcomes). Outside a pipeline this flag has no effect.
+    member _.UncheckedInPipe() =
+        Command({ config with UncheckedInPipe = true })
+
 /// Pipe-friendly functions over `Command`, mirroring the instance methods.
 [<RequireQualifiedAccess>]
 module Command =
@@ -313,3 +320,6 @@ module Command =
     /// Retry a failed run up to `maxAttempts` extra times, waiting `delay` between attempts.
     let retry (maxAttempts: int) (delay: TimeSpan) (shouldRetry: ProcessError -> bool) (command: Command) =
         command.Retry(maxAttempts, delay, Func<ProcessError, bool> shouldRetry)
+
+    /// Inside a pipeline, allow this stage to exit non-zero without failing the pipeline.
+    let uncheckedInPipe (command: Command) = command.UncheckedInPipe()

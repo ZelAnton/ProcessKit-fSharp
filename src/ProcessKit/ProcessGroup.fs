@@ -2,6 +2,7 @@ namespace ProcessKit
 
 open System
 open System.Diagnostics
+open System.IO
 open System.Runtime.InteropServices
 open System.Text
 open System.Threading
@@ -15,6 +16,21 @@ type internal CapturedRun =
       Outcome: Outcome
       Duration: TimeSpan }
 
+/// One stage's terminal state inside a pipeline run.
+type internal PipelineStage =
+    { Program: string
+      Outcome: Outcome
+      Unchecked: bool
+      Stderr: string }
+
+/// The captured result of running a whole pipeline: the last stage's stdout, every stage's
+/// terminal state (left-to-right), the wall-clock duration, and whether the pipeline timed out.
+type internal PipelineCapture =
+    { LastStdout: byte[]
+      Stages: PipelineStage list
+      Duration: TimeSpan
+      TimedOut: bool }
+
 /// A kill-on-dispose container for a process *tree*.
 ///
 /// Every process started into the group — and everything those processes spawn — is reaped when
@@ -24,10 +40,11 @@ type internal CapturedRun =
 [<Sealed>]
 type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
 
-    // Windows: pgid unused, processHandle is the (single) child's process handle.
-    // POSIX: jobHandle/processHandle unused, pgid records the spawned child's pgid (0 until spawned).
+    // Windows: pgid unused, processHandles are the children's process handles (several for a
+    // shared group, e.g. a pipeline). POSIX: jobHandle/processHandles unused, pgid records the
+    // first spawned child's pgid (0 until spawned).
     let mutable pgid = 0
-    let mutable processHandle = IntPtr.Zero
+    let processHandles = System.Collections.Generic.List<nativeint>()
     // 0 = live, 1 = released. Interlocked so Dispose/DisposeAsync/Shutdown/finalizer run the
     // teardown exactly once and never signal a handle or pgid after it has been released.
     let mutable releasedFlag = 0
@@ -46,8 +63,8 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
     let hardRelease () =
         match mechanism with
         | Mechanism.JobObject ->
-            if processHandle <> IntPtr.Zero then
-                Native.closeWindowsHandle processHandle
+            for handle in processHandles do
+                Native.closeWindowsHandle handle
 
             Native.closeWindowsHandle jobHandle
         | _ ->
@@ -76,6 +93,13 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
             // The POSIX group forms when the first child is spawned (its pid becomes the pgid).
             Ok(new ProcessGroup(Mechanism.ProcessGroup, IntPtr.Zero))
 
+    /// Wait for one contained process handle to conclude. Internal — used by pipeline staging.
+    member internal _.WaitHandle(handle: nativeint) : Task<Outcome> = waitOutcome handle
+
+    /// Hard-kill the contained tree now (no grace) without releasing the group. Internal — used by
+    /// pipeline cancellation/timeout.
+    member internal _.KillTree() = killContainedTree ()
+
     /// Spawn `command` into the group, recording the pgid / process handle. Internal.
     member internal _.SpawnInto(command: Command) : Result<Native.Spawned, ProcessError> =
         let spawn =
@@ -87,7 +111,7 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
         | Error error -> Error error
         | Ok spawned ->
             match mechanism with
-            | Mechanism.JobObject -> processHandle <- spawned.Handle
+            | Mechanism.JobObject -> processHandles.Add spawned.Handle
             | _ -> pgid <- int spawned.Handle
 
             Ok spawned
@@ -222,6 +246,161 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                 GC.SuppressFinalize this
         }
         :> Task
+
+    /// Run a multi-stage pipeline: spawn every stage into one fresh shared group, wire each stage's
+    /// stdout to the next stage's stdin (no shell involved), capture the last stage's stdout, and
+    /// reap the whole tree on exit. Cancellation or the optional `timeout` hard-kill the tree.
+    /// Internal — `Pipeline` shapes the capture into the verb results.
+    static member internal RunPipeline
+        (commands: Command list)
+        (timeout: TimeSpan option)
+        (lastTee: Stream option)
+        (cancellationToken: CancellationToken)
+        : Task<Result<PipelineCapture, ProcessError>> =
+        task {
+            let stages = List.toArray commands
+
+            if stages.Length = 0 then
+                return Error(ProcessError.Spawn("<pipeline>", "a pipeline needs at least one stage"))
+            elif cancellationToken.IsCancellationRequested then
+                return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
+            else
+                match ProcessGroup.Create() with
+                | Error error -> return Error error
+                | Ok group ->
+                    use group = group
+                    let startedAt = Stopwatch.GetTimestamp()
+                    use timeoutCts = new CancellationTokenSource()
+
+                    use linkedCts =
+                        CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
+
+                    match timeout with
+                    | Some duration -> timeoutCts.CancelAfter duration
+                    | None -> ()
+
+                    use _registration = linkedCts.Token.Register(fun () -> group.KillTree())
+
+                    // Dispose a pipe stream, swallowing the teardown-race exceptions (double close,
+                    // or a broken pipe surfaced while flushing on dispose because the peer is gone).
+                    let closeQuietly (stream: Stream) =
+                        try
+                            stream.Dispose()
+                        with
+                        | :? ObjectDisposedException ->
+                            // Already disposed (double close during teardown); nothing to do.
+                            ()
+                        | :? IOException ->
+                            // The pipe broke while flushing on dispose (peer end already gone). The
+                            // run's outcome already reflects it; closing is best-effort teardown.
+                            ()
+
+                    let spawned = ResizeArray<Native.Spawned>()
+                    let copyTasks = ResizeArray<Task>()
+                    let stderrTasks = ResizeArray<Task<byte[]>>()
+                    let mutable prevStdout: Stream option = None
+                    let mutable spawnError = None
+                    let mutable index = 0
+
+                    while index < stages.Length && spawnError.IsNone do
+                        // Stages after the first take their stdin from the previous stage's stdout, so
+                        // they need a stdin pipe; `KeepStdinOpen` creates one without an auto-fed
+                        // source (we copy `prevStdout` into it below).
+                        let stage =
+                            if index > 0 then
+                                stages[index].KeepStdinOpen()
+                            else
+                                stages[index]
+
+                        match group.SpawnInto stage with
+                        | Error error -> spawnError <- Some error
+                        | Ok sp ->
+                            spawned.Add sp
+
+                            if index = 0 then
+                                // Only the first stage may carry its own stdin source; feed it.
+                                match sp.Stdin, stages[0].Config.StdinSource with
+                                | Some stdinStream, Some source ->
+                                    Pump.feedStdin source.Source stdinStream true CancellationToken.None |> ignore
+                                | _ -> ()
+                            else
+                                match prevStdout, sp.Stdin with
+                                | Some upstream, Some downstream ->
+                                    copyTasks.Add(
+                                        task {
+                                            try
+                                                do! upstream.CopyToAsync downstream
+                                            with _ ->
+                                                // A downstream stage that exits early stops reading
+                                                // (broken pipe), or the stream is torn down during
+                                                // teardown. Fall through to close both ends.
+                                                ()
+
+                                            // Close the write end (EOF to the downstream stage) AND the
+                                            // upstream read end: if the downstream exited early, closing
+                                            // the read end propagates a broken pipe up to the producing
+                                            // stage (SIGPIPE / failed write) so it stops instead of
+                                            // blocking forever on a full stdout pipe.
+                                            closeQuietly downstream
+                                            closeQuietly upstream
+                                        }
+                                        :> Task
+                                    )
+                                | _ -> ()
+
+                            // Drain every stage's stderr so a full stderr pipe never blocks a stage.
+                            match sp.Stderr with
+                            | Some s -> stderrTasks.Add(Pump.drainRaw s None CancellationToken.None)
+                            | None -> stderrTasks.Add(Task.FromResult Array.empty<byte>)
+
+                            prevStdout <- sp.Stdout
+
+                        index <- index + 1
+
+                    match spawnError with
+                    | Some error ->
+                        // The group's `use` dispose reaps any stages that did start.
+                        return Error error
+                    | None ->
+                        let lastSpawned = spawned[spawned.Count - 1]
+
+                        let captureTask =
+                            match lastSpawned.Stdout with
+                            | Some s -> Pump.drainRaw s lastTee CancellationToken.None
+                            | None -> Task.FromResult Array.empty<byte>
+
+                        let waitTasks =
+                            spawned |> Seq.map (fun sp -> group.WaitHandle sp.Handle) |> Seq.toArray
+
+                        let! outcomes = Task.WhenAll waitTasks
+                        do! Task.WhenAll(copyTasks.ToArray())
+                        let! lastStdout = captureTask
+                        let! stderrBytes = Task.WhenAll(stderrTasks.ToArray())
+
+                        for sp in spawned do
+                            sp.Stdout |> Option.iter closeQuietly
+                            sp.Stderr |> Option.iter closeQuietly
+                            sp.Stdin |> Option.iter closeQuietly
+
+                        let duration = Stopwatch.GetElapsedTime startedAt
+
+                        if cancellationToken.IsCancellationRequested then
+                            return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
+                        else
+                            let stageResults =
+                                [ for i in 0 .. stages.Length - 1 ->
+                                      { Program = stages[i].Program
+                                        Outcome = outcomes[i]
+                                        Unchecked = stages[i].Config.UncheckedInPipe
+                                        Stderr = stages[i].Config.StderrEncoding.GetString stderrBytes[i] } ]
+
+                            return
+                                Ok
+                                    { LastStdout = lastStdout
+                                      Stages = stageResults
+                                      Duration = duration
+                                      TimedOut = timeoutCts.IsCancellationRequested }
+        }
 
     // The finalizer is the GC-time safety net for a group that was never disposed: it reaps the
     // tree. Deterministic teardown still comes from `use`/`Dispose`.
