@@ -96,10 +96,15 @@ of the phase.
   `output_bytes` / `exit_code` / `probe`; and the `ScriptedRunner` double. Proves the
   whole architecture end-to-end: spawn into a kernel container, capture, honest
   results, the verb vocabulary, the mock seam, kill-on-dispose.
-- **M1.2 — Cross-platform containment.** Linux cgroup v2 preferred path with the
-  POSIX-pgroup fallback; honest `Mechanism` reporting; the documented `setsid`-escape
-  edge; teardown/`shutdown` (graceful SIGTERM → wait → SIGKILL on Unix, atomic on
-  Windows).
+- **M1.2 — Graceful teardown + containment honesty.** `ProcessGroup.shutdown` —
+  graceful SIGTERM → grace window → SIGKILL on Unix, atomic on Windows; honest
+  `Mechanism` reporting; and a Linux test that proves the documented `setsid`-escape
+  weakness of a POSIX process group (a `setsid` child leaves the group). *(The Linux
+  **cgroup v2** preferred path is re-sequenced to the `limits` feature — see S3: it is
+  delegation/privilege-gated so it never runs in unprivileged CI, and atomic placement
+  needs `clone3(CLONE_INTO_CGROUP)` rather than `posix_spawn`; it lands where it is
+  actually required and validated together. The POSIX process group remains the Linux
+  mechanism until then.)*
 - **M1.3 — Streaming & interactive I/O.** `Command::start` → `RunningProcess`;
   `stdout_lines` / `output_events` as `IAsyncEnumerable`; `Stdin` / `ProcessStdin`
   (string/bytes/file/reader/lines); `on_stdout_line` / `on_stderr_line` callbacks;
@@ -134,9 +139,14 @@ a module. One stage, one confirmation gate.
   (`StatsSampler` as `IAsyncEnumerable`), per-process `cpu_time` / `peak_memory_bytes`,
   and `RunProfile` / `RunningProcess::profile`. Windows peak-memory readout via PSAPI
   P/Invoke (built-in, no package).
-- **S3 — `limits`.** `ResourceLimits` and the `memory_max` / `max_processes` /
-  `cpu_quota` builders on `ProcessGroupOptions`; `ResourceLimit` failure. cgroup v2
-  controllers on Linux; Job Object limits on Windows.
+- **S3 — `limits` (+ Linux cgroup v2).** `ResourceLimits` and the `memory_max` /
+  `max_processes` / `cpu_quota` builders on `ProcessGroupOptions`; `ResourceLimit`
+  failure. This brings the **Linux cgroup v2 preferred containment path** (the cgroup
+  controllers it needs require it): atomic placement via `clone3(CLONE_INTO_CGROUP)`,
+  `cgroup.kill` teardown, `Mechanism.CgroupV2`, with the POSIX-pgroup fallback when
+  cgroup delegation is unavailable. Validated via a `--privileged` container — cgroup v2
+  is delegation-gated, so the unprivileged CI legs exercise the pgroup fallback. Job
+  Object limits on Windows.
 - **S4 — `record`.** Record/replay cassettes over `IProcessRunner`
   (`RecordReplayRunner`) using `System.Text.Json` (built-in); `Invocation` capture,
   hermetic replay, `CassetteMiss`.

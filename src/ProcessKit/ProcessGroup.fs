@@ -28,7 +28,8 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
 
     // Windows uses `jobHandle`; POSIX records the spawned child's pgid here (0 until spawned).
     let mutable pgid = 0
-    // 0 = live, 1 = released. Interlocked so Dispose/DisposeAsync/finalizer are idempotent.
+    // 0 = live, 1 = released. Interlocked so Dispose/DisposeAsync/Shutdown/finalizer run the
+    // teardown exactly once and never signal a handle or pgid after it has been released.
     let mutable releasedFlag = 0
 
     let killContainedTree () =
@@ -38,17 +39,20 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
             if pgid <> 0 then
                 Native.killProcessGroup pgid
 
+    // The hard teardown, run exactly once by whoever wins `releasedFlag`. On Windows, closing the
+    // only job handle triggers KILL_ON_JOB_CLOSE; a POSIX process group is not a closable object,
+    // so SIGKILL reaps any survivors. (The pgid-reuse hazard is closed by cgroup v2 in the limits
+    // feature.)
+    let hardRelease () =
+        match mechanism with
+        | Mechanism.JobObject -> Native.closeWindowsHandle jobHandle
+        | _ ->
+            if pgid <> 0 then
+                Native.killProcessGroup pgid
+
     let releaseContainer () =
         if Interlocked.Exchange(&releasedFlag, 1) = 0 then
-            match mechanism with
-            | Mechanism.JobObject ->
-                // Closing the only job handle triggers KILL_ON_JOB_CLOSE, reaping the tree.
-                Native.closeWindowsHandle jobHandle
-            | _ ->
-                // A POSIX process group is not a closable kernel object; signal it to reap any
-                // survivors. (cgroup v2, arriving in M1.2, removes the pgid-reuse hazard.)
-                if pgid <> 0 then
-                    Native.killProcessGroup pgid
+            hardRelease ()
 
     /// The OS primitive containing this group on the current platform.
     member _.Mechanism = mechanism
@@ -124,6 +128,33 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                         | Mechanism.JobObject -> Native.closeWindowsHandle spawned.Handle
                         | _ -> ()
         }
+
+    /// Tear the group down gracefully, then release it. On Unix: SIGTERM, then SIGKILL if the
+    /// group is still alive after `gracePeriod`. On Windows: an atomic Job kill (there is no
+    /// per-job graceful signal). Idempotent with `Dispose` — disposing instead skips the grace
+    /// period and kills immediately.
+    member this.Shutdown(gracePeriod: TimeSpan) : Task =
+        task {
+            // Win the single-teardown race; if Dispose or another Shutdown already released the
+            // group, do nothing rather than signal a closed handle / reused pgid.
+            if Interlocked.Exchange(&releasedFlag, 1) = 0 then
+                match mechanism with
+                | Mechanism.JobObject -> Native.terminateWindowsJob jobHandle
+                | _ ->
+                    if pgid <> 0 then
+                        Native.terminateProcessGroup pgid
+                        let stopwatch = Stopwatch.StartNew()
+
+                        while Native.processGroupAlive pgid && stopwatch.Elapsed < gracePeriod do
+                            do! Task.Delay 50
+
+                        if Native.processGroupAlive pgid then
+                            Native.killProcessGroup pgid
+
+                hardRelease ()
+                GC.SuppressFinalize this
+        }
+        :> Task
 
     // The finalizer is the GC-time safety net for a group that was never disposed: it reaps
     // the tree. Deterministic teardown still comes from `use`/`Dispose`.

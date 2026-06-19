@@ -400,6 +400,9 @@ module internal Native =
     let private SIGKILL = 9
 
     [<Literal>]
+    let private SIGTERM = 15
+
+    [<Literal>]
     let private ENOENT = 2
 
     [<Literal>]
@@ -492,6 +495,12 @@ module internal Native =
 
     /// Kill an entire POSIX process group (teardown / cancellation).
     let killProcessGroup (pgid: int) = killpg (pgid, SIGKILL) |> ignore
+
+    /// Ask an entire POSIX process group to terminate gracefully (SIGTERM).
+    let terminateProcessGroup (pgid: int) = killpg (pgid, SIGTERM) |> ignore
+
+    /// True while any process remains in the group (signal 0 probes existence).
+    let processGroupAlive (pgid: int) = killpg (pgid, 0) = 0
 
     // Mark a fd close-on-exec so a *different* concurrent spawn does not inherit this run's
     // pipe ends (which outlive the spawn). Our own child still gets fds 0/1/2 because dup2
