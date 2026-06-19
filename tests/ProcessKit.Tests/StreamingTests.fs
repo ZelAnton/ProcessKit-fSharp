@@ -142,6 +142,26 @@ type StreamingTests() =
         :> Task
 
     [<Test>]
+    member _.``concurrent stdin runs do not cross-inherit pipes and deadlock``() : Task =
+        task {
+            let runOne (i: int) =
+                task {
+                    let command = shell "sort" |> Command.stdin (Stdin.FromString $"value{i}\n")
+
+                    match! runner.OutputString(command, CancellationToken.None) with
+                    | Ok result -> return result.Stdout.Trim()
+                    | Error error -> return $"ERR:{error}"
+                }
+
+            let! results = Task.WhenAll [| for i in 1..8 -> runOne i |]
+            Assert.That(results.Length, Is.EqualTo 8)
+
+            for i in 1..8 do
+                Assert.That(results, Does.Contain $"value{i}")
+        }
+        :> Task
+
+    [<Test>]
     member _.``an on-stdout-line handler fires for each line``() : Task =
         task {
             let captured = ResizeArray<string>()

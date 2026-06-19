@@ -50,6 +50,34 @@ type ProcessError =
     /// The requested operation is unsupported on this platform or in this configuration.
     | Unsupported of operation: string
 
+    /// A short, human-readable description for logs and diagnostics.
+    member this.Message =
+        match this with
+        | ProcessError.Spawn(program, message) -> $"failed to spawn '{program}': {message}"
+        | ProcessError.NotFound(program, searched) ->
+            match searched with
+            | Some path -> $"program '{program}' was not found (searched {path})"
+            | None -> $"program '{program}' was not found"
+        | ProcessError.Exit(program, code, _, stderr) ->
+            if System.String.IsNullOrEmpty stderr then
+                $"'{program}' exited with code {code}"
+            else
+                $"'{program}' exited with code {code}: {stderr.Trim()}"
+        | ProcessError.Signalled(program, signal, _, _) ->
+            match signal with
+            | Some s -> $"'{program}' was terminated by signal {s}"
+            | None -> $"'{program}' was killed"
+        | ProcessError.Timeout(program, timeout, _, _) -> $"'{program}' timed out after {timeout.TotalSeconds}s"
+        | ProcessError.Cancelled program -> $"'{program}' was cancelled"
+        | ProcessError.Parse(program, message) -> $"failed to parse output of '{program}': {message}"
+        | ProcessError.OutputTooLarge(program, _, _, totalLines, totalBytes) ->
+            $"'{program}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
+        | ProcessError.Stdin(program, message) -> $"failed writing stdin to '{program}': {message}"
+        | ProcessError.Io message -> $"I/O error: {message}"
+        | ProcessError.Unsupported operation -> $"unsupported: {operation}"
+
+    override this.ToString() = this.Message
+
 [<RequireQualifiedAccess>]
 module ProcessError =
 

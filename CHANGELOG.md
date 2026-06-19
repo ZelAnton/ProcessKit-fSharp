@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Stdin` input sources (`FromString`/`FromBytes`/`FromFile`/`FromReader`/`FromIterLines`/`FromLines`/`Empty`) and the interactive `ProcessStdin` handle; `OutputLine`, `OutputEvent`, `Finished`.
 - Per-stream `Command` builders: `Stdin`/`KeepStdinOpen`, `Stdout`/`Stderr` (`StdioMode` Piped/Inherit/Null), `StdoutEncoding`/`StderrEncoding`/`Encoding`, `OnStdoutLine`/`OnStderrLine`, `StdoutTee`/`StderrTee`, and `OutputBuffer` (`OutputBufferPolicy` with line/byte caps and `OverflowMode`).
 - `ProcessError.OutputTooLarge` (fail-loud output ceiling) and `ProcessError.Stdin`.
+- `ProcessError.Message` — a short human-readable description (also its `ToString`), for logging and diagnostics.
 
 ### Changed
 -

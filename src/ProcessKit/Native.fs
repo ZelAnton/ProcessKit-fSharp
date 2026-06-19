@@ -529,6 +529,15 @@ module internal Native =
     [<Literal>]
     let private O_WRONLY = 1
 
+    // Non-variadic close-on-exec, used instead of fcntl (which a fixed-signature P/Invoke cannot
+    // call under the AArch64 variadic ABI): Linux gets O_CLOEXEC via pipe2/open; macOS gets
+    // POSIX_SPAWN_CLOEXEC_DEFAULT, which closes every non-dup2 fd in the child at exec.
+    [<Literal>]
+    let private O_CLOEXEC = 0x80000
+
+    [<Literal>]
+    let private POSIX_SPAWN_CLOEXEC_DEFAULT = 0x4000s
+
     [<Literal>]
     let private SIGKILL = 9
 
@@ -538,17 +547,13 @@ module internal Native =
     [<Literal>]
     let private ENOENT = 2
 
-    [<Literal>]
-    let private F_SETFD = 2
-
-    [<Literal>]
-    let private FD_CLOEXEC = 1
+    let private isMacOs = RuntimeInformation.IsOSPlatform OSPlatform.OSX
 
     [<DllImport("libc", SetLastError = true)>]
     extern int private pipe(int[] fds)
 
     [<DllImport("libc", SetLastError = true)>]
-    extern int private fcntl(int fd, int cmd, int arg)
+    extern int private pipe2(int[] fds, int flags)
 
     [<DllImport("libc", SetLastError = true)>]
     extern int private close(int fd)
@@ -635,18 +640,15 @@ module internal Native =
     /// True while any process remains in the group (signal 0 probes existence).
     let processGroupAlive (pgid: int) = killpg (pgid, 0) = 0
 
-    // `fcntl` is variadic; a fixed-signature P/Invoke mis-passes the third argument under the
-    // AArch64 variadic ABI, so the call is unreliable on ARM64 (Apple Silicon, Linux/arm64).
-    let private fcntlReliable =
-        RuntimeInformation.ProcessArchitecture <> Architecture.Arm64
+    // Create a pipe whose ends are close-on-exec so a *different* concurrent spawn does not
+    // inherit this run's pipe ends (which outlive the spawn). Linux sets it atomically with
+    // pipe2(O_CLOEXEC); macOS lacks pipe2, and relies on POSIX_SPAWN_CLOEXEC_DEFAULT instead.
+    let private createPipe (fds: int[]) : int =
+        if isMacOs then pipe fds else pipe2 (fds, O_CLOEXEC)
 
-    // Mark a fd close-on-exec so a *different* concurrent spawn does not inherit this run's pipe
-    // ends (which outlive the spawn). Best-effort isolation only — within-spawn correctness (a
-    // child never holding a writer to its own stdin) is guaranteed by explicit `addclose` in
-    // `spawnPosix`, not by this. Skipped on ARM64, where the variadic `fcntl` cannot be called.
-    let private setCloseOnExec (fd: int) =
-        if fd >= 0 && fcntlReliable then
-            fcntl (fd, F_SETFD, FD_CLOEXEC) |> ignore
+    let private openDevNull (flags: int) : int =
+        let flags = if isMacOs then flags else flags ||| O_CLOEXEC
+        openFile ("/dev/null", flags)
 
     /// Reap a POSIX child and report how it concluded.
     let waitPosix (pid: nativeint) : Task<Outcome> =
@@ -665,10 +667,9 @@ module internal Native =
         let childSideFds = System.Collections.Generic.List<int>()
 
         let openNul (flags: int) =
-            let fd = openFile ("/dev/null", flags)
+            let fd = openDevNull flags
 
             if fd >= 0 then
-                setCloseOnExec fd
                 childSideFds.Add fd
 
             fd
@@ -686,12 +687,10 @@ module internal Native =
         let makePipe (label: string) =
             let fds = Array.zeroCreate<int> 2
 
-            if pipe fds <> 0 then
+            if createPipe fds <> 0 then
                 failure <- Some $"pipe() failed for {label}"
                 None
             else
-                setCloseOnExec fds[0]
-                setCloseOnExec fds[1]
                 Some(fds[0], fds[1])
 
         // stdin
@@ -795,7 +794,13 @@ module internal Native =
                 | Some directory -> posix_spawn_file_actions_addchdir_np (fileActions, directory) |> ignore
                 | None -> ()
 
-                posix_spawnattr_setflags (attributes, POSIX_SPAWN_SETPGROUP) |> ignore
+                let spawnFlags =
+                    if isMacOs then
+                        POSIX_SPAWN_SETPGROUP ||| POSIX_SPAWN_CLOEXEC_DEFAULT
+                    else
+                        POSIX_SPAWN_SETPGROUP
+
+                posix_spawnattr_setflags (attributes, spawnFlags) |> ignore
                 posix_spawnattr_setpgroup (attributes, 0) |> ignore
 
                 let mutable pid = 0
