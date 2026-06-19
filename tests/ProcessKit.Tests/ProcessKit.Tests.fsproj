@@ -8,7 +8,9 @@
 
 	<!-- F# compile order is significant — list test files in dependency order. -->
 	<ItemGroup>
-		<Compile Include="GreeterTests.fs" />
+		<Compile Include="CommandTests.fs" />
+		<Compile Include="RunnerTests.fs" />
+		<Compile Include="JobRunnerTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>

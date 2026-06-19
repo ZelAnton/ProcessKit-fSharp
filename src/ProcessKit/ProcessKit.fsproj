@@ -32,7 +32,18 @@
 	     graph — it is not cosmetic, and there is no globbing. Insert a new file after
 	     everything it depends on and before everything that depends on it. -->
 	<ItemGroup>
-		<Compile Include="Greeter.fs" />
+		<Compile Include="ProcessError.fs" />
+		<Compile Include="Outcome.fs" />
+		<Compile Include="Mechanism.fs" />
+		<Compile Include="ProcessResult.fs" />
+		<Compile Include="Command.fs" />
+		<Compile Include="IProcessRunner.fs" />
+		<Compile Include="Runner.fs" />
+		<Compile Include="Reply.fs" />
+		<Compile Include="ScriptedRunner.fs" />
+		<Compile Include="Native.fs" />
+		<Compile Include="ProcessGroup.fs" />
+		<Compile Include="JobRunner.fs" />
 	</ItemGroup>
 
 	<ItemGroup>
