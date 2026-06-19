@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProcessError.Message` — a short human-readable description (also its `ToString`), for logging and diagnostics.
 - Readiness probes on `RunningProcess`: `WaitForLine` (await a matching stdout line), `WaitForPort` (await a TCP port), `WaitFor` (poll a custom predicate); `ProcessError.NotReady` on timeout.
 - `RunningProcess.WaitAny` / `WaitAll` to race or await several started processes.
+- `Command.Timeout` / `TimeoutGrace` (kill the run at a deadline, reporting `Outcome.TimedOut`; graceful = SIGTERM→grace→SIGKILL on Unix, atomic on Windows), `Command.CancelOn` (tie a run to a `CancellationToken`), and `Command.Retry` (re-run on a retriable error); `ProcessError.NotReady` joined by per-run timeout handling.
 
 ### Changed
 -

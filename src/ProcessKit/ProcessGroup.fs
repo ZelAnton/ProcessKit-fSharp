@@ -125,6 +125,7 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                   StartedTimestamp = Stopwatch.GetTimestamp()
                   Wait = (fun () -> waitOutcome spawned.Handle)
                   StartKill = killContainedTree
+                  GracefulKill = (fun grace -> this.GracefulKillTree grace)
                   Teardown =
                     fun () ->
                         // Close the pipe streams (OS handles/fds) before releasing the container.
@@ -178,6 +179,26 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                                   Outcome = outcome
                                   Duration = duration }
         }
+
+    /// Gracefully kill the contained tree (SIGTERM, then SIGKILL after `grace`) WITHOUT releasing
+    /// the group — used by per-run timeouts (the run's own teardown releases the group). On Windows
+    /// there is no per-job graceful signal, so this is the atomic Job kill.
+    member internal _.GracefulKillTree(grace: TimeSpan) : Task =
+        task {
+            match mechanism with
+            | Mechanism.JobObject -> Native.terminateWindowsJob jobHandle
+            | _ ->
+                if pgid <> 0 then
+                    Native.terminateProcessGroup pgid
+                    let stopwatch = Stopwatch.StartNew()
+
+                    while Native.processGroupAlive pgid && stopwatch.Elapsed < grace do
+                        do! Task.Delay 50
+
+                    if Native.processGroupAlive pgid then
+                        Native.killProcessGroup pgid
+        }
+        :> Task
 
     /// Tear the group down gracefully, then release it. On Unix: SIGTERM, then SIGKILL if still
     /// alive after `gracePeriod`. On Windows: an atomic Job kill. Idempotent with `Dispose`.

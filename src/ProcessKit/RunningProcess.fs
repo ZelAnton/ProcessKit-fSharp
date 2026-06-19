@@ -25,6 +25,9 @@ type internal RunningHost =
         Wait: unit -> Task<Outcome>
         /// Signal the tree to die without waiting (start_kill).
         StartKill: unit -> unit
+        /// Gracefully kill the tree (SIGTERM, then SIGKILL after the grace period) without
+        /// releasing the container — for timeouts.
+        GracefulKill: TimeSpan -> Task
         /// Reap the tree and release the container.
         Teardown: unit -> ValueTask
     }
@@ -86,6 +89,31 @@ type RunningProcess internal (host: RunningHost) =
             totalBytes
         )
 
+    // Wait for exit, applying a configured timeout: on the deadline, kill the tree (gracefully if
+    // `TimeoutGrace` is set, else hard) and report `Outcome.TimedOut`.
+    let waitWithTimeout () : Task<Outcome> =
+        match config.Timeout with
+        | None -> host.Wait()
+        | Some timeout ->
+            task {
+                let waitTask = host.Wait()
+                let waitBase = waitTask :> Task
+                use timeoutCts = new CancellationTokenSource()
+                let timeoutDelay = Task.Delay(timeout, timeoutCts.Token)
+                let! winner = Task.WhenAny(waitBase, timeoutDelay)
+
+                if obj.ReferenceEquals(winner, waitBase) then
+                    timeoutCts.Cancel()
+                    return! waitTask
+                else
+                    match config.TimeoutGrace with
+                    | Some grace -> do! host.GracefulKill grace
+                    | None -> host.StartKill()
+
+                    let! _ = waitTask
+                    return Outcome.TimedOut
+            }
+
     /// The pid, when known.
     member _.Pid = host.Pid
 
@@ -122,7 +150,7 @@ type RunningProcess internal (host: RunningHost) =
         task {
             let stdoutTask = pumpStdoutBuffer ()
             let stderrTask = pumpStderrBuffer ()
-            let! outcome = host.Wait()
+            let! outcome = waitWithTimeout ()
             let! outBuf = stdoutTask
             let! errBuf = stderrTask
             do! host.Teardown()
@@ -153,7 +181,7 @@ type RunningProcess internal (host: RunningHost) =
                 | None -> Task.FromResult Array.empty<byte>
 
             let stderrTask = pumpStderrBuffer ()
-            let! outcome = host.Wait()
+            let! outcome = waitWithTimeout ()
             let! stdoutBytes = stdoutTask
             let! errBuf = stderrTask
             do! host.Teardown()
@@ -188,7 +216,7 @@ type RunningProcess internal (host: RunningHost) =
                 | Some s -> Pump.drainDiscard s CancellationToken.None
                 | None -> Task.CompletedTask
 
-            let! outcome = host.Wait()
+            let! outcome = waitWithTimeout ()
             do! stdoutTask
             do! stderrTask
             do! host.Teardown()
@@ -243,7 +271,7 @@ type RunningProcess internal (host: RunningHost) =
 
             streamOutcome <-
                 task {
-                    let! outcome = host.Wait()
+                    let! outcome = waitWithTimeout ()
                     do! stdoutPump
                     do! stderrPump
                     return outcome
@@ -310,7 +338,7 @@ type RunningProcess internal (host: RunningHost) =
                 }
 
             task {
-                let! _ = host.Wait()
+                let! _ = waitWithTimeout ()
                 do! stdoutPump
                 do! stderrPump
                 eventChannel.Writer.Complete()
@@ -410,7 +438,7 @@ type RunningProcess internal (host: RunningHost) =
                             | Some s -> Pump.drainDiscard s CancellationToken.None
                             | None -> Task.CompletedTask
 
-                        let! outcome = host.Wait()
+                        let! outcome = waitWithTimeout ()
                         do! stdoutDrain
                         do! stderrDrain
                         return outcome

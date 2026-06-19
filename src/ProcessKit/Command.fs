@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.IO
 open System.Text
+open System.Threading
 
 /// The immutable configuration behind a `Command`. Internal — consumers build it through the
 /// `Command` builder; the runner/native layer reads it to spawn.
@@ -23,7 +24,11 @@ type internal CommandConfig =
       OnStderrLine: Action<string> option
       StdoutTee: Stream option
       StderrTee: Stream option
-      OutputBuffer: OutputBufferPolicy }
+      OutputBuffer: OutputBufferPolicy
+      Timeout: TimeSpan option
+      TimeoutGrace: TimeSpan option
+      CancelOn: CancellationToken option
+      Retry: (int * TimeSpan * Func<ProcessError, bool>) option }
 
 module internal CommandConfig =
 
@@ -43,7 +48,11 @@ module internal CommandConfig =
           OnStderrLine = None
           StdoutTee = None
           StderrTee = None
-          OutputBuffer = OutputBufferPolicy.Default }
+          OutputBuffer = OutputBufferPolicy.Default
+          Timeout = None
+          TimeoutGrace = None
+          CancelOn = None
+          Retry = None }
 
 /// An immutable description of a process to run.
 ///
@@ -203,6 +212,38 @@ type Command internal (config: CommandConfig) =
         ArgumentNullException.ThrowIfNull policy
         Command({ config with OutputBuffer = policy })
 
+    /// The configured run timeout, if any.
+    member _.ConfiguredTimeout = config.Timeout
+
+    /// Kill the run after `duration`, reporting the result as `Outcome.TimedOut`.
+    member _.Timeout(duration: TimeSpan) =
+        Command({ config with Timeout = Some duration })
+
+    /// On timeout, terminate gracefully (SIGTERM) and force-kill only if still alive after
+    /// `grace`. On Windows this degrades to the atomic Job kill.
+    member _.TimeoutGrace(grace: TimeSpan) =
+        Command(
+            { config with
+                TimeoutGrace = Some grace }
+        )
+
+    /// Also cancel the run when `cancellationToken` fires (in addition to any verb token).
+    member _.CancelOn(cancellationToken: CancellationToken) =
+        Command(
+            { config with
+                CancelOn = Some cancellationToken }
+        )
+
+    /// Retry a failed run up to `maxAttempts` extra times, waiting `delay` between attempts, while
+    /// `shouldRetry` returns true for the error.
+    member _.Retry(maxAttempts: int, delay: TimeSpan, shouldRetry: Func<ProcessError, bool>) =
+        ArgumentNullException.ThrowIfNull shouldRetry
+
+        Command(
+            { config with
+                Retry = Some(maxAttempts, delay, shouldRetry) }
+        )
+
 /// Pipe-friendly functions over `Command`, mirroring the instance methods.
 [<RequireQualifiedAccess>]
 module Command =
@@ -259,3 +300,16 @@ module Command =
 
     /// Bound the in-memory backlog of captured lines.
     let outputBuffer (policy: OutputBufferPolicy) (command: Command) = command.OutputBuffer policy
+
+    /// Kill the run after `duration`.
+    let timeout (duration: TimeSpan) (command: Command) = command.Timeout duration
+
+    /// Terminate gracefully on timeout, force-killing only after `grace`.
+    let timeoutGrace (grace: TimeSpan) (command: Command) = command.TimeoutGrace grace
+
+    /// Also cancel the run when `cancellationToken` fires.
+    let cancelOn (cancellationToken: CancellationToken) (command: Command) = command.CancelOn cancellationToken
+
+    /// Retry a failed run up to `maxAttempts` extra times, waiting `delay` between attempts.
+    let retry (maxAttempts: int) (delay: TimeSpan) (shouldRetry: ProcessError -> bool) (command: Command) =
+        command.Retry(maxAttempts, delay, Func<ProcessError, bool> shouldRetry)

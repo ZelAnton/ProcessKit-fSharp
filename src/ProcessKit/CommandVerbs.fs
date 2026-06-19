@@ -29,9 +29,9 @@ type CommandVerbs =
     /// Run to completion, capturing stdout as decoded text (a non-zero exit is data).
     [<Extension>]
     static member OutputString(command: Command) =
-        CommandVerbs.DefaultRunner.OutputString(command, CancellationToken.None)
+        Runner.outputString CommandVerbs.DefaultRunner CancellationToken.None command
 
     /// Run to completion, capturing stdout as raw bytes.
     [<Extension>]
     static member OutputBytes(command: Command) =
-        CommandVerbs.DefaultRunner.OutputBytes(command, CancellationToken.None)
+        Runner.outputBytes CommandVerbs.DefaultRunner CancellationToken.None command

@@ -14,6 +14,7 @@
 		<Compile Include="ShutdownTests.fs" />
 		<Compile Include="StreamingTests.fs" />
 		<Compile Include="ReadinessTests.fs" />
+		<Compile Include="TimeoutTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>
