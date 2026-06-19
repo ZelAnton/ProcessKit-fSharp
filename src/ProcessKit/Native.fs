@@ -635,11 +635,17 @@ module internal Native =
     /// True while any process remains in the group (signal 0 probes existence).
     let processGroupAlive (pgid: int) = killpg (pgid, 0) = 0
 
-    // Mark a fd close-on-exec so a *different* concurrent spawn does not inherit this run's
-    // pipe ends (which outlive the spawn). Our own child still gets fds 0/1/2 because dup2
-    // clears CLOEXEC on its target.
+    // `fcntl` is variadic; a fixed-signature P/Invoke mis-passes the third argument under the
+    // AArch64 variadic ABI, so the call is unreliable on ARM64 (Apple Silicon, Linux/arm64).
+    let private fcntlReliable =
+        RuntimeInformation.ProcessArchitecture <> Architecture.Arm64
+
+    // Mark a fd close-on-exec so a *different* concurrent spawn does not inherit this run's pipe
+    // ends (which outlive the spawn). Best-effort isolation only — within-spawn correctness (a
+    // child never holding a writer to its own stdin) is guaranteed by explicit `addclose` in
+    // `spawnPosix`, not by this. Skipped on ARM64, where the variadic `fcntl` cannot be called.
     let private setCloseOnExec (fd: int) =
-        if fd >= 0 then
+        if fd >= 0 && fcntlReliable then
             fcntl (fd, F_SETFD, FD_CLOEXEC) |> ignore
 
     /// Reap a POSIX child and report how it concluded.
@@ -770,6 +776,20 @@ module internal Native =
                 // After dup2, close the original child-side fds so only 0/1/2 remain in the child.
                 for fd in childSideFds do
                     posix_spawn_file_actions_addclose (fileActions, fd) |> ignore
+
+                // Also close the parent-kept ends in the child. This is what guarantees EOF: a
+                // child must never inherit a writer to its own stdin. We do it explicitly rather
+                // than rely on FD_CLOEXEC, whose `fcntl` is variadic and is mis-passed by a
+                // fixed-signature P/Invoke on the AArch64 variadic ABI (Apple Silicon), so CLOEXEC
+                // never takes effect there and the child would block forever waiting for stdin.
+                stdinParentWrite
+                |> Option.iter (fun fd -> posix_spawn_file_actions_addclose (fileActions, fd) |> ignore)
+
+                stdoutParentRead
+                |> Option.iter (fun fd -> posix_spawn_file_actions_addclose (fileActions, fd) |> ignore)
+
+                stderrParentRead
+                |> Option.iter (fun fd -> posix_spawn_file_actions_addclose (fileActions, fd) |> ignore)
 
                 match config.WorkingDirectory with
                 | Some directory -> posix_spawn_file_actions_addchdir_np (fileActions, directory) |> ignore
