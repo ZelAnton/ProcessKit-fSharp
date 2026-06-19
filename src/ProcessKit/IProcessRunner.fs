@@ -19,3 +19,7 @@ type IProcessRunner =
     /// Run to completion, capturing stdout as raw bytes.
     abstract member OutputBytes:
         command: Command * cancellationToken: CancellationToken -> Task<Result<ProcessResult<byte[]>, ProcessError>>
+
+    /// Start the command and return a live handle for streaming, interactive stdin, and waiting.
+    abstract member Start:
+        command: Command * cancellationToken: CancellationToken -> Task<Result<RunningProcess, ProcessError>>

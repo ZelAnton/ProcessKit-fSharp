@@ -1,0 +1,242 @@
+namespace ProcessKit
+
+open System
+open System.Collections.Generic
+open System.IO
+open System.Text
+open System.Threading
+open System.Threading.Tasks
+
+/// Internal: reading captured output into lines, raw bytes, and feeding stdin.
+module internal Pump =
+
+    /// Accumulates retained output lines under an `OutputBufferPolicy`, tracking cumulative
+    /// totals and whether the fail-loud ceiling tripped. Not thread-safe; one per stream.
+    type LineBuffer(policy: OutputBufferPolicy) =
+        let retained = LinkedList<string>()
+        let mutable retainedBytes = 0
+        let mutable totalLines = 0
+        let mutable totalBytes = 0
+        let mutable truncated = false
+        let mutable tooLarge = false
+
+        let byteLen (line: string) = Encoding.UTF8.GetByteCount line
+
+        let overLineCap () =
+            match policy.MaxLines with
+            | Some cap -> retained.Count >= cap
+            | None -> false
+
+        let wouldOverByteCap (addition: int) =
+            match policy.MaxBytes with
+            | Some cap -> retainedBytes + addition > cap
+            | None -> false
+
+        member _.TotalLines = totalLines
+        member _.TotalBytes = totalBytes
+        member _.Truncated = truncated
+        member _.TooLarge = tooLarge
+        member _.RetainedLines = List.ofSeq retained
+        member _.Text = String.Join('\n', retained)
+
+        /// Record a complete line, applying the policy.
+        member _.Add(line: string) =
+            let bytes = byteLen line
+            totalLines <- totalLines + 1
+            totalBytes <- totalBytes + bytes
+            let unbounded = policy.MaxLines.IsNone && policy.MaxBytes.IsNone
+            let full = overLineCap () || wouldOverByteCap bytes
+
+            match policy.Overflow with
+            | OverflowMode.Error when full || unbounded ->
+                // Fail-loud ceiling: count but never retain.
+                tooLarge <- true
+            | OverflowMode.DropNewest when full -> truncated <- true
+            | OverflowMode.DropOldest when full ->
+                truncated <- true
+                retained.AddLast line |> ignore
+                retainedBytes <- retainedBytes + bytes
+
+                let fits () =
+                    (match policy.MaxLines with
+                     | Some cap -> retained.Count <= cap
+                     | None -> true)
+                    && (match policy.MaxBytes with
+                        | Some cap -> retainedBytes <= cap
+                        | None -> true)
+
+                while not (fits ()) && retained.Count > 0 do
+                    match retained.First with
+                    | null -> ()
+                    | node ->
+                        retained.RemoveFirst()
+                        retainedBytes <- retainedBytes - byteLen node.Value
+            | _ ->
+                retained.AddLast line |> ignore
+                retainedBytes <- retainedBytes + bytes
+
+    /// Read `stream` to EOF: tee the raw bytes (if a sink is set), decode with `encoding`, split
+    /// into lines (stripping `\n` / `\r\n`), and pass each complete line — including a final
+    /// unterminated one — to `onLine`.
+    let readLines
+        (stream: Stream)
+        (encoding: Encoding)
+        (tee: Stream option)
+        (onLine: string -> unit)
+        (cancellationToken: CancellationToken)
+        : Task =
+        task {
+            let decoder = encoding.GetDecoder()
+            let byteBuffer = Array.zeroCreate<byte> 8192
+            let charBuffer = Array.zeroCreate<char> (encoding.GetMaxCharCount byteBuffer.Length)
+            let line = StringBuilder()
+            let mutable reading = true
+
+            while reading do
+                let! read = stream.ReadAsync(byteBuffer.AsMemory(0, byteBuffer.Length), cancellationToken)
+
+                if read = 0 then
+                    reading <- false
+                else
+                    match tee with
+                    | Some sink -> do! sink.WriteAsync(byteBuffer.AsMemory(0, read), cancellationToken)
+                    | None -> ()
+
+                    let chars = decoder.GetChars(byteBuffer, 0, read, charBuffer, 0)
+                    let mutable i = 0
+
+                    while i < chars do
+                        let c = charBuffer[i]
+
+                        if c = '\n' then
+                            if line.Length > 0 && line[line.Length - 1] = '\r' then
+                                line.Length <- line.Length - 1
+
+                            onLine (line.ToString())
+                            line.Clear() |> ignore
+                        else
+                            line.Append c |> ignore
+
+                        i <- i + 1
+
+            if line.Length > 0 then
+                if line[line.Length - 1] = '\r' then
+                    line.Length <- line.Length - 1
+
+                onLine (line.ToString())
+        }
+        :> Task
+
+    /// `readLines` for a background pump: swallows the disposal / broken-pipe exceptions of a
+    /// teardown race (the stream closed underneath an in-flight read), so the task never faults
+    /// unobserved.
+    let readLinesUntilDone
+        (stream: Stream)
+        (encoding: Encoding)
+        (tee: Stream option)
+        (onLine: string -> unit)
+        (cancellationToken: CancellationToken)
+        : Task =
+        task {
+            try
+                do! readLines stream encoding tee onLine cancellationToken
+            with
+            | :? ObjectDisposedException ->
+                // The stream was torn down (early dispose) while reading. Stop quietly.
+                ()
+            | :? IOException ->
+                // The pipe broke during teardown. Stop; the run's outcome reflects the child.
+                ()
+        }
+        :> Task
+
+    /// Read `stream` to EOF, discarding everything (so the child never blocks on a full pipe).
+    let drainDiscard (stream: Stream) (cancellationToken: CancellationToken) : Task =
+        task {
+            let chunk = Array.zeroCreate<byte> 8192
+            let mutable reading = true
+
+            while reading do
+                let! read = stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)
+
+                if read = 0 then
+                    reading <- false
+        }
+        :> Task
+
+    /// Read `stream` to EOF as raw bytes (no line splitting), teeing if a sink is set.
+    let drainRaw (stream: Stream) (tee: Stream option) (cancellationToken: CancellationToken) : Task<byte[]> =
+        task {
+            use buffer = new MemoryStream()
+            let chunk = Array.zeroCreate<byte> 8192
+            let mutable reading = true
+
+            while reading do
+                let! read = stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)
+
+                if read = 0 then
+                    reading <- false
+                else
+                    do! buffer.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
+
+                    match tee with
+                    | Some sink -> do! sink.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
+                    | None -> ()
+
+            return buffer.ToArray()
+        }
+
+    /// Write a stdin source to the child's stdin stream; close it (EOF) afterwards unless the
+    /// caller is keeping it open for interactive writing.
+    let feedStdin
+        (source: StdinSource)
+        (stdinStream: Stream)
+        (closeWhenDone: bool)
+        (cancellationToken: CancellationToken)
+        : Task =
+        task {
+            try
+                match source with
+                | StdinSource.Empty -> ()
+                | StdinSource.Bytes bytes -> do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
+                | StdinSource.File path ->
+                    use file = File.OpenRead path
+                    do! file.CopyToAsync(stdinStream, cancellationToken)
+                | StdinSource.Reader reader -> do! reader.CopyToAsync(stdinStream, cancellationToken)
+                | StdinSource.Lines lines ->
+                    for entry in lines do
+                        let bytes = Encoding.UTF8.GetBytes(entry + "\n")
+                        do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
+                | StdinSource.AsyncLines lines ->
+                    let enumerator = lines.GetAsyncEnumerator cancellationToken
+
+                    try
+                        let mutable more = true
+
+                        while more do
+                            let! has = enumerator.MoveNextAsync()
+
+                            if has then
+                                let bytes = Encoding.UTF8.GetBytes(enumerator.Current + "\n")
+                                do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
+                            else
+                                more <- false
+                    finally
+                        enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult()
+
+                do! stdinStream.FlushAsync cancellationToken
+            with _ ->
+                // The stdin writer is best-effort and runs detached: a broken pipe (child closed
+                // stdin early), a missing FromFile path, or a torn-down stream all mean the child
+                // gets partial/no input, which the run's outcome already reflects. Swallowing keeps
+                // the detached task from faulting unobserved; the failure is never actionable here.
+                ()
+
+            if closeWhenDone then
+                try
+                    stdinStream.Dispose()
+                with :? ObjectDisposedException ->
+                    // Already disposed during teardown; nothing to do.
+                    ()
+        }
+        :> Task

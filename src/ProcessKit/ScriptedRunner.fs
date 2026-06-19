@@ -60,6 +60,14 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
 
             Task.FromResult(Ok result)
 
+        member _.Start(_, _) =
+            Task.FromResult(
+                Error(
+                    ProcessError.Unsupported
+                        "ScriptedRunner does not support Start (live streaming); script OutputString/OutputBytes instead."
+                )
+            )
+
         member this.OutputBytes(command, _) =
             let reply = this.Resolve command
 

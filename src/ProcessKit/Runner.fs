@@ -86,3 +86,71 @@ module Runner =
                 | Outcome.TimedOut ->
                     return Error(ProcessError.Timeout(result.Program, result.Duration, result.Stdout, result.Stderr))
         }
+
+    /// Start the command and return a live `RunningProcess` for streaming and interactive I/O.
+    let start (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
+        runner.Start(command, cancellationToken)
+
+    /// Require a zero exit and parse the trimmed stdout into a `'T`; a thrown parser error
+    /// becomes `ProcessError.Parse`.
+    let parse
+        (runner: IProcessRunner)
+        (cancellationToken: CancellationToken)
+        (parser: string -> 'T)
+        (command: Command)
+        : Task<Result<'T, ProcessError>> =
+        task {
+            match! run runner cancellationToken command with
+            | Error error -> return Error error
+            | Ok text ->
+                try
+                    return Ok(parser text)
+                with ex ->
+                    return Error(ProcessError.Parse(command.Program, ex.Message))
+        }
+
+    /// Like `parse`, but the parser returns its own `Result` (its error message becomes `Parse`).
+    let tryParse
+        (runner: IProcessRunner)
+        (cancellationToken: CancellationToken)
+        (parser: string -> Result<'T, string>)
+        (command: Command)
+        : Task<Result<'T, ProcessError>> =
+        task {
+            match! run runner cancellationToken command with
+            | Error error -> return Error error
+            | Ok text ->
+                match parser text with
+                | Ok value -> return Ok value
+                | Error message -> return Error(ProcessError.Parse(command.Program, message))
+        }
+
+    /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
+    let firstLine
+        (runner: IProcessRunner)
+        (cancellationToken: CancellationToken)
+        (predicate: string -> bool)
+        (command: Command)
+        : Task<Result<string option, ProcessError>> =
+        task {
+            match! runner.Start(command, cancellationToken) with
+            | Error error -> return Error error
+            | Ok running ->
+                let mutable found = None
+                let enumerator = running.StdoutLines().GetAsyncEnumerator(cancellationToken)
+                let mutable more = true
+
+                while more do
+                    let! has = enumerator.MoveNextAsync()
+
+                    if not has then
+                        more <- false
+                    elif predicate enumerator.Current then
+                        found <- Some enumerator.Current
+                        more <- false
+
+                do! enumerator.DisposeAsync()
+                running.StartKill()
+                let! _ = running.Finish()
+                return Ok found
+        }

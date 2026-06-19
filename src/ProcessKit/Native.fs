@@ -17,14 +17,18 @@ open Microsoft.Win32.SafeHandles
 /// invoked on the OS that has it.
 module internal Native =
 
-    /// A freshly spawned, contained child: managed read streams for stdout/stderr and the
-    /// OS process handle/pid the platform layer waits on.
+    /// A freshly spawned, contained child: the OS process handle/pid the platform layer waits
+    /// on, plus managed streams for whichever of stdin/stdout/stderr are connected to a pipe.
     type Spawned =
         {
             /// The OS process handle (Windows) or pid (Unix), as a native integer.
             Handle: nativeint
-            Stdout: Stream
-            Stderr: Stream
+            /// Parent read stream for the child's stdout — `Some` only in `Piped` mode.
+            Stdout: Stream option
+            /// Parent read stream for the child's stderr — `Some` only in `Piped` mode.
+            Stderr: Stream option
+            /// Parent write stream for the child's stdin — `Some` only when a stdin pipe was created.
+            Stdin: Stream option
         }
 
     // ----------------------------------------------------------------------------------
@@ -79,13 +83,13 @@ module internal Native =
 
         let env = System.Collections.Generic.Dictionary<string, string>(comparer)
 
-        if not command.ClearEnv then
+        if not command.Config.ClearEnv then
             for entry in
                 Environment.GetEnvironmentVariables()
                 |> Seq.cast<System.Collections.DictionaryEntry> do
                 env[string entry.Key] <- string entry.Value
 
-        for key, value in command.EnvOverrides do
+        for key, value in command.Config.EnvOverrides do
             match value with
             | Some v -> env[key] <- v
             | None -> env.Remove key |> ignore
@@ -229,6 +233,98 @@ module internal Native =
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private CloseHandle(nativeint hObject)
 
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern uint32 private GetProcessId(nativeint hProcess)
+
+    /// The OS process id behind a Windows process handle.
+    let processIdWindows (hProcess: nativeint) : int = int (GetProcessId hProcess)
+
+    // Std-handle ids and flags for the Inherit / Null stdio modes.
+    [<Literal>]
+    let private STD_INPUT_HANDLE = -10
+
+    [<Literal>]
+    let private STD_OUTPUT_HANDLE = -11
+
+    [<Literal>]
+    let private STD_ERROR_HANDLE = -12
+
+    [<Literal>]
+    let private GENERIC_READ = 0x80000000u
+
+    [<Literal>]
+    let private GENERIC_WRITE = 0x40000000u
+
+    [<Literal>]
+    let private FILE_SHARE_RW = 0x00000003u
+
+    [<Literal>]
+    let private OPEN_EXISTING = 3u
+
+    [<Literal>]
+    let private HANDLE_FLAG_INHERIT = 1u
+
+    [<Literal>]
+    let private DUPLICATE_SAME_ACCESS = 2u
+
+    [<Literal>]
+    let private INVALID_HANDLE_VALUE = -1
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern nativeint private GetStdHandle(int nStdHandle)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern nativeint private GetCurrentProcess()
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private SetHandleInformation(nativeint hObject, uint32 dwMask, uint32 dwFlags)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private DuplicateHandle(
+        nativeint hSourceProcess,
+        nativeint hSource,
+        nativeint hTargetProcess,
+        nativeint& lpTargetHandle,
+        uint32 dwDesiredAccess,
+        bool bInheritHandle,
+        uint32 dwOptions
+    )
+
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern nativeint private CreateFileW(
+        string lpFileName,
+        uint32 dwDesiredAccess,
+        uint32 dwShareMode,
+        nativeint lpSecurityAttributes,
+        uint32 dwCreationDisposition,
+        uint32 dwFlagsAndAttributes,
+        nativeint hTemplateFile
+    )
+
+    /// An inheritable handle to the null device, for `StdioMode.Null`.
+    let private inheritableNul (access: uint32) : nativeint =
+        let handle =
+            CreateFileW("NUL", access, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, 0u, IntPtr.Zero)
+
+        if handle <> IntPtr.Zero && handle <> nativeint INVALID_HANDLE_VALUE then
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) |> ignore
+
+        handle
+
+    /// An inheritable duplicate of one of the parent's std handles, for `StdioMode.Inherit`.
+    let private inheritableStdHandle (stdHandleId: int) : nativeint =
+        let source = GetStdHandle stdHandleId
+        let current = GetCurrentProcess()
+        let mutable duplicate = IntPtr.Zero
+
+        if
+            source <> IntPtr.Zero
+            && DuplicateHandle(current, source, current, &duplicate, 0u, true, DUPLICATE_SAME_ACCESS)
+        then
+            duplicate
+        else
+            IntPtr.Zero
+
     /// Create a Job Object that kills its whole process tree when its last handle closes
     /// (`KILL_ON_JOB_CLOSE`). This is how kill-on-drop maps to .NET: the owning
     /// `ProcessGroup` holds the only handle, and disposing it (or GC finalizing it) reaps
@@ -270,7 +366,7 @@ module internal Native =
             Outcome.Exited(int code))
 
     let private buildWindowsEnvironment (command: Command) : nativeint =
-        if not command.ClearEnv && List.isEmpty command.EnvOverrides then
+        if not command.Config.ClearEnv && List.isEmpty command.Config.EnvOverrides then
             IntPtr.Zero
         else
             let env = effectiveEnvironment command
@@ -299,27 +395,51 @@ module internal Native =
     /// grandchild can escape the container), then resume it. Returns the process handle and
     /// managed read streams for stdout/stderr.
     let private spawnWindowsCore (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
-        let outPipe =
-            new AnonymousPipeServerStream(PipeDirection.In, HandleInheritability.Inheritable)
+        let config = command.Config
+        let stdinWanted = config.StdinSource.IsSome || config.KeepStdinOpen
 
-        let errPipe =
-            new AnonymousPipeServerStream(PipeDirection.In, HandleInheritability.Inheritable)
-
+        // stdin is always a pipe so we control EOF; the write end is kept (interactive) or closed.
         let inPipe =
             new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.Inheritable)
+
+        // For an output stream: the inheritable child-side handle, the parent read stream
+        // (`Some` only when piped), and a cleanup that closes the child-side handle after spawn.
+        let setupOut (mode: StdioMode) (stdHandleId: int) : nativeint * Stream option * (unit -> unit) =
+            match mode with
+            | StdioMode.Piped ->
+                let pipe =
+                    new AnonymousPipeServerStream(PipeDirection.In, HandleInheritability.Inheritable)
+
+                pipe.ClientSafePipeHandle.DangerousGetHandle(),
+                Some(pipe :> Stream),
+                (fun () -> pipe.DisposeLocalCopyOfClientHandle())
+            | StdioMode.Null ->
+                let handle = inheritableNul GENERIC_WRITE
+                handle, None, (fun () -> CloseHandle handle |> ignore)
+            | StdioMode.Inherit ->
+                let handle = inheritableStdHandle stdHandleId
+
+                handle,
+                None,
+                (fun () ->
+                    if handle <> IntPtr.Zero then
+                        CloseHandle handle |> ignore)
+
+        let outChild, outStream, outCleanup = setupOut config.StdoutMode STD_OUTPUT_HANDLE
+        let errChild, errStream, errCleanup = setupOut config.StderrMode STD_ERROR_HANDLE
 
         let mutable startup = STARTUPINFO()
         startup.cb <- Marshal.SizeOf<STARTUPINFO>()
         startup.dwFlags <- STARTF_USESTDHANDLES
         startup.hStdInput <- inPipe.ClientSafePipeHandle.DangerousGetHandle()
-        startup.hStdOutput <- outPipe.ClientSafePipeHandle.DangerousGetHandle()
-        startup.hStdError <- errPipe.ClientSafePipeHandle.DangerousGetHandle()
+        startup.hStdOutput <- outChild
+        startup.hStdError <- errChild
 
         let mutable info = PROCESS_INFORMATION()
         let commandLine = buildWindowsCommandLine command
 
         let workingDirectory =
-            command.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
+            config.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
 
         let environment = buildWindowsEnvironment command
 
@@ -349,10 +469,15 @@ module internal Native =
         if environment <> IntPtr.Zero then
             Marshal.FreeHGlobal environment
 
-        if not created then
-            outPipe.Dispose()
-            errPipe.Dispose()
+        let releaseStdio () =
+            outCleanup ()
+            errCleanup ()
+            outStream |> Option.iter (fun s -> s.Dispose())
+            errStream |> Option.iter (fun s -> s.Dispose())
             inPipe.Dispose()
+
+        if not created then
+            releaseStdio ()
 
             if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
                 Error(ProcessError.NotFound(command.Program, None))
@@ -364,24 +489,29 @@ module internal Native =
             TerminateProcess(info.hProcess, 1u) |> ignore
             CloseHandle info.hThread |> ignore
             CloseHandle info.hProcess |> ignore
-            outPipe.Dispose()
-            errPipe.Dispose()
-            inPipe.Dispose()
+            releaseStdio ()
             Error(ProcessError.Spawn(command.Program, $"could not assign process to job object: {message}"))
         else
             ResumeThread info.hThread |> ignore
             CloseHandle info.hThread |> ignore
-            // Drop the parent's copies of the child's handle ends so reads see EOF when the
-            // child exits; closing the stdin write end gives the child an empty stdin.
-            outPipe.DisposeLocalCopyOfClientHandle()
-            errPipe.DisposeLocalCopyOfClientHandle()
+            // Drop the parent's copies of the child-side handles now that the child has inherited
+            // them, so reads see EOF when the child exits.
             inPipe.DisposeLocalCopyOfClientHandle()
-            inPipe.Dispose()
+            outCleanup ()
+            errCleanup ()
+
+            let stdinStream =
+                if stdinWanted then
+                    Some(inPipe :> Stream)
+                else
+                    inPipe.Dispose() // close stdin write end -> child sees EOF
+                    None
 
             Ok
                 { Handle = info.hProcess
-                  Stdout = outPipe
-                  Stderr = errPipe }
+                  Stdout = outStream
+                  Stderr = errStream
+                  Stdin = stdinStream }
 
     let spawnWindows (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
         lock windowsSpawnLock (fun () -> spawnWindowsCore job command)
@@ -395,6 +525,9 @@ module internal Native =
 
     [<Literal>]
     let private O_RDONLY = 0
+
+    [<Literal>]
+    let private O_WRONLY = 1
 
     [<Literal>]
     let private SIGKILL = 9
@@ -520,27 +653,95 @@ module internal Native =
     /// child's pid) and capture its stdout/stderr. The whole group can later be reaped with
     /// `killProcessGroup`.
     let spawnPosix (command: Command) : Result<Spawned, ProcessError> =
-        let outFds = Array.zeroCreate<int> 2
-        let errFds = Array.zeroCreate<int> 2
+        let config = command.Config
+        let stdinWanted = config.StdinSource.IsSome || config.KeepStdinOpen
+        // Child-side fds the parent closes after spawn (the child gets its own via dup2).
+        let childSideFds = System.Collections.Generic.List<int>()
 
-        if pipe outFds <> 0 then
-            Error(ProcessError.Spawn(command.Program, "pipe() failed for stdout"))
-        elif pipe errFds <> 0 then
-            close outFds[0] |> ignore
-            close outFds[1] |> ignore
-            Error(ProcessError.Spawn(command.Program, "pipe() failed for stderr"))
+        let openNul (flags: int) =
+            let fd = openFile ("/dev/null", flags)
+
+            if fd >= 0 then
+                setCloseOnExec fd
+                childSideFds.Add fd
+
+            fd
+
+        // Per stream: the fd the child should see at the target slot (-1 = inherit, no dup2), and
+        // the fd the parent keeps as a stream (read for stdout/stderr, write for stdin).
+        let mutable stdinChildFd = -1
+        let mutable stdinParentWrite: int option = None
+        let mutable stdoutChildFd = -1
+        let mutable stdoutParentRead: int option = None
+        let mutable stderrChildFd = -1
+        let mutable stderrParentRead: int option = None
+        let mutable failure: string option = None
+
+        let makePipe (label: string) =
+            let fds = Array.zeroCreate<int> 2
+
+            if pipe fds <> 0 then
+                failure <- Some $"pipe() failed for {label}"
+                None
+            else
+                setCloseOnExec fds[0]
+                setCloseOnExec fds[1]
+                Some(fds[0], fds[1])
+
+        // stdin
+        if stdinWanted then
+            match makePipe "stdin" with
+            | Some(readFd, writeFd) ->
+                stdinChildFd <- readFd
+                childSideFds.Add readFd
+                stdinParentWrite <- Some writeFd
+            | None -> ()
         else
-            let outRead, outWrite = outFds[0], outFds[1]
-            let errRead, errWrite = errFds[0], errFds[1]
-            let devNull = openFile ("/dev/null", O_RDONLY)
-            // Keep these fds out of any other concurrent spawn's child.
-            setCloseOnExec outRead
-            setCloseOnExec outWrite
-            setCloseOnExec errRead
-            setCloseOnExec errWrite
-            setCloseOnExec devNull
-            // posix_spawn_file_actions_t / posix_spawnattr_t are opaque; a generous zeroed
-            // buffer holds either platform's representation (glibc structs or macOS pointers).
+            stdinChildFd <- openNul O_RDONLY
+
+        // stdout
+        if failure.IsNone then
+            match config.StdoutMode with
+            | StdioMode.Piped ->
+                match makePipe "stdout" with
+                | Some(readFd, writeFd) ->
+                    stdoutParentRead <- Some readFd
+                    stdoutChildFd <- writeFd
+                    childSideFds.Add writeFd
+                | None -> ()
+            | StdioMode.Null -> stdoutChildFd <- openNul O_WRONLY
+            | StdioMode.Inherit -> stdoutChildFd <- -1
+
+        // stderr
+        if failure.IsNone then
+            match config.StderrMode with
+            | StdioMode.Piped ->
+                match makePipe "stderr" with
+                | Some(readFd, writeFd) ->
+                    stderrParentRead <- Some readFd
+                    stderrChildFd <- writeFd
+                    childSideFds.Add writeFd
+                | None -> ()
+            | StdioMode.Null -> stderrChildFd <- openNul O_WRONLY
+            | StdioMode.Inherit -> stderrChildFd <- -1
+
+        let closeFd fd = close fd |> ignore
+
+        let closeParentEnds () =
+            stdinParentWrite |> Option.iter closeFd
+            stdoutParentRead |> Option.iter closeFd
+            stderrParentRead |> Option.iter closeFd
+
+        match failure with
+        | Some message ->
+            for fd in childSideFds do
+                closeFd fd
+
+            closeParentEnds ()
+            Error(ProcessError.Spawn(command.Program, message))
+        | None ->
+            // posix_spawn_file_actions_t / posix_spawnattr_t are opaque; a generous zeroed buffer
+            // holds either platform's representation (glibc structs or macOS pointers).
             let fileActions = Marshal.AllocHGlobal 1024
             let attributes = Marshal.AllocHGlobal 1024
             let argv = command.Program :: List.ofSeq command.Arguments
@@ -556,21 +757,21 @@ module internal Native =
             try
                 posix_spawn_file_actions_init fileActions |> ignore
                 posix_spawnattr_init attributes |> ignore
-                posix_spawn_file_actions_adddup2 (fileActions, outWrite, 1) |> ignore
-                posix_spawn_file_actions_adddup2 (fileActions, errWrite, 2) |> ignore
 
-                if devNull >= 0 then
-                    posix_spawn_file_actions_adddup2 (fileActions, devNull, 0) |> ignore
+                if stdinChildFd >= 0 then
+                    posix_spawn_file_actions_adddup2 (fileActions, stdinChildFd, 0) |> ignore
 
-                posix_spawn_file_actions_addclose (fileActions, outRead) |> ignore
-                posix_spawn_file_actions_addclose (fileActions, outWrite) |> ignore
-                posix_spawn_file_actions_addclose (fileActions, errRead) |> ignore
-                posix_spawn_file_actions_addclose (fileActions, errWrite) |> ignore
+                if stdoutChildFd >= 0 then
+                    posix_spawn_file_actions_adddup2 (fileActions, stdoutChildFd, 1) |> ignore
 
-                if devNull >= 0 then
-                    posix_spawn_file_actions_addclose (fileActions, devNull) |> ignore
+                if stderrChildFd >= 0 then
+                    posix_spawn_file_actions_adddup2 (fileActions, stderrChildFd, 2) |> ignore
 
-                match command.WorkingDirectory with
+                // After dup2, close the original child-side fds so only 0/1/2 remain in the child.
+                for fd in childSideFds do
+                    posix_spawn_file_actions_addclose (fileActions, fd) |> ignore
+
+                match config.WorkingDirectory with
                 | Some directory -> posix_spawn_file_actions_addchdir_np (fileActions, directory) |> ignore
                 | None -> ()
 
@@ -582,32 +783,29 @@ module internal Native =
                 let rc =
                     posix_spawnp (&pid, command.Program, fileActions, attributes, argvPointer, envpPointer)
 
-                // The parent no longer needs the child's pipe ends or /dev/null.
-                close outWrite |> ignore
-                close errWrite |> ignore
-
-                if devNull >= 0 then
-                    close devNull |> ignore
+                // The parent never needs the child-side fds.
+                for fd in childSideFds do
+                    closeFd fd
 
                 if rc <> 0 then
-                    close outRead |> ignore
-                    close errRead |> ignore
+                    closeParentEnds ()
 
                     if rc = ENOENT then
                         Error(ProcessError.NotFound(command.Program, None))
                     else
                         Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
                 else
-                    let stdout =
-                        new FileStream(new SafeFileHandle(nativeint outRead, true), FileAccess.Read)
+                    let readStream fd =
+                        new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Read) :> Stream
 
-                    let stderr =
-                        new FileStream(new SafeFileHandle(nativeint errRead, true), FileAccess.Read)
+                    let writeStream fd =
+                        new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Write) :> Stream
 
                     Ok
                         { Handle = nativeint pid
-                          Stdout = stdout
-                          Stderr = stderr }
+                          Stdout = stdoutParentRead |> Option.map readStream
+                          Stderr = stderrParentRead |> Option.map readStream
+                          Stdin = stdinParentWrite |> Option.map writeStream }
             finally
                 posix_spawn_file_actions_destroy fileActions |> ignore
                 posix_spawnattr_destroy attributes |> ignore

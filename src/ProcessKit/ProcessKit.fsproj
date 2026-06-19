@@ -36,14 +36,22 @@
 		<Compile Include="Outcome.fs" />
 		<Compile Include="Mechanism.fs" />
 		<Compile Include="ProcessResult.fs" />
+		<Compile Include="OutputPolicy.fs" />
+		<Compile Include="OutputEvent.fs" />
+		<Compile Include="Finished.fs" />
+		<Compile Include="Stdin.fs" />
 		<Compile Include="Command.fs" />
+		<Compile Include="Native.fs" />
+		<Compile Include="Pump.fs" />
+		<Compile Include="ProcessStdin.fs" />
+		<Compile Include="RunningProcess.fs" />
 		<Compile Include="IProcessRunner.fs" />
 		<Compile Include="Runner.fs" />
 		<Compile Include="Reply.fs" />
 		<Compile Include="ScriptedRunner.fs" />
-		<Compile Include="Native.fs" />
 		<Compile Include="ProcessGroup.fs" />
 		<Compile Include="JobRunner.fs" />
+		<Compile Include="CommandVerbs.fs" />
 	</ItemGroup>
 
 	<ItemGroup>

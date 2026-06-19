@@ -32,6 +32,18 @@ type ProcessError =
     /// Parsing the captured output into a typed value failed.
     | Parse of program: string * message: string
 
+    /// Captured line output exceeded the configured `OutputBufferPolicy` ceiling
+    /// (`OverflowMode.Error`). Carries the configured caps and the cumulative totals seen.
+    | OutputTooLarge of
+        program: string *
+        lineLimit: int option *
+        byteLimit: int option *
+        totalLines: int *
+        totalBytes: int
+
+    /// Writing to the child's standard input failed.
+    | Stdin of program: string * message: string
+
     /// An underlying I/O failure not attributable to a specific exit.
     | Io of message: string
 

@@ -1,50 +1,52 @@
 namespace ProcessKit
 
-open System.Text
+open System
 open System.Threading
 open System.Threading.Tasks
 
-/// The default `IProcessRunner`: spawns each command into a fresh kill-on-dispose
-/// `ProcessGroup`, captures its output to completion, and reaps the whole tree when the run
-/// ends (success, failure, or cancellation).
+/// The default `IProcessRunner`: spawns each command into a fresh kill-on-dispose `ProcessGroup`
+/// (owned by the returned `RunningProcess`), then captures or streams its output and reaps the
+/// whole tree on completion, failure, or cancellation.
 [<Sealed>]
 type JobRunner() =
 
-    let capture (command: Command) (cancellationToken: CancellationToken) : Task<Result<CapturedRun, ProcessError>> =
+    let start (command: Command) : Task<Result<RunningProcess, ProcessError>> =
         task {
             match ProcessGroup.Create() with
             | Error error -> return Error error
             | Ok group ->
-                use grp = group
-                return! grp.SpawnAndCapture(command, cancellationToken)
+                match group.StartInternal command with
+                | Error error ->
+                    (group :> IDisposable).Dispose()
+                    return Error error
+                | Ok host -> return Ok(RunningProcess host)
+        }
+
+    // Run a started process to a completion result, killing the tree if `cancellationToken` fires
+    // and reporting the cancellation as an error.
+    let runToCompletion
+        (command: Command)
+        (cancellationToken: CancellationToken)
+        (consume: RunningProcess -> Task<Result<'T, ProcessError>>)
+        : Task<Result<'T, ProcessError>> =
+        task {
+            match! start command with
+            | Error error -> return Error error
+            | Ok running ->
+                use _registration = cancellationToken.Register(fun () -> running.StartKill())
+                let! result = consume running
+
+                if cancellationToken.IsCancellationRequested then
+                    return Error(ProcessError.Cancelled command.Program)
+                else
+                    return result
         }
 
     interface IProcessRunner with
-        member _.OutputString(command, cancellationToken) =
-            task {
-                match! capture command cancellationToken with
-                | Error error -> return Error error
-                | Ok run ->
-                    let result =
-                        ProcessResult<string>(
-                            command.Program,
-                            Encoding.UTF8.GetString run.Stdout,
-                            run.Stderr,
-                            run.Outcome,
-                            run.Duration,
-                            false
-                        )
+        member _.Start(command, _) = start command
 
-                    return Ok result
-            }
+        member _.OutputString(command, cancellationToken) =
+            runToCompletion command cancellationToken (fun running -> running.OutputString())
 
         member _.OutputBytes(command, cancellationToken) =
-            task {
-                match! capture command cancellationToken with
-                | Error error -> return Error error
-                | Ok run ->
-                    let result =
-                        ProcessResult<byte[]>(command.Program, run.Stdout, run.Stderr, run.Outcome, run.Duration, false)
-
-                    return Ok result
-            }
+            runToCompletion command cancellationToken (fun running -> running.OutputBytes())
