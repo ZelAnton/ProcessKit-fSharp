@@ -29,6 +29,9 @@ type ProcessError =
     /// The run was cancelled through its `CancellationToken`. A cancellation is always an error.
     | Cancelled of program: string
 
+    /// A readiness probe (`WaitForLine` / `WaitForPort` / `WaitFor`) did not succeed within its timeout.
+    | NotReady of program: string * timeout: TimeSpan
+
     /// Parsing the captured output into a typed value failed.
     | Parse of program: string * message: string
 
@@ -69,6 +72,7 @@ type ProcessError =
             | None -> $"'{program}' was killed"
         | ProcessError.Timeout(program, timeout, _, _) -> $"'{program}' timed out after {timeout.TotalSeconds}s"
         | ProcessError.Cancelled program -> $"'{program}' was cancelled"
+        | ProcessError.NotReady(program, timeout) -> $"'{program}' was not ready within {timeout.TotalSeconds}s"
         | ProcessError.Parse(program, message) -> $"failed to parse output of '{program}': {message}"
         | ProcessError.OutputTooLarge(program, _, _, totalLines, totalBytes) ->
             $"'{program}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"

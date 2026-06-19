@@ -4,6 +4,8 @@ open System
 open System.Collections.Generic
 open System.Diagnostics
 open System.IO
+open System.Net
+open System.Net.Sockets
 open System.Threading
 open System.Threading.Tasks
 open System.Threading.Channels
@@ -42,6 +44,8 @@ type RunningProcess internal (host: RunningHost) =
     let stdoutChannel = Channel.CreateUnbounded<string>()
     let eventChannel = Channel.CreateUnbounded<OutputEvent>()
     let mutable eventStreamingStarted = false
+    let mutable exitStarted = false
+    let mutable exitTaskValue = Unchecked.defaultof<Task<Outcome>>
 
     let elapsed () =
         Stopwatch.GetElapsedTime host.StartedTimestamp
@@ -317,6 +321,120 @@ type RunningProcess internal (host: RunningHost) =
     member this.OutputEvents() : IAsyncEnumerable<OutputEvent> =
         this.StartEventStreaming()
         eventChannel.Reader.ReadAllAsync()
+
+    /// Wait until a stdout line satisfies `predicate`, or fail with `NotReady` after `timeout`.
+    /// Consumed lines are not re-delivered; a later `StdoutLines`/`Finish` sees the rest.
+    member this.WaitForLine(predicate: Func<string, bool>, timeout: TimeSpan) : Task<Result<string, ProcessError>> =
+        this.StartStdoutStreaming()
+
+        task {
+            use cts = new CancellationTokenSource(timeout)
+
+            try
+                let mutable found = None
+
+                while found.IsNone do
+                    let! line = stdoutChannel.Reader.ReadAsync cts.Token
+
+                    if predicate.Invoke line then
+                        found <- Some line
+
+                return Ok found.Value
+            with
+            | :? OperationCanceledException -> return Error(ProcessError.NotReady(config.Program, timeout))
+            | :? ChannelClosedException -> return Error(ProcessError.NotReady(config.Program, timeout))
+        }
+
+    /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`.
+    member _.WaitForPort(endpoint: IPEndPoint, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
+        task {
+            let deadline = Stopwatch.StartNew()
+            let mutable connected = false
+
+            while not connected && deadline.Elapsed < timeout do
+                use attempt = new CancellationTokenSource(TimeSpan.FromSeconds 1.0)
+
+                try
+                    use client = new TcpClient()
+                    do! client.ConnectAsync(endpoint.Address, endpoint.Port, attempt.Token)
+                    connected <- true
+                with _ ->
+                    // Any connection failure (refused / timed out / unreachable) just means the
+                    // server is not up yet — back off and retry until the overall deadline.
+                    try
+                        do! Task.Delay(50, attempt.Token)
+                    with :? OperationCanceledException ->
+                        ()
+
+            if connected then
+                return Ok()
+            else
+                return Error(ProcessError.NotReady(config.Program, timeout))
+        }
+
+    /// Poll `probe` until it returns true, or fail with `NotReady` after `timeout`.
+    member _.WaitFor(probe: Func<Task<bool>>, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
+        task {
+            let deadline = Stopwatch.StartNew()
+            let mutable ready = false
+
+            while not ready && deadline.Elapsed < timeout do
+                let! result = probe.Invoke()
+
+                if result then ready <- true else do! Task.Delay 50
+
+            if ready then
+                return Ok()
+            else
+                return Error(ProcessError.NotReady(config.Program, timeout))
+        }
+
+    /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
+    /// the racing primitive behind `WaitAny`/`WaitAll`.
+    member internal _.ExitTask: Task<Outcome> =
+        if not exitStarted then
+            exitStarted <- true
+
+            exitTaskValue <-
+                if streamingStarted then
+                    streamOutcome
+                else
+                    task {
+                        let stdoutDrain =
+                            match host.Stdout with
+                            | Some s -> Pump.drainDiscard s CancellationToken.None
+                            | None -> Task.CompletedTask
+
+                        let stderrDrain =
+                            match host.Stderr with
+                            | Some s -> Pump.drainDiscard s CancellationToken.None
+                            | None -> Task.CompletedTask
+
+                        let! outcome = host.Wait()
+                        do! stdoutDrain
+                        do! stderrDrain
+                        return outcome
+                    }
+
+        exitTaskValue
+
+    /// Wait for the first of `processes` to exit; returns its index and outcome. Does not reap any
+    /// of them — dispose them yourself.
+    static member WaitAny(processes: RunningProcess[]) : Task<Result<int * Outcome, ProcessError>> =
+        task {
+            if processes.Length = 0 then
+                return Error(ProcessError.Unsupported "WaitAny requires at least one process")
+            else
+                let tasks = processes |> Array.map (fun p -> p.ExitTask)
+                let! completed = Task.WhenAny tasks
+                let index = tasks |> Array.findIndex (fun t -> obj.ReferenceEquals(t, completed))
+                let! outcome = completed
+                return Ok(index, outcome)
+        }
+
+    /// Wait for all of `processes` to exit; returns their outcomes in order. Does not reap them.
+    static member WaitAll(processes: RunningProcess[]) : Task<Outcome[]> =
+        processes |> Array.map (fun p -> p.ExitTask) |> Task.WhenAll
 
     interface IAsyncDisposable with
         member _.DisposeAsync() = host.Teardown()

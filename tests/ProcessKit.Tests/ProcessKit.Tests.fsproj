@@ -13,6 +13,7 @@
 		<Compile Include="JobRunnerTests.fs" />
 		<Compile Include="ShutdownTests.fs" />
 		<Compile Include="StreamingTests.fs" />
+		<Compile Include="ReadinessTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>
