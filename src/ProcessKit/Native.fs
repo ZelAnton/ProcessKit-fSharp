@@ -437,6 +437,71 @@ module internal Native =
     let resumeWindows (job: nativeint) =
         forEachMemberHandle job (fun handle -> NtResumeProcess handle |> ignore)
 
+    // Job-Object accounting for `stats`: cumulative CPU + active count (basic accounting) and peak
+    // committed memory (extended limit info).
+    [<Literal>]
+    let private JobObjectBasicAccountingInformation = 1
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
+        struct
+            val mutable TotalUserTime: int64
+            val mutable TotalKernelTime: int64
+            val mutable ThisPeriodTotalUserTime: int64
+            val mutable ThisPeriodTotalKernelTime: int64
+            val mutable TotalPageFaultCount: uint32
+            val mutable TotalProcesses: uint32
+            val mutable ActiveProcesses: uint32
+            val mutable TotalTerminatedProcesses: uint32
+        end
+
+    /// Snapshot a Job's accounting: `(activeProcesses, totalCpuTime, peakCommittedBytes)`. `None` if
+    /// either query fails (e.g. the job handle was closed). CPU is user + kernel (100ns units, the
+    /// same as a `TimeSpan` tick).
+    let jobStatsWindows (job: nativeint) : (int * TimeSpan * uint64) option =
+        let accSize = Marshal.SizeOf<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>()
+        let extSize = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()
+        let accBuffer = Marshal.AllocHGlobal accSize
+        let extBuffer = Marshal.AllocHGlobal extSize
+
+        try
+            let mutable returnLength = 0u
+
+            let okAcc =
+                QueryInformationJobObject(
+                    job,
+                    JobObjectBasicAccountingInformation,
+                    accBuffer,
+                    uint32 accSize,
+                    &returnLength
+                )
+
+            let okExt =
+                QueryInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    extBuffer,
+                    uint32 extSize,
+                    &returnLength
+                )
+
+            if okAcc && okExt then
+                let acc =
+                    Marshal.PtrToStructure(accBuffer, typeof<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>)
+                    :?> JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+
+                let ext =
+                    Marshal.PtrToStructure(extBuffer, typeof<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>)
+                    :?> JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+
+                let cpu = TimeSpan.FromTicks(acc.TotalUserTime + acc.TotalKernelTime)
+                Some(int acc.ActiveProcesses, cpu, uint64 ext.PeakJobMemoryUsed)
+            else
+                None
+        finally
+            Marshal.FreeHGlobal accBuffer
+            Marshal.FreeHGlobal extBuffer
+
     let private buildWindowsEnvironment (command: Command) : nativeint =
         if not command.Config.ClearEnv && List.isEmpty command.Config.EnvOverrides then
             IntPtr.Zero

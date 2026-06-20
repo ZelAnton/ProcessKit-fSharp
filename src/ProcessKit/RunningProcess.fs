@@ -53,6 +53,32 @@ type RunningProcess internal (host: RunningHost) =
     let elapsed () =
         Stopwatch.GetElapsedTime host.StartedTimestamp
 
+    // Per-process CPU / peak-memory via the BCL `Process` (reads /proc on Linux, the OS APIs
+    // elsewhere) — no metrics once the child has exited or where the platform does not report them.
+    let processMetrics (pid: int) : TimeSpan option * uint64 option =
+        try
+            use proc = Process.GetProcessById pid
+
+            let cpu =
+                try
+                    Some proc.TotalProcessorTime
+                with _ ->
+                    // Not reported on this platform (e.g. denied / unsupported); omit it.
+                    None
+
+            let memory =
+                try
+                    let peak = proc.PeakWorkingSet64
+                    if peak > 0L then Some(uint64 peak) else None
+                with _ ->
+                    // Peak working set unavailable (some platforms report 0 / throw); omit it.
+                    None
+
+            cpu, memory
+        with _ ->
+            // The process has already exited or is inaccessible — no metrics to read.
+            None, None
+
     let pumpToBuffer (stream: Stream) encoding tee (callback: Action<string> option) counter =
         task {
             let buffer = Pump.LineBuffer(config.OutputBuffer)
@@ -122,6 +148,20 @@ type RunningProcess internal (host: RunningHost) =
 
     /// Wall-clock time since the process started.
     member _.Elapsed = elapsed ()
+
+    /// Cumulative CPU time (user + kernel) of the child right now, if the platform reports it and
+    /// the process is still alive.
+    member _.CpuTime: TimeSpan option =
+        match host.Pid with
+        | Some pid -> fst (processMetrics pid)
+        | None -> None
+
+    /// Peak resident memory of the child in bytes, if reported (some platforms, e.g. macOS, may
+    /// not) and the process is still alive.
+    member _.PeakMemoryBytes: uint64 option =
+        match host.Pid with
+        | Some pid -> snd (processMetrics pid)
+        | None -> None
 
     /// Total stdout lines pumped so far (counts dropped lines too).
     member _.StdoutLineCount = stdoutLineCount
@@ -224,6 +264,71 @@ type RunningProcess internal (host: RunningHost) =
             do! host.Teardown()
             return outcome
         }
+
+    /// Run to completion while periodically sampling the child's CPU/memory every `interval`, and
+    /// return a `RunProfile`. Drains and discards output (like `Wait`) and reaps the tree.
+    member _.Profile(interval: TimeSpan) : Task<RunProfile> =
+        task {
+            let period =
+                if interval <= TimeSpan.Zero then
+                    TimeSpan.FromMilliseconds 1.0
+                else
+                    interval
+
+            let mutable samples = 0
+            let mutable lastCpu = None
+            let mutable peakMemory = None
+            use sampleCts = new CancellationTokenSource()
+
+            let sampler =
+                task {
+                    try
+                        while not sampleCts.IsCancellationRequested do
+                            match host.Pid with
+                            | Some pid ->
+                                let cpu, memory = processMetrics pid
+                                cpu |> Option.iter (fun c -> lastCpu <- Some c)
+
+                                match memory with
+                                | Some m ->
+                                    peakMemory <-
+                                        Some(
+                                            match peakMemory with
+                                            | Some existing -> max existing m
+                                            | None -> m
+                                        )
+                                | None -> ()
+                            | None -> ()
+
+                            samples <- samples + 1
+                            do! Task.Delay(period, sampleCts.Token)
+                    with :? OperationCanceledException ->
+                        // The run finished and we cancelled sampling; stop quietly.
+                        ()
+                }
+
+            let stdoutTask =
+                match host.Stdout with
+                | Some s -> Pump.drainDiscard s CancellationToken.None
+                | None -> Task.CompletedTask
+
+            let stderrTask =
+                match host.Stderr with
+                | Some s -> Pump.drainDiscard s CancellationToken.None
+                | None -> Task.CompletedTask
+
+            let! outcome = waitWithTimeout ()
+            do! stdoutTask
+            do! stderrTask
+            sampleCts.Cancel()
+            do! sampler
+            do! host.Teardown()
+            return RunProfile(outcome.Code, elapsed (), lastCpu, peakMemory, samples)
+        }
+
+    /// `Profile` sampling every 100 ms.
+    member this.Profile() =
+        this.Profile(TimeSpan.FromMilliseconds 100.0)
 
     member private _.StartStdoutStreaming() =
         if not streamingStarted then

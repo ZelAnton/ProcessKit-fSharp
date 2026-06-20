@@ -20,6 +20,7 @@
 		<Compile Include="SupervisorTests.fs" />
 		<Compile Include="ProcessControlTests.fs" />
 		<Compile Include="ErgonomicsTests.fs" />
+		<Compile Include="StatsTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>

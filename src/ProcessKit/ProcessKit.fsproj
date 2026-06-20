@@ -40,6 +40,7 @@
 		<Compile Include="OutputPolicy.fs" />
 		<Compile Include="OutputEvent.fs" />
 		<Compile Include="Finished.fs" />
+		<Compile Include="Stats.fs" />
 		<Compile Include="Stdin.fs" />
 		<Compile Include="Command.fs" />
 		<Compile Include="Native.fs" />

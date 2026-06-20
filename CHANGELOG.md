@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Command.OkCodes(codes)` — treat the given exit codes (in addition to `0`) as success, widening `ProcessResult.IsSuccess` (also exposed as `AcceptedCodes`), `ensureSuccess`, the `Run` verbs, and `Supervisor` crash classification. `Command.CreateNoWindow()` (Windows `CREATE_NO_WINDOW`) and `Command.InheritEnv(bool)`.
 - `CliClient` — a reusable handle to one program with shared defaults (timeout, environment, working directory, cancellation): build configured `Command`s for argument lists, or run them through the client's runner.
 - Top-level `Exec` conveniences: `Exec.run` / `Exec.outputString` (run a program by name), and `Exec.outputAll` / `Exec.outputAllBytes` (run a batch of commands with bounded concurrency, collecting every result in input order).
+- Resource stats: `ProcessGroup.Stats` (a `ProcessGroupStats` snapshot — active process count, plus total CPU time and peak memory on Windows; CPU/memory are `None` on the POSIX fallback) and `ProcessGroup.SampleStats(interval)` (a periodic `IAsyncEnumerable` series). Per-process `RunningProcess.CpuTime` / `PeakMemoryBytes`, and `RunningProcess.Profile` returning a `RunProfile` (exit code, duration, CPU, peak memory, sample count, and `AvgCpu`).
 
 ### Changed
 -

@@ -1,11 +1,13 @@
 namespace ProcessKit
 
 open System
+open System.Collections.Generic
 open System.Diagnostics
 open System.IO
 open System.Runtime.InteropServices
 open System.Text
 open System.Threading
+open System.Threading.Channels
 open System.Threading.Tasks
 
 /// A captured run before it is shaped into a `ProcessResult` (stdout kept as raw bytes so the
@@ -316,6 +318,53 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                 Native.resumeProcessGroup pgid
 
             Ok()
+
+    /// A snapshot of the group's resource usage. On Windows this reads the Job Object's accounting
+    /// (CPU + peak committed memory + active count); on the POSIX fallback only the live group count
+    /// is available (CPU/memory are `None` until the cgroup v2 backend). Errors once the group is
+    /// released.
+    member _.Stats() : Result<ProcessGroupStats, ProcessError> =
+        if releasedFlag <> 0 then
+            Error(ProcessError.Io "the process group has been released")
+        else
+            match mechanism with
+            | Mechanism.JobObject ->
+                match Native.jobStatsWindows jobHandle with
+                | Some(active, cpu, peak) -> Ok(ProcessGroupStats(active, Some cpu, Some peak))
+                | None -> Error(ProcessError.Io "failed to query Job Object accounting")
+            | _ ->
+                let active = pgidSnapshot () |> List.filter Native.processGroupAlive |> List.length
+                Ok(ProcessGroupStats(active, None, None))
+
+    /// A periodic `ProcessGroupStats` series: the first sample immediately, then one per `interval`.
+    /// The series ends (the enumeration completes) on the first snapshot the group fails to report
+    /// — notably after it is torn down. The sampler does not keep the group alive; consume it
+    /// promptly (or dispose the group) so its background sampling stops.
+    member this.SampleStats(interval: TimeSpan) : IAsyncEnumerable<ProcessGroupStats> =
+        let period =
+            if interval <= TimeSpan.Zero then
+                TimeSpan.FromMilliseconds 1.0
+            else
+                interval
+
+        let channel = Channel.CreateUnbounded<ProcessGroupStats>()
+
+        let pump =
+            task {
+                let mutable go = true
+
+                while go do
+                    match this.Stats() with
+                    | Ok snapshot ->
+                        channel.Writer.TryWrite snapshot |> ignore
+                        do! Task.Delay period
+                    | Error _ -> go <- false
+
+                channel.Writer.Complete()
+            }
+
+        pump |> ignore
+        channel.Reader.ReadAllAsync()
 
     /// Spawn `command` into the group, capture stdout/stderr to completion, and reap it. Does
     /// **not** release the group (the caller keeps it for `Shutdown`/`Dispose`). A cancelled token
