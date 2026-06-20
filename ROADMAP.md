@@ -175,7 +175,18 @@ a module. One stage, one confirmation gate.
   `cgroup.kill` teardown, `Mechanism.CgroupV2`, with the POSIX-pgroup fallback when
   cgroup delegation is unavailable. Validated via a `--privileged` container — cgroup v2
   is delegation-gated, so the unprivileged CI legs exercise the pgroup fallback. Job
-  Object limits on Windows.
+  Object limits on Windows. *(Done — `ProcessGroup.Create(options)` with
+  `ResourceLimits` (`MemoryMax`/`MaxProcesses`/`CpuQuota`); `ProcessError.ResourceLimit`.
+  Linux cgroup v2 (`Mechanism.CgroupV2`) is the limits backend — **used when limits are
+  requested**; without limits Linux stays on the pgroup mechanism, so nothing regresses.
+  Placement is **`cgroup.procs` migration** after `posix_spawn` (the same mechanic the
+  Rust crate uses — `clone3(CLONE_INTO_CGROUP)` was the plan note, not what upstream does),
+  with `cgroup.kill` teardown, `cgroup.freeze` suspend/resume, and `cpu.stat`/`memory.peak`
+  feeding `Stats`. Windows Job-Object limits (`JobMemoryLimit` / `ActiveProcessLimit` /
+  CPU hard cap). Fail-fast `ResourceLimit` on macOS and where the cgroup is not the real
+  root. A **privileged CI leg** (`--privileged --cgroupns=host`, process moved to the real
+  cgroup root) exercises real cgroup enforcement; the unprivileged matrix legs exercise the
+  fail-fast path.)*
 - **S4 — `record`.** Record/replay cassettes over `IProcessRunner`
   (`RecordReplayRunner`) using `System.Text.Json` (built-in); `Invocation` capture,
   hermetic replay, `CassetteMiss`.

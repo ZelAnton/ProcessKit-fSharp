@@ -30,11 +30,20 @@
 .PARAMETER Rebuild
     Run `dotnet clean` before the tests.
 
+.PARAMETER Privileged
+    Run the container with `--privileged --cgroupns=host` so the Linux cgroup v2
+    `limits` backend can engage (it needs write access to the real cgroup
+    hierarchy). Without this, the unprivileged container exercises the
+    fail-fast / process-group fallback path only.
+
 .EXAMPLE
     pwsh ./scripts/test-linux.ps1
 
 .EXAMPLE
     pwsh ./scripts/test-linux.ps1 -Filter "FullyQualifiedName~greet"
+
+.EXAMPLE
+    pwsh ./scripts/test-linux.ps1 -Privileged -Filter "FullyQualifiedName~LimitsTests"
 #>
 [CmdletBinding()]
 param(
@@ -42,7 +51,8 @@ param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
     [string]$Filter,
-    [switch]$Rebuild
+    [switch]$Rebuild,
+    [switch]$Privileged
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,6 +76,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $bashLines = @('set -e')
+if ($Privileged) {
+    # cgroup v2's "no internal processes" rule lets controllers be enabled (in subtree_control)
+    # only for the real hierarchy root. Move this shell — and the dotnet processes it spawns — to
+    # the real root so the `limits` cgroup backend can engage, then tell the tests to *require* the
+    # cgroup path (not silently accept the fail-fast fallback).
+    $bashLines += 'if echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null; then export PROCESSKIT_EXPECT_CGROUP=1; fi'
+}
 if ($Rebuild) {
     $bashLines += "dotnet clean -c $Configuration"
 }
@@ -94,6 +111,11 @@ $dockerArgs = @(
     '-v', "${RepoRoot}:/src",
     '-v', "${NugetVolume}:/root/.nuget/packages"
 )
+if ($Privileged) {
+    # cgroup v2 limits need write access to the real cgroup hierarchy: --cgroupns=host
+    # exposes it (a private cgroup namespace EBUSYs the subtree_control enable).
+    $dockerArgs += @('--privileged', '--cgroupns=host')
+}
 foreach ($p in $shadowedPaths) {
     $dockerArgs += @('-v', $p)
 }

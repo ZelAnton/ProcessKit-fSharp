@@ -502,6 +502,86 @@ module internal Native =
             Marshal.FreeHGlobal accBuffer
             Marshal.FreeHGlobal extBuffer
 
+    // Job-Object resource limits (the `limits` backend on Windows).
+    [<Literal>]
+    let private JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008u
+
+    [<Literal>]
+    let private JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200u
+
+    [<Literal>]
+    let private JobObjectCpuRateControlInformation = 15
+
+    [<Literal>]
+    let private JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1u
+
+    [<Literal>]
+    let private JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4u
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private JOBOBJECT_CPU_RATE_CONTROL_INFORMATION =
+        struct
+            val mutable ControlFlags: uint32
+            // Union member: the hard-cap rate as 1/100ths of a percent of total system CPU (1..10000).
+            val mutable CpuRate: uint32
+        end
+
+    /// Apply resource limits to a Job: a memory cap (`JobMemoryLimit`), an active-process cap, and a
+    /// CPU hard cap (a fraction of *total* system CPU, so per-core quota is approximate). Preserves
+    /// `KILL_ON_JOB_CLOSE`. Returns an error message on failure.
+    let applyWindowsJobLimits (job: nativeint) (limits: ResourceLimits) : Result<unit, string> =
+        let mutable info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        let mutable flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+        match limits.MaxProcesses with
+        | Some n ->
+            flags <- flags ||| JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            info.BasicLimitInformation.ActiveProcessLimit <- uint32 (max 0 n)
+        | None -> ()
+
+        match limits.MemoryMax with
+        | Some bytes ->
+            flags <- flags ||| JOB_OBJECT_LIMIT_JOB_MEMORY
+            info.JobMemoryLimit <- unativeint (uint64 bytes)
+        | None -> ()
+
+        info.BasicLimitInformation.LimitFlags <- flags
+        let size = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()
+        let buffer = Marshal.AllocHGlobal size
+
+        try
+            Marshal.StructureToPtr(info, buffer, false)
+
+            if not (SetInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, uint32 size)) then
+                Error(Win32Exception(Marshal.GetLastWin32Error()).Message)
+            else
+                match limits.CpuQuota with
+                | None -> Ok()
+                | Some cores ->
+                    let fraction = min 1.0 (cores / float Environment.ProcessorCount)
+                    let rate = uint32 (max 1.0 (Math.Round(fraction * 10000.0)))
+                    let mutable cpuInfo = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
+
+                    cpuInfo.ControlFlags <- JOB_OBJECT_CPU_RATE_CONTROL_ENABLE ||| JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP
+
+                    cpuInfo.CpuRate <- rate
+                    let cpuSize = Marshal.SizeOf<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>()
+                    let cpuBuffer = Marshal.AllocHGlobal cpuSize
+
+                    try
+                        Marshal.StructureToPtr(cpuInfo, cpuBuffer, false)
+
+                        if
+                            SetInformationJobObject(job, JobObjectCpuRateControlInformation, cpuBuffer, uint32 cpuSize)
+                        then
+                            Ok()
+                        else
+                            Error(Win32Exception(Marshal.GetLastWin32Error()).Message)
+                    finally
+                        Marshal.FreeHGlobal cpuBuffer
+        finally
+            Marshal.FreeHGlobal buffer
+
     let private buildWindowsEnvironment (command: Command) : nativeint =
         if not command.Config.ClearEnv && List.isEmpty command.Config.EnvOverrides then
             IntPtr.Zero
@@ -803,6 +883,216 @@ module internal Native =
 
     /// Thaw a POSIX process group (SIGCONT).
     let resumeProcessGroup (pgid: int) = killpg (pgid, sigCont) |> ignore
+
+    // ----------------------------------------------------------------------------------
+    // Linux cgroup v2 (the `limits` backend) — all plain file I/O over /sys/fs/cgroup
+    // ----------------------------------------------------------------------------------
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private kill(int pid, int signalNumber)
+
+    let private cgroupRoot = "/sys/fs/cgroup"
+
+    /// True when cgroup v2's unified hierarchy is mounted (its root exposes `cgroup.controllers`).
+    let cgroupV2Available () =
+        try
+            File.Exists(Path.Combine(cgroupRoot, "cgroup.controllers"))
+        with _ ->
+            false
+
+    // This process's own cgroup path (the `0::<path>` line of /proc/self/cgroup), defaulting to "/".
+    let private selfCgroupRelative () =
+        try
+            File.ReadAllLines "/proc/self/cgroup"
+            |> Array.tryPick (fun line ->
+                if line.StartsWith "0::" then
+                    Some(line.Substring(3).Trim())
+                else
+                    None)
+            |> Option.defaultValue "/"
+        with _ ->
+            "/"
+
+    // Format a per-core CPU fraction as a cgroup v2 `cpu.max` value ("quota period", microseconds).
+    let private cpuMaxValue (cores: float) =
+        let period = 100000.0
+        let quota = max 1.0 (Math.Round(cores * period))
+        $"{int64 quota} {int64 period}"
+
+    // Enable the controllers the requested limits need (only the missing ones) in the parent's
+    // `cgroup.subtree_control`, then write the caps into the child cgroup. Raises on failure (notably
+    // EBUSY writing subtree_control when this process is not at the real cgroup root).
+    let private applyCgroupLimits (parent: string) (cgroupPath: string) (limits: ResourceLimits) =
+        let needed =
+            [ if limits.MemoryMax.IsSome then
+                  "memory"
+              if limits.MaxProcesses.IsSome then
+                  "pids"
+              if limits.CpuQuota.IsSome then
+                  "cpu" ]
+
+        let subtreeFile = Path.Combine(parent, "cgroup.subtree_control")
+
+        let alreadyEnabled =
+            try
+                (File.ReadAllText subtreeFile).Split([| ' '; '\n'; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Set.ofArray
+            with _ ->
+                Set.empty
+
+        let toEnable = needed |> List.filter (fun c -> not (alreadyEnabled.Contains c))
+
+        if not (List.isEmpty toEnable) then
+            let spec = toEnable |> List.map (fun c -> "+" + c) |> String.concat " "
+            File.WriteAllText(subtreeFile, spec)
+
+        match limits.MemoryMax with
+        | Some bytes -> File.WriteAllText(Path.Combine(cgroupPath, "memory.max"), string bytes)
+        | None -> ()
+
+        match limits.MaxProcesses with
+        | Some n -> File.WriteAllText(Path.Combine(cgroupPath, "pids.max"), string n)
+        | None -> ()
+
+        match limits.CpuQuota with
+        | Some cores -> File.WriteAllText(Path.Combine(cgroupPath, "cpu.max"), cpuMaxValue cores)
+        | None -> ()
+
+    // A process-wide counter making each cgroup name unique without relying on `CreateDirectory`
+    // failing on an existing path (it is idempotent, so a TOCTOU "exists?" check could collide).
+    let mutable private nextCgroupId = 0
+
+    /// Create a fresh limit cgroup under this process's own cgroup and apply `limits`. Returns the
+    /// new cgroup's absolute path, or an error message (the dir is removed on a limit failure).
+    let createCgroup (limits: ResourceLimits) : Result<string, string> =
+        try
+            let rel = (selfCgroupRelative ()).TrimStart('/')
+            let parent = Path.Combine(cgroupRoot, rel)
+            let id = System.Threading.Interlocked.Increment(&nextCgroupId)
+            let path = Path.Combine(parent, $"processkit-{Environment.ProcessId}-{id}")
+            Directory.CreateDirectory path |> ignore
+
+            if limits.Any then
+                try
+                    applyCgroupLimits parent path limits
+                    Ok path
+                with ex ->
+                    (try
+                        Directory.Delete path
+                     with _ ->
+                         ())
+
+                    Error ex.Message
+            else
+                Ok path
+        with ex ->
+            Error ex.Message
+
+    /// Migrate a process into the cgroup (a single write to `cgroup.procs`). Best-effort: a failure
+    /// leaves the child in the parent cgroup (unbounded), which the run's outcome reflects.
+    let migrateToCgroup (cgroupPath: string) (pid: int) =
+        try
+            File.WriteAllText(Path.Combine(cgroupPath, "cgroup.procs"), string pid)
+        with _ ->
+            ()
+
+    /// The live member pids of a cgroup (`cgroup.procs`).
+    let cgroupMembers (cgroupPath: string) : int list =
+        try
+            File.ReadAllLines(Path.Combine(cgroupPath, "cgroup.procs"))
+            |> Array.choose (fun line ->
+                match Int32.TryParse(line.Trim()) with
+                | true, pid -> Some pid
+                | _ -> None)
+            |> List.ofArray
+        with _ ->
+            []
+
+    let cgroupAlive (cgroupPath: string) =
+        not (List.isEmpty (cgroupMembers cgroupPath))
+
+    /// Hard-kill the whole subtree via `cgroup.kill` (kernel >= 5.14); on older kernels, freeze then
+    /// run a bounded per-pid SIGKILL sweep.
+    let killCgroup (cgroupPath: string) =
+        let viaKillFile =
+            try
+                File.WriteAllText(Path.Combine(cgroupPath, "cgroup.kill"), "1")
+                true
+            with _ ->
+                false
+
+        if not viaKillFile then
+            (try
+                File.WriteAllText(Path.Combine(cgroupPath, "cgroup.freeze"), "1")
+             with _ ->
+                 ())
+
+            let mutable sweep = 0
+
+            while cgroupAlive cgroupPath && sweep < 50 do
+                for pid in cgroupMembers cgroupPath do
+                    kill (pid, SIGKILL) |> ignore
+
+                System.Threading.Thread.Sleep 2
+                sweep <- sweep + 1
+
+            (try
+                File.WriteAllText(Path.Combine(cgroupPath, "cgroup.freeze"), "0")
+             with _ ->
+                 ())
+
+    /// SIGTERM every member (graceful); the caller polls then escalates with `killCgroup`.
+    let terminateCgroup (cgroupPath: string) =
+        for pid in cgroupMembers cgroupPath do
+            kill (pid, SIGTERM) |> ignore
+
+    /// Broadcast a raw signal to every member of a cgroup.
+    let signalCgroup (cgroupPath: string) (signalNum: int) =
+        for pid in cgroupMembers cgroupPath do
+            kill (pid, signalNum) |> ignore
+
+    /// Freeze (`true`) or thaw (`false`) a cgroup (`cgroup.freeze`).
+    let freezeCgroup (cgroupPath: string) (frozen: bool) =
+        try
+            File.WriteAllText(Path.Combine(cgroupPath, "cgroup.freeze"), (if frozen then "1" else "0"))
+        with _ ->
+            ()
+
+    /// cgroup accounting for `stats`: cumulative CPU (cpu.stat `usage_usec`) and peak memory
+    /// (`memory.peak`), each `None` when the file is absent.
+    let cgroupStats (cgroupPath: string) : TimeSpan option * uint64 option =
+        let cpu =
+            try
+                File.ReadAllLines(Path.Combine(cgroupPath, "cpu.stat"))
+                |> Array.tryPick (fun line ->
+                    if line.StartsWith "usage_usec" then
+                        match Int64.TryParse(line.Substring("usage_usec".Length).Trim()) with
+                        | true, usec -> Some(TimeSpan.FromTicks(usec * 10L)) // 1 microsecond = 10 ticks
+                        | _ -> None
+                    else
+                        None)
+            with _ ->
+                None
+
+        let memory =
+            try
+                match Int64.TryParse((File.ReadAllText(Path.Combine(cgroupPath, "memory.peak"))).Trim()) with
+                | true, peak -> Some(uint64 peak)
+                | _ -> None
+            with _ ->
+                None
+
+        cpu, memory
+
+    /// Remove a (drained) cgroup directory. Best-effort cleanup.
+    let removeCgroup (cgroupPath: string) =
+        try
+            Directory.Delete cgroupPath
+        with _ ->
+            ()
+
+    /// Hard-kill a single POSIX process by pid (SIGKILL).
+    let killProcess (pid: int) = kill (pid, SIGKILL) |> ignore
 
     // Create a pipe whose ends are close-on-exec so a *different* concurrent spawn does not
     // inherit this run's pipe ends (which outlive the spawn). Linux sets it atomically with

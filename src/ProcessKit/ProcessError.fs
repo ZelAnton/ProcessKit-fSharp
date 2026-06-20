@@ -47,6 +47,11 @@ type ProcessError =
     /// Writing to the child's standard input failed.
     | Stdin of program: string * message: string
 
+    /// A `ResourceLimits` cap was requested but could not be enforced — the platform has no
+    /// whole-tree limit primitive (macOS / the Linux process-group fallback), or the Linux cgroup v2
+    /// controllers could not be enabled (this process is not at the real cgroup root).
+    | ResourceLimit of message: string
+
     /// An underlying I/O failure not attributable to a specific exit.
     | Io of message: string
 
@@ -77,6 +82,7 @@ type ProcessError =
         | ProcessError.OutputTooLarge(program, _, _, totalLines, totalBytes) ->
             $"'{program}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
         | ProcessError.Stdin(program, message) -> $"failed writing stdin to '{program}': {message}"
+        | ProcessError.ResourceLimit message -> $"resource limit could not be enforced: {message}"
         | ProcessError.Io message -> $"I/O error: {message}"
         | ProcessError.Unsupported operation -> $"unsupported: {operation}"
 

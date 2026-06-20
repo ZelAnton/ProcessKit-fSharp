@@ -21,6 +21,7 @@
 		<Compile Include="ProcessControlTests.fs" />
 		<Compile Include="ErgonomicsTests.fs" />
 		<Compile Include="StatsTests.fs" />
+		<Compile Include="LimitsTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>
