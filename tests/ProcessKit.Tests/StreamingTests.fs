@@ -274,19 +274,12 @@ type StreamingTests() =
     [<Test>]
     member _.``a faulted terminal verb still reaps the tree``() : Task =
         task {
-            // An instrumented host whose stdout yields one line (firing a handler that throws) and
-            // whose Teardown records that it ran. A verb that faults mid-flight must still reap.
             let mutable teardowns = 0
 
-            let makeHost () : RunningHost =
-                let config =
-                    (Command.create "test"
-                     |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom")))
-                        .Config
-
-                { Config = config
+            let baseHost () : RunningHost =
+                { Config = (Command.create "test").Config
                   Pid = None
-                  Stdout = Some(new MemoryStream(Encoding.UTF8.GetBytes "line1\n") :> Stream)
+                  Stdout = None
                   Stderr = None
                   Stdin = None
                   StartTime = DateTime.UtcNow
@@ -299,7 +292,15 @@ type StreamingTests() =
                         teardowns <- teardowns + 1
                         ValueTask() }
 
-            let faultsAndReaps (verb: RunningProcess -> Task) =
+            let oneLine (text: string) =
+                Some(new MemoryStream(Encoding.UTF8.GetBytes text) :> Stream)
+
+            let configThatThrows (onLine: (string -> unit) -> Command -> Command) =
+                (Command.create "test"
+                 |> onLine (fun _ -> raise (InvalidOperationException "boom")))
+                    .Config
+
+            let faultsAndReaps (makeHost: unit -> RunningHost) (verb: RunningProcess -> Task) =
                 task {
                     teardowns <- 0
                     let running = new RunningProcess(makeHost ())
@@ -310,14 +311,44 @@ type StreamingTests() =
                     with :? InvalidOperationException ->
                         faulted <- true
 
-                    Assert.That(faulted, Is.True, "the verb should fault on a throwing handler")
+                    Assert.That(faulted, Is.True, "the verb should fault")
                     Assert.That(teardowns, Is.GreaterThanOrEqualTo 1, "the faulted verb must still reap the tree")
                 }
 
-            // The capture verbs (OnStdoutLine fires through the buffer pump) and Finish (through the
-            // stream-channel pump) all fault on the throwing handler — each must still tear down.
-            do! faultsAndReaps (fun p -> p.OutputString() :> Task)
-            do! faultsAndReaps (fun p -> p.Finish() :> Task)
+            // (1) A faulting wait is hit by every terminal verb's `waitWithTimeout()` — all five reap.
+            let faultingWait () =
+                { baseHost () with
+                    Wait = fun () -> Task.FromException<Outcome>(InvalidOperationException "boom") }
+
+            do! faultsAndReaps faultingWait (fun p -> p.OutputString() :> Task)
+            do! faultsAndReaps faultingWait (fun p -> p.OutputBytes() :> Task)
+            do! faultsAndReaps faultingWait (fun p -> p.Wait() :> Task)
+            do! faultsAndReaps faultingWait (fun p -> p.Profile(TimeSpan.FromMilliseconds 5.0) :> Task)
+            do! faultsAndReaps faultingWait (fun p -> p.Finish() :> Task)
+
+            // (2) A throwing OnStdoutLine with a LIVE stderr pump drives the capture path's two-pump
+            //     WhenAll: the verb must fault and still reap. (Like the Profile sampler, the
+            //     no-orphaned-sibling guarantee is exercised here but not directly asserted — only
+            //     fault + reap is observable from outside.)
+            let throwingStdout () =
+                { baseHost () with
+                    Config = configThatThrows Command.onStdoutLine
+                    Stdout = oneLine "line1\n"
+                    Stderr = oneLine "err1\n" }
+
+            do! faultsAndReaps throwingStdout (fun p -> p.OutputString() :> Task)
+
+            // (3) A throwing OnStderrLine faults both capture verbs (stderr is buffered in each), again
+            //     with a live stdout pump. For OutputBytes the fault must come through the stderr
+            //     buffer pump, since its stdout is a handler-free raw drain.
+            let throwingStderr () =
+                { baseHost () with
+                    Config = configThatThrows Command.onStderrLine
+                    Stdout = oneLine "out1\n"
+                    Stderr = oneLine "err1\n" }
+
+            do! faultsAndReaps throwingStderr (fun p -> p.OutputString() :> Task)
+            do! faultsAndReaps throwingStderr (fun p -> p.OutputBytes() :> Task)
         }
         :> Task
 

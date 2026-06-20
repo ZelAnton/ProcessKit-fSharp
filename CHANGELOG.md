@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - POSIX containment now reaps **every** child of a multi-child group (e.g. a pipeline), not just the last. Each `posix_spawn` forms its own process group, so the group tracks all of them; previously only the most-recent pgid was killed, letting an earlier long-running stage linger until its natural exit.
-- A throwing `OnStdoutLine`/`OnStderrLine` handler now surfaces the error on `StdoutLines()` / `OutputEvents()` (and `Finish()`) instead of hanging the stream reader: the output channel is always completed — carrying the fault — even when a line pump throws, and the two pumps are awaited together so a fault in one no longer leaves the other unobserved.
+- A throwing `OnStdoutLine`/`OnStderrLine` handler now surfaces the error on `StdoutLines()` / `OutputEvents()` (and `Finish()`) instead of hanging the stream reader: the output channel is always completed — carrying the fault — even when a line pump throws. Across both the streaming verbs and the capture verbs (`OutputString`/`OutputBytes`) the two output pumps are now awaited together, so a fault in one never leaves the other running as an unobserved task.
 - Every terminal `RunningProcess` verb (`OutputString`/`OutputBytes`/`Wait`/`Profile`/`Finish`) now reaps the process tree even when the run faults mid-flight (e.g. a throwing line handler), rather than deferring teardown to disposal/GC.
 - `RunningProcess.Profile` now cancels and awaits its background metric sampler on the fault path too — a fault mid-profile can no longer leave the sampler running against a soon-to-be-disposed token as an unobserved task.
 

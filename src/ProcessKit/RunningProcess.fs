@@ -157,6 +157,11 @@ type RunningProcess internal (host: RunningHost) =
     // a throwing line handler) before the verb would otherwise reach its teardown. `Teardown` is
     // idempotent (the group's release runs once), so the redundant call on `RunningProcess` disposal
     // is harmless.
+    //
+    // Load-bearing invariant: a verb must await ALL of its pumps before this guard's scope exits,
+    // because `Teardown` disposes the pipe streams the pumps read — a pump still in-flight at teardown
+    // would race a stream `Dispose`. Every verb satisfies this (it awaits the pumps / `streamOutcome`
+    // before returning); keep it that way when editing.
     let reapGuard () =
         { new IAsyncDisposable with
             member _.DisposeAsync() = host.Teardown() }
@@ -216,6 +221,9 @@ type RunningProcess internal (host: RunningHost) =
             let stdoutTask = pumpStdoutBuffer ()
             let stderrTask = pumpStderrBuffer ()
             let! outcome = waitWithTimeout ()
+            // Observe BOTH buffer pumps before reading either, so a throwing line handler in one
+            // never orphans the other as an unobserved task (mirrors the streaming path's WhenAll).
+            do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
             let! outBuf = stdoutTask
             let! errBuf = stderrTask
             Log.exit config.Logger config.Program outcome (elapsed ())
@@ -250,6 +258,9 @@ type RunningProcess internal (host: RunningHost) =
 
             let stderrTask = pumpStderrBuffer ()
             let! outcome = waitWithTimeout ()
+            // Observe both pumps before reading either, so a throwing stderr handler (or a raw-drain
+            // I/O fault) can't orphan the other as an unobserved task.
+            do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
             let! stdoutBytes = stdoutTask
             let! errBuf = stderrTask
             Log.exit config.Logger config.Program outcome (elapsed ())
@@ -287,8 +298,8 @@ type RunningProcess internal (host: RunningHost) =
                 | None -> Task.CompletedTask
 
             let! outcome = waitWithTimeout ()
-            do! stdoutTask
-            do! stderrTask
+            // Observe both drains together so an I/O fault on one can't orphan the other.
+            do! Task.WhenAll([| stdoutTask; stderrTask |])
             Log.exit config.Logger config.Program outcome (elapsed ())
             return outcome
         }
@@ -357,8 +368,7 @@ type RunningProcess internal (host: RunningHost) =
 
             try
                 let! settled = waitWithTimeout ()
-                do! stdoutTask
-                do! stderrTask
+                do! Task.WhenAll([| stdoutTask; stderrTask |])
                 outcome <- settled
             with ex ->
                 error <- Some ex
@@ -559,8 +569,7 @@ type RunningProcess internal (host: RunningHost) =
                             | None -> Task.CompletedTask
 
                         let! outcome = waitWithTimeout ()
-                        do! stdoutDrain
-                        do! stderrDrain
+                        do! Task.WhenAll([| stdoutDrain; stderrDrain |])
                         return outcome
                     }
 
