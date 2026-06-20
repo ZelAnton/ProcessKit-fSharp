@@ -40,5 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - POSIX containment now reaps **every** child of a multi-child group (e.g. a pipeline), not just the last. Each `posix_spawn` forms its own process group, so the group tracks all of them; previously only the most-recent pgid was killed, letting an earlier long-running stage linger until its natural exit.
+- A throwing `OnStdoutLine`/`OnStderrLine` handler now surfaces the error on `StdoutLines()` / `OutputEvents()` (and `Finish()`) instead of hanging the stream reader: the output channel is always completed — carrying the fault — even when a line pump throws, and the two pumps are awaited together so a fault in one no longer leaves the other unobserved.
 
 [Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/commits/main

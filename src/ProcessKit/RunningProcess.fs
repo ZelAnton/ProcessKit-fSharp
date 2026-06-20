@@ -6,6 +6,7 @@ open System.Diagnostics
 open System.IO
 open System.Net
 open System.Net.Sockets
+open System.Runtime.ExceptionServices
 open System.Threading
 open System.Threading.Tasks
 open System.Threading.Channels
@@ -355,13 +356,22 @@ type RunningProcess internal (host: RunningHost) =
 
             let stdoutPump =
                 task {
-                    do!
-                        pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
-                            config.OnStdoutLine |> Option.iter (fun cb -> cb.Invoke line)
-                            stdoutLineCount <- stdoutLineCount + 1
-                            stdoutChannel.Writer.TryWrite line |> ignore)
+                    try
+                        do!
+                            pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
+                                config.OnStdoutLine |> Option.iter (fun cb -> cb.Invoke line)
+                                stdoutLineCount <- stdoutLineCount + 1
+                                stdoutChannel.Writer.TryWrite line |> ignore)
 
-                    stdoutChannel.Writer.Complete()
+                        stdoutChannel.Writer.Complete()
+                    with ex ->
+                        // A pump fault — most plausibly a throwing `OnStdoutLine` handler — must still
+                        // complete the channel, carrying the error, so a `StdoutLines` consumer observes
+                        // it instead of hanging on a reader that never ends. Re-raise (preserving the
+                        // original stack; `reraise` is unavailable inside a task CE) so `streamOutcome`
+                        // / `Finish` surface the same fault.
+                        stdoutChannel.Writer.Complete ex
+                        ExceptionDispatchInfo.Throw ex
                 }
 
             let stderrPump =
@@ -373,8 +383,8 @@ type RunningProcess internal (host: RunningHost) =
             streamOutcome <-
                 task {
                     let! outcome = waitWithTimeout ()
-                    do! stdoutPump
-                    do! stderrPump
+                    // Await both pumps together so neither task is left unobserved if the other faults.
+                    do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
                     return outcome
                 }
 
@@ -414,10 +424,17 @@ type RunningProcess internal (host: RunningHost) =
                     eventChannel.Writer.TryWrite(OutputEvent.Stderr(OutputLine line)) |> ignore)
 
             task {
-                let! _ = waitWithTimeout ()
-                do! stdoutPump
-                do! stderrPump
-                eventChannel.Writer.Complete()
+                try
+                    let! _ = waitWithTimeout ()
+                    // Await both pumps together so neither is left unobserved if the other faults.
+                    do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
+                    eventChannel.Writer.Complete()
+                with ex ->
+                    // This combined pump is fire-and-forget, so a fault (e.g. a throwing handler) must
+                    // complete the channel WITH the error: an `OutputEvents` consumer then observes it
+                    // instead of hanging, and the fault is consumed here rather than surfacing as an
+                    // unobserved task exception at finalization.
+                    eventChannel.Writer.Complete ex
             }
             |> ignore
 

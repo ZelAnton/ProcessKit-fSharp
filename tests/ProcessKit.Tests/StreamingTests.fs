@@ -1,5 +1,6 @@
 namespace ProcessKit.Tests
 
+open System
 open System.Collections.Generic
 open System.Runtime.InteropServices
 open System.Threading
@@ -38,6 +39,34 @@ type StreamingTests() =
 
             do! enumerator.DisposeAsync()
             return acc
+        }
+
+    // Race a stream drain against a deadline: a regression that strands the channel reader fails the
+    // test in `deadlineMs` instead of hanging the whole run. Returns the completed (here, faulted)
+    // drain task so the caller can inspect how it ended.
+    let drainWithDeadline (lines: IAsyncEnumerable<'T>) (deadlineMs: int) =
+        task {
+            let drain = collect lines :> Task
+            let! winner = Task.WhenAny(drain, Task.Delay deadlineMs)
+
+            Assert.That(
+                obj.ReferenceEquals(winner, drain),
+                Is.True,
+                "the stream hung instead of surfacing the handler fault"
+            )
+
+            return drain
+        }
+
+    // Await a drain known to have faulted, returning the surfaced message (the task CE rethrows the
+    // original exception, unwrapped from the AggregateException).
+    let faultMessage (drain: Task) =
+        task {
+            try
+                do! drain
+                return None
+            with :? InvalidOperationException as ex ->
+                return Some ex.Message
         }
 
     [<Test>]
@@ -175,6 +204,67 @@ type StreamingTests() =
             | Ok running ->
                 let! _ = running.OutputString()
                 Assert.That(captured, Does.Contain "line1")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing OnStdoutLine handler surfaces on StdoutLines instead of hanging``() : Task =
+        task {
+            let command =
+                threeLines
+                |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom"))
+
+            match! runner.Start(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                let! drain = drainWithDeadline (running.StdoutLines()) 10000
+                let! message = faultMessage drain
+                Assert.That(message, Is.EqualTo(Some "boom"), "expected the throwing handler to surface")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing OnStdoutLine handler surfaces on OutputEvents instead of hanging``() : Task =
+        task {
+            let command =
+                threeLines
+                |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom"))
+
+            match! runner.Start(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                let! drain = drainWithDeadline (running.OutputEvents()) 10000
+                let! message = faultMessage drain
+                Assert.That(message, Is.EqualTo(Some "boom"), "expected the throwing handler to surface")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing OnStdoutLine handler surfaces on Finish``() : Task =
+        task {
+            let command =
+                threeLines
+                |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom"))
+
+            match! runner.Start(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                // Finish awaits streamOutcome, which the stdout pump faults via the re-raise — so the
+                // error must propagate here (not be swallowed into an Ok result).
+                let finish = running.Finish() :> Task
+                let! winner = Task.WhenAny(finish, Task.Delay 10000)
+
+                Assert.That(
+                    obj.ReferenceEquals(winner, finish),
+                    Is.True,
+                    "Finish hung instead of surfacing the handler fault"
+                )
+
+                let! message = faultMessage finish
+                Assert.That(message, Is.EqualTo(Some "boom"), "expected Finish to surface the throwing handler")
         }
         :> Task
 
