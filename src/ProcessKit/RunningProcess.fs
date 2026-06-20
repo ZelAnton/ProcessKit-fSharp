@@ -347,12 +347,28 @@ type RunningProcess internal (host: RunningHost) =
                 | Some s -> Pump.drainDiscard s CancellationToken.None
                 | None -> Task.CompletedTask
 
-            let! outcome = waitWithTimeout ()
-            do! stdoutTask
-            do! stderrTask
+            // Capture a fault rather than letting it escape immediately, so the sampler is ALWAYS
+            // cancelled and awaited before its CTS is disposed at scope exit — never left running as
+            // an unobserved task. (A task CE cannot `do!` inside a `finally`, so this is the
+            // try/with-then-single-cleanup form of try/finally; the cleanup must also precede reading
+            // the sampler's metrics on the success path, which a `finally`/`use` could not guarantee.)
+            let mutable error: exn option = None
+            let mutable outcome = Unchecked.defaultof<Outcome>
+
+            try
+                let! settled = waitWithTimeout ()
+                do! stdoutTask
+                do! stderrTask
+                outcome <- settled
+            with ex ->
+                error <- Some ex
+
             sampleCts.Cancel()
             do! sampler
-            return RunProfile(outcome.Code, elapsed (), lastCpu, peakMemory, samples)
+
+            match error with
+            | Some ex -> return! Task.FromException<RunProfile> ex
+            | None -> return RunProfile(outcome.Code, elapsed (), lastCpu, peakMemory, samples)
         }
 
     /// `Profile` sampling every 100 ms.

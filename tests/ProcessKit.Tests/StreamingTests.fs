@@ -322,6 +322,40 @@ type StreamingTests() =
         :> Task
 
     [<Test>]
+    member _.``a faulted Profile surfaces the error without hanging``() : Task =
+        task {
+            // A host whose wait faults immediately. Profile must cancel and await its sampler in the
+            // cleanup (no hang, no swallowed error) and re-raise the original fault.
+            let host: RunningHost =
+                { Config = (Command.create "test").Config
+                  Pid = None
+                  Stdout = None
+                  Stderr = None
+                  Stdin = None
+                  StartTime = DateTime.UtcNow
+                  StartedTimestamp = Stopwatch.GetTimestamp()
+                  Wait = fun () -> Task.FromException<Outcome>(InvalidOperationException "boom")
+                  StartKill = ignore
+                  GracefulKill = fun _ -> Task.CompletedTask
+                  Teardown = fun () -> ValueTask() }
+
+            let profile =
+                (new RunningProcess(host)).Profile(TimeSpan.FromMilliseconds 5.0) :> Task
+
+            let! winner = Task.WhenAny(profile, Task.Delay 10000)
+
+            Assert.That(
+                obj.ReferenceEquals(winner, profile),
+                Is.True,
+                "Profile hung instead of surfacing the faulting wait"
+            )
+
+            let! message = faultMessage profile
+            Assert.That(message, Is.EqualTo(Some "boom"), "expected Profile to surface the faulting wait")
+        }
+        :> Task
+
+    [<Test>]
     member _.``StdioMode.Null discards stdout``() : Task =
         task {
             let command = threeLines |> Command.stdout StdioMode.Null
