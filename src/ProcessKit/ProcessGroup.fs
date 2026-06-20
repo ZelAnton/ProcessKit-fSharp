@@ -7,7 +7,6 @@ open System.IO
 open System.Runtime.InteropServices
 open System.Text
 open System.Threading
-open System.Threading.Channels
 open System.Threading.Tasks
 
 /// A captured run before it is shaped into a `ProcessResult` (stdout kept as raw bytes so the
@@ -32,6 +31,56 @@ type internal PipelineCapture =
       Stages: PipelineStage list
       Duration: TimeSpan
       TimedOut: bool }
+
+/// A **pull-based** periodic `ProcessGroupStats` series (the iterator behind `SampleStats`): the
+/// first sample lands on the first `MoveNextAsync`, then one per `period`. It samples only when
+/// pulled and runs no background task, so abandoning it does no work and — crucially — does not keep
+/// the group alive, preserving kill-on-drop. The series ends on the first failing snapshot (e.g.
+/// after the group is released) or when `cancellationToken` fires.
+type internal StatsSampler
+    (sample: unit -> Result<ProcessGroupStats, ProcessError>, period: TimeSpan, cancellationToken: CancellationToken) =
+
+    let mutable current = Unchecked.defaultof<ProcessGroupStats>
+    let mutable first = true
+    let mutable finished = false
+
+    interface IAsyncEnumerator<ProcessGroupStats> with
+        member _.Current = current
+
+        member _.MoveNextAsync() : ValueTask<bool> =
+            ValueTask<bool>(
+                task {
+                    if finished || cancellationToken.IsCancellationRequested then
+                        finished <- true
+                        return false
+                    else
+                        if first then
+                            first <- false
+                        else
+                            try
+                                do! Task.Delay(period, cancellationToken)
+                            with :? OperationCanceledException ->
+                                finished <- true
+
+                        if finished then
+                            return false
+                        else
+                            match sample () with
+                            | Ok snapshot ->
+                                current <- snapshot
+                                return true
+                            | Error _ ->
+                                finished <- true
+                                return false
+                }
+            )
+
+        member _.DisposeAsync() = ValueTask.CompletedTask
+
+type internal StatsSamplerSeq(sample: unit -> Result<ProcessGroupStats, ProcessError>, period: TimeSpan) =
+    interface IAsyncEnumerable<ProcessGroupStats> with
+        member _.GetAsyncEnumerator(cancellationToken) =
+            StatsSampler(sample, period, cancellationToken) :> IAsyncEnumerator<ProcessGroupStats>
 
 /// A kill-on-dispose container for a process *tree*.
 ///
@@ -337,9 +386,9 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                 Ok(ProcessGroupStats(active, None, None))
 
     /// A periodic `ProcessGroupStats` series: the first sample immediately, then one per `interval`.
-    /// The series ends (the enumeration completes) on the first snapshot the group fails to report
-    /// — notably after it is torn down. The sampler does not keep the group alive; consume it
-    /// promptly (or dispose the group) so its background sampling stops.
+    /// **Pull-based** — it samples only as the enumeration is pulled and runs no background task, so
+    /// it neither keeps the group alive nor leaks if abandoned. The series ends on the first snapshot
+    /// the group fails to report (notably after it is torn down) or when the enumerator's token fires.
     member this.SampleStats(interval: TimeSpan) : IAsyncEnumerable<ProcessGroupStats> =
         let period =
             if interval <= TimeSpan.Zero then
@@ -347,24 +396,7 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
             else
                 interval
 
-        let channel = Channel.CreateUnbounded<ProcessGroupStats>()
-
-        let pump =
-            task {
-                let mutable go = true
-
-                while go do
-                    match this.Stats() with
-                    | Ok snapshot ->
-                        channel.Writer.TryWrite snapshot |> ignore
-                        do! Task.Delay period
-                    | Error _ -> go <- false
-
-                channel.Writer.Complete()
-            }
-
-        pump |> ignore
-        channel.Reader.ReadAllAsync()
+        StatsSamplerSeq((fun () -> this.Stats()), period)
 
     /// Spawn `command` into the group, capture stdout/stderr to completion, and reap it. Does
     /// **not** release the group (the caller keeps it for `Shutdown`/`Dispose`). A cancelled token
