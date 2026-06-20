@@ -86,111 +86,26 @@ type internal StatsSamplerSeq(sample: unit -> Result<ProcessGroupStats, ProcessE
 ///
 /// Every process started into the group — and everything those processes spawn — is reaped when
 /// the group is disposed (deterministic under `use`) or, failing that, when the GC finalizes it.
-/// On Windows the container is a Job Object (`KILL_ON_JOB_CLOSE`); on Linux/macOS a POSIX process
-/// group (`killpg` teardown). The active mechanism is reported honestly by `Mechanism`.
+/// The OS primitive is chosen at creation and reported honestly by `Mechanism` — a Windows Job
+/// Object (`KILL_ON_JOB_CLOSE`), a Linux cgroup v2 (when resource limits are requested), or a POSIX
+/// process group (`killpg` teardown). All of that lives behind an `IContainmentBackend`; this type
+/// only orchestrates once-only teardown, the stdin/stream wiring, and the runner/disposable seams.
 [<Sealed>]
-type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPath: string, options: ProcessGroupOptions)
-    =
+type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOptions) =
 
-    // The contained children, tracked so the whole tree can be signalled / killed. Windows: each
-    // child's process handle (closed on reap or group teardown). POSIX process group: each child's
-    // pgid — every `posix_spawn` makes its *own* process group, so a multi-child group (e.g. a
-    // pipeline) holds several. Cgroup v2: membership lives in the cgroup itself (`cgroup.procs`), so
-    // neither list is used — `cgroupPath` is the container. Guarded by `childLock` because
-    // shared-group runs spawn and reap concurrently.
-    let childLock = obj ()
-    let processHandles = System.Collections.Generic.List<nativeint>()
-    let childPgids = System.Collections.Generic.List<int>()
     // 0 = live, 1 = released. Interlocked so Dispose/DisposeAsync/Shutdown/finalizer run the
-    // teardown exactly once.
+    // teardown exactly once. All containment behaviour lives in `backend`; this type only
+    // orchestrates the once-only teardown, the stdin/stream wiring, and the runner/disposable seams.
     let mutable releasedFlag = 0
 
-    let pgidSnapshot () =
-        lock childLock (fun () -> List.ofSeq childPgids)
-
-    let trackChild (spawned: Native.Spawned) =
-        match mechanism with
-        | Mechanism.JobObject -> lock childLock (fun () -> processHandles.Add spawned.Handle)
-        // Place the child in the cgroup; membership is tracked by the kernel, not a list.
-        | Mechanism.CgroupV2 -> Native.migrateToCgroup cgroupPath (int spawned.Handle)
-        | Mechanism.ProcessGroup -> lock childLock (fun () -> childPgids.Add(int spawned.Handle))
-
-    // Stop tracking a *reaped* child. Windows: close its process handle (removing it first so the
-    // group teardown will not double-close a possibly-reused handle value); the Job still contains
-    // the tree. POSIX process group: a pgid is a whole *group*, and the reaped leader may have left
-    // backgrounded members behind — only stop tracking once the group is actually empty, so
-    // Shutdown/Dispose can still reap lingering members. Cgroup: nothing to untrack (the kernel
-    // removes an exited process from `cgroup.procs`).
-    let releaseChild (spawned: Native.Spawned) =
-        match mechanism with
-        | Mechanism.JobObject ->
-            let wasTracked = lock childLock (fun () -> processHandles.Remove spawned.Handle)
-
-            if wasTracked then
-                Native.closeWindowsHandle spawned.Handle
-        | Mechanism.CgroupV2 -> ()
-        | Mechanism.ProcessGroup ->
-            let pgid = int spawned.Handle
-
-            if not (Native.processGroupAlive pgid) then
-                lock childLock (fun () -> childPgids.Remove pgid |> ignore)
-
-    // Hard-kill a single contained child (not the whole group): the lone process on Windows / cgroup
-    // (its descendants stay in the shared container), its own pgid (subtree) on a POSIX group.
-    let killChild (spawned: Native.Spawned) =
-        match mechanism with
-        | Mechanism.JobObject -> Native.terminateWindowsProcess spawned.Handle
-        | Mechanism.CgroupV2 -> Native.killProcess (int spawned.Handle)
-        | Mechanism.ProcessGroup -> Native.killProcessGroup (int spawned.Handle)
-
-    let anyChildAlive () =
-        match mechanism with
-        | Mechanism.CgroupV2 -> Native.cgroupAlive cgroupPath
-        | _ -> pgidSnapshot () |> List.exists Native.processGroupAlive
-
-    let killContainedTree () =
-        match mechanism with
-        | Mechanism.JobObject -> Native.terminateWindowsJob jobHandle
-        | Mechanism.CgroupV2 -> Native.killCgroup cgroupPath
-        | Mechanism.ProcessGroup ->
-            for pgid in pgidSnapshot () do
-                Native.killProcessGroup pgid
-
-    // The hard teardown, run exactly once by whoever wins `releasedFlag`. Windows: closing the job
-    // handle triggers KILL_ON_JOB_CLOSE. Cgroup v2: `cgroup.kill` SIGKILLs the subtree atomically,
-    // then the (drained) directory is removed. POSIX process group: not a closable object, so SIGKILL
-    // reaps survivors. Any still-tracked child process handles (Windows) are closed here too.
-    let hardRelease () =
-        match mechanism with
-        | Mechanism.JobObject ->
-            let handles =
-                lock childLock (fun () ->
-                    let copy = List.ofSeq processHandles
-                    processHandles.Clear()
-                    copy)
-
-            for handle in handles do
-                Native.closeWindowsHandle handle
-
-            Native.closeWindowsHandle jobHandle
-        | Mechanism.CgroupV2 ->
-            Native.killCgroup cgroupPath
-            Native.removeCgroup cgroupPath
-        | Mechanism.ProcessGroup ->
-            for pgid in pgidSnapshot () do
-                Native.killProcessGroup pgid
+    let waitOutcome (handle: nativeint) : Task<Outcome> = backend.Wait handle
 
     let releaseContainer () =
         if Interlocked.Exchange(&releasedFlag, 1) = 0 then
-            hardRelease ()
-
-    let waitOutcome (handle: nativeint) : Task<Outcome> =
-        match mechanism with
-        | Mechanism.JobObject -> Native.waitWindows handle
-        | _ -> Native.waitPosix handle
+            backend.HardRelease()
 
     /// The OS primitive containing this group on the current platform.
-    member _.Mechanism = mechanism
+    member _.Mechanism = backend.Mechanism
 
     /// The options the group was created with (shutdown grace, resource limits).
     member _.Options = options
@@ -207,22 +122,24 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
     static member Create(options: ProcessGroupOptions) : Result<ProcessGroup, ProcessError> =
         let limits = options.Limits
 
+        let withBackend (backend: IContainmentBackend) = Ok(new ProcessGroup(backend, options))
+
         if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
             match Native.createWindowsJob () with
             | Error error -> Error error
             | Ok job ->
                 if limits.Any then
                     match Native.applyWindowsJobLimits job limits with
-                    | Ok() -> Ok(new ProcessGroup(Mechanism.JobObject, job, "", options))
+                    | Ok() -> withBackend (JobObjectBackend job)
                     | Error message ->
                         Native.closeWindowsHandle job
                         Error(ProcessError.ResourceLimit message)
                 else
-                    Ok(new ProcessGroup(Mechanism.JobObject, job, "", options))
+                    withBackend (JobObjectBackend job)
         elif RuntimeInformation.IsOSPlatform OSPlatform.Linux && limits.Any then
             if Native.cgroupV2Available () then
                 match Native.createCgroup limits with
-                | Ok path -> Ok(new ProcessGroup(Mechanism.CgroupV2, IntPtr.Zero, path, options))
+                | Ok path -> withBackend (CgroupBackend path)
                 | Error message -> Error(ProcessError.ResourceLimit message)
             else
                 Error(
@@ -237,26 +154,21 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
             )
         else
             // No limits: the POSIX group forms when children are spawned (each becomes its own pgid).
-            Ok(new ProcessGroup(Mechanism.ProcessGroup, IntPtr.Zero, "", options))
+            withBackend (ProcessGroupBackend())
 
     /// Wait for one contained process handle to conclude. Internal — used by pipeline staging.
     member internal _.WaitHandle(handle: nativeint) : Task<Outcome> = waitOutcome handle
 
     /// Hard-kill the contained tree now (no grace) without releasing the group. Internal — used by
     /// pipeline cancellation/timeout.
-    member internal _.KillTree() = killContainedTree ()
+    member internal _.KillTree() = backend.KillTree()
 
     /// Spawn `command` into the group, tracking the child for signalling / teardown. Internal.
     member internal _.SpawnInto(command: Command) : Result<Native.Spawned, ProcessError> =
-        let spawn =
-            match mechanism with
-            | Mechanism.JobObject -> Native.spawnWindows jobHandle command
-            | _ -> Native.spawnPosix command
-
-        match spawn with
+        match backend.Spawn command with
         | Error error -> Error error
         | Ok spawned ->
-            trackChild spawned
+            backend.Track spawned
             Ok spawned
 
     /// Spawn `command` into the group and build a `RunningHost`. Disposing the resulting
@@ -273,14 +185,9 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
                 Pump.feedStdin source.Source stdinStream true CancellationToken.None |> ignore
             | _ -> ()
 
-            let pid =
-                match mechanism with
-                | Mechanism.JobObject -> Some(Native.processIdWindows spawned.Handle)
-                | _ -> Some(int spawned.Handle)
-
             Ok
                 { Config = command.Config
-                  Pid = pid
+                  Pid = backend.PidOf spawned
                   Stdout = spawned.Stdout
                   Stderr = spawned.Stderr
                   Stdin =
@@ -291,7 +198,7 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
                   StartTime = DateTime.UtcNow
                   StartedTimestamp = Stopwatch.GetTimestamp()
                   Wait = (fun () -> waitOutcome spawned.Handle)
-                  StartKill = killContainedTree
+                  StartKill = backend.KillTree
                   GracefulKill = (fun grace -> this.GracefulKillTree grace)
                   Teardown =
                     fun () ->
@@ -314,14 +221,9 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
                 Pump.feedStdin source.Source stdinStream true CancellationToken.None |> ignore
             | _ -> ()
 
-            let pid =
-                match mechanism with
-                | Mechanism.JobObject -> Some(Native.processIdWindows spawned.Handle)
-                | _ -> Some(int spawned.Handle)
-
             Ok
                 { Config = command.Config
-                  Pid = pid
+                  Pid = backend.PidOf spawned
                   Stdout = spawned.Stdout
                   Stderr = spawned.Stderr
                   Stdin =
@@ -332,8 +234,8 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
                   StartTime = DateTime.UtcNow
                   StartedTimestamp = Stopwatch.GetTimestamp()
                   Wait = (fun () -> waitOutcome spawned.Handle)
-                  StartKill = (fun () -> killChild spawned)
-                  GracefulKill = (fun _ -> task { killChild spawned } :> Task)
+                  StartKill = (fun () -> backend.KillChild spawned)
+                  GracefulKill = (fun _ -> task { backend.KillChild spawned } :> Task)
                   Teardown =
                     fun () ->
                         // Shared group: closing this run's `RunningProcess` detaches its I/O only —
@@ -344,7 +246,7 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
                         // Stop tracking it — POSIX only once its group is empty, so a still-live
                         // child stays reapable by the group; Windows closes the handle (the Job
                         // still contains and will kill the tree).
-                        releaseChild spawned
+                        backend.Release spawned
                         ValueTask.CompletedTask }
 
     /// Start `command` into this shared group and return a live `RunningProcess`. The **group** owns
@@ -359,98 +261,36 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
 
     /// Immediately hard-kill every process currently in the group. Idempotent; the group stays
     /// usable for further spawns. Returns `Result` for parity with the other tree-control verbs (a
-    /// future cgroup backend can report an undrained tree); the current backends always succeed.
+    /// future backend can report an undrained tree); the current backends always succeed.
     member _.TerminateAll() : Result<unit, ProcessError> =
-        killContainedTree ()
+        backend.KillTree()
         Ok()
 
     /// The pids of the processes currently in the group — a point-in-time snapshot. On Windows the
-    /// whole Job tree; on the POSIX fallback the tracked group leaders (one per spawned child).
-    /// Returns `Result` because a future cgroup backend's `cgroup.procs` read can fail; the current
-    /// backends always succeed.
-    member _.Members() : Result<int list, ProcessError> =
-        match mechanism with
-        | Mechanism.JobObject -> Ok(Native.membersWindows jobHandle)
-        | Mechanism.CgroupV2 -> Ok(Native.cgroupMembers cgroupPath)
-        | Mechanism.ProcessGroup -> Ok(pgidSnapshot ())
+    /// whole Job tree, on cgroup v2 the whole cgroup, on the POSIX fallback the tracked group leaders.
+    member _.Members() : Result<int list, ProcessError> = backend.Members()
 
     /// Broadcast `signal` to every process in the group. Best-effort: an exited member is skipped
     /// and an empty group succeeds trivially. On **Windows** only `Signal.Kill` is deliverable (it
     /// maps to the Job terminate); any other signal returns `ProcessError.Unsupported`.
-    member _.Signal(signal: Signal) : Result<unit, ProcessError> =
-        match mechanism with
-        | Mechanism.JobObject ->
-            match signal with
-            | Signal.Kill ->
-                Native.terminateWindowsJob jobHandle
-                Ok()
-            | _ -> Error(ProcessError.Unsupported $"signal {signal} on Windows (only Signal.Kill is deliverable)")
-        | Mechanism.CgroupV2 ->
-            match signal with
-            | Signal.Kill -> Native.killCgroup cgroupPath // atomic whole-subtree SIGKILL
-            | _ -> Native.signalCgroup cgroupPath (Native.signalNumber signal)
-
-            Ok()
-        | Mechanism.ProcessGroup ->
-            let signalNum = Native.signalNumber signal
-
-            for pgid in pgidSnapshot () do
-                Native.signalProcessGroup pgid signalNum |> ignore
-
-            Ok()
+    member _.Signal(signal: Signal) : Result<unit, ProcessError> = backend.Signal signal
 
     /// Suspend (freeze) every process in the group. POSIX: `SIGSTOP` (level-triggered, idempotent).
-    /// Windows: suspend every thread of every member — best-effort, and suspend counts stack, so N
-    /// `Suspend`s need N `Resume`s.
-    member _.Suspend() : Result<unit, ProcessError> =
-        match mechanism with
-        | Mechanism.JobObject ->
-            Native.suspendWindows jobHandle
-            Ok()
-        | Mechanism.CgroupV2 ->
-            Native.freezeCgroup cgroupPath true
-            Ok()
-        | Mechanism.ProcessGroup ->
-            for pgid in pgidSnapshot () do
-                Native.suspendProcessGroup pgid
-
-            Ok()
+    /// Cgroup v2: `cgroup.freeze`. Windows: suspend every thread of every member — best-effort, and
+    /// suspend counts stack, so N `Suspend`s need N `Resume`s.
+    member _.Suspend() : Result<unit, ProcessError> = backend.Suspend()
 
     /// Resume a tree suspended by `Suspend`.
-    member _.Resume() : Result<unit, ProcessError> =
-        match mechanism with
-        | Mechanism.JobObject ->
-            Native.resumeWindows jobHandle
-            Ok()
-        | Mechanism.CgroupV2 ->
-            Native.freezeCgroup cgroupPath false
-            Ok()
-        | Mechanism.ProcessGroup ->
-            for pgid in pgidSnapshot () do
-                Native.resumeProcessGroup pgid
-
-            Ok()
+    member _.Resume() : Result<unit, ProcessError> = backend.Resume()
 
     /// A snapshot of the group's resource usage. On Windows this reads the Job Object's accounting
-    /// (CPU + peak committed memory + active count); on the POSIX fallback only the live group count
-    /// is available (CPU/memory are `None` until the cgroup v2 backend). Errors once the group is
-    /// released.
+    /// (CPU + peak committed memory + active count); on cgroup v2 the cgroup accounting; on the POSIX
+    /// fallback only the live group count (CPU/memory are `None`). Errors once the group is released.
     member _.Stats() : Result<ProcessGroupStats, ProcessError> =
         if releasedFlag <> 0 then
             Error(ProcessError.Io "the process group has been released")
         else
-            match mechanism with
-            | Mechanism.JobObject ->
-                match Native.jobStatsWindows jobHandle with
-                | Some(active, cpu, peak) -> Ok(ProcessGroupStats(active, Some cpu, Some peak))
-                | None -> Error(ProcessError.Io "failed to query Job Object accounting")
-            | Mechanism.CgroupV2 ->
-                let active = List.length (Native.cgroupMembers cgroupPath)
-                let cpu, peak = Native.cgroupStats cgroupPath
-                Ok(ProcessGroupStats(active, cpu, peak))
-            | Mechanism.ProcessGroup ->
-                let active = pgidSnapshot () |> List.filter Native.processGroupAlive |> List.length
-                Ok(ProcessGroupStats(active, None, None))
+            backend.Stats()
 
     /// A periodic `ProcessGroupStats` series: the first sample immediately, then one per `interval`.
     /// **Pull-based** — it samples only as the enumeration is pulled and runs no background task, so
@@ -479,7 +319,7 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
                 | Error error -> return Error error
                 | Ok spawned ->
                     let startedAt = Stopwatch.GetTimestamp()
-                    use _registration = cancellationToken.Register(fun () -> killChild spawned)
+                    use _registration = cancellationToken.Register(fun () -> backend.KillChild spawned)
 
                     // Feed a stdin source, then close stdin (EOF) — a source is the child's full input.
                     match spawned.Stdin, command.Config.StdinSource with
@@ -505,7 +345,7 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
                     spawned.Stdin |> Option.iter (fun s -> s.Dispose())
                     // The child is reaped: stop tracking it (close its Windows handle) so a long-lived
                     // shared group does not accumulate handles/pgids across many captured runs.
-                    releaseChild spawned
+                    backend.Release spawned
                     let duration = Stopwatch.GetElapsedTime startedAt
 
                     if cancellationToken.IsCancellationRequested then
@@ -522,69 +362,15 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint, cgroupPat
     /// Gracefully kill the contained tree (SIGTERM, then SIGKILL after `grace`) WITHOUT releasing
     /// the group — used by per-run timeouts (the run's own teardown releases the group). On Windows
     /// there is no per-job graceful signal, so this is the atomic Job kill.
-    member internal _.GracefulKillTree(grace: TimeSpan) : Task =
-        task {
-            match mechanism with
-            | Mechanism.JobObject -> Native.terminateWindowsJob jobHandle
-            | Mechanism.CgroupV2 ->
-                Native.terminateCgroup cgroupPath
-                let stopwatch = Stopwatch.StartNew()
-
-                while Native.cgroupAlive cgroupPath && stopwatch.Elapsed < grace do
-                    do! Task.Delay 50
-
-                if Native.cgroupAlive cgroupPath then
-                    Native.killCgroup cgroupPath
-            | Mechanism.ProcessGroup ->
-                let pgids = pgidSnapshot ()
-
-                if not (List.isEmpty pgids) then
-                    for pgid in pgids do
-                        Native.terminateProcessGroup pgid
-
-                    let stopwatch = Stopwatch.StartNew()
-
-                    while anyChildAlive () && stopwatch.Elapsed < grace do
-                        do! Task.Delay 50
-
-                    for pgid in pgids do
-                        if Native.processGroupAlive pgid then
-                            Native.killProcessGroup pgid
-        }
-        :> Task
+    member internal _.GracefulKillTree(grace: TimeSpan) : Task = backend.GracefulKillTree grace
 
     /// Tear the group down gracefully, then release it. On Unix: SIGTERM, then SIGKILL if still
     /// alive after `gracePeriod`. On Windows: an atomic Job kill. Idempotent with `Dispose`.
     member this.Shutdown(gracePeriod: TimeSpan) : Task =
         task {
             if Interlocked.Exchange(&releasedFlag, 1) = 0 then
-                match mechanism with
-                | Mechanism.JobObject -> Native.terminateWindowsJob jobHandle
-                | Mechanism.CgroupV2 ->
-                    Native.terminateCgroup cgroupPath
-                    let stopwatch = Stopwatch.StartNew()
-
-                    while Native.cgroupAlive cgroupPath && stopwatch.Elapsed < gracePeriod do
-                        do! Task.Delay 50
-                    // hardRelease below does the cgroup.kill + rmdir.
-                    ()
-                | Mechanism.ProcessGroup ->
-                    let pgids = pgidSnapshot ()
-
-                    if not (List.isEmpty pgids) then
-                        for pgid in pgids do
-                            Native.terminateProcessGroup pgid
-
-                        let stopwatch = Stopwatch.StartNew()
-
-                        while anyChildAlive () && stopwatch.Elapsed < gracePeriod do
-                            do! Task.Delay 50
-
-                        for pgid in pgids do
-                            if Native.processGroupAlive pgid then
-                                Native.killProcessGroup pgid
-
-                hardRelease ()
+                do! backend.GracefulKillTree gracePeriod
+                backend.HardRelease()
                 GC.SuppressFinalize this
         }
         :> Task

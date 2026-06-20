@@ -46,6 +46,7 @@
 		<Compile Include="Stdin.fs" />
 		<Compile Include="Command.fs" />
 		<Compile Include="Native.fs" />
+		<Compile Include="Backend.fs" />
 		<Compile Include="Pump.fs" />
 		<Compile Include="ProcessStdin.fs" />
 		<Compile Include="RunningProcess.fs" />
