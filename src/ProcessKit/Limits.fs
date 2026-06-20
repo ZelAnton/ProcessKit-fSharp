@@ -71,13 +71,13 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, escalateToKill: bo
         ProcessGroupOptions(shutdownTimeout, escalate, limits)
 
     /// A copy capping the tree's total memory at `bytes`.
-    member _.MemoryMax(bytes: int64) =
+    member _.WithMemoryMax(bytes: int64) =
         ProcessGroupOptions(shutdownTimeout, escalateToKill, limits.WithMemoryMax bytes)
 
     /// A copy capping the number of live processes in the tree at `count`.
-    member _.MaxProcesses(count: int) =
+    member _.WithMaxProcesses(count: int) =
         ProcessGroupOptions(shutdownTimeout, escalateToKill, limits.WithMaxProcesses count)
 
     /// A copy capping the tree's CPU at `cores` cores' worth.
-    member _.CpuQuota(cores: float) =
+    member _.WithCpuQuota(cores: float) =
         ProcessGroupOptions(shutdownTimeout, escalateToKill, limits.WithCpuQuota cores)

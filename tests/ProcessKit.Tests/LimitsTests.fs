@@ -28,7 +28,7 @@ type LimitsTests() =
     [<Test>]
     member _.``ProcessGroupOptions builders set the limits``() =
         let options =
-            ProcessGroupOptions().MemoryMax(256L * 1024L * 1024L).MaxProcesses(50).CpuQuota(1.5)
+            ProcessGroupOptions().WithMemoryMax(256L * 1024L * 1024L).WithMaxProcesses(50).WithCpuQuota(1.5)
 
         Assert.That(options.Limits.MemoryMax, Is.EqualTo(Some(256L * 1024L * 1024L)))
         Assert.That(options.Limits.MaxProcesses, Is.EqualTo(Some 50))
@@ -53,7 +53,7 @@ type LimitsTests() =
     member _.``a group with limits uses a limit-capable mechanism or fails fast``() : Task =
         task {
             let options =
-                ProcessGroupOptions().MemoryMax(256L * 1024L * 1024L).MaxProcesses(64).CpuQuota(2.0)
+                ProcessGroupOptions().WithMemoryMax(256L * 1024L * 1024L).WithMaxProcesses(64).WithCpuQuota(2.0)
 
             let result = ProcessGroup.Create options
 
@@ -101,7 +101,8 @@ type LimitsTests() =
             if isWindows || isMacOs then
                 Assert.Ignore "cgroup v2 is Linux-only"
             else
-                let options = ProcessGroupOptions().MemoryMax(256L * 1024L * 1024L).MaxProcesses(64)
+                let options =
+                    ProcessGroupOptions().WithMemoryMax(256L * 1024L * 1024L).WithMaxProcesses(64)
 
                 match ProcessGroup.Create options with
                 | Error(ProcessError.ResourceLimit _) ->
