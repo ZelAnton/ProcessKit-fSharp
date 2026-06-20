@@ -22,6 +22,7 @@
 		<Compile Include="ErgonomicsTests.fs" />
 		<Compile Include="StatsTests.fs" />
 		<Compile Include="LimitsTests.fs" />
+		<Compile Include="CassetteTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>

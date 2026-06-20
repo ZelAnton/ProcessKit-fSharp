@@ -52,6 +52,7 @@
 		<Compile Include="Runner.fs" />
 		<Compile Include="Reply.fs" />
 		<Compile Include="ScriptedRunner.fs" />
+		<Compile Include="Cassette.fs" />
 		<Compile Include="ProcessGroup.fs" />
 		<Compile Include="JobRunner.fs" />
 		<Compile Include="CommandVerbs.fs" />

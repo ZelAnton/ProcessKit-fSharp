@@ -189,7 +189,13 @@ a module. One stage, one confirmation gate.
   fail-fast path.)*
 - **S4 — `record`.** Record/replay cassettes over `IProcessRunner`
   (`RecordReplayRunner`) using `System.Text.Json` (built-in); `Invocation` capture,
-  hermetic replay, `CassetteMiss`.
+  hermetic replay, `CassetteMiss`. *(Done — `ProcessKit.Testing.RecordReplayRunner`
+  (`Record`/`Replay`/`Save` + drop-time flush) with `System.Text.Json` cassettes;
+  `ProcessError.CassetteMiss`; matching on program+args+cwd+stdin-digest with
+  order-then-repeat-last duplicates; covers `OutputString`/`OutputBytes`, `Start`
+  unsupported. Cassettes are `0600` on Unix and redact env values. One-shot stdin
+  sources (`FromReader`/`FromLines`) can't be keyed and error — a slightly tighter
+  rule than upstream's eager `from_iter_lines`.)*
 - **S5 — Observability parity.** Complete the `ILogger` event taxonomy to match the
   Rust `tracing` feature (spawn/exit, timeout/cancel, teardown anomalies, retries,
   supervisor restarts/storm pauses) — argv/env never logged.

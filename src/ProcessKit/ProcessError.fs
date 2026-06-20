@@ -52,6 +52,9 @@ type ProcessError =
     /// controllers could not be enabled (this process is not at the real cgroup root).
     | ResourceLimit of message: string
 
+    /// A `RecordReplayRunner` in replay mode found no recorded entry matching the invocation.
+    | CassetteMiss of program: string
+
     /// An underlying I/O failure not attributable to a specific exit.
     | Io of message: string
 
@@ -83,6 +86,7 @@ type ProcessError =
             $"'{program}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
         | ProcessError.Stdin(program, message) -> $"failed writing stdin to '{program}': {message}"
         | ProcessError.ResourceLimit message -> $"resource limit could not be enforced: {message}"
+        | ProcessError.CassetteMiss program -> $"no recorded cassette entry for '{program}'"
         | ProcessError.Io message -> $"I/O error: {message}"
         | ProcessError.Unsupported operation -> $"unsupported: {operation}"
 
