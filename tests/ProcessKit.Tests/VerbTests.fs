@@ -73,3 +73,34 @@ type VerbTests() =
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
+
+    [<Test>]
+    member _.``Command.ExitCode returns the process exit code``() : Task =
+        task {
+            match! (shell "exit 7").ExitCode() with
+            | Ok code -> Assert.That(code, Is.EqualTo 7)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Command.Probe reads exit 0/1 as true/false``() : Task =
+        task {
+            match! (shell "exit 0").Probe() with
+            | Ok value -> Assert.That(value, Is.True)
+            | Error error -> Assert.Fail $"{error}"
+
+            match! (shell "exit 1").Probe() with
+            | Ok value -> Assert.That(value, Is.False)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Command.RunUnit succeeds on a zero exit and is cancellable``() : Task =
+        task {
+            match! (shell "echo hi").RunUnit(CancellationToken.None) with
+            | Ok() -> Assert.Pass()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task

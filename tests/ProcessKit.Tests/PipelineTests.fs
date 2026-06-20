@@ -186,3 +186,14 @@ type PipelineTests() =
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
+
+    [<Test>]
+    member _.``Pipeline parse converts the trimmed pipefail output to a typed value``() : Task =
+        task {
+            let pipeline = (emit [ "42" ]).Pipe sortStage
+
+            match! pipeline |> Pipeline.parse (fun s -> int (s.Trim())) with
+            | Ok value -> Assert.That(value, Is.EqualTo 42)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task

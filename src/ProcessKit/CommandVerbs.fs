@@ -26,12 +26,57 @@ type CommandVerbs =
     static member Run(command: Command) =
         Runner.run CommandVerbs.DefaultRunner CancellationToken.None command
 
+    /// Require a zero exit and return stdout, cancellable through `cancellationToken`.
+    [<Extension>]
+    static member Run(command: Command, cancellationToken: CancellationToken) =
+        Runner.run CommandVerbs.DefaultRunner cancellationToken command
+
+    /// Require a zero exit, discarding the captured output.
+    [<Extension>]
+    static member RunUnit(command: Command) =
+        Runner.runUnit CommandVerbs.DefaultRunner CancellationToken.None command
+
+    /// Require a zero exit (discarding output), cancellable through `cancellationToken`.
+    [<Extension>]
+    static member RunUnit(command: Command, cancellationToken: CancellationToken) =
+        Runner.runUnit CommandVerbs.DefaultRunner cancellationToken command
+
     /// Run to completion, capturing stdout as decoded text (a non-zero exit is data).
     [<Extension>]
     static member OutputString(command: Command) =
         Runner.outputString CommandVerbs.DefaultRunner CancellationToken.None command
 
+    /// Run to completion capturing stdout as text, cancellable through `cancellationToken`.
+    [<Extension>]
+    static member OutputString(command: Command, cancellationToken: CancellationToken) =
+        Runner.outputString CommandVerbs.DefaultRunner cancellationToken command
+
     /// Run to completion, capturing stdout as raw bytes.
     [<Extension>]
     static member OutputBytes(command: Command) =
         Runner.outputBytes CommandVerbs.DefaultRunner CancellationToken.None command
+
+    /// Run to completion capturing stdout as raw bytes, cancellable through `cancellationToken`.
+    [<Extension>]
+    static member OutputBytes(command: Command, cancellationToken: CancellationToken) =
+        Runner.outputBytes CommandVerbs.DefaultRunner cancellationToken command
+
+    /// The exit code; a signal kill or timeout errors instead of inventing a sentinel code.
+    [<Extension>]
+    static member ExitCode(command: Command) =
+        Runner.exitCode CommandVerbs.DefaultRunner CancellationToken.None command
+
+    /// The exit code, cancellable through `cancellationToken`.
+    [<Extension>]
+    static member ExitCode(command: Command, cancellationToken: CancellationToken) =
+        Runner.exitCode CommandVerbs.DefaultRunner cancellationToken command
+
+    /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
+    [<Extension>]
+    static member Probe(command: Command) =
+        Runner.probe CommandVerbs.DefaultRunner CancellationToken.None command
+
+    /// Read the exit code as a yes/no answer, cancellable through `cancellationToken`.
+    [<Extension>]
+    static member Probe(command: Command, cancellationToken: CancellationToken) =
+        Runner.probe CommandVerbs.DefaultRunner cancellationToken command

@@ -44,8 +44,6 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                 | Some stage -> stage
                 | None -> last
 
-    member internal _.Commands = commands
-
     /// Append another stage; its stdin is fed from the current last stage's stdout.
     member _.Pipe(command: Command) =
         ArgumentNullException.ThrowIfNull command
@@ -181,6 +179,44 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     /// `Probe` against `CancellationToken.None`.
     member this.Probe() = this.Probe CancellationToken.None
 
+    /// Require a successful pipefail exit and parse the trimmed stdout into a `'T`; a thrown parser
+    /// error becomes `ProcessError.Parse`.
+    member this.Parse(parser: Func<string, 'T>, cancellationToken: CancellationToken) : Task<Result<'T, ProcessError>> =
+        ArgumentNullException.ThrowIfNull parser
+
+        task {
+            match! this.Run cancellationToken with
+            | Error error -> return Error error
+            | Ok text ->
+                try
+                    return Ok(parser.Invoke text)
+                with ex ->
+                    return Error(ProcessError.Parse((List.last commands).Program, ex.Message))
+        }
+
+    /// `Parse` against `CancellationToken.None`.
+    member this.Parse(parser: Func<string, 'T>) =
+        this.Parse(parser, CancellationToken.None)
+
+    /// Like `Parse`, but the parser returns its own `Result` (its error message becomes `Parse`).
+    member this.TryParse
+        (parser: Func<string, Result<'T, string>>, cancellationToken: CancellationToken)
+        : Task<Result<'T, ProcessError>> =
+        ArgumentNullException.ThrowIfNull parser
+
+        task {
+            match! this.Run cancellationToken with
+            | Error error -> return Error error
+            | Ok text ->
+                match parser.Invoke text with
+                | Ok value -> return Ok value
+                | Error message -> return Error(ProcessError.Parse((List.last commands).Program, message))
+        }
+
+    /// `TryParse` against `CancellationToken.None`.
+    member this.TryParse(parser: Func<string, Result<'T, string>>) =
+        this.TryParse(parser, CancellationToken.None)
+
 /// `Command.Pipe` builds a two-stage `Pipeline`; further `Pipeline.Pipe` calls extend it.
 [<Extension>]
 type PipelineExtensions =
@@ -225,3 +261,10 @@ module Pipeline =
 
     /// Read the pipefail exit code as a yes/no answer.
     let probe (pipeline: Pipeline) = pipeline.Probe()
+
+    /// Require a successful pipefail exit and parse the trimmed stdout into a `'T`.
+    let parse (parser: string -> 'T) (pipeline: Pipeline) = pipeline.Parse(Func<string, 'T> parser)
+
+    /// Like `parse`, but the parser returns its own `Result` (its error message becomes `Parse`).
+    let tryParse (parser: string -> Result<'T, string>) (pipeline: Pipeline) =
+        pipeline.TryParse(Func<string, Result<'T, string>> parser)
