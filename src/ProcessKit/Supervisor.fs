@@ -179,8 +179,10 @@ module internal SupervisorConfig =
 ///
 /// `Command.Retry` answers "run this once, replaying on failure"; a supervisor answers the
 /// different question **"keep this alive"** — a minimal `runit`/`systemd`-style keeper on top of
-/// the runner layer. Runs go through an `IProcessRunner` (the default `JobRunner`); override with
-/// `WithRunner` to share a `ProcessGroup` or inject a test double.
+/// the runner layer. The two are distinct layers: a supervised command's own `Retry` is **not**
+/// applied per incarnation (supervision runs the bare runner), so use the supervisor's own restart
+/// policy and backoff instead. Runs go through an `IProcessRunner` (the default `JobRunner`);
+/// override with `WithRunner` to share a `ProcessGroup` or inject a test double.
 ///
 /// Defaults: `OnCrash`, unlimited restarts, backoff `200ms × 2.0` capped at 30 s, jitter on,
 /// failure-storm guard off (enable with `StormPause`; failure half-life 30 s, threshold 5.0).
