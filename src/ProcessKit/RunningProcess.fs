@@ -249,9 +249,7 @@ type RunningProcess internal (host: RunningHost) =
             use _reap = reapGuard ()
 
             let stdoutTask =
-                match host.Stdout with
-                | Some s -> Pump.drainRaw s config.StdoutTee CancellationToken.None
-                | None -> Task.FromResult Array.empty<byte>
+                Pump.drainRawOrEmpty host.Stdout config.StdoutTee CancellationToken.None
 
             let stderrTask = pumpStderrBuffer ()
             let! outcome = waitWithTimeout ()
@@ -284,16 +282,8 @@ type RunningProcess internal (host: RunningHost) =
         task {
             use _reap = reapGuard ()
             // Drain both pipes (so the child never blocks on a full buffer) without retaining.
-            let stdoutTask =
-                match host.Stdout with
-                | Some s -> Pump.drainDiscard s CancellationToken.None
-                | None -> Task.CompletedTask
-
-            let stderrTask =
-                match host.Stderr with
-                | Some s -> Pump.drainDiscard s CancellationToken.None
-                | None -> Task.CompletedTask
-
+            let stdoutTask = Pump.drainDiscardOrEmpty host.Stdout CancellationToken.None
+            let stderrTask = Pump.drainDiscardOrEmpty host.Stderr CancellationToken.None
             let! outcome = waitWithTimeout ()
             // Observe both drains together so an I/O fault on one can't orphan the other.
             do! Task.WhenAll([| stdoutTask; stderrTask |])
@@ -345,15 +335,8 @@ type RunningProcess internal (host: RunningHost) =
                         ()
                 }
 
-            let stdoutTask =
-                match host.Stdout with
-                | Some s -> Pump.drainDiscard s CancellationToken.None
-                | None -> Task.CompletedTask
-
-            let stderrTask =
-                match host.Stderr with
-                | Some s -> Pump.drainDiscard s CancellationToken.None
-                | None -> Task.CompletedTask
+            let stdoutTask = Pump.drainDiscardOrEmpty host.Stdout CancellationToken.None
+            let stderrTask = Pump.drainDiscardOrEmpty host.Stderr CancellationToken.None
 
             // Capture a fault rather than letting it escape immediately, so the sampler is ALWAYS
             // cancelled and awaited before its CTS is disposed at scope exit — never left running as
@@ -555,16 +538,8 @@ type RunningProcess internal (host: RunningHost) =
                     streamOutcome
                 else
                     task {
-                        let stdoutDrain =
-                            match host.Stdout with
-                            | Some s -> Pump.drainDiscard s CancellationToken.None
-                            | None -> Task.CompletedTask
-
-                        let stderrDrain =
-                            match host.Stderr with
-                            | Some s -> Pump.drainDiscard s CancellationToken.None
-                            | None -> Task.CompletedTask
-
+                        let stdoutDrain = Pump.drainDiscardOrEmpty host.Stdout CancellationToken.None
+                        let stderrDrain = Pump.drainDiscardOrEmpty host.Stderr CancellationToken.None
                         let! outcome = waitWithTimeout ()
                         do! Task.WhenAll([| stdoutDrain; stderrDrain |])
                         return outcome

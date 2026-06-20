@@ -181,13 +181,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         match this.SpawnInto command with
         | Error error -> Error error
         | Ok spawned ->
-            // Feed a stdin source in the background, then close stdin (EOF): a source is the
-            // child's complete input. `KeepStdinOpen` is only for the no-source interactive case,
-            // where the stream is handed to the caller via `TakeStdin` instead of being fed here.
-            match spawned.Stdin, command.Config.StdinSource with
-            | Some stdinStream, Some source ->
-                Pump.feedStdin source.Source stdinStream true CancellationToken.None |> ignore
-            | _ -> ()
+            Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
 
             let closeStreams () =
                 // Close the pipe streams (OS handles/fds) before releasing/detaching.
@@ -317,22 +311,9 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     let startedAt = Stopwatch.GetTimestamp()
                     use _registration = cancellationToken.Register(fun () -> backend.KillChild spawned)
 
-                    // Feed a stdin source, then close stdin (EOF) — a source is the child's full input.
-                    match spawned.Stdin, command.Config.StdinSource with
-                    | Some stdinStream, Some source ->
-                        Pump.feedStdin source.Source stdinStream true CancellationToken.None |> ignore
-                    | _ -> ()
-
-                    let stdoutTask =
-                        match spawned.Stdout with
-                        | Some s -> Pump.drainRaw s None CancellationToken.None
-                        | None -> Task.FromResult Array.empty<byte>
-
-                    let stderrTask =
-                        match spawned.Stderr with
-                        | Some s -> Pump.drainRaw s None CancellationToken.None
-                        | None -> Task.FromResult Array.empty<byte>
-
+                    Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
+                    let stdoutTask = Pump.drainRawOrEmpty spawned.Stdout None CancellationToken.None
+                    let stderrTask = Pump.drainRawOrEmpty spawned.Stderr None CancellationToken.None
                     let! outcome = waitOutcome spawned.Handle
                     let! stdoutBytes = stdoutTask
                     let! stderrBytes = stderrTask
@@ -446,10 +427,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
                             if index = 0 then
                                 // Only the first stage may carry its own stdin source; feed it.
-                                match sp.Stdin, stages[0].Config.StdinSource with
-                                | Some stdinStream, Some source ->
-                                    Pump.feedStdin source.Source stdinStream true CancellationToken.None |> ignore
-                                | _ -> ()
+                                Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource
                             else
                                 match prevStdout, sp.Stdin with
                                 | Some upstream, Some downstream ->
@@ -476,9 +454,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                                 | _ -> ()
 
                             // Drain every stage's stderr so a full stderr pipe never blocks a stage.
-                            match sp.Stderr with
-                            | Some s -> stderrTasks.Add(Pump.drainRaw s None CancellationToken.None)
-                            | None -> stderrTasks.Add(Task.FromResult Array.empty<byte>)
+                            stderrTasks.Add(Pump.drainRawOrEmpty sp.Stderr None CancellationToken.None)
 
                             prevStdout <- sp.Stdout
 
@@ -492,9 +468,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                         let lastSpawned = spawned[spawned.Count - 1]
 
                         let captureTask =
-                            match lastSpawned.Stdout with
-                            | Some s -> Pump.drainRaw s lastTee CancellationToken.None
-                            | None -> Task.FromResult Array.empty<byte>
+                            Pump.drainRawOrEmpty lastSpawned.Stdout lastTee CancellationToken.None
 
                         let waitTasks =
                             spawned |> Seq.map (fun sp -> group.WaitHandle sp.Handle) |> Seq.toArray

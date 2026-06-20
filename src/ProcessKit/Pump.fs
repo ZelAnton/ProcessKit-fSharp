@@ -36,7 +36,6 @@ module internal Pump =
         member _.TotalBytes = totalBytes
         member _.Truncated = truncated
         member _.TooLarge = tooLarge
-        member _.RetainedLines = List.ofSeq retained
         member _.Text = String.Join('\n', retained)
 
         /// Record a complete line, applying the policy.
@@ -186,6 +185,22 @@ module internal Pump =
             return buffer.ToArray()
         }
 
+    /// `drainDiscard` over an optional stream — a completed no-op when the stream isn't piped.
+    let drainDiscardOrEmpty (stream: Stream option) (cancellationToken: CancellationToken) : Task =
+        match stream with
+        | Some s -> drainDiscard s cancellationToken
+        | None -> Task.CompletedTask
+
+    /// `drainRaw` over an optional stream — an empty byte array when the stream isn't piped.
+    let drainRawOrEmpty
+        (stream: Stream option)
+        (tee: Stream option)
+        (cancellationToken: CancellationToken)
+        : Task<byte[]> =
+        match stream with
+        | Some s -> drainRaw s tee cancellationToken
+        | None -> Task.FromResult Array.empty<byte>
+
     /// Write a stdin source to the child's stdin stream; close it (EOF) afterwards unless the
     /// caller is keeping it open for interactive writing.
     let feedStdin
@@ -240,3 +255,11 @@ module internal Pump =
                     ()
         }
         :> Task
+
+    /// Feed a stdin `source` (if any) into the child's `stdin` (if piped) in the background, then EOF.
+    /// Detached fire-and-forget: a source is the child's complete input, so stdin is closed after.
+    /// (The no-source interactive case keeps the stream for `TakeStdin` instead of feeding here.)
+    let feedStdinSource (stdin: Stream option) (source: Stdin option) =
+        match stdin, source with
+        | Some stdinStream, Some src -> feedStdin src.Source stdinStream true CancellationToken.None |> ignore
+        | _ -> ()

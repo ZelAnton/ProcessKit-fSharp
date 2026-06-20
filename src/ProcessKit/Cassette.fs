@@ -82,11 +82,7 @@ type RecordReplayRunner private (mode: Mode, path: string) =
                 )
 
     let keyOf (command: Command) (digest: string option) : Key =
-        command.Program,
-        List.ofSeq command.Arguments,
-        command.WorkingDirectory,
-        command.Config.StdinSource.IsSome,
-        digest
+        command.Program, command.Config.Args, command.WorkingDirectory, command.Config.StdinSource.IsSome, digest
 
     let entryOf (command: Command) (result: ProcessResult<string>) (digest: string option) : CassetteEntry =
         let envNames =
@@ -102,7 +98,7 @@ type RecordReplayRunner private (mode: Mode, path: string) =
             | _ -> Nullable()
 
         { Program = command.Program
-          Args = List.toArray (List.ofSeq command.Arguments)
+          Args = List.toArray command.Config.Args
           Cwd = Option.toObj command.WorkingDirectory
           StdinDigest = Option.toObj digest
           HasStdin = command.Config.StdinSource.IsSome
@@ -159,7 +155,9 @@ type RecordReplayRunner private (mode: Mode, path: string) =
                 | null -> [||]
                 | loaded -> loaded
 
-            let slots = Dictionary<Key, ReplaySlot>()
+            // Group entries by key, accumulating into ResizeArrays (O(1) append) and freezing to the
+            // immutable per-slot arrays once — not `Array.append` per duplicate, which is O(n²).
+            let grouped = Dictionary<Key, ResizeArray<CassetteEntry>>()
 
             for entry in entries do
                 let key =
@@ -169,12 +167,16 @@ type RecordReplayRunner private (mode: Mode, path: string) =
                     entry.HasStdin,
                     Option.ofObj entry.StdinDigest
 
-                match slots.TryGetValue key with
-                | true, slot ->
-                    slots[key] <-
-                        { slot with
-                            Entries = Array.append slot.Entries [| entry |] }
-                | _ -> slots[key] <- { Entries = [| entry |]; Next = 0 }
+                match grouped.TryGetValue key with
+                | true, bucket -> bucket.Add entry
+                | _ -> grouped[key] <- ResizeArray [ entry ]
+
+            let slots = Dictionary<Key, ReplaySlot>()
+
+            for kvp in grouped do
+                slots[kvp.Key] <-
+                    { Entries = kvp.Value.ToArray()
+                      Next = 0 }
 
             Ok(new RecordReplayRunner(ReplayMode slots, path))
         with ex ->

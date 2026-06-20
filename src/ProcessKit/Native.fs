@@ -68,7 +68,7 @@ module internal Native =
             sb.Append('"').ToString()
 
     let private buildWindowsCommandLine (command: Command) =
-        let parts = command.Program :: List.ofSeq command.Arguments
+        let parts = command.Program :: command.Config.Args
         parts |> List.map quoteWindowsArg |> String.concat " "
 
     /// The effective environment for the child: the inherited set (unless cleared) with the
@@ -1203,7 +1203,7 @@ module internal Native =
             // holds either platform's representation (glibc structs or macOS pointers).
             let fileActions = Marshal.AllocHGlobal 1024
             let attributes = Marshal.AllocHGlobal 1024
-            let argv = command.Program :: List.ofSeq command.Arguments
+            let argv = command.Program :: command.Config.Args
 
             let envp =
                 effectiveEnvironment command
