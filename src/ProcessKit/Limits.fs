@@ -53,7 +53,10 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, escalateToKill: bo
     /// How long `Shutdown` waits after SIGTERM before escalating to SIGKILL (Unix; default 2s).
     member _.ShutdownTimeout = shutdownTimeout
 
-    /// Whether `Shutdown` SIGKILLs processes that outlive the grace window (default true).
+    /// Advisory: whether `Shutdown`'s graceful tier force-kills after the grace window (default
+    /// true). Note this cannot fully leave a tree alive — releasing the container *is* a kill
+    /// (closing a Job Object, `cgroup.kill`, `killpg`), so the kill-on-drop guarantee reaps any
+    /// survivor regardless when the group is released.
     member _.EscalateToKill = escalateToKill
 
     /// The whole-tree resource caps applied at creation.
