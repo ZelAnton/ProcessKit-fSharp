@@ -257,15 +257,20 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
         }
 
     /// Immediately hard-kill every process currently in the group. Idempotent; the group stays
-    /// usable for further spawns.
-    member _.TerminateAll() = killContainedTree ()
+    /// usable for further spawns. Returns `Result` for parity with the other tree-control verbs (a
+    /// future cgroup backend can report an undrained tree); the current backends always succeed.
+    member _.TerminateAll() : Result<unit, ProcessError> =
+        killContainedTree ()
+        Ok()
 
     /// The pids of the processes currently in the group — a point-in-time snapshot. On Windows the
     /// whole Job tree; on the POSIX fallback the tracked group leaders (one per spawned child).
-    member _.Members() : int list =
+    /// Returns `Result` because a future cgroup backend's `cgroup.procs` read can fail; the current
+    /// backends always succeed.
+    member _.Members() : Result<int list, ProcessError> =
         match mechanism with
-        | Mechanism.JobObject -> Native.membersWindows jobHandle
-        | _ -> pgidSnapshot ()
+        | Mechanism.JobObject -> Ok(Native.membersWindows jobHandle)
+        | _ -> Ok(pgidSnapshot ())
 
     /// Broadcast `signal` to every process in the group. Best-effort: an exited member is skipped
     /// and an empty group succeeds trivially. On **Windows** only `Signal.Kill` is deliverable (it

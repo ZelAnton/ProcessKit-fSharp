@@ -39,7 +39,11 @@ type ProcessControlTests() =
             match! group.Start sleeper with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
-                let members = group.Members()
+                let members =
+                    match group.Members() with
+                    | Ok pids -> pids
+                    | Error error -> failwith $"Members failed: {error}"
+
                 Assert.That(members, Is.Not.Empty)
 
                 match running.Pid with
