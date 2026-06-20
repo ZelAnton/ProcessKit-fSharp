@@ -152,6 +152,15 @@ type RunningProcess internal (host: RunningHost) =
                     return Outcome.TimedOut
             }
 
+    // An async-disposable that reaps the tree on scope exit — normal OR exceptional. Every terminal
+    // verb opens one with `use` so the container is always torn down, even when a pump faults (e.g.
+    // a throwing line handler) before the verb would otherwise reach its teardown. `Teardown` is
+    // idempotent (the group's release runs once), so the redundant call on `RunningProcess` disposal
+    // is harmless.
+    let reapGuard () =
+        { new IAsyncDisposable with
+            member _.DisposeAsync() = host.Teardown() }
+
     // Log the spawn once, at construction.
     do Log.spawn config.Logger config.Program host.Pid
 
@@ -203,12 +212,12 @@ type RunningProcess internal (host: RunningHost) =
     /// reaped when the call returns.
     member _.OutputString() : Task<Result<ProcessResult<string>, ProcessError>> =
         task {
+            use _reap = reapGuard ()
             let stdoutTask = pumpStdoutBuffer ()
             let stderrTask = pumpStderrBuffer ()
             let! outcome = waitWithTimeout ()
             let! outBuf = stdoutTask
             let! errBuf = stderrTask
-            do! host.Teardown()
             Log.exit config.Logger config.Program outcome (elapsed ())
 
             if outBuf.TooLarge || errBuf.TooLarge then
@@ -232,6 +241,8 @@ type RunningProcess internal (host: RunningHost) =
     /// Run to completion, capturing stdout as raw bytes (no line splitting) and stderr as text.
     member _.OutputBytes() : Task<Result<ProcessResult<byte[]>, ProcessError>> =
         task {
+            use _reap = reapGuard ()
+
             let stdoutTask =
                 match host.Stdout with
                 | Some s -> Pump.drainRaw s config.StdoutTee CancellationToken.None
@@ -241,7 +252,6 @@ type RunningProcess internal (host: RunningHost) =
             let! outcome = waitWithTimeout ()
             let! stdoutBytes = stdoutTask
             let! errBuf = stderrTask
-            do! host.Teardown()
             Log.exit config.Logger config.Program outcome (elapsed ())
 
             if errBuf.TooLarge then
@@ -264,6 +274,7 @@ type RunningProcess internal (host: RunningHost) =
     /// Wait for the process to exit, discarding its output. Reaps the tree.
     member _.Wait() : Task<Outcome> =
         task {
+            use _reap = reapGuard ()
             // Drain both pipes (so the child never blocks on a full buffer) without retaining.
             let stdoutTask =
                 match host.Stdout with
@@ -278,7 +289,6 @@ type RunningProcess internal (host: RunningHost) =
             let! outcome = waitWithTimeout ()
             do! stdoutTask
             do! stderrTask
-            do! host.Teardown()
             Log.exit config.Logger config.Program outcome (elapsed ())
             return outcome
         }
@@ -287,6 +297,8 @@ type RunningProcess internal (host: RunningHost) =
     /// return a `RunProfile`. Drains and discards output (like `Wait`) and reaps the tree.
     member _.Profile(interval: TimeSpan) : Task<RunProfile> =
         task {
+            use _reap = reapGuard ()
+
             let period =
                 if interval <= TimeSpan.Zero then
                     TimeSpan.FromMilliseconds 1.0
@@ -340,7 +352,6 @@ type RunningProcess internal (host: RunningHost) =
             do! stderrTask
             sampleCts.Cancel()
             do! sampler
-            do! host.Teardown()
             return RunProfile(outcome.Code, elapsed (), lastCpu, peakMemory, samples)
         }
 
@@ -396,9 +407,9 @@ type RunningProcess internal (host: RunningHost) =
     /// After streaming stdout, wait for exit and return the captured stderr. Reaps the tree.
     member this.Finish() : Task<Result<Finished, ProcessError>> =
         task {
+            use _reap = reapGuard ()
             this.StartStdoutStreaming()
             let! outcome = streamOutcome
-            do! host.Teardown()
             Log.exit config.Logger config.Program outcome (elapsed ())
 
             if stderrStreamBuffer.TooLarge then

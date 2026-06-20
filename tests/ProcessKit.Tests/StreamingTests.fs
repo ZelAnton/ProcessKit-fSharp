@@ -2,7 +2,10 @@ namespace ProcessKit.Tests
 
 open System
 open System.Collections.Generic
+open System.Diagnostics
+open System.IO
 open System.Runtime.InteropServices
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
@@ -265,6 +268,56 @@ type StreamingTests() =
 
                 let! message = faultMessage finish
                 Assert.That(message, Is.EqualTo(Some "boom"), "expected Finish to surface the throwing handler")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a faulted terminal verb still reaps the tree``() : Task =
+        task {
+            // An instrumented host whose stdout yields one line (firing a handler that throws) and
+            // whose Teardown records that it ran. A verb that faults mid-flight must still reap.
+            let mutable teardowns = 0
+
+            let makeHost () : RunningHost =
+                let config =
+                    (Command.create "test"
+                     |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom")))
+                        .Config
+
+                { Config = config
+                  Pid = None
+                  Stdout = Some(new MemoryStream(Encoding.UTF8.GetBytes "line1\n") :> Stream)
+                  Stderr = None
+                  Stdin = None
+                  StartTime = DateTime.UtcNow
+                  StartedTimestamp = Stopwatch.GetTimestamp()
+                  Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+                  StartKill = ignore
+                  GracefulKill = fun _ -> Task.CompletedTask
+                  Teardown =
+                    fun () ->
+                        teardowns <- teardowns + 1
+                        ValueTask() }
+
+            let faultsAndReaps (verb: RunningProcess -> Task) =
+                task {
+                    teardowns <- 0
+                    let running = new RunningProcess(makeHost ())
+                    let mutable faulted = false
+
+                    try
+                        do! verb running
+                    with :? InvalidOperationException ->
+                        faulted <- true
+
+                    Assert.That(faulted, Is.True, "the verb should fault on a throwing handler")
+                    Assert.That(teardowns, Is.GreaterThanOrEqualTo 1, "the faulted verb must still reap the tree")
+                }
+
+            // The capture verbs (OnStdoutLine fires through the buffer pump) and Finish (through the
+            // stream-channel pump) all fault on the throwing handler — each must still tear down.
+            do! faultsAndReaps (fun p -> p.OutputString() :> Task)
+            do! faultsAndReaps (fun p -> p.Finish() :> Task)
         }
         :> Task
 
