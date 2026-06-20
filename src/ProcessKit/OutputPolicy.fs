@@ -52,8 +52,7 @@ type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, ov
     member _.Overflow = overflow
 
     /// Retain everything (the default).
-    static member Unbounded() =
-        OutputBufferPolicy(None, None, OverflowMode.DropOldest)
+    static member Unbounded = OutputBufferPolicy(None, None, OverflowMode.DropOldest)
 
     /// Retain at most `maxLines`, dropping the oldest when full.
     static member Bounded(maxLines: int) =
@@ -72,4 +71,4 @@ type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, ov
         OutputBufferPolicy(maxLines, maxBytes, overflow)
 
     /// The default policy: retain everything.
-    static member Default = OutputBufferPolicy.Unbounded()
+    static member Default = OutputBufferPolicy.Unbounded

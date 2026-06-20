@@ -514,7 +514,7 @@ type SupervisorTests() =
             match!
                 Supervisor(Command.create "server")
                     .Restart(RestartPolicy.Never)
-                    .Capture(OutputBufferPolicy.Unbounded())
+                    .Capture(OutputBufferPolicy.Unbounded)
                     .WithRunner(unboundedRunner)
                     .Run()
             with
@@ -570,7 +570,7 @@ type SupervisorTests() =
 
         let failLoud =
             Command.create "server"
-            |> Command.outputBuffer (OutputBufferPolicy.Unbounded().WithOverflow OverflowMode.Error)
+            |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithOverflow OverflowMode.Error)
 
         let policy = Supervision.defaultCapture failLoud
         Assert.That(policy.MaxLines, Is.EqualTo(Some Supervision.DefaultSupervisionTail))

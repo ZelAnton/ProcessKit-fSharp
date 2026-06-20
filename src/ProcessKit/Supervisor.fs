@@ -202,7 +202,7 @@ type Supervisor internal (config: SupervisorConfig) =
         Supervisor({ config with Runner = runner })
 
     /// Bound (or widen) the output captured from each incarnation. The default is a bounded tail;
-    /// pass `OutputBufferPolicy.Unbounded()` to retain everything.
+    /// pass `OutputBufferPolicy.Unbounded` to retain everything.
     member _.Capture(policy: OutputBufferPolicy) =
         ArgumentNullException.ThrowIfNull policy
         Supervisor({ config with Capture = policy })
