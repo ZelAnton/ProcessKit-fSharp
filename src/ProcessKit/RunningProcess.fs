@@ -106,6 +106,16 @@ type RunningProcess internal (host: RunningHost) =
                 stderrLineCount <- stderrLineCount + 1)
         | None -> Task.FromResult(Pump.LineBuffer config.OutputBuffer)
 
+    // Pump one stream's lines through `onLine` until the stream ends — the streaming-verb analogue
+    // of `pumpToBuffer` (which captures to a `LineBuffer` instead). No-op when the stream isn't
+    // piped. The caller owns the sink (a channel writer, a buffer) and any completion signal.
+    let pumpLines (stream: Stream option) encoding tee (onLine: string -> unit) =
+        task {
+            match stream with
+            | Some s -> do! Pump.readLinesUntilDone s encoding tee onLine CancellationToken.None
+            | None -> ()
+        }
+
     let tooLargeError (totalLines: int) (totalBytes: int) =
         ProcessError.OutputTooLarge(
             config.Program,
@@ -345,43 +355,20 @@ type RunningProcess internal (host: RunningHost) =
 
             let stdoutPump =
                 task {
-                    match host.Stdout with
-                    | Some s ->
-                        let onLine (line: string) =
+                    do!
+                        pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
                             config.OnStdoutLine |> Option.iter (fun cb -> cb.Invoke line)
                             stdoutLineCount <- stdoutLineCount + 1
-                            stdoutChannel.Writer.TryWrite line |> ignore
-
-                        do!
-                            Pump.readLinesUntilDone
-                                s
-                                config.StdoutEncoding
-                                config.StdoutTee
-                                onLine
-                                CancellationToken.None
-                    | None -> ()
+                            stdoutChannel.Writer.TryWrite line |> ignore)
 
                     stdoutChannel.Writer.Complete()
                 }
 
             let stderrPump =
-                task {
-                    match host.Stderr with
-                    | Some s ->
-                        let onLine (line: string) =
-                            config.OnStderrLine |> Option.iter (fun cb -> cb.Invoke line)
-                            stderrLineCount <- stderrLineCount + 1
-                            stderrBuffer.Add line
-
-                        do!
-                            Pump.readLinesUntilDone
-                                s
-                                config.StderrEncoding
-                                config.StderrTee
-                                onLine
-                                CancellationToken.None
-                    | None -> ()
-                }
+                pumpLines host.Stderr config.StderrEncoding config.StderrTee (fun line ->
+                    config.OnStderrLine |> Option.iter (fun cb -> cb.Invoke line)
+                    stderrLineCount <- stderrLineCount + 1
+                    stderrBuffer.Add line)
 
             streamOutcome <-
                 task {
@@ -415,42 +402,16 @@ type RunningProcess internal (host: RunningHost) =
             eventStreamingStarted <- true
 
             let stdoutPump =
-                task {
-                    match host.Stdout with
-                    | Some s ->
-                        let onLine (line: string) =
-                            config.OnStdoutLine |> Option.iter (fun cb -> cb.Invoke line)
-                            stdoutLineCount <- stdoutLineCount + 1
-                            eventChannel.Writer.TryWrite(OutputEvent.Stdout(OutputLine line)) |> ignore
-
-                        do!
-                            Pump.readLinesUntilDone
-                                s
-                                config.StdoutEncoding
-                                config.StdoutTee
-                                onLine
-                                CancellationToken.None
-                    | None -> ()
-                }
+                pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
+                    config.OnStdoutLine |> Option.iter (fun cb -> cb.Invoke line)
+                    stdoutLineCount <- stdoutLineCount + 1
+                    eventChannel.Writer.TryWrite(OutputEvent.Stdout(OutputLine line)) |> ignore)
 
             let stderrPump =
-                task {
-                    match host.Stderr with
-                    | Some s ->
-                        let onLine (line: string) =
-                            config.OnStderrLine |> Option.iter (fun cb -> cb.Invoke line)
-                            stderrLineCount <- stderrLineCount + 1
-                            eventChannel.Writer.TryWrite(OutputEvent.Stderr(OutputLine line)) |> ignore
-
-                        do!
-                            Pump.readLinesUntilDone
-                                s
-                                config.StderrEncoding
-                                config.StderrTee
-                                onLine
-                                CancellationToken.None
-                    | None -> ()
-                }
+                pumpLines host.Stderr config.StderrEncoding config.StderrTee (fun line ->
+                    config.OnStderrLine |> Option.iter (fun cb -> cb.Invoke line)
+                    stderrLineCount <- stderrLineCount + 1
+                    eventChannel.Writer.TryWrite(OutputEvent.Stderr(OutputLine line)) |> ignore)
 
             task {
                 let! _ = waitWithTimeout ()

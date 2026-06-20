@@ -171,9 +171,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             backend.Track spawned
             Ok spawned
 
-    /// Spawn `command` into the group and build a `RunningHost`. Disposing the resulting
-    /// `RunningProcess` reaps this whole group (the group is owned by the running process).
-    member internal this.StartInternal(command: Command) : Result<RunningHost, ProcessError> =
+    /// Spawn `command` into the group and build a `RunningHost`. `ownsGroup` decides what disposing
+    /// the resulting `RunningProcess` does: when **true** (a private per-run group) it reaps this
+    /// whole group; when **false** (a shared group) it only detaches this run's I/O — the group owns
+    /// the child's lifetime and reaps it on `Shutdown`/`Dispose`. That ownership choice is the only
+    /// difference between the two start paths, so it lives here as one branch each on `StartKill`,
+    /// `GracefulKill`, and `Teardown`.
+    member private this.BuildHost(command: Command, ownsGroup: bool) : Result<RunningHost, ProcessError> =
         match this.SpawnInto command with
         | Error error -> Error error
         | Ok spawned ->
@@ -185,6 +189,12 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                 Pump.feedStdin source.Source stdinStream true CancellationToken.None |> ignore
             | _ -> ()
 
+            let closeStreams () =
+                // Close the pipe streams (OS handles/fds) before releasing/detaching.
+                spawned.Stdout |> Option.iter (fun s -> s.Dispose())
+                spawned.Stderr |> Option.iter (fun s -> s.Dispose())
+                spawned.Stdin |> Option.iter (fun s -> s.Dispose())
+
             Ok
                 { Config = command.Config
                   Pid = backend.PidOf spawned
@@ -198,56 +208,42 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                   StartTime = DateTime.UtcNow
                   StartedTimestamp = Stopwatch.GetTimestamp()
                   Wait = (fun () -> waitOutcome spawned.Handle)
-                  StartKill = backend.KillTree
-                  GracefulKill = (fun grace -> this.GracefulKillTree grace)
+                  StartKill =
+                    (if ownsGroup then
+                         backend.KillTree
+                     else
+                         (fun () -> backend.KillChild spawned))
+                  GracefulKill =
+                    (if ownsGroup then
+                         (fun grace -> this.GracefulKillTree grace)
+                     else
+                         (fun _ -> task { backend.KillChild spawned } :> Task))
                   Teardown =
                     fun () ->
-                        // Close the pipe streams (OS handles/fds) before releasing the container.
-                        spawned.Stdout |> Option.iter (fun s -> s.Dispose())
-                        spawned.Stderr |> Option.iter (fun s -> s.Dispose())
-                        spawned.Stdin |> Option.iter (fun s -> s.Dispose())
-                        (this :> IDisposable).Dispose()
+                        closeStreams ()
+
+                        if ownsGroup then
+                            // Owned group: closing the run reaps the whole tree.
+                            (this :> IDisposable).Dispose()
+                        else
+                            // Shared group: detach this run's I/O only — the GROUP owns the child's
+                            // lifetime (Shutdown/Dispose reaps it). Stop tracking it — POSIX only
+                            // once its group is empty, so a still-live child stays reapable by the
+                            // group; Windows closes the handle (the Job still contains the tree).
+                            backend.Release spawned
+
                         ValueTask.CompletedTask }
+
+    /// Spawn `command` into the group and build a `RunningHost`. Disposing the resulting
+    /// `RunningProcess` reaps this whole group (the group is owned by the running process).
+    member internal this.StartInternal(command: Command) : Result<RunningHost, ProcessError> =
+        this.BuildHost(command, ownsGroup = true)
 
     /// Spawn `command` into this *shared* group and build a `RunningHost`. Unlike `StartInternal`,
     /// disposing the resulting `RunningProcess` does **not** reap the group — the group owns the
     /// child's lifetime (reaped on `Shutdown`/`Dispose`). Internal — `Start` wraps it.
     member internal this.StartShared(command: Command) : Result<RunningHost, ProcessError> =
-        match this.SpawnInto command with
-        | Error error -> Error error
-        | Ok spawned ->
-            match spawned.Stdin, command.Config.StdinSource with
-            | Some stdinStream, Some source ->
-                Pump.feedStdin source.Source stdinStream true CancellationToken.None |> ignore
-            | _ -> ()
-
-            Ok
-                { Config = command.Config
-                  Pid = backend.PidOf spawned
-                  Stdout = spawned.Stdout
-                  Stderr = spawned.Stderr
-                  Stdin =
-                    (if command.Config.StdinSource.IsSome then
-                         None
-                     else
-                         spawned.Stdin)
-                  StartTime = DateTime.UtcNow
-                  StartedTimestamp = Stopwatch.GetTimestamp()
-                  Wait = (fun () -> waitOutcome spawned.Handle)
-                  StartKill = (fun () -> backend.KillChild spawned)
-                  GracefulKill = (fun _ -> task { backend.KillChild spawned } :> Task)
-                  Teardown =
-                    fun () ->
-                        // Shared group: closing this run's `RunningProcess` detaches its I/O only —
-                        // the GROUP owns the child's lifetime (group Shutdown/Dispose reaps it).
-                        spawned.Stdout |> Option.iter (fun s -> s.Dispose())
-                        spawned.Stderr |> Option.iter (fun s -> s.Dispose())
-                        spawned.Stdin |> Option.iter (fun s -> s.Dispose())
-                        // Stop tracking it — POSIX only once its group is empty, so a still-live
-                        // child stays reapable by the group; Windows closes the handle (the Job
-                        // still contains and will kill the tree).
-                        backend.Release spawned
-                        ValueTask.CompletedTask }
+        this.BuildHost(command, ownsGroup = false)
 
     /// Start `command` into this shared group and return a live `RunningProcess`. The **group** owns
     /// the child's lifetime: disposing the returned process detaches its I/O but does not kill it —
