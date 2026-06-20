@@ -206,7 +206,15 @@ a module. One stage, one confirmation gate.
   non-secret lifecycle facts (pid, outcome, durations, counts).)*
 - **S6 — DI extensions.** A separate `ProcessKit.Extensions.DependencyInjection`
   package: `AddProcessKit` registering `IProcessRunner` (and an `ILogger`-aware runner)
-  for `Microsoft.Extensions.DependencyInjection` consumers.
+  for `Microsoft.Extensions.DependencyInjection` consumers. *(Done — the separate
+  `src/ProcessKit.Extensions.DependencyInjection` project: `AddProcessKit()`
+  (`TryAddSingleton`, so it never clobbers an existing registration) registers a
+  `JobRunner`, wrapped in a `LoggingRunner` when an `ILoggerFactory` is present so
+  DI-resolved runs emit the S5 events. Built/tested in the matrix CI. **Release-wiring
+  follow-up:** the release workflow currently packs only the main `ProcessKit` project;
+  publishing this second package (packing it + declaring its NuGet dependency on
+  `ProcessKit`, in lockstep versions) is a deliberately-deferred deployment task — the
+  package is functionally complete and CI-validated.)*
 
 ## Known limitations (tracked)
 

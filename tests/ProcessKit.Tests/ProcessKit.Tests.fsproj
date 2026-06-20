@@ -3,7 +3,7 @@
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
 		<IsPackable>false</IsPackable>
-		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.DependencyInjection\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
 	</PropertyGroup>
 
 	<!-- F# compile order is significant — list test files in dependency order. -->
@@ -24,11 +24,13 @@
 		<Compile Include="LimitsTests.fs" />
 		<Compile Include="CassetteTests.fs" />
 		<Compile Include="LoggingTests.fs" />
+		<Compile Include="DependencyInjectionTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>
 		<!-- See the library .fsproj: explicit FSharp.Core is required under CPM. -->
 		<PackageReference Include="FSharp.Core" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
 		<PackageReference Include="Microsoft.NET.Test.Sdk" />
 		<PackageReference Include="NUnit" />
@@ -37,6 +39,7 @@
 
 	<ItemGroup>
 		<Reference Include="ProcessKit" />
+		<Reference Include="ProcessKit.Extensions.DependencyInjection" />
 	</ItemGroup>
 
 </Project>
