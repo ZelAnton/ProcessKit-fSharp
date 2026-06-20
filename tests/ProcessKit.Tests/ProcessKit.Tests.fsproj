@@ -17,6 +17,7 @@
 		<Compile Include="TimeoutTests.fs" />
 		<Compile Include="VerbTests.fs" />
 		<Compile Include="PipelineTests.fs" />
+		<Compile Include="SupervisorTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>

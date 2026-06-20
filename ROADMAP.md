@@ -128,7 +128,14 @@ of the phase.
   POSIX-only.)*
 - **M1.7 — Supervision.** `Supervisor` with `RestartPolicy`, backoff + `max_backoff` +
   `jitter`, `max_restarts`, `failure_threshold` / `failure_decay`, `storm_pause`,
-  `stop_when` → `SupervisionOutcome` / `StopReason`.
+  `stop_when` → `SupervisionOutcome` / `StopReason`. *(Done — built entirely on the
+  `IProcessRunner` seam (default `JobRunner`, override with `WithRunner`), so supervision
+  is hermetically testable. Crash = not `ProcessResult.IsSuccess` (exit 0); the
+  `ok_codes`-aware refinement is **deferred** (it is cross-cutting across `Command` /
+  `ProcessResult` / the verbs) and the supervisor picks it up automatically once it lands,
+  since classification routes through `IsSuccess`. Backoff/storm timing uses an internal
+  injectable clock seam — real time by default, a virtual advance-on-sleep clock in tests
+  — so the timing suite is deterministic and instant.)*
 - **M1.8 — Tree control + ergonomics.** `Signal` and
   `ProcessGroup::{signal, suspend, resume, members, adopt}` (the default
   `process-control` feature); sandbox knobs (`inherit_env`, `uid`/`gid`/`groups`,
@@ -185,6 +192,12 @@ Surfaced by the milestone reviews; deferred deliberately because they are intern
   emitting a legacy OEM code page need an explicit `StdoutEncoding`. (Matches upstream.)
 - **POSIX pgid-reuse window.** The process-group teardown has a small reuse window on Unix; cgroup
   v2 (in the `limits` feature, S3) closes it.
+- **`ok_codes` (accepted non-zero exits) not yet ported.** `ProcessResult.IsSuccess` is exit-0 only,
+  so `run`/`probe`/`ensureSuccess` and `Supervisor` `OnCrash` all treat any non-zero exit as a
+  failure. Upstream lets a command accept e.g. `{0, 2}`. This is a cross-cutting addition (`Command`
+  + `ProcessResult` + the verbs) and is additive/non-breaking — `IsSuccess` is the single
+  integration point, so the supervisor honours it automatically once it lands. Targeted for the
+  M1.8 ergonomics pass.
 
 ## Out of scope / deferred
 
