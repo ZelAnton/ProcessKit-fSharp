@@ -198,7 +198,12 @@ a module. One stage, one confirmation gate.
   rule than upstream's eager `from_iter_lines`.)*
 - **S5 — Observability parity.** Complete the `ILogger` event taxonomy to match the
   Rust `tracing` feature (spawn/exit, timeout/cancel, teardown anomalies, retries,
-  supervisor restarts/storm pauses) — argv/env never logged.
+  supervisor restarts/storm pauses) — argv/env never logged. *(Done —
+  `Command.WithLogger(ILogger)` (the `Microsoft.Extensions.Logging.Abstractions`
+  seam, optional and no-op when unset). Events: spawn + exit (Debug), timeout
+  (Warning), retry (Debug), supervisor restart (Debug) + failure-storm pause
+  (Warning). **argv and environment are never emitted** — only the program name and
+  non-secret lifecycle facts (pid, outcome, durations, counts).)*
 - **S6 — DI extensions.** A separate `ProcessKit.Extensions.DependencyInjection`
   package: `AddProcessKit` registering `IProcessRunner` (and an `ILogger`-aware runner)
   for `Microsoft.Extensions.DependencyInjection` consumers.

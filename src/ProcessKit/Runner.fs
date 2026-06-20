@@ -38,6 +38,7 @@ module Runner =
                             && not cancellationToken.IsCancellationRequested
                         then
                             attempt <- attempt + 1
+                            Log.retry command.Config.Logger command.Program attempt delay
                             do! Task.Delay delay
                         else
                             final <- Some(Error error)

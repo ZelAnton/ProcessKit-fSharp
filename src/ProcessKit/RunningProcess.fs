@@ -137,8 +137,12 @@ type RunningProcess internal (host: RunningHost) =
                     | None -> host.StartKill()
 
                     let! _ = waitTask
+                    Log.timeout config.Logger config.Program timeout
                     return Outcome.TimedOut
             }
+
+    // Log the spawn once, at construction.
+    do Log.spawn config.Logger config.Program host.Pid
 
     /// The pid, when known.
     member _.Pid = host.Pid
@@ -194,6 +198,7 @@ type RunningProcess internal (host: RunningHost) =
             let! outBuf = stdoutTask
             let! errBuf = stderrTask
             do! host.Teardown()
+            Log.exit config.Logger config.Program outcome (elapsed ())
 
             if outBuf.TooLarge || errBuf.TooLarge then
                 return
@@ -226,6 +231,7 @@ type RunningProcess internal (host: RunningHost) =
             let! stdoutBytes = stdoutTask
             let! errBuf = stderrTask
             do! host.Teardown()
+            Log.exit config.Logger config.Program outcome (elapsed ())
 
             if errBuf.TooLarge then
                 return Error(tooLargeError errBuf.TotalLines errBuf.TotalBytes)
@@ -262,6 +268,7 @@ type RunningProcess internal (host: RunningHost) =
             do! stdoutTask
             do! stderrTask
             do! host.Teardown()
+            Log.exit config.Logger config.Program outcome (elapsed ())
             return outcome
         }
 
@@ -395,6 +402,7 @@ type RunningProcess internal (host: RunningHost) =
             this.StartStdoutStreaming()
             let! outcome = streamOutcome
             do! host.Teardown()
+            Log.exit config.Logger config.Program outcome (elapsed ())
 
             if stderrStreamBuffer.TooLarge then
                 return Error(tooLargeError stderrStreamBuffer.TotalLines stderrStreamBuffer.TotalBytes)

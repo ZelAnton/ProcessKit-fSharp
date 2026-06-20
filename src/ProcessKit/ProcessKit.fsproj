@@ -34,6 +34,7 @@
 	<ItemGroup>
 		<Compile Include="ProcessError.fs" />
 		<Compile Include="Outcome.fs" />
+		<Compile Include="Log.fs" />
 		<Compile Include="Mechanism.fs" />
 		<Compile Include="Signal.fs" />
 		<Compile Include="Limits.fs" />
@@ -78,6 +79,7 @@
 		     dropped from the dependency graph, so declare it here or the runtime cannot
 		     load FSharp.Core and NUnit discovers zero tests. -->
 		<PackageReference Include="FSharp.Core" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
 		<PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
 	</ItemGroup>
 

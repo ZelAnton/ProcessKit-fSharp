@@ -315,6 +315,7 @@ type Supervisor internal (config: SupervisorConfig) =
 
                         if stormScore > config.FailureThreshold then
                             let jittered = Supervision.applyJitter pause config.Jitter
+                            Log.stormPause config.Command.Config.Logger program jittered
 
                             if jittered > TimeSpan.Zero then
                                 do! config.Sleep jittered cancellationToken
@@ -329,6 +330,7 @@ type Supervisor internal (config: SupervisorConfig) =
                 task {
                     let delay = Supervision.backoffDelay config.BackoffBase factor n config.MaxBackoff
                     let delay = Supervision.applyJitter delay config.Jitter
+                    Log.supervisorRestart config.Command.Config.Logger program (n + 1) delay
 
                     if delay > TimeSpan.Zero then
                         do! config.Sleep delay cancellationToken

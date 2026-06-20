@@ -5,6 +5,7 @@ open System.Collections.Generic
 open System.IO
 open System.Text
 open System.Threading
+open Microsoft.Extensions.Logging
 
 /// The immutable configuration behind a `Command`. Internal — consumers build it through the
 /// `Command` builder; the runner/native layer reads it to spawn.
@@ -31,7 +32,8 @@ type internal CommandConfig =
       Retry: (int * TimeSpan * Func<ProcessError, bool>) option
       UncheckedInPipe: bool
       OkCodes: int list
-      CreateNoWindow: bool }
+      CreateNoWindow: bool
+      Logger: ILogger option }
 
 module internal CommandConfig =
 
@@ -58,7 +60,8 @@ module internal CommandConfig =
           Retry = None
           UncheckedInPipe = false
           OkCodes = [ 0 ]
-          CreateNoWindow = false }
+          CreateNoWindow = false
+          Logger = None }
 
 /// An immutable description of a process to run.
 ///
@@ -271,6 +274,12 @@ type Command internal (config: CommandConfig) =
     member _.CreateNoWindow() =
         Command({ config with CreateNoWindow = true })
 
+    /// Emit structured lifecycle events (spawn / exit / timeout / retry) to `logger`. The program
+    /// name and non-secret facts only — **argv and environment are never logged**.
+    member _.WithLogger(logger: ILogger) =
+        ArgumentNullException.ThrowIfNull logger
+        Command({ config with Logger = Some logger })
+
     /// Inherit the parent's environment (the default). `InheritEnv false` starts the child's
     /// environment empty — the same as `EnvClear`.
     member this.InheritEnv(inheritEnv: bool) =
@@ -360,3 +369,6 @@ module Command =
 
     /// Inherit the parent's environment (the default); `false` starts it empty.
     let inheritEnv (inheritEnv: bool) (command: Command) = command.InheritEnv inheritEnv
+
+    /// Emit structured lifecycle events to `logger` (argv/env never logged).
+    let withLogger (logger: ILogger) (command: Command) = command.WithLogger logger
