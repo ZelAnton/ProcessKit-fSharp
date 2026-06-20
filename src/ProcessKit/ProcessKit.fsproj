@@ -35,6 +35,7 @@
 		<Compile Include="ProcessError.fs" />
 		<Compile Include="Outcome.fs" />
 		<Compile Include="Mechanism.fs" />
+		<Compile Include="Signal.fs" />
 		<Compile Include="ProcessResult.fs" />
 		<Compile Include="OutputPolicy.fs" />
 		<Compile Include="OutputEvent.fs" />

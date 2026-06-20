@@ -365,6 +365,75 @@ module internal Native =
             GetExitCodeProcess(hProcess, &code) |> ignore
             Outcome.Exited(int code))
 
+    /// Hard-kill one Windows process (not its descendants — for that, terminate the whole Job).
+    let terminateWindowsProcess (hProcess: nativeint) =
+        TerminateProcess(hProcess, 1u) |> ignore
+
+    // Tree introspection / suspend-resume for the `process-control` surface.
+    [<Literal>]
+    let private JobObjectBasicProcessIdList = 3
+
+    [<Literal>]
+    let private PROCESS_SUSPEND_RESUME = 0x0800u
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private QueryInformationJobObject(
+        nativeint hJob,
+        int infoClass,
+        nativeint lpInfo,
+        uint32 cbInfo,
+        uint32& returnLength
+    )
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern nativeint private OpenProcess(uint32 dwDesiredAccess, bool bInheritHandle, uint32 dwProcessId)
+
+    // NtSuspendProcess/NtResumeProcess freeze/thaw every thread of a process in one call. They are
+    // undocumented ntdll entry points but stable and the standard way to suspend a whole process;
+    // the documented alternative (snapshot every thread + SuspendThread) is far more code.
+    [<DllImport("ntdll.dll")>]
+    extern int private NtSuspendProcess(nativeint hProcess)
+
+    [<DllImport("ntdll.dll")>]
+    extern int private NtResumeProcess(nativeint hProcess)
+
+    /// Snapshot the pids assigned to a Job Object (the whole contained tree). A point-in-time view;
+    /// a process can exit immediately after. Caps at 1024 members (ample for a diagnostic snapshot).
+    let membersWindows (job: nativeint) : int list =
+        let capacity = 1024
+        let headerSize = 8 // two DWORDs: NumberOfAssignedProcesses, NumberOfProcessIdsInList
+        let size = headerSize + capacity * IntPtr.Size
+        let buffer = Marshal.AllocHGlobal size
+
+        try
+            let mutable returnLength = 0u
+
+            if QueryInformationJobObject(job, JobObjectBasicProcessIdList, buffer, uint32 size, &returnLength) then
+                let count = min (Marshal.ReadInt32(buffer, 4)) capacity
+
+                [ for i in 0 .. count - 1 -> int (Marshal.ReadIntPtr(buffer, headerSize + i * IntPtr.Size)) ]
+            else
+                []
+        finally
+            Marshal.FreeHGlobal buffer
+
+    // Suspend / resume every member process of a Job. Best-effort and not atomic: a process can
+    // spawn between the snapshot and the suspend; Windows keeps per-thread suspend counts, so nested
+    // suspends stack and need matching resumes (unlike the level-triggered POSIX SIGSTOP/SIGCONT).
+    let private forEachMemberHandle (job: nativeint) (action: nativeint -> unit) =
+        for pid in membersWindows job do
+            let handle = OpenProcess(PROCESS_SUSPEND_RESUME, false, uint32 pid)
+
+            if handle <> IntPtr.Zero then
+                action handle
+                CloseHandle handle |> ignore
+
+    let suspendWindows (job: nativeint) =
+        forEachMemberHandle job (fun handle -> NtSuspendProcess handle |> ignore)
+
+    let resumeWindows (job: nativeint) =
+        forEachMemberHandle job (fun handle -> NtResumeProcess handle |> ignore)
+
     let private buildWindowsEnvironment (command: Command) : nativeint =
         if not command.Config.ClearEnv && List.isEmpty command.Config.EnvOverrides then
             IntPtr.Zero
@@ -639,6 +708,32 @@ module internal Native =
 
     /// True while any process remains in the group (signal 0 probes existence).
     let processGroupAlive (pgid: int) = killpg (pgid, 0) = 0
+
+    // SIGSTOP / SIGCONT numbers differ between Linux and the BSD/macOS table (so do SIGUSR1/2);
+    // resolve them per-platform.
+    let private sigStop = if isMacOs then 17 else 19
+    let private sigCont = if isMacOs then 19 else 18
+
+    /// The raw POSIX signal number for a portable `Signal`, resolved for the current platform.
+    let signalNumber (signal: Signal) : int =
+        match signal with
+        | Signal.Term -> SIGTERM
+        | Signal.Kill -> SIGKILL
+        | Signal.Int -> 2
+        | Signal.Hup -> 1
+        | Signal.Quit -> 3
+        | Signal.Usr1 -> if isMacOs then 30 else 10
+        | Signal.Usr2 -> if isMacOs then 31 else 12
+        | Signal.Other n -> n
+
+    /// Broadcast a raw signal to a POSIX process group; `true` if the send was accepted.
+    let signalProcessGroup (pgid: int) (signalNum: int) : bool = killpg (pgid, signalNum) = 0
+
+    /// Freeze a POSIX process group (SIGSTOP).
+    let suspendProcessGroup (pgid: int) = killpg (pgid, sigStop) |> ignore
+
+    /// Thaw a POSIX process group (SIGCONT).
+    let resumeProcessGroup (pgid: int) = killpg (pgid, sigCont) |> ignore
 
     // Create a pipe whose ends are close-on-exec so a *different* concurrent spawn does not
     // inherit this run's pipe ends (which outlive the spawn). Linux sets it atomically with

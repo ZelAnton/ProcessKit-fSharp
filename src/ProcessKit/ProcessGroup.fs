@@ -40,35 +40,80 @@ type internal PipelineCapture =
 [<Sealed>]
 type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
 
-    // Windows: pgid unused, processHandles are the children's process handles (several for a
-    // shared group, e.g. a pipeline). POSIX: jobHandle/processHandles unused, pgid records the
-    // first spawned child's pgid (0 until spawned).
-    let mutable pgid = 0
+    // The contained children, tracked so the whole tree can be signalled / killed. Windows: each
+    // child's process handle (closed on reap or group teardown). POSIX: each child's pgid — every
+    // `posix_spawn` makes its *own* process group, so a multi-child group (e.g. a pipeline) holds
+    // several. Guarded by `childLock` because shared-group runs spawn and reap concurrently.
+    let childLock = obj ()
     let processHandles = System.Collections.Generic.List<nativeint>()
+    let childPgids = System.Collections.Generic.List<int>()
     // 0 = live, 1 = released. Interlocked so Dispose/DisposeAsync/Shutdown/finalizer run the
-    // teardown exactly once and never signal a handle or pgid after it has been released.
+    // teardown exactly once.
     let mutable releasedFlag = 0
+
+    let pgidSnapshot () =
+        lock childLock (fun () -> List.ofSeq childPgids)
+
+    let trackChild (spawned: Native.Spawned) =
+        lock childLock (fun () ->
+            match mechanism with
+            | Mechanism.JobObject -> processHandles.Add spawned.Handle
+            | _ -> childPgids.Add(int spawned.Handle))
+
+    // Stop tracking a *reaped* child. Windows: close its process handle (removing it first so the
+    // group teardown will not double-close a possibly-reused handle value); the Job still contains
+    // the tree. POSIX: a pgid is a whole *group*, and the reaped leader may have left backgrounded
+    // members behind — only stop tracking once the group is actually empty, so Shutdown/Dispose can
+    // still reap lingering members.
+    let releaseChild (spawned: Native.Spawned) =
+        match mechanism with
+        | Mechanism.JobObject ->
+            let wasTracked = lock childLock (fun () -> processHandles.Remove spawned.Handle)
+
+            if wasTracked then
+                Native.closeWindowsHandle spawned.Handle
+        | _ ->
+            let pgid = int spawned.Handle
+
+            if not (Native.processGroupAlive pgid) then
+                lock childLock (fun () -> childPgids.Remove pgid |> ignore)
+
+    // Hard-kill a single contained child (not the whole group): its own pgid on POSIX, the lone
+    // process on Windows (its descendants stay in the shared Job).
+    let killChild (spawned: Native.Spawned) =
+        match mechanism with
+        | Mechanism.JobObject -> Native.terminateWindowsProcess spawned.Handle
+        | _ -> Native.killProcessGroup (int spawned.Handle)
+
+    let anyChildAlive () =
+        pgidSnapshot () |> List.exists Native.processGroupAlive
 
     let killContainedTree () =
         match mechanism with
         | Mechanism.JobObject -> Native.terminateWindowsJob jobHandle
         | _ ->
-            if pgid <> 0 then
+            for pgid in pgidSnapshot () do
                 Native.killProcessGroup pgid
 
     // The hard teardown, run exactly once by whoever wins `releasedFlag`. On Windows, closing the
     // job handle triggers KILL_ON_JOB_CLOSE; a POSIX process group is not a closable object, so
     // SIGKILL reaps any survivors. (The pgid-reuse hazard is closed by cgroup v2 in the limits
-    // feature.) The child's process handle (Windows) is closed here too.
+    // feature.) Any still-tracked child process handles (Windows) are closed here too.
     let hardRelease () =
         match mechanism with
         | Mechanism.JobObject ->
-            for handle in processHandles do
+            let handles =
+                lock childLock (fun () ->
+                    let copy = List.ofSeq processHandles
+                    processHandles.Clear()
+                    copy)
+
+            for handle in handles do
                 Native.closeWindowsHandle handle
 
             Native.closeWindowsHandle jobHandle
         | _ ->
-            if pgid <> 0 then
+            for pgid in pgidSnapshot () do
                 Native.killProcessGroup pgid
 
     let releaseContainer () =
@@ -90,7 +135,7 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
             | Ok job -> Ok(new ProcessGroup(Mechanism.JobObject, job))
             | Error error -> Error error
         else
-            // The POSIX group forms when the first child is spawned (its pid becomes the pgid).
+            // The POSIX group forms when children are spawned (each becomes its own pgid).
             Ok(new ProcessGroup(Mechanism.ProcessGroup, IntPtr.Zero))
 
     /// Wait for one contained process handle to conclude. Internal — used by pipeline staging.
@@ -100,7 +145,7 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
     /// pipeline cancellation/timeout.
     member internal _.KillTree() = killContainedTree ()
 
-    /// Spawn `command` into the group, recording the pgid / process handle. Internal.
+    /// Spawn `command` into the group, tracking the child for signalling / teardown. Internal.
     member internal _.SpawnInto(command: Command) : Result<Native.Spawned, ProcessError> =
         let spawn =
             match mechanism with
@@ -110,10 +155,7 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
         match spawn with
         | Error error -> Error error
         | Ok spawned ->
-            match mechanism with
-            | Mechanism.JobObject -> processHandles.Add spawned.Handle
-            | _ -> pgid <- int spawned.Handle
-
+            trackChild spawned
             Ok spawned
 
     /// Spawn `command` into the group and build a `RunningHost`. Disposing the resulting
@@ -159,6 +201,117 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                         (this :> IDisposable).Dispose()
                         ValueTask.CompletedTask }
 
+    /// Spawn `command` into this *shared* group and build a `RunningHost`. Unlike `StartInternal`,
+    /// disposing the resulting `RunningProcess` does **not** reap the group — the group owns the
+    /// child's lifetime (reaped on `Shutdown`/`Dispose`). Internal — `Start` wraps it.
+    member internal this.StartShared(command: Command) : Result<RunningHost, ProcessError> =
+        match this.SpawnInto command with
+        | Error error -> Error error
+        | Ok spawned ->
+            match spawned.Stdin, command.Config.StdinSource with
+            | Some stdinStream, Some source ->
+                Pump.feedStdin source.Source stdinStream true CancellationToken.None |> ignore
+            | _ -> ()
+
+            let pid =
+                match mechanism with
+                | Mechanism.JobObject -> Some(Native.processIdWindows spawned.Handle)
+                | _ -> Some(int spawned.Handle)
+
+            Ok
+                { Config = command.Config
+                  Pid = pid
+                  Stdout = spawned.Stdout
+                  Stderr = spawned.Stderr
+                  Stdin =
+                    (if command.Config.StdinSource.IsSome then
+                         None
+                     else
+                         spawned.Stdin)
+                  StartTime = DateTime.UtcNow
+                  StartedTimestamp = Stopwatch.GetTimestamp()
+                  Wait = (fun () -> waitOutcome spawned.Handle)
+                  StartKill = (fun () -> killChild spawned)
+                  GracefulKill = (fun _ -> task { killChild spawned } :> Task)
+                  Teardown =
+                    fun () ->
+                        // Shared group: closing this run's `RunningProcess` detaches its I/O only —
+                        // the GROUP owns the child's lifetime (group Shutdown/Dispose reaps it).
+                        spawned.Stdout |> Option.iter (fun s -> s.Dispose())
+                        spawned.Stderr |> Option.iter (fun s -> s.Dispose())
+                        spawned.Stdin |> Option.iter (fun s -> s.Dispose())
+                        // Stop tracking it — POSIX only once its group is empty, so a still-live
+                        // child stays reapable by the group; Windows closes the handle (the Job
+                        // still contains and will kill the tree).
+                        releaseChild spawned
+                        ValueTask.CompletedTask }
+
+    /// Start `command` into this shared group and return a live `RunningProcess`. The **group** owns
+    /// the child's lifetime: disposing the returned process detaches its I/O but does not kill it —
+    /// reap the tree with `Shutdown`/`Dispose`, or this one run with its `StartKill`.
+    member this.Start(command: Command) : Task<Result<RunningProcess, ProcessError>> =
+        task {
+            match this.StartShared command with
+            | Error error -> return Error error
+            | Ok host -> return Ok(RunningProcess host)
+        }
+
+    /// Immediately hard-kill every process currently in the group. Idempotent; the group stays
+    /// usable for further spawns.
+    member _.TerminateAll() = killContainedTree ()
+
+    /// The pids of the processes currently in the group — a point-in-time snapshot. On Windows the
+    /// whole Job tree; on the POSIX fallback the tracked group leaders (one per spawned child).
+    member _.Members() : int list =
+        match mechanism with
+        | Mechanism.JobObject -> Native.membersWindows jobHandle
+        | _ -> pgidSnapshot ()
+
+    /// Broadcast `signal` to every process in the group. Best-effort: an exited member is skipped
+    /// and an empty group succeeds trivially. On **Windows** only `Signal.Kill` is deliverable (it
+    /// maps to the Job terminate); any other signal returns `ProcessError.Unsupported`.
+    member _.Signal(signal: Signal) : Result<unit, ProcessError> =
+        match mechanism with
+        | Mechanism.JobObject ->
+            match signal with
+            | Signal.Kill ->
+                Native.terminateWindowsJob jobHandle
+                Ok()
+            | _ -> Error(ProcessError.Unsupported $"signal {signal} on Windows (only Signal.Kill is deliverable)")
+        | _ ->
+            let signalNum = Native.signalNumber signal
+
+            for pgid in pgidSnapshot () do
+                Native.signalProcessGroup pgid signalNum |> ignore
+
+            Ok()
+
+    /// Suspend (freeze) every process in the group. POSIX: `SIGSTOP` (level-triggered, idempotent).
+    /// Windows: suspend every thread of every member — best-effort, and suspend counts stack, so N
+    /// `Suspend`s need N `Resume`s.
+    member _.Suspend() : Result<unit, ProcessError> =
+        match mechanism with
+        | Mechanism.JobObject ->
+            Native.suspendWindows jobHandle
+            Ok()
+        | _ ->
+            for pgid in pgidSnapshot () do
+                Native.suspendProcessGroup pgid
+
+            Ok()
+
+    /// Resume a tree suspended by `Suspend`.
+    member _.Resume() : Result<unit, ProcessError> =
+        match mechanism with
+        | Mechanism.JobObject ->
+            Native.resumeWindows jobHandle
+            Ok()
+        | _ ->
+            for pgid in pgidSnapshot () do
+                Native.resumeProcessGroup pgid
+
+            Ok()
+
     /// Spawn `command` into the group, capture stdout/stderr to completion, and reap it. Does
     /// **not** release the group (the caller keeps it for `Shutdown`/`Dispose`). A cancelled token
     /// terminates the whole tree and resolves to `ProcessError.Cancelled`.
@@ -173,7 +326,13 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                 | Error error -> return Error error
                 | Ok spawned ->
                     let startedAt = Stopwatch.GetTimestamp()
-                    use _registration = cancellationToken.Register(fun () -> killContainedTree ())
+                    use _registration = cancellationToken.Register(fun () -> killChild spawned)
+
+                    // Feed a stdin source, then close stdin (EOF) — a source is the child's full input.
+                    match spawned.Stdin, command.Config.StdinSource with
+                    | Some stdinStream, Some source ->
+                        Pump.feedStdin source.Source stdinStream true CancellationToken.None |> ignore
+                    | _ -> ()
 
                     let stdoutTask =
                         match spawned.Stdout with
@@ -191,6 +350,9 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                     spawned.Stdout |> Option.iter (fun s -> s.Dispose())
                     spawned.Stderr |> Option.iter (fun s -> s.Dispose())
                     spawned.Stdin |> Option.iter (fun s -> s.Dispose())
+                    // The child is reaped: stop tracking it (close its Windows handle) so a long-lived
+                    // shared group does not accumulate handles/pgids across many captured runs.
+                    releaseChild spawned
                     let duration = Stopwatch.GetElapsedTime startedAt
 
                     if cancellationToken.IsCancellationRequested then
@@ -212,15 +374,20 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
             match mechanism with
             | Mechanism.JobObject -> Native.terminateWindowsJob jobHandle
             | _ ->
-                if pgid <> 0 then
-                    Native.terminateProcessGroup pgid
+                let pgids = pgidSnapshot ()
+
+                if not (List.isEmpty pgids) then
+                    for pgid in pgids do
+                        Native.terminateProcessGroup pgid
+
                     let stopwatch = Stopwatch.StartNew()
 
-                    while Native.processGroupAlive pgid && stopwatch.Elapsed < grace do
+                    while anyChildAlive () && stopwatch.Elapsed < grace do
                         do! Task.Delay 50
 
-                    if Native.processGroupAlive pgid then
-                        Native.killProcessGroup pgid
+                    for pgid in pgids do
+                        if Native.processGroupAlive pgid then
+                            Native.killProcessGroup pgid
         }
         :> Task
 
@@ -232,15 +399,20 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                 match mechanism with
                 | Mechanism.JobObject -> Native.terminateWindowsJob jobHandle
                 | _ ->
-                    if pgid <> 0 then
-                        Native.terminateProcessGroup pgid
+                    let pgids = pgidSnapshot ()
+
+                    if not (List.isEmpty pgids) then
+                        for pgid in pgids do
+                            Native.terminateProcessGroup pgid
+
                         let stopwatch = Stopwatch.StartNew()
 
-                        while Native.processGroupAlive pgid && stopwatch.Elapsed < gracePeriod do
+                        while anyChildAlive () && stopwatch.Elapsed < gracePeriod do
                             do! Task.Delay 50
 
-                        if Native.processGroupAlive pgid then
-                            Native.killProcessGroup pgid
+                        for pgid in pgids do
+                            if Native.processGroupAlive pgid then
+                                Native.killProcessGroup pgid
 
                 hardRelease ()
                 GC.SuppressFinalize this
@@ -405,6 +577,58 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
     // The finalizer is the GC-time safety net for a group that was never disposed: it reaps the
     // tree. Deterministic teardown still comes from `use`/`Dispose`.
     override _.Finalize() = releaseContainer ()
+
+    // A `ProcessGroup` is itself an `IProcessRunner` — every run goes into THIS shared group rather
+    // than a fresh private one, so a whole fleet shares one kill-on-dispose container (pass it to
+    // `Supervisor.WithRunner`). Captured runs decode stdout with the command's encoding; they do not
+    // apply the line-level `OutputBufferPolicy` or the per-run `Command.Timeout` (cancellation still
+    // works) — use `Start` + the `RunningProcess` verbs, or the default `JobRunner`, for those.
+    interface IProcessRunner with
+        member this.Start(command, cancellationToken) =
+            task {
+                if cancellationToken.IsCancellationRequested then
+                    return Error(ProcessError.Cancelled command.Program)
+                else
+                    return! this.Start command
+            }
+
+        member this.OutputString(command, cancellationToken) =
+            task {
+                match! this.SpawnAndCapture(command, cancellationToken) with
+                | Error error -> return Error error
+                | Ok captured ->
+                    let text = command.Config.StdoutEncoding.GetString captured.Stdout
+
+                    return
+                        Ok(
+                            ProcessResult<string>(
+                                command.Program,
+                                text,
+                                captured.Stderr,
+                                captured.Outcome,
+                                captured.Duration,
+                                false
+                            )
+                        )
+            }
+
+        member this.OutputBytes(command, cancellationToken) =
+            task {
+                match! this.SpawnAndCapture(command, cancellationToken) with
+                | Error error -> return Error error
+                | Ok captured ->
+                    return
+                        Ok(
+                            ProcessResult<byte[]>(
+                                command.Program,
+                                captured.Stdout,
+                                captured.Stderr,
+                                captured.Outcome,
+                                captured.Duration,
+                                false
+                            )
+                        )
+            }
 
     interface IDisposable with
         member this.Dispose() =

@@ -24,11 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shell-free pipelines: `Command.Pipe(next)` builds a `Pipeline` that wires each stage's stdout into the next stage's stdin, running the whole chain in one kill-on-dispose group. The same verbs as a single command (`Run`/`RunUnit`/`OutputString`/`OutputBytes`/`ExitCode`/`Probe`/`Parse`/`TryParse`) plus `Pipeline.Timeout`/`CancelOn`. The exit status follows shell **pipefail** (the rightmost checked stage that did not exit 0 decides the result); `Command.UncheckedInPipe()` lets a stage fail without failing the pipeline.
 - Completed the `Command` convenience verbs: `RunUnit`/`ExitCode`/`Probe` now sit alongside `Run`/`OutputString`/`OutputBytes`, and every convenience verb has a `CancellationToken` overload.
 - `Supervisor` — keep a command alive with policy-driven restarts: `RestartPolicy` (`Always`/`OnCrash`/`Never`), exponential `Backoff` + `MaxBackoff` + `Jitter`, `MaxRestarts`, a failure-storm guard (`StormPause` + `FailureThreshold` + `FailureDecay`), and a `StopWhen` predicate, reporting a `SupervisionOutcome` (`FinalResult`/`Restarts`/`Stopped`/`StormPauses`) with `StopReason`. Runs through any `IProcessRunner` (`WithRunner`) so supervision is testable without spawning processes.
+- Process-tree control on `ProcessGroup`: `Signal` (the portable `Signal` type — `Term`/`Kill`/`Int`/`Hup`/`Quit`/`Usr1`/`Usr2`/`Other`; Windows delivers only `Kill`), `Suspend`/`Resume` (freeze/thaw the whole tree), `Members` (a pid snapshot), and `TerminateAll`.
+- `ProcessGroup` now implements `IProcessRunner` (`Start`/`OutputString`/`OutputBytes`): every run goes into that one shared kill-on-dispose group, so a fleet can share a container — e.g. `Supervisor.WithRunner(group)`. `ProcessGroup.Start` returns a `RunningProcess` whose lifetime the group owns.
 
 ### Changed
 -
 
 ### Fixed
--
+- POSIX containment now reaps **every** child of a multi-child group (e.g. a pipeline), not just the last. Each `posix_spawn` forms its own process group, so the group tracks all of them; previously only the most-recent pgid was killed, letting an earlier long-running stage linger until its natural exit.
 
 [Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/commits/main
