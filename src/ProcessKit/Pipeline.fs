@@ -89,7 +89,8 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                             stage.Stderr,
                             stage.Outcome,
                             capture.Duration,
-                            false
+                            false,
+                            [ 0 ]
                         )
                     )
         }
@@ -106,7 +107,17 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                 let text = encoding.GetString capture.LastStdout
 
                 return
-                    Ok(ProcessResult<string>(stage.Program, text, stage.Stderr, stage.Outcome, capture.Duration, false))
+                    Ok(
+                        ProcessResult<string>(
+                            stage.Program,
+                            text,
+                            stage.Stderr,
+                            stage.Outcome,
+                            capture.Duration,
+                            false,
+                            [ 0 ]
+                        )
+                    )
         }
 
     /// Require a successful pipefail exit and return the last stage's stdout, trailing whitespace

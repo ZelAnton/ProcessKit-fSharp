@@ -55,7 +55,8 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
                     reply.StderrText,
                     reply.Outcome,
                     TimeSpan.Zero,
-                    false
+                    false,
+                    command.Config.OkCodes
                 )
 
             Task.FromResult(Ok result)
@@ -78,7 +79,8 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
                     reply.StderrText,
                     reply.Outcome,
                     TimeSpan.Zero,
-                    false
+                    false,
+                    command.Config.OkCodes
                 )
 
             Task.FromResult(Ok result)

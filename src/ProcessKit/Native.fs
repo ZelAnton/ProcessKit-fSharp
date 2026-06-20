@@ -107,6 +107,9 @@ module internal Native =
     let private CREATE_UNICODE_ENVIRONMENT = 0x00000400u
 
     [<Literal>]
+    let private CREATE_NO_WINDOW = 0x08000000u
+
+    [<Literal>]
     let private STARTF_USESTDHANDLES = 0x00000100u
 
     [<Literal>]
@@ -518,6 +521,7 @@ module internal Native =
                      0u
                  else
                      CREATE_UNICODE_ENVIRONMENT)
+            ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
 
         let created =
             CreateProcessW(

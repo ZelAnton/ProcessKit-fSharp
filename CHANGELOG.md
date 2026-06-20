@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Supervisor` — keep a command alive with policy-driven restarts: `RestartPolicy` (`Always`/`OnCrash`/`Never`), exponential `Backoff` + `MaxBackoff` + `Jitter`, `MaxRestarts`, a failure-storm guard (`StormPause` + `FailureThreshold` + `FailureDecay`), and a `StopWhen` predicate, reporting a `SupervisionOutcome` (`FinalResult`/`Restarts`/`Stopped`/`StormPauses`) with `StopReason`. Runs through any `IProcessRunner` (`WithRunner`) so supervision is testable without spawning processes.
 - Process-tree control on `ProcessGroup`: `Signal` (the portable `Signal` type — `Term`/`Kill`/`Int`/`Hup`/`Quit`/`Usr1`/`Usr2`/`Other`; Windows delivers only `Kill`), `Suspend`/`Resume` (freeze/thaw the whole tree), `Members` (a pid snapshot), and `TerminateAll`.
 - `ProcessGroup` now implements `IProcessRunner` (`Start`/`OutputString`/`OutputBytes`): every run goes into that one shared kill-on-dispose group, so a fleet can share a container — e.g. `Supervisor.WithRunner(group)`. `ProcessGroup.Start` returns a `RunningProcess` whose lifetime the group owns.
+- `Command.OkCodes(codes)` — treat the given exit codes (in addition to `0`) as success, widening `ProcessResult.IsSuccess` (also exposed as `AcceptedCodes`), `ensureSuccess`, the `Run` verbs, and `Supervisor` crash classification. `Command.CreateNoWindow()` (Windows `CREATE_NO_WINDOW`) and `Command.InheritEnv(bool)`.
+- `CliClient` — a reusable handle to one program with shared defaults (timeout, environment, working directory, cancellation): build configured `Command`s for argument lists, or run them through the client's runner.
+- Top-level `Exec` conveniences: `Exec.run` / `Exec.outputString` (run a program by name), and `Exec.outputAll` / `Exec.outputAllBytes` (run a batch of commands with bounded concurrency, collecting every result in input order).
 
 ### Changed
 -

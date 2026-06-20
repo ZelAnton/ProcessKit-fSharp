@@ -167,7 +167,8 @@ type RunningProcess internal (host: RunningHost) =
                             errBuf.Text,
                             outcome,
                             elapsed (),
-                            outBuf.Truncated || errBuf.Truncated
+                            outBuf.Truncated || errBuf.Truncated,
+                            config.OkCodes
                         )
                     )
         }
@@ -197,7 +198,8 @@ type RunningProcess internal (host: RunningHost) =
                             errBuf.Text,
                             outcome,
                             elapsed (),
-                            errBuf.Truncated
+                            errBuf.Truncated,
+                            config.OkCodes
                         )
                     )
         }

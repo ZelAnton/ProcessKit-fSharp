@@ -142,6 +142,20 @@ of the phase.
   `setsid`, `create_no_window`, `keep_stdin_open`, `kill_on_parent_death`);
   `CliClient` + `IntoCommand`; batch `output_all` / `output_all_bytes`; top-level
   `run` / `output_string`. Optional `ILogger` plumbing wired through the lifecycle.
+  *(Done, in two parts. **M1.8a (process control):** the `Signal` type and
+  `ProcessGroup.Signal`/`Suspend`/`Resume`/`Members`/`TerminateAll`; `ProcessGroup`
+  became an `IProcessRunner` (shared-group `Start`/`OutputString`/`OutputBytes`),
+  which completes `Supervisor.WithRunner(group)`; and a fix so POSIX reaps every
+  child of a multi-child group (each `posix_spawn` forms its own pgid). **M1.8b
+  (ergonomics):** `Command.OkCodes` (now `ProcessResult.IsSuccess`/`ensureSuccess`/
+  `Supervisor` honour accepted exit codes), `CreateNoWindow`, `InheritEnv`,
+  `CliClient`, top-level `Exec.run`/`outputString`, and bounded-concurrency
+  `Exec.outputAll`/`outputAllBytes`. **Deferred (tracked):** `adopt` and the
+  `uid`/`gid`/`groups`/`setsid`/`kill_on_parent_death` sandbox knobs all need
+  `fork`+`exec` (not `posix_spawn`) and are privilege/platform-gated, so they are
+  untestable in unprivileged CI; `IntoCommand` + the `cli_client!` macro are
+  Rust-isms; and the optional `ILogger` plumbing lands in **S5** (its dedicated
+  observability milestone).)*
 
 → **Phase 1 confirmation gate.**
 
@@ -192,12 +206,12 @@ Surfaced by the milestone reviews; deferred deliberately because they are intern
   emitting a legacy OEM code page need an explicit `StdoutEncoding`. (Matches upstream.)
 - **POSIX pgid-reuse window.** The process-group teardown has a small reuse window on Unix; cgroup
   v2 (in the `limits` feature, S3) closes it.
-- **`ok_codes` (accepted non-zero exits) not yet ported.** `ProcessResult.IsSuccess` is exit-0 only,
-  so `run`/`probe`/`ensureSuccess` and `Supervisor` `OnCrash` all treat any non-zero exit as a
-  failure. Upstream lets a command accept e.g. `{0, 2}`. This is a cross-cutting addition (`Command`
-  + `ProcessResult` + the verbs) and is additive/non-breaking — `IsSuccess` is the single
-  integration point, so the supervisor honours it automatically once it lands. Targeted for the
-  M1.8 ergonomics pass.
+- **Privileged sandbox knobs and `adopt` deferred.** `ProcessGroup.adopt` and the
+  `uid`/`gid`/`groups`/`setsid`/`kill_on_parent_death` knobs need `fork`+`exec` (a child `pre_exec`
+  hook) rather than `posix_spawn`, and are privilege/platform-gated, so they cannot run in
+  unprivileged CI. They are additive when added later. (`create_no_window`, `inherit_env`, and
+  `keep_stdin_open` shipped in M1.8; `ok_codes` shipped and is honoured by `IsSuccess`/`ensureSuccess`/
+  `Supervisor`.)
 
 ## Out of scope / deferred
 

@@ -29,7 +29,9 @@ type internal CommandConfig =
       TimeoutGrace: TimeSpan option
       CancelOn: CancellationToken option
       Retry: (int * TimeSpan * Func<ProcessError, bool>) option
-      UncheckedInPipe: bool }
+      UncheckedInPipe: bool
+      OkCodes: int list
+      CreateNoWindow: bool }
 
 module internal CommandConfig =
 
@@ -54,7 +56,9 @@ module internal CommandConfig =
           TimeoutGrace = None
           CancelOn = None
           Retry = None
-          UncheckedInPipe = false }
+          UncheckedInPipe = false
+          OkCodes = [ 0 ]
+          CreateNoWindow = false }
 
 /// An immutable description of a process to run.
 ///
@@ -251,6 +255,30 @@ type Command internal (config: CommandConfig) =
     member _.UncheckedInPipe() =
         Command({ config with UncheckedInPipe = true })
 
+    /// Treat these exit codes (in addition to `0`) as success — widening `ProcessResult.IsSuccess`,
+    /// `ensureSuccess`, and the `Run` verbs. An empty set resets to the default `{0}`.
+    member _.OkCodes(codes: seq<int>) =
+        ArgumentNullException.ThrowIfNull codes
+        let list = List.ofSeq codes
+
+        Command(
+            { config with
+                OkCodes = (if List.isEmpty list then [ 0 ] else list) }
+        )
+
+    /// Windows: run the child with `CREATE_NO_WINDOW`, so a console child spawned from a GUI app
+    /// does not flash a console window. No effect on Unix.
+    member _.CreateNoWindow() =
+        Command({ config with CreateNoWindow = true })
+
+    /// Inherit the parent's environment (the default). `InheritEnv false` starts the child's
+    /// environment empty — the same as `EnvClear`.
+    member this.InheritEnv(inheritEnv: bool) =
+        if inheritEnv then
+            Command({ config with ClearEnv = false })
+        else
+            Command({ config with ClearEnv = true })
+
 /// Pipe-friendly functions over `Command`, mirroring the instance methods.
 [<RequireQualifiedAccess>]
 module Command =
@@ -323,3 +351,12 @@ module Command =
 
     /// Inside a pipeline, allow this stage to exit non-zero without failing the pipeline.
     let uncheckedInPipe (command: Command) = command.UncheckedInPipe()
+
+    /// Treat these exit codes (in addition to `0`) as success.
+    let okCodes (codes: seq<int>) (command: Command) = command.OkCodes codes
+
+    /// Windows: run the child with `CREATE_NO_WINDOW` (no effect on Unix).
+    let createNoWindow (command: Command) = command.CreateNoWindow()
+
+    /// Inherit the parent's environment (the default); `false` starts it empty.
+    let inheritEnv (inheritEnv: bool) (command: Command) = command.InheritEnv inheritEnv

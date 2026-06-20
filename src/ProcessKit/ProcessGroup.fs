@@ -607,7 +607,8 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                                 captured.Stderr,
                                 captured.Outcome,
                                 captured.Duration,
-                                false
+                                false,
+                                command.Config.OkCodes
                             )
                         )
             }
@@ -625,7 +626,8 @@ type ProcessGroup private (mechanism: Mechanism, jobHandle: nativeint) =
                                 captured.Stderr,
                                 captured.Outcome,
                                 captured.Duration,
-                                false
+                                false,
+                                command.Config.OkCodes
                             )
                         )
             }

@@ -9,7 +9,16 @@ open System
 /// captured-stdout type: `string` for the text verbs, `byte[]` for the bytes verbs.
 [<Sealed>]
 type ProcessResult<'T>
-    internal (program: string, stdout: 'T, stderr: string, outcome: Outcome, duration: TimeSpan, truncated: bool) =
+    internal
+    (
+        program: string,
+        stdout: 'T,
+        stderr: string,
+        outcome: Outcome,
+        duration: TimeSpan,
+        truncated: bool,
+        okCodes: int list
+    ) =
 
     /// The program that was run.
     member _.Program = program
@@ -38,21 +47,28 @@ type ProcessResult<'T>
     /// True when the run was killed for exceeding its timeout.
     member _.IsTimedOut = outcome.IsTimedOut
 
-    /// True when the process exited with code 0.
+    /// The exit codes treated as success (from `Command.OkCodes`; `{0}` by default).
+    member _.AcceptedCodes = okCodes
+
+    /// True when the process exited with an accepted code (`0`, or any code in `Command.OkCodes`).
     member _.IsSuccess =
         match outcome with
-        | Outcome.Exited 0 -> true
+        | Outcome.Exited code -> List.contains code okCodes
         | _ -> false
 
 [<RequireQualifiedAccess>]
 module ProcessResult =
 
-    /// Demand a successful (exit-0) run: returns the result unchanged on success, otherwise
-    /// the corresponding `ProcessError` (`Exit` / `Signalled` / `Timeout`).
+    /// Demand a successful run (an **accepted** exit code — `0`, or any in `Command.OkCodes`):
+    /// returns the result unchanged on success, otherwise the corresponding `ProcessError`
+    /// (`Exit` / `Signalled` / `Timeout`).
     let ensureSuccess (result: ProcessResult<string>) : Result<ProcessResult<string>, ProcessError> =
-        match result.Outcome with
-        | Outcome.Exited 0 -> Ok result
-        | Outcome.Exited code -> Error(ProcessError.Exit(result.Program, code, result.Stdout, result.Stderr))
-        | Outcome.Signalled signal ->
-            Error(ProcessError.Signalled(result.Program, signal, result.Stdout, result.Stderr))
-        | Outcome.TimedOut -> Error(ProcessError.Timeout(result.Program, result.Duration, result.Stdout, result.Stderr))
+        if result.IsSuccess then
+            Ok result
+        else
+            match result.Outcome with
+            | Outcome.Exited code -> Error(ProcessError.Exit(result.Program, code, result.Stdout, result.Stderr))
+            | Outcome.Signalled signal ->
+                Error(ProcessError.Signalled(result.Program, signal, result.Stdout, result.Stderr))
+            | Outcome.TimedOut ->
+                Error(ProcessError.Timeout(result.Program, result.Duration, result.Stdout, result.Stderr))

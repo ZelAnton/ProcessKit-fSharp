@@ -36,7 +36,7 @@ type private CapturingRunner() =
             this.SeenPolicy <- Some command.Config.OutputBuffer
 
             Task.FromResult(
-                Ok(ProcessResult<string>(command.Program, "out", "", Outcome.Exited 0, TimeSpan.Zero, false))
+                Ok(ProcessResult<string>(command.Program, "out", "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ]))
             )
 
         member _.OutputBytes(_command, _cancellationToken) =
@@ -64,13 +64,17 @@ type private FakeClock() =
 type SupervisorTests() =
 
     let ok () : Result<ProcessResult<string>, ProcessError> =
-        Ok(ProcessResult<string>("fake", "out", "", Outcome.Exited 0, TimeSpan.Zero, false))
+        Ok(ProcessResult<string>("fake", "out", "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ]))
 
     let failWith (code: int) : Result<ProcessResult<string>, ProcessError> =
-        Ok(ProcessResult<string>("fake", "", "boom", Outcome.Exited code, TimeSpan.Zero, false))
+        Ok(ProcessResult<string>("fake", "", "boom", Outcome.Exited code, TimeSpan.Zero, false, [ 0 ]))
 
     let timedOut () : Result<ProcessResult<string>, ProcessError> =
-        Ok(ProcessResult<string>("fake", "", "", Outcome.TimedOut, TimeSpan.FromSeconds 1.0, false))
+        Ok(ProcessResult<string>("fake", "", "", Outcome.TimedOut, TimeSpan.FromSeconds 1.0, false, [ 0 ]))
+
+    // A reply whose exit code is accepted via ok_codes — `IsSuccess` is true, so it is not a crash.
+    let accepted (code: int) (okCodes: int list) : Result<ProcessResult<string>, ProcessError> =
+        Ok(ProcessResult<string>("fake", "out", "", Outcome.Exited code, TimeSpan.Zero, false, okCodes))
 
     let spawnErr () : Result<ProcessResult<string>, ProcessError> =
         Error(ProcessError.Spawn("fake", "no such binary"))
@@ -182,6 +186,29 @@ type SupervisorTests() =
                 Assert.That(outcome.Restarts, Is.EqualTo 2)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.RestartsExhausted)
                 Assert.That(outcome.FinalResult.Code, Is.EqualTo(Some 7))
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an accepted non-zero exit is not a crash``() : Task =
+        task {
+            match! supervise([ accepted 2 [ 0; 2 ] ]).Run() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 0)
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
+                Assert.That(outcome.FinalResult.IsSuccess, Is.True)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a rejected zero exit is a crash``() : Task =
+        task {
+            match! supervise([ accepted 0 [ 1 ]; ok () ]).Run() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 1)
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
