@@ -176,12 +176,14 @@ type PipelineTests() =
         :> Task
 
     [<Test>]
-    member _.``Pipeline module functions compose a pipeline``() : Task =
+    member _.``Pipeline module builders compose a pipeline``() : Task =
         task {
+            // Builders pipe (module); the terminal verb is an instance method.
             let pipeline =
-                emit [ "banana"; "apple" ] |> fun first -> Pipeline.create first sortStage
+                Pipeline.create (emit [ "banana"; "apple" ]) sortStage
+                |> Pipeline.timeout (TimeSpan.FromSeconds 30.0)
 
-            match! Pipeline.run pipeline with
+            match! pipeline.Run() with
             | Ok output -> Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana" ]))
             | Error error -> Assert.Fail $"{error}"
         }
@@ -192,7 +194,7 @@ type PipelineTests() =
         task {
             let pipeline = (emit [ "42" ]).Pipe sortStage
 
-            match! pipeline |> Pipeline.parse (fun s -> int (s.Trim())) with
+            match! pipeline.Parse(fun s -> int (s.Trim())) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"{error}"
         }

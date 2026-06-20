@@ -80,3 +80,38 @@ type CommandVerbs =
     [<Extension>]
     static member Probe(command: Command, cancellationToken: CancellationToken) =
         Runner.probe CommandVerbs.DefaultRunner cancellationToken command
+
+    /// Require a zero/accepted exit and parse the trimmed stdout into a `'T`; a thrown parser error
+    /// becomes `ProcessError.Parse`.
+    [<Extension>]
+    static member Parse(command: Command, parser: System.Func<string, 'T>) =
+        Runner.parse CommandVerbs.DefaultRunner CancellationToken.None parser.Invoke command
+
+    /// `Parse`, cancellable through `cancellationToken`.
+    [<Extension>]
+    static member Parse(command: Command, parser: System.Func<string, 'T>, cancellationToken: CancellationToken) =
+        Runner.parse CommandVerbs.DefaultRunner cancellationToken parser.Invoke command
+
+    /// Like `Parse`, but the parser returns its own `Result` (its error becomes `Parse`).
+    [<Extension>]
+    static member TryParse(command: Command, parser: System.Func<string, Result<'T, string>>) =
+        Runner.tryParse CommandVerbs.DefaultRunner CancellationToken.None parser.Invoke command
+
+    /// `TryParse`, cancellable through `cancellationToken`.
+    [<Extension>]
+    static member TryParse
+        (command: Command, parser: System.Func<string, Result<'T, string>>, cancellationToken: CancellationToken)
+        =
+        Runner.tryParse CommandVerbs.DefaultRunner cancellationToken parser.Invoke command
+
+    /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
+    [<Extension>]
+    static member FirstLine(command: Command, predicate: System.Func<string, bool>) =
+        Runner.firstLine CommandVerbs.DefaultRunner CancellationToken.None predicate.Invoke command
+
+    /// `FirstLine`, cancellable through `cancellationToken`.
+    [<Extension>]
+    static member FirstLine
+        (command: Command, predicate: System.Func<string, bool>, cancellationToken: CancellationToken)
+        =
+        Runner.firstLine CommandVerbs.DefaultRunner cancellationToken predicate.Invoke command

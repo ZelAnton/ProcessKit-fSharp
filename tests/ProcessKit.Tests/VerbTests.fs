@@ -104,3 +104,17 @@ type VerbTests() =
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
+
+    [<Test>]
+    member _.``Command.Parse and FirstLine are reachable on the default runner``() : Task =
+        task {
+            match! (shell "echo 42").Parse(fun s -> int (s.Trim())) with
+            | Ok value -> Assert.That(value, Is.EqualTo 42)
+            | Error error -> Assert.Fail $"parse: {error}"
+
+            match! threeLines.FirstLine(fun line -> line.Contains "line2") with
+            | Ok(Some line) -> Assert.That(line, Does.Contain "line2")
+            | Ok None -> Assert.Fail "expected a matching line"
+            | Error error -> Assert.Fail $"firstLine: {error}"
+        }
+        :> Task

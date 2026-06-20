@@ -280,14 +280,6 @@ type Command internal (config: CommandConfig) =
         ArgumentNullException.ThrowIfNull logger
         Command({ config with Logger = Some logger })
 
-    /// Inherit the parent's environment (the default). `InheritEnv false` starts the child's
-    /// environment empty — the same as `EnvClear`.
-    member this.InheritEnv(inheritEnv: bool) =
-        if inheritEnv then
-            Command({ config with ClearEnv = false })
-        else
-            Command({ config with ClearEnv = true })
-
 /// Pipe-friendly functions over `Command`, mirroring the instance methods.
 [<RequireQualifiedAccess>]
 module Command =
@@ -324,6 +316,12 @@ module Command =
 
     /// Set how the child's standard error is connected.
     let stderr (mode: StdioMode) (command: Command) = command.Stderr mode
+
+    /// Decode captured stdout with `encoding`.
+    let stdoutEncoding (enc: Encoding) (command: Command) = command.StdoutEncoding enc
+
+    /// Decode captured stderr with `encoding`.
+    let stderrEncoding (enc: Encoding) (command: Command) = command.StderrEncoding enc
 
     /// Decode both captured streams with `encoding`.
     let encoding (enc: Encoding) (command: Command) = command.Encoding enc
@@ -366,9 +364,6 @@ module Command =
 
     /// Windows: run the child with `CREATE_NO_WINDOW` (no effect on Unix).
     let createNoWindow (command: Command) = command.CreateNoWindow()
-
-    /// Inherit the parent's environment (the default); `false` starts it empty.
-    let inheritEnv (inheritEnv: bool) (command: Command) = command.InheritEnv inheritEnv
 
     /// Emit structured lifecycle events to `logger` (argv/env never logged).
     let withLogger (logger: ILogger) (command: Command) = command.WithLogger logger

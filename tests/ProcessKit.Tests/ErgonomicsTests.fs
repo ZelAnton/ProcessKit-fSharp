@@ -75,7 +75,7 @@ type ErgonomicsTests() =
                 let command =
                     Command.create "/bin/sh"
                     |> Command.args [ "-c"; "echo [${PK_INHERIT_PROBE}]" ]
-                    |> Command.inheritEnv false
+                    |> Command.envClear
 
                 match! command.Run() with
                 | Ok output -> Assert.That(output.Trim(), Is.EqualTo "[]")

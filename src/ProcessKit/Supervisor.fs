@@ -421,5 +421,4 @@ module Supervisor =
     /// Supervise `command` with the default `JobRunner`.
     let create (command: Command) = Supervisor(command)
 
-    /// Supervise until the policy, the predicate, or the restart budget ends it.
-    let run (supervisor: Supervisor) = supervisor.Run()
+// `Run` is an instance method on `Supervisor` — call `supervisor.Run()` directly.

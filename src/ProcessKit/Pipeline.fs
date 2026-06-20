@@ -145,13 +145,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         task {
             match! this.OutputString cancellationToken with
             | Error error -> return Error error
-            | Ok result ->
-                match result.Outcome with
-                | Outcome.Exited code -> return Ok code
-                | Outcome.Signalled signal ->
-                    return Error(ProcessError.Signalled(result.Program, signal, result.Stdout, result.Stderr))
-                | Outcome.TimedOut ->
-                    return Error(ProcessError.Timeout(result.Program, result.Duration, result.Stdout, result.Stderr))
+            | Ok result -> return ProcessResult.exitCode result
         }
 
     /// Read the pipefail exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
@@ -159,16 +153,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         task {
             match! this.OutputString cancellationToken with
             | Error error -> return Error error
-            | Ok result ->
-                match result.Outcome with
-                | Outcome.Exited 0 -> return Ok true
-                | Outcome.Exited 1 -> return Ok false
-                | Outcome.Exited code ->
-                    return Error(ProcessError.Exit(result.Program, code, result.Stdout, result.Stderr))
-                | Outcome.Signalled signal ->
-                    return Error(ProcessError.Signalled(result.Program, signal, result.Stdout, result.Stderr))
-                | Outcome.TimedOut ->
-                    return Error(ProcessError.Timeout(result.Program, result.Duration, result.Stdout, result.Stderr))
+            | Ok result -> return ProcessResult.probe result
         }
 
     /// `OutputBytes` against `CancellationToken.None`.
@@ -255,27 +240,5 @@ module Pipeline =
     /// Also cancel the whole pipeline when `cancellationToken` fires.
     let cancelOn (cancellationToken: CancellationToken) (pipeline: Pipeline) = pipeline.CancelOn cancellationToken
 
-    /// Require a successful pipefail exit and return the last stage's trimmed stdout.
-    let run (pipeline: Pipeline) = pipeline.Run()
-
-    /// Like `run`, discarding the captured output.
-    let runUnit (pipeline: Pipeline) = pipeline.RunUnit()
-
-    /// Capture the last stage's stdout as decoded text (a non-zero pipefail exit is data).
-    let outputString (pipeline: Pipeline) = pipeline.OutputString()
-
-    /// Capture the last stage's stdout as raw bytes (a non-zero pipefail exit is data).
-    let outputBytes (pipeline: Pipeline) = pipeline.OutputBytes()
-
-    /// The pipefail exit code.
-    let exitCode (pipeline: Pipeline) = pipeline.ExitCode()
-
-    /// Read the pipefail exit code as a yes/no answer.
-    let probe (pipeline: Pipeline) = pipeline.Probe()
-
-    /// Require a successful pipefail exit and parse the trimmed stdout into a `'T`.
-    let parse (parser: string -> 'T) (pipeline: Pipeline) = pipeline.Parse(Func<string, 'T> parser)
-
-    /// Like `parse`, but the parser returns its own `Result` (its error message becomes `Parse`).
-    let tryParse (parser: string -> Result<'T, string>) (pipeline: Pipeline) =
-        pipeline.TryParse(Func<string, Result<'T, string>> parser)
+// Verbs (Run/OutputString/ExitCode/Probe/Parse/…) are instance methods on `Pipeline` — call them
+// directly (`pipeline.Run()`); the module forwards only the pipe-friendly *builders* above.

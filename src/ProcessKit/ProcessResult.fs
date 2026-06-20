@@ -59,6 +59,15 @@ type ProcessResult<'T>
 [<RequireQualifiedAccess>]
 module ProcessResult =
 
+    /// The single mapping from a non-success outcome to its `ProcessError`. One place so the verbs
+    /// (`ensureSuccess` / `exitCode` / `probe`, on a command or a pipeline) can never drift on how a
+    /// non-zero exit, a signal kill, or a timeout is reported.
+    let internal failureError (result: ProcessResult<string>) : ProcessError =
+        match result.Outcome with
+        | Outcome.Exited code -> ProcessError.Exit(result.Program, code, result.Stdout, result.Stderr)
+        | Outcome.Signalled signal -> ProcessError.Signalled(result.Program, signal, result.Stdout, result.Stderr)
+        | Outcome.TimedOut -> ProcessError.Timeout(result.Program, result.Duration, result.Stdout, result.Stderr)
+
     /// Demand a successful run (an **accepted** exit code — `0`, or any in `Command.OkCodes`):
     /// returns the result unchanged on success, otherwise the corresponding `ProcessError`
     /// (`Exit` / `Signalled` / `Timeout`).
@@ -66,9 +75,17 @@ module ProcessResult =
         if result.IsSuccess then
             Ok result
         else
-            match result.Outcome with
-            | Outcome.Exited code -> Error(ProcessError.Exit(result.Program, code, result.Stdout, result.Stderr))
-            | Outcome.Signalled signal ->
-                Error(ProcessError.Signalled(result.Program, signal, result.Stdout, result.Stderr))
-            | Outcome.TimedOut ->
-                Error(ProcessError.Timeout(result.Program, result.Duration, result.Stdout, result.Stderr))
+            Error(failureError result)
+
+    /// The exit code; a signal kill or timeout errors instead of inventing a sentinel.
+    let internal exitCode (result: ProcessResult<string>) : Result<int, ProcessError> =
+        match result.Outcome with
+        | Outcome.Exited code -> Ok code
+        | _ -> Error(failureError result)
+
+    /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
+    let internal probe (result: ProcessResult<string>) : Result<bool, ProcessError> =
+        match result.Outcome with
+        | Outcome.Exited 0 -> Ok true
+        | Outcome.Exited 1 -> Ok false
+        | _ -> Error(failureError result)

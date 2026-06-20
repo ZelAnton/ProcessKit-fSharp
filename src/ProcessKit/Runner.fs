@@ -92,14 +92,7 @@ module Runner =
             task {
                 match! runner.OutputString(command, cancellationToken) with
                 | Error error -> return Error error
-                | Ok result ->
-                    match result.Outcome with
-                    | Outcome.Exited code -> return Ok code
-                    | Outcome.Signalled signal ->
-                        return Error(ProcessError.Signalled(result.Program, signal, result.Stdout, result.Stderr))
-                    | Outcome.TimedOut ->
-                        return
-                            Error(ProcessError.Timeout(result.Program, result.Duration, result.Stdout, result.Stderr))
+                | Ok result -> return ProcessResult.exitCode result
             })
 
     /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
@@ -112,17 +105,7 @@ module Runner =
             task {
                 match! runner.OutputString(command, cancellationToken) with
                 | Error error -> return Error error
-                | Ok result ->
-                    match result.Outcome with
-                    | Outcome.Exited 0 -> return Ok true
-                    | Outcome.Exited 1 -> return Ok false
-                    | Outcome.Exited code ->
-                        return Error(ProcessError.Exit(result.Program, code, result.Stdout, result.Stderr))
-                    | Outcome.Signalled signal ->
-                        return Error(ProcessError.Signalled(result.Program, signal, result.Stdout, result.Stderr))
-                    | Outcome.TimedOut ->
-                        return
-                            Error(ProcessError.Timeout(result.Program, result.Duration, result.Stdout, result.Stderr))
+                | Ok result -> return ProcessResult.probe result
             })
 
     /// Start the command and return a live `RunningProcess` for streaming and interactive I/O.
