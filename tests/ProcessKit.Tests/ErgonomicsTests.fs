@@ -65,7 +65,7 @@ type ErgonomicsTests() =
         :> Task
 
     [<Test>]
-    member _.``InheritEnv false clears the inherited environment``() : Task =
+    member _.``EnvClear clears the inherited environment``() : Task =
         task {
             if isWindows then
                 Assert.Ignore "POSIX env-echo; the clearing logic is the shared EnvClear path."

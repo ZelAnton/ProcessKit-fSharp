@@ -11,9 +11,12 @@ open System.Threading.Tasks
 /// runs inside one shared kill-on-dispose group, so cancelling, timing out, or disposing the run
 /// reaps every stage together.
 ///
-/// Build it by piping commands (`a.Pipe(b).Pipe(c)`), then run it with the same verbs a single
-/// command exposes. The exit status follows shell **pipefail**: the rightmost stage that did not
-/// exit 0 determines the result, unless that stage opted out with `Command.UncheckedInPipe`.
+/// Build it by piping commands (`a.Pipe(b).Pipe(c)`), then run it to completion with the same
+/// run-and-capture verbs a single command exposes (`Run`/`OutputString`/`OutputBytes`/`ExitCode`/
+/// `Probe`/`Parse`/`TryParse`). A pipeline runs as a whole, so the *streaming* verbs (`FirstLine`,
+/// `StdoutLines`) are deliberately not offered — capture the last stage's output instead. The exit
+/// status follows shell **pipefail**: the rightmost stage that did not exit 0 determines the result,
+/// unless that stage opted out with `Command.UncheckedInPipe`.
 [<Sealed>]
 type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancelOn: CancellationToken option) =
 

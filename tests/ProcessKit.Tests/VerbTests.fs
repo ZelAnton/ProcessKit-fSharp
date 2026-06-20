@@ -106,15 +106,35 @@ type VerbTests() =
         :> Task
 
     [<Test>]
-    member _.``Command.Parse and FirstLine are reachable on the default runner``() : Task =
+    member _.``Command.Parse/TryParse/FirstLine are reachable on the default runner (both overloads)``() : Task =
         task {
+            // Parse — no-token and cancellation-token overloads.
             match! (shell "echo 42").Parse(fun s -> int (s.Trim())) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"parse: {error}"
 
+            match! (shell "echo 42").Parse((fun s -> int (s.Trim())), CancellationToken.None) with
+            | Ok value -> Assert.That(value, Is.EqualTo 42)
+            | Error error -> Assert.Fail $"parse(ct): {error}"
+
+            // TryParse — no-token and cancellation-token overloads.
+            match! (shell "echo 42").TryParse(fun s -> Ok(int (s.Trim()))) with
+            | Ok value -> Assert.That(value, Is.EqualTo 42)
+            | Error error -> Assert.Fail $"tryParse: {error}"
+
+            match! (shell "echo 42").TryParse((fun s -> Ok(int (s.Trim()))), CancellationToken.None) with
+            | Ok value -> Assert.That(value, Is.EqualTo 42)
+            | Error error -> Assert.Fail $"tryParse(ct): {error}"
+
+            // FirstLine — no-token and cancellation-token overloads.
             match! threeLines.FirstLine(fun line -> line.Contains "line2") with
             | Ok(Some line) -> Assert.That(line, Does.Contain "line2")
             | Ok None -> Assert.Fail "expected a matching line"
             | Error error -> Assert.Fail $"firstLine: {error}"
+
+            match! threeLines.FirstLine((fun line -> line.Contains "line2"), CancellationToken.None) with
+            | Ok(Some line) -> Assert.That(line, Does.Contain "line2")
+            | Ok None -> Assert.Fail "expected a matching line"
+            | Error error -> Assert.Fail $"firstLine(ct): {error}"
         }
         :> Task

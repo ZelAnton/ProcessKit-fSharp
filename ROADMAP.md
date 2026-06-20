@@ -148,7 +148,7 @@ of the phase.
   which completes `Supervisor.WithRunner(group)`; and a fix so POSIX reaps every
   child of a multi-child group (each `posix_spawn` forms its own pgid). **M1.8b
   (ergonomics):** `Command.OkCodes` (now `ProcessResult.IsSuccess`/`ensureSuccess`/
-  `Supervisor` honour accepted exit codes), `CreateNoWindow`, `InheritEnv`,
+  `Supervisor` honour accepted exit codes), `CreateNoWindow`, `EnvClear`,
   `CliClient`, top-level `Exec.run`/`outputString`, and bounded-concurrency
   `Exec.outputAll`/`outputAllBytes`. **Deferred (tracked):** `adopt` and the
   `uid`/`gid`/`groups`/`setsid`/`kill_on_parent_death` sandbox knobs all need
