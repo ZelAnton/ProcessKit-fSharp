@@ -39,7 +39,7 @@ type Stdin internal (source: StdinSource) =
     static member FromReader(reader: Stream) = Stdin(StdinSource.Reader reader)
 
     /// Lines (each written followed by `\n`) produced eagerly from a sequence.
-    static member FromIterLines(lines: seq<string>) = Stdin(StdinSource.Lines lines)
+    static member FromLines(lines: seq<string>) = Stdin(StdinSource.Lines lines)
 
     /// Lines (each written followed by `\n`) produced asynchronously.
-    static member FromLines(lines: IAsyncEnumerable<string>) = Stdin(StdinSource.AsyncLines lines)
+    static member FromAsyncLines(lines: IAsyncEnumerable<string>) = Stdin(StdinSource.AsyncLines lines)

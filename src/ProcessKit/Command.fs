@@ -280,7 +280,9 @@ type Command internal (config: CommandConfig) =
         ArgumentNullException.ThrowIfNull logger
         Command({ config with Logger = Some logger })
 
-/// Pipe-friendly functions over `Command`, mirroring the instance methods.
+/// Pipe-friendly functions over `Command`, mirroring the instance **builder** methods. The run
+/// verbs (`Run`/`OutputString`/`Parse`/…) are instance methods only — end a pipeline with method
+/// syntax (`(cmd |> Command.arg "x").Run()`), or go through `Runner.*` with an explicit runner.
 [<RequireQualifiedAccess>]
 module Command =
 

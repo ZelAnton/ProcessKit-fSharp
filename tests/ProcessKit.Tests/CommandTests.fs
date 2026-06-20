@@ -37,3 +37,17 @@ type CommandTests() =
         let command = Command("git").Arg("rev-parse").Args([ "--short"; "HEAD" ])
         Assert.That(command.Program, Is.EqualTo "git")
         Assert.That(command.Arguments, Is.EqualTo(box [| "rev-parse"; "--short"; "HEAD" |]))
+
+    [<Test>]
+    member _.``ProcessError.isNotFound classifies only NotFound``() =
+        Assert.That(ProcessError.isNotFound (ProcessError.NotFound("git", None)), Is.True)
+        Assert.That(ProcessError.isNotFound (ProcessError.Spawn("git", "x")), Is.False)
+        Assert.That(ProcessError.isNotFound (ProcessError.Io "disk"), Is.False)
+        Assert.That(ProcessError.isNotFound (ProcessError.Cancelled "git"), Is.False)
+
+    [<Test>]
+    member _.``ProcessError.isTransient classifies spawn and I/O errors as retriable``() =
+        Assert.That(ProcessError.isTransient (ProcessError.Spawn("git", "EAGAIN")), Is.True)
+        Assert.That(ProcessError.isTransient (ProcessError.Io "pipe"), Is.True)
+        Assert.That(ProcessError.isTransient (ProcessError.NotFound("git", None)), Is.False)
+        Assert.That(ProcessError.isTransient (ProcessError.Cancelled "git"), Is.False)

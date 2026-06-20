@@ -198,9 +198,6 @@ type RunningProcess internal (host: RunningHost) =
     /// Total stderr lines pumped so far.
     member _.StderrLineCount = stderrLineCount
 
-    /// Whether disposing this handle reaps the whole tree (always true).
-    member _.KillsTreeOnDispose = true
-
     /// Take the interactive stdin handle — `Some` only when the command kept stdin open without a
     /// source attached, and only once.
     member _.TakeStdin() : ProcessStdin option =
