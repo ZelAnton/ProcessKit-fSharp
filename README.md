@@ -58,10 +58,21 @@ From C# the same surface is available as fluent methods (`command.Run()`,
   `StdoutLines()` / `OutputEvents()` as `IAsyncEnumerable`, interactive stdin, and readiness
   probes (`WaitForLine` / `WaitForPort` / `WaitFor`).
 - **Timeouts, cancellation, retry** — `Command.Timeout` / `TimeoutGrace` / `CancelOn` /
-  `Retry`.
+  `Retry`, plus `Command.OkCodes` to accept non-zero exits as success.
 - **Shell-free pipelines** — `Command.Pipe` with pipefail semantics and `UncheckedInPipe`.
-- **Testable** — `ProcessKit.Testing.ScriptedRunner` is a subprocess-free `IProcessRunner`
-  for hermetic tests.
+- **Supervision** — `Supervisor` keeps a command alive with restart policies, exponential
+  backoff + jitter, and a failure-storm guard.
+- **Tree control & resource limits** — `ProcessGroup.Signal` / `Suspend` / `Resume` /
+  `Members`, and `ProcessGroup.Create(options)` with `ResourceLimits` (memory / process
+  count / CPU) enforced by a Windows Job Object or a Linux cgroup v2.
+- **Stats & profiling** — `ProcessGroup.Stats` / `SampleStats` and `RunningProcess.Profile`
+  (CPU / peak memory).
+- **Ergonomics** — `CliClient` (a program with shared defaults), top-level `Exec.run` /
+  `Exec.outputAll`, and shared-group running (`ProcessGroup` is itself an `IProcessRunner`).
+- **Observability** — optional `Command.WithLogger` lifecycle events (argv/env never logged),
+  and `ProcessKit.Extensions.DependencyInjection`'s `AddProcessKit`.
+- **Testable** — `ProcessKit.Testing.ScriptedRunner` and `RecordReplayRunner` (record/replay
+  cassettes) are subprocess-free `IProcessRunner`s for hermetic tests.
 
 ## License
 
