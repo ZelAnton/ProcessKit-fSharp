@@ -1,8 +1,9 @@
 # ProcessKit cookbook
 
-Task-oriented, idiomatic examples for every part of the public API. All verbs return
-`Task<Result<_, ProcessError>>`, so the F# samples below run inside a `task { }` block and
-use `match!`. Where a snippet writes `let! r = cmd.Verb()` for brevity, `r` is the
+Task-oriented, idiomatic examples for every part of the public API. The run and capture
+verbs return `Task<Result<_, ProcessError>>`, so the F# samples below run inside a `task { }`
+block and use `match!` (a few `RunningProcess` members — `Wait`, `Profile` — return their
+value directly). Where a snippet writes `let! r = cmd.Verb()` for brevity, `r` is the
 `Result<_, ProcessError>` you then match. From C# the same surface is `await`-able fluent
 methods.
 
