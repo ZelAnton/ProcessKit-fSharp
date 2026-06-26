@@ -17,17 +17,30 @@ open ProcessKit
 /// verbatim and can carry secrets — review a cassette before committing it.
 [<CLIMutable>]
 type CassetteEntry =
-    { Program: string
-      Args: string[]
-      Cwd: string | null
-      StdinDigest: string | null
-      HasStdin: bool
-      EnvNames: string[]
-      Stdout: string
-      Stderr: string
-      Code: Nullable<int>
-      TimedOut: bool
-      Signal: Nullable<int> }
+    {
+        /// The program (executable) that was invoked.
+        Program: string
+        /// The arguments passed to the program.
+        Args: string[]
+        /// The working directory, or `null` if the command did not set one.
+        Cwd: string | null
+        /// Digest of the stdin source; part of the replay match key (`null` when there was no stdin).
+        StdinDigest: string | null
+        /// Whether the invocation supplied a stdin source.
+        HasStdin: bool
+        /// Names of the environment variables set on the command — values are redacted, never stored.
+        EnvNames: string[]
+        /// The captured standard output (verbatim; may contain secrets).
+        Stdout: string
+        /// The captured standard error (verbatim; may contain secrets).
+        Stderr: string
+        /// The exit code, or `null` if the process did not exit normally (e.g. it was signalled).
+        Code: Nullable<int>
+        /// Whether the run was terminated by a timeout.
+        TimedOut: bool
+        /// The terminating signal number on POSIX, or `null` if the process was not signalled.
+        Signal: Nullable<int>
+    }
 
 // Match key: program + args + cwd + whether-stdin + stdin digest. F# tuple/list have structural
 // equality, so this works as a Dictionary key.
