@@ -11,10 +11,10 @@ open System.Threading
 open System.Threading.Tasks
 open ProcessKit
 
-/// One captured `invocation → result` pair — the on-disk cassette row (public so `System.Text.Json`
-/// can serialize it; inspect a cassette file directly rather than depending on this shape). Only env
-/// *names* are stored (values redacted); `program`, `args`, `cwd`, `stdout`, and `stderr` are
-/// verbatim and can carry secrets — review a cassette before committing it.
+/// One captured `invocation → result` pair — a row inside the `CassetteFile` envelope (public so
+/// `System.Text.Json` can serialize it; inspect a cassette file directly rather than depending on
+/// this shape). Only env *names* are stored (values redacted); `program`, `args`, `cwd`, `stdout`,
+/// and `stderr` are verbatim and can carry secrets — review a cassette before committing it.
 [<CLIMutable>]
 type CassetteEntry =
     {
@@ -40,6 +40,18 @@ type CassetteEntry =
         TimedOut: bool
         /// The terminating signal number on POSIX, or `null` if the process was not signalled.
         Signal: Nullable<int>
+    }
+
+/// The on-disk cassette envelope: a format `version` (so an incompatible future format is rejected
+/// rather than misread) wrapping the recorded `entries`. Public so `System.Text.Json` can serialize
+/// it; inspect a cassette file directly rather than depending on this shape.
+[<CLIMutable>]
+type CassetteFile =
+    {
+        /// The cassette format version; a file whose major differs from this build's is rejected.
+        Version: int
+        /// The recorded invocation→result rows, in capture order.
+        Entries: CassetteEntry[]
     }
 
 // Match key: program + args + cwd + whether-stdin + stdin digest. F# tuple/list have structural
@@ -71,6 +83,83 @@ type private Mode =
 type RecordReplayRunner private (mode: Mode, path: string) =
 
     static let jsonOptions = JsonSerializerOptions(WriteIndented = true)
+
+    // The cassette format version this build writes and accepts. Bump the (single) version when the
+    // on-disk schema changes incompatibly; a file with a different version is rejected on load.
+    static let currentFormatVersion = 1
+
+    static let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+
+    // Coalesce a possibly-null deserialized field (omitted JSON fields land as null even though the
+    // record type says non-null), so a crafted/partial cassette can't surface as a NullReferenceException
+    // at replay time (e.g. a null `Stdout` reaching `TrimEnd`).
+    static let stringOrEmpty (s: string | null) : string =
+        match s with
+        | null -> ""
+        | value -> value
+
+    static let arrayOrEmpty (a: 'a[] | null) : 'a[] =
+        match a with
+        | null -> [||]
+        | value -> value
+
+    static let normalizeEntry (entry: CassetteEntry) : CassetteEntry =
+        { entry with
+            Program = stringOrEmpty entry.Program
+            Args = arrayOrEmpty entry.Args
+            EnvNames = arrayOrEmpty entry.EnvNames
+            Stdout = stringOrEmpty entry.Stdout
+            Stderr = stringOrEmpty entry.Stderr }
+
+    // Write the cassette atomically and owner-only: serialize into a sibling temp file created `0600`
+    // from the start (so the secret-bearing bytes are never even briefly group/world-readable), then
+    // rename it over the target — same-directory rename is atomic on one filesystem, so a reader never
+    // sees a half-written cassette. On Windows the file inherits the directory ACL (restrict the
+    // directory instead). Throws on failure after cleaning up the temp; callers decide how to report.
+    static let writeCassette (path: string) (snapshot: CassetteEntry[]) : unit =
+        let json =
+            JsonSerializer.Serialize(
+                { Version = currentFormatVersion
+                  Entries = snapshot },
+                jsonOptions
+            )
+
+        let dir =
+            match Path.GetDirectoryName path with
+            | null
+            | "" -> "."
+            | d -> d
+
+        let tempPath =
+            Path.Combine(dir, stringOrEmpty (Path.GetFileName path) + ".tmp-" + Guid.NewGuid().ToString "N")
+
+        let writeContent () =
+            if isWindows then
+                File.WriteAllText(tempPath, json)
+            else
+                let options =
+                    FileStreamOptions(
+                        Mode = FileMode.CreateNew,
+                        Access = FileAccess.Write,
+                        Share = FileShare.None,
+                        UnixCreateMode = (UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                    )
+
+                use stream = new FileStream(tempPath, options)
+                use writer = new StreamWriter(stream)
+                writer.Write json
+
+        try
+            writeContent () // `use` disposes here, flushing/closing before the rename
+            File.Move(tempPath, path, true)
+        with _ ->
+            try
+                File.Delete tempPath
+            with _ ->
+                // The temp may never have been created (CreateNew failed); nothing to clean up.
+                ()
+
+            reraise ()
 
     let gate = obj ()
 
@@ -163,35 +252,45 @@ type RecordReplayRunner private (mode: Mode, path: string) =
     /// Load a cassette at `path` for hermetic replay.
     static member Replay(path: string) : Result<RecordReplayRunner, ProcessError> =
         try
-            let entries =
-                match JsonSerializer.Deserialize<CassetteEntry[]>(File.ReadAllText path, jsonOptions) with
-                | null -> [||]
+            let file =
+                match JsonSerializer.Deserialize<CassetteFile>(File.ReadAllText path, jsonOptions) with
+                | null -> { Version = 0; Entries = [||] }
                 | loaded -> loaded
 
-            // Group entries by key, accumulating into ResizeArrays (O(1) append) and freezing to the
-            // immutable per-slot arrays once — not `Array.append` per duplicate, which is O(n²).
-            let grouped = Dictionary<Key, ResizeArray<CassetteEntry>>()
+            if file.Version <> currentFormatVersion then
+                Error(
+                    ProcessError.Io
+                        $"unsupported cassette format version {file.Version} (this build reads version {currentFormatVersion})"
+                )
+            else
 
-            for entry in entries do
-                let key =
-                    entry.Program,
-                    List.ofArray entry.Args,
-                    Option.ofObj entry.Cwd,
-                    entry.HasStdin,
-                    Option.ofObj entry.StdinDigest
+                // Normalize every row so a crafted/partial cassette (omitted fields → null) can't NRE at
+                // replay time, then group by key, accumulating into ResizeArrays (O(1) append) and freezing
+                // to the immutable per-slot arrays once — not `Array.append` per duplicate, which is O(n²).
+                let entries = arrayOrEmpty file.Entries |> Array.map normalizeEntry
 
-                match grouped.TryGetValue key with
-                | true, bucket -> bucket.Add entry
-                | _ -> grouped[key] <- ResizeArray [ entry ]
+                let grouped = Dictionary<Key, ResizeArray<CassetteEntry>>()
 
-            let slots = Dictionary<Key, ReplaySlot>()
+                for entry in entries do
+                    let key =
+                        entry.Program,
+                        List.ofArray entry.Args,
+                        Option.ofObj entry.Cwd,
+                        entry.HasStdin,
+                        Option.ofObj entry.StdinDigest
 
-            for kvp in grouped do
-                slots[kvp.Key] <-
-                    { Entries = kvp.Value.ToArray()
-                      Next = 0 }
+                    match grouped.TryGetValue key with
+                    | true, bucket -> bucket.Add entry
+                    | _ -> grouped[key] <- ResizeArray [ entry ]
 
-            Ok(new RecordReplayRunner(ReplayMode slots, path))
+                let slots = Dictionary<Key, ReplaySlot>()
+
+                for kvp in grouped do
+                    slots[kvp.Key] <-
+                        { Entries = kvp.Value.ToArray()
+                          Next = 0 }
+
+                Ok(new RecordReplayRunner(ReplayMode slots, path))
         with ex ->
             Error(ProcessError.Io ex.Message)
 
@@ -202,13 +301,7 @@ type RecordReplayRunner private (mode: Mode, path: string) =
         | RecordMode(_, recorded, dirty) ->
             try
                 let snapshot = lock gate (fun () -> recorded.ToArray())
-                File.WriteAllText(path, JsonSerializer.Serialize(snapshot, jsonOptions))
-
-                if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
-                    // The cassette stores argv/cwd/stdout/stderr verbatim (secrets possible); keep it
-                    // owner-only. Windows inherits the directory ACL — restrict the directory instead.
-                    File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-
+                writeCassette path snapshot
                 dirty.Value <- false
                 Ok()
             with ex ->
@@ -270,10 +363,7 @@ type RecordReplayRunner private (mode: Mode, path: string) =
             | RecordMode(_, recorded, dirty) when dirty.Value ->
                 try
                     let snapshot = lock gate (fun () -> recorded.ToArray())
-                    File.WriteAllText(path, JsonSerializer.Serialize(snapshot, jsonOptions))
-
-                    if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
-                        File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                    writeCassette path snapshot
                 with _ ->
                     // Best-effort drop-time flush; an explicit Save surfaces write errors.
                     ()

@@ -916,6 +916,21 @@ class ProcessKit.Testing.CassetteEntry
   property Stdout : System.String { get; set }
   property TimedOut : System.Boolean { get; set }
 
+class ProcessKit.Testing.CassetteFile
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.Testing.CassetteFile>
+  member Equals(ProcessKit.Testing.CassetteFile) : System.Boolean
+  member Equals(ProcessKit.Testing.CassetteFile, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  new()
+  new(System.Int32, ProcessKit.Testing.CassetteEntry[])
+  property Entries : ProcessKit.Testing.CassetteEntry[] { get; set }
+  property Version : System.Int32 { get; set }
+
 class ProcessKit.Testing.RecordReplayRunner
   :> ProcessKit.IProcessRunner
   :> System.IDisposable

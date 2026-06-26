@@ -2,6 +2,7 @@ namespace ProcessKit.Tests
 
 open System
 open System.IO
+open System.Runtime.InteropServices
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -50,6 +51,72 @@ type CassetteTests() =
         }
 
     let runner (r: RecordReplayRunner) : IProcessRunner = r
+
+    let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+
+    [<Test>]
+    member _.``a cassette entry with omitted fields replays without a NullReferenceException``() : Task =
+        withCassette (fun path ->
+            task {
+                // A hand-crafted / partially-written cassette: the entry omits Stdout, Stderr, Cwd, and
+                // the codes. Loading must normalize the nulls so replay yields "" rather than NRE-ing
+                // when a consumer calls e.g. Stdout.TrimEnd.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 1, "Entries": [ { "Program": "partial-tool", "Args": ["x"], "HasStdin": false, "EnvNames": [] } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load failed: {error}"
+                | Ok replayer ->
+                    let command = Command.create "partial-tool" |> Command.arg "x"
+
+                    match! (runner replayer).OutputString(command, CancellationToken.None) with
+                    | Error error -> Assert.Fail $"replay failed: {error}"
+                    | Ok result ->
+                        Assert.That(result.Stdout, Is.EqualTo "")
+                        Assert.That(result.Stderr, Is.EqualTo "")
+                        // Prove the normalized value is a real (non-null) string.
+                        Assert.That(result.Stdout.TrimEnd(), Is.EqualTo "")
+            })
+
+    [<Test>]
+    member _.``a cassette with an unsupported format version is rejected``() : Task =
+        withCassette (fun path ->
+            task {
+                File.WriteAllText(path, """{ "Version": 999, "Entries": [] }""")
+
+                match RecordReplayRunner.Replay path with
+                | Error _ -> ()
+                | Ok _ -> Assert.Fail "expected an unsupported-version cassette to be rejected"
+            })
+
+    [<Test>]
+    member _.``a saved cassette is owner-only on Unix``() : Task =
+        task {
+            // A fresh (not pre-created) path, so the mode reflects how the cassette was written, not a
+            // pre-existing file's permissions.
+            let path = Path.Combine(Path.GetTempPath(), $"pk-cassette-{Guid.NewGuid():N}.json")
+
+            try
+                let recorder = RecordReplayRunner.Record(path, FixedRunner("secret-output", 0))
+                let command = Command.create "tool" |> Command.arg "x"
+                let! _ = (runner recorder).OutputString(command, CancellationToken.None)
+
+                match recorder.Save() with
+                | Error error -> Assert.Fail $"save failed: {error}"
+                | Ok() ->
+                    Assert.That(File.Exists path, Is.True)
+
+                    if not isWindows then
+                        Assert.That(
+                            File.GetUnixFileMode path,
+                            Is.EqualTo(UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                        )
+            finally
+                if File.Exists path then
+                    File.Delete path
+        }
 
     [<Test>]
     member _.``record then replay round-trips a result without the inner runner``() : Task =
