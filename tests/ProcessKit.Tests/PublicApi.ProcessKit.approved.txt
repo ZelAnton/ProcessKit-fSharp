@@ -1,0 +1,940 @@
+class ProcessKit.CliClient
+  member Command(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
+  member CommandIn(System.String, System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
+  member DefaultCancelOn(System.Threading.CancellationToken) : ProcessKit.CliClient
+  member DefaultCurrentDir(System.String) : ProcessKit.CliClient
+  member DefaultEnv(System.String, System.String) : ProcessKit.CliClient
+  member DefaultEnvRemove(System.String) : ProcessKit.CliClient
+  member DefaultTimeout(System.TimeSpan) : ProcessKit.CliClient
+  member OutputBytes(System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  member OutputString(System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  member Run(System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  member WithRunner(ProcessKit.IProcessRunner) : ProcessKit.CliClient
+  new(System.String)
+  property Runner : ProcessKit.IProcessRunner { get }
+  property Timeout : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
+
+module ProcessKit.CliClientModule
+  static member create(System.String) : ProcessKit.CliClient
+
+class ProcessKit.Command
+  member Arg(System.String) : ProcessKit.Command
+  member Args(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
+  member CancelOn(System.Threading.CancellationToken) : ProcessKit.Command
+  member CreateNoWindow() : ProcessKit.Command
+  member CurrentDir(System.String) : ProcessKit.Command
+  member Encoding(System.Text.Encoding) : ProcessKit.Command
+  member Env(System.String, System.String) : ProcessKit.Command
+  member EnvClear() : ProcessKit.Command
+  member EnvRemove(System.String) : ProcessKit.Command
+  member KeepStdinOpen() : ProcessKit.Command
+  member OkCodes(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.Command
+  member OnStderrLine(System.Action<System.String>) : ProcessKit.Command
+  member OnStdoutLine(System.Action<System.String>) : ProcessKit.Command
+  member OutputBuffer(ProcessKit.OutputBufferPolicy) : ProcessKit.Command
+  member Retry(System.Int32, System.TimeSpan, System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Command
+  member Stderr(ProcessKit.StdioMode) : ProcessKit.Command
+  member StderrEncoding(System.Text.Encoding) : ProcessKit.Command
+  member StderrTee(System.IO.Stream) : ProcessKit.Command
+  member Stdin(ProcessKit.Stdin) : ProcessKit.Command
+  member Stdout(ProcessKit.StdioMode) : ProcessKit.Command
+  member StdoutEncoding(System.Text.Encoding) : ProcessKit.Command
+  member StdoutTee(System.IO.Stream) : ProcessKit.Command
+  member Timeout(System.TimeSpan) : ProcessKit.Command
+  member TimeoutGrace(System.TimeSpan) : ProcessKit.Command
+  member UncheckedInPipe() : ProcessKit.Command
+  member WithLogger(Microsoft.Extensions.Logging.ILogger) : ProcessKit.Command
+  new(System.String)
+  property Arguments : System.Collections.Generic.IReadOnlyList<System.String> { get }
+  property ConfiguredTimeout : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
+  property Program : System.String { get }
+  property WorkingDirectory : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+
+module ProcessKit.CommandModule
+  static member arg(System.String, ProcessKit.Command) : ProcessKit.Command
+  static member args(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Command) : ProcessKit.Command
+  static member cancelOn(System.Threading.CancellationToken, ProcessKit.Command) : ProcessKit.Command
+  static member create(System.String) : ProcessKit.Command
+  static member createNoWindow(ProcessKit.Command) : ProcessKit.Command
+  static member currentDir(System.String, ProcessKit.Command) : ProcessKit.Command
+  static member encoding(System.Text.Encoding, ProcessKit.Command) : ProcessKit.Command
+  static member env(System.String, System.String, ProcessKit.Command) : ProcessKit.Command
+  static member envClear(ProcessKit.Command) : ProcessKit.Command
+  static member envRemove(System.String, ProcessKit.Command) : ProcessKit.Command
+  static member keepStdinOpen(ProcessKit.Command) : ProcessKit.Command
+  static member okCodes(System.Collections.Generic.IEnumerable<System.Int32>, ProcessKit.Command) : ProcessKit.Command
+  static member onStderrLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command
+  static member onStdoutLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command
+  static member outputBuffer(ProcessKit.OutputBufferPolicy, ProcessKit.Command) : ProcessKit.Command
+  static member retry(System.Int32, System.TimeSpan, Microsoft.FSharp.Core.FSharpFunc<ProcessKit.ProcessError, System.Boolean>, ProcessKit.Command) : ProcessKit.Command
+  static member stderr(ProcessKit.StdioMode, ProcessKit.Command) : ProcessKit.Command
+  static member stderrEncoding(System.Text.Encoding, ProcessKit.Command) : ProcessKit.Command
+  static member stderrTee(System.IO.Stream, ProcessKit.Command) : ProcessKit.Command
+  static member stdin(ProcessKit.Stdin, ProcessKit.Command) : ProcessKit.Command
+  static member stdout(ProcessKit.StdioMode, ProcessKit.Command) : ProcessKit.Command
+  static member stdoutEncoding(System.Text.Encoding, ProcessKit.Command) : ProcessKit.Command
+  static member stdoutTee(System.IO.Stream, ProcessKit.Command) : ProcessKit.Command
+  static member timeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
+  static member timeoutGrace(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
+  static member uncheckedInPipe(ProcessKit.Command) : ProcessKit.Command
+  static member withLogger(Microsoft.Extensions.Logging.ILogger, ProcessKit.Command) : ProcessKit.Command
+
+class ProcessKit.CommandVerbs
+  static member ExitCode(ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
+  static member ExitCode(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
+  static member FirstLine(ProcessKit.Command, System.Func<System.String, System.Boolean>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
+  static member FirstLine(ProcessKit.Command, System.Func<System.String, System.Boolean>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
+  static member OutputBytes(ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  static member OutputBytes(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  static member OutputString(ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  static member OutputString(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  static member Parse<T>(ProcessKit.Command, System.Func<System.String, T>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member Parse<T>(ProcessKit.Command, System.Func<System.String, T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member Probe(ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
+  static member Probe(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
+  static member Run(ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  static member Run(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  static member RunUnit(ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  static member RunUnit(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  static member Start(ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
+  static member Start(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
+  static member TryParse<T>(ProcessKit.Command, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member TryParse<T>(ProcessKit.Command, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+
+module ProcessKit.Exec
+  static member outputAll(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>[]>
+  static member outputAllBytes(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>[]>
+  static member outputString(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  static member run(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+
+class ProcessKit.Finished
+  property Outcome : ProcessKit.Outcome { get }
+  property Stderr : System.String { get }
+
+interface ProcessKit.IProcessRunner
+  member OutputBytes(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  member OutputString(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  member Start(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
+
+class ProcessKit.JobRunner
+  :> ProcessKit.IProcessRunner
+  new()
+
+class ProcessKit.Mechanism
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.Mechanism>
+  :> System.IEquatable<ProcessKit.Mechanism>
+  member CompareTo(ProcessKit.Mechanism) : System.Int32
+  member CompareTo(System.Object) : System.Int32
+  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
+  member Equals(ProcessKit.Mechanism) : System.Boolean
+  member Equals(ProcessKit.Mechanism, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsCgroupV2() : System.Boolean
+  member get_IsJobObject() : System.Boolean
+  member get_IsProcessGroup() : System.Boolean
+  member get_Tag() : System.Int32
+  property CgroupV2 : ProcessKit.Mechanism { get }
+  property IsCgroupV2 : System.Boolean { get }
+  property IsJobObject : System.Boolean { get }
+  property IsProcessGroup : System.Boolean { get }
+  property JobObject : ProcessKit.Mechanism { get }
+  property ProcessGroup : ProcessKit.Mechanism { get }
+  property Tag : System.Int32 { get }
+  static member get_CgroupV2() : ProcessKit.Mechanism
+  static member get_JobObject() : ProcessKit.Mechanism
+  static member get_ProcessGroup() : ProcessKit.Mechanism
+
+module ProcessKit.Mechanism+Tags
+  field literal CgroupV2 : System.Int32
+  field literal JobObject : System.Int32
+  field literal ProcessGroup : System.Int32
+
+class ProcessKit.Outcome
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.Outcome>
+  :> System.IEquatable<ProcessKit.Outcome>
+  member CompareTo(ProcessKit.Outcome) : System.Int32
+  member CompareTo(System.Object) : System.Int32
+  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
+  member Equals(ProcessKit.Outcome) : System.Boolean
+  member Equals(ProcessKit.Outcome, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsExited() : System.Boolean
+  member get_IsSignalled() : System.Boolean
+  member get_IsTimedOut() : System.Boolean
+  member get_Tag() : System.Int32
+  property Code : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property IsExited : System.Boolean { get }
+  property IsSignalled : System.Boolean { get }
+  property IsTimedOut : System.Boolean { get }
+  property Signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Tag : System.Int32 { get }
+  property TimedOut : ProcessKit.Outcome { get }
+  static member NewExited(System.Int32) : ProcessKit.Outcome
+  static member NewSignalled(Microsoft.FSharp.Core.FSharpOption<System.Int32>) : ProcessKit.Outcome
+  static member get_TimedOut() : ProcessKit.Outcome
+
+class ProcessKit.Outcome+Exited : ProcessKit.Outcome
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.Outcome>
+  :> System.IEquatable<ProcessKit.Outcome>
+  member get_code() : System.Int32
+  property code : System.Int32 { get }
+
+class ProcessKit.Outcome+Signalled : ProcessKit.Outcome
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.Outcome>
+  :> System.IEquatable<ProcessKit.Outcome>
+  member get_signal() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
+  property signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+
+module ProcessKit.Outcome+Tags
+  field literal Exited : System.Int32
+  field literal Signalled : System.Int32
+  field literal TimedOut : System.Int32
+
+class ProcessKit.OutputBufferPolicy
+  member WithMaxBytes(System.Int32) : ProcessKit.OutputBufferPolicy
+  member WithOverflow(ProcessKit.OverflowMode) : ProcessKit.OutputBufferPolicy
+  property Default : ProcessKit.OutputBufferPolicy { get }
+  property MaxBytes : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property MaxLines : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Overflow : ProcessKit.OverflowMode { get }
+  property Unbounded : ProcessKit.OutputBufferPolicy { get }
+  static member Bounded(System.Int32) : ProcessKit.OutputBufferPolicy
+  static member FailLoud(System.Int32) : ProcessKit.OutputBufferPolicy
+
+class ProcessKit.OutputEvent
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.OutputEvent>
+  member Equals(ProcessKit.OutputEvent) : System.Boolean
+  member Equals(ProcessKit.OutputEvent, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsStderr() : System.Boolean
+  member get_IsStdout() : System.Boolean
+  member get_Tag() : System.Int32
+  property IsStderr : System.Boolean { get }
+  property IsStdout : System.Boolean { get }
+  property Tag : System.Int32 { get }
+  property Text : System.String { get }
+  static member NewStderr(ProcessKit.OutputLine) : ProcessKit.OutputEvent
+  static member NewStdout(ProcessKit.OutputLine) : ProcessKit.OutputEvent
+
+class ProcessKit.OutputEvent+Stderr : ProcessKit.OutputEvent
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.OutputEvent>
+  member get_Item() : ProcessKit.OutputLine
+  property Item : ProcessKit.OutputLine { get }
+
+class ProcessKit.OutputEvent+Stdout : ProcessKit.OutputEvent
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.OutputEvent>
+  member get_Item() : ProcessKit.OutputLine
+  property Item : ProcessKit.OutputLine { get }
+
+module ProcessKit.OutputEvent+Tags
+  field literal Stderr : System.Int32
+  field literal Stdout : System.Int32
+
+class ProcessKit.OutputLine
+  member ToString() : System.String
+  property Text : System.String { get }
+
+class ProcessKit.OverflowMode
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.OverflowMode>
+  :> System.IEquatable<ProcessKit.OverflowMode>
+  member CompareTo(ProcessKit.OverflowMode) : System.Int32
+  member CompareTo(System.Object) : System.Int32
+  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
+  member Equals(ProcessKit.OverflowMode) : System.Boolean
+  member Equals(ProcessKit.OverflowMode, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsDropNewest() : System.Boolean
+  member get_IsDropOldest() : System.Boolean
+  member get_IsError() : System.Boolean
+  member get_Tag() : System.Int32
+  property DropNewest : ProcessKit.OverflowMode { get }
+  property DropOldest : ProcessKit.OverflowMode { get }
+  property Error : ProcessKit.OverflowMode { get }
+  property IsDropNewest : System.Boolean { get }
+  property IsDropOldest : System.Boolean { get }
+  property IsError : System.Boolean { get }
+  property Tag : System.Int32 { get }
+  static member get_DropNewest() : ProcessKit.OverflowMode
+  static member get_DropOldest() : ProcessKit.OverflowMode
+  static member get_Error() : ProcessKit.OverflowMode
+
+module ProcessKit.OverflowMode+Tags
+  field literal DropNewest : System.Int32
+  field literal DropOldest : System.Int32
+  field literal Error : System.Int32
+
+class ProcessKit.Pipeline
+  member CancelOn(System.Threading.CancellationToken) : ProcessKit.Pipeline
+  member ExitCode() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
+  member ExitCode(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
+  member OutputBytes() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  member OutputBytes(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  member OutputString() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  member OutputString(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  member Parse<T>(System.Func<System.String, T>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  member Parse<T>(System.Func<System.String, T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  member Pipe(ProcessKit.Command) : ProcessKit.Pipeline
+  member Probe() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
+  member Probe(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
+  member Run() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  member Run(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  member RunUnit() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member RunUnit(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member Timeout(System.TimeSpan) : ProcessKit.Pipeline
+  member TryParse<T>(System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  member TryParse<T>(System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+
+class ProcessKit.PipelineExtensions
+  static member Pipe(ProcessKit.Command, ProcessKit.Command) : ProcessKit.Pipeline
+
+module ProcessKit.PipelineModule
+  static member cancelOn(System.Threading.CancellationToken, ProcessKit.Pipeline) : ProcessKit.Pipeline
+  static member create(ProcessKit.Command, ProcessKit.Command) : ProcessKit.Pipeline
+  static member pipe(ProcessKit.Command, ProcessKit.Pipeline) : ProcessKit.Pipeline
+  static member timeout(System.TimeSpan, ProcessKit.Pipeline) : ProcessKit.Pipeline
+
+class ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member CompareTo(ProcessKit.ProcessError) : System.Int32
+  member CompareTo(System.Object) : System.Int32
+  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
+  member Equals(ProcessKit.ProcessError) : System.Boolean
+  member Equals(ProcessKit.ProcessError, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsCancelled() : System.Boolean
+  member get_IsCassetteMiss() : System.Boolean
+  member get_IsExit() : System.Boolean
+  member get_IsIo() : System.Boolean
+  member get_IsNotFound() : System.Boolean
+  member get_IsNotReady() : System.Boolean
+  member get_IsOutputTooLarge() : System.Boolean
+  member get_IsParse() : System.Boolean
+  member get_IsResourceLimit() : System.Boolean
+  member get_IsSignalled() : System.Boolean
+  member get_IsSpawn() : System.Boolean
+  member get_IsStdin() : System.Boolean
+  member get_IsTimeout() : System.Boolean
+  member get_IsUnsupported() : System.Boolean
+  member get_Tag() : System.Int32
+  property IsCancelled : System.Boolean { get }
+  property IsCassetteMiss : System.Boolean { get }
+  property IsExit : System.Boolean { get }
+  property IsIo : System.Boolean { get }
+  property IsNotFound : System.Boolean { get }
+  property IsNotReady : System.Boolean { get }
+  property IsOutputTooLarge : System.Boolean { get }
+  property IsParse : System.Boolean { get }
+  property IsResourceLimit : System.Boolean { get }
+  property IsSignalled : System.Boolean { get }
+  property IsSpawn : System.Boolean { get }
+  property IsStdin : System.Boolean { get }
+  property IsTimeout : System.Boolean { get }
+  property IsUnsupported : System.Boolean { get }
+  property Message : System.String { get }
+  property Tag : System.Int32 { get }
+  static member NewCancelled(System.String) : ProcessKit.ProcessError
+  static member NewCassetteMiss(System.String) : ProcessKit.ProcessError
+  static member NewExit(System.String, System.Int32, System.String, System.String) : ProcessKit.ProcessError
+  static member NewIo(System.String) : ProcessKit.ProcessError
+  static member NewNotFound(System.String, Microsoft.FSharp.Core.FSharpOption<System.String>) : ProcessKit.ProcessError
+  static member NewNotReady(System.String, System.TimeSpan) : ProcessKit.ProcessError
+  static member NewOutputTooLarge(System.String, Microsoft.FSharp.Core.FSharpOption<System.Int32>, Microsoft.FSharp.Core.FSharpOption<System.Int32>, System.Int32, System.Int32) : ProcessKit.ProcessError
+  static member NewParse(System.String, System.String) : ProcessKit.ProcessError
+  static member NewResourceLimit(System.String) : ProcessKit.ProcessError
+  static member NewSignalled(System.String, Microsoft.FSharp.Core.FSharpOption<System.Int32>, System.String, System.String) : ProcessKit.ProcessError
+  static member NewSpawn(System.String, System.String) : ProcessKit.ProcessError
+  static member NewStdin(System.String, System.String) : ProcessKit.ProcessError
+  static member NewTimeout(System.String, System.TimeSpan, System.String, System.String) : ProcessKit.ProcessError
+  static member NewUnsupported(System.String) : ProcessKit.ProcessError
+
+class ProcessKit.ProcessError+Cancelled : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_program() : System.String
+  property program : System.String { get }
+
+class ProcessKit.ProcessError+CassetteMiss : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_program() : System.String
+  property program : System.String { get }
+
+class ProcessKit.ProcessError+Exit : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_code() : System.Int32
+  member get_program() : System.String
+  member get_stderr() : System.String
+  member get_stdout() : System.String
+  property code : System.Int32 { get }
+  property program : System.String { get }
+  property stderr : System.String { get }
+  property stdout : System.String { get }
+
+class ProcessKit.ProcessError+Io : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_message() : System.String
+  property message : System.String { get }
+
+class ProcessKit.ProcessError+NotFound : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_program() : System.String
+  member get_searched() : Microsoft.FSharp.Core.FSharpOption<System.String>
+  property program : System.String { get }
+  property searched : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+
+class ProcessKit.ProcessError+NotReady : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_program() : System.String
+  member get_timeout() : System.TimeSpan
+  property program : System.String { get }
+  property timeout : System.TimeSpan { get }
+
+class ProcessKit.ProcessError+OutputTooLarge : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_byteLimit() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
+  member get_lineLimit() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
+  member get_program() : System.String
+  member get_totalBytes() : System.Int32
+  member get_totalLines() : System.Int32
+  property byteLimit : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property lineLimit : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property program : System.String { get }
+  property totalBytes : System.Int32 { get }
+  property totalLines : System.Int32 { get }
+
+class ProcessKit.ProcessError+Parse : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_message() : System.String
+  member get_program() : System.String
+  property message : System.String { get }
+  property program : System.String { get }
+
+class ProcessKit.ProcessError+ResourceLimit : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_message() : System.String
+  property message : System.String { get }
+
+class ProcessKit.ProcessError+Signalled : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_program() : System.String
+  member get_signal() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
+  member get_stderr() : System.String
+  member get_stdout() : System.String
+  property program : System.String { get }
+  property signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property stderr : System.String { get }
+  property stdout : System.String { get }
+
+class ProcessKit.ProcessError+Spawn : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_message() : System.String
+  member get_program() : System.String
+  property message : System.String { get }
+  property program : System.String { get }
+
+class ProcessKit.ProcessError+Stdin : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_message() : System.String
+  member get_program() : System.String
+  property message : System.String { get }
+  property program : System.String { get }
+
+module ProcessKit.ProcessError+Tags
+  field literal Cancelled : System.Int32
+  field literal CassetteMiss : System.Int32
+  field literal Exit : System.Int32
+  field literal Io : System.Int32
+  field literal NotFound : System.Int32
+  field literal NotReady : System.Int32
+  field literal OutputTooLarge : System.Int32
+  field literal Parse : System.Int32
+  field literal ResourceLimit : System.Int32
+  field literal Signalled : System.Int32
+  field literal Spawn : System.Int32
+  field literal Stdin : System.Int32
+  field literal Timeout : System.Int32
+  field literal Unsupported : System.Int32
+
+class ProcessKit.ProcessError+Timeout : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_program() : System.String
+  member get_stderr() : System.String
+  member get_stdout() : System.String
+  member get_timeout() : System.TimeSpan
+  property program : System.String { get }
+  property stderr : System.String { get }
+  property stdout : System.String { get }
+  property timeout : System.TimeSpan { get }
+
+class ProcessKit.ProcessError+Unsupported : ProcessKit.ProcessError
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.ProcessError>
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_operation() : System.String
+  property operation : System.String { get }
+
+module ProcessKit.ProcessErrorModule
+  static member isNotFound(ProcessKit.ProcessError) : System.Boolean
+  static member isTransient(ProcessKit.ProcessError) : System.Boolean
+
+class ProcessKit.ProcessGroup
+  :> ProcessKit.IProcessRunner
+  :> System.IAsyncDisposable
+  :> System.IDisposable
+  member Finalize() : System.Void
+  member Members() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Collections.FSharpList<System.Int32>, ProcessKit.ProcessError>
+  member Resume() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member SampleStats(System.TimeSpan) : System.Collections.Generic.IAsyncEnumerable<ProcessKit.ProcessGroupStats>
+  member Shutdown() : System.Threading.Tasks.Task
+  member Shutdown(System.TimeSpan) : System.Threading.Tasks.Task
+  member Signal(ProcessKit.Signal) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member Start(ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
+  member Stats() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroupStats, ProcessKit.ProcessError>
+  member Suspend() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member TerminateAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  property Mechanism : ProcessKit.Mechanism { get }
+  property Options : ProcessKit.ProcessGroupOptions { get }
+  static member Create() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroup, ProcessKit.ProcessError>
+  static member Create(ProcessKit.ProcessGroupOptions) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroup, ProcessKit.ProcessError>
+
+class ProcessKit.ProcessGroupOptions
+  member WithCpuQuota(System.Double) : ProcessKit.ProcessGroupOptions
+  member WithMaxProcesses(System.Int32) : ProcessKit.ProcessGroupOptions
+  member WithMemoryMax(System.Int64) : ProcessKit.ProcessGroupOptions
+  member WithShutdownTimeout(System.TimeSpan) : ProcessKit.ProcessGroupOptions
+  new()
+  property Limits : ProcessKit.ResourceLimits { get }
+  property ShutdownTimeout : System.TimeSpan { get }
+
+class ProcessKit.ProcessGroupStats
+  property ActiveProcessCount : System.Int32 { get }
+  property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.UInt64> { get }
+  property TotalCpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
+
+module ProcessKit.ProcessResult
+  static member ensureSuccess(ProcessKit.ProcessResult<System.String>) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>
+
+class ProcessKit.ProcessResult`1
+  property AcceptedCodes : Microsoft.FSharp.Collections.FSharpList<System.Int32> { get }
+  property Code : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Duration : System.TimeSpan { get }
+  property IsSuccess : System.Boolean { get }
+  property IsTimedOut : System.Boolean { get }
+  property Outcome : ProcessKit.Outcome { get }
+  property Program : System.String { get }
+  property Signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Stderr : System.String { get }
+  property Stdout : T { get }
+  property Truncated : System.Boolean { get }
+
+class ProcessKit.ProcessStdin
+  member Finish() : System.Threading.Tasks.Task
+  member Flush() : System.Threading.Tasks.Task
+  member Write(System.Byte[]) : System.Threading.Tasks.Task
+  member WriteLine(System.String) : System.Threading.Tasks.Task
+
+class ProcessKit.ResourceLimits
+  member WithCpuQuota(System.Double) : ProcessKit.ResourceLimits
+  member WithMaxProcesses(System.Int32) : ProcessKit.ResourceLimits
+  member WithMemoryMax(System.Int64) : ProcessKit.ResourceLimits
+  property CpuQuota : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
+  property MaxProcesses : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property MemoryMax : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property None : ProcessKit.ResourceLimits { get }
+
+class ProcessKit.RestartPolicy
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.RestartPolicy>
+  :> System.IEquatable<ProcessKit.RestartPolicy>
+  member CompareTo(ProcessKit.RestartPolicy) : System.Int32
+  member CompareTo(System.Object) : System.Int32
+  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
+  member Equals(ProcessKit.RestartPolicy) : System.Boolean
+  member Equals(ProcessKit.RestartPolicy, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsAlways() : System.Boolean
+  member get_IsNever() : System.Boolean
+  member get_IsOnCrash() : System.Boolean
+  member get_Tag() : System.Int32
+  property Always : ProcessKit.RestartPolicy { get }
+  property IsAlways : System.Boolean { get }
+  property IsNever : System.Boolean { get }
+  property IsOnCrash : System.Boolean { get }
+  property Never : ProcessKit.RestartPolicy { get }
+  property OnCrash : ProcessKit.RestartPolicy { get }
+  property Tag : System.Int32 { get }
+  static member get_Always() : ProcessKit.RestartPolicy
+  static member get_Never() : ProcessKit.RestartPolicy
+  static member get_OnCrash() : ProcessKit.RestartPolicy
+
+module ProcessKit.RestartPolicy+Tags
+  field literal Always : System.Int32
+  field literal Never : System.Int32
+  field literal OnCrash : System.Int32
+
+class ProcessKit.RunProfile
+  property AvgCpu : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
+  property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
+  property Duration : System.TimeSpan { get }
+  property ExitCode : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.UInt64> { get }
+  property Samples : System.Int32 { get }
+
+module ProcessKit.Runner
+  static member exitCode(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
+  static member firstLine(ProcessKit.IProcessRunner, System.Threading.CancellationToken, Microsoft.FSharp.Core.FSharpFunc<System.String, System.Boolean>, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
+  static member outputBytes(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  static member outputString(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  static member parse<T>(ProcessKit.IProcessRunner, System.Threading.CancellationToken, Microsoft.FSharp.Core.FSharpFunc<System.String, T>, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member probe(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
+  static member run(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  static member runUnit(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  static member start(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
+  static member tryParse<T>(ProcessKit.IProcessRunner, System.Threading.CancellationToken, Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+
+class ProcessKit.RunningProcess
+  :> System.IAsyncDisposable
+  member Finish() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.Finished, ProcessKit.ProcessError>>
+  member OutputBytes() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  member OutputEvents() : System.Collections.Generic.IAsyncEnumerable<ProcessKit.OutputEvent>
+  member OutputString() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  member Profile() : System.Threading.Tasks.Task<ProcessKit.RunProfile>
+  member Profile(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.RunProfile>
+  member StartKill() : System.Void
+  member StdoutLines() : System.Collections.Generic.IAsyncEnumerable<System.String>
+  member TakeStdin() : Microsoft.FSharp.Core.FSharpOption<ProcessKit.ProcessStdin>
+  member Wait() : System.Threading.Tasks.Task<ProcessKit.Outcome>
+  member WaitFor(System.Func<System.Threading.Tasks.Task<System.Boolean>>, System.TimeSpan) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member WaitForLine(System.Func<System.String, System.Boolean>, System.TimeSpan) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  member WaitForPort(System.Net.IPEndPoint, System.TimeSpan) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
+  property Elapsed : System.TimeSpan { get }
+  property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.UInt64> { get }
+  property Pid : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property StartTime : System.DateTime { get }
+  property StderrLineCount : System.Int32 { get }
+  property StdoutLineCount : System.Int32 { get }
+  static member WaitAll(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<ProcessKit.Outcome[]>
+  static member WaitAny(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Tuple<System.Int32, ProcessKit.Outcome>, ProcessKit.ProcessError>>
+
+class ProcessKit.Signal
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.Signal>
+  :> System.IEquatable<ProcessKit.Signal>
+  member CompareTo(ProcessKit.Signal) : System.Int32
+  member CompareTo(System.Object) : System.Int32
+  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
+  member Equals(ProcessKit.Signal) : System.Boolean
+  member Equals(ProcessKit.Signal, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsHup() : System.Boolean
+  member get_IsInt() : System.Boolean
+  member get_IsKill() : System.Boolean
+  member get_IsOther() : System.Boolean
+  member get_IsQuit() : System.Boolean
+  member get_IsTerm() : System.Boolean
+  member get_IsUsr1() : System.Boolean
+  member get_IsUsr2() : System.Boolean
+  member get_Tag() : System.Int32
+  property Hup : ProcessKit.Signal { get }
+  property Int : ProcessKit.Signal { get }
+  property IsHup : System.Boolean { get }
+  property IsInt : System.Boolean { get }
+  property IsKill : System.Boolean { get }
+  property IsOther : System.Boolean { get }
+  property IsQuit : System.Boolean { get }
+  property IsTerm : System.Boolean { get }
+  property IsUsr1 : System.Boolean { get }
+  property IsUsr2 : System.Boolean { get }
+  property Kill : ProcessKit.Signal { get }
+  property Quit : ProcessKit.Signal { get }
+  property Tag : System.Int32 { get }
+  property Term : ProcessKit.Signal { get }
+  property Usr1 : ProcessKit.Signal { get }
+  property Usr2 : ProcessKit.Signal { get }
+  static member NewOther(System.Int32) : ProcessKit.Signal
+  static member get_Hup() : ProcessKit.Signal
+  static member get_Int() : ProcessKit.Signal
+  static member get_Kill() : ProcessKit.Signal
+  static member get_Quit() : ProcessKit.Signal
+  static member get_Term() : ProcessKit.Signal
+  static member get_Usr1() : ProcessKit.Signal
+  static member get_Usr2() : ProcessKit.Signal
+
+class ProcessKit.Signal+Other : ProcessKit.Signal
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.Signal>
+  :> System.IEquatable<ProcessKit.Signal>
+  member get_signalNumber() : System.Int32
+  property signalNumber : System.Int32 { get }
+
+module ProcessKit.Signal+Tags
+  field literal Hup : System.Int32
+  field literal Int : System.Int32
+  field literal Kill : System.Int32
+  field literal Other : System.Int32
+  field literal Quit : System.Int32
+  field literal Term : System.Int32
+  field literal Usr1 : System.Int32
+  field literal Usr2 : System.Int32
+
+class ProcessKit.Stdin
+  property Empty : ProcessKit.Stdin { get }
+  static member FromAsyncLines(System.Collections.Generic.IAsyncEnumerable<System.String>) : ProcessKit.Stdin
+  static member FromBytes(System.Byte[]) : ProcessKit.Stdin
+  static member FromFile(System.String) : ProcessKit.Stdin
+  static member FromLines(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Stdin
+  static member FromReader(System.IO.Stream) : ProcessKit.Stdin
+  static member FromString(System.String) : ProcessKit.Stdin
+
+class ProcessKit.StdioMode
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.StdioMode>
+  :> System.IEquatable<ProcessKit.StdioMode>
+  member CompareTo(ProcessKit.StdioMode) : System.Int32
+  member CompareTo(System.Object) : System.Int32
+  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
+  member Equals(ProcessKit.StdioMode) : System.Boolean
+  member Equals(ProcessKit.StdioMode, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsInherit() : System.Boolean
+  member get_IsNull() : System.Boolean
+  member get_IsPiped() : System.Boolean
+  member get_Tag() : System.Int32
+  property Inherit : ProcessKit.StdioMode { get }
+  property IsInherit : System.Boolean { get }
+  property IsNull : System.Boolean { get }
+  property IsPiped : System.Boolean { get }
+  property Null : ProcessKit.StdioMode { get }
+  property Piped : ProcessKit.StdioMode { get }
+  property Tag : System.Int32 { get }
+  static member get_Inherit() : ProcessKit.StdioMode
+  static member get_Null() : ProcessKit.StdioMode
+  static member get_Piped() : ProcessKit.StdioMode
+
+module ProcessKit.StdioMode+Tags
+  field literal Inherit : System.Int32
+  field literal Null : System.Int32
+  field literal Piped : System.Int32
+
+class ProcessKit.StopReason
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.StopReason>
+  :> System.IEquatable<ProcessKit.StopReason>
+  member CompareTo(ProcessKit.StopReason) : System.Int32
+  member CompareTo(System.Object) : System.Int32
+  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
+  member Equals(ProcessKit.StopReason) : System.Boolean
+  member Equals(ProcessKit.StopReason, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsPolicySatisfied() : System.Boolean
+  member get_IsPredicate() : System.Boolean
+  member get_IsRestartsExhausted() : System.Boolean
+  member get_Tag() : System.Int32
+  property IsPolicySatisfied : System.Boolean { get }
+  property IsPredicate : System.Boolean { get }
+  property IsRestartsExhausted : System.Boolean { get }
+  property PolicySatisfied : ProcessKit.StopReason { get }
+  property Predicate : ProcessKit.StopReason { get }
+  property RestartsExhausted : ProcessKit.StopReason { get }
+  property Tag : System.Int32 { get }
+  static member get_PolicySatisfied() : ProcessKit.StopReason
+  static member get_Predicate() : ProcessKit.StopReason
+  static member get_RestartsExhausted() : ProcessKit.StopReason
+
+module ProcessKit.StopReason+Tags
+  field literal PolicySatisfied : System.Int32
+  field literal Predicate : System.Int32
+  field literal RestartsExhausted : System.Int32
+
+class ProcessKit.SupervisionOutcome
+  property FinalResult : ProcessKit.ProcessResult<System.String> { get }
+  property Restarts : System.Int32 { get }
+  property Stopped : ProcessKit.StopReason { get }
+  property StormPauses : System.Int32 { get }
+
+class ProcessKit.Supervisor
+  member Backoff(System.TimeSpan, System.Double) : ProcessKit.Supervisor
+  member Capture(ProcessKit.OutputBufferPolicy) : ProcessKit.Supervisor
+  member FailureDecay(System.TimeSpan) : ProcessKit.Supervisor
+  member FailureThreshold(System.Double) : ProcessKit.Supervisor
+  member Jitter(System.Boolean) : ProcessKit.Supervisor
+  member MaxBackoff(System.TimeSpan) : ProcessKit.Supervisor
+  member MaxRestarts(System.Int32) : ProcessKit.Supervisor
+  member Restart(ProcessKit.RestartPolicy) : ProcessKit.Supervisor
+  member Run() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>>
+  member Run(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>>
+  member StopWhen(System.Func<ProcessKit.ProcessResult<System.String>, System.Boolean>) : ProcessKit.Supervisor
+  member StormPause(System.TimeSpan) : ProcessKit.Supervisor
+  member WithRunner(ProcessKit.IProcessRunner) : ProcessKit.Supervisor
+  new(ProcessKit.Command)
+
+module ProcessKit.SupervisorModule
+  static member create(ProcessKit.Command) : ProcessKit.Supervisor
+
+class ProcessKit.Testing.CassetteEntry
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.Testing.CassetteEntry>
+  member Equals(ProcessKit.Testing.CassetteEntry) : System.Boolean
+  member Equals(ProcessKit.Testing.CassetteEntry, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  new()
+  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Nullable<System.Int32>)
+  property Args : System.String[] { get; set }
+  property Code : System.Nullable<System.Int32> { get; set }
+  property Cwd : System.String { get; set }
+  property EnvNames : System.String[] { get; set }
+  property HasStdin : System.Boolean { get; set }
+  property Program : System.String { get; set }
+  property Signal : System.Nullable<System.Int32> { get; set }
+  property Stderr : System.String { get; set }
+  property StdinDigest : System.String { get; set }
+  property Stdout : System.String { get; set }
+  property TimedOut : System.Boolean { get; set }
+
+class ProcessKit.Testing.RecordReplayRunner
+  :> ProcessKit.IProcessRunner
+  :> System.IDisposable
+  member Save() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  static member Record(System.String, ProcessKit.IProcessRunner) : ProcessKit.Testing.RecordReplayRunner
+  static member Replay(System.String) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
+
+class ProcessKit.Testing.Reply
+  member WithStderr(System.String) : ProcessKit.Testing.Reply
+  member WithStdout(System.String) : ProcessKit.Testing.Reply
+  static member Exit(System.Int32) : ProcessKit.Testing.Reply
+  static member Fail(System.Int32, System.String) : ProcessKit.Testing.Reply
+  static member Ok(System.String) : ProcessKit.Testing.Reply
+  static member Signalled(Microsoft.FSharp.Core.FSharpOption<System.Int32>) : ProcessKit.Testing.Reply
+
+class ProcessKit.Testing.ScriptedRunner
+  :> ProcessKit.IProcessRunner
+  member Fallback(ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
+  member On(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
+  member When(Microsoft.FSharp.Core.FSharpFunc<ProcessKit.Command, System.Boolean>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
+  new()
+

@@ -27,6 +27,14 @@
 		<Compile Include="CassetteTests.fs" />
 		<Compile Include="LoggingTests.fs" />
 		<Compile Include="DependencyInjectionTests.fs" />
+		<Compile Include="ApiSurfaceTests.fs" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- Public-API baselines for ApiSurfaceTests; copied next to the test assembly so the test
+		     reads them from its output directory. -->
+		<None Include="PublicApi.ProcessKit.approved.txt" CopyToOutputDirectory="PreserveNewest" />
+		<None Include="PublicApi.ProcessKit.Extensions.DependencyInjection.approved.txt" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 	<ItemGroup>

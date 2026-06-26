@@ -1,0 +1,3 @@
+class ProcessKit.Extensions.DependencyInjection.ServiceCollectionExtensions
+  static member AddProcessKit(Microsoft.Extensions.DependencyInjection.IServiceCollection) : Microsoft.Extensions.DependencyInjection.IServiceCollection
+

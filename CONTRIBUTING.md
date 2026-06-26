@@ -50,6 +50,11 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
   `ProjectReference`. Build order comes from `BuildDependency` in the `.slnx`.
 - Match the surrounding code's style for exception handling, comments, and
   architecture; keep the public API surface small and intentional.
+- **The public API is locked.** `ApiSurfaceTests` snapshots the exported surface
+  against `tests/ProcessKit.Tests/PublicApi.*.approved.txt`. If you change the
+  public API on purpose, run the tests, review the generated `*.received.txt`
+  (written next to the test assembly), and copy it over the matching
+  `*.approved.txt`. An unreviewed API change fails the build.
 
 ## Changelog
 
