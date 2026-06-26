@@ -9,7 +9,7 @@
 		<Authors>Anton Zhelezniakou</Authors>
 		<Copyright>Copyright (c) 2026 Anton Zhelezniakou</Copyright>
 		<Description>F# async child-process management: whole-tree kill-on-drop (no orphans), streaming, pipelines, timeouts, and supervision.</Description>
-		<!-- <PackageTags>tag1;tag2</PackageTags> -->
+		<PackageTags>fsharp;dotnet;process;subprocess;child-process;process-management;process-tree;kill-on-drop;async;pipeline;supervision;job-object;cgroups</PackageTags>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
 		<PackageReleaseNotes Condition="Exists('$(RepoRoot)release-notes.md')">$([System.IO.File]::ReadAllText('$(RepoRoot)release-notes.md'))</PackageReleaseNotes>

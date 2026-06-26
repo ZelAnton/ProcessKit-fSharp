@@ -1,5 +1,10 @@
 # ProcessKit
 
+[![CI](https://github.com/ZelAnton/ProcessKit-fSharp/actions/workflows/ci.yml/badge.svg)](https://github.com/ZelAnton/ProcessKit-fSharp/actions/workflows/ci.yml)
+[![NuGet](https://img.shields.io/nuget/v/ProcessKit.svg)](https://www.nuget.org/packages/ProcessKit)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![.NET](https://img.shields.io/badge/.NET-10.0-512BD4.svg)](https://dotnet.microsoft.com/)
+
 F# async child-process management for .NET: whole-tree kill-on-drop (no orphans),
 streaming, pipelines, timeouts, and supervision.
 
@@ -11,6 +16,8 @@ streaming, pipelines, timeouts, and supervision.
 
 ```bash
 dotnet add package ProcessKit
+# optional — Microsoft.Extensions.DependencyInjection integration (AddProcessKit)
+dotnet add package ProcessKit.Extensions.DependencyInjection
 ```
 
 ## Quick start
@@ -74,6 +81,16 @@ From C# the same surface is available as fluent methods (`command.Run()`,
 - **Testable** — `ProcessKit.Testing.ScriptedRunner` and `RecordReplayRunner` (record/replay
   cassettes) are subprocess-free `IProcessRunner`s for hermetic tests.
 
+## Contributing
+
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md). To report a security issue, follow [SECURITY.md](SECURITY.md).
+
+## Links
+
+- [Changelog](CHANGELOG.md) — what has shipped.
+- [Roadmap](ROADMAP.md) — what is planned.
+
 ## License
 
-MIT
+[MIT](LICENSE) © Anton Zhelezniakou

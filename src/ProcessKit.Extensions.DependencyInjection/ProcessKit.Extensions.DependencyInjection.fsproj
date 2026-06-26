@@ -9,6 +9,7 @@
 		<Authors>Anton Zhelezniakou</Authors>
 		<Copyright>Copyright (c) 2026 Anton Zhelezniakou</Copyright>
 		<Description>Microsoft.Extensions.DependencyInjection integration for ProcessKit: AddProcessKit registers an IProcessRunner (ILogger-aware when a logger factory is present).</Description>
+		<PackageTags>fsharp;dotnet;process;subprocess;dependency-injection;microsoft-extensions-dependencyinjection;iprocessrunner;processkit</PackageTags>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
 
