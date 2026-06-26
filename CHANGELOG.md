@@ -40,6 +40,7 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - Optional `Microsoft.Extensions.Logging` integration: `Command.WithLogger(logger)` emits structured lifecycle events — spawn, exit, timeout, retry, and supervisor restart / failure-storm pause. **argv and the environment are never logged** (only the program name and non-secret facts). No-op and free when no logger is set.
 - New `ProcessKit.Extensions.DependencyInjection` package: `IServiceCollection.AddProcessKit()` registers `IProcessRunner` (a singleton `JobRunner`), wrapped to emit ProcessKit's lifecycle events when the container has an `ILoggerFactory`. Uses `TryAdd`, so a pre-existing `IProcessRunner` registration is left untouched.
 - Both NuGet packages now ship an XML API documentation file, so consumers get IntelliSense / quick-info and generated API references for the public surface.
+- Multi-targets **net8.0 (LTS)** and **net10.0**, so the packages run on .NET 8 and later (previously net10.0 only).
 
 ### Changed
 -

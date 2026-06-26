@@ -64,7 +64,11 @@ jobs:
 
       - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5
         with:
-          dotnet-version: '10.0.x'
+          # The 10.0.x SDK builds (pinned by global.json); the 8.0.x runtime is needed to
+          # run the net8.0 test leg of the multi-targeted (net8.0;net10.0) test project.
+          dotnet-version: |
+            8.0.x
+            10.0.x
 
       # Cache the global NuGet package folder across runs. Keyed on the central
       # version files so the cache invalidates only when dependencies change.
@@ -116,7 +120,10 @@ jobs:
                 export PROCESSKIT_EXPECT_CGROUP=1
               fi
               echo "PROCESSKIT_EXPECT_CGROUP=$PROCESSKIT_EXPECT_CGROUP"
-              dotnet build --configuration Release
+              # The sdk:10.0 image has only the net10 runtime; build and test just net10.0 here
+              # (the cgroup limits backend is runtime-version-independent, so one TFM suffices).
+              dotnet build --configuration Release -p:TargetFrameworks=net10.0
               dotnet test --no-build --configuration Release \
+                --framework net10.0 \
                 --filter "FullyQualifiedName~LimitsTests"
             '

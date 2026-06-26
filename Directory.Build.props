@@ -9,6 +9,10 @@
 	</PropertyGroup>
 
 	<PropertyGroup>
+		<!-- Multi-target net8.0 (LTS) and net10.0. Set here so all projects stay in lockstep:
+		     the cross-project Reference + AssemblySearchPaths resolution keys on $(TargetFramework),
+		     so every project must build the same set of TFMs. -->
+		<TargetFrameworks>net8.0;net10.0</TargetFrameworks>
 		<LangVersion>latest</LangVersion>
 		<!-- F# nullable reference types (F# 9+). Real language feature, not the C#
 		     analyzer; it changes how the compiler treats `string` vs `string | null`. -->
