@@ -90,6 +90,10 @@ module internal Pump =
             let charBuffer = Array.zeroCreate<char> (encoding.GetMaxCharCount byteBuffer.Length)
             let line = StringBuilder()
             let mutable reading = true
+            // A leading byte-order mark of the chosen encoding is stripped from the decoded text
+            // (GetDecoder, unlike StreamReader, leaves it in). The raw `tee` and OutputBytes stay
+            // byte-exact — only decoded text drops the BOM.
+            let mutable atStreamStart = true
 
             while reading do
                 let! read = stream.ReadAsync(byteBuffer.AsMemory(0, byteBuffer.Length), cancellationToken)
@@ -107,14 +111,19 @@ module internal Pump =
                     while i < chars do
                         let c = charBuffer[i]
 
-                        if c = '\n' then
-                            if line.Length > 0 && line[line.Length - 1] = '\r' then
-                                line.Length <- line.Length - 1
-
-                            onLine (line.ToString())
-                            line.Clear() |> ignore
+                        if atStreamStart && c = char 0xFEFF then
+                            atStreamStart <- false
                         else
-                            line.Append c |> ignore
+                            atStreamStart <- false
+
+                            if c = '\n' then
+                                if line.Length > 0 && line[line.Length - 1] = '\r' then
+                                    line.Length <- line.Length - 1
+
+                                onLine (line.ToString())
+                                line.Clear() |> ignore
+                            else
+                                line.Append c |> ignore
 
                         i <- i + 1
 

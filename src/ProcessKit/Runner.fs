@@ -157,21 +157,30 @@ module Runner =
             match! runner.Start(command, cancellationToken) with
             | Error error -> return Error error
             | Ok running ->
-                let mutable found = None
-                let enumerator = running.StdoutLines().GetAsyncEnumerator(cancellationToken)
-                let mutable more = true
+                // `use` reaps the process tree on every exit path (match below / a throwing
+                // predicate / cancellation), so a streaming verb never downgrades the kill-on-drop
+                // guarantee to GC finalization.
+                use _ = running
 
-                while more do
-                    let! has = enumerator.MoveNextAsync()
+                try
+                    let mutable found = None
+                    use enumerator = running.StdoutLines().GetAsyncEnumerator(cancellationToken)
+                    let mutable more = true
 
-                    if not has then
-                        more <- false
-                    elif predicate enumerator.Current then
-                        found <- Some enumerator.Current
-                        more <- false
+                    while more do
+                        let! has = enumerator.MoveNextAsync()
 
-                do! enumerator.DisposeAsync()
-                running.StartKill()
-                let! _ = running.Finish()
-                return Ok found
+                        if not has then
+                            more <- false
+                        elif predicate enumerator.Current then
+                            found <- Some enumerator.Current
+                            more <- false
+
+                    running.StartKill()
+                    let! _ = running.Finish()
+                    return Ok found
+                with :? System.OperationCanceledException ->
+                    // Faithful to the contract: a cancelled run is always an error, not a raised
+                    // OperationCanceledException.
+                    return Error(ProcessError.Cancelled command.Program)
         }

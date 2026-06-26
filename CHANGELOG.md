@@ -50,5 +50,9 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - A throwing `OnStdoutLine`/`OnStderrLine` handler now surfaces the error on `StdoutLines()` / `OutputEvents()` (and `Finish()`) instead of hanging the stream reader: the output channel is always completed — carrying the fault — even when a line pump throws. Across both the streaming verbs and the capture verbs (`OutputString`/`OutputBytes`) the two output pumps are now awaited together, so a fault in one never leaves the other running as an unobserved task.
 - Every terminal `RunningProcess` verb (`OutputString`/`OutputBytes`/`Wait`/`Profile`/`Finish`) now reaps the process tree even when the run faults mid-flight (e.g. a throwing line handler), rather than deferring teardown to disposal/GC.
 - `RunningProcess.Profile` now cancels and awaits its background metric sampler on the fault path too — a fault mid-profile can no longer leave the sampler running against a soon-to-be-disposed token as an unobserved task.
+- POSIX process wait now retries when the blocking `waitpid` is interrupted by a signal (e.g. the runtime's own thread-suspension signal on Linux) instead of misreading the untouched status as exit 0 and leaking the child as a zombie.
+- Captured and streamed text now strips a leading byte-order mark of the chosen encoding (matching `StreamReader`); `OutputBytes` and the stdout/stderr tees stay byte-exact.
+- `FirstLine` now reaps the process tree on every exit path — a throwing predicate or a cancelled run no longer downgrades kill-on-drop to GC finalization — and a cancelled run is reported as `ProcessError.Cancelled` rather than raising.
+- Tree-control verbs (`Signal` / `Suspend` / `Resume` / `Members` / `TerminateAll`) now return an error once the group is released, like `Stats`, closing a use-after-close window when a verb races a concurrent `Dispose` / `Shutdown`.
 
 [Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/commits/main

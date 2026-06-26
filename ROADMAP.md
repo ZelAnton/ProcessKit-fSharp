@@ -232,6 +232,18 @@ Surfaced by the milestone reviews; deferred deliberately because they are intern
 - **Streaming backlog.** A streamed (`StdoutLines`/`OutputEvents`) consumer that stops draining
   while the child floods grows the channel unbounded; the `OutputBufferPolicy` ceiling is applied
   to the *buffered* verbs, and streaming is consumer-paced (pair with a `timeout`).
+- **Unbounded in-flight line.** The `OutputBufferPolicy` line/byte caps bound the *retained
+  complete lines*; a single not-yet-terminated line (a newline-free flood) still grows until EOF.
+  Pair an untrusted child with a `timeout`. (Upstream caps the in-flight line — a port follow-up.)
+- **cgroup migration-failure window (Linux `limits`).** If a child fails to migrate into the
+  limits cgroup *after* the group was created successfully (rare — creation already validated the
+  cgroup), it runs in the parent cgroup and escapes `cgroup.kill` teardown. The Windows Job and
+  POSIX-pgroup default paths are unaffected; a follow-up tracks the spawned pid as a teardown
+  fallback.
+- **Zombie leaders on kill-without-wait (POSIX).** Group teardown `SIGKILL`s the tree but does not
+  `waitpid` leaders that were never awaited through a run verb (e.g. `ProcessGroup.Start` into a
+  shared group, then dispose without consuming the `RunningProcess`). Run verbs reap normally; the
+  kill-without-wait path leaves defunct entries until the host exits — a follow-up reaps them.
 - **Default UTF-8 decoding.** Captured text is decoded UTF-8 by default; Windows console programs
   emitting a legacy OEM code page need an explicit `StdoutEncoding`. (Matches upstream.)
 - **POSIX pgid-reuse window.** The process-group teardown has a small reuse window on Unix; cgroup

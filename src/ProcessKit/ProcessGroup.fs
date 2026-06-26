@@ -249,38 +249,50 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             | Ok host -> return Ok(RunningProcess host)
         }
 
+    // Tree-control / accounting verbs become an error once the group is released: after teardown the
+    // backend's Job handle is closed (and POSIX pgids may have been recycled), so calling in would be
+    // a use-after-close or a wrong-target kill. Guarding here (as `Stats` already did) closes the
+    // window for a verb racing a concurrent `Dispose`/`Shutdown`.
+    member private _.WhenLive(action: unit -> Result<'T, ProcessError>) : Result<'T, ProcessError> =
+        if releasedFlag <> 0 then
+            Error(ProcessError.Io "the process group has been released")
+        else
+            action ()
+
     /// Immediately hard-kill every process currently in the group. Idempotent; the group stays
     /// usable for further spawns. Returns `Result` for parity with the other tree-control verbs (a
     /// future backend can report an undrained tree); the current backends always succeed.
-    member _.TerminateAll() : Result<unit, ProcessError> =
-        backend.KillTree()
-        Ok()
+    member this.TerminateAll() : Result<unit, ProcessError> =
+        this.WhenLive(fun () ->
+            backend.KillTree()
+            Ok())
 
     /// The pids of the processes currently in the group — a point-in-time snapshot. On Windows the
     /// whole Job tree, on cgroup v2 the whole cgroup, on the POSIX fallback the tracked group leaders.
-    member _.Members() : Result<int list, ProcessError> = backend.Members()
+    member this.Members() : Result<int list, ProcessError> =
+        this.WhenLive(fun () -> backend.Members())
 
     /// Broadcast `signal` to every process in the group. Best-effort: an exited member is skipped
     /// and an empty group succeeds trivially. On **Windows** only `Signal.Kill` is deliverable (it
     /// maps to the Job terminate); any other signal returns `ProcessError.Unsupported`.
-    member _.Signal(signal: Signal) : Result<unit, ProcessError> = backend.Signal signal
+    member this.Signal(signal: Signal) : Result<unit, ProcessError> =
+        this.WhenLive(fun () -> backend.Signal signal)
 
     /// Suspend (freeze) every process in the group. POSIX: `SIGSTOP` (level-triggered, idempotent).
     /// Cgroup v2: `cgroup.freeze`. Windows: suspend every thread of every member — best-effort, and
     /// suspend counts stack, so N `Suspend`s need N `Resume`s.
-    member _.Suspend() : Result<unit, ProcessError> = backend.Suspend()
+    member this.Suspend() : Result<unit, ProcessError> =
+        this.WhenLive(fun () -> backend.Suspend())
 
     /// Resume a tree suspended by `Suspend`.
-    member _.Resume() : Result<unit, ProcessError> = backend.Resume()
+    member this.Resume() : Result<unit, ProcessError> =
+        this.WhenLive(fun () -> backend.Resume())
 
     /// A snapshot of the group's resource usage. On Windows this reads the Job Object's accounting
     /// (CPU + peak committed memory + active count); on cgroup v2 the cgroup accounting; on the POSIX
     /// fallback only the live group count (CPU/memory are `None`). Errors once the group is released.
-    member _.Stats() : Result<ProcessGroupStats, ProcessError> =
-        if releasedFlag <> 0 then
-            Error(ProcessError.Io "the process group has been released")
-        else
-            backend.Stats()
+    member this.Stats() : Result<ProcessGroupStats, ProcessError> =
+        this.WhenLive(fun () -> backend.Stats())
 
     /// A periodic `ProcessGroupStats` series: the first sample immediately, then one per `interval`.
     /// **Pull-based** — it samples only as the enumeration is pulled and runs no background task, so

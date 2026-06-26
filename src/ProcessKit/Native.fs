@@ -1104,11 +1104,21 @@ module internal Native =
         let flags = if isMacOs then flags else flags ||| O_CLOEXEC
         openFile ("/dev/null", flags)
 
+    // errno value for a syscall interrupted by a signal (same number on Linux and macOS).
+    let private EINTR = 4
+
     /// Reap a POSIX child and report how it concluded.
     let waitPosix (pid: nativeint) : Task<Outcome> =
         Task.Run(fun () ->
             let mutable status = 0
-            waitpid (int pid, &status, 0) |> ignore
+            // `waitpid` can return -1/EINTR when a signal interrupts the blocking wait — notably the
+            // .NET runtime's own thread-suspension signal on Linux. Retry so we don't misread the
+            // untouched status as `Exited 0` (and leak the child as a zombie).
+            let mutable result = waitpid (int pid, &status, 0)
+
+            while result < 0 && Marshal.GetLastWin32Error() = EINTR do
+                result <- waitpid (int pid, &status, 0)
+
             decodeWaitStatus status)
 
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
