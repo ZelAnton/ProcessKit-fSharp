@@ -10,6 +10,9 @@ participating, you are expected to uphold it.
 ## Prerequisites
 
 - .NET 10 SDK (the exact band is pinned in [`global.json`](global.json)).
+- The .NET 8 runtime as well: the projects multi-target `net8.0;net10.0`, so the
+  full `dotnet test` runs both legs. Run `dotnet test --framework net10.0` to test
+  a single target if you don't have the net8 runtime installed.
 - Local tools restored once per clone (`dotnet tool restore`) — this installs
   [Fantomas](https://fsprojects.github.io/fantomas/), the F# formatter.
 - Optional: PowerShell 7+ and Docker/Rancher Desktop to run the Linux test

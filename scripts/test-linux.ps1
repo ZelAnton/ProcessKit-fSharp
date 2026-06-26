@@ -86,8 +86,11 @@ if ($Privileged) {
 if ($Rebuild) {
     $bashLines += "dotnet clean -c $Configuration"
 }
-$bashLines += "dotnet build -c $Configuration"
-$testCmd = "dotnet test --no-build -c $Configuration tests/ProcessKit.Tests/ProcessKit.Tests.fsproj"
+# The default sdk:10.0 image carries only the net10 runtime, so build and test the net10.0
+# TFM only (the Linux-specific code path is runtime-version-independent). CI exercises both
+# net8.0 and net10.0; this helper just exercises the Linux/Unix path quickly.
+$bashLines += "dotnet build -c $Configuration -p:TargetFrameworks=net10.0"
+$testCmd = "dotnet test --no-build -c $Configuration --framework net10.0 tests/ProcessKit.Tests/ProcessKit.Tests.fsproj"
 if ($Filter) {
     $testCmd += " --filter `"$Filter`""
 }
