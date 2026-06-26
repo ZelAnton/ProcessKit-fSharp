@@ -165,11 +165,17 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// Spawn `command` into the group, tracking the child for signalling / teardown. Internal.
     member internal _.SpawnInto(command: Command) : Result<Native.Spawned, ProcessError> =
-        match backend.Spawn command with
-        | Error error -> Error error
-        | Ok spawned ->
-            backend.Track spawned
-            Ok spawned
+        // Refuse to spawn into a released group: on Windows the child is created before it is assigned
+        // to the (now-closed) Job, so spawning after teardown would leak an UNCONTAINED child. Fail
+        // fast with a non-transient error instead. (Same released-flag guard as the control verbs.)
+        if releasedFlag <> 0 then
+            Error(ProcessError.Unsupported "the process group has been released")
+        else
+            match backend.Spawn command with
+            | Error error -> Error error
+            | Ok spawned ->
+                backend.Track spawned
+                Ok spawned
 
     /// Spawn `command` into the group and build a `RunningHost`. `ownsGroup` decides what disposing
     /// the resulting `RunningProcess` does: when **true** (a private per-run group) it reaps this
@@ -254,8 +260,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // a use-after-close or a wrong-target kill. Guarding here (as `Stats` already did) closes the
     // window for a verb racing a concurrent `Dispose`/`Shutdown`.
     member private _.WhenLive(action: unit -> Result<'T, ProcessError>) : Result<'T, ProcessError> =
+        // A released group is a permanent condition, not a transient I/O blip — use `Unsupported`
+        // (which `ProcessError.isTransient` rejects) so a retry classifier never re-tries a dead group.
         if releasedFlag <> 0 then
-            Error(ProcessError.Io "the process group has been released")
+            Error(ProcessError.Unsupported "the process group has been released")
         else
             action ()
 
@@ -474,7 +482,28 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
                     match spawnError with
                     | Some error ->
-                        // The group's `use` dispose reaps any stages that did start.
+                        // Some stages started before the failure. Hard-kill them, then reap (waitpid)
+                        // each, drain/observe the relay + stderr tasks, and close every pipe — the
+                        // group's `use` dispose alone hard-kills but does not waitpid POSIX leaders or
+                        // close these parent-side streams, so without this they would leak.
+                        group.KillTree()
+
+                        let! _ =
+                            spawned
+                            |> Seq.map (fun sp -> group.WaitHandle sp.Handle)
+                            |> Seq.toArray
+                            |> Task.WhenAll
+
+                        for t in copyTasks do
+                            do! t
+
+                        let! _ = Task.WhenAll(stderrTasks.ToArray())
+
+                        for sp in spawned do
+                            sp.Stdout |> Option.iter closeQuietly
+                            sp.Stderr |> Option.iter closeQuietly
+                            sp.Stdin |> Option.iter closeQuietly
+
                         return Error error
                     | None ->
                         let lastSpawned = spawned[spawned.Count - 1]

@@ -1179,7 +1179,11 @@ module internal Native =
                     childSideFds.Add writeFd
                 | None -> ()
             | StdioMode.Null -> stdoutChildFd <- openNul O_WRONLY
-            | StdioMode.Inherit -> stdoutChildFd <- -1
+            | StdioMode.Inherit ->
+                // Inherit the parent's stdout. On macOS, POSIX_SPAWN_CLOEXEC_DEFAULT closes every fd
+                // not named by a file action at exec, so register a self-dup2 (1 -> 1) to keep fd 1
+                // open in the child; on Linux the fd is inherited naturally, so no dup2 is needed.
+                stdoutChildFd <- if isMacOs then 1 else -1
 
         // stderr
         if failure.IsNone then
@@ -1192,7 +1196,10 @@ module internal Native =
                     childSideFds.Add writeFd
                 | None -> ()
             | StdioMode.Null -> stderrChildFd <- openNul O_WRONLY
-            | StdioMode.Inherit -> stderrChildFd <- -1
+            | StdioMode.Inherit ->
+                // See the stdout note: a self-dup2 (2 -> 2) keeps fd 2 alive under macOS
+                // POSIX_SPAWN_CLOEXEC_DEFAULT; Linux inherits it without a file action.
+                stderrChildFd <- if isMacOs then 2 else -1
 
         let closeFd fd = close fd |> ignore
 

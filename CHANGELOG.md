@@ -54,5 +54,8 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - Captured and streamed text now strips a leading byte-order mark of the chosen encoding (matching `StreamReader`); `OutputBytes` and the stdout/stderr tees stay byte-exact.
 - `FirstLine` now reaps the process tree on every exit path — a throwing predicate or a cancelled run no longer downgrades kill-on-drop to GC finalization — and a cancelled run is reported as `ProcessError.Cancelled` rather than raising.
 - Tree-control verbs (`Signal` / `Suspend` / `Resume` / `Members` / `TerminateAll`) now return an error once the group is released, like `Stats`, closing a use-after-close window when a verb races a concurrent `Dispose` / `Shutdown`.
+- Spawning into a released/disposed `ProcessGroup` now fails fast with a non-transient error instead of risking an uncontained child (on Windows the child is created before it is assigned to the Job, so a post-teardown spawn could leak an orphan). The released-group error is now `ProcessError.Unsupported` (not `Io`), so a retry classifier no longer re-tries a permanently-dead group.
+- `StdioMode.Inherit` now keeps the child's stdout/stderr open on macOS — the spawn registers the inherited descriptors as file actions so the macOS "close all on exec" default no longer silently leaves the child with no stdout/stderr.
+- A pipeline that fails to spawn a later stage now reaps and closes the stages that did start (and observes their relay tasks) before returning the error, instead of leaving zombies, leaked pipe handles, and unobserved tasks.
 
 [Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/commits/main
