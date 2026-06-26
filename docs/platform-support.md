@@ -185,19 +185,6 @@ unrelated process. The backend prunes dead entries on every probe to keep the wi
 it cannot be eliminated at the process-group layer — the cgroup v2 mechanism (used when limits are
 requested) closes it, since membership is kernel-enforced.
 
-**Zombie leaders on kill-without-wait (POSIX).** Group teardown `SIGKILL`s the tree, but it does
-not `waitpid` group leaders that were never awaited through a run verb — for example,
-`ProcessGroup.Start` into a shared group followed by disposing the group without ever consuming the
-returned `RunningProcess`. The ordinary run verbs reap their children normally; only the
-kill-without-wait path can leave defunct (zombie) entries until the host process exits. A
-follow-up will reap them.
-
-**cgroup migration-failure window (Linux limits).** With the cgroup v2 mechanism, a child is
-migrated into the limit cgroup after it is spawned. In the rare case that a child fails to migrate
-*after* the group was already created successfully (creation itself validates the cgroup), it runs
-in the parent cgroup and would escape `cgroup.kill` teardown. The Windows Job Object and POSIX
-process-group default paths are unaffected.
-
 **Unbounded in-flight line, and streaming backlog.** `OutputBufferPolicy` caps bound the *retained
 complete lines* (and total bytes) of the buffered verbs; a single not-yet-terminated line — a
 newline-free flood — still grows until end of stream. Likewise, a streamed consumer

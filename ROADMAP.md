@@ -42,14 +42,6 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
 - **Unbounded in-flight line.** The `OutputBufferPolicy` line/byte caps bound the *retained complete
   lines*; a single not-yet-terminated line (a newline-free flood) still grows until EOF. Pair an
   untrusted child with a `Timeout`. (A future hardening caps the in-flight assembly buffer.)
-- **cgroup migration-failure window (Linux limits).** If a child fails to migrate into the limits
-  cgroup *after* the group was created successfully (rare — creation already validated the cgroup),
-  it runs in the parent cgroup and escapes `cgroup.kill` teardown. The Windows Job and POSIX
-  process-group default paths are unaffected.
-- **Zombie leaders on kill-without-wait (POSIX).** Group teardown `SIGKILL`s the tree but does not
-  reap leaders that were never awaited through a run verb (e.g. `ProcessGroup.Start` into a shared
-  group, then dispose without consuming the `RunningProcess`). Run verbs reap normally; the
-  kill-without-wait path leaves defunct entries until the host exits.
 - **Default UTF-8 decoding.** Captured text is decoded UTF-8 by default; a Windows console program
   emitting a legacy OEM code page needs an explicit `StdoutEncoding` / `StderrEncoding`.
 - **POSIX pgid-reuse window.** The process-group teardown has a small pid-reuse window on Unix; the
@@ -59,9 +51,8 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
 
 - **Async-I/O hardening.** Move the per-process blocking wait to overlapped/registered waits so
   heavy concurrency no longer pressures the thread pool — an internal change, no public-API impact.
-- **Teardown & decode follow-ups.** Reap killed leaders on the kill-without-wait path; track the
-  spawned pid as a cgroup-teardown fallback for the migration-failure window; cap the in-flight
-  assembly buffer so a newline-free flood can't outgrow `OutputBufferPolicy`.
+- **In-flight assembly buffer cap.** Cap the not-yet-terminated line buffer so a newline-free flood
+  can't outgrow `OutputBufferPolicy`.
 
 ## Not currently supported
 

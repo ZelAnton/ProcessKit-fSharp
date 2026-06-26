@@ -57,5 +57,7 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - Spawning into a released/disposed `ProcessGroup` now fails fast with a non-transient error instead of risking an uncontained child (on Windows the child is created before it is assigned to the Job, so a post-teardown spawn could leak an orphan). The released-group error is now `ProcessError.Unsupported` (not `Io`), so a retry classifier no longer re-tries a permanently-dead group.
 - `StdioMode.Inherit` now keeps the child's stdout/stderr open on macOS — the spawn registers the inherited descriptors as file actions so the macOS "close all on exec" default no longer silently leaves the child with no stdout/stderr.
 - A pipeline that fails to spawn a later stage now reaps and closes the stages that did start (and observes their relay tasks) before returning the error, instead of leaving zombies, leaked pipe handles, and unobserved tasks.
+- POSIX/macOS teardown now reaps the group leaders it kills: disposing or shutting down a group whose children were never awaited through a run verb no longer leaves defunct (zombie) processes behind until the host exits.
+- Linux cgroup teardown now also kills and reaps the children it spawned directly — `cgroup.kill` does not `waitpid` our own descendants, and a child that failed to migrate into the cgroup (so escaping `cgroup.kill`) is now cleaned up via its process group as a fallback.
 
 [Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/commits/main

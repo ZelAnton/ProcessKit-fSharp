@@ -129,14 +129,28 @@ type internal JobObjectBackend(jobHandle: nativeint) =
 /// Linux cgroup v2 backend (the `limits` mechanism). Membership lives in `cgroup.procs`; the tree is
 /// reaped with `cgroup.kill` and the directory removed.
 type internal CgroupBackend(cgroupPath: string) =
+    let childLock = obj ()
+    let childPids = List<int>()
+
+    let pidSnapshot () =
+        lock childLock (fun () -> List.ofSeq childPids)
+
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.CgroupV2
         member _.Spawn(command) = Native.spawnPosix command
 
         member _.Track(spawned) =
+            // Track the pid so teardown can reap it (cgroup.kill SIGKILLs but does not waitpid our own
+            // children) and clean it up as a fallback if it failed to migrate into the cgroup and so
+            // escapes cgroup.kill.
+            lock childLock (fun () -> childPids.Add(int spawned.Handle))
             Native.migrateToCgroup cgroupPath (int spawned.Handle)
-        // The kernel removes an exited process from cgroup.procs — nothing to untrack.
-        member _.Release(_spawned) = ()
+
+        member _.Release(spawned) =
+            // A run verb has reaped this child; stop tracking so teardown does not waitpid it again.
+            // (The kernel already removed it from cgroup.procs.)
+            lock childLock (fun () -> childPids.Remove(int spawned.Handle) |> ignore)
+
         member _.Wait(handle) = Native.waitPosix handle
         member _.PidOf(spawned) = Some(int spawned.Handle)
         member _.KillChild(spawned) = Native.killProcess (int spawned.Handle)
@@ -179,6 +193,14 @@ type internal CgroupBackend(cgroupPath: string) =
 
         member _.HardRelease() =
             Native.killCgroup cgroupPath
+
+            // cgroup.kill SIGKILLs everything in the cgroup but does not reap our own children, and a
+            // child that failed to migrate runs outside the cgroup entirely. Every child is also its own
+            // process-group leader, so killpg cleans up an escapee's subtree; then reap the leader.
+            for pid in pidSnapshot () do
+                Native.killProcessGroup pid
+                Native.reapLeader pid
+
             Native.removeCgroup cgroupPath
 
 /// POSIX process-group backend (macOS/BSD, or Linux without cgroup delegation). Every `posix_spawn`
@@ -264,5 +286,9 @@ type internal ProcessGroupBackend() =
             Ok(ProcessGroupStats(active, None, None))
 
         member _.HardRelease() =
+            // Each pgid's leader is a child we posix_spawned, so we must waitpid it ourselves — `killpg`
+            // SIGKILLs the group but does not reap our own children. Reap the leaders we still track (a
+            // run verb Releases the ones it already reaped); other group members reparent to init.
             for pgid in pgidSnapshot () do
                 Native.killProcessGroup pgid
+                Native.reapLeader pgid

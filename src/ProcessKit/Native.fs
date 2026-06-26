@@ -1121,6 +1121,17 @@ module internal Native =
 
             decodeWaitStatus status)
 
+    /// Synchronously reap a POSIX child we own (a group leader, whose pid == its pgid) during teardown.
+    /// The child has just been SIGKILLed, so the blocking `waitpid` returns promptly; a child already
+    /// reaped by a run verb yields -1/ECHILD, the harmless no-op we want. Without this a killed-but-
+    /// unawaited leader lingers as a zombie until the owning process exits. EINTR-safe.
+    let reapLeader (pid: int) : unit =
+        let mutable status = 0
+        let mutable result = waitpid (pid, &status, 0)
+
+        while result < 0 && Marshal.GetLastWin32Error() = EINTR do
+            result <- waitpid (pid, &status, 0)
+
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
     /// child's pid) and capture its stdout/stderr. The whole group can later be reaped with
     /// `killProcessGroup`.
