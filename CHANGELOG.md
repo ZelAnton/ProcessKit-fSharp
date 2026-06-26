@@ -39,6 +39,7 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - `ProcessKit.Testing.RecordReplayRunner` — an `IProcessRunner` that records real runs to a JSON cassette (`Record(path, inner)` / `Save`, with a drop-time flush) and replays them hermetically (`Replay(path)`) with no subprocess. Matches on program + args + cwd + stdin-source digest; an unmatched call is `ProcessError.CassetteMiss`. Covers `OutputString`/`OutputBytes`; cassettes are owner-only (`0600`) on Unix and store env *names* only (values redacted).
 - Optional `Microsoft.Extensions.Logging` integration: `Command.WithLogger(logger)` emits structured lifecycle events — spawn, exit, timeout, retry, and supervisor restart / failure-storm pause. **argv and the environment are never logged** (only the program name and non-secret facts). No-op and free when no logger is set.
 - New `ProcessKit.Extensions.DependencyInjection` package: `IServiceCollection.AddProcessKit()` registers `IProcessRunner` (a singleton `JobRunner`), wrapped to emit ProcessKit's lifecycle events when the container has an `ILoggerFactory`. Uses `TryAdd`, so a pre-existing `IProcessRunner` registration is left untouched.
+- Both NuGet packages now ship an XML API documentation file, so consumers get IntelliSense / quick-info and generated API references for the public surface.
 
 ### Changed
 -

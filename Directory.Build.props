@@ -41,6 +41,9 @@
 		<Copyright>Copyright (c) 2026 Anton Zhelezniakou</Copyright>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<!-- Ship XML API docs (IntelliSense) in the package. Non-packable projects opt out
+		     (the test project sets GenerateDocumentationFile=false). -->
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 
 		<PackageProjectUrl>https://github.com/ZelAnton/ProcessKit-fSharp</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/ZelAnton/ProcessKit-fSharp</RepositoryUrl>
