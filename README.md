@@ -55,6 +55,9 @@ task {
 From C# the same surface is available as fluent methods (`command.Run()`,
 `command.Pipe(next).OutputString()`, …).
 
+For task-oriented examples across every feature — streaming, supervision, process groups,
+limits, DI, testing — see the **[cookbook](docs/cookbook.md)**.
+
 ## Highlights
 
 - **Whole-tree kill-on-drop** — a process and everything it spawns is reaped on dispose
@@ -90,6 +93,7 @@ Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) 
 
 ## Links
 
+- [Cookbook](docs/cookbook.md) — task-oriented examples for every part of the API.
 - [Changelog](CHANGELOG.md) — what has shipped.
 - [Roadmap](ROADMAP.md) — what is planned.
 
