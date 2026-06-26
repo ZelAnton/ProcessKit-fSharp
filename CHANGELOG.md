@@ -43,7 +43,8 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - Multi-targets **net8.0 (LTS)** and **net10.0**, so the packages run on .NET 8 and later (previously net10.0 only).
 
 ### Changed
--
+- `RunningProcess` now enforces single consumption of its output. Once a terminal verb (`OutputString`/`OutputBytes`/`Wait`/`Profile`) or a streaming session (`StdoutLines`/`OutputEvents`, and their `Finish`/`WaitForLine` companions) has claimed the pipes, a second, conflicting consumer is refused instead of racing two readers on the same pipe (which split and lost output): the `Result`-returning verbs return `ProcessError.Unsupported`, while `Wait`/`Profile`/`StdoutLines`/`OutputEvents` throw `InvalidOperationException`.
+- `Command.Timeout` / `Pipeline.Timeout` now reject a negative duration up front (`ArgumentOutOfRangeException`) and treat a duration longer than the BCL timer range (~24.8 days) as "no timeout". Previously an out-of-range timeout threw from inside the run verb when the deadline was armed, breaking the honest-result contract and orphaning the in-flight output pumps.
 
 ### Fixed
 - POSIX containment now reaps **every** child of a multi-child group (e.g. a pipeline), not just the last. Each `posix_spawn` forms its own process group, so the group tracks all of them; previously only the most-recent pgid was killed, letting an earlier long-running stage linger until its natural exit.
@@ -59,5 +60,8 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - A pipeline that fails to spawn a later stage now reaps and closes the stages that did start (and observes their relay tasks) before returning the error, instead of leaving zombies, leaked pipe handles, and unobserved tasks.
 - POSIX/macOS teardown now reaps the group leaders it kills: disposing or shutting down a group whose children were never awaited through a run verb no longer leaves defunct (zombie) processes behind until the host exits.
 - Linux cgroup teardown now also kills and reaps the children it spawned directly — `cgroup.kill` does not `waitpid` our own descendants, and a child that failed to migrate into the cgroup (so escaping `cgroup.kill`) is now cleaned up via its process group as a fallback.
+- A pipeline now honours each stage's `OkCodes`: a stage that exits with one of its own accepted codes no longer fails the pipeline, and the pipeline result carries the blamed stage's accepted codes instead of a hardcoded `{0}` (so `ensureSuccess` / `ExitCode` / `Probe` on a pipeline agree with a single command's).
+- A pipeline stage whose stdout was set to `Null` or `Inherit` no longer deadlocks the next stage on its unwired stdin — the pipeline forces every stage's stdout to a pipe so the chain is always connected (the last stage's stdout is still what the verbs capture).
+- `RunningProcess.Profile` now also observes its stdout/stderr drains on the fault path, so a fault before they complete can't leave them running as unobserved tasks.
 
 [Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/commits/main

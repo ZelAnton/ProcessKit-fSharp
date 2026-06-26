@@ -51,6 +51,39 @@ type RunningProcess internal (host: RunningHost) =
     let mutable exitStarted = false
     let mutable exitTaskValue = Unchecked.defaultof<Task<Outcome>>
 
+    // Single-consumption guard. The output pipes can be pumped exactly once: a buffered one-shot verb
+    // (OutputString/OutputBytes/Wait/Profile) consumes them whole, and the streaming verbs form one
+    // session (StdoutLines/WaitForLine/Finish share the stdout channel; OutputEvents owns the event
+    // channel). A second, different consumer would race two readers on the same pipe — splitting and
+    // losing output — so it is refused. 0 = fresh, 1 = buffered one-shot, 2 = stdout streaming,
+    // 3 = event streaming. Verb calls are assumed sequential (the class is not built for concurrent
+    // verbs), so a plain flag matches the existing `streamingStarted`/`exitStarted` style.
+    let mutable consumption = 0
+
+    // Claim the pipes for a one-shot buffered verb — only from fresh (no re-entry: a second buffered
+    // verb would re-pump already-torn-down streams).
+    let claimBuffered () =
+        if consumption = 0 then
+            consumption <- 1
+            true
+        else
+            false
+
+    // Claim the pipes for a streaming session, allowing re-entry of the *same* streaming mode (so
+    // StdoutLines → Finish, or repeated StdoutLines, compose) but rejecting a different consumer.
+    let claimStreaming (mode: int) =
+        if consumption = 0 then
+            consumption <- mode
+            true
+        else
+            consumption = mode
+
+    let alreadyConsumedMessage =
+        "this RunningProcess has already been consumed by another verb"
+
+    let alreadyConsumedError () =
+        ProcessError.Unsupported alreadyConsumedMessage
+
     let elapsed () =
         Stopwatch.GetElapsedTime host.StartedTimestamp
 
@@ -130,8 +163,11 @@ type RunningProcess internal (host: RunningHost) =
     // `TimeoutGrace` is set, else hard) and report `Outcome.TimedOut`.
     let waitWithTimeout () : Task<Outcome> =
         match config.Timeout with
-        | None -> host.Wait()
-        | Some timeout ->
+        // Arm the deadline only when it fits a BCL timer. A negative timeout was already rejected by
+        // `Command.Timeout`, and `isArmable` screens out both negatives and over-long spans, so the
+        // `Task.Delay` below can never throw synchronously and orphan the in-flight pumps. Anything
+        // unarmable (no timeout, or "effectively never") just waits.
+        | Some timeout when Timeouts.isArmable timeout ->
             task {
                 let waitTask = host.Wait()
                 let waitBase = waitTask :> Task
@@ -151,6 +187,7 @@ type RunningProcess internal (host: RunningHost) =
                     Log.timeout config.Logger config.Program timeout
                     return Outcome.TimedOut
             }
+        | _ -> host.Wait()
 
     // An async-disposable that reaps the tree on scope exit — normal OR exceptional. Every terminal
     // verb opens one with `use` so the container is always torn down, even when a pump faults (e.g.
@@ -213,72 +250,87 @@ type RunningProcess internal (host: RunningHost) =
     /// Run to completion, capturing stdout as decoded text. A non-zero exit is data; the tree is
     /// reaped when the call returns.
     member _.OutputString() : Task<Result<ProcessResult<string>, ProcessError>> =
-        task {
-            use _reap = reapGuard ()
-            let stdoutTask = pumpStdoutBuffer ()
-            let stderrTask = pumpStderrBuffer ()
-            let! outcome = waitWithTimeout ()
-            // Observe BOTH buffer pumps before reading either, so a throwing line handler in one
-            // never orphans the other as an unobserved task (mirrors the streaming path's WhenAll).
-            do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
-            let! outBuf = stdoutTask
-            let! errBuf = stderrTask
-            Log.exit config.Logger config.Program outcome (elapsed ())
+        if not (claimBuffered ()) then
+            Task.FromResult(Error(alreadyConsumedError ()))
+        else
 
-            if outBuf.TooLarge || errBuf.TooLarge then
-                return
-                    Error(tooLargeError (outBuf.TotalLines + errBuf.TotalLines) (outBuf.TotalBytes + errBuf.TotalBytes))
-            else
-                return
-                    Ok(
-                        ProcessResult<string>(
-                            config.Program,
-                            outBuf.Text,
-                            errBuf.Text,
-                            outcome,
-                            elapsed (),
-                            outBuf.Truncated || errBuf.Truncated,
-                            config.OkCodes
+            task {
+                use _reap = reapGuard ()
+                let stdoutTask = pumpStdoutBuffer ()
+                let stderrTask = pumpStderrBuffer ()
+                let! outcome = waitWithTimeout ()
+                // Observe BOTH buffer pumps before reading either, so a throwing line handler in one
+                // never orphans the other as an unobserved task (mirrors the streaming path's WhenAll).
+                do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
+                let! outBuf = stdoutTask
+                let! errBuf = stderrTask
+                Log.exit config.Logger config.Program outcome (elapsed ())
+
+                if outBuf.TooLarge || errBuf.TooLarge then
+                    return
+                        Error(
+                            tooLargeError
+                                (outBuf.TotalLines + errBuf.TotalLines)
+                                (outBuf.TotalBytes + errBuf.TotalBytes)
                         )
-                    )
-        }
+                else
+                    return
+                        Ok(
+                            ProcessResult<string>(
+                                config.Program,
+                                outBuf.Text,
+                                errBuf.Text,
+                                outcome,
+                                elapsed (),
+                                outBuf.Truncated || errBuf.Truncated,
+                                config.OkCodes
+                            )
+                        )
+            }
 
     /// Run to completion, capturing stdout as raw bytes (no line splitting) and stderr as text.
     member _.OutputBytes() : Task<Result<ProcessResult<byte[]>, ProcessError>> =
-        task {
-            use _reap = reapGuard ()
+        if not (claimBuffered ()) then
+            Task.FromResult(Error(alreadyConsumedError ()))
+        else
 
-            let stdoutTask =
-                Pump.drainRawOrEmpty host.Stdout config.StdoutTee CancellationToken.None
+            task {
+                use _reap = reapGuard ()
 
-            let stderrTask = pumpStderrBuffer ()
-            let! outcome = waitWithTimeout ()
-            // Observe both pumps before reading either, so a throwing stderr handler (or a raw-drain
-            // I/O fault) can't orphan the other as an unobserved task.
-            do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
-            let! stdoutBytes = stdoutTask
-            let! errBuf = stderrTask
-            Log.exit config.Logger config.Program outcome (elapsed ())
+                let stdoutTask =
+                    Pump.drainRawOrEmpty host.Stdout config.StdoutTee CancellationToken.None
 
-            if errBuf.TooLarge then
-                return Error(tooLargeError errBuf.TotalLines errBuf.TotalBytes)
-            else
-                return
-                    Ok(
-                        ProcessResult<byte[]>(
-                            config.Program,
-                            stdoutBytes,
-                            errBuf.Text,
-                            outcome,
-                            elapsed (),
-                            errBuf.Truncated,
-                            config.OkCodes
+                let stderrTask = pumpStderrBuffer ()
+                let! outcome = waitWithTimeout ()
+                // Observe both pumps before reading either, so a throwing stderr handler (or a raw-drain
+                // I/O fault) can't orphan the other as an unobserved task.
+                do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
+                let! stdoutBytes = stdoutTask
+                let! errBuf = stderrTask
+                Log.exit config.Logger config.Program outcome (elapsed ())
+
+                if errBuf.TooLarge then
+                    return Error(tooLargeError errBuf.TotalLines errBuf.TotalBytes)
+                else
+                    return
+                        Ok(
+                            ProcessResult<byte[]>(
+                                config.Program,
+                                stdoutBytes,
+                                errBuf.Text,
+                                outcome,
+                                elapsed (),
+                                errBuf.Truncated,
+                                config.OkCodes
+                            )
                         )
-                    )
-        }
+            }
 
     /// Wait for the process to exit, discarding its output. Reaps the tree.
     member _.Wait() : Task<Outcome> =
+        if not (claimBuffered ()) then
+            raise (InvalidOperationException alreadyConsumedMessage)
+
         task {
             use _reap = reapGuard ()
             // Drain both pipes (so the child never blocks on a full buffer) without retaining.
@@ -294,6 +346,9 @@ type RunningProcess internal (host: RunningHost) =
     /// Run to completion while periodically sampling the child's CPU/memory every `interval`, and
     /// return a `RunProfile`. Drains and discards output (like `Wait`) and reaps the tree.
     member _.Profile(interval: TimeSpan) : Task<RunProfile> =
+        if not (claimBuffered ()) then
+            raise (InvalidOperationException alreadyConsumedMessage)
+
         task {
             use _reap = reapGuard ()
 
@@ -352,6 +407,13 @@ type RunningProcess internal (host: RunningHost) =
                 outcome <- settled
             with ex ->
                 error <- Some ex
+                // A fault before the drains were awaited (e.g. waitWithTimeout threw) must not orphan
+                // them — observe them best-effort. Their own fault is secondary to the error we surface.
+                try
+                    do! Task.WhenAll([| stdoutTask; stderrTask |])
+                with _ ->
+                    // best-effort teardown drain; the original fault above is what we report.
+                    ()
 
             sampleCts.Cancel()
             do! sampler
@@ -365,8 +427,14 @@ type RunningProcess internal (host: RunningHost) =
     member this.Profile() =
         this.Profile(TimeSpan.FromMilliseconds 100.0)
 
-    member private _.StartStdoutStreaming() =
-        if not streamingStarted then
+    // Returns false when a different consumption (a buffered verb, or event streaming) already owns the
+    // pipes; true once the stdout streaming session is (or already was) ours.
+    member private _.StartStdoutStreaming() : bool =
+        if streamingStarted then
+            true
+        elif not (claimStreaming 2) then
+            false
+        else
             streamingStarted <- true
             let stderrBuffer = Pump.LineBuffer(config.OutputBuffer)
             stderrStreamBuffer <- stderrBuffer
@@ -405,27 +473,40 @@ type RunningProcess internal (host: RunningHost) =
                     return outcome
                 }
 
+            true
+
     /// Stream stdout line by line as it arrives. Call `Finish` afterwards for stderr + outcome.
     member this.StdoutLines() : IAsyncEnumerable<string> =
-        this.StartStdoutStreaming()
+        if not (this.StartStdoutStreaming()) then
+            raise (InvalidOperationException alreadyConsumedMessage)
+
         stdoutChannel.Reader.ReadAllAsync()
 
     /// After streaming stdout, wait for exit and return the captured stderr. Reaps the tree.
     member this.Finish() : Task<Result<Finished, ProcessError>> =
-        task {
-            use _reap = reapGuard ()
-            this.StartStdoutStreaming()
-            let! outcome = streamOutcome
-            Log.exit config.Logger config.Program outcome (elapsed ())
+        if not (this.StartStdoutStreaming()) then
+            Task.FromResult(Error(alreadyConsumedError ()))
+        else
 
-            if stderrStreamBuffer.TooLarge then
-                return Error(tooLargeError stderrStreamBuffer.TotalLines stderrStreamBuffer.TotalBytes)
-            else
-                return Ok(Finished(outcome, stderrStreamBuffer.Text))
-        }
+            task {
+                use _reap = reapGuard ()
+                let! outcome = streamOutcome
+                Log.exit config.Logger config.Program outcome (elapsed ())
 
-    member private _.StartEventStreaming() =
-        if not eventStreamingStarted then
+                if stderrStreamBuffer.TooLarge then
+                    return Error(tooLargeError stderrStreamBuffer.TotalLines stderrStreamBuffer.TotalBytes)
+                else
+                    return Ok(Finished(outcome, stderrStreamBuffer.Text))
+            }
+
+    // Returns false when a different consumption (a buffered verb, or stdout streaming) already owns the
+    // pipes; true once the event streaming session is (or already was) ours.
+    member private _.StartEventStreaming() : bool =
+        if eventStreamingStarted then
+            true
+        elif not (claimStreaming 3) then
+            false
+        else
             eventStreamingStarted <- true
 
             let stdoutPump =
@@ -455,33 +536,39 @@ type RunningProcess internal (host: RunningHost) =
             }
             |> ignore
 
+            true
+
     /// Stream merged stdout+stderr line events as they arrive.
     member this.OutputEvents() : IAsyncEnumerable<OutputEvent> =
-        this.StartEventStreaming()
+        if not (this.StartEventStreaming()) then
+            raise (InvalidOperationException alreadyConsumedMessage)
+
         eventChannel.Reader.ReadAllAsync()
 
     /// Wait until a stdout line satisfies `predicate`, or fail with `NotReady` after `timeout`.
     /// Consumed lines are not re-delivered; a later `StdoutLines`/`Finish` sees the rest.
     member this.WaitForLine(predicate: Func<string, bool>, timeout: TimeSpan) : Task<Result<string, ProcessError>> =
-        this.StartStdoutStreaming()
+        if not (this.StartStdoutStreaming()) then
+            Task.FromResult(Error(alreadyConsumedError ()))
+        else
 
-        task {
-            use cts = new CancellationTokenSource(timeout)
+            task {
+                use cts = new CancellationTokenSource(timeout)
 
-            try
-                let mutable found = None
+                try
+                    let mutable found = None
 
-                while found.IsNone do
-                    let! line = stdoutChannel.Reader.ReadAsync cts.Token
+                    while found.IsNone do
+                        let! line = stdoutChannel.Reader.ReadAsync cts.Token
 
-                    if predicate.Invoke line then
-                        found <- Some line
+                        if predicate.Invoke line then
+                            found <- Some line
 
-                return Ok found.Value
-            with
-            | :? OperationCanceledException -> return Error(ProcessError.NotReady(config.Program, timeout))
-            | :? ChannelClosedException -> return Error(ProcessError.NotReady(config.Program, timeout))
-        }
+                    return Ok found.Value
+                with
+                | :? OperationCanceledException -> return Error(ProcessError.NotReady(config.Program, timeout))
+                | :? ChannelClosedException -> return Error(ProcessError.NotReady(config.Program, timeout))
+            }
 
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`.
     member _.WaitForPort(endpoint: IPEndPoint, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =

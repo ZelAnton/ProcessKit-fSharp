@@ -22,7 +22,8 @@ type internal PipelineStage =
     { Program: string
       Outcome: Outcome
       Unchecked: bool
-      Stderr: string }
+      Stderr: string
+      OkCodes: int list }
 
 /// The captured result of running a whole pipeline: the last stage's stdout, every stage's
 /// terminal state (left-to-right), the wall-clock duration, and whether the pipeline timed out.
@@ -404,8 +405,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                         CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
 
                     match timeout with
-                    | Some duration -> timeoutCts.CancelAfter duration
-                    | None -> ()
+                    // Only arm the deadline when it fits a BCL timer; an over-long span is "no timeout"
+                    // (a negative one was already rejected by `Pipeline.Timeout`). Guards CancelAfter
+                    // against a synchronous out-of-range throw that would abort the run mid-spawn.
+                    | Some duration when Timeouts.isArmable duration -> timeoutCts.CancelAfter duration
+                    | _ -> ()
 
                     use _registration = linkedCts.Token.Register(fun () -> group.KillTree())
 
@@ -431,14 +435,16 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     let mutable index = 0
 
                     while index < stages.Length && spawnError.IsNone do
-                        // Stages after the first take their stdin from the previous stage's stdout, so
-                        // they need a stdin pipe; `KeepStdinOpen` creates one without an auto-fed
-                        // source (we copy `prevStdout` into it below).
-                        let stage =
-                            if index > 0 then
-                                stages[index].KeepStdinOpen()
-                            else
-                                stages[index]
+                        // The pipeline owns stdout wiring: every stage's stdout must be a pipe —
+                        // intermediate stages feed the next stage's stdin and the last stage's stdout is
+                        // captured. Force `Piped` over any user-set `Null`/`Inherit` so an unwired
+                        // downstream stdin can't deadlock the chain. Stages after the first also take
+                        // their stdin from the previous stage's stdout, so they need a stdin pipe;
+                        // `KeepStdinOpen` creates one without an auto-fed source (we copy `prevStdout`
+                        // into it below).
+                        let piped = stages[index] |> Command.stdout StdioMode.Piped
+
+                        let stage = if index > 0 then piped.KeepStdinOpen() else piped
 
                         match group.SpawnInto stage with
                         | Error error -> spawnError <- Some error
@@ -534,7 +540,8 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                                       { Program = stages[i].Program
                                         Outcome = outcomes[i]
                                         Unchecked = stages[i].Config.UncheckedInPipe
-                                        Stderr = stages[i].Config.StderrEncoding.GetString stderrBytes[i] } ]
+                                        Stderr = stages[i].Config.StderrEncoding.GetString stderrBytes[i]
+                                        OkCodes = stages[i].Config.OkCodes } ]
 
                             return
                                 Ok

@@ -365,6 +365,10 @@ module internal Native =
         Task.Run(fun () ->
             WaitForSingleObject(hProcess, INFINITE) |> ignore
             let mutable code = 0u
+            // `GetExitCodeProcess` can fail with ERROR_INVALID_HANDLE when teardown closes the handle
+            // concurrently (the process is being force-killed, so its exit code is moot). Tolerate that
+            // benign race — and any wait/read hiccup on our own handle — by reporting `Exited 0` rather
+            // than throwing out of a run verb.
             GetExitCodeProcess(hProcess, &code) |> ignore
             Outcome.Exited(int code))
 

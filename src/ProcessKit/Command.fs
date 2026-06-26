@@ -7,6 +7,21 @@ open System.Text
 open System.Threading
 open Microsoft.Extensions.Logging
 
+/// Bounds for arming an OS timer from a user `TimeSpan`. `Task.Delay`,
+/// `CancellationTokenSource.CancelAfter`, and `System.Threading.Timer` all reject a delay outside
+/// `[-1ms, Int32.MaxValue ms]` — feeding them an out-of-range span throws synchronously, which would
+/// break the honest-result contract and orphan the in-flight output pumps. ProcessKit rejects a
+/// negative timeout when it is configured and treats an over-long one as "no timeout".
+module internal Timeouts =
+
+    /// The largest delay the BCL timers accept (`Int32.MaxValue` ms ≈ 24.8 days).
+    let maxArmable = TimeSpan.FromMilliseconds(float Int32.MaxValue)
+
+    /// True when `duration` can be armed on a BCL timer (non-negative and within range). A larger
+    /// positive span is "effectively never", so the run proceeds as if no timeout were set.
+    let isArmable (duration: TimeSpan) =
+        duration >= TimeSpan.Zero && duration <= maxArmable
+
 /// The immutable configuration behind a `Command`. Internal — consumers build it through the
 /// `Command` builder; the runner/native layer reads it to spawn.
 type internal CommandConfig =
@@ -224,8 +239,10 @@ type Command internal (config: CommandConfig) =
     /// The configured run timeout, if any.
     member _.ConfiguredTimeout = config.Timeout
 
-    /// Kill the run after `duration`, reporting the result as `Outcome.TimedOut`.
+    /// Kill the run after `duration`, reporting the result as `Outcome.TimedOut`. A negative
+    /// `duration` is rejected; one larger than ~24.8 days is treated as no timeout.
     member _.Timeout(duration: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero)
         Command({ config with Timeout = Some duration })
 
     /// On timeout, terminate gracefully (SIGTERM) and force-kill only if still alive after

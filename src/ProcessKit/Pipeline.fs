@@ -34,8 +34,10 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             let checkedStages = capture.Stages |> List.filter (fun stage -> not stage.Unchecked)
 
             let failed (stage: PipelineStage) =
+                // A stage succeeds when it exits with one of *its own* accepted codes (`Command.OkCodes`,
+                // default `{0}`); a signal/timeout is always a failure.
                 match stage.Outcome with
-                | Outcome.Exited 0 -> false
+                | Outcome.Exited code -> not (List.contains code stage.OkCodes)
                 | _ -> true
 
             match checkedStages |> List.filter failed |> List.tryLast with
@@ -52,8 +54,10 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         ArgumentNullException.ThrowIfNull command
         Pipeline(commands @ [ command ], timeout, cancelOn)
 
-    /// Kill the whole pipeline after `duration`, reporting the result as `Outcome.TimedOut`.
+    /// Kill the whole pipeline after `duration`, reporting the result as `Outcome.TimedOut`. A
+    /// negative `duration` is rejected; one larger than ~24.8 days is treated as no timeout.
     member _.Timeout(duration: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero)
         Pipeline(commands, Some duration, cancelOn)
 
     /// Also cancel the whole pipeline when `cancellationToken` fires (in addition to any verb token).
@@ -93,7 +97,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                             stage.Outcome,
                             capture.Duration,
                             false,
-                            [ 0 ]
+                            stage.OkCodes
                         )
                     )
         }
@@ -118,7 +122,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                             stage.Outcome,
                             capture.Duration,
                             false,
-                            [ 0 ]
+                            stage.OkCodes
                         )
                     )
         }
