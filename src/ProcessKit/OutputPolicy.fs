@@ -62,6 +62,10 @@ type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, ov
     static member FailLoud(maxLines: int) =
         OutputBufferPolicy(Some maxLines, None, OverflowMode.Error)
 
+    /// A copy with the retained-line ceiling set, composable with any policy.
+    member _.WithMaxLines(maxLines: int) =
+        OutputBufferPolicy(Some maxLines, maxBytes, overflow)
+
     /// A copy with the retained-byte ceiling set, composable with any policy.
     member _.WithMaxBytes(maxBytes: int) =
         OutputBufferPolicy(maxLines, Some maxBytes, overflow)

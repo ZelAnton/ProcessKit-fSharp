@@ -41,11 +41,19 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - New `ProcessKit.Extensions.DependencyInjection` package: `IServiceCollection.AddProcessKit()` registers `IProcessRunner` (a singleton `JobRunner`), wrapped to emit ProcessKit's lifecycle events when the container has an `ILoggerFactory`. Uses `TryAdd`, so a pre-existing `IProcessRunner` registration is left untouched.
 - Both NuGet packages now ship an XML API documentation file, so consumers get IntelliSense / quick-info and generated API references for the public surface.
 - Multi-targets **net8.0 (LTS)** and **net10.0**, so the packages run on .NET 8 and later (previously net10.0 only).
+- `CliClient` verb parity: `RunUnit`/`ExitCode`/`Probe`/`Parse`/`TryParse`/`FirstLine`/`Start` now sit alongside `Run`/`OutputString`/`OutputBytes`, each with a `CancellationToken` overload — and **all** route through the client's configured runner (`WithRunner`), so a client built on a test/shared runner stays hermetic for every verb, not just for captured output.
+- `Exec.outputBytes` — the single-command raw-bytes companion to `Exec.outputString`.
+- `OutputBufferPolicy.WithMaxLines` — a composable retained-line cap, mirroring `WithMaxBytes`.
+- `ProcessResult.EnsureSuccess()` — an instance form of `ensureSuccess` for fluent C# use.
+- `RunningProcess.WaitForLine` / `WaitForPort` / `WaitFor` each gain a `CancellationToken` overload; a cancelled wait reports `ProcessError.Cancelled` (a timeout still reports `NotReady`).
 
 ### Changed
 - `RunningProcess` now enforces single consumption of its output. Once a terminal verb (`OutputString`/`OutputBytes`/`Wait`/`Profile`) or a streaming session (`StdoutLines`/`OutputEvents`, and their `Finish`/`WaitForLine` companions) has claimed the pipes, a second, conflicting consumer is refused instead of racing two readers on the same pipe (which split and lost output): the `Result`-returning verbs return `ProcessError.Unsupported`, while `Wait`/`Profile`/`StdoutLines`/`OutputEvents` throw `InvalidOperationException`.
 - `Command.Timeout` / `Pipeline.Timeout` now reject a negative duration up front (`ArgumentOutOfRangeException`) and treat a duration longer than the BCL timer range (~24.8 days) as "no timeout". Previously an out-of-range timeout threw from inside the run verb when the deadline was armed, breaking the honest-result contract and orphaning the in-flight output pumps.
 - Record/replay cassettes are now a versioned JSON envelope (`{ "Version", "Entries" }`) instead of a bare array (new `ProcessKit.Testing.CassetteFile` type). Loading rejects a cassette whose format version this build does not understand, and normalizes a partial/crafted cassette (omitted fields default to empty `""`/`[]`) so a malformed entry can no longer surface as a `NullReferenceException` at replay time.
+- `Exec.run` / `outputString` / `outputAll` / `outputAllBytes` now take an explicit `CancellationToken` (pass `CancellationToken.None` when not needed), matching the `Runner` module so an `Exec` batch can be cancelled.
+- `ProcessResult.ensureSuccess` is now generic over the captured-stdout type (`'T`), so it works on a `ProcessResult<byte[]>` as well as `<string>` (a `byte[]` stdout is decoded UTF-8 to fill the error's stdout field).
+- `ProcessGroup` used as an `IProcessRunner` now honours `Command.Timeout`: a run that exceeds its deadline is hard-killed (just that child's subtree, leaving sibling runs in a shared group untouched) and reported as `Outcome.TimedOut`, instead of the timeout being silently ignored.
 
 ### Fixed
 - POSIX containment now reaps **every** child of a multi-child group (e.g. a pipeline), not just the last. Each `posix_spawn` forms its own process group, so the group tracks all of them; previously only the most-recent pgid was killed, letting an earlier long-running stage linger until its natural exit.

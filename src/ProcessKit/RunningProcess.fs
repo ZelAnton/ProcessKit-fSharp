@@ -545,39 +545,61 @@ type RunningProcess internal (host: RunningHost) =
 
         eventChannel.Reader.ReadAllAsync()
 
-    /// Wait until a stdout line satisfies `predicate`, or fail with `NotReady` after `timeout`.
-    /// Consumed lines are not re-delivered; a later `StdoutLines`/`Finish` sees the rest.
-    member this.WaitForLine(predicate: Func<string, bool>, timeout: TimeSpan) : Task<Result<string, ProcessError>> =
+    /// Wait until a stdout line satisfies `predicate`, or fail with `NotReady` after `timeout`
+    /// (or `Cancelled` if `cancellationToken` fires first). Consumed lines are not re-delivered; a
+    /// later `StdoutLines`/`Finish` sees the rest.
+    member this.WaitForLine
+        (predicate: Func<string, bool>, timeout: TimeSpan, cancellationToken: CancellationToken)
+        : Task<Result<string, ProcessError>> =
         if not (this.StartStdoutStreaming()) then
             Task.FromResult(Error(alreadyConsumedError ()))
         else
 
             task {
-                use cts = new CancellationTokenSource(timeout)
+                use timeoutCts = new CancellationTokenSource(timeout)
+
+                use linked =
+                    CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken)
 
                 try
                     let mutable found = None
 
                     while found.IsNone do
-                        let! line = stdoutChannel.Reader.ReadAsync cts.Token
+                        let! line = stdoutChannel.Reader.ReadAsync linked.Token
 
                         if predicate.Invoke line then
                             found <- Some line
 
                     return Ok found.Value
                 with
-                | :? OperationCanceledException -> return Error(ProcessError.NotReady(config.Program, timeout))
+                | :? OperationCanceledException ->
+                    // The caller's token wins over the deadline: a cancelled wait is an error, a
+                    // timed-out one is "not ready yet".
+                    if cancellationToken.IsCancellationRequested then
+                        return Error(ProcessError.Cancelled config.Program)
+                    else
+                        return Error(ProcessError.NotReady(config.Program, timeout))
                 | :? ChannelClosedException -> return Error(ProcessError.NotReady(config.Program, timeout))
             }
 
-    /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`.
-    member _.WaitForPort(endpoint: IPEndPoint, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
+    /// `WaitForLine` with no extra cancellation token.
+    member this.WaitForLine(predicate: Func<string, bool>, timeout: TimeSpan) : Task<Result<string, ProcessError>> =
+        this.WaitForLine(predicate, timeout, CancellationToken.None)
+
+    /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`
+    /// (or `Cancelled` if `cancellationToken` fires first).
+    member _.WaitForPort
+        (endpoint: IPEndPoint, timeout: TimeSpan, cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
         task {
             let deadline = Stopwatch.StartNew()
             let mutable connected = false
 
-            while not connected && deadline.Elapsed < timeout do
-                use attempt = new CancellationTokenSource(TimeSpan.FromSeconds 1.0)
+            while not connected
+                  && not cancellationToken.IsCancellationRequested
+                  && deadline.Elapsed < timeout do
+                use attempt = CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+                attempt.CancelAfter(TimeSpan.FromSeconds 1.0)
 
                 try
                     use client = new TcpClient()
@@ -585,7 +607,7 @@ type RunningProcess internal (host: RunningHost) =
                     connected <- true
                 with _ ->
                     // Any connection failure (refused / timed out / unreachable) just means the
-                    // server is not up yet — back off and retry until the overall deadline.
+                    // server is not up yet — back off and retry until the deadline or cancellation.
                     try
                         do! Task.Delay(50, attempt.Token)
                     with :? OperationCanceledException ->
@@ -593,26 +615,50 @@ type RunningProcess internal (host: RunningHost) =
 
             if connected then
                 return Ok()
+            elif cancellationToken.IsCancellationRequested then
+                return Error(ProcessError.Cancelled config.Program)
             else
                 return Error(ProcessError.NotReady(config.Program, timeout))
         }
 
-    /// Poll `probe` until it returns true, or fail with `NotReady` after `timeout`.
-    member _.WaitFor(probe: Func<Task<bool>>, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
+    /// `WaitForPort` with no extra cancellation token.
+    member this.WaitForPort(endpoint: IPEndPoint, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
+        this.WaitForPort(endpoint, timeout, CancellationToken.None)
+
+    /// Poll `probe` until it returns true, or fail with `NotReady` after `timeout` (or `Cancelled`
+    /// if `cancellationToken` fires first).
+    member _.WaitFor
+        (probe: Func<Task<bool>>, timeout: TimeSpan, cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
         task {
             let deadline = Stopwatch.StartNew()
             let mutable ready = false
 
-            while not ready && deadline.Elapsed < timeout do
+            while not ready
+                  && not cancellationToken.IsCancellationRequested
+                  && deadline.Elapsed < timeout do
                 let! result = probe.Invoke()
 
-                if result then ready <- true else do! Task.Delay 50
+                if result then
+                    ready <- true
+                else
+                    try
+                        do! Task.Delay(50, cancellationToken)
+                    with :? OperationCanceledException ->
+                        // Cancelled mid-backoff; the loop guard exits and reports Cancelled below.
+                        ()
 
             if ready then
                 return Ok()
+            elif cancellationToken.IsCancellationRequested then
+                return Error(ProcessError.Cancelled config.Program)
             else
                 return Error(ProcessError.NotReady(config.Program, timeout))
         }
+
+    /// `WaitFor` with no extra cancellation token.
+    member this.WaitFor(probe: Func<Task<bool>>, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
+        this.WaitFor(probe, timeout, CancellationToken.None)
 
     /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
     /// the racing primitive behind `WaitAny`/`WaitAll`.

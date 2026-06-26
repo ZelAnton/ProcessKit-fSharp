@@ -29,6 +29,7 @@
 		<Compile Include="DependencyInjectionTests.fs" />
 		<Compile Include="ContainmentBugTests.fs" />
 		<Compile Include="CorrectnessBugTests.fs" />
+		<Compile Include="ApiParityTests.fs" />
 		<Compile Include="PumpTests.fs" />
 		<Compile Include="ApiSurfaceTests.fs" />
 	</ItemGroup>

@@ -121,7 +121,7 @@ type ErgonomicsTests() =
     [<Test>]
     member _.``Exec.run runs a program by name``() : Task =
         task {
-            match! Exec.run shellProgram [ shellFlag; "echo execrun" ] with
+            match! Exec.run shellProgram [ shellFlag; "echo execrun" ] CancellationToken.None with
             | Ok output -> Assert.That(output, Does.Contain "execrun")
             | Error error -> Assert.Fail $"{error}"
         }
@@ -135,7 +135,7 @@ type ErgonomicsTests() =
             let commands =
                 [ shell "echo one"; shell "echo two"; shell "echo three"; shell "exit 4" ]
 
-            let! results = Exec.outputAll 2 runner commands
+            let! results = Exec.outputAll 2 runner commands CancellationToken.None
             Assert.That(results.Length, Is.EqualTo 4)
 
             let stdoutOf i =

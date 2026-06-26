@@ -4,19 +4,24 @@ open System.Threading
 open System.Threading.Tasks
 
 /// Top-level conveniences: run a program by name (without first building a `Command`), and run a
-/// whole batch of commands with bounded concurrency.
+/// whole batch of commands with bounded concurrency. Each verb takes an explicit `CancellationToken`
+/// (pass `CancellationToken.None` when you don't need cancellation), matching the `Runner` module.
 [<RequireQualifiedAccess>]
 module Exec =
 
     /// Run `program` with `args` in a private kill-on-dispose group, require a zero/accepted exit,
     /// and return stdout with trailing whitespace trimmed.
-    let run (program: string) (args: seq<string>) =
-        (Command.create program |> Command.args args).Run()
+    let run (program: string) (args: seq<string>) (cancellationToken: CancellationToken) =
+        (Command.create program |> Command.args args).Run cancellationToken
 
     /// Run `program` with `args` to completion and return the full `ProcessResult` (a non-zero exit
     /// is data, not an error).
-    let outputString (program: string) (args: seq<string>) =
-        (Command.create program |> Command.args args).OutputString()
+    let outputString (program: string) (args: seq<string>) (cancellationToken: CancellationToken) =
+        (Command.create program |> Command.args args).OutputString cancellationToken
+
+    /// The raw-bytes companion to `outputString` — captures `program`'s stdout as bytes.
+    let outputBytes (program: string) (args: seq<string>) (cancellationToken: CancellationToken) =
+        (Command.create program |> Command.args args).OutputBytes cancellationToken
 
     // Run every command through `runner`, capping how many are live at once, and collect ALL results
     // in input order — the batch never short-circuits. `capture` selects the text / bytes verb.
@@ -48,9 +53,19 @@ module Exec =
     /// Run every command in `commands` through `runner`, keeping at most `concurrency` live at once,
     /// and collect all results (decoded text) in input order. Each element is one command's
     /// independent `Result`; the batch never short-circuits on a failure.
-    let outputAll (concurrency: int) (runner: IProcessRunner) (commands: seq<Command>) =
-        runAll concurrency runner commands (fun r c -> r.OutputString(c, CancellationToken.None))
+    let outputAll
+        (concurrency: int)
+        (runner: IProcessRunner)
+        (commands: seq<Command>)
+        (cancellationToken: CancellationToken)
+        =
+        runAll concurrency runner commands (fun r c -> r.OutputString(c, cancellationToken))
 
     /// The raw-bytes companion to `outputAll` — captures each command's stdout as bytes.
-    let outputAllBytes (concurrency: int) (runner: IProcessRunner) (commands: seq<Command>) =
-        runAll concurrency runner commands (fun r c -> r.OutputBytes(c, CancellationToken.None))
+    let outputAllBytes
+        (concurrency: int)
+        (runner: IProcessRunner)
+        (commands: seq<Command>)
+        (cancellationToken: CancellationToken)
+        =
+        runAll concurrency runner commands (fun r c -> r.OutputBytes(c, cancellationToken))

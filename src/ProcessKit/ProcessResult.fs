@@ -1,6 +1,7 @@
 namespace ProcessKit
 
 open System
+open System.Text
 
 /// The full outcome of a run: the exit code as data, captured stdout/stderr, and timing.
 ///
@@ -56,36 +57,49 @@ type ProcessResult<'T>
         | Outcome.Exited code -> List.contains code okCodes
         | _ -> false
 
-[<RequireQualifiedAccess>]
-module ProcessResult =
+    /// The single mapping from a non-success outcome to its `ProcessError`. Lives on the type so the
+    /// instance `EnsureSuccess` and the module verbs (`ensureSuccess` / `exitCode` / `probe`, on a
+    /// command or a pipeline) can never drift on how a non-zero exit, signal kill, or timeout is
+    /// reported. For a `byte[]` capture the stdout is decoded UTF-8 to fill the (string) error field.
+    member internal _.FailureError: ProcessError =
+        let stdoutText =
+            match box stdout with
+            | :? string as s -> s
+            | :? (byte[]) as bytes -> Encoding.UTF8.GetString bytes
+            | _ -> ""
 
-    /// The single mapping from a non-success outcome to its `ProcessError`. One place so the verbs
-    /// (`ensureSuccess` / `exitCode` / `probe`, on a command or a pipeline) can never drift on how a
-    /// non-zero exit, a signal kill, or a timeout is reported.
-    let internal failureError (result: ProcessResult<string>) : ProcessError =
-        match result.Outcome with
-        | Outcome.Exited code -> ProcessError.Exit(result.Program, code, result.Stdout, result.Stderr)
-        | Outcome.Signalled signal -> ProcessError.Signalled(result.Program, signal, result.Stdout, result.Stderr)
-        | Outcome.TimedOut -> ProcessError.Timeout(result.Program, result.Duration, result.Stdout, result.Stderr)
+        match outcome with
+        | Outcome.Exited code -> ProcessError.Exit(program, code, stdoutText, stderr)
+        | Outcome.Signalled signal -> ProcessError.Signalled(program, signal, stdoutText, stderr)
+        | Outcome.TimedOut -> ProcessError.Timeout(program, duration, stdoutText, stderr)
 
     /// Demand a successful run (an **accepted** exit code — `0`, or any in `Command.OkCodes`):
     /// returns the result unchanged on success, otherwise the corresponding `ProcessError`
-    /// (`Exit` / `Signalled` / `Timeout`).
-    let ensureSuccess (result: ProcessResult<string>) : Result<ProcessResult<string>, ProcessError> =
-        if result.IsSuccess then
-            Ok result
-        else
-            Error(failureError result)
+    /// (`Exit` / `Signalled` / `Timeout`). The instance form for C# fluency.
+    member this.EnsureSuccess() : Result<ProcessResult<'T>, ProcessError> =
+        if this.IsSuccess then Ok this else Error this.FailureError
+
+[<RequireQualifiedAccess>]
+module ProcessResult =
+
+    /// The single mapping from a non-success outcome to its `ProcessError` (delegates to the type's
+    /// `FailureError` so there is exactly one source of truth).
+    let internal failureError (result: ProcessResult<'T>) : ProcessError = result.FailureError
+
+    /// Demand a successful run (an **accepted** exit code — `0`, or any in `Command.OkCodes`):
+    /// returns the result unchanged on success, otherwise the corresponding `ProcessError`
+    /// (`Exit` / `Signalled` / `Timeout`). Generic over the captured-stdout type.
+    let ensureSuccess (result: ProcessResult<'T>) : Result<ProcessResult<'T>, ProcessError> = result.EnsureSuccess()
 
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel.
     let internal exitCode (result: ProcessResult<string>) : Result<int, ProcessError> =
         match result.Outcome with
         | Outcome.Exited code -> Ok code
-        | _ -> Error(failureError result)
+        | _ -> Error result.FailureError
 
     /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
     let internal probe (result: ProcessResult<string>) : Result<bool, ProcessError> =
         match result.Outcome with
         | Outcome.Exited 0 -> Ok true
         | Outcome.Exited 1 -> Ok false
-        | _ -> Error(failureError result)
+        | _ -> Error result.FailureError

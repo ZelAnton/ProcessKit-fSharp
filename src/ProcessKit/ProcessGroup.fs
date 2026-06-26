@@ -335,7 +335,29 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
                     let stdoutTask = Pump.drainRawOrEmpty spawned.Stdout None CancellationToken.None
                     let stderrTask = Pump.drainRawOrEmpty spawned.Stderr None CancellationToken.None
-                    let! outcome = waitOutcome spawned.Handle
+                    let waitTask = waitOutcome spawned.Handle
+
+                    // Honour the command's `Timeout`: on the deadline, hard-kill just this child's
+                    // subtree (a shared group may hold siblings, so the graceful whole-tree path is not
+                    // used here) and report `TimedOut`. An over-long span is treated as no timeout.
+                    let! outcome =
+                        match command.Config.Timeout with
+                        | Some timeout when Timeouts.isArmable timeout ->
+                            task {
+                                use timeoutCts = new CancellationTokenSource()
+                                let! winner = Task.WhenAny(waitTask :> Task, Task.Delay(timeout, timeoutCts.Token))
+
+                                if obj.ReferenceEquals(winner, (waitTask :> Task)) then
+                                    timeoutCts.Cancel()
+                                    return! waitTask
+                                else
+                                    backend.KillChild spawned
+                                    let! _ = waitTask
+                                    Log.timeout command.Config.Logger command.Program timeout
+                                    return Outcome.TimedOut
+                            }
+                        | _ -> waitTask
+
                     let! stdoutBytes = stdoutTask
                     let! stderrBytes = stderrTask
                     spawned.Stdout |> Option.iter (fun s -> s.Dispose())
