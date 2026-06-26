@@ -4,26 +4,11 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<AssemblyName>ProcessKit.Extensions.DependencyInjection</AssemblyName>
 
+		<!-- Package identity only; shared metadata is hoisted to Directory.Build.props. -->
 		<PackageId>ProcessKit.Extensions.DependencyInjection</PackageId>
 		<Version>2.0.0</Version>
-		<Authors>Anton Zhelezniakou</Authors>
-		<Copyright>Copyright (c) 2026 Anton Zhelezniakou</Copyright>
 		<Description>Microsoft.Extensions.DependencyInjection integration for ProcessKit: AddProcessKit registers an IProcessRunner (ILogger-aware when a logger factory is present).</Description>
 		<PackageTags>fsharp;dotnet;process;subprocess;dependency-injection;microsoft-extensions-dependencyinjection;iprocessrunner;processkit</PackageTags>
-		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageReadmeFile>README.md</PackageReadmeFile>
-
-		<PackageProjectUrl>https://github.com/ZelAnton/ProcessKit-fSharp</PackageProjectUrl>
-		<RepositoryUrl>https://github.com/ZelAnton/ProcessKit-fSharp</RepositoryUrl>
-		<RepositoryType>git</RepositoryType>
-		<PublishRepositoryUrl>true</PublishRepositoryUrl>
-		<EmbedUntrackedSources>true</EmbedUntrackedSources>
-
-		<IncludeSymbols>true</IncludeSymbols>
-		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
-
-		<Deterministic>true</Deterministic>
-		<ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
 
 		<!-- The referenced ProcessKit.dll resolves from the main project's build output. -->
 		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
@@ -37,7 +22,6 @@
 		<PackageReference Include="FSharp.Core" />
 		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
-		<PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
 	</ItemGroup>
 
 	<ItemGroup>
