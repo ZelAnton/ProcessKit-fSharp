@@ -115,7 +115,7 @@ type ReadinessTests() =
                     use slow = slow
 
                     match! RunningProcess.WaitAny [| fast; slow |] with
-                    | Ok(index, _) -> Assert.That(index, Is.EqualTo 0)
+                    | Ok result -> Assert.That(result.Index, Is.EqualTo 0)
                     | Error error -> Assert.Fail $"{error}"
         }
         :> Task

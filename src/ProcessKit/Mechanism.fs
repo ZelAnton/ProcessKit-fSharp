@@ -4,7 +4,7 @@ namespace ProcessKit
 ///
 /// Reported honestly (never a silent downgrade) so callers can reason about the
 /// containment guarantee on the current platform.
-[<RequireQualifiedAccess>]
+[<RequireQualifiedAccess; NoComparison>]
 type Mechanism =
 
     /// Windows Job Object.

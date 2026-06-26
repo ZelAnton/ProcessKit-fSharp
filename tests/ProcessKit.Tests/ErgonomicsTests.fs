@@ -5,6 +5,7 @@ open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
+open NUnit.Framework.Legacy
 open ProcessKit
 
 [<TestFixture>]
@@ -46,7 +47,7 @@ type ErgonomicsTests() =
             match! command.OutputString() with
             | Ok result ->
                 Assert.That(result.IsSuccess, Is.False)
-                Assert.That(result.AcceptedCodes, Is.EqualTo(box [ 1 ]))
+                CollectionAssert.AreEqual([| 1 |], result.AcceptedCodes)
             | Error error -> Assert.Fail $"{error}"
 
             match! command.Run() with

@@ -13,7 +13,7 @@ namespace ProcessKit
 /// tree with `ProcessGroup.Suspend` / `ProcessGroup.Resume`, which are portable (Windows included);
 /// `Signal.Other` with the raw `SIGSTOP` number remains available when the raw signal is
 /// specifically wanted on Unix.
-[<RequireQualifiedAccess>]
+[<RequireQualifiedAccess; NoComparison>]
 type Signal =
 
     /// `SIGTERM` — polite request to exit.

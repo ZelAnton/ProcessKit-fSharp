@@ -1,7 +1,7 @@
 namespace ProcessKit
 
-/// How a process run concluded. Mirrors the Rust `Outcome`.
-[<RequireQualifiedAccess>]
+/// How a process run concluded.
+[<RequireQualifiedAccess; NoComparison>]
 type Outcome =
 
     /// Exited with the given code.

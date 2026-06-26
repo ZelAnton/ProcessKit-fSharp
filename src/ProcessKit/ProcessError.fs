@@ -8,7 +8,7 @@ open System
 /// with the `Result.Error` constructor in F#. Honest-result verbs — `outputString`,
 /// `outputBytes`, `exitCode`, `probe` — return their value; only genuine failures
 /// surface as a `ProcessError` in the `Result` channel.
-[<RequireQualifiedAccess>]
+[<RequireQualifiedAccess; NoComparison>]
 type ProcessError =
 
     /// The process could not be spawned (a failure before or during launch).

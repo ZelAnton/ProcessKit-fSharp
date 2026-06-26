@@ -105,7 +105,7 @@ type ContainmentBugTests() =
                 | Ok m -> m
                 | Error e -> failwith $"Members failed: {e}"
 
-            Assert.That(List.isEmpty pids, Is.False, "expected the started child to be tracked")
+            Assert.That(Seq.isEmpty pids, Is.False, "expected the started child to be tracked")
 
             // Teardown must SIGKILL *and* waitpid the leaders. After Dispose each pid must be fully
             // reaped (gone from /proc) — not lingering as a zombie (state 'Z').

@@ -7,7 +7,7 @@ open System.Threading.Tasks
 
 /// When the supervisor restarts an exited child. In every case `Supervisor.StopWhen` and
 /// `Supervisor.MaxRestarts` can end supervision first.
-[<RequireQualifiedAccess>]
+[<RequireQualifiedAccess; NoComparison>]
 type RestartPolicy =
 
     /// Restart after every completed run, clean or not.
@@ -22,7 +22,7 @@ type RestartPolicy =
     | Never
 
 /// Why supervision ended.
-[<RequireQualifiedAccess>]
+[<RequireQualifiedAccess; NoComparison>]
 type StopReason =
 
     /// The `Supervisor.StopWhen` predicate matched a run.

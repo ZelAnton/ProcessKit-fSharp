@@ -2,7 +2,7 @@ namespace ProcessKit
 
 /// How a child's stdout or stderr stream is connected. Set per-stream on `Command` via
 /// `Stdout`/`Stderr`; the default is `Piped`.
-[<RequireQualifiedAccess>]
+[<RequireQualifiedAccess; NoComparison>]
 type StdioMode =
 
     /// Capture the stream through a pipe (the default). Required for line streaming,
@@ -17,7 +17,7 @@ type StdioMode =
     | Null
 
 /// What to drop when a bounded output buffer is full.
-[<RequireQualifiedAccess>]
+[<RequireQualifiedAccess; NoComparison>]
 type OverflowMode =
 
     /// Ring-buffer / "tail" semantics: discard the oldest retained line so the most recent

@@ -278,8 +278,9 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// The pids of the processes currently in the group — a point-in-time snapshot. On Windows the
     /// whole Job tree, on cgroup v2 the whole cgroup, on the POSIX fallback the tracked group leaders.
-    member this.Members() : Result<int list, ProcessError> =
+    member this.Members() : Result<IReadOnlyList<int>, ProcessError> =
         this.WhenLive(fun () -> backend.Members())
+        |> Result.map (fun pids -> List.toArray pids :> IReadOnlyList<int>)
 
     /// Broadcast `signal` to every process in the group. Best-effort: an exited member is skipped
     /// and an empty group succeeds trivially. On **Windows** only `Signal.Kill` is deliverable (it

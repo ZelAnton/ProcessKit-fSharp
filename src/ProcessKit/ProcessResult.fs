@@ -1,6 +1,7 @@
 namespace ProcessKit
 
 open System
+open System.Collections.Generic
 open System.Text
 
 /// The full outcome of a run: the exit code as data, captured stdout/stderr, and timing.
@@ -49,7 +50,7 @@ type ProcessResult<'T>
     member _.IsTimedOut = outcome.IsTimedOut
 
     /// The exit codes treated as success (from `Command.OkCodes`; `{0}` by default).
-    member _.AcceptedCodes = okCodes
+    member _.AcceptedCodes: IReadOnlyList<int> = List.toArray okCodes
 
     /// True when the process exited with an accepted code (`0`, or any code in `Command.OkCodes`).
     member _.IsSuccess =

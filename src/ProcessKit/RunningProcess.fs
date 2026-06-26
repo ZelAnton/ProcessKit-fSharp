@@ -33,6 +33,17 @@ type internal RunningHost =
         Teardown: unit -> ValueTask
     }
 
+/// The result of `RunningProcess.WaitAny`: which started process finished first and how it
+/// concluded. A named type (rather than a tuple) so the fields read clearly from C#.
+[<Sealed; NoComparison>]
+type WaitAnyResult internal (index: int, outcome: Outcome) =
+
+    /// The index, into the array passed to `WaitAny`, of the process that finished first.
+    member _.Index = index
+
+    /// How that process concluded.
+    member _.Outcome = outcome
+
 /// A live handle to a started process: stream its output, feed its stdin, wait for it, or
 /// collect it to completion. Disposing it reaps the whole process tree (kill-on-drop).
 [<Sealed>]
@@ -682,7 +693,7 @@ type RunningProcess internal (host: RunningHost) =
 
     /// Wait for the first of `processes` to exit; returns its index and outcome. Does not reap any
     /// of them — dispose them yourself.
-    static member WaitAny(processes: RunningProcess[]) : Task<Result<int * Outcome, ProcessError>> =
+    static member WaitAny(processes: RunningProcess[]) : Task<Result<WaitAnyResult, ProcessError>> =
         task {
             if processes.Length = 0 then
                 return Error(ProcessError.Unsupported "WaitAny requires at least one process")
@@ -691,7 +702,7 @@ type RunningProcess internal (host: RunningHost) =
                 let! completed = Task.WhenAny tasks
                 let index = tasks |> Array.findIndex (fun t -> obj.ReferenceEquals(t, completed))
                 let! outcome = completed
-                return Ok(index, outcome)
+                return Ok(WaitAnyResult(index, outcome))
         }
 
     /// Wait for all of `processes` to exit; returns their outcomes in order. Does not reap them.

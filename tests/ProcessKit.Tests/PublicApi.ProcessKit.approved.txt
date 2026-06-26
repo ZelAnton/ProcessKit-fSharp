@@ -139,14 +139,8 @@ class ProcessKit.JobRunner
   new()
 
 class ProcessKit.Mechanism
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.Mechanism>
   :> System.IEquatable<ProcessKit.Mechanism>
-  member CompareTo(ProcessKit.Mechanism) : System.Int32
-  member CompareTo(System.Object) : System.Int32
-  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
   member Equals(ProcessKit.Mechanism) : System.Boolean
   member Equals(ProcessKit.Mechanism, System.Collections.IEqualityComparer) : System.Boolean
   member Equals(System.Object) : System.Boolean
@@ -175,14 +169,8 @@ module ProcessKit.Mechanism+Tags
   field literal ProcessGroup : System.Int32
 
 class ProcessKit.Outcome
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.Outcome>
   :> System.IEquatable<ProcessKit.Outcome>
-  member CompareTo(ProcessKit.Outcome) : System.Int32
-  member CompareTo(System.Object) : System.Int32
-  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
   member Equals(ProcessKit.Outcome) : System.Boolean
   member Equals(ProcessKit.Outcome, System.Collections.IEqualityComparer) : System.Boolean
   member Equals(System.Object) : System.Boolean
@@ -206,19 +194,13 @@ class ProcessKit.Outcome
   static member get_TimedOut() : ProcessKit.Outcome
 
 class ProcessKit.Outcome+Exited : ProcessKit.Outcome
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.Outcome>
   :> System.IEquatable<ProcessKit.Outcome>
   member get_code() : System.Int32
   property code : System.Int32 { get }
 
 class ProcessKit.Outcome+Signalled : ProcessKit.Outcome
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.Outcome>
   :> System.IEquatable<ProcessKit.Outcome>
   member get_signal() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
   property signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
@@ -281,14 +263,8 @@ class ProcessKit.OutputLine
   property Text : System.String { get }
 
 class ProcessKit.OverflowMode
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.OverflowMode>
   :> System.IEquatable<ProcessKit.OverflowMode>
-  member CompareTo(ProcessKit.OverflowMode) : System.Int32
-  member CompareTo(System.Object) : System.Int32
-  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
   member Equals(ProcessKit.OverflowMode) : System.Boolean
   member Equals(ProcessKit.OverflowMode, System.Collections.IEqualityComparer) : System.Boolean
   member Equals(System.Object) : System.Boolean
@@ -347,14 +323,8 @@ module ProcessKit.PipelineModule
   static member timeout(System.TimeSpan, ProcessKit.Pipeline) : ProcessKit.Pipeline
 
 class ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
-  member CompareTo(ProcessKit.ProcessError) : System.Int32
-  member CompareTo(System.Object) : System.Int32
-  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
   member Equals(ProcessKit.ProcessError) : System.Boolean
   member Equals(ProcessKit.ProcessError, System.Collections.IEqualityComparer) : System.Boolean
   member Equals(System.Object) : System.Boolean
@@ -409,28 +379,19 @@ class ProcessKit.ProcessError
   static member NewUnsupported(System.String) : ProcessKit.ProcessError
 
 class ProcessKit.ProcessError+Cancelled : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_program() : System.String
   property program : System.String { get }
 
 class ProcessKit.ProcessError+CassetteMiss : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_program() : System.String
   property program : System.String { get }
 
 class ProcessKit.ProcessError+Exit : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_code() : System.Int32
   member get_program() : System.String
@@ -442,19 +403,13 @@ class ProcessKit.ProcessError+Exit : ProcessKit.ProcessError
   property stdout : System.String { get }
 
 class ProcessKit.ProcessError+Io : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_message() : System.String
   property message : System.String { get }
 
 class ProcessKit.ProcessError+NotFound : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_program() : System.String
   member get_searched() : Microsoft.FSharp.Core.FSharpOption<System.String>
@@ -462,10 +417,7 @@ class ProcessKit.ProcessError+NotFound : ProcessKit.ProcessError
   property searched : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
 
 class ProcessKit.ProcessError+NotReady : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_program() : System.String
   member get_timeout() : System.TimeSpan
@@ -473,10 +425,7 @@ class ProcessKit.ProcessError+NotReady : ProcessKit.ProcessError
   property timeout : System.TimeSpan { get }
 
 class ProcessKit.ProcessError+OutputTooLarge : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_byteLimit() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
   member get_lineLimit() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
@@ -490,10 +439,7 @@ class ProcessKit.ProcessError+OutputTooLarge : ProcessKit.ProcessError
   property totalLines : System.Int32 { get }
 
 class ProcessKit.ProcessError+Parse : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_message() : System.String
   member get_program() : System.String
@@ -501,19 +447,13 @@ class ProcessKit.ProcessError+Parse : ProcessKit.ProcessError
   property program : System.String { get }
 
 class ProcessKit.ProcessError+ResourceLimit : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_message() : System.String
   property message : System.String { get }
 
 class ProcessKit.ProcessError+Signalled : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_program() : System.String
   member get_signal() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
@@ -525,10 +465,7 @@ class ProcessKit.ProcessError+Signalled : ProcessKit.ProcessError
   property stdout : System.String { get }
 
 class ProcessKit.ProcessError+Spawn : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_message() : System.String
   member get_program() : System.String
@@ -536,10 +473,7 @@ class ProcessKit.ProcessError+Spawn : ProcessKit.ProcessError
   property program : System.String { get }
 
 class ProcessKit.ProcessError+Stdin : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_message() : System.String
   member get_program() : System.String
@@ -563,10 +497,7 @@ module ProcessKit.ProcessError+Tags
   field literal Unsupported : System.Int32
 
 class ProcessKit.ProcessError+Timeout : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_program() : System.String
   member get_stderr() : System.String
@@ -578,10 +509,7 @@ class ProcessKit.ProcessError+Timeout : ProcessKit.ProcessError
   property timeout : System.TimeSpan { get }
 
 class ProcessKit.ProcessError+Unsupported : ProcessKit.ProcessError
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.ProcessError>
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_operation() : System.String
   property operation : System.String { get }
@@ -595,7 +523,7 @@ class ProcessKit.ProcessGroup
   :> System.IAsyncDisposable
   :> System.IDisposable
   member Finalize() : System.Void
-  member Members() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Collections.FSharpList<System.Int32>, ProcessKit.ProcessError>
+  member Members() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<System.Int32>, ProcessKit.ProcessError>
   member Resume() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member SampleStats(System.TimeSpan) : System.Collections.Generic.IAsyncEnumerable<ProcessKit.ProcessGroupStats>
   member Shutdown() : System.Threading.Tasks.Task
@@ -629,7 +557,7 @@ module ProcessKit.ProcessResult
 
 class ProcessKit.ProcessResult`1
   member EnsureSuccess() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<T>, ProcessKit.ProcessError>
-  property AcceptedCodes : Microsoft.FSharp.Collections.FSharpList<System.Int32> { get }
+  property AcceptedCodes : System.Collections.Generic.IReadOnlyList<System.Int32> { get }
   property Code : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property Duration : System.TimeSpan { get }
   property IsSuccess : System.Boolean { get }
@@ -657,14 +585,8 @@ class ProcessKit.ResourceLimits
   property None : ProcessKit.ResourceLimits { get }
 
 class ProcessKit.RestartPolicy
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.RestartPolicy>
   :> System.IEquatable<ProcessKit.RestartPolicy>
-  member CompareTo(ProcessKit.RestartPolicy) : System.Int32
-  member CompareTo(System.Object) : System.Int32
-  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
   member Equals(ProcessKit.RestartPolicy) : System.Boolean
   member Equals(ProcessKit.RestartPolicy, System.Collections.IEqualityComparer) : System.Boolean
   member Equals(System.Object) : System.Boolean
@@ -738,17 +660,11 @@ class ProcessKit.RunningProcess
   property StderrLineCount : System.Int32 { get }
   property StdoutLineCount : System.Int32 { get }
   static member WaitAll(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<ProcessKit.Outcome[]>
-  static member WaitAny(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Tuple<System.Int32, ProcessKit.Outcome>, ProcessKit.ProcessError>>
+  static member WaitAny(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.WaitAnyResult, ProcessKit.ProcessError>>
 
 class ProcessKit.Signal
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.Signal>
   :> System.IEquatable<ProcessKit.Signal>
-  member CompareTo(ProcessKit.Signal) : System.Int32
-  member CompareTo(System.Object) : System.Int32
-  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
   member Equals(ProcessKit.Signal) : System.Boolean
   member Equals(ProcessKit.Signal, System.Collections.IEqualityComparer) : System.Boolean
   member Equals(System.Object) : System.Boolean
@@ -791,10 +707,7 @@ class ProcessKit.Signal
   static member get_Usr2() : ProcessKit.Signal
 
 class ProcessKit.Signal+Other : ProcessKit.Signal
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.Signal>
   :> System.IEquatable<ProcessKit.Signal>
   member get_signalNumber() : System.Int32
   property signalNumber : System.Int32 { get }
@@ -819,14 +732,8 @@ class ProcessKit.Stdin
   static member FromString(System.String) : ProcessKit.Stdin
 
 class ProcessKit.StdioMode
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.StdioMode>
   :> System.IEquatable<ProcessKit.StdioMode>
-  member CompareTo(ProcessKit.StdioMode) : System.Int32
-  member CompareTo(System.Object) : System.Int32
-  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
   member Equals(ProcessKit.StdioMode) : System.Boolean
   member Equals(ProcessKit.StdioMode, System.Collections.IEqualityComparer) : System.Boolean
   member Equals(System.Object) : System.Boolean
@@ -855,14 +762,8 @@ module ProcessKit.StdioMode+Tags
   field literal Piped : System.Int32
 
 class ProcessKit.StopReason
-  :> System.Collections.IStructuralComparable
   :> System.Collections.IStructuralEquatable
-  :> System.IComparable
-  :> System.IComparable<ProcessKit.StopReason>
   :> System.IEquatable<ProcessKit.StopReason>
-  member CompareTo(ProcessKit.StopReason) : System.Int32
-  member CompareTo(System.Object) : System.Int32
-  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
   member Equals(ProcessKit.StopReason) : System.Boolean
   member Equals(ProcessKit.StopReason, System.Collections.IEqualityComparer) : System.Boolean
   member Equals(System.Object) : System.Boolean
@@ -975,4 +876,8 @@ class ProcessKit.Testing.ScriptedRunner
   member On(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
   member When(Microsoft.FSharp.Core.FSharpFunc<ProcessKit.Command, System.Boolean>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
   new()
+
+class ProcessKit.WaitAnyResult
+  property Index : System.Int32 { get }
+  property Outcome : ProcessKit.Outcome { get }
 

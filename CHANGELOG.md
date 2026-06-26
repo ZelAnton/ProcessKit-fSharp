@@ -54,6 +54,9 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - `Exec.run` / `outputString` / `outputAll` / `outputAllBytes` now take an explicit `CancellationToken` (pass `CancellationToken.None` when not needed), matching the `Runner` module so an `Exec` batch can be cancelled.
 - `ProcessResult.ensureSuccess` is now generic over the captured-stdout type (`'T`), so it works on a `ProcessResult<byte[]>` as well as `<string>` (a `byte[]` stdout is decoded UTF-8 to fill the error's stdout field).
 - `ProcessGroup` used as an `IProcessRunner` now honours `Command.Timeout`: a run that exceeds its deadline is hard-killed (just that child's subtree, leaving sibling runs in a shared group untouched) and reported as `Outcome.TimedOut`, instead of the timeout being silently ignored.
+- `ProcessGroup.Members` and `ProcessResult.AcceptedCodes` now return `IReadOnlyList<int>` (was an F# list), matching `Command.Arguments` and reading naturally from C#.
+- `RunningProcess.WaitAny` now returns a named `WaitAnyResult` (`Index` / `Outcome`) instead of an `(int * Outcome)` tuple, so the fields are clear from C#.
+- The control/error discriminated unions (`ProcessError`, `Outcome`, `Mechanism`, `Signal`, `StopReason`, `RestartPolicy`, `StdioMode`, `OverflowMode`) no longer implement `IComparable` / `IStructuralComparable` — ordering them was meaningless. Equality and pattern matching are unchanged.
 
 ### Fixed
 - POSIX containment now reaps **every** child of a multi-child group (e.g. a pipeline), not just the last. Each `posix_spawn` forms its own process group, so the group tracks all of them; previously only the most-recent pgid was killed, letting an earlier long-running stage linger until its natural exit.
