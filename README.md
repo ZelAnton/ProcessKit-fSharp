@@ -8,9 +8,11 @@
 F# async child-process management for .NET: whole-tree kill-on-drop (no orphans),
 streaming, pipelines, timeouts, and supervision.
 
-> **Status: pre-1.0, API in progress.** ProcessKit is an F# port of the Rust crate
-> `ProcessKit-rs` and is being built feature by feature. The public API is not yet frozen —
-> expect additions until the 1.0 release. See `CHANGELOG.md` for what has landed.
+> **Status: F# rewrite, first release 2.0.0.** ProcessKit 2.x is a ground-up F# reimplementation
+> that supersedes the author's earlier C# `ProcessKit` package (published through 1.3.2). It is an
+> F# port of the Rust crate `ProcessKit-rs`, built feature by feature against that crate's stable
+> v1.0.1 surface; expect API refinements until the 2.0.0 release lands. See `CHANGELOG.md` for what
+> has landed.
 
 ## Install
 

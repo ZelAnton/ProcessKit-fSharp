@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+ProcessKit 2.0 is a ground-up F# rewrite that replaces the author's earlier C# `ProcessKit`
+package (published through 1.3.2). The assembly and public API are entirely new — treat it as a
+new library that shares the name and problem domain, not an in-place upgrade of the 1.x line.
+
 ### Added
 - Core run vocabulary: an immutable `Command` builder, the `IProcessRunner` seam, and the `Runner` verbs `run`/`runUnit`/`outputString`/`outputBytes`/`exitCode`/`probe`, returning `Task<Result<_, ProcessError>>` (a non-zero exit is data, not an error).
 - `ProcessResult<'T>`, `Outcome`, `Mechanism`, and the structured `ProcessError` failure type.

@@ -5,7 +5,7 @@
 		<AssemblyName>ProcessKit</AssemblyName>
 
 		<PackageId>ProcessKit</PackageId>
-		<Version>0.1.0</Version>
+		<Version>2.0.0</Version>
 		<Authors>Anton Zhelezniakou</Authors>
 		<Copyright>Copyright (c) 2026 Anton Zhelezniakou</Copyright>
 		<Description>F# async child-process management: whole-tree kill-on-drop (no orphans), streaming, pipelines, timeouts, and supervision.</Description>

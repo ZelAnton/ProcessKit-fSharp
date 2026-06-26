@@ -5,7 +5,7 @@
 		<AssemblyName>ProcessKit.Extensions.DependencyInjection</AssemblyName>
 
 		<PackageId>ProcessKit.Extensions.DependencyInjection</PackageId>
-		<Version>0.1.0</Version>
+		<Version>2.0.0</Version>
 		<Authors>Anton Zhelezniakou</Authors>
 		<Copyright>Copyright (c) 2026 Anton Zhelezniakou</Copyright>
 		<Description>Microsoft.Extensions.DependencyInjection integration for ProcessKit: AddProcessKit registers an IProcessRunner (ILogger-aware when a logger factory is present).</Description>
