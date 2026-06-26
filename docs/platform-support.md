@@ -1,0 +1,222 @@
+# Platform support
+
+[‹ docs index](README.md)
+
+ProcessKit treats platform behaviour as first-class. Every child you start lives inside the
+operating system's own containment primitive, so the kill-on-dispose tree guarantee holds on
+Windows, Linux, and macOS/BSD alike. Where a mechanism is genuinely weaker than another, the
+difference is reported honestly — the active `Mechanism` is queryable and unsupported operations
+return a typed `ProcessError`, never a silent downgrade. This page collects every per-OS
+mechanism, capability matrix, and caveat in one place.
+
+- [Containment mechanisms](#containment-mechanisms)
+- [Target frameworks](#target-frameworks)
+- [Capability matrices](#capability-matrices)
+- [Caveats](#caveats)
+
+## Containment mechanisms
+
+A `ProcessGroup` wraps one of three OS primitives. Whichever it gets, disposing the group (or the
+live `RunningProcess` from a one-shot verb) reaps the whole tree — children, grandchildren, and
+anything they spawned — as a single kernel operation.
+
+| `Mechanism` | Platform | How containment works |
+|---|---|---|
+| `Mechanism.JobObject` | Windows | A Job Object created with kill-on-close. Children are spawned suspended, assigned to the job, then resumed, so even a grandchild forked in the first instant is already contained. Teardown closes the job handle (`KILL_ON_JOB_CLOSE`) or terminates the job. |
+| `Mechanism.CgroupV2` | Linux (when resource limits are requested and a usable cgroup v2 root exists) | A private cgroup under the unified hierarchy. Each child is migrated into `cgroup.procs`; teardown is `cgroup.kill` followed by removing the cgroup directory. |
+| `Mechanism.ProcessGroup` | macOS/BSD, and the Linux default when no limits are requested | POSIX process groups. Each spawned child forms its own process-group id (pgid); teardown sends `SIGKILL` to the tracked pgids (`killpg`). |
+
+### When each mechanism is chosen
+
+The selection at `ProcessGroup.Create` is deterministic per platform:
+
+- **Windows** always uses a **Job Object** (`Mechanism.JobObject`), with or without limits. When
+  limits are requested they are applied to the job; if they cannot be applied, creation fails with
+  `ProcessError.ResourceLimit`.
+- **Linux** uses a **cgroup v2** (`Mechanism.CgroupV2`) *only when resource limits are requested
+  and cgroup v2 is mounted and usable at the real cgroup-v2 root*. Without limits, Linux uses the
+  **POSIX process group** (`Mechanism.ProcessGroup`) — so an ordinary, limit-free group on Linux
+  reports `ProcessGroup`, not `CgroupV2`. If limits are requested but no usable cgroup exists,
+  creation fails with `ProcessError.ResourceLimit` rather than running unbounded.
+- **macOS / BSD** always use a **POSIX process group** (`Mechanism.ProcessGroup`). They have no
+  whole-tree limit primitive, so requesting limits fails fast with `ProcessError.ResourceLimit`.
+
+### Reading the active mechanism
+
+`ProcessGroup.Mechanism` reports which primitive you actually got, so code that depends on a
+guarantee can check rather than assume:
+
+```fsharp
+open ProcessKit
+
+match ProcessGroup.Create() with
+| Ok group ->
+    use group = group
+
+    match group.Mechanism with
+    | Mechanism.JobObject -> printfn "Windows Job Object — whole-tree kill, members, stats"
+    | Mechanism.CgroupV2 -> printfn "Linux cgroup v2 — whole-tree kill, signals, limits, stats"
+    | Mechanism.ProcessGroup -> printfn "POSIX process group — kill-on-dispose, leaders-only members"
+| Error err -> eprintfn $"{err.Message}"
+```
+
+The `Mechanism.IsJobObject` / `IsCgroupV2` / `IsProcessGroup` properties are the same check in
+boolean form, convenient from C#.
+
+## Target frameworks
+
+ProcessKit targets **.NET 8.0** and **.NET 10.0**, and is usable from F# and C# alike. The
+containment work is done through platform P/Invoke (Win32 for the Job Object, the cgroup
+filesystem and `libc` on Unix), so the supported runtime set is Windows, Linux, and macOS/BSD —
+the desktop and server platforms these target frameworks run on.
+
+## Capability matrices
+
+In the matrices below the columns are the three mechanisms. The **POSIX process group** column
+covers macOS/BSD *and* the Linux default (a limit-free group), since they share one backend.
+Legend: ✅ full support · 🟡 supported with a documented qualification · ❌ not available.
+
+**Whole-tree teardown**
+
+| Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
+|---|:---:|:---:|:---:|
+| Kill-on-dispose, whole tree | ✅ | ✅ | ✅ |
+| Graceful `Shutdown` (TERM → grace → KILL) | 🟡 atomic kill only | ✅ | ✅ |
+
+`Shutdown(grace)` on Windows has no per-job graceful signal, so it is the atomic Job terminate;
+on the Unix mechanisms it is `SIGTERM`, then a grace window, then `SIGKILL`.
+
+**Signals (`Signal`)**
+
+| Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
+|---|:---:|:---:|:---:|
+| `Signal.Kill` | ✅ maps to Job terminate | ✅ | ✅ |
+| Any other signal (`Term`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other n`) | ❌ `ProcessError.Unsupported` | ✅ | ✅ |
+
+**Suspend / resume**
+
+| Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
+|---|:---:|:---:|:---:|
+| `Suspend` / `Resume` the whole tree | ✅ per-process freeze across the job | ✅ `cgroup.freeze` | ✅ `SIGSTOP` / `SIGCONT` |
+
+**Member listing (`Members`)**
+
+| Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
+|---|:---:|:---:|:---:|
+| `Members()` snapshot | ✅ whole tree | ✅ whole tree | 🟡 tracked group leaders only |
+
+**Stats (`Stats` / `SampleStats`)**
+
+| Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
+|---|:---:|:---:|:---:|
+| `ActiveProcessCount` | ✅ | ✅ | ✅ |
+| `TotalCpuTime` + `PeakMemoryBytes` | ✅ | ✅ | ❌ active count only |
+
+On the POSIX process-group mechanism, `ProcessGroupStats.TotalCpuTime` and `PeakMemoryBytes` are
+`None` — only the live process count is available. Windows reads Job Object accounting; the cgroup
+mechanism reads `cpu.stat` / `memory.peak`.
+
+**Resource limits (`ProcessGroupOptions`)**
+
+| Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
+|---|:---:|:---:|:---:|
+| `WithMemoryMax` (whole tree) | ✅ | ✅ | ❌ `ProcessError.ResourceLimit` |
+| `WithMaxProcesses` | ✅ | ✅ | ❌ `ProcessError.ResourceLimit` |
+| `WithCpuQuota` | 🟡 approximate | ✅ | ❌ `ProcessError.ResourceLimit` |
+
+`WithCpuQuota` is a fraction of a single core (`0.5` = half a core, `2.0` = two cores). On Windows
+it is converted against the host's CPU count and is approximate. Because limits need a real
+limit-capable container, the POSIX process-group mechanism cannot enforce any of them — requesting
+limits where none can apply fails at creation with `ProcessError.ResourceLimit` rather than
+returning a silently-unbounded group.
+
+Everything not listed here — capture, line streaming, interactive stdin, encodings, buffer
+policies, timeouts, retry, pipelines, supervision, readiness probes, cancellation, and the
+testing seams — is platform-agnostic and behaves identically everywhere. See [commands.md](commands.md),
+[streaming.md](streaming.md), [pipelines.md](pipelines.md), [supervision.md](supervision.md),
+and [testing.md](testing.md).
+
+## Caveats
+
+The honest fine print — mostly consequences of OS semantics, plus a few tracked internal
+constraints that do not change the public surface.
+
+**POSIX process groups: a `setsid` child can escape.** The process-group mechanism tracks each
+child's pgid, and teardown signals those pgids. A descendant that deliberately starts a new
+session (a `setsid` call) gets a fresh process group that the parent group does not track, so it
+can outlive the teardown. This is the genuine weakness of the process-group mechanism; it is why
+`ProcessGroup.Mechanism` is reported rather than papered over. The Job Object and cgroup v2
+mechanisms have no such hole — membership is enforced by the kernel container, not by group
+bookkeeping. When this matters, check the active mechanism.
+
+**Windows delivers only `Signal.Kill`.** Windows has no general signal abstraction. `Signal.Kill`
+maps to the Job Object terminate; every other `Signal` value (`Term`, `Int`, `Hup`, `Quit`,
+`Usr1`, `Usr2`, `Other n`) returns `ProcessError.Unsupported` on Windows. Portable code that needs
+a cooperative stop should drive the child another way (a known stdin command, a control file) and
+fall back to `Shutdown` / `Signal.Kill` for the hard stop. On the Unix mechanisms the full set is
+delivered.
+
+**No whole-tree resource limits on macOS/BSD or the Linux process-group fallback.** Limits require
+a Windows Job Object or a Linux cgroup v2; the POSIX process-group mechanism has no primitive to
+cap a tree's memory, process count, or CPU. Requesting any limit there makes `ProcessGroup.Create`
+return `ProcessError.ResourceLimit` immediately — an unapplied cap is no protection, so the group
+is never created unbounded.
+
+**cgroup v2 needs the *real* cgroup root.** The cgroup v2 mechanism is selected on Linux only when
+limits are requested *and* a usable cgroup v2 hierarchy is available. Enabling the controllers a
+limit needs (writing the parent's `cgroup.subtree_control`) is permitted by cgroup v2's
+"no internal processes" rule only at the real hierarchy root. A cgroup *namespace* root — what an
+ordinary container or a systemd session/scope/service sees — does not qualify and the write is
+refused (surfacing as `ProcessError.ResourceLimit`). In practice real cgroup limit enforcement
+needs a minimal init sitting at the true root; elsewhere a limit-free group simply uses the POSIX
+process-group mechanism. Check `ProcessGroup.Mechanism` when the limit must not silently fail to
+apply.
+
+**Output is decoded as UTF-8 by default.** Captured stdout/stderr text is decoded as UTF-8 unless
+you say otherwise. A Windows console program that emits a legacy OEM code page will mis-decode;
+set the encoding explicitly per stream with `Command.StdoutEncoding` / `Command.StderrEncoding`
+(or `Command.Encoding` for both). For legacy code pages, register the code-page provider first
+(`System.Text.Encoding.RegisterProvider(CodePagesEncodingProvider.Instance)`), then pass the
+`Encoding` you need.
+
+**POSIX pgid reuse.** Process-group signalling is inherently best-effort against pid/pgid reuse:
+between a child exiting and the group teardown running, the OS can recycle that pgid for an
+unrelated process. The backend prunes dead entries on every probe to keep the window minimal, but
+it cannot be eliminated at the process-group layer — the cgroup v2 mechanism (used when limits are
+requested) closes it, since membership is kernel-enforced.
+
+**Zombie leaders on kill-without-wait (POSIX).** Group teardown `SIGKILL`s the tree, but it does
+not `waitpid` group leaders that were never awaited through a run verb — for example,
+`ProcessGroup.Start` into a shared group followed by disposing the group without ever consuming the
+returned `RunningProcess`. The ordinary run verbs reap their children normally; only the
+kill-without-wait path can leave defunct (zombie) entries until the host process exits. A
+follow-up will reap them.
+
+**cgroup migration-failure window (Linux limits).** With the cgroup v2 mechanism, a child is
+migrated into the limit cgroup after it is spawned. In the rare case that a child fails to migrate
+*after* the group was already created successfully (creation itself validates the cgroup), it runs
+in the parent cgroup and would escape `cgroup.kill` teardown. The Windows Job Object and POSIX
+process-group default paths are unaffected.
+
+**Unbounded in-flight line, and streaming backlog.** `OutputBufferPolicy` caps bound the *retained
+complete lines* (and total bytes) of the buffered verbs; a single not-yet-terminated line — a
+newline-free flood — still grows until end of stream. Likewise, a streamed consumer
+(`StdoutLines` / `OutputEvents`) that stops draining while the child keeps writing grows the
+backing channel, since streaming is consumer-paced. Pair an untrusted or chatty child with a
+`Command.Timeout`, which bounds the run and ends the stream at the deadline.
+
+**One terminal consumption per `RunningProcess`.** The streaming verbs compose in one chain
+(`WaitForLine` → `StdoutLines` → `Finish`); `OutputString` / `OutputBytes` / `Wait` are each a
+standalone terminal. Mixing terminals on one handle — for example calling `OutputString` *and*
+enumerating `StdoutLines` — double-pumps the same pipe. This is a usage constraint, not yet
+guarded; pick one consumption model per handle.
+
+**Blocking waits under heavy concurrency.** Internally, waiting on a running child blocks a
+thread-pool thread per process. A very large `WaitAll`, a busy `Supervisor`, or a wide
+`Exec.outputAll` fan-out therefore pressures the thread pool. This is an internal characteristic
+only — the `Task`-based public API does not change when the waits move to overlapped/registered
+I/O — but bound your concurrency accordingly (`Exec.outputAll` already takes a concurrency cap).
+
+---
+
+Next: [Process groups](process-groups.md) · [Running commands](commands.md) · [Streaming & interactive I/O](streaming.md) · [docs index](README.md)
