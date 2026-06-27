@@ -52,10 +52,10 @@ task {
 ```csharp
 var cmd = new Command("git").Args(["rev-parse", "HEAD"]);
 
-Console.WriteLine(await cmd.Run() switch
+Console.WriteLine((await cmd.Run()).AsRun() switch
 {
-    (true, var sha, _)  => $"HEAD is {sha}",
-    (false, _, var err) => $"git failed: {err.Message}",
+    { IsOk: true, Value: var sha }  => $"HEAD is {sha}",
+    { IsOk: false, Error: var err } => $"git failed: {err.Message}",
 });
 ```
 
@@ -107,7 +107,7 @@ match! (Command.create "mkdir" |> Command.arg "out").RunUnit() with
 **C#**
 
 ```csharp
-if (await new Command("mkdir").Arg("out").RunUnit() is (false, _, var err))
+if ((await new Command("mkdir").Arg("out").RunUnit()).AsRun() is { IsOk: false, Error: var err })
     Console.Error.WriteLine(err.Message);
 ```
 
@@ -129,13 +129,13 @@ match! (Command.create "ls" |> Command.arg "-la").OutputString() with
 **C#**
 
 ```csharp
-switch (await new Command("ls").Arg("-la").OutputString())
+switch ((await new Command("ls").Arg("-la").OutputString()).AsRun())
 {
-    case (true, var result, _):
+    case { IsOk: true, Value: var result }:
         Console.WriteLine($"exit={result.Code} success={result.IsSuccess} in {result.Duration}");
         Console.WriteLine(result.Stdout);
         break;
-    case (false, _, var err):
+    case { IsOk: false, Error: var err }:
         Console.Error.WriteLine(err.Message);
         break;
 }
@@ -162,12 +162,12 @@ match! (Command.create "definitely-not-a-program").OutputString() with
 **C#**
 
 ```csharp
-Console.WriteLine(await new Command("definitely-not-a-program").OutputString() switch
+Console.WriteLine((await new Command("definitely-not-a-program").OutputString()).AsRun() switch
 {
-    (true, var result, _)                => result.Stdout,
-    (false, _, ProcessError.NotFound n)  => $"not installed: {n.program}",
-    (false, _, ProcessError.Timeout t)   => $"{t.program} timed out after {t.timeout}",
-    (false, _, var err)                  => err.Message,
+    { IsOk: true, Value: var result }                => result.Stdout,
+    { IsOk: false, Error: ProcessError.NotFound n }  => $"not installed: {n.program}",
+    { IsOk: false, Error: ProcessError.Timeout t }   => $"{t.program} timed out after {t.timeout}",
+    { IsOk: false, Error: var err }                  => err.Message,
 });
 ```
 
@@ -186,17 +186,17 @@ match! cmd.Run() with
 **C#**
 
 ```csharp
-switch (await cmd.Run())
+switch ((await cmd.Run()).AsRun())
 {
-    case (true, _, _):
+    case { IsOk: true }:
         break;
-    case (false, _, { IsNotFound: true }):
+    case { IsOk: false, Error: { IsNotFound: true } }:
         installThenRetry();
         break;
-    case (false, _, { IsTransient: true }):
+    case { IsOk: false, Error: { IsTransient: true } }:
         scheduleRetry();   // spawn / I/O blips
         break;
-    case (false, _, var err):
+    case { IsOk: false, Error: var err }:
         fail(err);
         break;
 }
@@ -248,10 +248,10 @@ var grep = new Command("grep")
     .Args(["ERROR", "app.log"])
     .OkCodes([0, 1]);   // 1 ("no match") is not a failure
 
-Console.WriteLine(await grep.Run() switch
+Console.WriteLine((await grep.Run()).AsRun() switch
 {
-    (true, var output, _) => $"matches:\n{output}",
-    (false, _, var err)   => err.Message,   // a real failure (e.g. exit 2)
+    { IsOk: true, Value: var output } => $"matches:\n{output}",
+    { IsOk: false, Error: var err }   => err.Message,   // a real failure (e.g. exit 2)
 });
 ```
 
@@ -328,10 +328,10 @@ var pipeline = new Command("cat").Arg("access.log")
     .Pipe(new Command("grep").Arg("ERROR"))
     .Pipe(new Command("wc").Arg("-l"));
 
-Console.WriteLine(await pipeline.Run() switch
+Console.WriteLine((await pipeline.Run()).AsRun() switch
 {
-    (true, var count, _) => $"{count} error lines",
-    (false, _, var err)  => err.Message,
+    { IsOk: true, Value: var count } => $"{count} error lines",
+    { IsOk: false, Error: var err }  => err.Message,
 });
 ```
 
@@ -427,10 +427,10 @@ match! (Command.create "myserver").Start() with
 await using var proc = (await new Command("myserver").Start()).GetValueOrThrow();
 
 // Wait up to 10s for a log line, a TCP port, or a custom predicate.
-Console.WriteLine(await proc.WaitForLine(l => l.Contains("ready"), TimeSpan.FromSeconds(10)) switch
+Console.WriteLine((await proc.WaitForLine(l => l.Contains("ready"), TimeSpan.FromSeconds(10))).AsRun() switch
 {
-    (true, _, _)        => "server is up",
-    (false, _, var err) => $"never became ready: {err.Message}",   // ProcessError.NotReady on timeout
+    { IsOk: true }        => "server is up",
+    { IsOk: false, Error: var err } => $"never became ready: {err.Message}",   // ProcessError.NotReady on timeout
 });
 ```
 
@@ -496,7 +496,7 @@ await group.Start(new Command("build-everything"));
 group.Signal(Signal.Term);     // signal the whole tree
 group.Suspend();               // freeze it
 group.Resume();                // thaw it
-if (group.Members() is (true, var pids, _))
+if (group.Members().AsRun() is { IsOk: true, Value: var pids })
     Console.WriteLine($"{pids.Count} processes in the tree");
 await group.Shutdown(TimeSpan.FromSeconds(5));   // graceful: SIGTERM -> grace -> SIGKILL
 ```
@@ -536,7 +536,7 @@ var options = new ProcessGroupOptions()
     .WithCpuQuota(1.5);                     // 1.5 cores
 
 var created = ProcessGroup.Create(options);
-if (created is (false, _, var err))
+if (created.AsRun() is { IsOk: false, Error: var err })
 {
     Console.Error.WriteLine($"limits unavailable: {err.Message}");
     return;
@@ -562,7 +562,7 @@ let series = group.SampleStats(TimeSpan.FromSeconds 1.0)
 **C#**
 
 ```csharp
-if (group.Stats() is (true, var stats, _))
+if (group.Stats().AsRun() is { IsOk: true, Value: var stats })
     Console.WriteLine($"active={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}");
 
 // A periodic series (IAsyncEnumerable) for live dashboards:
@@ -625,10 +625,10 @@ var outcome = new Supervisor(new Command("worker"))
     .StormPause(TimeSpan.FromMinutes(5))          // pause after a burst of failures
     .Run();
 
-Console.WriteLine(await outcome switch
+Console.WriteLine((await outcome).AsRun() switch
 {
-    (true, var result, _) => $"stopped: {result.Stopped} after {result.Restarts} restarts",
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var result } => $"stopped: {result.Stopped} after {result.Restarts} restarts",
+    { IsOk: false, Error: var err }   => err.Message,
 });
 ```
 
@@ -805,11 +805,11 @@ var recorder = RecordReplayRunner.Record("fixture.json", new JobRunner());
 recorder.Save();
 
 // Replay later with no subprocess (an unmatched call is ProcessError.CassetteMiss):
-var (ok, replay, err) = RecordReplayRunner.Replay("fixture.json");
-if (ok)
+var loaded = RecordReplayRunner.Replay("fixture.json").AsRun();
+if (loaded.IsOk)
 {
-    // use `replay` as an IProcessRunner
+    var replay = loaded.Value; // use `replay` as an IProcessRunner
 }
 else
-    Console.Error.WriteLine(err.Message);
+    Console.Error.WriteLine(loaded.Error.Message);
 ```

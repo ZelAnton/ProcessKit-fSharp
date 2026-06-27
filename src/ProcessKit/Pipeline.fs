@@ -18,6 +18,13 @@ open System.Threading.Tasks
 /// status follows shell **pipefail**: the rightmost stage that did not exit with an accepted code
 /// (its `Command.OkCodes`, `{0}` by default) determines the result, unless that stage opted out with
 /// `Command.UncheckedInPipe`.
+///
+/// Per-stage I/O config that applies inside a pipeline: each stage's `OkCodes` (pipefail), the last
+/// stage's `StdoutEncoding` and `StdoutTee` (the captured stdout), and the chain-level `Timeout` /
+/// `CancelOn`. Per-stage *stdout/stderr observation* hooks are **not** applied — intermediate stages'
+/// `StdoutTee`, and every stage's `StderrTee`, `OnStdoutLine`/`OnStderrLine`, and `OutputBuffer`
+/// policy — because the chain wires stdout into the next stage's stdin and captures only the final
+/// stage's output. Observe an individual command by running it on its own, not as a pipeline stage.
 [<Sealed>]
 type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancelOn: CancellationToken option) =
 
@@ -74,11 +81,14 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         Pipeline(commands, timeout, Some cancellationToken)
 
     // Run the chain, honouring the pipeline-level `cancelOn` on top of the verb's token.
-    member private _.Execute
-        (lastTee: Stream option)
-        (cancellationToken: CancellationToken)
-        : Task<Result<PipelineCapture, ProcessError>> =
+    member private _.Execute(cancellationToken: CancellationToken) : Task<Result<PipelineCapture, ProcessError>> =
         task {
+            // A pipeline captures only the *last* stage's stdout, so the last command's `StdoutTee` is
+            // applied to that captured stream — matching a single command's `StdoutTee`. (Per-stage line
+            // handlers / stderr tees / output-buffer caps are not applied within a pipeline; see the
+            // type doc.)
+            let lastTee = (List.last commands).Config.StdoutTee
+
             match cancelOn with
             | Some extra ->
                 use linked =
@@ -92,7 +102,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     /// pipefail exit is data here, not an error.
     member this.OutputBytes(cancellationToken: CancellationToken) : Task<Result<ProcessResult<byte[]>, ProcessError>> =
         task {
-            match! this.Execute None cancellationToken with
+            match! this.Execute cancellationToken with
             | Error error -> return Error error
             | Ok capture ->
                 let stage = representative capture
@@ -115,7 +125,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     /// last stage's stdout encoding). A non-zero pipefail exit is data here, not an error.
     member this.OutputString(cancellationToken: CancellationToken) : Task<Result<ProcessResult<string>, ProcessError>> =
         task {
-            match! this.Execute None cancellationToken with
+            match! this.Execute cancellationToken with
             | Error error -> return Error error
             | Ok capture ->
                 let stage = representative capture

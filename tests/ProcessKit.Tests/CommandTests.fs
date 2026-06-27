@@ -117,11 +117,19 @@ type CommandTests() =
         Assert.That(seen, Is.EqualTo "err:cancelled")
 
     [<Test>]
-    member _.``Result.Deconstruct splits Ok and Error``() =
-        match ResultExtensions.Deconstruct(Ok 5: Result<int, ProcessError>) with
-        | true, v, _ -> Assert.That(v, Is.EqualTo 5)
-        | _ -> Assert.Fail "expected Ok"
+    member _.``AsRun exposes IsOk / Value / Error and throws reading the wrong case``() =
+        let ok = ResultExtensions.AsRun(Ok 5: Result<int, ProcessError>)
+        Assert.That(ok.IsOk, Is.True)
+        Assert.That(ok.Value, Is.EqualTo 5)
 
-        match ResultExtensions.Deconstruct(Error(ProcessError.Cancelled "x"): Result<int, ProcessError>) with
-        | false, _, e -> Assert.That(e.IsCancelled, Is.True)
-        | _ -> Assert.Fail "expected Error"
+        Assert.Throws<System.InvalidOperationException>(System.Action(fun () -> ok.Error |> ignore))
+        |> ignore
+
+        let err =
+            ResultExtensions.AsRun(Error(ProcessError.Cancelled "x"): Result<int, ProcessError>)
+
+        Assert.That(err.IsOk, Is.False)
+        Assert.That(err.Error.IsCancelled, Is.True)
+
+        Assert.Throws<System.InvalidOperationException>(System.Action(fun () -> err.Value |> ignore))
+        |> ignore

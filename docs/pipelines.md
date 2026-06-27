@@ -59,10 +59,10 @@ var pipeline = new Command("git").Args(["log", "--format=%an"])
     .Pipe(new Command("sort"))
     .Pipe(new Command("uniq").Arg("-c"));
 
-Console.WriteLine(await pipeline.Run() switch
+Console.WriteLine((await pipeline.Run()).AsRun() switch
 {
-    (true, var authors, _) => authors,
-    (false, _, var err)    => err.Message,
+    { IsOk: true, Value: var authors } => authors,
+    { IsOk: false, Error: var err }    => err.Message,
 });
 ```
 
@@ -93,10 +93,10 @@ var pipeline = new Command("git").Args(["log", "--format=%an"])
     .Pipe(new Command("sort"))
     .Pipe(new Command("uniq").Arg("-c"));
 
-Console.WriteLine(await pipeline.OutputString() switch
+Console.WriteLine((await pipeline.OutputString()).AsRun() switch
 {
-    (true, var result, _) => result.Stdout,
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var result } => result.Stdout,
+    { IsOk: false, Error: var err }   => err.Message,
 });
 ```
 
@@ -175,11 +175,11 @@ var pipeline = new Command("cat").Arg("data.txt")
     .Pipe(new Command("grep").Arg("ERROR")) // suppose grep exits 2 (bad regex)
     .Pipe(new Command("wc").Arg("-l"));
 
-Console.WriteLine(await pipeline.OutputString() switch
+Console.WriteLine((await pipeline.OutputString()).AsRun() switch
 {
     // Blame points at grep — the rightmost unclean stage — while Stdout is whatever wc managed.
-    (true, var result, _) => $"code={result.Code} program={result.Program} success={result.IsSuccess}", // code=Some 2  program=grep  success=false
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var result } => $"code={result.Code} program={result.Program} success={result.IsSuccess}", // code=Some 2  program=grep  success=false
+    { IsOk: false, Error: var err }   => err.Message,
 });
 ```
 
@@ -200,11 +200,11 @@ match! pipeline.Run() with
 **C#**
 
 ```csharp
-Console.WriteLine(await pipeline.Run() switch
+Console.WriteLine((await pipeline.Run()).AsRun() switch
 {
-    (true, var output, _) => output,
-    (false, _, ProcessError.Exit { program: var p, code: var c, stderr: var s }) => $"{p} exited {c}: {s}", // program = "grep", code = 2
-    (false, _, var err) => err.Message,
+    { IsOk: true, Value: var output } => output,
+    { IsOk: false, Error: ProcessError.Exit { program: var p, code: var c, stderr: var s } } => $"{p} exited {c}: {s}", // program = "grep", code = 2
+    { IsOk: false, Error: var err } => err.Message,
 });
 ```
 
@@ -242,10 +242,10 @@ var uniqueCount = new Command("sort").Stdin(Stdin.FromString("b\na\nb\nc\n"))
     .Pipe(new Command("uniq"))
     .Pipe(new Command("wc").Arg("-l"));
 
-Console.WriteLine(await uniqueCount.Run() switch
+Console.WriteLine((await uniqueCount.Run()).AsRun() switch
 {
-    (true, var n, _)    => n, // "3"
-    (false, _, var err) => err.Message,
+    { IsOk: true, Value: var n }    => n, // "3"
+    { IsOk: false, Error: var err } => err.Message,
 });
 ```
 
@@ -281,10 +281,10 @@ task {
 var first = new Command("seq").Args(["1", "1000000"]).UncheckedInPipe()
     .Pipe(new Command("head").Args(["-n", "1"]));
 
-Console.WriteLine(await first.Run() switch
+Console.WriteLine((await first.Run()).AsRun() switch
 {
-    (true, var line, _) => line, // "1"
-    (false, _, var err) => err.Message,
+    { IsOk: true, Value: var line } => line, // "1"
+    { IsOk: false, Error: var err } => err.Message,
 });
 ```
 
@@ -329,10 +329,10 @@ var pipeline = new Command("producer").Timeout(TimeSpan.FromSeconds(10)) // per-
     .Pipe(new Command("consumer"))
     .Timeout(TimeSpan.FromSeconds(30));                                  // whole-CHAIN
 
-Console.WriteLine(await pipeline.OutputString() switch
+Console.WriteLine((await pipeline.OutputString()).AsRun() switch
 {
-    (true, var result, _) => $"timedOut={result.IsTimedOut}",
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var result } => $"timedOut={result.IsTimedOut}",
+    { IsOk: false, Error: var err }   => err.Message,
 });
 ```
 

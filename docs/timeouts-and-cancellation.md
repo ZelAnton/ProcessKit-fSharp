@@ -56,12 +56,12 @@ task {
 var cmd = new Command("slow-tool")
     .Timeout(TimeSpan.FromSeconds(5));
 
-Console.WriteLine(await cmd.OutputString() switch
+Console.WriteLine((await cmd.OutputString()).AsRun() switch
 {
     // Code is None on a timeout; the partial output captured before the kill is kept.
-    (true, { IsTimedOut: true } result, _) => $"timed out; partial stdout before the kill: {result.Stdout}",
-    (true, var result, _)                  => $"exited {result.Code}: {result.Stdout}",
-    (false, _, var err)                    => err.Message,
+    { IsOk: true, Value: { IsTimedOut: true } result } => $"timed out; partial stdout before the kill: {result.Stdout}",
+    { IsOk: true, Value: var result }                  => $"exited {result.Code}: {result.Stdout}",
+    { IsOk: false, Error: var err }                    => err.Message,
 });
 ```
 
@@ -90,11 +90,11 @@ task {
 var cmd = new Command("slow-tool")
     .Timeout(TimeSpan.FromSeconds(5));
 
-Console.WriteLine(await cmd.Run() switch
+Console.WriteLine((await cmd.Run()).AsRun() switch
 {
-    (true, var stdout, _) => stdout,
-    (false, _, ProcessError.Timeout { program: var p, timeout: var t }) => $"{p} exceeded {t}",
-    (false, _, var err) => err.Message,
+    { IsOk: true, Value: var stdout } => stdout,
+    { IsOk: false, Error: ProcessError.Timeout { program: var p, timeout: var t } } => $"{p} exceeded {t}",
+    { IsOk: false, Error: var err } => err.Message,
 });
 ```
 
@@ -209,9 +209,9 @@ await foreach (var line in proc.StdoutLines())
     Console.WriteLine($"> {line}"); // the stream ends when the deadline kills the tree
 
 var finished = await proc.Finish();
-if (finished is (true, { Outcome.IsTimedOut: true }, _))
+if (finished.AsRun() is { IsOk: true, Value: { Outcome.IsTimedOut: true } })
     Console.Error.WriteLine("killed at the deadline");
-else if (finished is (false, _, var err))
+else if (finished.AsRun() is { IsOk: false, Error: var err })
     Console.Error.WriteLine(err.Message);
 ```
 
@@ -265,10 +265,10 @@ var cmd = new Command("curl")
             || err.IsTimeout
             || err is ProcessError.Exit { code: 7 });
 
-Console.WriteLine(await cmd.Run() switch
+Console.WriteLine((await cmd.Run()).AsRun() switch
 {
-    (true, var body, _) => body,
-    (false, _, var err) => $"gave up: {err.Message}",
+    { IsOk: true, Value: var body } => body,
+    { IsOk: false, Error: var err } => $"gave up: {err.Message}",
 });
 ```
 
@@ -347,7 +347,7 @@ var job = new Command("long-export").Run(cts.Token);
 // elsewhere — a shutdown signal, a sibling failure, a UI button:
 cts.Cancel();
 
-if (await job is (false, _, ProcessError.Cancelled { program: var p }))
+if ((await job).AsRun() is { IsOk: false, Error: ProcessError.Cancelled { program: var p } })
     Console.WriteLine($"{p} cancelled");
 ```
 
@@ -412,10 +412,10 @@ var pipeline = new Command("producer")
     .Timeout(TimeSpan.FromSeconds(30))   // whole-chain deadline (mirror: Pipeline.timeout)
     .CancelOn(shutdownToken);            // whole-chain token   (mirror: Pipeline.cancelOn)
 
-Console.WriteLine(await pipeline.OutputString() switch
+Console.WriteLine((await pipeline.OutputString()).AsRun() switch
 {
-    (true, var result, _) => $"timedOut={result.IsTimedOut}",
-    (false, _, var err)   => err.Message, // ProcessError.Cancelled when the token fires
+    { IsOk: true, Value: var result } => $"timedOut={result.IsTimedOut}",
+    { IsOk: false, Error: var err }   => err.Message, // ProcessError.Cancelled when the token fires
 });
 ```
 

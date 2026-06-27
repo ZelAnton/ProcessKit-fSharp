@@ -110,7 +110,16 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             | Error error -> Error error
             | Ok spawned ->
                 backend.Track spawned
-                Ok spawned
+                // Re-check after tracking: if the group was released concurrently between the guard
+                // above and `Track`, `HardRelease`'s kill/reap snapshot may have missed this child (it
+                // would then run uncontained on the POSIX/cgroup backends). The release flag is set
+                // before that snapshot runs, so observing it set here means the child may have escaped —
+                // reap it ourselves rather than leak it, preserving the kill-on-drop guarantee.
+                if releasedFlag <> 0 then
+                    backend.ReapEscapee spawned
+                    Error(ProcessError.Unsupported "the process group has been released")
+                else
+                    Ok spawned
 
     /// Spawn `command` into the group and build a `RunningHost`. `ownsGroup` decides what disposing
     /// the resulting `RunningProcess` does: when **true** (a private per-run group) it reaps this

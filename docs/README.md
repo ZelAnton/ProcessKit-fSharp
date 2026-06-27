@@ -85,17 +85,17 @@ task {
 
 ```csharp
 // One-shot: capture everything. A non-zero exit is data, not an Error.
-Console.WriteLine(await new Command("git").Args(["rev-parse", "HEAD"]).OutputString() switch
+Console.WriteLine((await new Command("git").Args(["rev-parse", "HEAD"]).OutputString()).AsRun() switch
 {
-    (true, var head, _) => $"HEAD = {head.Stdout.Trim()}",
-    (false, _, var err) => err.Message,
+    { IsOk: true, Value: var head } => $"HEAD = {head.Stdout.Trim()}",
+    { IsOk: false, Error: var err } => err.Message,
 });
 
 // Success-checking: a non-zero exit / timeout / signal-kill becomes a typed error.
-Console.WriteLine(await new Command("dotnet").Arg("--version").Run() switch
+Console.WriteLine((await new Command("dotnet").Arg("--version").Run()).AsRun() switch
 {
-    (true, var version, _) => version,
-    (false, _, var err)    => err.Message,
+    { IsOk: true, Value: var version } => version,
+    { IsOk: false, Error: var err }    => err.Message,
 });
 
 // Stdin + timeout (streaming, pipelines, supervision … see the guides).

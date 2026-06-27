@@ -400,27 +400,27 @@ task {
 await using var proc = (await new Command("my-server").Start()).GetValueOrThrow();
 
 // 1. A line on stdout (returns the matching line):
-Console.WriteLine(await proc.WaitForLine(line => line.Contains("listening on"), TimeSpan.FromSeconds(10)) switch
+Console.WriteLine((await proc.WaitForLine(line => line.Contains("listening on"), TimeSpan.FromSeconds(10))).AsRun() switch
 {
-    (true, var banner, _)                => $"server says: {banner}",
-    (false, _, ProcessError.NotReady nr) => $"{nr.program} not ready after {nr.timeout}",
-    (false, _, var err)                  => err.Message,
+    { IsOk: true, Value: var banner }                => $"server says: {banner}",
+    { IsOk: false, Error: ProcessError.NotReady nr } => $"{nr.program} not ready after {nr.timeout}",
+    { IsOk: false, Error: var err }                  => err.Message,
 });
 
 // 2. A TCP port accepting connections:
 var endpoint = new IPEndPoint(IPAddress.Loopback, 8080);
 
-Console.WriteLine(await proc.WaitForPort(endpoint, TimeSpan.FromSeconds(10)) switch
+Console.WriteLine((await proc.WaitForPort(endpoint, TimeSpan.FromSeconds(10))).AsRun() switch
 {
-    (true, _, _)        => "port is open",
-    (false, _, var err) => err.Message,
+    { IsOk: true }        => "port is open",
+    { IsOk: false, Error: var err } => err.Message,
 });
 
 // 3. Any async predicate (an HTTP /health endpoint, a file appearing, …):
-Console.WriteLine(await proc.WaitFor(() => healthCheck(), TimeSpan.FromSeconds(10)) switch
+Console.WriteLine((await proc.WaitFor(() => healthCheck(), TimeSpan.FromSeconds(10))).AsRun() switch
 {
-    (true, _, _)        => "healthy",
-    (false, _, var err) => err.Message,
+    { IsOk: true }        => "healthy",
+    { IsOk: false, Error: var err } => err.Message,
 });
 ```
 
@@ -481,10 +481,10 @@ Command withDeadline(string name) =>
 await using var a = (await withDeadline("replica-a").Start()).GetValueOrThrow();
 await using var b = (await withDeadline("replica-b").Start()).GetValueOrThrow();
 
-Console.WriteLine(await RunningProcess.WaitAny([a, b]) switch
+Console.WriteLine((await RunningProcess.WaitAny([a, b])).AsRun() switch
 {
-    (true, var first, _) => $"contender #{first.Index} exited first with {first.Outcome}",
-    (false, _, var err)  => err.Message,
+    { IsOk: true, Value: var first } => $"contender #{first.Index} exited first with {first.Outcome}",
+    { IsOk: false, Error: var err }  => err.Message,
 });
 ```
 

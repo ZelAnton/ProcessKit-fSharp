@@ -50,6 +50,12 @@ type internal IContainmentBackend =
     /// Hard-kill a single contained child (not the whole tree).
     abstract KillChild: Native.Spawned -> unit
 
+    /// Kill and reap a child that escaped the teardown snapshot — one tracked in the race window after
+    /// `HardRelease` began — so a spawn racing `Dispose` can never leave it running uncontained or as a
+    /// zombie. Backend-specific: the Windows Job already kills it on close, the POSIX backends must
+    /// killpg the subtree and reap the leader.
+    abstract ReapEscapee: Native.Spawned -> unit
+
     /// Hard-kill the whole contained tree now (no grace) without releasing the container.
     abstract KillTree: unit -> unit
 
@@ -103,6 +109,15 @@ type internal JobObjectBackend(jobHandle: nativeint) =
 
         member _.KillChild(spawned) =
             Native.terminateWindowsProcess spawned.Handle
+
+        member _.ReapEscapee(spawned) =
+            // The child was assigned to the Job at spawn, so KILL_ON_JOB_CLOSE kills it when HardRelease
+            // closes the job handle — no TerminateProcess here (a concurrent HardRelease may already have
+            // closed this handle value). Just drop our wait-handle if still tracked, so it is not leaked.
+            let wasTracked = lock childLock (fun () -> processHandles.Remove spawned.Handle)
+
+            if wasTracked then
+                Native.closeWindowsHandle spawned.Handle
 
         member _.KillTree() = Native.terminateWindowsJob jobHandle
 
@@ -172,6 +187,15 @@ type internal CgroupBackend(cgroupPath: string) =
         member _.Wait(handle) = Native.waitPosix handle
         member _.PidOf(spawned) = Some(int spawned.Handle)
         member _.KillChild(spawned) = Native.killProcess (int spawned.Handle)
+
+        member _.ReapEscapee(spawned) =
+            let pid = int spawned.Handle
+            lock childLock (fun () -> childPids.Remove pid |> ignore)
+            // Mirror HardRelease's per-child cleanup: the child is its own pgid leader, so killpg covers
+            // any subtree it spawned (whether or not it migrated into the cgroup), then reap the leader.
+            Native.killProcessGroup pid
+            Native.reapLeader pid
+
         member _.KillTree() = Native.killCgroup cgroupPath
 
         member _.GracefulKillTree(grace) =
@@ -247,6 +271,14 @@ type internal ProcessGroupBackend() =
 
         member _.KillChild(spawned) =
             Native.killProcessGroup (int spawned.Handle)
+
+        member _.ReapEscapee(spawned) =
+            let pgid = int spawned.Handle
+            lock childLock (fun () -> childPgids.Remove pgid |> ignore)
+            // killpg the leader's group, then reap the leader we posix_spawned (killpg does not waitpid
+            // our own child), matching HardRelease's per-pgid cleanup.
+            Native.killProcessGroup pgid
+            Native.reapLeader pgid
 
         member _.KillTree() =
             for pgid in pgidSnapshot () do

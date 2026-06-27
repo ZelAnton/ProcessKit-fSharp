@@ -1,5 +1,6 @@
 namespace ProcessKit
 
+open System
 open System.Threading
 open System.Threading.Tasks
 
@@ -9,6 +10,8 @@ open System.Threading.Tasks
 /// dispatches to it.
 [<AbstractClass>]
 type DelegatingProcessRunner(inner: IProcessRunner) =
+
+    do ArgumentNullException.ThrowIfNull inner
 
     /// The wrapped runner.
     member _.Inner = inner

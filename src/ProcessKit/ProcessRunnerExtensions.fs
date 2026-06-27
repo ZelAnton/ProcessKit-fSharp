@@ -10,12 +10,13 @@ open System.Threading
 /// (`group.Run command`, `scripted.Probe command`), callable from F# and C#. The verb *logic* lives
 /// once in the `Runner` module; these are thin sugar over it.
 ///
-/// Retry contract: every terminal verb here (`Run`/`RunUnit`/`OutputString`/`OutputBytes`/`ExitCode`/
-/// `Probe`/`Parse`/`TryParse`) applies the command's `Retry` policy, exactly like the `Command`/
-/// `CliClient` verbs — because they all route through the `Runner` module. The raw
-/// `IProcessRunner.OutputString`/`OutputBytes`/`Start` interface methods (the ones taking a
-/// `CancellationToken`) are the single-run *seam* and never retry; retry is layered on top here.
-/// Streaming verbs (`Start`/`FirstLine`) never retry on any surface.
+/// Retry contract: the verbs here apply the command's `Retry` policy (they route through the `Runner`
+/// module), exactly like the `Command`/`CliClient` verbs. One asymmetry to know: `OutputString`/
+/// `OutputBytes` have no `CancellationToken` overload (it would be shadowed by the seam), so a call
+/// like `runner.OutputString(command, ct)` binds to the raw `IProcessRunner` seam method and does NOT
+/// retry — for capture with a token *and* retry, call `Runner.outputString runner ct command`. The
+/// raw `IProcessRunner.OutputString`/`OutputBytes`/`Start` seam never retries; streaming verbs
+/// (`Start`/`FirstLine`) never retry on any surface.
 [<Extension>]
 type ProcessRunnerExtensions =
 

@@ -27,10 +27,10 @@ task {
 **C#**
 
 ```csharp
-Console.WriteLine(await new Command("dotnet").Arg("--version").Run() switch
+Console.WriteLine((await new Command("dotnet").Arg("--version").Run()).AsRun() switch
 {
-    (true, var version, _) => version,
-    (false, _, var err)    => $"error: {err.Message}",
+    { IsOk: true, Value: var version } => version,
+    { IsOk: false, Error: var err }    => $"error: {err.Message}",
 });
 ```
 
@@ -92,9 +92,9 @@ every example below is shown in both. To keep them on the usage code, the snippe
 `using` directives: assume `open ProcessKit` (plus the relevant `System` opens) inside a `task { }`
 in F#, and `using ProcessKit;` (plus the implicit `System` usings) inside an `async` method in C#.
 Every verb returns `Task<Result<_, ProcessError>>`; from C# you pattern-match it —
-`result switch { (true, var value, _) => …, (false, _, var err) => … }`, `result.Match(onOk, onError)`,
-`if (result.TryGetValue(out var value, out var error))`, or `result.GetValueOrThrow()` (throws
-`ProcessException`).
+`result.AsRun() switch { { IsOk: true, Value: var value } => …, { IsOk: false, Error: var err } => … }`,
+`result.Match(onOk, onError)`, `if (result.TryGetValue(out var value, out var error))`, or
+`result.GetValueOrThrow()` (throws `ProcessException`).
 
 ## Picking a verb
 
@@ -153,24 +153,24 @@ task {
 
 ```csharp
 // Capture output; a non-zero exit does not error on its own.
-Console.WriteLine(await new Command("git").Args(["rev-parse", "HEAD"]).OutputString() switch
+Console.WriteLine((await new Command("git").Args(["rev-parse", "HEAD"]).OutputString()).AsRun() switch
 {
-    (true, var result, _) => $"HEAD is {result.Stdout.Trim()}",
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var result } => $"HEAD is {result.Stdout.Trim()}",
+    { IsOk: false, Error: var err }   => err.Message,
 });
 
 // Require success and get trimmed stdout directly.
-Console.WriteLine(await new Command("dotnet").Arg("--version").Run() switch
+Console.WriteLine((await new Command("dotnet").Arg("--version").Run()).AsRun() switch
 {
-    (true, var version, _) => version,
-    (false, _, var err)    => err.Message,
+    { IsOk: true, Value: var version } => version,
+    { IsOk: false, Error: var err }    => err.Message,
 });
 
 // Feed stdin.
-Console.WriteLine(await new Command("sort").Stdin(Stdin.FromString("banana\napple\n")).OutputString() switch
+Console.WriteLine((await new Command("sort").Stdin(Stdin.FromString("banana\napple\n")).OutputString()).AsRun() switch
 {
-    (true, var sorted, _) => sorted.Stdout,
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var sorted } => sorted.Stdout,
+    { IsOk: false, Error: var err }   => err.Message,
 });
 
 // Share one kill-on-dispose group across several children; disposing the group reaps the whole tree.
@@ -249,7 +249,7 @@ var options = new ProcessGroupOptions()
     .WithCpuQuota(0.5);                   // half of one core
 
 var created = ProcessGroup.Create(options);
-if (created is (false, _, var limitErr))
+if (created.AsRun() is { IsOk: false, Error: var limitErr })
 {
     Console.Error.WriteLine($"limits unavailable: {limitErr.Message}"); // ProcessError.ResourceLimit
     return;
@@ -344,13 +344,13 @@ using var group = ProcessGroup.Create().GetValueOrThrow();
 var a = (await group.Start(new Command("server-a"))).GetValueOrThrow();
 var b = (await group.Start(new Command("server-b"))).GetValueOrThrow();
 
-if (group.Members() is (true, var pids, _))
+if (group.Members().AsRun() is { IsOk: true, Value: var pids })
     Console.WriteLine($"live pids: {string.Join(", ", pids)}");
 
-Console.WriteLine(await RunningProcess.WaitAny([a, b]) switch
+Console.WriteLine((await RunningProcess.WaitAny([a, b])).AsRun() switch
 {
-    (true, var first, _) => $"contender #{first.Index} exited first with {first.Outcome}",
-    (false, _, var err)  => err.Message,
+    { IsOk: true, Value: var first } => $"contender #{first.Index} exited first with {first.Outcome}",
+    { IsOk: false, Error: var err }  => err.Message,
 });
 ```
 
@@ -392,7 +392,7 @@ var commands = Enumerable.Range(0, 200).Select(i => new Command("convert").Arg($
 var results = await Exec.outputAll(8, runner, commands, CancellationToken.None);
 
 // A failure is either an Error, or an Ok whose run was not successful.
-var failed = results.Count(r => r is (false, _, _) or (true, { IsSuccess: false }, _));
+var failed = results.Count(r => r.AsRun() is { IsOk: false } or { IsOk: true, Value: { IsSuccess: false } });
 Console.WriteLine($"{failed} conversions failed");
 ```
 
@@ -468,10 +468,10 @@ var supervisor = new Supervisor(new Command("my-server").Args(["--port", "8080"]
     .Backoff(TimeSpan.FromMilliseconds(200), 2.0) // base, multiplier (cap: MaxBackoff)
     .StormPause(TimeSpan.FromSeconds(15));         // crash-loop guard (off by default)
 
-Console.WriteLine(await supervisor.Run() switch
+Console.WriteLine((await supervisor.Run()).AsRun() switch
 {
-    (true, var outcome, _) => $"ended after {outcome.Restarts} restarts: {outcome.Stopped}",
-    (false, _, var err)    => err.Message,
+    { IsOk: true, Value: var outcome } => $"ended after {outcome.Restarts} restarts: {outcome.Stopped}",
+    { IsOk: false, Error: var err }    => err.Message,
 });
 ```
 
@@ -516,10 +516,10 @@ task {
 await using var proc = (await new Command("my-server").Start()).GetValueOrThrow();
 
 // Wait for the startup banner (returns the matching line)…
-Console.WriteLine(await proc.WaitForLine(l => l.Contains("listening on"), TimeSpan.FromSeconds(10)) switch
+Console.WriteLine((await proc.WaitForLine(l => l.Contains("listening on"), TimeSpan.FromSeconds(10))).AsRun() switch
 {
-    (true, var banner, _) => $"server says: {banner}",
-    (false, _, var err)   => $"never became ready: {err.Message}", // ProcessError.NotReady
+    { IsOk: true, Value: var banner } => $"server says: {banner}",
+    { IsOk: false, Error: var err }   => $"never became ready: {err.Message}", // ProcessError.NotReady
 });
 
 // …or for a TCP port to accept connections, or any async health check:
@@ -560,10 +560,10 @@ var pipeline = new Command("git").Args(["log", "--format=%an"])
     .Pipe(new Command("sort"))
     .Pipe(new Command("uniq").Arg("-c"));
 
-Console.WriteLine(await pipeline.OutputString() switch
+Console.WriteLine((await pipeline.OutputString()).AsRun() switch
 {
-    (true, var output, _) => output.Stdout,
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var output } => output.Stdout,
+    { IsOk: false, Error: var err }   => err.Message,
 });
 ```
 
@@ -650,7 +650,7 @@ var job = new Command("long-job").Run(cts.Token);
 // elsewhere — a shutdown signal, a sibling failure, a UI button:
 cts.Cancel();
 
-if (await job is (false, _, { IsCancelled: true }))
+if ((await job).AsRun() is { IsOk: false, Error: { IsCancelled: true } })
     Console.WriteLine("cancelled");
 ```
 
@@ -789,10 +789,10 @@ task {
 var git = new CliClient("git")
     .WithDefaults(c => c.CurrentDir("/repo").Timeout(TimeSpan.FromSeconds(30)));
 
-Console.WriteLine(await git.Run(["rev-parse", "HEAD"]) switch
+Console.WriteLine((await git.Run(["rev-parse", "HEAD"])).AsRun() switch
 {
-    (true, var sha, _)  => sha,
-    (false, _, var err) => err.Message,
+    { IsOk: true, Value: var sha }  => sha,
+    { IsOk: false, Error: var err } => err.Message,
 });
 ```
 
@@ -828,7 +828,7 @@ await recorder.Run(new Command("git").Arg("--version"), CancellationToken.None);
 recorder.Save();
 
 // Replay everywhere else — no subprocess, identical results:
-if (RecordReplayRunner.Replay("fixtures/git.json") is (true, var replay, _))
+if (RecordReplayRunner.Replay("fixtures/git.json").AsRun() is { IsOk: true, Value: var replay })
 {
     // use `replay` as an IProcessRunner
 }

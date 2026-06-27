@@ -42,7 +42,13 @@ module Exec =
                     do! gate.WaitAsync()
 
                     try
-                        return! capture runner command
+                        try
+                            return! capture runner command
+                        with ex ->
+                            // Keep the batch collect-all: a command whose run *throws* (e.g. a throwing
+                            // OnStdoutLine handler faults the capture) becomes this element's Error rather
+                            // than faulting Task.WhenAll and discarding every other command's result.
+                            return Error(ProcessError.Io ex.Message)
                     finally
                         gate.Release() |> ignore
                 }

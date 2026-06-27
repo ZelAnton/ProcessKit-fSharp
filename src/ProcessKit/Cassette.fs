@@ -317,23 +317,28 @@ type RecordReplayRunner private (mode: Mode, path: string) =
 
     member private this.Capture(command: Command, cancellationToken: CancellationToken) =
         task {
-            match stdinDigest command with
-            | Error error -> return Error error
-            | Ok digest ->
-                match mode with
-                | RecordMode(inner, recorded, dirty) ->
-                    match! inner.OutputString(command, cancellationToken) with
-                    | Error error -> return Error error
-                    | Ok result ->
-                        lock gate (fun () ->
-                            recorded.Add(entryOf command result digest)
-                            dirty.Value <- true)
+            if cancellationToken.IsCancellationRequested then
+                // Honour the cancelled-is-always-an-error contract on both modes: replay ignored the
+                // token entirely, and record should not capture a run the caller cancelled up front.
+                return Error(ProcessError.Cancelled command.Program)
+            else
+                match stdinDigest command with
+                | Error error -> return Error error
+                | Ok digest ->
+                    match mode with
+                    | RecordMode(inner, recorded, dirty) ->
+                        match! inner.OutputString(command, cancellationToken) with
+                        | Error error -> return Error error
+                        | Ok result ->
+                            lock gate (fun () ->
+                                recorded.Add(entryOf command result digest)
+                                dirty.Value <- true)
 
-                        return Ok result
-                | ReplayMode slots ->
-                    match lock gate (fun () -> play slots (keyOf command digest)) with
-                    | Some entry -> return Ok(resultText command entry)
-                    | None -> return Error(ProcessError.CassetteMiss command.Program)
+                            return Ok result
+                    | ReplayMode slots ->
+                        match lock gate (fun () -> play slots (keyOf command digest)) with
+                        | Some entry -> return Ok(resultText command entry)
+                        | None -> return Error(ProcessError.CassetteMiss command.Program)
         }
 
     interface IProcessRunner with

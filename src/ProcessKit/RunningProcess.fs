@@ -78,6 +78,11 @@ type RunningProcess internal (host: RunningHost) =
     let mutable exitStarted = false
     let mutable exitTaskValue = Unchecked.defaultof<Task<Outcome>>
 
+    // The event-streaming session's single combined outcome (waiting for exit + draining both pipes via
+    // the two pumps). ExitTask reuses it for an `EventStreaming` handle so it does not start a second,
+    // racing set of drains on the same streams.
+    let mutable eventOutcome = Unchecked.defaultof<Task<Outcome>>
+
     // Single-consumption guard: the output pipes are pumped exactly once. A buffered one-shot verb
     // (OutputString/OutputBytes/Wait/Profile) consumes them whole; the streaming verbs form one
     // session (`StdoutStreaming`: StdoutLines/WaitForLine/Finish share the stdout channel;
@@ -530,31 +535,67 @@ type RunningProcess internal (host: RunningHost) =
         elif not (claimStreaming Consumption.EventStreaming) then
             false
         else
+            // Each pump completes the shared event channel on its own fault (carrying the error), so an
+            // `OutputEvents` consumer observes a throwing handler promptly rather than hanging until the
+            // process exits — `eventOutcome` below only completes the channel after the exit wait, which
+            // for a long-running child can be far away. `TryComplete` because the two pumps and the
+            // combined task below all race to complete the one channel; re-raise so `eventOutcome` faults.
             let stdoutPump =
-                pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
-                    invokeLine config.OnStdoutLine line
-                    stdoutLineCount <- stdoutLineCount + 1
-                    eventChannel.Writer.TryWrite(OutputEvent.Stdout(OutputLine line)) |> ignore)
+                task {
+                    try
+                        do!
+                            pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
+                                invokeLine config.OnStdoutLine line
+                                stdoutLineCount <- stdoutLineCount + 1
+                                eventChannel.Writer.TryWrite(OutputEvent.Stdout(OutputLine line)) |> ignore)
+                    with ex ->
+                        eventChannel.Writer.TryComplete ex |> ignore
+                        ExceptionDispatchInfo.Throw ex
+                }
 
             let stderrPump =
-                pumpLines host.Stderr config.StderrEncoding config.StderrTee (fun line ->
-                    invokeLine config.OnStderrLine line
-                    stderrLineCount <- stderrLineCount + 1
-                    eventChannel.Writer.TryWrite(OutputEvent.Stderr(OutputLine line)) |> ignore)
+                task {
+                    try
+                        do!
+                            pumpLines host.Stderr config.StderrEncoding config.StderrTee (fun line ->
+                                invokeLine config.OnStderrLine line
+                                stderrLineCount <- stderrLineCount + 1
+                                eventChannel.Writer.TryWrite(OutputEvent.Stderr(OutputLine line)) |> ignore)
+                    with ex ->
+                        eventChannel.Writer.TryComplete ex |> ignore
+                        ExceptionDispatchInfo.Throw ex
+                }
 
-            task {
-                try
-                    let! _ = waitWithTimeout ()
-                    // Await both pumps together so neither is left unobserved if the other faults.
-                    do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
-                    eventChannel.Writer.Complete()
-                with ex ->
-                    // This combined pump is fire-and-forget, so a fault (e.g. a throwing handler) must
-                    // complete the channel WITH the error: an `OutputEvents` consumer then observes it
-                    // instead of hanging, and the fault is consumed here rather than surfacing as an
-                    // unobserved task exception at finalization.
-                    eventChannel.Writer.Complete ex
-            }
+            eventOutcome <-
+                task {
+                    let mutable error: exn option = None
+                    let mutable outcome = Unchecked.defaultof<Outcome>
+
+                    try
+                        let! settled = waitWithTimeout ()
+                        outcome <- settled
+                        // Await both pumps together so neither is left unobserved if the other faults.
+                        do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
+                        eventChannel.Writer.TryComplete() |> ignore
+                    with ex ->
+                        error <- Some ex
+                        // A fault (a throwing handler, or the exit wait itself) completes the channel WITH
+                        // the error so an `OutputEvents` consumer observes it instead of hanging — idempotent
+                        // with the per-pump completion above. The fault is otherwise consumed here (and by
+                        // the ContinueWith below) rather than surfacing as an unobserved task exception.
+                        eventChannel.Writer.TryComplete ex |> ignore
+
+                    // Surface the outcome, or re-raise the fault for a concurrent ExitTask (WaitAny/WaitAll
+                    // on this handle). The ContinueWith below observes that fault, so the OutputEvents-only
+                    // case never leaves an unobserved task exception.
+                    match error with
+                    | Some ex -> return! Task.FromException<Outcome> ex
+                    | None -> return outcome
+                }
+
+            // Observe any fault on this otherwise fire-and-forget task, so it is never an unobserved task
+            // exception at finalization when nothing awaits ExitTask (the OutputEvents-only case).
+            eventOutcome.ContinueWith(Action<Task<Outcome>>(fun t -> t.Exception |> ignore))
             |> ignore
 
             true
@@ -706,6 +747,10 @@ type RunningProcess internal (host: RunningHost) =
             exitTaskValue <-
                 if consumption = Consumption.StdoutStreaming then
                     streamOutcome
+                elif consumption = Consumption.EventStreaming then
+                    // The event pumps already drain both pipes; reuse their shared outcome rather than
+                    // starting our own drains here, which would race a second reader on the same streams.
+                    eventOutcome
                 else
                     // Claim the buffered slot so a terminal verb called after WaitAny/WaitAll on the
                     // same handle is refused rather than racing a second reader on these pipes.

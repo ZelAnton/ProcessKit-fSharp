@@ -184,10 +184,10 @@ public class GitTests
         var runner = new ScriptedRunner()
             .On(["git", "rev-parse", "HEAD"], Reply.Ok("abc123\n"));
 
-        switch (await Head(runner, CancellationToken.None))
+        switch ((await Head(runner, CancellationToken.None)).AsRun())
         {
-            case (true, var sha, _):  Assert.That(sha, Is.EqualTo("abc123")); break;
-            case (false, _, var err): Assert.Fail(err.Message); break;
+            case { IsOk: true, Value: var sha }:  Assert.That(sha, Is.EqualTo("abc123")); break;
+            case { IsOk: false, Error: var err }: Assert.Fail(err.Message); break;
         }
     }
 }
@@ -225,13 +225,13 @@ var runner = new ScriptedRunner().Fallback(Reply.Fail(2, "boom"));
 var grep = new Command("grep").Args(["needle", "file"]);
 
 // Success-requiring verb: the non-zero exit surfaces as an error.
-if (await runner.Run(grep) is (false, _, { IsExit: true })) { } // program="grep", code=2, stderr="boom"
+if ((await runner.Run(grep)).AsRun() is { IsOk: false, Error: { IsExit: true } }) { } // program="grep", code=2, stderr="boom"
 
 // Honest-result verb: the non-zero exit is data.
-switch (await runner.OutputString(grep))
+switch ((await runner.OutputString(grep)).AsRun())
 {
-    case (true, var output, _): Assert.That(output.IsSuccess, Is.False); break;
-    case (false, _, var err):   Assert.Fail(err.Message); break;
+    case { IsOk: true, Value: var output }: Assert.That(output.IsSuccess, Is.False); break;
+    case { IsOk: false, Error: var err }:   Assert.Fail(err.Message); break;
 }
 ```
 
@@ -347,13 +347,13 @@ recorder.Save(); // Result<unit, ProcessError> — surfaces write errors
 
 // Replay everywhere else — no subprocess, identical results:
 var replayResult = RecordReplayRunner.Replay("fixtures/git.json");
-if (replayResult is (true, var replay, _))
+if (replayResult.AsRun() is { IsOk: true, Value: var replay })
 {
     // the recorded stdout, replayed
-    if (await replay.Run(new Command("git").Arg("--version"), CancellationToken.None) is (false, _, var err))
+    if ((await replay.Run(new Command("git").Arg("--version"), CancellationToken.None)).AsRun() is { IsOk: false, Error: var err })
         Console.Error.WriteLine(err.Message);
 }
-else if (replayResult is (false, _, var loadErr))
+else if (replayResult.AsRun() is { IsOk: false, Error: var loadErr })
     Console.Error.WriteLine(loadErr.Message);
 ```
 
@@ -492,10 +492,10 @@ public class GitWrapperTests
 
         var git = new Git(new CliClient("git").WithRunner(scripted));
 
-        switch (await git.Head("/repo"))
+        switch ((await git.Head("/repo")).AsRun())
         {
-            case (true, var sha, _):  Assert.That(sha, Is.EqualTo("abc123")); break;
-            case (false, _, var err): Assert.Fail(err.Message); break;
+            case { IsOk: true, Value: var sha }:  Assert.That(sha, Is.EqualTo("abc123")); break;
+            case { IsOk: false, Error: var err }: Assert.Fail(err.Message); break;
         }
     }
 }

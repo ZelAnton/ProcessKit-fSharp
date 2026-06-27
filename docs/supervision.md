@@ -85,10 +85,10 @@ var supervisor = new Supervisor(new Command("my-server").Args(["--port", "8080"]
     .Jitter(true)                                 // default: on
     .StormPause(TimeSpan.FromSeconds(15));        // crash-loop guard (off by default)
 
-Console.WriteLine(await supervisor.Run() switch
+Console.WriteLine((await supervisor.Run()).AsRun() switch
 {
-    (true, var outcome, _) => $"ended after {outcome.Restarts} restarts: {outcome.Stopped}",
-    (false, _, var err)    => err.Message,
+    { IsOk: true, Value: var outcome } => $"ended after {outcome.Restarts} restarts: {outcome.Stopped}",
+    { IsOk: false, Error: var err }    => err.Message,
 });
 ```
 
@@ -193,10 +193,10 @@ var supervisor = new Supervisor(new Command("worker"))
     .FailureDecay(TimeSpan.FromSeconds(30)) // score half-life (default 30s)
     .FailureThreshold(5.0);                 // trip point (default 5.0)
 
-Console.WriteLine(await supervisor.Run() switch
+Console.WriteLine((await supervisor.Run()).AsRun() switch
 {
-    (true, var outcome, _) => $"storm pauses taken: {outcome.StormPauses}",
-    (false, _, var err)    => err.Message,
+    { IsOk: true, Value: var outcome } => $"storm pauses taken: {outcome.StormPauses}",
+    { IsOk: false, Error: var err }    => err.Message,
 });
 ```
 
@@ -289,11 +289,11 @@ var supervisor = new Supervisor(new Command("batch-worker"))
     .StopWhen(result => result.Code is { Value: 0 }) // …until one exits cleanly
     .MaxRestarts(50);                                // but give up after 50 restarts
 
-Console.WriteLine(await supervisor.Run() switch
+Console.WriteLine((await supervisor.Run()).AsRun() switch
 {
-    (true, { Stopped.IsPredicate: true }, _) => "worker finished cleanly",
-    (true, var outcome, _)                   => $"gave up: {outcome.Stopped}",
-    (false, _, var err)                      => err.Message,
+    { IsOk: true, Value: { Stopped.IsPredicate: true } } => "worker finished cleanly",
+    { IsOk: true, Value: var outcome }                   => $"gave up: {outcome.Stopped}",
+    { IsOk: false, Error: var err }                      => err.Message,
 });
 ```
 
@@ -338,17 +338,17 @@ task {
 
 ```csharp
 var outcome = await new Supervisor(new Command("job")).Run();
-if (outcome is (true, var o, _))
+if (outcome.AsRun() is { IsOk: true, Value: var o })
 {
     Console.WriteLine($"runs={o.Restarts + 1} reason={o.Stopped} pauses={o.StormPauses}");
 
-    Console.WriteLine(o.FinalResult.EnsureSuccess() switch
+    Console.WriteLine((o.FinalResult.EnsureSuccess()).AsRun() switch
     {
-        (true, var final, _) => $"last run ok: {final.Stdout}",
-        (false, _, var err)  => $"last run failed: {err.Message}",
+        { IsOk: true, Value: var final } => $"last run ok: {final.Stdout}",
+        { IsOk: false, Error: var err }  => $"last run failed: {err.Message}",
     });
 }
-else if (outcome is (false, _, var err))
+else if (outcome.AsRun() is { IsOk: false, Error: var err })
     Console.Error.WriteLine(err.Message);
 ```
 
@@ -385,7 +385,7 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created is (false, _, var createErr))
+if (created.AsRun() is { IsOk: false, Error: var createErr })
 {
     Console.Error.WriteLine(createErr.Message);
     return;
@@ -398,10 +398,10 @@ var supervisor = new Supervisor(new Command("worker"))
     .Restart(RestartPolicy.OnCrash)
     .MaxRestarts(10);
 
-Console.WriteLine(await supervisor.Run() switch
+Console.WriteLine((await supervisor.Run()).AsRun() switch
 {
-    (true, var outcome, _) => $"stopped: {outcome.Stopped}",
-    (false, _, var err)    => err.Message,
+    { IsOk: true, Value: var outcome } => $"stopped: {outcome.Stopped}",
+    { IsOk: false, Error: var err }    => err.Message,
 });
 ```
 
@@ -458,11 +458,11 @@ var supervisor = new Supervisor(new Command("worker"))
     .Restart(RestartPolicy.OnCrash)
     .Jitter(false);
 
-Console.WriteLine(await supervisor.Run() switch
+Console.WriteLine((await supervisor.Run()).AsRun() switch
 {
     // Restarts = 2, Stopped = PolicySatisfied (the clean third run ends OnCrash supervision).
-    (true, var outcome, _) => $"restarts={outcome.Restarts} reason={outcome.Stopped}",
-    (false, _, var err)    => err.Message,
+    { IsOk: true, Value: var outcome } => $"restarts={outcome.Restarts} reason={outcome.Stopped}",
+    { IsOk: false, Error: var err }    => err.Message,
 });
 ```
 
@@ -509,7 +509,7 @@ var supervised = new Supervisor(new Command("worker")).Run(cts.Token);
 // elsewhere — a shutdown signal, a sibling failure:
 cts.Cancel();
 
-if (await supervised is (false, _, { IsCancelled: true }))
+if ((await supervised).AsRun() is { IsOk: false, Error: { IsCancelled: true } })
     Console.WriteLine("supervision cancelled");
 ```
 

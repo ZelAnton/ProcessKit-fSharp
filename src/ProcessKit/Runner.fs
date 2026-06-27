@@ -56,10 +56,11 @@ module Runner =
                                 // guard `Timeouts` applies to `Command.Timeout`.
                                 do! Task.Delay(Timeouts.clampArmable delay, cancellationToken)
                             with :? System.OperationCanceledException ->
-                                // Cancelled mid-backoff: don't sleep out the rest of the delay before
-                                // observing the token; surface the last attempt's error (a cancelled
-                                // token would not have been retried anyway).
-                                final <- Some(Error error)
+                                // Cancelled mid-backoff: don't sleep out the rest of the delay. Report it
+                                // as `Cancelled` (not the prior attempt's error), consistent with every
+                                // other cancellation path, so a caller matching on `Cancelled` is not
+                                // misrouted into its generic-failure branch.
+                                final <- Some(Error(ProcessError.Cancelled command.Program))
                         else
                             final <- Some(Error error)
 

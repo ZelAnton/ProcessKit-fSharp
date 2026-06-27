@@ -50,7 +50,7 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created is (false, _, var err))
+if (created.AsRun() is { IsOk: false, Error: var err })
 {
     Console.Error.WriteLine($"could not create a group: {err.Message}");
     return;
@@ -82,7 +82,7 @@ match ProcessGroup.Create options with
 var options = new ProcessGroupOptions().WithShutdownTimeout(TimeSpan.FromSeconds(10));
 
 var created = ProcessGroup.Create(options);
-if (created is (false, _, var err))
+if (created.AsRun() is { IsOk: false, Error: var err })
 {
     Console.Error.WriteLine(err.Message);
     return;
@@ -166,7 +166,7 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created is (false, _, var err))
+if (created.AsRun() is { IsOk: false, Error: var err })
 {
     Console.Error.WriteLine(err.Message);
     return;
@@ -175,7 +175,7 @@ if (created is (false, _, var err))
 using var group = created.GetValueOrThrow();
 
 var started = await group.Start(new Command("dev-server"));
-if (started is (false, _, var startErr))
+if (started.AsRun() is { IsOk: false, Error: var startErr })
 {
     Console.Error.WriteLine(startErr.Message);
     return;
@@ -210,7 +210,7 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created is (false, _, var err))
+if (created.AsRun() is { IsOk: false, Error: var err })
 {
     Console.Error.WriteLine(err.Message);
     return;
@@ -218,10 +218,10 @@ if (created is (false, _, var err))
 
 using var group = created.GetValueOrThrow();
 
-Console.WriteLine(await Runner.outputString(group, CancellationToken.None, new Command("probe-tool")) switch
+Console.WriteLine((await Runner.outputString(group, CancellationToken.None, new Command("probe-tool"))).AsRun() switch
 {
-    (true, var result, _)  => $"exit={result.Code}: {result.Stdout}",
-    (false, _, var runErr) => runErr.Message,
+    { IsOk: true, Value: var result }  => $"exit={result.Code}: {result.Stdout}",
+    { IsOk: false, Error: var runErr } => runErr.Message,
 });
 // `Runner.outputBytes` is the binary companion; `Runner.start` mirrors `group.Start`.
 ```
@@ -266,7 +266,7 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created is (false, _, var err))
+if (created.AsRun() is { IsOk: false, Error: var err })
 {
     Console.Error.WriteLine(err.Message);
     return;
@@ -311,7 +311,7 @@ let reload (group: ProcessGroup) =
 ```csharp
 void reload(ProcessGroup group)
 {
-    if (group.Signal(Signal.Hup) is (false, _, var err)) // "reload your configuration"
+    if (group.Signal(Signal.Hup).AsRun() is { IsOk: false, Error: var err }) // "reload your configuration"
         Console.Error.WriteLine(err.Message);
 }
 ```
@@ -343,7 +343,7 @@ match group.Signal Signal.Hup with
 **C#**
 
 ```csharp
-if (group.Signal(Signal.Hup) is (false, _, var err))
+if (group.Signal(Signal.Hup).AsRun() is { IsOk: false, Error: var err })
     Console.Error.WriteLine(err switch
     {
         ProcessError.Unsupported { operation: var op } => $"not on this platform: {op}",
@@ -413,7 +413,7 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created is (false, _, var err))
+if (created.AsRun() is { IsOk: false, Error: var err })
 {
     Console.Error.WriteLine(err.Message);
     return;
@@ -423,10 +423,10 @@ using var group = created.GetValueOrThrow();
 await group.Start(new Command("worker-a"));
 await group.Start(new Command("worker-b"));
 
-Console.WriteLine(group.Members() switch
+Console.WriteLine((group.Members()).AsRun() switch
 {
-    (true, var pids, _)        => $"{pids.Count} live members: {string.Join(", ", pids)}",
-    (false, _, var membersErr) => membersErr.Message,
+    { IsOk: true, Value: var pids }        => $"{pids.Count} live members: {string.Join(", ", pids)}",
+    { IsOk: false, Error: var membersErr } => membersErr.Message,
 });
 ```
 
@@ -475,7 +475,7 @@ var options = new ProcessGroupOptions()
     .WithCpuQuota(0.5);                   // half of one core
 
 var created = ProcessGroup.Create(options);
-if (created is (false, _, var err))
+if (created.AsRun() is { IsOk: false, Error: var err })
 {
     Console.Error.WriteLine($"limits unavailable: {err.Message}"); // ProcessError.ResourceLimit
     return;
@@ -534,7 +534,7 @@ match ProcessGroup.Create options with
 
 ```csharp
 var created = ProcessGroup.Create(options);
-if (created is (false, _, var err))
+if (created.AsRun() is { IsOk: false, Error: var err })
 {
     Console.Error.WriteLine(err switch
     {
@@ -564,10 +564,10 @@ match group.Stats() with
 **C#**
 
 ```csharp
-Console.WriteLine(group.Stats() switch
+Console.WriteLine((group.Stats()).AsRun() switch
 {
-    (true, var stats, _) => $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}",
-    (false, _, var err)  => err.Message,
+    { IsOk: true, Value: var stats } => $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}",
+    { IsOk: false, Error: var err }  => err.Message,
 });
 ```
 

@@ -113,3 +113,19 @@ type RunnerTests() =
             Assert.That(calls, Is.EqualTo 1)
         }
         :> Task
+
+    [<Test>]
+    member _.``a pre-cancelled token makes the scripted runner report Cancelled``() : Task =
+        task {
+            use cts = new CancellationTokenSource()
+            cts.Cancel()
+
+            // "echo" is scripted to succeed; a cancelled token must still win, so the scripted seam is
+            // honest about cancellation (and the Cancelled path is testable through it) like a real run.
+            let! result = Command.create "echo" |> Runner.outputString runner cts.Token
+
+            match result with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+        }
+        :> Task

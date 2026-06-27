@@ -44,54 +44,65 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
             | None -> invalidOp $"ScriptedRunner: no scripted reply matched command '{command.Program}'."
 
     interface IProcessRunner with
-        member this.OutputString(command, _) =
-            let reply = this.Resolve command
+        member this.OutputString(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                // Honour the contract that a cancelled run is always an error, matching `JobRunner` /
+                // `ProcessGroup`, so the cancelled path is testable through the scripted seam too.
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                let reply = this.Resolve command
 
-            match reply.ErrorOverride with
-            | Some error -> Task.FromResult(Error error)
-            | None ->
-                // Route capture through the same in-memory FakeProcess as `Start`, so all three seam
-                // paths agree byte-for-byte with a real run: line-ending normalization, the command's
-                // encoding, OkCodes, and output-buffer truncation are applied identically.
-                FakeProcess
-                    .OfCommand(command)
-                    .WithStdout(reply.StdoutText)
-                    .WithStderr(reply.StderrText)
-                    .WithOutcome(reply.Outcome)
-                    .Build()
-                    .OutputString()
-
-        member this.Start(command, _) =
-            let reply = this.Resolve command
-
-            match reply.ErrorOverride with
-            | Some error -> Task.FromResult(Error error)
-            | None ->
-                // Serve a real in-memory RunningProcess so streaming/readiness consumers can be tested
-                // through the same scripting as the capture verbs. OfCommand carries the matched
-                // command's config (OkCodes/encodings/…) so both paths agree on success semantics.
-                let running =
+                match reply.ErrorOverride with
+                | Some error -> Task.FromResult(Error error)
+                | None ->
+                    // Route capture through the same in-memory FakeProcess as `Start`, so all three seam
+                    // paths agree byte-for-byte with a real run: line-ending normalization, the command's
+                    // encoding, OkCodes, and output-buffer truncation are applied identically.
                     FakeProcess
                         .OfCommand(command)
                         .WithStdout(reply.StdoutText)
                         .WithStderr(reply.StderrText)
                         .WithOutcome(reply.Outcome)
                         .Build()
+                        .OutputString()
 
-                Task.FromResult(Ok running)
+        member this.Start(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                let reply = this.Resolve command
 
-        member this.OutputBytes(command, _) =
-            let reply = this.Resolve command
+                match reply.ErrorOverride with
+                | Some error -> Task.FromResult(Error error)
+                | None ->
+                    // Serve a real in-memory RunningProcess so streaming/readiness consumers can be tested
+                    // through the same scripting as the capture verbs. OfCommand carries the matched
+                    // command's config (OkCodes/encodings/…) so both paths agree on success semantics.
+                    let running =
+                        FakeProcess
+                            .OfCommand(command)
+                            .WithStdout(reply.StdoutText)
+                            .WithStderr(reply.StderrText)
+                            .WithOutcome(reply.Outcome)
+                            .Build()
 
-            match reply.ErrorOverride with
-            | Some error -> Task.FromResult(Error error)
-            | None ->
-                // Same FakeProcess path as OutputString/Start, so the captured bytes honour the
-                // command's StdoutEncoding instead of a hardcoded UTF-8.
-                FakeProcess
-                    .OfCommand(command)
-                    .WithStdout(reply.StdoutText)
-                    .WithStderr(reply.StderrText)
-                    .WithOutcome(reply.Outcome)
-                    .Build()
-                    .OutputBytes()
+                    Task.FromResult(Ok running)
+
+        member this.OutputBytes(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                let reply = this.Resolve command
+
+                match reply.ErrorOverride with
+                | Some error -> Task.FromResult(Error error)
+                | None ->
+                    // Same FakeProcess path as OutputString/Start, so the captured bytes honour the
+                    // command's StdoutEncoding instead of a hardcoded UTF-8.
+                    FakeProcess
+                        .OfCommand(command)
+                        .WithStdout(reply.StdoutText)
+                        .WithStderr(reply.StderrText)
+                        .WithOutcome(reply.Outcome)
+                        .Build()
+                        .OutputBytes()

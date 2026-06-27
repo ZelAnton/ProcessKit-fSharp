@@ -55,10 +55,10 @@ var cmd =
         .Args(["--oneline", "-n", "10"]) // …or in bulk
         .CurrentDir("/path/to/repo"); // run there
 
-Console.WriteLine(await cmd.Run() switch
+Console.WriteLine((await cmd.Run()).AsRun() switch
 {
-    (true, var output, _) => output,
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var output } => output,
+    { IsOk: false, Error: var err }   => err.Message,
 });
 ```
 
@@ -195,10 +195,10 @@ var sorted =
     new Command("sort")
         .Stdin(Stdin.FromLines(["banana", "apple", "cherry"]));
 
-Console.WriteLine(await sorted.Run() switch
+Console.WriteLine((await sorted.Run()).AsRun() switch
 {
-    (true, var output, _) => output, // apple / banana / cherry
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var output } => output, // apple / banana / cherry
+    { IsOk: false, Error: var err }   => err.Message,
 });
 ```
 
@@ -258,10 +258,10 @@ var cmd =
         .Encoding(System.Text.Encoding.Latin1); // both streams…
 // .StdoutEncoding(enc) / .StderrEncoding(enc)  // …or each its own
 
-Console.WriteLine(await cmd.OutputString() switch
+Console.WriteLine((await cmd.OutputString()).AsRun() switch
 {
-    (true, var result, _) => result.Stdout,
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var result } => result.Stdout,
+    { IsOk: false, Error: var err }   => err.Message,
 });
 ```
 
@@ -379,10 +379,10 @@ var cmd =
         .Args(["build", "-c", "Release"])
         .OnStderrLine(line => Console.Error.WriteLine($"[build] {line}"));
 
-Console.WriteLine(await cmd.OutputString() switch
+Console.WriteLine((await cmd.OutputString()).AsRun() switch
 {
-    (true, var result, _) => $"build exited {result.Code}",
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var result } => $"build exited {result.Code}",
+    { IsOk: false, Error: var err }   => err.Message,
 });
 ```
 
@@ -446,10 +446,10 @@ var cmd =
         .Timeout(TimeSpan.FromSeconds(30)) // kill the tree at the deadline
         .Retry(3, TimeSpan.FromMilliseconds(200), err => err.IsTransient);
 
-Console.WriteLine(await cmd.Run() switch
+Console.WriteLine((await cmd.Run()).AsRun() switch
 {
-    (true, var output, _) => output,
-    (false, _, var err)   => err.Message,
+    { IsOk: true, Value: var output } => output,
+    { IsOk: false, Error: var err }   => err.Message,
 });
 ```
 
@@ -555,22 +555,22 @@ task {
 
 ```csharp
 // Probe: the exit code as a yes/no.
-Console.WriteLine(await new Command("git").Args(["diff", "--quiet"]).Probe() switch
+Console.WriteLine((await new Command("git").Args(["diff", "--quiet"]).Probe()).AsRun() switch
 {
-    (true, true, _)     => "working tree clean",
-    (true, false, _)    => "there are changes",
-    (false, _, var err) => err.Message,
+    { IsOk: true, Value: true }     => "working tree clean",
+    { IsOk: true, Value: false }    => "there are changes",
+    { IsOk: false, Error: var err } => err.Message,
 });
 
 // Parse: a typed value from stdout.
 var version = await new Command("node").Arg("--version").Parse(s => s.TrimStart('v'));
 
 // FirstLine: stop as soon as the interesting line appears.
-Console.WriteLine(await new Command("git").Args(["log", "--oneline"]).FirstLine(l => l.Contains("fix:")) switch
+Console.WriteLine((await new Command("git").Args(["log", "--oneline"]).FirstLine(l => l.Contains("fix:"))).AsRun() switch
 {
-    (true, { Value: var line }, _) => line,            // Some(line)
-    (true, _, _)                   => "no fix commit", // None
-    (false, _, var err)            => err.Message,
+    { IsOk: true, Value: { Value: var line } } => line,            // Some(line)
+    { IsOk: true }                   => "no fix commit", // None
+    { IsOk: false, Error: var err }            => err.Message,
 });
 ```
 
@@ -611,10 +611,10 @@ if ((await new Command("git").Args(["merge", "feature"]).OutputString()).TryGetV
     Console.WriteLine($"took {result.Duration}, truncated={result.Truncated}");
 
     // Opt into erroring whenever you're ready:
-    Console.WriteLine(result.EnsureSuccess() switch
+    Console.WriteLine((result.EnsureSuccess()).AsRun() switch
     {
-        (true, var ok, _)   => ok.Stdout,
-        (false, _, var err) => err.Message,
+        { IsOk: true, Value: var ok }   => ok.Stdout,
+        { IsOk: false, Error: var err } => err.Message,
     });
 }
 else
@@ -668,10 +668,10 @@ var grep =
         .Args(["ERROR", "app.log"])
         .OkCodes([0, 1]); // 1 ("no match") is success, not failure
 
-Console.WriteLine(await grep.Run() switch
+Console.WriteLine((await grep.Run()).AsRun() switch
 {
-    (true, var output, _) => $"matches:\n{output}",
-    (false, _, var err)   => err.Message, // a real failure (e.g. exit 2)
+    { IsOk: true, Value: var output } => $"matches:\n{output}",
+    { IsOk: false, Error: var err }   => err.Message, // a real failure (e.g. exit 2)
 });
 ```
 
@@ -738,13 +738,13 @@ task {
 **C#**
 
 ```csharp
-Console.WriteLine(await new Command("deploy").Run() switch
+Console.WriteLine((await new Command("deploy").Run()).AsRun() switch
 {
-    (true, var output, _)               => output,
-    (false, _, ProcessError.NotFound n) => $"not installed: {n.program}",
-    (false, _, ProcessError.Exit e)     => $"{e.program} exited {e.code}: {e.stderr}",
-    (false, _, ProcessError.Timeout t)  => $"{t.program} timed out after {t.timeout}",
-    (false, _, var err)                 => err.Message,
+    { IsOk: true, Value: var output }               => output,
+    { IsOk: false, Error: ProcessError.NotFound n } => $"not installed: {n.program}",
+    { IsOk: false, Error: ProcessError.Exit e }     => $"{e.program} exited {e.code}: {e.stderr}",
+    { IsOk: false, Error: ProcessError.Timeout t }  => $"{t.program} timed out after {t.timeout}",
+    { IsOk: false, Error: var err }                 => err.Message,
 });
 ```
 
@@ -780,17 +780,17 @@ match! cmd.Run() with
 **C#**
 
 ```csharp
-switch (await cmd.Run())
+switch ((await cmd.Run()).AsRun())
 {
-    case (true, _, _):
+    case { IsOk: true }:
         break;
-    case (false, _, { IsNotFound: true }): // NotFound only
+    case { IsOk: false, Error: { IsNotFound: true } }: // NotFound only
         installThenRetry();
         break;
-    case (false, _, { IsTransient: true }): // Spawn / Io blips
+    case { IsOk: false, Error: { IsTransient: true } }: // Spawn / Io blips
         scheduleRetry();
         break;
-    case (false, _, var err):
+    case { IsOk: false, Error: var err }:
         fail(err);
         break;
 }

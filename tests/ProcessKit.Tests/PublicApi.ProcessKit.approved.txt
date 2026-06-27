@@ -641,7 +641,7 @@ module ProcessKit.RestartPolicy+Tags
   field literal OnCrash : System.Int32
 
 class ProcessKit.ResultExtensions
-  static member Deconstruct<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, System.Boolean&, T&, ProcessKit.ProcessError&) : System.Void
+  static member AsRun<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>) : ProcessKit.RunResult<T>
   static member GetValueOrThrow<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>) : T
   static member Match<T, R>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, System.Func<T, R>, System.Func<ProcessKit.ProcessError, R>) : R
   static member Switch<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, System.Action<T>, System.Action<ProcessKit.ProcessError>) : System.Void
@@ -654,6 +654,20 @@ class ProcessKit.RunProfile
   property ExitCode : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.UInt64> { get }
   property Samples : System.Int32 { get }
+
+struct ProcessKit.RunResult`1
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.RunResult<T>>
+  member Equals(ProcessKit.RunResult<T>) : System.Boolean
+  member Equals(ProcessKit.RunResult<T>, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  property Error : ProcessKit.ProcessError { get }
+  property IsOk : System.Boolean { get }
+  property Value : T { get }
+  static member op_Implicit(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>) : ProcessKit.RunResult<T>
 
 module ProcessKit.Runner
   static member exitCode(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
