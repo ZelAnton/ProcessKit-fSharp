@@ -5,6 +5,24 @@ open System.Collections.Generic
 open System.Diagnostics
 open System.Threading.Tasks
 
+/// Shared graceful-teardown shape for the backends that support one (cgroup, POSIX process group):
+/// request termination (SIGTERM), poll until the tree is dead or `grace` elapses, then force-kill
+/// whatever remains.
+module private GracefulTeardown =
+
+    let poll (terminate: unit -> unit) (alive: unit -> bool) (forceKill: unit -> unit) (grace: TimeSpan) : Task =
+        task {
+            terminate ()
+            let stopwatch = Stopwatch.StartNew()
+
+            while alive () && stopwatch.Elapsed < grace do
+                do! Task.Delay 50
+
+            if alive () then
+                forceKill ()
+        }
+        :> Task
+
 /// One OS containment primitive behind a `ProcessGroup`. Each implementation owns exactly the state
 /// its mechanism needs — a Windows Job handle, a Linux cgroup path, or the tracked POSIX pgids — so
 /// the type-state that used to be a runtime `match mechanism` is now structural, and `ProcessGroup`
@@ -157,17 +175,11 @@ type internal CgroupBackend(cgroupPath: string) =
         member _.KillTree() = Native.killCgroup cgroupPath
 
         member _.GracefulKillTree(grace) =
-            task {
-                Native.terminateCgroup cgroupPath
-                let stopwatch = Stopwatch.StartNew()
-
-                while Native.cgroupAlive cgroupPath && stopwatch.Elapsed < grace do
-                    do! Task.Delay 50
-
-                if Native.cgroupAlive cgroupPath then
-                    Native.killCgroup cgroupPath
-            }
-            :> Task
+            GracefulTeardown.poll
+                (fun () -> Native.terminateCgroup cgroupPath)
+                (fun () -> Native.cgroupAlive cgroupPath)
+                (fun () -> Native.killCgroup cgroupPath)
+                grace
 
         member _.Members() = Ok(Native.cgroupMembers cgroupPath)
 
@@ -241,23 +253,19 @@ type internal ProcessGroupBackend() =
                 Native.killProcessGroup pgid
 
         member _.GracefulKillTree(grace) =
-            task {
-                let pgids = pgidSnapshot ()
+            // Snapshot the pgids once so terminate and the final force-kill act on the same set.
+            let pgids = pgidSnapshot ()
 
-                if not (List.isEmpty pgids) then
+            GracefulTeardown.poll
+                (fun () ->
                     for pgid in pgids do
-                        Native.terminateProcessGroup pgid
-
-                    let stopwatch = Stopwatch.StartNew()
-
-                    while anyChildAlive () && stopwatch.Elapsed < grace do
-                        do! Task.Delay 50
-
+                        Native.terminateProcessGroup pgid)
+                anyChildAlive
+                (fun () ->
                     for pgid in pgids do
                         if Native.processGroupAlive pgid then
-                            Native.killProcessGroup pgid
-            }
-            :> Task
+                            Native.killProcessGroup pgid)
+                grace
 
         member _.Members() = Ok(pgidSnapshot ())
 

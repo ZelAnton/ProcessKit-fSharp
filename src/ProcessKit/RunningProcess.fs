@@ -44,6 +44,16 @@ type WaitAnyResult internal (index: int, outcome: Outcome) =
     /// How that process concluded.
     member _.Outcome = outcome
 
+/// The single output consumption a `RunningProcess` has been claimed for. Its output pipes are
+/// pumped exactly once: a buffered one-shot verb, a stdout-streaming session, or an event-streaming
+/// session — never two readers on the same pipe.
+[<RequireQualifiedAccess>]
+type internal Consumption =
+    | Fresh
+    | Buffered
+    | StdoutStreaming
+    | EventStreaming
+
 /// A live handle to a started process: stream its output, feed its stdin, wait for it, or
 /// collect it to completion. Disposing it reaps the whole process tree (kill-on-drop).
 [<Sealed>]
@@ -53,37 +63,42 @@ type RunningProcess internal (host: RunningHost) =
     let mutable stdinTaken = false
     let mutable stdoutLineCount = 0
     let mutable stderrLineCount = 0
-    let mutable streamingStarted = false
     let mutable stderrStreamBuffer = Unchecked.defaultof<Pump.LineBuffer>
     let mutable streamOutcome = Unchecked.defaultof<Task<Outcome>>
-    let stdoutChannel = Channel.CreateUnbounded<string>()
-    let eventChannel = Channel.CreateUnbounded<OutputEvent>()
-    let mutable eventStreamingStarted = false
+
+    // Single-reader/single-writer channels: each is consumed by exactly one reader, and the stdout
+    // channel is written by exactly one pump (the event channel by two), selecting the faster
+    // single-consumer channel implementation.
+    let stdoutChannel =
+        Channel.CreateUnbounded<string>(UnboundedChannelOptions(SingleReader = true, SingleWriter = true))
+
+    let eventChannel =
+        Channel.CreateUnbounded<OutputEvent>(UnboundedChannelOptions(SingleReader = true, SingleWriter = false))
+
     let mutable exitStarted = false
     let mutable exitTaskValue = Unchecked.defaultof<Task<Outcome>>
 
-    // Single-consumption guard. The output pipes can be pumped exactly once: a buffered one-shot verb
-    // (OutputString/OutputBytes/Wait/Profile) consumes them whole, and the streaming verbs form one
-    // session (StdoutLines/WaitForLine/Finish share the stdout channel; OutputEvents owns the event
-    // channel). A second, different consumer would race two readers on the same pipe — splitting and
-    // losing output — so it is refused. 0 = fresh, 1 = buffered one-shot, 2 = stdout streaming,
-    // 3 = event streaming. Verb calls are assumed sequential (the class is not built for concurrent
-    // verbs), so a plain flag matches the existing `streamingStarted`/`exitStarted` style.
-    let mutable consumption = 0
+    // Single-consumption guard: the output pipes are pumped exactly once. A buffered one-shot verb
+    // (OutputString/OutputBytes/Wait/Profile) consumes them whole; the streaming verbs form one
+    // session (`StdoutStreaming`: StdoutLines/WaitForLine/Finish share the stdout channel;
+    // `EventStreaming`: OutputEvents owns the event channel). A second, different consumer would race
+    // two readers on the same pipe — splitting/losing output — so it is refused. Verb calls are
+    // assumed sequential (the class is not built for concurrent verbs), so a plain field suffices.
+    let mutable consumption = Consumption.Fresh
 
     // Claim the pipes for a one-shot buffered verb — only from fresh (no re-entry: a second buffered
     // verb would re-pump already-torn-down streams).
     let claimBuffered () =
-        if consumption = 0 then
-            consumption <- 1
+        if consumption = Consumption.Fresh then
+            consumption <- Consumption.Buffered
             true
         else
             false
 
     // Claim the pipes for a streaming session, allowing re-entry of the *same* streaming mode (so
     // StdoutLines → Finish, or repeated StdoutLines, compose) but rejecting a different consumer.
-    let claimStreaming (mode: int) =
-        if consumption = 0 then
+    let claimStreaming (mode: Consumption) =
+        if consumption = Consumption.Fresh then
             consumption <- mode
             true
         else
@@ -124,12 +139,19 @@ type RunningProcess internal (host: RunningHost) =
             // The process has already exited or is inaccessible — no metrics to read.
             None, None
 
+    // Invoke a per-line callback without allocating a closure per line (which `Option.iter (fun cb ->
+    // cb.Invoke line)` would, capturing `line`). On the hot per-line path.
+    let invokeLine (callback: Action<string> option) (line: string) =
+        match callback with
+        | Some cb -> cb.Invoke line
+        | None -> ()
+
     let pumpToBuffer (stream: Stream) encoding tee (callback: Action<string> option) counter =
         task {
             let buffer = Pump.LineBuffer(config.OutputBuffer)
 
             let onLine (line: string) =
-                callback |> Option.iter (fun cb -> cb.Invoke line)
+                invokeLine callback line
                 counter ()
                 buffer.Add line
 
@@ -173,32 +195,15 @@ type RunningProcess internal (host: RunningHost) =
     // Wait for exit, applying a configured timeout: on the deadline, kill the tree (gracefully if
     // `TimeoutGrace` is set, else hard) and report `Outcome.TimedOut`.
     let waitWithTimeout () : Task<Outcome> =
-        match config.Timeout with
-        // Arm the deadline only when it fits a BCL timer. A negative timeout was already rejected by
-        // `Command.Timeout`, and `isArmable` screens out both negatives and over-long spans, so the
-        // `Task.Delay` below can never throw synchronously and orphan the in-flight pumps. Anything
-        // unarmable (no timeout, or "effectively never") just waits.
-        | Some timeout when Timeouts.isArmable timeout ->
+        let onTimeout () : Task =
             task {
-                let waitTask = host.Wait()
-                let waitBase = waitTask :> Task
-                use timeoutCts = new CancellationTokenSource()
-                let timeoutDelay = Task.Delay(timeout, timeoutCts.Token)
-                let! winner = Task.WhenAny(waitBase, timeoutDelay)
-
-                if obj.ReferenceEquals(winner, waitBase) then
-                    timeoutCts.Cancel()
-                    return! waitTask
-                else
-                    match config.TimeoutGrace with
-                    | Some grace -> do! host.GracefulKill grace
-                    | None -> host.StartKill()
-
-                    let! _ = waitTask
-                    Log.timeout config.Logger config.Program timeout
-                    return Outcome.TimedOut
+                match config.TimeoutGrace with
+                | Some grace -> do! host.GracefulKill grace
+                | None -> host.StartKill()
             }
-        | _ -> host.Wait()
+            :> Task
+
+        Timeouts.raceTimeout config.Logger config.Program config.Timeout onTimeout (host.Wait())
 
     // An async-disposable that reaps the tree on scope exit — normal OR exceptional. Every terminal
     // verb opens one with `use` so the container is always torn down, even when a pump faults (e.g.
@@ -441,12 +446,11 @@ type RunningProcess internal (host: RunningHost) =
     // Returns false when a different consumption (a buffered verb, or event streaming) already owns the
     // pipes; true once the stdout streaming session is (or already was) ours.
     member private _.StartStdoutStreaming() : bool =
-        if streamingStarted then
+        if consumption = Consumption.StdoutStreaming then
             true
-        elif not (claimStreaming 2) then
+        elif not (claimStreaming Consumption.StdoutStreaming) then
             false
         else
-            streamingStarted <- true
             let stderrBuffer = Pump.LineBuffer(config.OutputBuffer)
             stderrStreamBuffer <- stderrBuffer
 
@@ -455,7 +459,7 @@ type RunningProcess internal (host: RunningHost) =
                     try
                         do!
                             pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
-                                config.OnStdoutLine |> Option.iter (fun cb -> cb.Invoke line)
+                                invokeLine config.OnStdoutLine line
                                 stdoutLineCount <- stdoutLineCount + 1
                                 stdoutChannel.Writer.TryWrite line |> ignore)
 
@@ -472,7 +476,7 @@ type RunningProcess internal (host: RunningHost) =
 
             let stderrPump =
                 pumpLines host.Stderr config.StderrEncoding config.StderrTee (fun line ->
-                    config.OnStderrLine |> Option.iter (fun cb -> cb.Invoke line)
+                    invokeLine config.OnStderrLine line
                     stderrLineCount <- stderrLineCount + 1
                     stderrBuffer.Add line)
 
@@ -513,22 +517,20 @@ type RunningProcess internal (host: RunningHost) =
     // Returns false when a different consumption (a buffered verb, or stdout streaming) already owns the
     // pipes; true once the event streaming session is (or already was) ours.
     member private _.StartEventStreaming() : bool =
-        if eventStreamingStarted then
+        if consumption = Consumption.EventStreaming then
             true
-        elif not (claimStreaming 3) then
+        elif not (claimStreaming Consumption.EventStreaming) then
             false
         else
-            eventStreamingStarted <- true
-
             let stdoutPump =
                 pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
-                    config.OnStdoutLine |> Option.iter (fun cb -> cb.Invoke line)
+                    invokeLine config.OnStdoutLine line
                     stdoutLineCount <- stdoutLineCount + 1
                     eventChannel.Writer.TryWrite(OutputEvent.Stdout(OutputLine line)) |> ignore)
 
             let stderrPump =
                 pumpLines host.Stderr config.StderrEncoding config.StderrTee (fun line ->
-                    config.OnStderrLine |> Option.iter (fun cb -> cb.Invoke line)
+                    invokeLine config.OnStderrLine line
                     stderrLineCount <- stderrLineCount + 1
                     eventChannel.Writer.TryWrite(OutputEvent.Stderr(OutputLine line)) |> ignore)
 
@@ -685,7 +687,7 @@ type RunningProcess internal (host: RunningHost) =
             exitStarted <- true
 
             exitTaskValue <-
-                if streamingStarted then
+                if consumption = Consumption.StdoutStreaming then
                     streamOutcome
                 else
                     // Claim the buffered slot so a terminal verb called after WaitAny/WaitAll on the

@@ -192,9 +192,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
             let closeStreams () =
                 // Close the pipe streams (OS handles/fds) before releasing/detaching.
-                spawned.Stdout |> Option.iter (fun s -> s.Dispose())
-                spawned.Stderr |> Option.iter (fun s -> s.Dispose())
-                spawned.Stdin |> Option.iter (fun s -> s.Dispose())
+                Pump.closeSpawned spawned
 
             Ok
                 { Config = command.Config
@@ -351,31 +349,19 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     // subtree (a shared group may hold siblings, so the graceful whole-tree path is not
                     // used here) and report `TimedOut`. An over-long span is treated as no timeout.
                     let! outcome =
-                        match command.Config.Timeout with
-                        | Some timeout when Timeouts.isArmable timeout ->
-                            task {
-                                use timeoutCts = new CancellationTokenSource()
-                                let! winner = Task.WhenAny(waitTask :> Task, Task.Delay(timeout, timeoutCts.Token))
-
-                                if obj.ReferenceEquals(winner, (waitTask :> Task)) then
-                                    timeoutCts.Cancel()
-                                    return! waitTask
-                                else
-                                    backend.KillChild spawned
-                                    let! _ = waitTask
-                                    Log.timeout command.Config.Logger command.Program timeout
-                                    return Outcome.TimedOut
-                            }
-                        | _ -> waitTask
+                        Timeouts.raceTimeout
+                            command.Config.Logger
+                            command.Program
+                            command.Config.Timeout
+                            (fun () -> task { backend.KillChild spawned } :> Task)
+                            waitTask
 
                     let! stdoutBytes = stdoutTask
                     let! stderrBytes = stderrTask
                     // Stop reacting to cancellation before closing the child's handle, so a late
                     // cancellation can't fire KillChild on a since-reused handle value.
                     registration.Dispose()
-                    spawned.Stdout |> Option.iter (fun s -> s.Dispose())
-                    spawned.Stderr |> Option.iter (fun s -> s.Dispose())
-                    spawned.Stdin |> Option.iter (fun s -> s.Dispose())
+                    Pump.closeSpawned spawned
                     // The child is reaped: stop tracking it (close its Windows handle) so a long-lived
                     // shared group does not accumulate handles/pgids across many captured runs.
                     backend.Release spawned
@@ -448,19 +434,9 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
                     use _registration = linkedCts.Token.Register(fun () -> group.KillTree())
 
-                    // Dispose a pipe stream, swallowing the teardown-race exceptions (double close,
-                    // or a broken pipe surfaced while flushing on dispose because the peer is gone).
-                    let closeQuietly (stream: Stream) =
-                        try
-                            stream.Dispose()
-                        with
-                        | :? ObjectDisposedException ->
-                            // Already disposed (double close during teardown); nothing to do.
-                            ()
-                        | :? IOException ->
-                            // The pipe broke while flushing on dispose (peer end already gone). The
-                            // run's outcome already reflects it; closing is best-effort teardown.
-                            ()
+                    // Dispose a pipe stream, swallowing the teardown-race exceptions (double close, or
+                    // a broken pipe surfaced while flushing on dispose because the peer is gone).
+                    let closeQuietly = Pump.disposeQuietly
 
                     let spawned = ResizeArray<Native.Spawned>()
                     let copyTasks = ResizeArray<Task>()
@@ -541,9 +517,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                         let! _ = Task.WhenAll(stderrTasks.ToArray())
 
                         for sp in spawned do
-                            sp.Stdout |> Option.iter closeQuietly
-                            sp.Stderr |> Option.iter closeQuietly
-                            sp.Stdin |> Option.iter closeQuietly
+                            Pump.closeSpawned sp
 
                         return Error error
                     | None ->
@@ -561,9 +535,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                         let! stderrBytes = Task.WhenAll(stderrTasks.ToArray())
 
                         for sp in spawned do
-                            sp.Stdout |> Option.iter closeQuietly
-                            sp.Stderr |> Option.iter closeQuietly
-                            sp.Stdin |> Option.iter closeQuietly
+                            Pump.closeSpawned sp
 
                         let duration = Stopwatch.GetElapsedTime startedAt
 

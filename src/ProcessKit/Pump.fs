@@ -22,6 +22,11 @@ module internal Pump =
 
         let byteLen (line: string) = Encoding.UTF8.GetByteCount line
 
+        // The retained/total byte counts only matter when a byte cap is set or the fail-loud ceiling
+        // is in play; under the default (line-only / unbounded) policy, skip the per-line UTF-8 scan.
+        // `TotalBytes` is therefore meaningful only in those modes.
+        let needBytes = policy.MaxBytes.IsSome || policy.Overflow = OverflowMode.Error
+
         let overLineCap () =
             match policy.MaxLines with
             | Some cap -> retained.Count >= cap
@@ -40,7 +45,7 @@ module internal Pump =
 
         /// Record a complete line, applying the policy.
         member _.Add(line: string) =
-            let bytes = byteLen line
+            let bytes = if needBytes then byteLen line else 0
             totalLines <- totalLines + 1
             totalBytes <- totalBytes + bytes
             let unbounded = policy.MaxLines.IsNone && policy.MaxBytes.IsNone
@@ -69,7 +74,7 @@ module internal Pump =
                     | null -> ()
                     | node ->
                         retained.RemoveFirst()
-                        retainedBytes <- retainedBytes - byteLen node.Value
+                        retainedBytes <- retainedBytes - (if needBytes then byteLen node.Value else 0)
             | _ ->
                 retained.AddLast line |> ignore
                 retainedBytes <- retainedBytes + bytes
@@ -233,6 +238,26 @@ module internal Pump =
         | Some s -> drainRaw s tee cancellationToken
         | None -> Task.FromResult Array.empty<byte>
 
+    /// Dispose a stream, swallowing the exceptions a teardown race raises — a double-close, or a
+    /// broken pipe surfaced while flushing on dispose because the peer is already gone. The one
+    /// definition of "teardown-race-safe close" used wherever a pipe stream is torn down.
+    let disposeQuietly (stream: Stream) =
+        try
+            stream.Dispose()
+        with
+        | :? ObjectDisposedException ->
+            // Already disposed (double close during teardown); nothing to do.
+            ()
+        | :? IOException ->
+            // The pipe broke while flushing on dispose (peer end already gone); best-effort teardown.
+            ()
+
+    /// Quietly dispose all three of a spawned child's parent-side pipe streams (teardown-race-safe).
+    let closeSpawned (spawned: Native.Spawned) =
+        spawned.Stdout |> Option.iter disposeQuietly
+        spawned.Stderr |> Option.iter disposeQuietly
+        spawned.Stdin |> Option.iter disposeQuietly
+
     /// Write a stdin source to the child's stdin stream; close it (EOF) afterwards unless the
     /// caller is keeping it open for interactive writing.
     let feedStdin
@@ -280,11 +305,7 @@ module internal Pump =
                 ()
 
             if closeWhenDone then
-                try
-                    stdinStream.Dispose()
-                with :? ObjectDisposedException ->
-                    // Already disposed during teardown; nothing to do.
-                    ()
+                disposeQuietly stdinStream
         }
         :> Task
 

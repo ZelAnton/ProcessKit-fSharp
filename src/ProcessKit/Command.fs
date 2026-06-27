@@ -5,6 +5,7 @@ open System.Collections.Generic
 open System.IO
 open System.Text
 open System.Threading
+open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 
 /// Bounds for arming an OS timer from a user `TimeSpan`. `Task.Delay`,
@@ -29,6 +30,37 @@ module internal Timeouts =
         if duration < TimeSpan.Zero then TimeSpan.Zero
         elif duration > maxArmable then maxArmable
         else duration
+
+    /// Race a process `wait` against a deadline. With no timeout (or one too large to arm) just returns
+    /// `wait`. Otherwise: if the wait wins, cancel the timer and return its outcome; on the deadline,
+    /// run `onTimeout` (the kill), await `wait` so the child is reaped, log, and report `TimedOut`.
+    /// One home for the subtle CTS-cancel + reference-equality-winner logic shared by the run verbs and
+    /// the group runner. (Negative is rejected by the builder; `isArmable` screens it out defensively,
+    /// so `Task.Delay` here can never throw synchronously.)
+    let raceTimeout
+        (logger: ILogger option)
+        (program: string)
+        (timeout: TimeSpan option)
+        (onTimeout: unit -> Task)
+        (wait: Task<Outcome>)
+        : Task<Outcome> =
+        match timeout with
+        | Some t when isArmable t ->
+            task {
+                use timeoutCts = new CancellationTokenSource()
+                let waitBase = wait :> Task
+                let! winner = Task.WhenAny(waitBase, Task.Delay(t, timeoutCts.Token))
+
+                if obj.ReferenceEquals(winner, waitBase) then
+                    timeoutCts.Cancel()
+                    return! wait
+                else
+                    do! onTimeout ()
+                    let! _ = wait
+                    Log.timeout logger program t
+                    return Outcome.TimedOut
+            }
+        | _ -> wait
 
 /// The immutable configuration behind a `Command`. Internal — consumers build it through the
 /// `Command` builder; the runner/native layer reads it to spawn.
