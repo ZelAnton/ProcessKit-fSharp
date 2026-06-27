@@ -46,6 +46,7 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - `OutputBufferPolicy.WithMaxLines` — a composable retained-line cap, mirroring `WithMaxBytes`.
 - `ProcessResult.EnsureSuccess()` — an instance form of `ensureSuccess` for fluent C# use.
 - `RunningProcess.WaitForLine` / `WaitForPort` / `WaitFor` each gain a `CancellationToken` overload; a cancelled wait reports `ProcessError.Cancelled` (a timeout still reports `NotReady`).
+- The full run-verb vocabulary is now available on **any** `IProcessRunner` as extension methods (`runner.Run` / `RunUnit` / `OutputString` / `OutputBytes` / `ExitCode` / `Probe` / `Parse` / `TryParse` / `FirstLine` / `Start`, each with a `CancellationToken` overload). A chosen or injected runner — a shared `ProcessGroup`, a `ScriptedRunner` — now offers the same verbs as a `Command` (e.g. `runner.ExitCode command`), instead of only through the `Runner` module functions. The verb logic stays centralized in the `Runner` module; these are thin sugar over it.
 
 ### Changed
 - `RunningProcess` now enforces single consumption of its output. Once a terminal verb (`OutputString`/`OutputBytes`/`Wait`/`Profile`) or a streaming session (`StdoutLines`/`OutputEvents`, and their `Finish`/`WaitForLine` companions) has claimed the pipes, a second, conflicting consumer is refused instead of racing two readers on the same pipe (which split and lost output): the `Result`-returning verbs return `ProcessError.Unsupported`, while `Wait`/`Profile`/`StdoutLines`/`OutputEvents` throw `InvalidOperationException`.

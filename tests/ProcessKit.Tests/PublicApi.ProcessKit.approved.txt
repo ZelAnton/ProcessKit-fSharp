@@ -569,6 +569,25 @@ class ProcessKit.ProcessResult`1
   property Stdout : T { get }
   property Truncated : System.Boolean { get }
 
+class ProcessKit.ProcessRunnerExtensions
+  static member ExitCode(ProcessKit.IProcessRunner, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
+  static member ExitCode(ProcessKit.IProcessRunner, ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
+  static member FirstLine(ProcessKit.IProcessRunner, ProcessKit.Command, System.Func<System.String, System.Boolean>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
+  static member FirstLine(ProcessKit.IProcessRunner, ProcessKit.Command, System.Func<System.String, System.Boolean>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
+  static member OutputBytes(ProcessKit.IProcessRunner, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  static member OutputString(ProcessKit.IProcessRunner, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  static member Parse<T>(ProcessKit.IProcessRunner, ProcessKit.Command, System.Func<System.String, T>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member Parse<T>(ProcessKit.IProcessRunner, ProcessKit.Command, System.Func<System.String, T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member Probe(ProcessKit.IProcessRunner, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
+  static member Probe(ProcessKit.IProcessRunner, ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
+  static member Run(ProcessKit.IProcessRunner, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  static member Run(ProcessKit.IProcessRunner, ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  static member RunUnit(ProcessKit.IProcessRunner, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  static member RunUnit(ProcessKit.IProcessRunner, ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  static member Start(ProcessKit.IProcessRunner, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
+  static member TryParse<T>(ProcessKit.IProcessRunner, ProcessKit.Command, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member TryParse<T>(ProcessKit.IProcessRunner, ProcessKit.Command, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+
 class ProcessKit.ProcessStdin
   member Finish() : System.Threading.Tasks.Task
   member Flush() : System.Threading.Tasks.Task

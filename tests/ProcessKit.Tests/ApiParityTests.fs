@@ -30,6 +30,29 @@ type ApiParityTests() =
             shell "sleep 8"
 
     [<Test>]
+    member _.``the derived verbs are available on any IProcessRunner``() : Task =
+        task {
+            // A ScriptedRunner gains ExitCode (a derived verb) for free via the runner extensions.
+            let scripted: IProcessRunner = ScriptedRunner().On([ "tool" ], Reply.Fail(2, ""))
+
+            match! scripted.ExitCode(Command.create "tool") with
+            | Ok code -> Assert.That(code, Is.EqualTo 2)
+            | Error error -> Assert.Fail $"expected ExitCode 2, got {error.Message}"
+
+            // A ProcessGroup used as a runner gains Run too.
+            let group =
+                match ProcessGroup.Create() with
+                | Ok g -> g
+                | Error e -> failwith $"ProcessGroup.Create failed: {e}"
+
+            use group = group
+
+            match! (group :> IProcessRunner).Run(shell "echo hi") with
+            | Ok out -> Assert.That(out.Trim(), Is.EqualTo "hi")
+            | Error error -> Assert.Fail $"group.Run failed: {error.Message}"
+        }
+
+    [<Test>]
     member _.``CliClient verbs route through the configured runner, not the default``() : Task =
         task {
             // The program is not a real binary; only the scripted runner can answer it. If a client
