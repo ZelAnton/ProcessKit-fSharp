@@ -33,15 +33,18 @@ type ProcessRunnerExtensions =
     static member RunUnit(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
         Runner.runUnit runner cancellationToken command
 
-    /// Run to completion, capturing stdout as decoded text (a non-zero exit is data).
+    /// Run to completion, capturing stdout as decoded text (a non-zero exit is data). Forwards to the
+    /// runner's own seam method, so its behaviour matches `runner.OutputString(command, ct)` exactly
+    /// (no extra retry layer — retry is applied by the derived verbs and the `Command` verbs).
     [<Extension>]
     static member OutputString(runner: IProcessRunner, command: Command) =
-        Runner.outputString runner CancellationToken.None command
+        runner.OutputString(command, CancellationToken.None)
 
-    /// Run to completion, capturing stdout as raw bytes (a non-zero exit is data).
+    /// Run to completion, capturing stdout as raw bytes (a non-zero exit is data). Forwards to the
+    /// runner's own seam method, matching `runner.OutputBytes(command, ct)`.
     [<Extension>]
     static member OutputBytes(runner: IProcessRunner, command: Command) =
-        Runner.outputBytes runner CancellationToken.None command
+        runner.OutputBytes(command, CancellationToken.None)
 
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel.
     [<Extension>]
@@ -63,10 +66,10 @@ type ProcessRunnerExtensions =
     static member Probe(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
         Runner.probe runner cancellationToken command
 
-    /// Start the command and return a live `RunningProcess`.
+    /// Start the command and return a live `RunningProcess`. Forwards to the runner's own seam method.
     [<Extension>]
     static member Start(runner: IProcessRunner, command: Command) =
-        Runner.start runner CancellationToken.None command
+        runner.Start(command, CancellationToken.None)
 
     /// Require a zero/accepted exit and parse the trimmed stdout into a `'T`; a thrown parser error
     /// becomes `ProcessError.Parse`.

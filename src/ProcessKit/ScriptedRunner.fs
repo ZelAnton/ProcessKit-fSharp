@@ -70,11 +70,12 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
             match reply.ErrorOverride with
             | Some error -> Task.FromResult(Error error)
             | None ->
-                // Serve a real in-memory RunningProcess so streaming/readiness consumers can be
-                // tested through the same scripting used for the capture verbs.
+                // Serve a real in-memory RunningProcess so streaming/readiness consumers can be tested
+                // through the same scripting as the capture verbs. OfCommand carries the matched
+                // command's config (OkCodes/encodings/…) so both paths agree on success semantics.
                 let running =
                     FakeProcess
-                        .Create(command.Program)
+                        .OfCommand(command)
                         .WithStdout(reply.StdoutText)
                         .WithStderr(reply.StderrText)
                         .WithOutcome(reply.Outcome)

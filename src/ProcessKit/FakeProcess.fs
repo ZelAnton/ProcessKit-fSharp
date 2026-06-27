@@ -12,42 +12,48 @@ open ProcessKit
 /// stdout/stderr are `MemoryStream`s of the scripted text, whose wait resolves to the scripted
 /// outcome, and whose kill/teardown are no-ops.
 [<Sealed>]
-type FakeProcess private (program: string, stdout: string, stderr: string, outcome: Outcome, pid: int option) =
+type FakeProcess private (template: Command, stdout: string, stderr: string, outcome: Outcome, pid: int option) =
 
     /// A fake of `program` that exits 0 with no output.
     static member Create(program: string) =
-        FakeProcess(program, "", "", Outcome.Exited 0, None)
+        FakeProcess(Command.create program, "", "", Outcome.Exited 0, None)
 
     /// A fake (named `"fake"`) that exits 0 with no output.
     static member Create() = FakeProcess.Create "fake"
 
+    /// A fake whose built `RunningProcess` inherits `command`'s config — encodings, `OkCodes`, output
+    /// buffer, line handlers — so it behaves like a real run of that command. Internal: `ScriptedRunner`
+    /// uses it so `Start` and the capture verbs agree on success/encoding semantics.
+    static member internal OfCommand(command: Command) =
+        FakeProcess(command, "", "", Outcome.Exited 0, None)
+
     /// The captured stdout the fake replays (split on `\n` into lines for the streaming verbs).
     member _.WithStdout(text: string) =
-        FakeProcess(program, text, stderr, outcome, pid)
+        FakeProcess(template, text, stderr, outcome, pid)
 
     /// The captured stdout as a sequence of lines (joined with `\n`).
     member _.WithStdoutLines(lines: seq<string>) =
-        FakeProcess(program, String.Join('\n', lines), stderr, outcome, pid)
+        FakeProcess(template, String.Join('\n', lines), stderr, outcome, pid)
 
     /// The captured stderr.
     member _.WithStderr(text: string) =
-        FakeProcess(program, stdout, text, outcome, pid)
+        FakeProcess(template, stdout, text, outcome, pid)
 
     /// Make the fake exit with `code`.
     member _.WithExit(code: int) =
-        FakeProcess(program, stdout, stderr, Outcome.Exited code, pid)
+        FakeProcess(template, stdout, stderr, Outcome.Exited code, pid)
 
     /// Make the fake conclude with an explicit `Outcome` (e.g. `Outcome.TimedOut` or `Signalled`).
     member _.WithOutcome(value: Outcome) =
-        FakeProcess(program, stdout, stderr, value, pid)
+        FakeProcess(template, stdout, stderr, value, pid)
 
     /// Set the pid the handle reports.
     member _.WithPid(value: int) =
-        FakeProcess(program, stdout, stderr, outcome, Some value)
+        FakeProcess(template, stdout, stderr, outcome, Some value)
 
     /// Build a real `RunningProcess` over in-memory streams.
     member _.Build() : RunningProcess =
-        let config = (Command.create program).Config
+        let config = template.Config
 
         let stdoutStream = new MemoryStream(config.StdoutEncoding.GetBytes stdout) :> Stream
         let stderrStream = new MemoryStream(config.StderrEncoding.GetBytes stderr) :> Stream

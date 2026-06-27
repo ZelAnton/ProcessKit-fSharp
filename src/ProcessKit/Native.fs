@@ -360,6 +360,12 @@ module internal Native =
 
     let closeWindowsHandle (handle: nativeint) = CloseHandle handle |> ignore
 
+    /// A `WaitHandle` over an already-owned `SafeWaitHandle`. Subclassing avoids `new ManualResetEvent()`
+    /// — which allocates a throwaway kernel event that assigning `SafeWaitHandle` would orphan until GC.
+    type private OwnedProcessWait(handle: SafeWaitHandle) =
+        inherit WaitHandle()
+        do base.SafeWaitHandle <- handle
+
     /// Wait for a Windows process to exit and read its exit code — asynchronously, via a thread-pool
     /// *registered wait* (one pool wait thread serves ~63 handles) instead of parking a dedicated
     /// thread per child for its whole lifetime. The process handle is itself a waitable object that
@@ -368,31 +374,39 @@ module internal Native =
         let tcs =
             TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-        // A wait handle pointed at the process handle (non-owning: the backend closes `hProcess` on
-        // reap/teardown, not us).
-        let waitHandle = new ManualResetEvent(false)
-        waitHandle.SafeWaitHandle <- new SafeWaitHandle(hProcess, false)
+        // Wait on our OWN duplicate of the process handle, not the backend's: the backend may close
+        // its handle on reap/teardown while this wait is still pending, and a registered wait on a
+        // closed handle is undefined (and shares its pool wait thread with other handles, so the blast
+        // radius is wider than a dedicated thread). The duplicate signals on the same process exit and
+        // is closed when the wait completes.
+        let current = GetCurrentProcess()
+        let mutable duplicate = IntPtr.Zero
 
-        let callback =
-            WaitOrTimerCallback(fun _ _ ->
-                let mutable code = 0u
-                // `GetExitCodeProcess` can fail with ERROR_INVALID_HANDLE when teardown closes the
-                // handle concurrently (the process is being force-killed, so its exit code is moot).
-                // Tolerate that benign race — and any wait hiccup on our own handle — by reporting
-                // `Exited 0` rather than faulting a run verb.
-                GetExitCodeProcess(hProcess, &code) |> ignore
-                tcs.TrySetResult(Outcome.Exited(int code)) |> ignore)
+        if not (DuplicateHandle(current, hProcess, current, &duplicate, 0u, false, DUPLICATE_SAME_ACCESS)) then
+            // The source handle is already gone — the process is unobservable; report a clean exit.
+            tcs.SetResult(Outcome.Exited 0)
+        else
+            let waitHandle =
+                new OwnedProcessWait(new SafeWaitHandle(duplicate, ownsHandle = true))
 
-        // -1 = infinite, executeOnlyOnce = true. The registration is published before the continuation
-        // that uses it is attached, so unregistering there is race-free even if the wait was already
-        // satisfied when registered.
-        let registration =
-            ThreadPool.RegisterWaitForSingleObject(waitHandle, callback, null, -1, true)
+            let callback =
+                WaitOrTimerCallback(fun _ _ ->
+                    let mutable code = 0u
+                    // We own `duplicate` for the wait's lifetime, so this reads the real exit code;
+                    // tolerate any residual hiccup by reporting `Exited 0` rather than faulting a verb.
+                    GetExitCodeProcess(duplicate, &code) |> ignore
+                    tcs.TrySetResult(Outcome.Exited(int code)) |> ignore)
 
-        tcs.Task.ContinueWith(fun (_: Task<Outcome>) ->
-            registration.Unregister null |> ignore
-            waitHandle.Dispose())
-        |> ignore
+            // -1 = infinite, executeOnlyOnce = true. The registration is published before the
+            // continuation that uses it is attached, so unregistering there is race-free even if the
+            // wait was already satisfied when registered.
+            let registration =
+                ThreadPool.RegisterWaitForSingleObject(waitHandle, callback, null, -1, true)
+
+            tcs.Task.ContinueWith(fun (_: Task<Outcome>) ->
+                registration.Unregister null |> ignore
+                waitHandle.Dispose()) // disposes the SafeWaitHandle -> closes our duplicate
+            |> ignore
 
         tcs.Task
 
