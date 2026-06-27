@@ -33,9 +33,6 @@ C# the same surface is `await`-able fluent methods. Samples assume
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     let cmd =
         Command.create "git"
@@ -52,20 +49,17 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var cmd =
     new Command("git")
         .Arg("log") // one at a time…
-        .Args(new[] { "--oneline", "-n", "10" }) // …or in bulk
+        .Args(["--oneline", "-n", "10"]) // …or in bulk
         .CurrentDir("/path/to/repo"); // run there
 
-var result = await cmd.Run();
-if (result.IsOk)
-    Console.WriteLine(result.ResultValue);
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+Console.WriteLine(await cmd.Run() switch
+{
+    (true, var output, _) => output,
+    (false, _, var err)   => err.Message,
+});
 ```
 
 The same chain in method style — identical from C#:
@@ -86,7 +80,7 @@ let cmd =
 var cmd =
     new Command("git")
         .Arg("log")
-        .Args(new[] { "--oneline", "-n", "10" })
+        .Args(["--oneline", "-n", "10"])
         .CurrentDir("/path/to/repo");
 ```
 
@@ -116,8 +110,8 @@ task {
 **C#**
 
 ```csharp
-var version = await Exec.run("dotnet", new[] { "--version" }); // trimmed stdout, success required
-var status = await Exec.outputString("git", new[] { "status", "-s" }); // full ProcessResult
+var version = await Exec.run("dotnet", ["--version"]); // trimmed stdout, success required
+var status = await Exec.outputString("git", ["status", "-s"]); // full ProcessResult
 ```
 
 ## Environment
@@ -127,8 +121,6 @@ Three builders compose and are applied at spawn:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     // Set one variable, unset one inherited variable.
     let! _ =
@@ -146,8 +138,6 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-
 // Set one variable, unset one inherited variable.
 await new Command("worker")
     .Env("DOTNET_ENVIRONMENT", "Production")
@@ -187,8 +177,6 @@ can never hang waiting for input. Everything else is opt-in via `Stdin`:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     let sorted =
         Command.create "sort"
@@ -203,18 +191,15 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var sorted =
     new Command("sort")
-        .Stdin(Stdin.FromLines(new[] { "banana", "apple", "cherry" }));
+        .Stdin(Stdin.FromLines(["banana", "apple", "cherry"]));
 
-var result = await sorted.Run();
-if (result.IsOk)
-    Console.WriteLine(result.ResultValue); // apple / banana / cherry
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+Console.WriteLine(await sorted.Run() switch
+{
+    (true, var output, _) => output, // apple / banana / cherry
+    (false, _, var err)   => err.Message,
+});
 ```
 
 The payload is written on a background task — so a large input can't deadlock
@@ -253,8 +238,6 @@ per stream with `StdoutEncoding` / `StderrEncoding`, or both at once with
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     let cmd =
         Command.create "legacy-tool"
@@ -270,19 +253,16 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var cmd =
     new Command("legacy-tool")
         .Encoding(System.Text.Encoding.Latin1); // both streams…
 // .StdoutEncoding(enc) / .StderrEncoding(enc)  // …or each its own
 
-var result = await cmd.OutputString();
-if (result.IsOk)
-    Console.WriteLine(result.ResultValue.Stdout);
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+Console.WriteLine(await cmd.OutputString() switch
+{
+    (true, var result, _) => result.Stdout,
+    (false, _, var err)   => err.Message,
+});
 ```
 
 A single persistent decoder runs over the whole stream, so a multi-byte sequence
@@ -302,8 +282,6 @@ line, so a count larger than what you got back reveals that lines were dropped
 **F#**
 
 ```fsharp
-open ProcessKit
-
 // Keep the newest 1000 lines (a rolling tail; the default overflow is DropOldest):
 let tail =
     Command.create "verbose-build"
@@ -318,8 +296,6 @@ let head =
 **C#**
 
 ```csharp
-using ProcessKit;
-
 // Keep the newest 1000 lines (a rolling tail; the default overflow is DropOldest):
 var tail =
     new Command("verbose-build")
@@ -357,8 +333,6 @@ let strict =
 **C#**
 
 ```csharp
-using ProcessKit;
-
 // An 8 MiB retained-byte ring on an otherwise unbounded buffer:
 var ring =
     new Command("flood")
@@ -385,8 +359,6 @@ synchronously on the read pump as each line arrives, so keep it cheap:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     let cmd =
         Command.create "dotnet"
@@ -402,19 +374,16 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var cmd =
     new Command("dotnet")
-        .Args(new[] { "build", "-c", "Release" })
+        .Args(["build", "-c", "Release"])
         .OnStderrLine(line => Console.Error.WriteLine($"[build] {line}"));
 
-var result = await cmd.OutputString();
-if (result.IsOk)
-    Console.WriteLine($"build exited {result.ResultValue.Code}");
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+Console.WriteLine(await cmd.OutputString() switch
+{
+    (true, var result, _) => $"build exited {result.Code}",
+    (false, _, var err)   => err.Message,
+});
 ```
 
 For a ready-made copy to a `System.IO.Stream` sink — a file, a socket, anything —
@@ -426,8 +395,6 @@ both fire:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     use logFile = System.IO.File.Create "build.log"
 
@@ -444,13 +411,11 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-
 using var logFile = System.IO.File.Create("build.log");
 
 var cmd =
     new Command("dotnet")
-        .Args(new[] { "build" })
+        .Args(["build"])
         .StdoutTee(logFile);
 
 await cmd.OutputString();
@@ -461,9 +426,6 @@ await cmd.OutputString();
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     let cmd =
         Command.create "flaky-network-tool"
@@ -479,19 +441,16 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var cmd =
     new Command("flaky-network-tool")
         .Timeout(TimeSpan.FromSeconds(30)) // kill the tree at the deadline
         .Retry(3, TimeSpan.FromMilliseconds(200), err => err.IsTransient);
 
-var result = await cmd.Run();
-if (result.IsOk)
-    Console.WriteLine(result.ResultValue);
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+Console.WriteLine(await cmd.Run() switch
+{
+    (true, var output, _) => output,
+    (false, _, var err)   => err.Message,
+});
 ```
 
 - **`Timeout`** kills the whole process tree at the deadline. On the capturing
@@ -517,8 +476,6 @@ overload, `cmd.Run(ct)`). A cancelled run is **always** an error
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     // Windows: no console window flashes up from a GUI app (a harmless no-op elsewhere).
     let! _ = (Command.create "helper" |> Command.createNoWindow).Run()
@@ -529,8 +486,6 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-
 // Windows: no console window flashes up from a GUI app (a harmless no-op elsewhere).
 await new Command("helper").CreateNoWindow().Run();
 ```
@@ -578,8 +533,6 @@ it has its answer — you never wait out a long log for one line — and returns
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     // Probe: the exit code as a yes/no.
     match! (Command.create "git" |> Command.args [ "diff"; "--quiet" ]).Probe() with
@@ -601,29 +554,24 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 // Probe: the exit code as a yes/no.
-var probe = await new Command("git").Args(new[] { "diff", "--quiet" }).Probe();
-if (probe.IsOk && probe.ResultValue)
-    Console.WriteLine("working tree clean");
-else if (probe.IsOk)
-    Console.WriteLine("there are changes");
-else
-    Console.Error.WriteLine(probe.ErrorValue.Message);
+Console.WriteLine(await new Command("git").Args(["diff", "--quiet"]).Probe() switch
+{
+    (true, true, _)     => "working tree clean",
+    (true, false, _)    => "there are changes",
+    (false, _, var err) => err.Message,
+});
 
 // Parse: a typed value from stdout.
 var version = await new Command("node").Arg("--version").Parse(s => s.TrimStart('v'));
 
 // FirstLine: stop as soon as the interesting line appears.
-var firstLine = await new Command("git").Args(new[] { "log", "--oneline" }).FirstLine(l => l.Contains("fix:"));
-if (firstLine.IsOk && firstLine.ResultValue != null) // FSharpOption: None is null
-    Console.WriteLine(firstLine.ResultValue.Value);
-else if (firstLine.IsOk)
-    Console.WriteLine("no fix commit");
-else
-    Console.Error.WriteLine(firstLine.ErrorValue.Message);
+Console.WriteLine(await new Command("git").Args(["log", "--oneline"]).FirstLine(l => l.Contains("fix:")) switch
+{
+    (true, { Value: var line }, _) => line,            // Some(line)
+    (true, _, _)                   => "no fix commit", // None
+    (false, _, var err)            => err.Message,
+});
 ```
 
 The same vocabulary repeats on every layer. To run a verb through a specific
@@ -640,8 +588,6 @@ The capturing verbs (`OutputString` / `OutputBytes`) hand back a
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match! (Command.create "git" |> Command.args [ "merge"; "feature" ]).OutputString() with
     | Ok result ->
@@ -659,24 +605,20 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
-var result = await new Command("git").Args(new[] { "merge", "feature" }).OutputString();
-if (result.IsOk)
+if ((await new Command("git").Args(["merge", "feature"]).OutputString()).TryGetValue(out var result, out var runErr))
 {
-    Console.WriteLine($"code={result.ResultValue.Code} success={result.ResultValue.IsSuccess} timedOut={result.ResultValue.IsTimedOut}");
-    Console.WriteLine($"took {result.ResultValue.Duration}, truncated={result.ResultValue.Truncated}");
+    Console.WriteLine($"code={result.Code} success={result.IsSuccess} timedOut={result.IsTimedOut}");
+    Console.WriteLine($"took {result.Duration}, truncated={result.Truncated}");
 
     // Opt into erroring whenever you're ready:
-    var ensured = result.ResultValue.EnsureSuccess();
-    if (ensured.IsOk)
-        Console.WriteLine(ensured.ResultValue.Stdout);
-    else
-        Console.Error.WriteLine(ensured.ErrorValue.Message);
+    Console.WriteLine(result.EnsureSuccess() switch
+    {
+        (true, var ok, _)   => ok.Stdout,
+        (false, _, var err) => err.Message,
+    });
 }
 else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+    Console.Error.WriteLine(runErr.Message);
 ```
 
 The accessors:
@@ -706,8 +648,6 @@ Tell ProcessKit which codes count as success with `OkCodes`:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     let grep =
         Command.create "grep"
@@ -723,19 +663,16 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var grep =
     new Command("grep")
-        .Args(new[] { "ERROR", "app.log" })
-        .OkCodes(new[] { 0, 1 }); // 1 ("no match") is success, not failure
+        .Args(["ERROR", "app.log"])
+        .OkCodes([0, 1]); // 1 ("no match") is success, not failure
 
-var output = await grep.Run();
-if (output.IsOk)
-    Console.WriteLine($"matches:\n{output.ResultValue}");
-else
-    Console.Error.WriteLine(output.ErrorValue.Message); // a real failure (e.g. exit 2)
+Console.WriteLine(await grep.Run() switch
+{
+    (true, var output, _) => $"matches:\n{output}",
+    (false, _, var err)   => err.Message, // a real failure (e.g. exit 2)
+});
 ```
 
 `OkCodes` sets which exit codes `ProcessResult.IsSuccess`, `ensureSuccess`, and
@@ -751,8 +688,6 @@ When the three-way distinction matters, match on `Outcome` instead of decoding t
 **F#**
 
 ```fsharp
-open ProcessKit
-
 match result.Outcome with
 | Outcome.Exited 0 -> printfn "clean"
 | Outcome.Exited code -> printfn $"failed with {code}"
@@ -763,18 +698,14 @@ match result.Outcome with
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
-var o = result.Outcome;
-if (o.IsExited && o.Code.Value == 0)
-    Console.WriteLine("clean");
-else if (o.IsExited)
-    Console.WriteLine($"failed with {o.Code.Value}");
-else if (o.IsSignalled)
-    Console.WriteLine($"killed by signal {o.Signal.Value}");
-else // o.IsTimedOut
-    Console.WriteLine("hit its deadline");
+Console.WriteLine(result.Outcome switch
+{
+    { IsExited: true, Code.Value: 0 }               => "clean",
+    { IsExited: true, Code.Value: var code }        => $"failed with {code}",
+    { IsSignalled: true, Signal.Value: var signal } => $"killed by signal {signal}",
+    { IsSignalled: true }                           => "killed by an unknown signal",
+    _                                               => "hit its deadline", // TimedOut
+});
 ```
 
 `Outcome` carries the same `Code` / `Signal` / `IsTimedOut` accessors as
@@ -794,8 +725,6 @@ timeout / cancellation) — never on a non-zero exit; the success-checking verbs
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match! (Command.create "deploy").Run() with
     | Ok out -> printfn $"{out}"
@@ -809,20 +738,14 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
-var result = await new Command("deploy").Run();
-if (result.IsOk)
-    Console.WriteLine(result.ResultValue);
-else if (result.ErrorValue is ProcessError.NotFound notFound)
-    Console.Error.WriteLine($"not installed: {notFound.program}");
-else if (result.ErrorValue is ProcessError.Exit exit)
-    Console.Error.WriteLine($"{exit.program} exited {exit.code}: {exit.stderr}");
-else if (result.ErrorValue is ProcessError.Timeout t)
-    Console.Error.WriteLine($"{t.program} timed out after {t.timeout}");
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+Console.WriteLine(await new Command("deploy").Run() switch
+{
+    (true, var output, _)               => output,
+    (false, _, ProcessError.NotFound n) => $"not installed: {n.program}",
+    (false, _, ProcessError.Exit e)     => $"{e.program} exited {e.code}: {e.stderr}",
+    (false, _, ProcessError.Timeout t)  => $"{t.program} timed out after {t.timeout}",
+    (false, _, var err)                 => err.Message,
+});
 ```
 
 | Variant | Fields | Meaning |
@@ -857,16 +780,20 @@ match! cmd.Run() with
 **C#**
 
 ```csharp
-var result = await cmd.Run();
-if (result.IsOk)
+switch (await cmd.Run())
 {
+    case (true, _, _):
+        break;
+    case (false, _, { IsNotFound: true }): // NotFound only
+        installThenRetry();
+        break;
+    case (false, _, { IsTransient: true }): // Spawn / Io blips
+        scheduleRetry();
+        break;
+    case (false, _, var err):
+        fail(err);
+        break;
 }
-else if (result.ErrorValue.IsNotFound) // NotFound only
-    installThenRetry();
-else if (result.ErrorValue.IsTransient) // Spawn / Io blips
-    scheduleRetry();
-else
-    fail(result.ErrorValue);
 ```
 
 `ProcessError.isNotFound` is `true` only for `NotFound`; `ProcessError.isTransient`

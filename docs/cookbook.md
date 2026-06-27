@@ -38,8 +38,6 @@ accepted) exit and returns stdout with trailing whitespace trimmed.
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     let cmd = Command.create "git" |> Command.args [ "rev-parse"; "HEAD" ]
 
@@ -52,15 +50,13 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
+var cmd = new Command("git").Args(["rev-parse", "HEAD"]);
 
-var cmd = new Command("git").Args(new[] { "rev-parse", "HEAD" });
-
-var sha = await cmd.Run();
-if (sha.IsOk)
-    Console.WriteLine($"HEAD is {sha.ResultValue}");
-else
-    Console.Error.WriteLine($"git failed: {sha.ErrorValue.Message}");
+Console.WriteLine(await cmd.Run() switch
+{
+    (true, var sha, _)  => $"HEAD is {sha}",
+    (false, _, var err) => $"git failed: {err.Message}",
+});
 ```
 
 The builder is fluent and immutable — each method returns a new `Command`:
@@ -79,7 +75,7 @@ let cmd =
 
 ```csharp
 var cmd = new Command("dotnet")
-    .Args(new[] { "build", "-c", "Release" })
+    .Args(["build", "-c", "Release"])
     .CurrentDir("/repo")
     .Env("DOTNET_NOLOGO", "1");
 ```
@@ -95,7 +91,7 @@ let cmd = (Command "dotnet").Args([ "build"; "-c"; "Release" ]).CurrentDir("/rep
 **C#**
 
 ```csharp
-var cmd = new Command("dotnet").Args(new[] { "build", "-c", "Release" }).CurrentDir("/repo");
+var cmd = new Command("dotnet").Args(["build", "-c", "Release"]).CurrentDir("/repo");
 ```
 
 Use `RunUnit` when you only care that it succeeded:
@@ -111,9 +107,8 @@ match! (Command.create "mkdir" |> Command.arg "out").RunUnit() with
 **C#**
 
 ```csharp
-var result = await new Command("mkdir").Arg("out").RunUnit();
-if (result.IsError)
-    Console.Error.WriteLine(result.ErrorValue.Message);
+if (await new Command("mkdir").Arg("out").RunUnit() is (false, _, var err))
+    Console.Error.WriteLine(err.Message);
 ```
 
 ## Capturing output
@@ -134,15 +129,16 @@ match! (Command.create "ls" |> Command.arg "-la").OutputString() with
 **C#**
 
 ```csharp
-var output = await new Command("ls").Arg("-la").OutputString();
-if (output.IsOk)
+switch (await new Command("ls").Arg("-la").OutputString())
 {
-    var result = output.ResultValue;
-    Console.WriteLine($"exit={result.Code} success={result.IsSuccess} in {result.Duration}");
-    Console.WriteLine(result.Stdout);
+    case (true, var result, _):
+        Console.WriteLine($"exit={result.Code} success={result.IsSuccess} in {result.Duration}");
+        Console.WriteLine(result.Stdout);
+        break;
+    case (false, _, var err):
+        Console.Error.WriteLine(err.Message);
+        break;
 }
-else
-    Console.Error.WriteLine(output.ErrorValue.Message);
 ```
 
 `OutputBytes` is the binary companion (`ProcessResult<byte[]>`), for non-text output.
@@ -166,15 +162,13 @@ match! (Command.create "definitely-not-a-program").OutputString() with
 **C#**
 
 ```csharp
-var output = await new Command("definitely-not-a-program").OutputString();
-if (output.IsOk)
-    Console.WriteLine(output.ResultValue.Stdout);
-else if (output.ErrorValue is ProcessError.NotFound notFound)
-    Console.Error.WriteLine($"not installed: {notFound.program}");
-else if (output.ErrorValue is ProcessError.Timeout timeout)
-    Console.Error.WriteLine($"{timeout.program} timed out after {timeout.timeout}");
-else
-    Console.Error.WriteLine(output.ErrorValue.Message);
+Console.WriteLine(await new Command("definitely-not-a-program").OutputString() switch
+{
+    (true, var result, _)                => result.Stdout,
+    (false, _, ProcessError.NotFound n)  => $"not installed: {n.program}",
+    (false, _, ProcessError.Timeout t)   => $"{t.program} timed out after {t.timeout}",
+    (false, _, var err)                  => err.Message,
+});
 ```
 
 Classifiers help with retry/diagnostic logic:
@@ -192,14 +186,20 @@ match! cmd.Run() with
 **C#**
 
 ```csharp
-var result = await cmd.Run();
-if (result.IsOk) { }
-else if (result.ErrorValue.IsNotFound)
-    installThenRetry();
-else if (result.ErrorValue.IsTransient)
-    scheduleRetry();   // spawn / I/O blips
-else
-    fail(result.ErrorValue);
+switch (await cmd.Run())
+{
+    case (true, _, _):
+        break;
+    case (false, _, { IsNotFound: true }):
+        installThenRetry();
+        break;
+    case (false, _, { IsTransient: true }):
+        scheduleRetry();   // spawn / I/O blips
+        break;
+    case (false, _, var err):
+        fail(err);
+        break;
+}
 ```
 
 The success-requiring verbs (`Run` / `RunUnit`) additionally turn a non-zero exit into
@@ -217,8 +217,8 @@ let! found = (Command.create "which" |> Command.arg "git").Probe()              
 **C#**
 
 ```csharp
-var code = await new Command("grep").Args(new[] { "pattern", "file" }).ExitCode();  // Ok 0 / Ok 1 / ...
-var found = await new Command("which").Arg("git").Probe();                          // Ok true if exit 0
+var code = await new Command("grep").Args(["pattern", "file"]).ExitCode();  // Ok 0 / Ok 1 / ...
+var found = await new Command("which").Arg("git").Probe();                  // Ok true if exit 0
 ```
 
 `Probe` is `true` when the command runs and exits zero — handy for feature detection.
@@ -245,14 +245,14 @@ match! grep.Run() with
 
 ```csharp
 var grep = new Command("grep")
-    .Args(new[] { "ERROR", "app.log" })
-    .OkCodes(new[] { 0, 1 });   // 1 ("no match") is not a failure
+    .Args(["ERROR", "app.log"])
+    .OkCodes([0, 1]);   // 1 ("no match") is not a failure
 
-var result = await grep.Run();
-if (result.IsOk)
-    Console.WriteLine($"matches:\n{result.ResultValue}");
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);   // a real failure (e.g. exit 2)
+Console.WriteLine(await grep.Run() switch
+{
+    (true, var output, _) => $"matches:\n{output}",
+    (false, _, var err)   => err.Message,   // a real failure (e.g. exit 2)
+});
 ```
 
 `OkCodes` sets which exit codes `ProcessResult.IsSuccess`, `Run`/`RunUnit`, and supervisor crash
@@ -328,11 +328,11 @@ var pipeline = new Command("cat").Arg("access.log")
     .Pipe(new Command("grep").Arg("ERROR"))
     .Pipe(new Command("wc").Arg("-l"));
 
-var count = await pipeline.Run();
-if (count.IsOk)
-    Console.WriteLine($"{count.ResultValue} error lines");
-else
-    Console.Error.WriteLine(count.ErrorValue.Message);
+Console.WriteLine(await pipeline.Run() switch
+{
+    (true, var count, _) => $"{count} error lines",
+    (false, _, var err)  => err.Message,
+});
 ```
 
 A pipeline supports the same verbs as a command (`Run`/`OutputString`/`ExitCode`/…) plus
@@ -369,16 +369,10 @@ task {
 **C#**
 
 ```csharp
-var started = await new Command("dotnet").Arg("watch").Start();
-if (started.IsError)
-    Console.Error.WriteLine(started.ErrorValue.Message);
-else
-{
-    await using var proc = started.ResultValue;
+await using var proc = (await new Command("dotnet").Arg("watch").Start()).GetValueOrThrow();
 
-    await foreach (var line in proc.StdoutLines())
-        Console.WriteLine($"> {line}");
-}
+await foreach (var line in proc.StdoutLines())
+    Console.WriteLine($"> {line}");
 ```
 
 From C# this is simply `await foreach (var line in proc.StdoutLines()) { ... }`.
@@ -400,12 +394,11 @@ match proc.TakeStdin() with
 **C#**
 
 ```csharp
-var stdin = proc.TakeStdin();
-if (stdin != null) // FSharpOption: None is null
+if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
-    await stdin.Value.WriteLine("command one");
-    await stdin.Value.Flush();
-    await stdin.Value.Finish();   // close stdin (EOF)
+    await stdin.WriteLine("command one");
+    await stdin.Flush();
+    await stdin.Finish();   // close stdin (EOF)
 }
 ```
 
@@ -431,21 +424,14 @@ match! (Command.create "myserver").Start() with
 **C#**
 
 ```csharp
-using System;
+await using var proc = (await new Command("myserver").Start()).GetValueOrThrow();
 
-var started = await new Command("myserver").Start();
-if (started.IsOk)
+// Wait up to 10s for a log line, a TCP port, or a custom predicate.
+Console.WriteLine(await proc.WaitForLine(l => l.Contains("ready"), TimeSpan.FromSeconds(10)) switch
 {
-    await using var proc = started.ResultValue;
-    // Wait up to 10s for a log line, a TCP port, or a custom predicate.
-    var ready = await proc.WaitForLine(l => l.Contains("ready"), TimeSpan.FromSeconds(10));
-    if (ready.IsOk)
-        Console.WriteLine("server is up");
-    else
-        Console.Error.WriteLine($"never became ready: {ready.ErrorValue.Message}");   // ProcessError.NotReady on timeout
-}
-else
-    Console.Error.WriteLine(started.ErrorValue.Message);
+    (true, _, _)        => "server is up",
+    (false, _, var err) => $"never became ready: {err.Message}",   // ProcessError.NotReady on timeout
+});
 ```
 
 Also `WaitForPort(endpoint, timeout)` and `WaitFor(predicateReturningTask, timeout)`.
@@ -464,8 +450,6 @@ let cmd =
 **C#**
 
 ```csharp
-using System;
-
 var cmd = new Command("slow-job")
     .Timeout(TimeSpan.FromSeconds(30))   // kill at the deadline -> Outcome.TimedOut
     .Retry(3, TimeSpan.FromMilliseconds(200), err => err.IsTransient);
@@ -505,29 +489,16 @@ task {
 **C#**
 
 ```csharp
-using System;
+using var group = ProcessGroup.Create().GetValueOrThrow();   // disposes (and reaps the whole tree) on scope exit
 
-var created = ProcessGroup.Create();
-if (created.IsError)
-    Console.Error.WriteLine(created.ErrorValue.Message);
-else
-{
-    using var group = created.ResultValue;   // disposes (and reaps the whole tree) on scope exit
+await group.Start(new Command("build-everything"));
 
-    var proc = await group.Start(new Command("build-everything"));
-    if (proc.IsOk)
-    {
-        group.Signal(Signal.Term);     // signal the whole tree
-        group.Suspend();               // freeze it
-        group.Resume();                // thaw it
-        var members = group.Members();
-        if (members.IsOk)
-            Console.WriteLine($"{members.ResultValue.Count} processes in the tree");
-        await group.Shutdown(TimeSpan.FromSeconds(5));   // graceful: SIGTERM -> grace -> SIGKILL
-    }
-    else
-        Console.Error.WriteLine(proc.ErrorValue.Message);
-}
+group.Signal(Signal.Term);     // signal the whole tree
+group.Suspend();               // freeze it
+group.Resume();                // thaw it
+if (group.Members() is (true, var pids, _))
+    Console.WriteLine($"{pids.Count} processes in the tree");
+await group.Shutdown(TimeSpan.FromSeconds(5));   // graceful: SIGTERM -> grace -> SIGKILL
 ```
 
 Portable `Signal` values: `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`,
@@ -565,12 +536,13 @@ var options = new ProcessGroupOptions()
     .WithCpuQuota(1.5);                     // 1.5 cores
 
 var created = ProcessGroup.Create(options);
-if (created.IsOk)
+if (created is (false, _, var err))
 {
-    using var group = created.ResultValue;   // ... run within the limited group
+    Console.Error.WriteLine($"limits unavailable: {err.Message}");
+    return;
 }
-else
-    Console.Error.WriteLine($"limits unavailable: {created.ErrorValue.Message}");
+
+using var group = created.GetValueOrThrow();   // ... run within the limited group
 ```
 
 ## Stats and profiling
@@ -590,11 +562,8 @@ let series = group.SampleStats(TimeSpan.FromSeconds 1.0)
 **C#**
 
 ```csharp
-using System;
-
-var stats = group.Stats();
-if (stats.IsOk)
-    Console.WriteLine($"active={stats.ResultValue.ActiveProcessCount} cpu={stats.ResultValue.TotalCpuTime} peak={stats.ResultValue.PeakMemoryBytes}");
+if (group.Stats() is (true, var stats, _))
+    Console.WriteLine($"active={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}");
 
 // A periodic series (IAsyncEnumerable) for live dashboards:
 var series = group.SampleStats(TimeSpan.FromSeconds(1));
@@ -616,13 +585,9 @@ match! (Command.create "heavy-job").Start() with
 **C#**
 
 ```csharp
-var started = await new Command("heavy-job").Start();
-if (started.IsOk)
-{
-    await using var proc = started.ResultValue;
-    var profile = await proc.Profile();
-    Console.WriteLine($"exit={profile.ExitCode} cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} samples={profile.Samples}");
-}
+await using var proc = (await new Command("heavy-job").Start()).GetValueOrThrow();
+var profile = await proc.Profile();
+Console.WriteLine($"exit={profile.ExitCode} cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} samples={profile.Samples}");
 ```
 
 ## Supervision
@@ -651,8 +616,6 @@ match! outcome with
 **C#**
 
 ```csharp
-using System;
-
 var outcome = new Supervisor(new Command("worker"))
     .Restart(RestartPolicy.OnCrash)
     .Backoff(TimeSpan.FromSeconds(1), 2.0)        // base delay, multiplier
@@ -662,11 +625,11 @@ var outcome = new Supervisor(new Command("worker"))
     .StormPause(TimeSpan.FromMinutes(5))          // pause after a burst of failures
     .Run();
 
-var result = await outcome;
-if (result.IsOk)
-    Console.WriteLine($"stopped: {result.ResultValue.Stopped} after {result.ResultValue.Restarts} restarts");
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+Console.WriteLine(await outcome switch
+{
+    (true, var result, _) => $"stopped: {result.Stopped} after {result.Restarts} restarts",
+    (false, _, var err)   => err.Message,
+});
 ```
 
 Supervision runs through any `IProcessRunner` (`WithRunner`), so it is testable without
@@ -690,13 +653,11 @@ let! log = git.OutputString [ "log"; "--oneline"; "-n"; "10" ]
 **C#**
 
 ```csharp
-using System;
-
 var git = new CliClient("git")
     .WithDefaults(c => c.CurrentDir("/repo").Timeout(TimeSpan.FromSeconds(30)));
 
-var sha = await git.Run(new[] { "rev-parse", "HEAD" });
-var log = await git.OutputString(new[] { "log", "--oneline", "-n", "10" });
+var sha = await git.Run(["rev-parse", "HEAD"]);
+var log = await git.OutputString(["log", "--oneline", "-n", "10"]);
 ```
 
 `WithDefaults` configures the shared defaults with the full `Command` builder; `client.Command args`
@@ -716,8 +677,8 @@ let! info = Exec.outputString "dotnet" [ "--info" ]
 **C#**
 
 ```csharp
-var sha = await Exec.run("git", new[] { "rev-parse", "HEAD" });
-var info = await Exec.outputString("dotnet", new[] { "--info" });
+var sha = await Exec.run("git", ["rev-parse", "HEAD"]);
+var info = await Exec.outputString("dotnet", ["--info"]);
 ```
 
 Run a batch with bounded concurrency, collecting every result in input order (never
@@ -734,9 +695,6 @@ let! results = Exec.outputAll 4 runner commands CancellationToken.None // at mos
 **C#**
 
 ```csharp
-using System.Linq;
-using System.Threading;
-
 var runner = new JobRunner();
 var commands = files.Select(f => new Command("gzip").Arg(f));
 var results = await Exec.outputAll(4, runner, commands, CancellationToken.None); // at most 4 live at once
@@ -768,9 +726,6 @@ The `ProcessKit.Extensions.DependencyInjection` package registers an `IProcessRu
 **F#**
 
 ```fsharp
-open Microsoft.Extensions.DependencyInjection
-open ProcessKit.Extensions.DependencyInjection
-
 services.AddProcessKit() |> ignore
 // When the container also has an ILoggerFactory, runs emit ProcessKit's lifecycle events.
 
@@ -782,22 +737,12 @@ type Deployer(runner: IProcessRunner) =
 **C#**
 
 ```csharp
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.FSharp.Core;
-using ProcessKit;
-using ProcessKit.Extensions.DependencyInjection;
-using System.Threading;
-using System.Threading.Tasks;
-
 services.AddProcessKit();
 // When the container also has an ILoggerFactory, runs emit ProcessKit's lifecycle events.
 
 // Later, injected as IProcessRunner:
-public class Deployer
+public class Deployer(IProcessRunner runner)
 {
-    private readonly IProcessRunner runner;
-    public Deployer(IProcessRunner runner) => this.runner = runner;
-
     public Task<FSharpResult<string, ProcessError>> Deploy() =>
         runner.Run(new Command("deploy"), CancellationToken.None);
 }
@@ -813,8 +758,6 @@ canned replies:
 **F#**
 
 ```fsharp
-open ProcessKit.Testing
-
 let runner =
     (ScriptedRunner())
         .On([ "git"; "rev-parse"; "HEAD" ], Reply.Ok "abc123")
@@ -828,17 +771,13 @@ let! sha = Runner.run runner CancellationToken.None (Command.create "git" |> Com
 **C#**
 
 ```csharp
-using ProcessKit;
-using ProcessKit.Testing;
-using System.Threading;
-
 var runner = new ScriptedRunner()
-    .On(new[] { "git", "rev-parse", "HEAD" }, Reply.Ok("abc123"))
+    .On(["git", "rev-parse", "HEAD"], Reply.Ok("abc123"))
     .When(cmd => cmd.Program == "flaky", Reply.Fail(1, "boom"))
     .Fallback(Reply.Ok(""));
 
 // Inject `runner` wherever an IProcessRunner is expected — no real processes run.
-var sha = await runner.Run(new Command("git").Args(new[] { "rev-parse", "HEAD" }), CancellationToken.None);
+var sha = await runner.Run(new Command("git").Args(["rev-parse", "HEAD"]), CancellationToken.None);
 ```
 
 `RecordReplayRunner` records real runs to a JSON cassette and replays them hermetically:
@@ -860,20 +799,17 @@ match RecordReplayRunner.Replay "fixture.json" with
 **C#**
 
 ```csharp
-using ProcessKit;
-using ProcessKit.Testing;
-
 // Record (wraps a real runner), then save:
 var recorder = RecordReplayRunner.Record("fixture.json", new JobRunner());
 // ... drive recorder as an IProcessRunner ...
 recorder.Save();
 
 // Replay later with no subprocess (an unmatched call is ProcessError.CassetteMiss):
-var replay = RecordReplayRunner.Replay("fixture.json");
-if (replay.IsOk)
+var (ok, replay, err) = RecordReplayRunner.Replay("fixture.json");
+if (ok)
 {
-    // use replay.ResultValue as an IProcessRunner
+    // use `replay` as an IProcessRunner
 }
 else
-    Console.Error.WriteLine(replay.ErrorValue.Message);
+    Console.Error.WriteLine(err.Message);
 ```

@@ -19,6 +19,8 @@
 	     everything it depends on and before everything that depends on it. -->
 	<ItemGroup>
 		<Compile Include="ProcessError.fs" />
+		<Compile Include="ProcessException.fs" />
+		<Compile Include="ResultExtensions.fs" />
 		<Compile Include="Outcome.fs" />
 		<Compile Include="Log.fs" />
 		<Compile Include="Mechanism.fs" />

@@ -34,9 +34,6 @@ one-shot run.
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     match! (Command.create "dev-server").Start() with
     | Error err -> eprintfn $"could not start: {err.Message}"
@@ -55,23 +52,14 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
+await using var proc = (await new Command("dev-server").Start()).GetValueOrThrow(); // disposing the handle kills the whole tree
 
-var started = await new Command("dev-server").Start();
-if (started.IsError)
-    Console.Error.WriteLine($"could not start: {started.ErrorValue.Message}");
-else
-{
-    await using var proc = started.ResultValue; // disposing the handle kills the whole tree
+Console.WriteLine($"pid={proc.Pid} started {proc.StartTime:o}");
+// ... drive the process: stream, write stdin, probe for readiness ...
+Console.WriteLine($"alive for {proc.Elapsed}; {proc.StdoutLineCount} stdout lines so far");
 
-    Console.WriteLine($"pid={proc.Pid} started {proc.StartTime:o}");
-    // ... drive the process: stream, write stdin, probe for readiness ...
-    Console.WriteLine($"alive for {proc.Elapsed}; {proc.StdoutLineCount} stdout lines so far");
-
-    var outcome = await proc.Wait(); // Outcome: Exited code / Signalled sig / TimedOut
-    Console.WriteLine($"exited: {outcome}");
-}
+var outcome = await proc.Wait(); // Outcome: Exited code / Signalled sig / TimedOut
+Console.WriteLine($"exited: {outcome}");
 ```
 
 `Start()` puts the child in a **private group the handle owns**: dropping the
@@ -108,8 +96,6 @@ drive the enumerator directly:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match! (Command.create "git" |> Command.args [ "log"; "--oneline"; "-n"; "50" ]).Start() with
     | Error err -> eprintfn $"{err.Message}"
@@ -132,19 +118,10 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
+await using var proc = (await new Command("git").Args(["log", "--oneline", "-n", "50"]).Start()).GetValueOrThrow();
 
-var started = await new Command("git").Args(new[] { "log", "--oneline", "-n", "50" }).Start();
-if (started.IsError)
-    Console.Error.WriteLine(started.ErrorValue.Message);
-else
-{
-    await using var proc = started.ResultValue;
-
-    await foreach (var line in proc.StdoutLines())
-        Console.WriteLine($"commit: {line}");
-}
+await foreach (var line in proc.StdoutLines())
+    Console.WriteLine($"commit: {line}");
 ```
 
 From C# the same loop is simply `await foreach (var line in proc.StdoutLines()) { ... }`.
@@ -164,8 +141,6 @@ progress to one and diagnostics to the other — `OutputEvents()` returns an
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match! (Command.create "dotnet" |> Command.args [ "build"; "-c"; "Release" ]).Start() with
     | Error err -> eprintfn $"{err.Message}"
@@ -191,23 +166,14 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
+await using var proc = (await new Command("dotnet").Args(["build", "-c", "Release"]).Start()).GetValueOrThrow();
 
-var started = await new Command("dotnet").Args(new[] { "build", "-c", "Release" }).Start();
-if (started.IsError)
-    Console.Error.WriteLine(started.ErrorValue.Message);
-else
+await foreach (var ev in proc.OutputEvents())
 {
-    await using var proc = started.ResultValue;
-
-    await foreach (var ev in proc.OutputEvents())
-    {
-        if (ev.IsStdout)
-            Console.WriteLine($"out| {ev.Text}");
-        else
-            Console.Error.WriteLine($"err| {ev.Text}");
-    }
+    if (ev.IsStdout)
+        Console.WriteLine($"out| {ev.Text}");
+    else
+        Console.Error.WriteLine($"err| {ev.Text}");
 }
 ```
 
@@ -224,8 +190,6 @@ that was drained while you streamed:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match! (Command.create "build-everything").Start() with
     | Error err -> eprintfn $"{err.Message}"
@@ -254,28 +218,14 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
+await using var proc = (await new Command("build-everything").Start()).GetValueOrThrow();
 
-var started = await new Command("build-everything").Start();
-if (started.IsError)
-    Console.Error.WriteLine(started.ErrorValue.Message);
-else
-{
-    await using var proc = started.ResultValue;
+await foreach (var line in proc.StdoutLines())
+    Console.WriteLine($"> {line}");
 
-    await foreach (var line in proc.StdoutLines())
-        Console.WriteLine($"> {line}");
-
-    var finished = await proc.Finish();
-    if (finished.IsOk)
-    {
-        if (!finished.ResultValue.Outcome.Equals(Outcome.NewExited(0)))
-            Console.Error.WriteLine($"failed ({finished.ResultValue.Outcome}):\n{finished.ResultValue.Stderr}");
-    }
-    else
-        Console.Error.WriteLine(finished.ErrorValue.Message);
-}
+var finished = (await proc.Finish()).GetValueOrThrow();
+if (finished.Outcome is not { IsExited: true, Code.Value: 0 }) // anything but a clean exit 0
+    Console.Error.WriteLine($"failed ({finished.Outcome}):\n{finished.Stderr}");
 ```
 
 Use `Finish()` after you have streamed stdout. If you only need the exit status and
@@ -293,8 +243,6 @@ taken):
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     // `bc` evaluates each stdin line and prints the result.
     match! (Command.create "bc" |> Command.keepStdinOpen).Start() with
@@ -317,26 +265,17 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-
 // `bc` evaluates each stdin line and prints the result.
-var started = await new Command("bc").KeepStdinOpen().Start();
-if (started.IsError)
-    Console.Error.WriteLine(started.ErrorValue.Message);
-else
+await using var proc = (await new Command("bc").KeepStdinOpen().Start()).GetValueOrThrow();
+
+if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
-    await using var proc = started.ResultValue;
-
-    var stdin = proc.TakeStdin();
-    if (stdin != null) // FSharpOption: None is null
-    {
-        await stdin.Value.WriteLine("2 + 2"); // writes "2 + 2\n", flushed
-        await stdin.Value.WriteLine("6 * 7");
-        await stdin.Value.Finish(); // send EOF so bc exits
-    }
-
-    // ... then read proc.StdoutLines() for the answers.
+    await stdin.WriteLine("2 + 2"); // writes "2 + 2\n", flushed
+    await stdin.WriteLine("6 * 7");
+    await stdin.Finish(); // send EOF so bc exits
 }
+
+// ... then read proc.StdoutLines() for the answers.
 ```
 
 `ProcessStdin` offers `WriteLine(line)` (appends a newline and flushes),
@@ -355,8 +294,6 @@ the child produces output, write stdin from one task and drain stdout from anoth
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match! (Command.create "transform" |> Command.keepStdinOpen).Start() with
     | Error err -> eprintfn $"{err.Message}"
@@ -395,33 +332,24 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
+await using var proc = (await new Command("transform").KeepStdinOpen().Start()).GetValueOrThrow();
 
-var started = await new Command("transform").KeepStdinOpen().Start();
-if (started.IsError)
-    Console.Error.WriteLine(started.ErrorValue.Message);
-else
+if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
-    await using var proc = started.ResultValue;
-
-    var stdin = proc.TakeStdin();
-    if (stdin != null) // FSharpOption: None is null
+    // Producer: feed a large stdin on its own task.
+    var writer = Task.Run(async () =>
     {
-        // Producer: feed a large stdin on its own task.
-        var writer = Task.Run(async () =>
-        {
-            foreach (var line in bigInput)
-                await stdin.Value.WriteLine(line);
+        foreach (var line in bigInput)
+            await stdin.WriteLine(line);
 
-            await stdin.Value.Finish();
-        });
+        await stdin.Finish();
+    });
 
-        // Consumer: drain stdout concurrently on this task.
-        await foreach (var line in proc.StdoutLines())
-            handle(line);
+    // Consumer: drain stdout concurrently on this task.
+    await foreach (var line in proc.StdoutLines())
+        handle(line);
 
-        await writer;
-    }
+    await writer;
 }
 ```
 
@@ -440,10 +368,6 @@ returning a `Result`:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-open System.Net
-
 task {
     match! (Command.create "my-server").Start() with
     | Error err -> eprintfn $"{err.Message}"
@@ -473,42 +397,31 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-using System.Net;
+await using var proc = (await new Command("my-server").Start()).GetValueOrThrow();
 
-var started = await new Command("my-server").Start();
-if (started.IsError)
-    Console.Error.WriteLine(started.ErrorValue.Message);
-else
+// 1. A line on stdout (returns the matching line):
+Console.WriteLine(await proc.WaitForLine(line => line.Contains("listening on"), TimeSpan.FromSeconds(10)) switch
 {
-    await using var proc = started.ResultValue;
+    (true, var banner, _)                => $"server says: {banner}",
+    (false, _, ProcessError.NotReady nr) => $"{nr.program} not ready after {nr.timeout}",
+    (false, _, var err)                  => err.Message,
+});
 
-    // 1. A line on stdout (returns the matching line):
-    var banner = await proc.WaitForLine(line => line.Contains("listening on"), TimeSpan.FromSeconds(10));
-    if (banner.IsOk)
-        Console.WriteLine($"server says: {banner.ResultValue}");
-    else if (banner.ErrorValue is ProcessError.NotReady nr)
-        Console.Error.WriteLine($"{nr.program} not ready after {nr.timeout}");
-    else
-        Console.Error.WriteLine(banner.ErrorValue.Message);
+// 2. A TCP port accepting connections:
+var endpoint = new IPEndPoint(IPAddress.Loopback, 8080);
 
-    // 2. A TCP port accepting connections:
-    var endpoint = new IPEndPoint(IPAddress.Loopback, 8080);
+Console.WriteLine(await proc.WaitForPort(endpoint, TimeSpan.FromSeconds(10)) switch
+{
+    (true, _, _)        => "port is open",
+    (false, _, var err) => err.Message,
+});
 
-    var port = await proc.WaitForPort(endpoint, TimeSpan.FromSeconds(10));
-    if (port.IsOk)
-        Console.WriteLine("port is open");
-    else
-        Console.Error.WriteLine(port.ErrorValue.Message);
-
-    // 3. Any async predicate (an HTTP /health endpoint, a file appearing, …):
-    var healthy = await proc.WaitFor(() => healthCheck(), TimeSpan.FromSeconds(10));
-    if (healthy.IsOk)
-        Console.WriteLine("healthy");
-    else
-        Console.Error.WriteLine(healthy.ErrorValue.Message);
-}
+// 3. Any async predicate (an HTTP /health endpoint, a file appearing, …):
+Console.WriteLine(await proc.WaitFor(() => healthCheck(), TimeSpan.FromSeconds(10)) switch
+{
+    (true, _, _)        => "healthy",
+    (false, _, var err) => err.Message,
+});
 ```
 
 Probe semantics are deliberately uniform:
@@ -537,9 +450,6 @@ returns `Result<WaitAnyResult, ProcessError>`, where `WaitAnyResult` carries the
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     // Bound the race with a per-command Timeout — WaitAny applies none of its own.
     let withDeadline name =
@@ -564,34 +474,18 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 // Bound the race with a per-command Timeout — WaitAny applies none of its own.
 Command withDeadline(string name) =>
     new Command(name).Timeout(TimeSpan.FromSeconds(30));
 
-var startedA = await withDeadline("replica-a").Start();
-if (startedA.IsError)
-    Console.Error.WriteLine(startedA.ErrorValue.Message);
-else
+await using var a = (await withDeadline("replica-a").Start()).GetValueOrThrow();
+await using var b = (await withDeadline("replica-b").Start()).GetValueOrThrow();
+
+Console.WriteLine(await RunningProcess.WaitAny([a, b]) switch
 {
-    await using var a = startedA.ResultValue;
-
-    var startedB = await withDeadline("replica-b").Start();
-    if (startedB.IsError)
-        Console.Error.WriteLine(startedB.ErrorValue.Message);
-    else
-    {
-        await using var b = startedB.ResultValue;
-
-        var result = await RunningProcess.WaitAny(new[] { a, b });
-        if (result.IsOk)
-            Console.WriteLine($"contender #{result.ResultValue.Index} exited first with {result.ResultValue.Outcome}");
-        else
-            Console.Error.WriteLine(result.ErrorValue.Message);
-    }
-}
+    (true, var first, _) => $"contender #{first.Index} exited first with {first.Outcome}",
+    (false, _, var err)  => err.Message,
+});
 ```
 
 To join a fixed set instead of racing it, `RunningProcess.WaitAll` waits for *all* of
@@ -608,7 +502,7 @@ printfn $"{outcomes.Length} children done"
 **C#**
 
 ```csharp
-var outcomes = await RunningProcess.WaitAll(new[] { a, b });
+var outcomes = await RunningProcess.WaitAll([a, b]);
 Console.WriteLine($"{outcomes.Length} children done");
 ```
 
@@ -624,9 +518,6 @@ run into a summary. The live gauges read the *child process itself* at any momen
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     match! (Command.create "crunch").Start() with
     | Error err -> eprintfn $"{err.Message}"
@@ -647,25 +538,16 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
+await using var proc = (await new Command("crunch").Start()).GetValueOrThrow();
 
-var started = await new Command("crunch").Start();
-if (started.IsError)
-    Console.Error.WriteLine(started.ErrorValue.Message);
-else
-{
-    await using var proc = started.ResultValue;
+// Live, mid-run:
+Console.WriteLine($"pid={proc.Pid} elapsed={proc.Elapsed} cpu={proc.CpuTime} peak={proc.PeakMemoryBytes}");
 
-    // Live, mid-run:
-    Console.WriteLine($"pid={proc.Pid} elapsed={proc.Elapsed} cpu={proc.CpuTime} peak={proc.PeakMemoryBytes}");
+// Capture + sample on an interval until exit (returns a RunProfile directly):
+var profile = await proc.Profile(TimeSpan.FromMilliseconds(100));
 
-    // Capture + sample on an interval until exit (returns a RunProfile directly):
-    var profile = await proc.Profile(TimeSpan.FromMilliseconds(100));
-
-    Console.WriteLine($"exit={profile.ExitCode} wall={profile.Duration} samples={profile.Samples}");
-    Console.WriteLine($"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}");
-}
+Console.WriteLine($"exit={profile.ExitCode} wall={profile.Duration} samples={profile.Samples}");
+Console.WriteLine($"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}");
 ```
 
 `Profile()` with no argument uses a default sampling interval; `Profile(interval)`

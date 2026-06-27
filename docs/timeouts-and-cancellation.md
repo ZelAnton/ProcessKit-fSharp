@@ -34,9 +34,6 @@ grandchildren die too. The run's `Outcome` becomes `Outcome.TimedOut`.
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     // Captured: a non-zero exit / timeout is data on the capture verbs.
     let cmd =
@@ -55,21 +52,17 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 // Captured: a non-zero exit / timeout is data on the capture verbs.
 var cmd = new Command("slow-tool")
     .Timeout(TimeSpan.FromSeconds(5));
 
-var result = await cmd.OutputString();
-if (result.IsOk && result.ResultValue.IsTimedOut)
+Console.WriteLine(await cmd.OutputString() switch
+{
     // Code is None on a timeout; the partial output captured before the kill is kept.
-    Console.WriteLine($"timed out; partial stdout before the kill: {result.ResultValue.Stdout}");
-else if (result.IsOk)
-    Console.WriteLine($"exited {result.ResultValue.Code}: {result.ResultValue.Stdout}");
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+    (true, { IsTimedOut: true } result, _) => $"timed out; partial stdout before the kill: {result.Stdout}",
+    (true, var result, _)                  => $"exited {result.Code}: {result.Stdout}",
+    (false, _, var err)                    => err.Message,
+});
 ```
 
 The same command finished with a success-checking verb raises the deadline as a
@@ -78,9 +71,6 @@ typed error instead:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     let cmd =
         Command.create "slow-tool"
@@ -97,22 +87,15 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var cmd = new Command("slow-tool")
     .Timeout(TimeSpan.FromSeconds(5));
 
-var result = await cmd.Run();
-if (result.IsOk)
-    Console.WriteLine(result.ResultValue);
-else if (result.ErrorValue.IsTimeout)
+Console.WriteLine(await cmd.Run() switch
 {
-    var err = (ProcessError.Timeout)result.ErrorValue;
-    Console.Error.WriteLine($"{err.program} exceeded {err.timeout}");
-}
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+    (true, var stdout, _) => stdout,
+    (false, _, ProcessError.Timeout { program: var p, timeout: var t }) => $"{p} exceeded {t}",
+    (false, _, var err) => err.Message,
+});
 ```
 
 `ProcessError.Timeout(program, timeout, stdout, stderr)` carries the partial
@@ -138,9 +121,6 @@ ends the grace early.
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     let cmd =
         Command.create "slow-tool"
@@ -155,9 +135,6 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var cmd = new Command("slow-tool")
     .Timeout(TimeSpan.FromSeconds(30))
     .TimeoutGrace(TimeSpan.FromSeconds(5)); // SIGTERM, wait up to 5s, then SIGKILL
@@ -192,9 +169,6 @@ and the outcome is readable afterwards:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     let cmd =
         Command.create "chatty-job"
@@ -226,28 +200,19 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var cmd = new Command("chatty-job")
     .Timeout(TimeSpan.FromSeconds(10));
 
-var started = await cmd.Start();
-if (started.IsOk)
-{
-    await using var proc = started.ResultValue;
+await using var proc = (await cmd.Start()).GetValueOrThrow();
 
-    await foreach (var line in proc.StdoutLines())
-        Console.WriteLine($"> {line}"); // the stream ends when the deadline kills the tree
+await foreach (var line in proc.StdoutLines())
+    Console.WriteLine($"> {line}"); // the stream ends when the deadline kills the tree
 
-    var finished = await proc.Finish();
-    if (finished.IsOk && finished.ResultValue.Outcome.IsTimedOut)
-        Console.Error.WriteLine("killed at the deadline");
-    else if (finished.IsError)
-        Console.Error.WriteLine(finished.ErrorValue.Message);
-}
-else
-    Console.Error.WriteLine(started.ErrorValue.Message);
+var finished = await proc.Finish();
+if (finished is (true, { Outcome.IsTimedOut: true }, _))
+    Console.Error.WriteLine("killed at the deadline");
+else if (finished is (false, _, var err))
+    Console.Error.WriteLine(err.Message);
 ```
 
 ## Retries
@@ -263,9 +228,6 @@ the command at most four times.
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     let cmd =
         Command.create "curl"
@@ -291,11 +253,8 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var cmd = new Command("curl")
-    .Args(new[] { "-fsS", "https://example.com/api" })
+    .Args(["-fsS", "https://example.com/api"])
     .Timeout(TimeSpan.FromSeconds(10))
     .Retry(
         3,
@@ -304,13 +263,13 @@ var cmd = new Command("curl")
             // transient (spawn/I/O), a timeout, or curl's "couldn't connect" (exit 7)
             err.IsTransient
             || err.IsTimeout
-            || (err.IsExit && ((ProcessError.Exit)err).code == 7));
+            || err is ProcessError.Exit { code: 7 });
 
-var result = await cmd.Run();
-if (result.IsOk)
-    Console.WriteLine(result.ResultValue);
-else
-    Console.Error.WriteLine($"gave up: {result.ErrorValue.Message}");
+Console.WriteLine(await cmd.Run() switch
+{
+    (true, var body, _) => body,
+    (false, _, var err) => $"gave up: {err.Message}",
+});
 ```
 
 The two built-in classifiers are ready to drop in as predicates:
@@ -366,9 +325,6 @@ Every verb has a `CancellationToken` overload (`cmd.Run(token)`,
 **F#**
 
 ```fsharp
-open ProcessKit
-open System.Threading
-
 task {
     use cts = new CancellationTokenSource()
     let job = (Command.create "long-export").Run(cts.Token)
@@ -385,22 +341,14 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-using System.Threading;
-
 using var cts = new CancellationTokenSource();
 var job = new Command("long-export").Run(cts.Token);
 
 // elsewhere — a shutdown signal, a sibling failure, a UI button:
 cts.Cancel();
 
-var result = await job;
-if (result.IsError && result.ErrorValue.IsCancelled)
-{
-    var cancelled = (ProcessError.Cancelled)result.ErrorValue;
-    Console.WriteLine($"{cancelled.program} cancelled");
-}
+if (await job is (false, _, ProcessError.Cancelled { program: var p }))
+    Console.WriteLine($"{p} cancelled");
 ```
 
 Or tie a token to a command for its whole lifetime with `Command.CancelOn(token)`
@@ -443,9 +391,6 @@ A whole **pipeline** has its own deadline and token, bounding the entire chain:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     let pipeline =
         (Command.create "producer")
@@ -462,19 +407,16 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var pipeline = new Command("producer")
     .Pipe(new Command("consumer"))
     .Timeout(TimeSpan.FromSeconds(30))   // whole-chain deadline (mirror: Pipeline.timeout)
     .CancelOn(shutdownToken);            // whole-chain token   (mirror: Pipeline.cancelOn)
 
-var result = await pipeline.OutputString();
-if (result.IsOk)
-    Console.WriteLine($"timedOut={result.ResultValue.IsTimedOut}");
-else
-    Console.Error.WriteLine(result.ErrorValue.Message); // ProcessError.Cancelled when the token fires
+Console.WriteLine(await pipeline.OutputString() switch
+{
+    (true, var result, _) => $"timedOut={result.IsTimedOut}",
+    (false, _, var err)   => err.Message, // ProcessError.Cancelled when the token fires
+});
 ```
 
 `Pipeline.Timeout` tears the shared group down at the deadline and reports the
@@ -490,9 +432,6 @@ them:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 let gh =
     (CliClient.create "gh")
         .WithDefaults(fun c ->
@@ -504,9 +443,6 @@ let gh =
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var gh = new CliClient("gh")
     .WithDefaults(c =>
         c

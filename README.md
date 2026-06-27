@@ -17,12 +17,9 @@ mockable runner seam for subprocess-free tests.
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
-    let! version = (Command.create "dotnet" |> Command.arg "--version").Run()
-    match version with
-    | Ok v -> printfn $"{v}"
+    match! (Command.create "dotnet" |> Command.arg "--version").Run() with
+    | Ok version -> printfn $"{version}"
     | Error err -> eprintfn $"{err.Message}"
 }
 ```
@@ -30,13 +27,11 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-
-var version = await new Command("dotnet").Arg("--version").Run();
-if (version.IsOk)
-    Console.WriteLine(version.ResultValue);
-else
-    Console.Error.WriteLine(version.ErrorValue.Message);
+Console.WriteLine(await new Command("dotnet").Arg("--version").Run() switch
+{
+    (true, var version, _) => version,
+    (false, _, var err)    => $"error: {err.Message}",
+});
 ```
 
 ![Cover](https://raw.githubusercontent.com/ZelAnton/ProcessKit-fSharp/main/cover.png)
@@ -79,6 +74,10 @@ unit (Job Object / cgroup v2 / process group), not just the direct child.
 > author's earlier C# `ProcessKit` package (published through 1.3.2); its first release is
 > **2.0.0**. The public API targets [Semantic Versioning](https://semver.org/): breaking changes
 > land only in a new major version. See [`CHANGELOG.md`](CHANGELOG.md).
+>
+> **Although ProcessKit is implemented in F#, it is designed for first-class, idiomatic use from
+> both F# and C#** — every public API is meant to be called naturally from either language, and
+> every example in this README and the [guides](docs/README.md) is shown in both.
 
 ## Install
 
@@ -88,12 +87,14 @@ dotnet add package ProcessKit
 dotnet add package ProcessKit.Extensions.DependencyInjection
 ```
 
-Targets **.NET 8.0** and **.NET 10.0**, and is built to be used from **F# and C# alike**. Every
-example below is shown in both languages. F# snippets assume `open ProcessKit` and run inside a
-`task { }`; C# snippets assume `using ProcessKit;` and run inside an `async` method. Every verb
-returns `Task<Result<_, ProcessError>>` — in C# that is an `FSharpResult<_, ProcessError>` you
-consume with `.IsOk` / `.ResultValue` / `.ErrorValue` (and `err.Message` for a human-readable
-description).
+Targets **.NET 8.0** and **.NET 10.0**, and is built for first-class use from **F# and C# alike** —
+every example below is shown in both. To keep them on the usage code, the snippets omit `open` /
+`using` directives: assume `open ProcessKit` (plus the relevant `System` opens) inside a `task { }`
+in F#, and `using ProcessKit;` (plus the implicit `System` usings) inside an `async` method in C#.
+Every verb returns `Task<Result<_, ProcessError>>`; from C# you pattern-match it —
+`result switch { (true, var value, _) => …, (false, _, var err) => … }`, `result.Match(onOk, onError)`,
+`if (result.TryGetValue(out var value, out var error))`, or `result.GetValueOrThrow()` (throws
+`ProcessException`).
 
 ## Picking a verb
 
@@ -118,8 +119,6 @@ The same vocabulary repeats on every layer (`IProcessRunner`, `CliClient`, `Pipe
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     // Capture output; a non-zero exit does not error on its own.
     match! (Command.create "git" |> Command.args [ "rev-parse"; "HEAD" ]).OutputString() with
@@ -153,43 +152,32 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 // Capture output; a non-zero exit does not error on its own.
-var status = await new Command("git").Args(new[] { "rev-parse", "HEAD" }).OutputString();
-if (status.IsOk)
-    Console.WriteLine($"HEAD is {status.ResultValue.Stdout.Trim()}");
-else
-    Console.Error.WriteLine(status.ErrorValue.Message);
+Console.WriteLine(await new Command("git").Args(["rev-parse", "HEAD"]).OutputString() switch
+{
+    (true, var result, _) => $"HEAD is {result.Stdout.Trim()}",
+    (false, _, var err)   => err.Message,
+});
 
 // Require success and get trimmed stdout directly.
-var version = await new Command("dotnet").Arg("--version").Run();
-if (version.IsOk)
-    Console.WriteLine(version.ResultValue);
-else
-    Console.Error.WriteLine(version.ErrorValue.Message);
+Console.WriteLine(await new Command("dotnet").Arg("--version").Run() switch
+{
+    (true, var version, _) => version,
+    (false, _, var err)    => err.Message,
+});
 
 // Feed stdin.
-var sort = new Command("sort").Stdin(Stdin.FromString("banana\napple\n"));
-var sorted = await sort.OutputString();
-if (sorted.IsOk)
-    Console.WriteLine(sorted.ResultValue.Stdout);
-else
-    Console.Error.WriteLine(sorted.ErrorValue.Message);
-
-// Share one kill-on-dispose group across several children; disposing the group reaps the
-// whole tree.
-var created = ProcessGroup.Create();
-if (created.IsOk)
+Console.WriteLine(await new Command("sort").Stdin(Stdin.FromString("banana\napple\n")).OutputString() switch
 {
-    using var group = created.ResultValue;
-    await group.Start(new Command("some-server"));
-    // ... work ...
-    await group.Shutdown(TimeSpan.FromSeconds(5)); // graceful: SIGTERM → wait → SIGKILL (Unix); atomic on Windows
-}
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+    (true, var sorted, _) => sorted.Stdout,
+    (false, _, var err)   => err.Message,
+});
+
+// Share one kill-on-dispose group across several children; disposing the group reaps the whole tree.
+using var group = ProcessGroup.Create().GetValueOrThrow();
+await group.Start(new Command("some-server"));
+// ... work ...
+await group.Shutdown(TimeSpan.FromSeconds(5)); // graceful: SIGTERM → wait → SIGKILL (Unix); atomic on Windows
 ```
 
 ## Documentation
@@ -236,8 +224,6 @@ runaway or untrusted child tree can't exhaust the host:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     let options =
         ProcessGroupOptions()
@@ -257,23 +243,21 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var options = new ProcessGroupOptions()
     .WithMemoryMax(512L * 1024L * 1024L) // 512 MiB across the tree
     .WithMaxProcesses(64)
     .WithCpuQuota(0.5);                   // half of one core
 
 var created = ProcessGroup.Create(options);
-if (created.IsOk)
+if (created is (false, _, var limitErr))
 {
-    using var group = created.ResultValue;
-    await group.Start(new Command("untrusted-tool"));
-    // ... work ...
+    Console.Error.WriteLine($"limits unavailable: {limitErr.Message}"); // ProcessError.ResourceLimit
+    return;
 }
-else
-    Console.Error.WriteLine($"limits unavailable: {created.ErrorValue.Message}"); // ProcessError.ResourceLimit
+
+using var group = created.GetValueOrThrow();
+await group.Start(new Command("untrusted-tool"));
+// ... work ...
 ```
 
 `WithCpuQuota` is a fraction of a **single** core (`0.5` = half a core, `2.0` = two cores); on
@@ -292,8 +276,6 @@ and thaw the whole tree:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match ProcessGroup.Create() with
     | Ok group ->
@@ -310,21 +292,12 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
+using var group = ProcessGroup.Create().GetValueOrThrow();
+await group.Start(new Command("my-server"));
 
-var created = ProcessGroup.Create();
-if (created.IsOk)
-{
-    using var group = created.ResultValue;
-    await group.Start(new Command("my-server"));
-
-    group.Signal(Signal.Hup); // e.g. "reload configuration"
-    group.Suspend();          // freeze the whole tree…
-    group.Resume();           // …and let it run again
-}
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+group.Signal(Signal.Hup); // e.g. "reload configuration"
+group.Suspend();          // freeze the whole tree…
+group.Resume();           // …and let it run again
 ```
 
 Signals are POSIX-only: on Windows just `Signal.Kill` is deliverable (it maps to the Job Object
@@ -343,8 +316,6 @@ long-lived children:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match ProcessGroup.Create() with
     | Ok group ->
@@ -369,31 +340,18 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
+using var group = ProcessGroup.Create().GetValueOrThrow();
+var a = (await group.Start(new Command("server-a"))).GetValueOrThrow();
+var b = (await group.Start(new Command("server-b"))).GetValueOrThrow();
 
-var created = ProcessGroup.Create();
-if (created.IsOk)
+if (group.Members() is (true, var pids, _))
+    Console.WriteLine($"live pids: {string.Join(", ", pids)}");
+
+Console.WriteLine(await RunningProcess.WaitAny([a, b]) switch
 {
-    using var group = created.ResultValue;
-    var a = await group.Start(new Command("server-a"));
-    var b = await group.Start(new Command("server-b"));
-
-    if (a.IsOk && b.IsOk)
-    {
-        var members = group.Members();
-        if (members.IsOk)
-            Console.WriteLine($"live pids: {string.Join(", ", members.ResultValue)}");
-
-        var first = await RunningProcess.WaitAny(new[] { a.ResultValue, b.ResultValue });
-        if (first.IsOk)
-            Console.WriteLine($"contender #{first.ResultValue.Index} exited first with {first.ResultValue.Outcome}");
-        else
-            Console.Error.WriteLine(first.ErrorValue.Message);
-    }
-}
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+    (true, var first, _) => $"contender #{first.Index} exited first with {first.Outcome}",
+    (false, _, var err)  => err.Message,
+});
 ```
 
 `Members()` lists the whole tree on Windows (Job Object) and Linux (cgroup); the POSIX
@@ -413,9 +371,6 @@ hundreds of commands can't exhaust file descriptors or the process table:
 **F#**
 
 ```fsharp
-open System.Threading
-open ProcessKit
-
 task {
     let runner = JobRunner() :> IProcessRunner
 
@@ -430,17 +385,14 @@ task {
 **C#**
 
 ```csharp
-using System;
-using System.Linq;
-using System.Threading;
-using ProcessKit;
-
 var runner = new JobRunner();
 
 // 200 conversions, but never more than 8 processes alive at once.
 var commands = Enumerable.Range(0, 200).Select(i => new Command("convert").Arg($"{i}.png"));
 var results = await Exec.outputAll(8, runner, commands, CancellationToken.None);
-var failed = results.Count(r => r.IsError || !r.ResultValue.IsSuccess);
+
+// A failure is either an Error, or an Ok whose run was not successful.
+var failed = results.Count(r => r is (false, _, _) or (true, { IsSuccess: false }, _));
 Console.WriteLine($"{failed} conversions failed");
 ```
 
@@ -458,9 +410,6 @@ end-to-end:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     // A one-shot summary of a single run:
     match! (Command.create "crunch").Start() with
@@ -475,19 +424,10 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 // A one-shot summary of a single run:
-var started = await new Command("crunch").Start();
-if (started.IsOk)
-{
-    await using var proc = started.ResultValue;
-    var profile = await proc.Profile();
-    Console.WriteLine($"exit={profile.ExitCode} took={profile.Duration} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}");
-}
-else
-    Console.Error.WriteLine(started.ErrorValue.Message);
+await using var proc = (await new Command("crunch").Start()).GetValueOrThrow();
+var profile = await proc.Profile();
+Console.WriteLine($"exit={profile.ExitCode} took={profile.Duration} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}");
 ```
 
 `Stats()`/`SampleStats` report full CPU/memory on Windows and the Linux cgroup backend, and active
@@ -505,9 +445,6 @@ backoff (jittered by default so a restarted fleet doesn't stampede):
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     let supervisor =
         (Supervisor.create (Command.create "my-server" |> Command.args [ "--port"; "8080" ]))
@@ -525,20 +462,17 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
-var supervisor = new Supervisor(new Command("my-server").Args(new[] { "--port", "8080" }))
+var supervisor = new Supervisor(new Command("my-server").Args(["--port", "8080"]))
     .Restart(RestartPolicy.OnCrash)               // Always | OnCrash | Never
     .MaxRestarts(5)
     .Backoff(TimeSpan.FromMilliseconds(200), 2.0) // base, multiplier (cap: MaxBackoff)
     .StormPause(TimeSpan.FromSeconds(15));         // crash-loop guard (off by default)
 
-var outcome = await supervisor.Run();
-if (outcome.IsOk)
-    Console.WriteLine($"ended after {outcome.ResultValue.Restarts} restarts: {outcome.ResultValue.Stopped}");
-else
-    Console.Error.WriteLine(outcome.ErrorValue.Message);
+Console.WriteLine(await supervisor.Run() switch
+{
+    (true, var outcome, _) => $"ended after {outcome.Restarts} restarts: {outcome.Stopped}",
+    (false, _, var err)    => err.Message,
+});
 ```
 
 `Run()` reports a `SupervisionOutcome` — the final run's result, the restart count, and why
@@ -558,9 +492,6 @@ replace the arbitrary sleep:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     match! (Command.create "my-server").Start() with
     | Ok proc ->
@@ -582,27 +513,18 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
+await using var proc = (await new Command("my-server").Start()).GetValueOrThrow();
 
-var started = await new Command("my-server").Start();
-if (started.IsOk)
+// Wait for the startup banner (returns the matching line)…
+Console.WriteLine(await proc.WaitForLine(l => l.Contains("listening on"), TimeSpan.FromSeconds(10)) switch
 {
-    await using var proc = started.ResultValue;
+    (true, var banner, _) => $"server says: {banner}",
+    (false, _, var err)   => $"never became ready: {err.Message}", // ProcessError.NotReady
+});
 
-    // Wait for the startup banner (returns the matching line)…
-    var ready = await proc.WaitForLine(l => l.Contains("listening on"), TimeSpan.FromSeconds(10));
-    if (ready.IsOk)
-        Console.WriteLine($"server says: {ready.ResultValue}");
-    else
-        Console.Error.WriteLine($"never became ready: {ready.ErrorValue.Message}"); // ProcessError.NotReady
-
-    // …or for a TCP port to accept connections, or any async health check:
-    // await proc.WaitForPort(endpoint, TimeSpan.FromSeconds(10));
-    // await proc.WaitFor(() => healthCheck(), TimeSpan.FromSeconds(10));
-}
-else
-    Console.Error.WriteLine(started.ErrorValue.Message);
+// …or for a TCP port to accept connections, or any async health check:
+// await proc.WaitForPort(endpoint, TimeSpan.FromSeconds(10));
+// await proc.WaitFor(() => healthCheck(), TimeSpan.FromSeconds(10));
 ```
 
 A probe that doesn't pass within its deadline — or that can no longer pass (the child exits; for
@@ -619,8 +541,6 @@ quoting or injection surface, and every stage lives in one shared kill-on-dispos
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     let pipeline =
         (Command.create "git" |> Command.args [ "log"; "--format=%an" ])
@@ -636,18 +556,15 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
-var pipeline = new Command("git").Args(new[] { "log", "--format=%an" })
+var pipeline = new Command("git").Args(["log", "--format=%an"])
     .Pipe(new Command("sort"))
     .Pipe(new Command("uniq").Arg("-c"));
 
-var result = await pipeline.OutputString();
-if (result.IsOk)
-    Console.WriteLine(result.ResultValue.Stdout);
-else
-    Console.Error.WriteLine(result.ErrorValue.Message);
+Console.WriteLine(await pipeline.OutputString() switch
+{
+    (true, var output, _) => output.Stdout,
+    (false, _, var err)   => err.Message,
+});
 ```
 
 The outcome is **pipefail**: `Stdout` is the last stage's output, while the exit code, stderr, and
@@ -663,8 +580,6 @@ whole chain.
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     // Set / unset individual variables, or clear the environment entirely.
     let! _ =
@@ -685,8 +600,6 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-
 // Set / unset individual variables, or clear the environment entirely.
 await new Command("worker")
     .Env("DOTNET_ENVIRONMENT", "Production")
@@ -715,9 +628,6 @@ consuming path reports `ProcessError.Cancelled`:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System.Threading
-
 task {
     use cts = new CancellationTokenSource()
     let job = (Command.create "long-job").Run(cts.Token)
@@ -734,18 +644,13 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-using System.Threading;
-
 using var cts = new CancellationTokenSource();
 var job = new Command("long-job").Run(cts.Token);
 
 // elsewhere — a shutdown signal, a sibling failure, a UI button:
 cts.Cancel();
 
-var result = await job;
-if (result.IsError && result.ErrorValue.IsCancelled)
+if (await job is (false, _, { IsCancelled: true }))
     Console.WriteLine("cancelled");
 ```
 
@@ -771,8 +676,6 @@ enumerate it (`open FSharp.Control` for `TaskSeq`, or use the enumerator directl
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match! (Command.create "git" |> Command.args [ "log"; "--oneline"; "-n"; "50" ]).Start() with
     | Ok proc ->
@@ -800,29 +703,15 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
+await using var proc = (await new Command("git").Args(["log", "--oneline", "-n", "50"]).Start()).GetValueOrThrow();
 
-var started = await new Command("git").Args(new[] { "log", "--oneline", "-n", "50" }).Start();
-if (started.IsOk)
-{
-    await using var proc = started.ResultValue;
+await foreach (var line in proc.StdoutLines())
+    Console.WriteLine($"commit: {line}");
 
-    await foreach (var line in proc.StdoutLines())
-        Console.WriteLine($"commit: {line}");
-
-    // After the stream ends, collect the outcome and stderr (drained in the background).
-    var finished = await proc.Finish();
-    if (finished.IsOk)
-    {
-        if (!finished.ResultValue.Outcome.Equals(Outcome.NewExited(0)))
-            Console.Error.WriteLine(finished.ResultValue.Stderr);
-    }
-    else
-        Console.Error.WriteLine(finished.ErrorValue.Message);
-}
-else
-    Console.Error.WriteLine(started.ErrorValue.Message);
+// After the stream ends, collect the outcome and stderr (drained in the background).
+var finished = (await proc.Finish()).GetValueOrThrow();
+if (finished.Outcome is not { IsExited: true, Code.Value: 0 }) // anything but a clean exit 0
+    Console.Error.WriteLine(finished.Stderr);
 ```
 
 The command's `Timeout` **bounds the stream**: at the deadline the tree is killed, the pipes
@@ -836,8 +725,6 @@ and reads:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match! (Command.create "bc" |> Command.keepStdinOpen).Start() with
     | Ok proc ->
@@ -858,24 +745,15 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
+await using var proc = (await new Command("bc").KeepStdinOpen().Start()).GetValueOrThrow();
 
-var started = await new Command("bc").KeepStdinOpen().Start();
-if (started.IsOk)
+if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
-    await using var proc = started.ResultValue;
-
-    var stdin = proc.TakeStdin();
-    if (stdin != null) // FSharpOption: None is null
-    {
-        await stdin.Value.WriteLine("2 + 2");
-        await stdin.Value.WriteLine("6 * 7");
-        await stdin.Value.Finish(); // send EOF so bc finishes
-    }
-    // …then read proc.StdoutLines() for the answers.
+    await stdin.WriteLine("2 + 2");
+    await stdin.WriteLine("6 * 7");
+    await stdin.Finish(); // send EOF so bc finishes
 }
-else
-    Console.Error.WriteLine(started.ErrorValue.Message);
+// …then read proc.StdoutLines() for the answers.
 ```
 
 > For a **large** interactive stdin, write from one task and read `StdoutLines()` from another —
@@ -894,9 +772,6 @@ subprocess):
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     let git =
         (CliClient.create "git")
@@ -911,17 +786,14 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var git = new CliClient("git")
     .WithDefaults(c => c.CurrentDir("/repo").Timeout(TimeSpan.FromSeconds(30)));
 
-var sha = await git.Run(new[] { "rev-parse", "HEAD" });
-if (sha.IsOk)
-    Console.WriteLine(sha.ResultValue);
-else
-    Console.Error.WriteLine(sha.ErrorValue.Message);
+Console.WriteLine(await git.Run(["rev-parse", "HEAD"]) switch
+{
+    (true, var sha, _)  => sha,
+    (false, _, var err) => err.Message,
+});
 ```
 
 *Deeper: [Testing your code → CliClient](docs/testing.md#cliclient).*
@@ -934,9 +806,6 @@ deterministically — fast, hermetic, no subprocess in CI:
 **F#**
 
 ```fsharp
-open ProcessKit
-open ProcessKit.Testing
-
 task {
     // Record once against the real tool, then save:
     let recorder = RecordReplayRunner.Record("fixtures/git.json", JobRunner())
@@ -953,24 +822,20 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using ProcessKit.Testing;
-using System;
-using System.Threading;
-
 // Record once against the real tool, then save:
 var recorder = RecordReplayRunner.Record("fixtures/git.json", new JobRunner());
 await recorder.Run(new Command("git").Arg("--version"), CancellationToken.None);
 recorder.Save();
 
 // Replay everywhere else — no subprocess, identical results:
-var replay = RecordReplayRunner.Replay("fixtures/git.json");
-if (replay.IsOk)
+if (RecordReplayRunner.Replay("fixtures/git.json") is (true, var replay, _))
 {
-    // use replay.ResultValue as an IProcessRunner
+    // use `replay` as an IProcessRunner
 }
 else
-    Console.Error.WriteLine(replay.ErrorValue.Message); // ProcessError.CassetteMiss on an unmatched call
+{
+    // ProcessError.CassetteMiss on an unmatched call
+}
 ```
 
 Entries are matched by program + args + cwd + a stdin **source digest**; environment override

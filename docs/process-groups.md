@@ -36,8 +36,6 @@ with `use` so it (and the tree it contains) is reaped on scope exit:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match ProcessGroup.Create() with
     | Error err -> eprintfn $"could not create a group: {err.Message}"
@@ -51,17 +49,15 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var created = ProcessGroup.Create();
-if (created.IsOk)
+if (created is (false, _, var err))
 {
-    using var group = created.ResultValue; // disposes — and hard-kills the whole tree — on scope exit
-    // ... start children into `group` ...
+    Console.Error.WriteLine($"could not create a group: {err.Message}");
+    return;
 }
-else
-    Console.Error.WriteLine($"could not create a group: {created.ErrorValue.Message}");
+
+using var group = created.GetValueOrThrow(); // disposes — and hard-kills the whole tree — on scope exit
+// ... start children into `group` ...
 ```
 
 `ProcessGroup.Create(options)` takes a `ProcessGroupOptions` to tune the
@@ -71,9 +67,6 @@ graceful-shutdown window and apply whole-tree resource limits (see
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 let options = ProcessGroupOptions().WithShutdownTimeout(TimeSpan.FromSeconds 10.0)
 
 match ProcessGroup.Create options with
@@ -86,18 +79,16 @@ match ProcessGroup.Create options with
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var options = new ProcessGroupOptions().WithShutdownTimeout(TimeSpan.FromSeconds(10));
 
 var created = ProcessGroup.Create(options);
-if (created.IsOk)
+if (created is (false, _, var err))
 {
-    using var group = created.ResultValue; // ...
+    Console.Error.WriteLine(err.Message);
+    return;
 }
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+
+using var group = created.GetValueOrThrow(); // ...
 ```
 
 Two read-only properties report what you actually got. `Options` echoes back the
@@ -117,13 +108,13 @@ match group.Mechanism with
 **C#**
 
 ```csharp
-var mechanism = group.Mechanism;
-if (mechanism.IsJobObject)
-    Console.WriteLine("Windows Job Object");
-else if (mechanism.IsCgroupV2)
-    Console.WriteLine("Linux cgroup v2");
-else if (mechanism.IsProcessGroup)
-    Console.WriteLine("POSIX process group");
+Console.WriteLine(group.Mechanism switch
+{
+    { IsJobObject: true }    => "Windows Job Object",
+    { IsCgroupV2: true }     => "Linux cgroup v2",
+    { IsProcessGroup: true } => "POSIX process group",
+    _                        => "unknown mechanism",
+});
 ```
 
 Which mechanism you get is not a free choice — it follows the platform and
@@ -156,8 +147,6 @@ run's I/O; the child keeps running until you reap the whole tree
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match ProcessGroup.Create() with
     | Error err -> eprintfn $"{err.Message}"
@@ -176,25 +165,25 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var created = ProcessGroup.Create();
-if (created.IsOk)
+if (created is (false, _, var err))
 {
-    using var group = created.ResultValue;
-
-    var server = await group.Start(new Command("dev-server"));
-    if (server.IsOk)
-    {
-        // `server` streams/probes as usual, but the GROUP owns its lifetime.
-        var _ready = await server.ResultValue.WaitForLine(l => l.Contains("ready"), System.TimeSpan.FromSeconds(10));
-    }
-    else
-        Console.Error.WriteLine(server.ErrorValue.Message);
+    Console.Error.WriteLine(err.Message);
+    return;
 }
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+
+using var group = created.GetValueOrThrow();
+
+var started = await group.Start(new Command("dev-server"));
+if (started is (false, _, var startErr))
+{
+    Console.Error.WriteLine(startErr.Message);
+    return;
+}
+
+var server = started.GetValueOrThrow();
+// `server` streams/probes as usual, but the GROUP owns its lifetime.
+var ready = await server.WaitForLine(l => l.Contains("ready"), TimeSpan.FromSeconds(10));
 ```
 
 To **capture** a child to completion inside the shared group, drive the group
@@ -204,9 +193,6 @@ a `CancellationToken`, and the `Command`:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System.Threading
-
 task {
     match ProcessGroup.Create() with
     | Ok group ->
@@ -223,24 +209,21 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-using System.Threading;
-
 var created = ProcessGroup.Create();
-if (created.IsOk)
+if (created is (false, _, var err))
 {
-    using var group = created.ResultValue;
-
-    var result = await Runner.outputString(group, CancellationToken.None, new Command("probe-tool"));
-    if (result.IsOk)
-        Console.WriteLine($"exit={result.ResultValue.Code}: {result.ResultValue.Stdout}");
-    else
-        Console.Error.WriteLine(result.ErrorValue.Message);
-    // `Runner.outputBytes` is the binary companion; `Runner.start` mirrors `group.Start`.
+    Console.Error.WriteLine(err.Message);
+    return;
 }
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+
+using var group = created.GetValueOrThrow();
+
+Console.WriteLine(await Runner.outputString(group, CancellationToken.None, new Command("probe-tool")) switch
+{
+    (true, var result, _)  => $"exit={result.Code}: {result.Stdout}",
+    (false, _, var runErr) => runErr.Message,
+});
+// `Runner.outputBytes` is the binary companion; `Runner.start` mirrors `group.Start`.
 ```
 
 Because a group satisfies `IProcessRunner`, you can also hand it to anything that
@@ -267,9 +250,6 @@ For an orderly stop, prefer `Shutdown`, which awaits a `Task`:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     match ProcessGroup.Create() with
     | Ok group ->
@@ -285,20 +265,18 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var created = ProcessGroup.Create();
-if (created.IsOk)
+if (created is (false, _, var err))
 {
-    using var group = created.ResultValue;
-    var _service = await group.Start(new Command("my-service"));
-
-    // SIGTERM, give it 5s to flush and exit, then SIGKILL any straggler:
-    await group.Shutdown(TimeSpan.FromSeconds(5));
+    Console.Error.WriteLine(err.Message);
+    return;
 }
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+
+using var group = created.GetValueOrThrow();
+await group.Start(new Command("my-service"));
+
+// SIGTERM, give it 5s to flush and exit, then SIGKILL any straggler:
+await group.Shutdown(TimeSpan.FromSeconds(5));
 ```
 
 `Shutdown()` with no argument uses the group's configured
@@ -322,8 +300,6 @@ thaw the whole tree. All of these are synchronous and return
 **F#**
 
 ```fsharp
-open ProcessKit
-
 let reload (group: ProcessGroup) =
     match group.Signal Signal.Hup with // "reload your configuration"
     | Ok () -> ()
@@ -333,14 +309,10 @@ let reload (group: ProcessGroup) =
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 void reload(ProcessGroup group)
 {
-    var result = group.Signal(Signal.Hup); // "reload your configuration"
-    if (result.IsError)
-        Console.Error.WriteLine(result.ErrorValue.Message);
+    if (group.Signal(Signal.Hup) is (false, _, var err)) // "reload your configuration"
+        Console.Error.WriteLine(err.Message);
 }
 ```
 
@@ -371,14 +343,12 @@ match group.Signal Signal.Hup with
 **C#**
 
 ```csharp
-var result = group.Signal(Signal.Hup);
-if (result.IsError)
-{
-    if (result.ErrorValue.IsUnsupported)
-        Console.Error.WriteLine($"not on this platform: {((ProcessError.Unsupported)result.ErrorValue).operation}");
-    else
-        Console.Error.WriteLine(result.ErrorValue.Message);
-}
+if (group.Signal(Signal.Hup) is (false, _, var err))
+    Console.Error.WriteLine(err switch
+    {
+        ProcessError.Unsupported { operation: var op } => $"not on this platform: {op}",
+        _                                              => err.Message,
+    });
 ```
 
 `Suspend()` freezes the whole tree (to snapshot it, to starve a runaway while you
@@ -425,8 +395,6 @@ the caveats in full.
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     match ProcessGroup.Create() with
     | Ok group ->
@@ -444,24 +412,22 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var created = ProcessGroup.Create();
-if (created.IsOk)
+if (created is (false, _, var err))
 {
-    using var group = created.ResultValue;
-    var _a = await group.Start(new Command("worker-a"));
-    var _b = await group.Start(new Command("worker-b"));
-
-    var members = group.Members();
-    if (members.IsOk)
-        Console.WriteLine($"{members.ResultValue.Count} live members: {string.Join(", ", members.ResultValue)}");
-    else
-        Console.Error.WriteLine(members.ErrorValue.Message);
+    Console.Error.WriteLine(err.Message);
+    return;
 }
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+
+using var group = created.GetValueOrThrow();
+await group.Start(new Command("worker-a"));
+await group.Start(new Command("worker-b"));
+
+Console.WriteLine(group.Members() switch
+{
+    (true, var pids, _)        => $"{pids.Count} live members: {string.Join(", ", pids)}",
+    (false, _, var membersErr) => membersErr.Message,
+});
 ```
 
 What "members" means depends on the mechanism. On **Windows** (Job Object) and
@@ -484,8 +450,6 @@ tree. The builder is fluent and immutable:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 task {
     let options =
         ProcessGroupOptions()
@@ -505,23 +469,20 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
-var options =
-    new ProcessGroupOptions()
-        .WithMemoryMax(512L * 1024L * 1024L) // bytes, whole tree (512 MiB)
-        .WithMaxProcesses(64)                 // fork-bomb ceiling
-        .WithCpuQuota(0.5);                   // half of one core
+var options = new ProcessGroupOptions()
+    .WithMemoryMax(512L * 1024L * 1024L) // bytes, whole tree (512 MiB)
+    .WithMaxProcesses(64)                 // fork-bomb ceiling
+    .WithCpuQuota(0.5);                   // half of one core
 
 var created = ProcessGroup.Create(options);
-if (created.IsOk)
+if (created is (false, _, var err))
 {
-    using var group = created.ResultValue;
-    var _sandboxed = await group.Start(new Command("untrusted-tool")); // ... runs within the limited group ...
+    Console.Error.WriteLine($"limits unavailable: {err.Message}"); // ProcessError.ResourceLimit
+    return;
 }
-else
-    Console.Error.WriteLine($"limits unavailable: {created.ErrorValue.Message}"); // ProcessError.ResourceLimit
+
+using var group = created.GetValueOrThrow();
+await group.Start(new Command("untrusted-tool")); // ... runs within the limited group ...
 ```
 
 The three caps are:
@@ -573,14 +534,17 @@ match ProcessGroup.Create options with
 
 ```csharp
 var created = ProcessGroup.Create(options);
-if (created.IsOk)
+if (created is (false, _, var err))
 {
-    using var group = created.ResultValue; // ...
+    Console.Error.WriteLine(err switch
+    {
+        ProcessError.ResourceLimit { message: var m } => $"cannot enforce limits here: {m}",
+        _                                             => err.Message,
+    });
+    return;
 }
-else if (created.ErrorValue.IsResourceLimit)
-    Console.Error.WriteLine($"cannot enforce limits here: {((ProcessError.ResourceLimit)created.ErrorValue).message}");
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+
+using var group = created.GetValueOrThrow(); // ...
 ```
 
 ## Stats
@@ -600,11 +564,11 @@ match group.Stats() with
 **C#**
 
 ```csharp
-var stats = group.Stats();
-if (stats.IsOk)
-    Console.WriteLine($"procs={stats.ResultValue.ActiveProcessCount} cpu={stats.ResultValue.TotalCpuTime} peak={stats.ResultValue.PeakMemoryBytes}");
-else
-    Console.Error.WriteLine(stats.ErrorValue.Message);
+Console.WriteLine(group.Stats() switch
+{
+    (true, var stats, _) => $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}",
+    (false, _, var err)  => err.Message,
+});
 ```
 
 `ProcessGroupStats` carries `ActiveProcessCount` (an `int`, always populated),
@@ -621,9 +585,6 @@ time and peak memory are available where the kernel accounts for the whole tree 
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     let series = group.SampleStats(TimeSpan.FromSeconds 1.0)
     let e = series.GetAsyncEnumerator()
@@ -643,9 +604,6 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 await foreach (var s in group.SampleStats(TimeSpan.FromSeconds(1)))
     Console.WriteLine($"rss now: {s.PeakMemoryBytes}");
 ```

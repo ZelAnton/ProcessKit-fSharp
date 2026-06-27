@@ -13,8 +13,6 @@ a double so your tests never touch the operating system.
 **F#**
 
 ```fsharp
-open ProcessKit
-
 // One interface, three methods — each takes a CancellationToken:
 type IProcessRunner =
     abstract OutputString: Command * System.Threading.CancellationToken -> System.Threading.Tasks.Task<Result<ProcessResult<string>, ProcessError>>
@@ -25,11 +23,6 @@ type IProcessRunner =
 **C#**
 
 ```csharp
-using ProcessKit;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.FSharp.Core;
-
 // One interface, three methods — each takes a CancellationToken:
 public interface IProcessRunner
 {
@@ -86,9 +79,6 @@ Production code, generic over the runner:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System.Threading
-
 /// HEAD's commit id, run through whatever runner the caller injects.
 let head (runner: IProcessRunner) (ct: CancellationToken) =
     Runner.run runner ct (Command.create "git" |> Command.args [ "rev-parse"; "HEAD" ])
@@ -97,14 +87,9 @@ let head (runner: IProcessRunner) (ct: CancellationToken) =
 **C#**
 
 ```csharp
-using ProcessKit;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.FSharp.Core;
-
 /// HEAD's commit id, run through whatever runner the caller injects.
 Task<FSharpResult<string, ProcessError>> Head(IProcessRunner runner, CancellationToken ct) =>
-    runner.Run(new Command("git").Args(new[] { "rev-parse", "HEAD" }), ct);
+    runner.Run(new Command("git").Args(["rev-parse", "HEAD"]), ct);
 ```
 
 In production you pass `JobRunner()`; in a test you pass a double and no process
@@ -122,9 +107,6 @@ a new runner:
 **F#**
 
 ```fsharp
-open ProcessKit
-open ProcessKit.Testing
-
 let runner =
     (ScriptedRunner())
         // Match when every listed token appears among the command's program and
@@ -139,15 +121,12 @@ let runner =
 **C#**
 
 ```csharp
-using ProcessKit;
-using ProcessKit.Testing;
-
 var runner = new ScriptedRunner()
     // Match when every listed token appears among the command's program and
     // arguments (order-independent):
-    .On(new[] { "git", "rev-parse", "HEAD" }, Reply.Ok("abc123\n"))
+    .On(["git", "rev-parse", "HEAD"], Reply.Ok("abc123\n"))
     // …or by any predicate over the whole Command:
-    .When(cmd => cmd.WorkingDirectory != null, Reply.Fail(128, "fatal: not a git repository"))
+    .When(cmd => cmd.WorkingDirectory is not null, Reply.Fail(128, "fatal: not a git repository"))
     // …with an optional catch-all:
     .Fallback(Reply.Ok(""));
 ```
@@ -177,11 +156,6 @@ NUnit):
 **F#**
 
 ```fsharp
-open NUnit.Framework
-open System.Threading
-open ProcessKit
-open ProcessKit.Testing
-
 [<TestFixture>]
 type GitTests() =
 
@@ -201,12 +175,6 @@ type GitTests() =
 **C#**
 
 ```csharp
-using NUnit.Framework;
-using System.Threading;
-using System.Threading.Tasks;
-using ProcessKit;
-using ProcessKit.Testing;
-
 [TestFixture]
 public class GitTests
 {
@@ -214,13 +182,13 @@ public class GitTests
     public async Task Head_returns_the_trimmed_sha()
     {
         var runner = new ScriptedRunner()
-            .On(new[] { "git", "rev-parse", "HEAD" }, Reply.Ok("abc123\n"));
+            .On(["git", "rev-parse", "HEAD"], Reply.Ok("abc123\n"));
 
-        var result = await Head(runner, CancellationToken.None);
-        if (result.IsOk)
-            Assert.That(result.ResultValue, Is.EqualTo("abc123"));
-        else
-            Assert.Fail(result.ErrorValue.Message);
+        switch (await Head(runner, CancellationToken.None))
+        {
+            case (true, var sha, _):  Assert.That(sha, Is.EqualTo("abc123")); break;
+            case (false, _, var err): Assert.Fail(err.Message); break;
+        }
     }
 }
 ```
@@ -254,18 +222,17 @@ task {
 
 ```csharp
 var runner = new ScriptedRunner().Fallback(Reply.Fail(2, "boom"));
-var grep = new Command("grep").Args(new[] { "needle", "file" });
+var grep = new Command("grep").Args(["needle", "file"]);
 
 // Success-requiring verb: the non-zero exit surfaces as an error.
-var run = await runner.Run(grep);
-if (run.IsError && run.ErrorValue.IsExit) { } // program="grep", code=2, stderr="boom"
+if (await runner.Run(grep) is (false, _, { IsExit: true })) { } // program="grep", code=2, stderr="boom"
 
 // Honest-result verb: the non-zero exit is data.
-var output = await runner.OutputString(grep);
-if (output.IsOk)
-    Assert.That(output.ResultValue.IsSuccess, Is.False);
-else
-    Assert.Fail(output.ErrorValue.Message);
+switch (await runner.OutputString(grep))
+{
+    case (true, var output, _): Assert.That(output.IsSuccess, Is.False); break;
+    case (false, _, var err):   Assert.Fail(err.Message); break;
+}
 ```
 
 ## Custom doubles and mocking frameworks
@@ -289,9 +256,6 @@ delegating, so you can test that retry handling actually retries:
 **F#**
 
 ```fsharp
-open ProcessKit
-open System.Threading.Tasks
-
 let failOnce (inner: IProcessRunner) : IProcessRunner =
     let mutable calls = 0
 
@@ -313,28 +277,15 @@ let failOnce (inner: IProcessRunner) : IProcessRunner =
 **C#**
 
 ```csharp
-using ProcessKit;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.FSharp.Core;
-
-public sealed class FailOnce : IProcessRunner
+public sealed class FailOnce(IProcessRunner inner) : IProcessRunner
 {
-    private readonly IProcessRunner inner;
     private int calls;
 
-    public FailOnce(IProcessRunner inner) => this.inner = inner;
-
-    public Task<FSharpResult<ProcessResult<string>, ProcessError>> OutputString(Command command, CancellationToken ct)
-    {
-        calls = calls + 1;
-
-        if (calls == 1)
-            return Task.FromResult(
-                FSharpResult<ProcessResult<string>, ProcessError>.NewError(ProcessError.NewIo("transient blip"))); // ProcessError.isTransient -> true
-        else
-            return inner.OutputString(command, ct);
-    }
+    public Task<FSharpResult<ProcessResult<string>, ProcessError>> OutputString(Command command, CancellationToken ct) =>
+        ++calls == 1
+            ? Task.FromResult(
+                FSharpResult<ProcessResult<string>, ProcessError>.NewError(ProcessError.NewIo("transient blip"))) // ProcessError.isTransient -> true
+            : inner.OutputString(command, ct);
 
     public Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> OutputBytes(Command command, CancellationToken ct) =>
         inner.OutputBytes(command, ct);
@@ -370,10 +321,6 @@ hermetic, no subprocess in CI.
 **F#**
 
 ```fsharp
-open ProcessKit
-open ProcessKit.Testing
-open System.Threading
-
 task {
     // Record once against the real tool (wraps a real runner), then save:
     let recorder = RecordReplayRunner.Record("fixtures/git.json", JobRunner())
@@ -393,30 +340,21 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using ProcessKit.Testing;
-using System;
-using System.Threading;
-
 // Record once against the real tool (wraps a real runner), then save:
 var recorder = RecordReplayRunner.Record("fixtures/git.json", new JobRunner());
 await recorder.Run(new Command("git").Arg("--version"), CancellationToken.None);
 recorder.Save(); // Result<unit, ProcessError> — surfaces write errors
 
 // Replay everywhere else — no subprocess, identical results:
-var replay = RecordReplayRunner.Replay("fixtures/git.json");
-if (replay.IsOk)
+var replayResult = RecordReplayRunner.Replay("fixtures/git.json");
+if (replayResult is (true, var replay, _))
 {
-    var version = await replay.ResultValue.Run(new Command("git").Arg("--version"), CancellationToken.None);
-    if (version.IsOk)
-    {
-        // the recorded stdout, replayed
-    }
-    else
-        Console.Error.WriteLine(version.ErrorValue.Message);
+    // the recorded stdout, replayed
+    if (await replay.Run(new Command("git").Arg("--version"), CancellationToken.None) is (false, _, var err))
+        Console.Error.WriteLine(err.Message);
 }
-else
-    Console.Error.WriteLine(replay.ErrorValue.Message);
+else if (replayResult is (false, _, var loadErr))
+    Console.Error.WriteLine(loadErr.Message);
 ```
 
 `Record(path, inner)` wraps `inner` and captures each completed call; `Save()`
@@ -475,8 +413,6 @@ defaults applied), and `.Run(args)` / `.OutputString(args)` / `.OutputBytes(args
 **F#**
 
 ```fsharp
-open ProcessKit
-
 /// A small typed git wrapper. The CliClient is supplied, so tests inject a double.
 type Git(client: CliClient) =
 
@@ -492,24 +428,16 @@ type Git(client: CliClient) =
 **C#**
 
 ```csharp
-using ProcessKit;
-using System.Threading.Tasks;
-using Microsoft.FSharp.Core;
-
 /// A small typed git wrapper. The CliClient is supplied, so tests inject a double.
-public class Git
+public class Git(CliClient client)
 {
-    private readonly CliClient client;
-
-    public Git(CliClient client) => this.client = client;
-
     /// HEAD's commit id (trimmed stdout, success required).
     public Task<FSharpResult<string, ProcessError>> Head(string repo) =>
-        client.Run(new[] { "-C", repo, "rev-parse", "HEAD" });
+        client.Run(["-C", repo, "rev-parse", "HEAD"]);
 
     /// Is the work tree clean? The exit code *is* the answer, so probe it.
     public Task<FSharpResult<bool, ProcessError>> IsClean(string repo) =>
-        client.Probe(new[] { "-C", repo, "diff", "--quiet" });
+        client.Probe(["-C", repo, "diff", "--quiet"]);
 }
 ```
 
@@ -518,17 +446,12 @@ Production wires the real runner and the per-client defaults:
 **F#**
 
 ```fsharp
-open System
-
 let git = Git((CliClient.create "git").WithDefaults(fun c -> c.Timeout(TimeSpan.FromSeconds 30.0)))
 ```
 
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 var git = new Git(new CliClient("git").WithDefaults(c => c.Timeout(TimeSpan.FromSeconds(30))));
 ```
 
@@ -537,10 +460,6 @@ var git = new Git(new CliClient("git").WithDefaults(c => c.Timeout(TimeSpan.From
 **F#**
 
 ```fsharp
-open NUnit.Framework
-open ProcessKit
-open ProcessKit.Testing
-
 [<TestFixture>]
 type GitWrapperTests() =
 
@@ -562,11 +481,6 @@ type GitWrapperTests() =
 **C#**
 
 ```csharp
-using NUnit.Framework;
-using System.Threading.Tasks;
-using ProcessKit;
-using ProcessKit.Testing;
-
 [TestFixture]
 public class GitWrapperTests
 {
@@ -574,15 +488,15 @@ public class GitWrapperTests
     public async Task Head_is_trimmed()
     {
         var scripted = new ScriptedRunner()
-            .On(new[] { "git", "rev-parse", "HEAD" }, Reply.Ok("abc123\n"));
+            .On(["git", "rev-parse", "HEAD"], Reply.Ok("abc123\n"));
 
         var git = new Git(new CliClient("git").WithRunner(scripted));
 
-        var result = await git.Head("/repo");
-        if (result.IsOk)
-            Assert.That(result.ResultValue, Is.EqualTo("abc123"));
-        else
-            Assert.Fail(result.ErrorValue.Message);
+        switch (await git.Head("/repo"))
+        {
+            case (true, var sha, _):  Assert.That(sha, Is.EqualTo("abc123")); break;
+            case (false, _, var err): Assert.Fail(err.Message); break;
+        }
     }
 }
 ```
@@ -600,11 +514,6 @@ wiring:
 **F#**
 
 ```fsharp
-open Microsoft.Extensions.DependencyInjection
-open ProcessKit
-open ProcessKit.Extensions.DependencyInjection
-open System.Threading
-
 services.AddProcessKit() |> ignore
 
 // Consumers depend on the interface — the same seam you test against:
@@ -616,22 +525,11 @@ type Deployer(runner: IProcessRunner) =
 **C#**
 
 ```csharp
-using Microsoft.Extensions.DependencyInjection;
-using ProcessKit;
-using ProcessKit.Extensions.DependencyInjection;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.FSharp.Core;
-
 services.AddProcessKit();
 
 // Consumers depend on the interface — the same seam you test against:
-public class Deployer
+public class Deployer(IProcessRunner runner)
 {
-    private readonly IProcessRunner runner;
-
-    public Deployer(IProcessRunner runner) => this.runner = runner;
-
     public Task<FSharpResult<string, ProcessError>> Deploy() =>
         runner.Run(new Command("deploy"), CancellationToken.None);
 }

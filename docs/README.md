@@ -23,6 +23,10 @@ group that dies with the run, so an early return or an unhandled exception never
 tree. The layers are also usable independently — a raw `ProcessGroup` can contain children you
 spawn yourself, and the runner's test doubles never touch the OS at all.
 
+> **Written in F#, built for both F# and C#.** ProcessKit is implemented in F#, but it is designed
+> for first-class, idiomatic use from **both F# and C#** — every public API is meant to be called
+> naturally from either language, and every example in these guides is shown in both.
+
 ## Guides
 
 **New here?** Start with the [Cookbook](cookbook.md) — short task-to-snippet recipes for
@@ -48,9 +52,6 @@ one place.
 **F#**
 
 ```fsharp
-open ProcessKit
-open System
-
 task {
     // One-shot: capture everything. A non-zero exit is data, not an Error.
     match! (Command.create "git" |> Command.args [ "rev-parse"; "HEAD" ]).OutputString() with
@@ -83,40 +84,30 @@ task {
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
-
 // One-shot: capture everything. A non-zero exit is data, not an Error.
-var head = await new Command("git").Args(new[] { "rev-parse", "HEAD" }).OutputString();
-if (head.IsOk)
-    Console.WriteLine($"HEAD = {head.ResultValue.Stdout.Trim()}");
-else
-    Console.Error.WriteLine(head.ErrorValue.Message);
+Console.WriteLine(await new Command("git").Args(["rev-parse", "HEAD"]).OutputString() switch
+{
+    (true, var head, _) => $"HEAD = {head.Stdout.Trim()}",
+    (false, _, var err) => err.Message,
+});
 
 // Success-checking: a non-zero exit / timeout / signal-kill becomes a typed error.
-var version = await new Command("dotnet").Arg("--version").Run();
-if (version.IsOk)
-    Console.WriteLine(version.ResultValue);
-else
-    Console.Error.WriteLine(version.ErrorValue.Message);
+Console.WriteLine(await new Command("dotnet").Arg("--version").Run() switch
+{
+    (true, var version, _) => version,
+    (false, _, var err)    => err.Message,
+});
 
 // Stdin + timeout (streaming, pipelines, supervision … see the guides).
-var sort = new Command("sort")
+await new Command("sort")
     .Stdin(Stdin.FromString("b\na\n"))
-    .Timeout(TimeSpan.FromSeconds(5));
-
-await sort.Run();
+    .Timeout(TimeSpan.FromSeconds(5))
+    .Run();
 
 // Containment: anything spawned through a group dies with it.
-var created = ProcessGroup.Create();
-if (created.IsOk)
-{
-    using var group = created.ResultValue;
-    await group.Start(new Command("dev-server"));
-    // disposing the group reaps the server — and everything it spawned
-}
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+using var group = ProcessGroup.Create().GetValueOrThrow();
+await group.Start(new Command("dev-server"));
+// disposing the group reaps the server — and everything it spawned
 ```
 
 ## API reference

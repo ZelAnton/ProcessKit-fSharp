@@ -49,8 +49,6 @@ guarantee can check rather than assume:
 **F#**
 
 ```fsharp
-open ProcessKit
-
 match ProcessGroup.Create() with
 | Ok group ->
     use group = group
@@ -65,23 +63,15 @@ match ProcessGroup.Create() with
 **C#**
 
 ```csharp
-using ProcessKit;
-using System;
+using var group = ProcessGroup.Create().GetValueOrThrow();
 
-var created = ProcessGroup.Create();
-if (created.IsOk)
+Console.WriteLine(group.Mechanism switch
 {
-    using var group = created.ResultValue;
-
-    if (group.Mechanism.IsJobObject)
-        Console.WriteLine("Windows Job Object — whole-tree kill, members, stats");
-    else if (group.Mechanism.IsCgroupV2)
-        Console.WriteLine("Linux cgroup v2 — whole-tree kill, signals, limits, stats");
-    else if (group.Mechanism.IsProcessGroup)
-        Console.WriteLine("POSIX process group — kill-on-dispose, leaders-only members");
-}
-else
-    Console.Error.WriteLine(created.ErrorValue.Message);
+    { IsJobObject: true }    => "Windows Job Object — whole-tree kill, members, stats",
+    { IsCgroupV2: true }     => "Linux cgroup v2 — whole-tree kill, signals, limits, stats",
+    { IsProcessGroup: true } => "POSIX process group — kill-on-dispose, leaders-only members",
+    _                        => "unknown mechanism",
+});
 ```
 
 The `Mechanism.IsJobObject` / `IsCgroupV2` / `IsProcessGroup` properties are the same check in

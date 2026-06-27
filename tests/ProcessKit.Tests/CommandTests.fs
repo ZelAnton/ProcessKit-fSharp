@@ -60,3 +60,68 @@ type CommandTests() =
         Assert.That((ProcessError.NotFound("git", None)).IsTransient, Is.False)
         Assert.That((ProcessError.Cancelled "git").IsTransient, Is.False)
         Assert.That((ProcessError.Exit("git", 1, "", "")).IsTransient, Is.False)
+
+    [<Test>]
+    member _.``Result.Match projects Ok and Error``() =
+        let ok: Result<string, ProcessError> = Ok "hi"
+        let err: Result<string, ProcessError> = Error(ProcessError.NotFound("x", None))
+        Assert.That(ResultExtensions.Match(ok, (fun v -> v.ToUpperInvariant()), (fun e -> e.Message)), Is.EqualTo "HI")
+        Assert.That(ResultExtensions.Match(err, (fun v -> v), (fun _ -> "fallback")), Is.EqualTo "fallback")
+
+    [<Test>]
+    member _.``Result.TryGetValue yields the value on Ok and the error on Error``() =
+        match ResultExtensions.TryGetValue(Ok 42: Result<int, ProcessError>) with
+        | true, v, _ -> Assert.That(v, Is.EqualTo 42)
+        | _ -> Assert.Fail "expected success"
+
+        match ResultExtensions.TryGetValue(Error(ProcessError.Cancelled "x"): Result<int, ProcessError>) with
+        | false, _, e -> Assert.That(e.IsCancelled, Is.True)
+        | _ -> Assert.Fail "expected failure"
+
+    [<Test>]
+    member _.``Result.GetValueOrThrow returns the value or raises ProcessException``() =
+        Assert.That(ResultExtensions.GetValueOrThrow(Ok 7: Result<int, ProcessError>), Is.EqualTo 7)
+        let failure = ProcessError.Cancelled "svc"
+        let err: Result<int, ProcessError> = Error failure
+        let mutable caught = None
+
+        try
+            ResultExtensions.GetValueOrThrow err |> ignore
+        with :? ProcessException as ex ->
+            caught <- Some ex
+
+        match caught with
+        | Some ex ->
+            Assert.That(ex.Error.IsCancelled, Is.True)
+            Assert.That(ex.Message, Is.EqualTo failure.Message) // ProcessException.Message mirrors the error
+        | None -> Assert.Fail "expected ProcessException"
+
+    [<Test>]
+    member _.``Result.Switch runs exactly the matching action``() =
+        let mutable seen = ""
+
+        ResultExtensions.Switch(
+            (Ok "v": Result<string, ProcessError>),
+            (fun v -> seen <- "ok:" + v),
+            (fun _ -> seen <- "err")
+        )
+
+        Assert.That(seen, Is.EqualTo "ok:v")
+
+        ResultExtensions.Switch(
+            (Error(ProcessError.Cancelled "x"): Result<string, ProcessError>),
+            (fun _ -> seen <- "ok"),
+            (fun e -> seen <- (if e.IsCancelled then "err:cancelled" else "err:other"))
+        )
+
+        Assert.That(seen, Is.EqualTo "err:cancelled")
+
+    [<Test>]
+    member _.``Result.Deconstruct splits Ok and Error``() =
+        match ResultExtensions.Deconstruct(Ok 5: Result<int, ProcessError>) with
+        | true, v, _ -> Assert.That(v, Is.EqualTo 5)
+        | _ -> Assert.Fail "expected Ok"
+
+        match ResultExtensions.Deconstruct(Error(ProcessError.Cancelled "x"): Result<int, ProcessError>) with
+        | false, _, e -> Assert.That(e.IsCancelled, Is.True)
+        | _ -> Assert.Fail "expected Error"

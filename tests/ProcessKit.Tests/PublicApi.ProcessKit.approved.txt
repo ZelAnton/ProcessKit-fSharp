@@ -521,6 +521,10 @@ module ProcessKit.ProcessErrorModule
   static member isNotFound(ProcessKit.ProcessError) : System.Boolean
   static member isTransient(ProcessKit.ProcessError) : System.Boolean
 
+class ProcessKit.ProcessException : System.Exception
+  :> System.Runtime.Serialization.ISerializable
+  property Error : ProcessKit.ProcessError { get }
+
 class ProcessKit.ProcessGroup
   :> ProcessKit.IProcessRunner
   :> System.IAsyncDisposable
@@ -635,6 +639,13 @@ module ProcessKit.RestartPolicy+Tags
   field literal Always : System.Int32
   field literal Never : System.Int32
   field literal OnCrash : System.Int32
+
+class ProcessKit.ResultExtensions
+  static member Deconstruct<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, System.Boolean&, T&, ProcessKit.ProcessError&) : System.Void
+  static member GetValueOrThrow<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>) : T
+  static member Match<T, R>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, System.Func<T, R>, System.Func<ProcessKit.ProcessError, R>) : R
+  static member Switch<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, System.Action<T>, System.Action<ProcessKit.ProcessError>) : System.Void
+  static member TryGetValue<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, T&, ProcessKit.ProcessError&) : System.Boolean
 
 class ProcessKit.RunProfile
   property AvgCpu : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
