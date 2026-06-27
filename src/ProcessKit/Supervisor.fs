@@ -94,15 +94,20 @@ module internal Supervision =
     /// A pseudo-random factor in `[0.5, 1.5)`.
     let jitterFactor () = 0.5 + Random.Shared.NextDouble()
 
-    /// Multiply `delay` by a uniform random factor in `[0.5, 1.5)` when `enabled`, clamped to a
-    /// safe ceiling so a near-max delay cannot overflow.
+    /// Multiply `delay` by a uniform random factor in `[0.5, 1.5)` when `enabled`, always clamped to
+    /// `[0, maxDelay]` so the result is safe to hand to `Task.Delay` — even with jitter off and a
+    /// large `MaxBackoff` / `StormPause`, the delay can never overflow the BCL timer.
     let applyJitter (delay: TimeSpan) (enabled: bool) : TimeSpan =
-        if not enabled || delay <= TimeSpan.Zero then
-            delay
+        if delay <= TimeSpan.Zero then
+            TimeSpan.Zero
         else
-            let scaled = delay.TotalSeconds * jitterFactor ()
+            let scaled =
+                if enabled then
+                    delay.TotalSeconds * jitterFactor ()
+                else
+                    delay.TotalSeconds
 
-            if scaled >= maxDelay.TotalSeconds then
+            if not (Double.IsFinite scaled) || scaled >= maxDelay.TotalSeconds then
                 maxDelay
             else
                 TimeSpan.FromSeconds scaled
@@ -313,7 +318,9 @@ type Supervisor internal (config: SupervisorConfig) =
                         lastFailureAt <- Some now
                         stormScore <- Supervision.decayedFailureScore stormScore elapsed config.FailureDecay
 
-                        if stormScore > config.FailureThreshold then
+                        // A non-finite threshold never trips (matches the doc): `Double.IsFinite` keeps
+                        // `-infinity` from making the comparison true for every finite score.
+                        if Double.IsFinite config.FailureThreshold && stormScore > config.FailureThreshold then
                             let jittered = Supervision.applyJitter pause config.Jitter
                             Log.stormPause config.Command.Config.Logger program jittered
 

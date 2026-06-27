@@ -22,6 +22,14 @@ module internal Timeouts =
     let isArmable (duration: TimeSpan) =
         duration >= TimeSpan.Zero && duration <= maxArmable
 
+    /// Clamp `duration` into the armable range so a BCL timer can be constructed without throwing:
+    /// a negative span becomes zero (the timer fires immediately); an over-long one is capped at the
+    /// max (~24.8 days). Used where a deadline must always be armed (e.g. a readiness probe).
+    let clampArmable (duration: TimeSpan) =
+        if duration < TimeSpan.Zero then TimeSpan.Zero
+        elif duration > maxArmable then maxArmable
+        else duration
+
 /// The immutable configuration behind a `Command`. Internal — consumers build it through the
 /// `Command` builder; the runner/native layer reads it to spawn.
 type internal CommandConfig =

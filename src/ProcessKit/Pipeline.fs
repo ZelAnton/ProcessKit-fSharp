@@ -15,16 +15,17 @@ open System.Threading.Tasks
 /// run-and-capture verbs a single command exposes (`Run`/`OutputString`/`OutputBytes`/`ExitCode`/
 /// `Probe`/`Parse`/`TryParse`). A pipeline runs as a whole, so the *streaming* verbs (`FirstLine`,
 /// `StdoutLines`) are deliberately not offered — capture the last stage's output instead. The exit
-/// status follows shell **pipefail**: the rightmost stage that did not exit 0 determines the result,
-/// unless that stage opted out with `Command.UncheckedInPipe`.
+/// status follows shell **pipefail**: the rightmost stage that did not exit with an accepted code
+/// (its `Command.OkCodes`, `{0}` by default) determines the result, unless that stage opted out with
+/// `Command.UncheckedInPipe`.
 [<Sealed>]
 type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancelOn: CancellationToken option) =
 
     // pipefail: the representative stage carries the program/outcome/stderr for the verb result.
-    // It is the rightmost *checked* stage that did not exit 0; if every checked stage exited 0, the
-    // last checked stage stands (so an unchecked, failed final stage does not fail the pipeline).
-    // With no checked stages at all, the last stage stands. A timed-out pipeline reports TimedOut
-    // against the last stage.
+    // It is the rightmost *checked* stage that did not exit with an accepted code; if every checked
+    // stage succeeded, the last checked stage stands (so an unchecked, failed final stage does not
+    // fail the pipeline). With no checked stages at all the pipeline is reported as a success. A
+    // timed-out pipeline reports TimedOut against the last stage.
     static let representative (capture: PipelineCapture) : PipelineStage =
         let last = List.last capture.Stages
 
@@ -44,10 +45,18 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             | Some stage -> stage // rightmost checked failure -> the pipeline failed here
             | None ->
                 // No checked stage failed: the pipeline succeeded. Report the last checked stage
-                // (its exit 0), falling back to the last stage when every stage is unchecked.
+                // (its accepted exit).
                 match List.tryLast checkedStages with
                 | Some stage -> stage
-                | None -> last
+                | None ->
+                    // Every stage opted out of pipefail (`UncheckedInPipe`): nothing can fail the
+                    // pipeline, so report success against the last stage regardless of its raw exit
+                    // (otherwise an all-unchecked chain with a failing last stage would wrongly fail
+                    // `Run`/`ExitCode`). Use the last stage's own first accepted code.
+                    let okCode = last.OkCodes |> List.tryHead |> Option.defaultValue 0
+
+                    { last with
+                        Outcome = Outcome.Exited okCode }
 
     /// Append another stage; its stdin is fed from the current last stage's stdout.
     member _.Pipe(command: Command) =

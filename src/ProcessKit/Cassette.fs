@@ -25,6 +25,9 @@ type CassetteEntry =
         /// The working directory, or `null` if the command did not set one.
         Cwd: string | null
         /// Digest of the stdin source; part of the replay match key (`null` when there was no stdin).
+        /// For an in-memory stdin source this is a SHA-256 of the content — a low-entropy stdin secret
+        /// (a short password/PIN) can be recovered from it by brute force, so treat a cassette with
+        /// stdin as sensitive and review it before committing.
         StdinDigest: string | null
         /// Whether the invocation supplied a stdin source.
         HasStdin: bool
@@ -302,7 +305,12 @@ type RecordReplayRunner private (mode: Mode, path: string) =
             try
                 let snapshot = lock gate (fun () -> recorded.ToArray())
                 writeCassette path snapshot
-                dirty.Value <- false
+                // Clear `dirty` only if nothing was recorded during the write — otherwise a `Capture`
+                // that raced this `Save` would have its entry dropped from the drop-time flush.
+                lock gate (fun () ->
+                    if recorded.Count = snapshot.Length then
+                        dirty.Value <- false)
+
                 Ok()
             with ex ->
                 Error(ProcessError.Io ex.Message)
@@ -360,7 +368,7 @@ type RecordReplayRunner private (mode: Mode, path: string) =
     interface IDisposable with
         member _.Dispose() =
             match mode with
-            | RecordMode(_, recorded, dirty) when dirty.Value ->
+            | RecordMode(_, recorded, dirty) when lock gate (fun () -> dirty.Value) ->
                 try
                     let snapshot = lock gate (fun () -> recorded.ToArray())
                     writeCassette path snapshot

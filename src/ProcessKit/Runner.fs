@@ -3,8 +3,7 @@ namespace ProcessKit
 open System.Threading
 open System.Threading.Tasks
 
-/// The run verbs, expressed over any `IProcessRunner` (the F# analog of the Rust
-/// `ProcessRunnerExt` trait). One verb, one meaning:
+/// The run verbs, expressed over any `IProcessRunner`. One verb, one meaning:
 ///
 /// - `run` — require a zero exit; return stdout, trailing whitespace trimmed.
 /// - `outputString` / `outputBytes` — the full `ProcessResult`; a non-zero exit is data.

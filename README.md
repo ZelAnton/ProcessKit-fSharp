@@ -247,7 +247,7 @@ task {
             | Error _ -> ()
 
             match! RunningProcess.WaitAny [| a; b |] with
-            | Ok(idx, outcome) -> printfn $"contender #{idx} exited first with {outcome}"
+            | Ok result -> printfn $"contender #{result.Index} exited first with {result.Outcome}"
             | Error err -> eprintfn $"{err.Message}"
         | _ -> ()
     | Error err -> eprintfn $"{err.Message}"
@@ -269,6 +269,7 @@ children first.
 hundreds of commands can't exhaust file descriptors or the process table:
 
 ```fsharp
+open System.Threading
 open ProcessKit
 
 task {
@@ -276,7 +277,7 @@ task {
 
     // 200 conversions, but never more than 8 processes alive at once.
     let commands = [ for i in 0..199 -> Command.create "convert" |> Command.arg $"{i}.png" ]
-    let! results = Exec.outputAll 8 runner commands
+    let! results = Exec.outputAll 8 runner commands CancellationToken.None
     let failed = results |> Array.filter (fun r -> match r with Ok o -> not o.IsSuccess | Error _ -> true)
     printfn $"{failed.Length} conversions failed"
 }

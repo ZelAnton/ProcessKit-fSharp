@@ -4,10 +4,9 @@ open System
 
 /// Structured failure type for ProcessKit operations.
 ///
-/// Mirrors the Rust crate's `Error` enum, renamed to `ProcessError` to avoid colliding
-/// with the `Result.Error` constructor in F#. Honest-result verbs — `outputString`,
-/// `outputBytes`, `exitCode`, `probe` — return their value; only genuine failures
-/// surface as a `ProcessError` in the `Result` channel.
+/// Named `ProcessError` (rather than just `Error`) to avoid colliding with the `Result.Error`
+/// constructor in F#. Honest-result verbs — `outputString`, `outputBytes`, `exitCode`, `probe` —
+/// return their value; only genuine failures surface as a `ProcessError` in the `Result` channel.
 [<RequireQualifiedAccess; NoComparison>]
 type ProcessError =
 

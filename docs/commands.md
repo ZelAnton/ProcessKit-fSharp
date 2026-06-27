@@ -437,9 +437,9 @@ The accessors:
 | `Truncated` | A buffer policy dropped output |
 | `AcceptedCodes` | The exit codes treated as success (`{0}` plus any `OkCodes`) |
 
-`ProcessResult.ensureSuccess` converts a `ProcessResult<string>` into a
-`Result` — the result unchanged on success, otherwise the matching
-`ProcessError` (`Exit` / `Signalled` / `Timeout`).
+`ProcessResult.ensureSuccess` (or the instance `result.EnsureSuccess()`) converts a
+`ProcessResult<'T>` — text or bytes — into a `Result`: the result unchanged on success,
+otherwise the matching `ProcessError` (`Exit` / `Signalled` / `Timeout`).
 
 ### Accepting non-zero exits
 

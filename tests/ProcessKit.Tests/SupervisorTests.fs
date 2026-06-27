@@ -556,7 +556,8 @@ type SupervisorTests() =
     member _.``applyJitter clamps instead of overflowing``() =
         let clamped = Supervision.applyJitter TimeSpan.MaxValue true
         Assert.That(clamped, Is.LessThanOrEqualTo Supervision.maxDelay)
-        Assert.That(Supervision.applyJitter TimeSpan.MaxValue false, Is.EqualTo TimeSpan.MaxValue)
+        // Jitter OFF must clamp too — an over-max delay would otherwise overflow Task.Delay.
+        Assert.That(Supervision.applyJitter TimeSpan.MaxValue false, Is.LessThanOrEqualTo Supervision.maxDelay)
         Assert.That(Supervision.applyJitter TimeSpan.Zero true, Is.EqualTo TimeSpan.Zero)
         let normal = Supervision.applyJitter (TimeSpan.FromSeconds 10.0) true
         Assert.That(normal.TotalSeconds, Is.InRange(5.0, 15.0))

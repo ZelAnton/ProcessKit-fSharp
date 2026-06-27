@@ -351,7 +351,7 @@ task {
             use _ = b
 
             match! RunningProcess.WaitAny [| a; b |] with
-            | Ok(index, outcome) -> printfn $"contender #{index} exited first with {outcome}"
+            | Ok result -> printfn $"contender #{result.Index} exited first with {result.Outcome}"
             | Error err -> eprintfn $"{err.Message}"
 }
 ```

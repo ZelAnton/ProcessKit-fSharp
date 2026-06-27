@@ -567,7 +567,9 @@ type RunningProcess internal (host: RunningHost) =
         else
 
             task {
-                use timeoutCts = new CancellationTokenSource(timeout)
+                // Clamp so an out-of-range timeout can't throw out of the CTS constructor (a negative
+                // value fires immediately → NotReady); the reported NotReady still carries the original.
+                use timeoutCts = new CancellationTokenSource(Timeouts.clampArmable timeout)
 
                 use linked =
                     CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken)
@@ -598,7 +600,10 @@ type RunningProcess internal (host: RunningHost) =
         this.WaitForLine(predicate, timeout, CancellationToken.None)
 
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`
-    /// (or `Cancelled` if `cancellationToken` fires first).
+    /// (or `Cancelled` if `cancellationToken` fires first). Unlike `WaitForLine`, this does not read
+    /// the child's stdout/stderr while polling — a child that floods a *piped* stream before it is
+    /// ready can block on a full pipe; consume its output concurrently (`StdoutLines`/`OutputEvents`)
+    /// or run it with `Stdout`/`Stderr` set to `Inherit`/`Null` when polling a chatty process.
     member _.WaitForPort
         (endpoint: IPEndPoint, timeout: TimeSpan, cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -637,7 +642,9 @@ type RunningProcess internal (host: RunningHost) =
         this.WaitForPort(endpoint, timeout, CancellationToken.None)
 
     /// Poll `probe` until it returns true, or fail with `NotReady` after `timeout` (or `Cancelled`
-    /// if `cancellationToken` fires first).
+    /// if `cancellationToken` fires first). Like `WaitForPort`, this does not drain the child's
+    /// stdout/stderr while polling — consume a piped, chatty child's output concurrently (or run it
+    /// with `Stdout`/`Stderr` `Inherit`/`Null`) so it can't block on a full pipe before becoming ready.
     member _.WaitFor
         (probe: Func<Task<bool>>, timeout: TimeSpan, cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -681,9 +688,19 @@ type RunningProcess internal (host: RunningHost) =
                 if streamingStarted then
                     streamOutcome
                 else
+                    // Claim the buffered slot so a terminal verb called after WaitAny/WaitAll on the
+                    // same handle is refused rather than racing a second reader on these pipes.
+                    claimBuffered () |> ignore
+
                     task {
-                        let stdoutDrain = Pump.drainDiscardOrEmpty host.Stdout CancellationToken.None
-                        let stderrDrain = Pump.drainDiscardOrEmpty host.Stderr CancellationToken.None
+                        // These drains are fire-and-forget for a race loser the caller may dispose
+                        // mid-drain, so they must complete quietly on teardown rather than fault unobserved.
+                        let stdoutDrain =
+                            Pump.drainDiscardOrEmptyUntilDone host.Stdout CancellationToken.None
+
+                        let stderrDrain =
+                            Pump.drainDiscardOrEmptyUntilDone host.Stderr CancellationToken.None
+
                         let! outcome = waitWithTimeout ()
                         do! Task.WhenAll([| stdoutDrain; stderrDrain |])
                         return outcome

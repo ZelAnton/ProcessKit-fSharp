@@ -1111,6 +1111,10 @@ module internal Native =
     // errno value for a syscall interrupted by a signal (same number on Linux and macOS).
     let private EINTR = 4
 
+    // `waitpid` option: return immediately (0) if the child has not yet changed state, rather than
+    // blocking. Same value on Linux and macOS.
+    let private WNOHANG = 1
+
     /// Reap a POSIX child and report how it concluded.
     let waitPosix (pid: nativeint) : Task<Outcome> =
         Task.Run(fun () ->
@@ -1125,16 +1129,32 @@ module internal Native =
 
             decodeWaitStatus status)
 
-    /// Synchronously reap a POSIX child we own (a group leader, whose pid == its pgid) during teardown.
-    /// The child has just been SIGKILLed, so the blocking `waitpid` returns promptly; a child already
-    /// reaped by a run verb yields -1/ECHILD, the harmless no-op we want. Without this a killed-but-
-    /// unawaited leader lingers as a zombie until the owning process exits. EINTR-safe.
+    /// Best-effort synchronous reap of a POSIX child we own (a group leader, whose pid == its pgid)
+    /// during teardown — it was just SIGKILLed, so it becomes a zombie within a moment. Uses a
+    /// *non-blocking* `WNOHANG` wait in a short bounded loop, deliberately NOT a blocking `waitpid`:
+    /// a blocking wait would (a) stall the disposing/finalizer thread indefinitely on a child wedged
+    /// in uninterruptible (D-state) sleep, where SIGKILL is deferred, and (b) compete for the reap a
+    /// run verb may be blocking on. A child already reaped elsewhere yields ECHILD — the harmless
+    /// no-op we want. A still-wedged child is left for the OS to reap at host exit (the prior, rarer
+    /// failure mode), rather than wedging teardown.
     let reapLeader (pid: int) : unit =
         let mutable status = 0
-        let mutable result = waitpid (pid, &status, 0)
+        let mutable attempts = 0
+        let mutable finished = false
 
-        while result < 0 && Marshal.GetLastWin32Error() = EINTR do
-            result <- waitpid (pid, &status, 0)
+        // ~200 ms ceiling: the common just-SIGKILLed child is reaped in the first iteration or two;
+        // the bound only matters for a wedged child, which we must not let stall teardown.
+        while not finished && attempts < 200 do
+            attempts <- attempts + 1
+            let result = waitpid (pid, &status, WNOHANG)
+
+            if result = 0 then
+                // Still alive — SIGKILL not yet reflected; wait a brief, bounded moment and retry.
+                System.Threading.Thread.Sleep 1
+            elif result < 0 && Marshal.GetLastWin32Error() = EINTR then
+                () // interrupted before we learned anything; loop and retry
+            else
+                finished <- true // reaped (result = pid), or ECHILD / other error — nothing more to do
 
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
     /// child's pid) and capture its stdout/stderr. The whole group can later be reaped with

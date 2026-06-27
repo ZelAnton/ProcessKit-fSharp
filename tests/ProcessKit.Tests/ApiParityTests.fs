@@ -85,6 +85,34 @@ type ApiParityTests() =
         Assert.That(policy.Overflow, Is.EqualTo OverflowMode.Error)
 
     [<Test>]
+    member _.``an all-unchecked pipeline with a failing last stage still succeeds``() : Task =
+        task {
+            // Every stage opts out of pipefail, so nothing can fail the pipeline — Run must succeed
+            // even though the last stage exits non-zero.
+            let pipeline =
+                ((shell "echo hi") |> Command.uncheckedInPipe).Pipe((shell "exit 5") |> Command.uncheckedInPipe)
+
+            match! pipeline.Run() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"expected an all-unchecked pipeline to succeed, got {error.Message}"
+        }
+
+    [<Test>]
+    member _.``WaitForLine tolerates an out-of-range timeout instead of throwing``() : Task =
+        task {
+            let runner: IProcessRunner = JobRunner()
+
+            match! runner.Start(sleeper (), CancellationToken.None) with
+            | Error e -> failwith $"Start failed: {e}"
+            | Ok running ->
+                use _ = running
+                // A negative timeout must not throw out of the CTS constructor; it resolves to NotReady.
+                match! running.WaitForLine((fun _ -> false), TimeSpan.FromSeconds -1.0) with
+                | Error(ProcessError.NotReady _) -> ()
+                | other -> Assert.Fail $"expected NotReady for a negative timeout, got {other}"
+        }
+
+    [<Test>]
     member _.``WaitFor with a cancelled token reports Cancelled, not NotReady``() : Task =
         task {
             let runner: IProcessRunner = JobRunner()

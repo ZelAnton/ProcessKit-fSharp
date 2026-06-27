@@ -200,6 +200,29 @@ module internal Pump =
         | Some s -> drainDiscard s cancellationToken
         | None -> Task.CompletedTask
 
+    /// `drainDiscardOrEmpty` that stops quietly if the stream is torn down mid-drain (early dispose /
+    /// broken pipe). For a fire-and-forget drain that nobody awaits — e.g. a `WaitAny`/`WaitAll` loser
+    /// the caller disposes while its drain is still reading — so the abandoned drain completes instead
+    /// of faulting as an unobserved task.
+    let drainDiscardOrEmptyUntilDone (stream: Stream option) (cancellationToken: CancellationToken) : Task =
+        task {
+            try
+                match stream with
+                | Some s -> do! drainDiscard s cancellationToken
+                | None -> ()
+            with
+            | :? ObjectDisposedException ->
+                // The stream was disposed by teardown while draining (an abandoned race loser).
+                ()
+            | :? IOException ->
+                // The pipe broke during teardown. Stop quietly.
+                ()
+            | :? OperationCanceledException ->
+                // The drain was cancelled during teardown. Stop quietly.
+                ()
+        }
+        :> Task
+
     /// `drainRaw` over an optional stream — an empty byte array when the stream isn't piped.
     let drainRawOrEmpty
         (stream: Stream option)

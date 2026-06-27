@@ -114,9 +114,9 @@ line, then leave it alive — a `head` stage would tear it down; reach for a sin
 The outcome follows shell **pipefail** (`set -o pipefail`):
 
 - **stdout** is always the **last** stage's output — that is what the chain produced.
-- **code**, **stderr**, and the reported **program** come from the **first** stage that
-  did not exit cleanly (a non-zero code, a signal kill, or a timeout) — or from the last
-  stage when every stage succeeded.
+- **code**, **stderr**, and the reported **program** come from the **rightmost** stage that
+  did not finish successfully — a code outside *its* accepted `OkCodes` (just `0` unless
+  widened), a signal kill, or a timeout — or from the last stage when every stage succeeded.
 
 So when an inner stage fails, the result's stdout is whatever the tail still printed,
 while the diagnostics point at the culprit:
@@ -132,7 +132,7 @@ task {
 
     match! pipeline.OutputString() with
     | Ok result ->
-        // Blame points at grep — the first unclean stage — while Stdout is whatever wc managed.
+        // Blame points at grep — the rightmost unclean stage — while Stdout is whatever wc managed.
         printfn $"code={result.Code} program={result.Program} success={result.IsSuccess}"
         // code=Some 2  program=grep  success=false
     | Error err -> eprintfn $"{err.Message}"
@@ -157,6 +157,9 @@ The two ends of the chain behave like a single `Command`:
   whole pipeline from a string, bytes, a file, or a stream.
 - **Inner** stages always read from the pipe: any `Stdin` source or `KeepStdinOpen`
   configured on a non-first stage is overridden.
+- Every stage's **stdout** is wired into a pipe — feeding the next stage's stdin, or captured
+  at the end — so a `Stdout` mode of `Null` / `Inherit` set on a stage is overridden to keep the
+  chain connected.
 - Each inner stage's **stderr** is captured per-stage for pipefail diagnostics; only the
   last stage's stdout reaches you.
 

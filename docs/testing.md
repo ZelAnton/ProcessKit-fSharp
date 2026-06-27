@@ -269,12 +269,15 @@ Semantics worth knowing before you commit a cassette:
 | `Start` | unsupported — replay serves the bulk verbs only (see [above](#what-the-doubles-dont-cover)) |
 | Err results | not recorded — only completed runs (a non-zero exit and a captured timeout *are* results and are recorded) |
 | One-shot stdin | `Stdin.FromReader` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
+| Format | a versioned JSON envelope — `{ "Version", "Entries" }`; a cassette whose format version this build doesn't understand is rejected on load, and a partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
 
 Only env *values* are redacted. `program`, `args`, `stdout`, and `stderr` are
 stored **verbatim** and can carry secrets (a `--password=…` flag, a token echoed
 to output), so review a fixture before committing it. On Unix the file is written
-owner-only (`0600`); on Windows it inherits the containing directory's ACL, so
-keep secret-bearing fixtures out of world-readable directories.
+**atomically and owner-only** (`0600` from creation — a temp file renamed into
+place, so it is never briefly world-readable); on Windows it inherits the
+containing directory's ACL, so keep secret-bearing fixtures out of world-readable
+directories.
 
 A neat trick: in tests, record against a `ScriptedRunner` instead of
 `JobRunner()` — the whole record → save → replay round trip is then itself

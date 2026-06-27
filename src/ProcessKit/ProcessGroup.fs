@@ -324,14 +324,23 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         (command: Command, cancellationToken: CancellationToken)
         : Task<Result<CapturedRun, ProcessError>> =
         task {
-            if cancellationToken.IsCancellationRequested then
+            // Honour the command's own CancelOn in addition to the verb's token, so a Command.CancelOn
+            // (or a CliClient default) ties this run to its token even through a ProcessGroup runner.
+            use linkedCts =
+                match command.Config.CancelOn with
+                | Some extra -> CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, extra)
+                | None -> CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+
+            let effectiveToken = linkedCts.Token
+
+            if effectiveToken.IsCancellationRequested then
                 return Error(ProcessError.Cancelled command.Program)
             else
                 match this.SpawnInto command with
                 | Error error -> return Error error
                 | Ok spawned ->
                     let startedAt = Stopwatch.GetTimestamp()
-                    use _registration = cancellationToken.Register(fun () -> backend.KillChild spawned)
+                    let registration = effectiveToken.Register(fun () -> backend.KillChild spawned)
 
                     Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
                     let stdoutTask = Pump.drainRawOrEmpty spawned.Stdout None CancellationToken.None
@@ -361,6 +370,9 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
                     let! stdoutBytes = stdoutTask
                     let! stderrBytes = stderrTask
+                    // Stop reacting to cancellation before closing the child's handle, so a late
+                    // cancellation can't fire KillChild on a since-reused handle value.
+                    registration.Dispose()
                     spawned.Stdout |> Option.iter (fun s -> s.Dispose())
                     spawned.Stderr |> Option.iter (fun s -> s.Dispose())
                     spawned.Stdin |> Option.iter (fun s -> s.Dispose())
@@ -369,7 +381,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     backend.Release spawned
                     let duration = Stopwatch.GetElapsedTime startedAt
 
-                    if cancellationToken.IsCancellationRequested then
+                    if effectiveToken.IsCancellationRequested then
                         return Error(ProcessError.Cancelled command.Program)
                     else
                         return
@@ -580,9 +592,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     // A `ProcessGroup` is itself an `IProcessRunner` — every run goes into THIS shared group rather
     // than a fresh private one, so a whole fleet shares one kill-on-dispose container (pass it to
-    // `Supervisor.WithRunner`). Captured runs decode stdout with the command's encoding; they do not
-    // apply the line-level `OutputBufferPolicy` or the per-run `Command.Timeout` (cancellation still
-    // works) — use `Start` + the `RunningProcess` verbs, or the default `JobRunner`, for those.
+    // `Supervisor.WithRunner`). Captured runs decode stdout with the command's encoding and honour the
+    // per-run `Command.Timeout` (hard-kill of just that child's subtree → `TimedOut`) and `CancelOn`;
+    // they do not apply the line-level `OutputBufferPolicy` or `TimeoutGrace` (a shared group has no
+    // per-child graceful kill) — use `Start` + the `RunningProcess` verbs for those.
     interface IProcessRunner with
         member this.Start(command, cancellationToken) =
             task {

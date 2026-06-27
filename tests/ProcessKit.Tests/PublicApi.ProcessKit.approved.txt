@@ -121,9 +121,9 @@ class ProcessKit.CommandVerbs
 module ProcessKit.Exec
   static member outputAll(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>[]>
   static member outputAllBytes(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>[]>
-  static member outputBytes(System.String, System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
-  static member outputString(System.String, System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
-  static member run(System.String, System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  static member outputBytes(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  static member outputString(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  static member run(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
 
 class ProcessKit.Finished
   property Outcome : ProcessKit.Outcome { get }

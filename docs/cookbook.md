@@ -383,7 +383,7 @@ short-circuits):
 ```fsharp
 let runner = JobRunner() :> IProcessRunner
 let commands = files |> List.map (fun f -> Command.create "gzip" |> Command.arg f)
-let! results = Exec.outputAll 4 runner commands   // at most 4 live at once
+let! results = Exec.outputAll 4 runner commands CancellationToken.None // at most 4 live at once
 ```
 
 ## Logging

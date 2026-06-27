@@ -122,7 +122,7 @@ type ErgonomicsTests() =
     [<Test>]
     member _.``Exec.run runs a program by name``() : Task =
         task {
-            match! Exec.run shellProgram [ shellFlag; "echo execrun" ] CancellationToken.None with
+            match! Exec.run shellProgram [ shellFlag; "echo execrun" ] with
             | Ok output -> Assert.That(output, Does.Contain "execrun")
             | Error error -> Assert.Fail $"{error}"
         }

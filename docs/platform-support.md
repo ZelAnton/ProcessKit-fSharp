@@ -192,11 +192,12 @@ newline-free flood — still grows until end of stream. Likewise, a streamed con
 backing channel, since streaming is consumer-paced. Pair an untrusted or chatty child with a
 `Command.Timeout`, which bounds the run and ends the stream at the deadline.
 
-**One terminal consumption per `RunningProcess`.** The streaming verbs compose in one chain
-(`WaitForLine` → `StdoutLines` → `Finish`); `OutputString` / `OutputBytes` / `Wait` are each a
-standalone terminal. Mixing terminals on one handle — for example calling `OutputString` *and*
-enumerating `StdoutLines` — double-pumps the same pipe. This is a usage constraint, not yet
-guarded; pick one consumption model per handle.
+**One consumption per `RunningProcess`.** The streaming verbs compose in one session
+(`WaitForLine` → `StdoutLines` → `Finish`); `OutputString` / `OutputBytes` / `Wait` / `Profile` are
+each a standalone terminal. The handle enforces this: once one consumer has claimed the output
+pipes, a second, conflicting one is refused rather than racing two readers on the same pipe — the
+`Result`-returning verbs return `ProcessError.Unsupported`, while `Wait` / `Profile` / `StdoutLines`
+/ `OutputEvents` throw `InvalidOperationException`. Pick one consumption model per handle.
 
 **Blocking waits under heavy concurrency.** Internally, waiting on a running child blocks a
 thread-pool thread per process. A very large `WaitAll`, a busy `Supervisor`, or a wide

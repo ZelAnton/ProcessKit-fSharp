@@ -4,24 +4,25 @@ open System.Threading
 open System.Threading.Tasks
 
 /// Top-level conveniences: run a program by name (without first building a `Command`), and run a
-/// whole batch of commands with bounded concurrency. Each verb takes an explicit `CancellationToken`
-/// (pass `CancellationToken.None` when you don't need cancellation), matching the `Runner` module.
+/// whole batch of commands with bounded concurrency. The single-command verbs are zero-config
+/// one-liners (for cancellation, build a `Command` and use its verbs, or go through `Runner`); the
+/// batch verbs take an explicit `CancellationToken` so a long fan-out can be cancelled.
 [<RequireQualifiedAccess>]
 module Exec =
 
     /// Run `program` with `args` in a private kill-on-dispose group, require a zero/accepted exit,
     /// and return stdout with trailing whitespace trimmed.
-    let run (program: string) (args: seq<string>) (cancellationToken: CancellationToken) =
-        (Command.create program |> Command.args args).Run cancellationToken
+    let run (program: string) (args: seq<string>) =
+        (Command.create program |> Command.args args).Run()
 
     /// Run `program` with `args` to completion and return the full `ProcessResult` (a non-zero exit
     /// is data, not an error).
-    let outputString (program: string) (args: seq<string>) (cancellationToken: CancellationToken) =
-        (Command.create program |> Command.args args).OutputString cancellationToken
+    let outputString (program: string) (args: seq<string>) =
+        (Command.create program |> Command.args args).OutputString()
 
     /// The raw-bytes companion to `outputString` — captures `program`'s stdout as bytes.
-    let outputBytes (program: string) (args: seq<string>) (cancellationToken: CancellationToken) =
-        (Command.create program |> Command.args args).OutputBytes cancellationToken
+    let outputBytes (program: string) (args: seq<string>) =
+        (Command.create program |> Command.args args).OutputBytes()
 
     // Run every command through `runner`, capping how many are live at once, and collect ALL results
     // in input order — the batch never short-circuits. `capture` selects the text / bytes verb.

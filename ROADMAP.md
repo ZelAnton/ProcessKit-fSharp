@@ -33,9 +33,6 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
   anonymous pipes are not overlapped, so reads are sync-over-async too). Under heavy concurrency (a
   large `WaitAll`, a `Supervisor`, `Exec.outputAll`) this pressures the thread pool. The public API
   would not change when the internals move to overlapped/registered waits.
-- **One terminal consumption per `RunningProcess`.** `WaitForLine` → `StdoutLines` → `Finish`
-  compose; `OutputString` / `OutputBytes` / `Wait` are standalone. Mixing terminal verbs (e.g.
-  `OutputString` *and* `StdoutLines`) double-pumps the same pipe — documented, not yet guarded.
 - **Streaming backlog.** A streamed (`StdoutLines` / `OutputEvents`) consumer that stops draining
   while the child floods grows the channel unbounded; the `OutputBufferPolicy` ceiling applies to
   the *buffered* verbs, and streaming is consumer-paced (pair it with a `Timeout`).

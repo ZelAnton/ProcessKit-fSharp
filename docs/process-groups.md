@@ -251,7 +251,7 @@ the caveats in full.
 ## Listing members
 
 `Members()` returns a point-in-time snapshot of the live member pids as an
-`int list`, wrapped in a `Result`:
+`IReadOnlyList<int>`, wrapped in a `Result`:
 
 ```fsharp
 open ProcessKit
