@@ -38,7 +38,7 @@ one place.
 | [Process groups](process-groups.md) | Kill-on-dispose containment: creating groups, spawning, teardown verbs, whole-tree signals, suspend/resume, member listing, resource limits, stats sampling |
 | [Streaming & interactive I/O](streaming.md) | `Start()` and the live `RunningProcess`: line streaming, interactive stdin, readiness probes (`WaitForLine` / `WaitForPort` / `WaitFor`), racing children with `WaitAny`, per-run profiling |
 | [Pipelines](pipelines.md) | `a → b → c` without a shell: wiring, pipefail attribution, `UncheckedInPipe` stages for the `… → head` pattern, timeouts, stdin/stdout at the ends |
-| [Timeouts, retries & cancellation](timeouts-and-cancellation.md) | How a deadline is *captured* vs when it errors, retry policies and their classifier, and cancellation: per-command tokens and the client-level `DefaultCancelOn` |
+| [Timeouts, retries & cancellation](timeouts-and-cancellation.md) | How a deadline is *captured* vs when it errors, retry policies and their classifier, and cancellation: per-command tokens and client-level defaults via `CliClient.WithDefaults` |
 | [Supervision](supervision.md) | Keeping a child alive: restart policies, backoff & jitter math, the failure-storm guard, stop conditions, outcomes, supervising inside a shared group |
 | [Testing your code](testing.md) | The `IProcessRunner` seam — bulk **and** streaming: `ScriptedRunner` (incl. scripted `Start()` with canned lines), record/replay cassettes, and building hermetically-testable CLI wrappers with `CliClient` |
 | [Platform support](platform-support.md) | The containment mechanisms, every per-capability support matrix in one place, and the platform caveats worth knowing before you ship |

@@ -291,24 +291,21 @@ the runner, so your wrapper contributes only the commands and the parsers — an
 because the runner is injectable, the wrapper tests hermetically with a
 `ScriptedRunner`.
 
-Create one with `CliClient.create name` (or `CliClient(name)`) and configure
-shared defaults, each returning a new client:
+Create one with `CliClient.create name` (or `CliClient(name)`) and configure it,
+each call returning a new client:
 
-- `.DefaultTimeout(timeSpan)`
-- `.DefaultEnv(key, value)` / `.DefaultEnvRemove(key)`
-- `.DefaultCurrentDir(directory)`
-- `.DefaultCancelOn(token)`
+- `.WithDefaults(configure)` — apply shared defaults with the **full** `Command`
+  builder, e.g. `client.WithDefaults(fun c -> c.CurrentDir(repo).Timeout(ts).Env("K", "V"))`
+  (timeout, working directory, environment, encoding, ok-codes, retry, logger, …)
 - `.WithRunner(runner)` — run every command through `runner` instead of the
   default `JobRunner` (this is the test seam)
 
-`.Command(args)` and `.CommandIn(directory, args)` build a configured `Command`
-without running it (defaults applied), and `.Run(args)` / `.OutputString(args)` /
-`.OutputBytes(args)` build and run. For the other verbs, reach the configured
-command plus the client's `.Runner`:
+`.Command(args)` builds a configured `Command` without running it (the template's
+defaults applied), and `.Run(args)` / `.OutputString(args)` / `.OutputBytes(args)`
+(plus `ExitCode`/`Probe`/`Parse`/…) build and run through the client's runner:
 
 ```fsharp
 open ProcessKit
-open System.Threading
 
 /// A small typed git wrapper. The CliClient is supplied, so tests inject a double.
 type Git(client: CliClient) =
@@ -317,10 +314,9 @@ type Git(client: CliClient) =
     member _.Head(repo: string) =
         client.Run [ "-C"; repo; "rev-parse"; "HEAD" ]
 
-    /// Is the work tree clean? The exit code *is* the answer, so probe it
-    /// through the client's runner and a configured Command.
+    /// Is the work tree clean? The exit code *is* the answer, so probe it.
     member _.IsClean(repo: string) =
-        Runner.probe client.Runner CancellationToken.None (client.CommandIn(repo, [ "diff"; "--quiet" ]))
+        client.Probe [ "-C"; repo; "diff"; "--quiet" ]
 ```
 
 Production wires the real runner and the per-client defaults:
@@ -328,7 +324,7 @@ Production wires the real runner and the per-client defaults:
 ```fsharp
 open System
 
-let git = Git((CliClient.create "git").DefaultTimeout(TimeSpan.FromSeconds 30.0))
+let git = Git((CliClient.create "git").WithDefaults(fun c -> c.Timeout(TimeSpan.FromSeconds 30.0)))
 ```
 
 …and the wrapper tests against a scripted runner, no subprocess:

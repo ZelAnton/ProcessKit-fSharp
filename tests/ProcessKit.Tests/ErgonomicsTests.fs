@@ -88,7 +88,9 @@ type ErgonomicsTests() =
 
     [<Test>]
     member _.``CliClient applies its default timeout to built commands``() =
-        let client = CliClient(shellProgram).DefaultTimeout(TimeSpan.FromSeconds 7.0)
+        let client =
+            CliClient(shellProgram).WithDefaults(fun c -> c.Timeout(TimeSpan.FromSeconds 7.0))
+
         let command = client.Command [ shellFlag; "echo hi" ]
         Assert.That(command.ConfiguredTimeout, Is.EqualTo(Some(TimeSpan.FromSeconds 7.0)))
 
@@ -109,7 +111,8 @@ type ErgonomicsTests() =
             if isWindows then
                 Assert.Ignore "POSIX env-echo."
             else
-                let client = CliClient("/bin/sh").DefaultEnv("PK_CLIENT_VAR", "configured")
+                let client =
+                    CliClient("/bin/sh").WithDefaults(fun c -> c.Env("PK_CLIENT_VAR", "configured"))
 
                 match! client.Run [ "-c"; "echo env-$PK_CLIENT_VAR" ] with
                 | Ok output -> Assert.That(output, Does.Contain "env-configured")

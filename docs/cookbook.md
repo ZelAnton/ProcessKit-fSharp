@@ -359,14 +359,14 @@ A reusable handle to one program with shared defaults:
 ```fsharp
 let git =
     (CliClient.create "git")
-        .DefaultCurrentDir("/repo")
-        .DefaultTimeout(TimeSpan.FromSeconds 30.0)
+        .WithDefaults(fun c -> c.CurrentDir("/repo").Timeout(TimeSpan.FromSeconds 30.0))
 
 let! sha = git.Run [ "rev-parse"; "HEAD" ]
 let! log = git.OutputString [ "log"; "--oneline"; "-n"; "10" ]
 ```
 
-`Command args` / `CommandIn dir args` build a configured `Command` without running it.
+`WithDefaults` configures the shared defaults with the full `Command` builder; `client.Command args`
+builds a configured `Command` without running it.
 
 ## Top-level Exec helpers
 

@@ -27,8 +27,8 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
         ScriptedRunner(rules @ [ predicate, reply ], fallback)
 
     /// Reply when the predicate matches the command.
-    member _.When(predicate: Command -> bool, reply: Reply) =
-        ScriptedRunner(rules @ [ predicate, reply ], fallback)
+    member _.When(predicate: Func<Command, bool>, reply: Reply) =
+        ScriptedRunner(rules @ [ predicate.Invoke, reply ], fallback)
 
     /// Reply to any command not matched by a rule.
     member _.Fallback(reply: Reply) = ScriptedRunner(rules, Some reply)

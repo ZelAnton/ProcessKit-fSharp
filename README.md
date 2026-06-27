@@ -464,7 +464,7 @@ Unlike a timeout â€” whose expiry is *captured* in the result as `IsTimedOut` â€
 **always an error**: the run was abandoned, so there is no result to inspect. A token cancelled
 *before* the run starts short-circuits without spawning anything. Tie a token to a command for its
 whole lifetime with `Command.CancelOn(token)`, or set it once on a `CliClient` with
-`DefaultCancelOn`.
+`WithDefaults(fun c -> c.CancelOn token)`.
 
 *Deeper: [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md).*
 
@@ -554,8 +554,7 @@ open System
 task {
     let git =
         (CliClient.create "git")
-            .DefaultCurrentDir("/repo")
-            .DefaultTimeout(TimeSpan.FromSeconds 30.0)
+            .WithDefaults(fun c -> c.CurrentDir("/repo").Timeout(TimeSpan.FromSeconds 30.0))
 
     match! git.Run [ "rev-parse"; "HEAD" ] with
     | Ok sha -> printfn $"{sha}"

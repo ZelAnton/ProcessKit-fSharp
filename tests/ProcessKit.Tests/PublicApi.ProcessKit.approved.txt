@@ -1,11 +1,5 @@
 class ProcessKit.CliClient
   member Command(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
-  member CommandIn(System.String, System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
-  member DefaultCancelOn(System.Threading.CancellationToken) : ProcessKit.CliClient
-  member DefaultCurrentDir(System.String) : ProcessKit.CliClient
-  member DefaultEnv(System.String, System.String) : ProcessKit.CliClient
-  member DefaultEnvRemove(System.String) : ProcessKit.CliClient
-  member DefaultTimeout(System.TimeSpan) : ProcessKit.CliClient
   member ExitCode(System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
   member ExitCode(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
   member FirstLine(System.Collections.Generic.IEnumerable<System.String>, System.Func<System.String, System.Boolean>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
@@ -26,10 +20,10 @@ class ProcessKit.CliClient
   member Start(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
   member TryParse<T>(System.Collections.Generic.IEnumerable<System.String>, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   member TryParse<T>(System.Collections.Generic.IEnumerable<System.String>, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  member WithDefaults(System.Func<ProcessKit.Command, ProcessKit.Command>) : ProcessKit.CliClient
   member WithRunner(ProcessKit.IProcessRunner) : ProcessKit.CliClient
   new(System.String)
   property Runner : ProcessKit.IProcessRunner { get }
-  property Timeout : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
 
 module ProcessKit.CliClientModule
   static member create(System.String) : ProcessKit.CliClient
@@ -914,7 +908,7 @@ class ProcessKit.Testing.ScriptedRunner
   :> ProcessKit.IProcessRunner
   member Fallback(ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
   member On(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
-  member When(Microsoft.FSharp.Core.FSharpFunc<ProcessKit.Command, System.Boolean>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
+  member When(System.Func<ProcessKit.Command, System.Boolean>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
   new()
 
 class ProcessKit.WaitAnyResult

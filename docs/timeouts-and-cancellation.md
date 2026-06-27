@@ -316,8 +316,10 @@ open System
 
 let gh =
     (CliClient.create "gh")
-        .DefaultTimeout(TimeSpan.FromSeconds 30.0)   // applied to every built command
-        .DefaultCancelOn(shutdownToken)              // …controller cancels → all in-flight runs die
+        .WithDefaults(fun c ->
+            c
+                .Timeout(TimeSpan.FromSeconds 30.0)  // applied to every built command
+                .CancelOn(shutdownToken))            // …controller cancels → all in-flight runs die
 ```
 
 Clients are cheap — scope cancellation by building **one client per cancellable
@@ -341,7 +343,7 @@ returned an `IsTimedOut` result.
 | "This operation is flaky, try a few times" | `Command.Retry` |
 | "Stop everything when the app shuts down" | `Command.CancelOn` / a verb token + one shared token |
 | "Bound a whole multi-stage chain" | `Pipeline.Timeout` / `Pipeline.CancelOn` |
-| "Set a deadline/token once for a tool" | `CliClient.DefaultTimeout` / `DefaultCancelOn` |
+| "Set a deadline/token once for a tool" | `CliClient.WithDefaults(fun c -> c.Timeout(...).CancelOn(...))` |
 | "Keep this service alive across crashes" | [supervision.md](supervision.md) `Supervisor` |
 | "Tell me when it's *ready*, don't kill it" | readiness probes — [streaming.md](streaming.md) |
 
