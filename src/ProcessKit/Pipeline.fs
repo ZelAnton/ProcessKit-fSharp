@@ -84,8 +84,8 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                 use linked =
                     CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, extra)
 
-                return! ProcessGroup.RunPipeline commands timeout lastTee linked.Token
-            | None -> return! ProcessGroup.RunPipeline commands timeout lastTee cancellationToken
+                return! PipelineRunner.run commands timeout lastTee linked.Token
+            | None -> return! PipelineRunner.run commands timeout lastTee cancellationToken
         }
 
     /// Run the pipeline to completion, capturing the last stage's stdout as raw bytes. A non-zero

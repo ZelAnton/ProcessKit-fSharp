@@ -1,6 +1,9 @@
 namespace ProcessKit
 
 open System
+open System.Collections.Generic
+open System.Threading
+open System.Threading.Tasks
 
 /// A snapshot of a process group's resource usage.
 ///
@@ -57,3 +60,53 @@ type RunProfile
         match cpuTime with
         | Some cpu when duration > TimeSpan.Zero -> Some(cpu.TotalSeconds / duration.TotalSeconds)
         | _ -> None
+
+/// A **pull-based** periodic `ProcessGroupStats` series (the iterator behind `ProcessGroup.SampleStats`):
+/// the first sample lands on the first `MoveNextAsync`, then one per `period`. It samples only when
+/// pulled and runs no background task, so abandoning it does no work and — crucially — does not keep
+/// the group alive, preserving kill-on-drop. The series ends on the first failing snapshot (e.g.
+/// after the group is released) or when `cancellationToken` fires.
+type internal StatsSampler
+    (sample: unit -> Result<ProcessGroupStats, ProcessError>, period: TimeSpan, cancellationToken: CancellationToken) =
+
+    let mutable current = Unchecked.defaultof<ProcessGroupStats>
+    let mutable first = true
+    let mutable finished = false
+
+    interface IAsyncEnumerator<ProcessGroupStats> with
+        member _.Current = current
+
+        member _.MoveNextAsync() : ValueTask<bool> =
+            ValueTask<bool>(
+                task {
+                    if finished || cancellationToken.IsCancellationRequested then
+                        finished <- true
+                        return false
+                    else
+                        if first then
+                            first <- false
+                        else
+                            try
+                                do! Task.Delay(period, cancellationToken)
+                            with :? OperationCanceledException ->
+                                finished <- true
+
+                        if finished then
+                            return false
+                        else
+                            match sample () with
+                            | Ok snapshot ->
+                                current <- snapshot
+                                return true
+                            | Error _ ->
+                                finished <- true
+                                return false
+                }
+            )
+
+        member _.DisposeAsync() = ValueTask.CompletedTask
+
+type internal StatsSamplerSeq(sample: unit -> Result<ProcessGroupStats, ProcessError>, period: TimeSpan) =
+    interface IAsyncEnumerable<ProcessGroupStats> with
+        member _.GetAsyncEnumerator(cancellationToken) =
+            StatsSampler(sample, period, cancellationToken) :> IAsyncEnumerator<ProcessGroupStats>

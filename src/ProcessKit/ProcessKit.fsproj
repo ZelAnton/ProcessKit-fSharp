@@ -44,6 +44,7 @@
 		<Compile Include="ProcessGroup.fs" />
 		<Compile Include="JobRunner.fs" />
 		<Compile Include="CommandVerbs.fs" />
+		<Compile Include="PipelineRunner.fs" />
 		<Compile Include="Pipeline.fs" />
 		<Compile Include="Supervisor.fs" />
 		<Compile Include="CliClient.fs" />
