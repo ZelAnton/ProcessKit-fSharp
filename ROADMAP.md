@@ -29,10 +29,12 @@ The [documentation guide set](docs/README.md) covers all of it in depth.
 
 Deliberate, documented constraints — not correctness bugs — kept here for future hardening:
 
-- **Blocking waits.** Each running process is awaited on a thread-pool thread (and on Windows the
-  anonymous pipes are not overlapped, so reads are sync-over-async too). Under heavy concurrency (a
-  large `WaitAll`, a `Supervisor`, `Exec.outputAll`) this pressures the thread pool. The public API
-  would not change when the internals move to overlapped/registered waits.
+- **Blocking pipe reads (and the POSIX exit wait).** The Windows exit wait now uses a thread-pool
+  registered wait (no dedicated thread per child), but the parent-side **pipe reads** are still
+  sync-over-async on both platforms — they park a thread-pool thread per piped stream — and the
+  **POSIX exit wait** still blocks a thread per child. Under heavy concurrency (a large `WaitAll`, a
+  `Supervisor`, `Exec.outputAll`) this pressures the thread pool. The public API would not change
+  when the remaining reads/waits move to overlapped (Windows) / `pidfd`-or-reaper (POSIX) I/O.
 - **Streaming backlog.** A streamed (`StdoutLines` / `OutputEvents`) consumer that stops draining
   while the child floods grows the channel unbounded; the `OutputBufferPolicy` ceiling applies to
   the *buffered* verbs, and streaming is consumer-paced (pair it with a `Timeout`).
@@ -46,8 +48,10 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
 
 ## Future directions
 
-- **Async-I/O hardening.** Move the per-process blocking wait to overlapped/registered waits so
-  heavy concurrency no longer pressures the thread pool — an internal change, no public-API impact.
+- **Async-I/O hardening.** The Windows exit wait is now a registered wait; the remaining work is
+  overlapped (named-pipe) reads on Windows and an async exit wait on POSIX (`pidfd` on Linux ≥5.3, a
+  single reaper thread otherwise) so heavy concurrency no longer parks a thread per piped stream /
+  per POSIX child. An internal change, no public-API impact; best driven by a concurrency benchmark.
 - **In-flight assembly buffer cap.** Cap the not-yet-terminated line buffer so a newline-free flood
   can't outgrow `OutputBufferPolicy`.
 
