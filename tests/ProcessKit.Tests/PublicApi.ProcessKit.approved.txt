@@ -118,6 +118,14 @@ class ProcessKit.CommandVerbs
   static member TryParse<T>(ProcessKit.Command, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   static member TryParse<T>(ProcessKit.Command, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
 
+class ProcessKit.DelegatingProcessRunner
+  :> ProcessKit.IProcessRunner
+  member OutputBytes(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  member OutputString(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  member Start(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
+  new(ProcessKit.IProcessRunner)
+  property Inner : ProcessKit.IProcessRunner { get }
+
 module ProcessKit.Exec
   static member outputAll(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>[]>
   static member outputAllBytes(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>[]>
@@ -874,6 +882,17 @@ class ProcessKit.Testing.CassetteFile
   property Entries : ProcessKit.Testing.CassetteEntry[] { get; set }
   property Version : System.Int32 { get; set }
 
+class ProcessKit.Testing.FakeProcess
+  member Build() : ProcessKit.RunningProcess
+  member WithExit(System.Int32) : ProcessKit.Testing.FakeProcess
+  member WithOutcome(ProcessKit.Outcome) : ProcessKit.Testing.FakeProcess
+  member WithPid(System.Int32) : ProcessKit.Testing.FakeProcess
+  member WithStderr(System.String) : ProcessKit.Testing.FakeProcess
+  member WithStdout(System.String) : ProcessKit.Testing.FakeProcess
+  member WithStdoutLines(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Testing.FakeProcess
+  static member Create() : ProcessKit.Testing.FakeProcess
+  static member Create(System.String) : ProcessKit.Testing.FakeProcess
+
 class ProcessKit.Testing.RecordReplayRunner
   :> ProcessKit.IProcessRunner
   :> System.IDisposable
@@ -884,6 +903,8 @@ class ProcessKit.Testing.RecordReplayRunner
 class ProcessKit.Testing.Reply
   member WithStderr(System.String) : ProcessKit.Testing.Reply
   member WithStdout(System.String) : ProcessKit.Testing.Reply
+  property TimedOut : ProcessKit.Testing.Reply { get }
+  static member Error(ProcessKit.ProcessError) : ProcessKit.Testing.Reply
   static member Exit(System.Int32) : ProcessKit.Testing.Reply
   static member Fail(System.Int32, System.String) : ProcessKit.Testing.Reply
   static member Ok(System.String) : ProcessKit.Testing.Reply

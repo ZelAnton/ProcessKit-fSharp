@@ -39,6 +39,8 @@
 		<Compile Include="IProcessRunner.fs" />
 		<Compile Include="Runner.fs" />
 		<Compile Include="ProcessRunnerExtensions.fs" />
+		<Compile Include="DelegatingProcessRunner.fs" />
+		<Compile Include="FakeProcess.fs" />
 		<Compile Include="Reply.fs" />
 		<Compile Include="ScriptedRunner.fs" />
 		<Compile Include="Cassette.fs" />

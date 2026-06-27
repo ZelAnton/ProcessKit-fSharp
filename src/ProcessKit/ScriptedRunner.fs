@@ -48,39 +48,55 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
         member this.OutputString(command, _) =
             let reply = this.Resolve command
 
-            let result =
-                ProcessResult<string>(
-                    command.Program,
-                    reply.StdoutText,
-                    reply.StderrText,
-                    reply.Outcome,
-                    TimeSpan.Zero,
-                    false,
-                    command.Config.OkCodes
-                )
+            match reply.ErrorOverride with
+            | Some error -> Task.FromResult(Error error)
+            | None ->
+                let result =
+                    ProcessResult<string>(
+                        command.Program,
+                        reply.StdoutText,
+                        reply.StderrText,
+                        reply.Outcome,
+                        TimeSpan.Zero,
+                        false,
+                        command.Config.OkCodes
+                    )
 
-            Task.FromResult(Ok result)
+                Task.FromResult(Ok result)
 
-        member _.Start(_, _) =
-            Task.FromResult(
-                Error(
-                    ProcessError.Unsupported
-                        "ScriptedRunner does not support Start (live streaming); script OutputString/OutputBytes instead."
-                )
-            )
+        member this.Start(command, _) =
+            let reply = this.Resolve command
+
+            match reply.ErrorOverride with
+            | Some error -> Task.FromResult(Error error)
+            | None ->
+                // Serve a real in-memory RunningProcess so streaming/readiness consumers can be
+                // tested through the same scripting used for the capture verbs.
+                let running =
+                    FakeProcess
+                        .Create(command.Program)
+                        .WithStdout(reply.StdoutText)
+                        .WithStderr(reply.StderrText)
+                        .WithOutcome(reply.Outcome)
+                        .Build()
+
+                Task.FromResult(Ok running)
 
         member this.OutputBytes(command, _) =
             let reply = this.Resolve command
 
-            let result =
-                ProcessResult<byte[]>(
-                    command.Program,
-                    Encoding.UTF8.GetBytes reply.StdoutText,
-                    reply.StderrText,
-                    reply.Outcome,
-                    TimeSpan.Zero,
-                    false,
-                    command.Config.OkCodes
-                )
+            match reply.ErrorOverride with
+            | Some error -> Task.FromResult(Error error)
+            | None ->
+                let result =
+                    ProcessResult<byte[]>(
+                        command.Program,
+                        Encoding.UTF8.GetBytes reply.StdoutText,
+                        reply.StderrText,
+                        reply.Outcome,
+                        TimeSpan.Zero,
+                        false,
+                        command.Config.OkCodes
+                    )
 
-            Task.FromResult(Ok result)
+                Task.FromResult(Ok result)
