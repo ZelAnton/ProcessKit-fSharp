@@ -6,6 +6,7 @@ open System.IO
 open System.IO.Pipes
 open System.Runtime.InteropServices
 open System.Text
+open System.Threading
 open System.Threading.Tasks
 open Microsoft.Win32.SafeHandles
 
@@ -359,18 +360,41 @@ module internal Native =
 
     let closeWindowsHandle (handle: nativeint) = CloseHandle handle |> ignore
 
-    /// Wait for a Windows process to exit and read its exit code. Blocks a thread-pool
-    /// thread for the child's lifetime (acceptable for the run-to-completion verbs).
+    /// Wait for a Windows process to exit and read its exit code — asynchronously, via a thread-pool
+    /// *registered wait* (one pool wait thread serves ~63 handles) instead of parking a dedicated
+    /// thread per child for its whole lifetime. The process handle is itself a waitable object that
+    /// signals on exit.
     let waitWindows (hProcess: nativeint) : Task<Outcome> =
-        Task.Run(fun () ->
-            WaitForSingleObject(hProcess, INFINITE) |> ignore
-            let mutable code = 0u
-            // `GetExitCodeProcess` can fail with ERROR_INVALID_HANDLE when teardown closes the handle
-            // concurrently (the process is being force-killed, so its exit code is moot). Tolerate that
-            // benign race — and any wait/read hiccup on our own handle — by reporting `Exited 0` rather
-            // than throwing out of a run verb.
-            GetExitCodeProcess(hProcess, &code) |> ignore
-            Outcome.Exited(int code))
+        let tcs =
+            TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        // A wait handle pointed at the process handle (non-owning: the backend closes `hProcess` on
+        // reap/teardown, not us).
+        let waitHandle = new ManualResetEvent(false)
+        waitHandle.SafeWaitHandle <- new SafeWaitHandle(hProcess, false)
+
+        let callback =
+            WaitOrTimerCallback(fun _ _ ->
+                let mutable code = 0u
+                // `GetExitCodeProcess` can fail with ERROR_INVALID_HANDLE when teardown closes the
+                // handle concurrently (the process is being force-killed, so its exit code is moot).
+                // Tolerate that benign race — and any wait hiccup on our own handle — by reporting
+                // `Exited 0` rather than faulting a run verb.
+                GetExitCodeProcess(hProcess, &code) |> ignore
+                tcs.TrySetResult(Outcome.Exited(int code)) |> ignore)
+
+        // -1 = infinite, executeOnlyOnce = true. The registration is published before the continuation
+        // that uses it is attached, so unregistering there is race-free even if the wait was already
+        // satisfied when registered.
+        let registration =
+            ThreadPool.RegisterWaitForSingleObject(waitHandle, callback, null, -1, true)
+
+        tcs.Task.ContinueWith(fun (_: Task<Outcome>) ->
+            registration.Unregister null |> ignore
+            waitHandle.Dispose())
+        |> ignore
+
+        tcs.Task
 
     /// Hard-kill one Windows process (not its descendants — for that, terminate the whole Job).
     let terminateWindowsProcess (hProcess: nativeint) =

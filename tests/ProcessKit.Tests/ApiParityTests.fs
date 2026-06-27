@@ -30,6 +30,26 @@ type ApiParityTests() =
             shell "sleep 8"
 
     [<Test>]
+    member _.``many concurrent runs all complete (async wait under load)``() : Task =
+        task {
+            // Exercises the OS-wait path under concurrency (Windows registered-wait / POSIX wait): 40
+            // short runs, 16 live at once, must all complete with a real exit code — none hung or lost.
+            let runner: IProcessRunner = JobRunner()
+            let commands = [ for i in 0..39 -> shell $"exit {i % 3}" ]
+            let! results = Exec.outputAll 16 runner commands CancellationToken.None
+            Assert.That(results.Length, Is.EqualTo 40)
+
+            let codes =
+                results
+                |> Array.map (fun r ->
+                    match r with
+                    | Ok outcome -> outcome.Code
+                    | Error _ -> None)
+
+            Assert.That(codes |> Array.forall Option.isSome, Is.True)
+        }
+
+    [<Test>]
     member _.``the derived verbs are available on any IProcessRunner``() : Task =
         task {
             // A ScriptedRunner gains ExitCode (a derived verb) for free via the runner extensions.
