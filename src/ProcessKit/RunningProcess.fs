@@ -400,7 +400,8 @@ type RunningProcess internal (host: RunningHost) =
                             | None -> ()
 
                             samples <- samples + 1
-                            do! Task.Delay(period, sampleCts.Token)
+                            // Clamp so an over-long sampling period can't throw out of `Task.Delay`.
+                            do! Task.Delay(Timeouts.clampArmable period, sampleCts.Token)
                     with :? OperationCanceledException ->
                         // The run finished and we cancelled sampling; stop quietly.
                         ()
@@ -488,6 +489,13 @@ type RunningProcess internal (host: RunningHost) =
                     return outcome
                 }
 
+            // A `StdoutLines()` consumer can abandon `Finish()` — e.g. its enumeration throws because a
+            // faulting `OnStdoutLine` handler completed the channel with the error. Observe `streamOutcome`'s
+            // fault here so that abandoned task can't surface as an unobserved exception at finalization;
+            // a consumer that does await (`Finish`/`WaitAny`/`WaitAll`) still re-throws it.
+            streamOutcome.ContinueWith(Action<Task<Outcome>>(fun t -> t.Exception |> ignore))
+            |> ignore
+
             true
 
     /// Stream stdout line by line as it arrives. Call `Finish` afterwards for stderr + outcome.
@@ -564,6 +572,8 @@ type RunningProcess internal (host: RunningHost) =
     member this.WaitForLine
         (predicate: Func<string, bool>, timeout: TimeSpan, cancellationToken: CancellationToken)
         : Task<Result<string, ProcessError>> =
+        ArgumentNullException.ThrowIfNull predicate
+
         if not (this.StartStdoutStreaming()) then
             Task.FromResult(Error(alreadyConsumedError ()))
         else
@@ -609,6 +619,8 @@ type RunningProcess internal (host: RunningHost) =
     member _.WaitForPort
         (endpoint: IPEndPoint, timeout: TimeSpan, cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
+        ArgumentNullException.ThrowIfNull endpoint
+
         task {
             let deadline = Stopwatch.StartNew()
             let mutable connected = false
@@ -629,6 +641,9 @@ type RunningProcess internal (host: RunningHost) =
                     try
                         do! Task.Delay(50, attempt.Token)
                     with :? OperationCanceledException ->
+                        // The per-attempt 1s window or the caller's token cancelled the backoff; the
+                        // loop guard re-checks the deadline/token next iteration and reports
+                        // NotReady/Cancelled, so swallowing here is correct.
                         ()
 
             if connected then
@@ -650,6 +665,8 @@ type RunningProcess internal (host: RunningHost) =
     member _.WaitFor
         (probe: Func<Task<bool>>, timeout: TimeSpan, cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
+        ArgumentNullException.ThrowIfNull probe
+
         task {
             let deadline = Stopwatch.StartNew()
             let mutable ready = false

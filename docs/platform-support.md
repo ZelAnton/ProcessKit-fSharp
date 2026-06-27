@@ -46,6 +46,8 @@ The selection at `ProcessGroup.Create` is deterministic per platform:
 `ProcessGroup.Mechanism` reports which primitive you actually got, so code that depends on a
 guarantee can check rather than assume:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -58,6 +60,28 @@ match ProcessGroup.Create() with
     | Mechanism.CgroupV2 -> printfn "Linux cgroup v2 — whole-tree kill, signals, limits, stats"
     | Mechanism.ProcessGroup -> printfn "POSIX process group — kill-on-dispose, leaders-only members"
 | Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var created = ProcessGroup.Create();
+if (created.IsOk)
+{
+    using var group = created.ResultValue;
+
+    if (group.Mechanism.IsJobObject)
+        Console.WriteLine("Windows Job Object — whole-tree kill, members, stats");
+    else if (group.Mechanism.IsCgroupV2)
+        Console.WriteLine("Linux cgroup v2 — whole-tree kill, signals, limits, stats");
+    else if (group.Mechanism.IsProcessGroup)
+        Console.WriteLine("POSIX process group — kill-on-dispose, leaders-only members");
+}
+else
+    Console.Error.WriteLine(created.ErrorValue.Message);
 ```
 
 The `Mechanism.IsJobObject` / `IsCgroupV2` / `IsProcessGroup` properties are the same check in

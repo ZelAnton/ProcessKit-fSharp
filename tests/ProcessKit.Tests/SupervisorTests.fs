@@ -7,9 +7,9 @@ open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
 
-/// A subprocess-free `IProcessRunner` that returns a fixed *sequence* of replies, one per call —
-/// the supervisor analog of the Rust `SeqRunner`. Running out of replies fails the test loudly, so
-/// an unexpected restart is caught rather than hanging.
+/// A subprocess-free `IProcessRunner` that returns a fixed *sequence* of replies, one per call.
+/// Running out of replies fails the test loudly, so an unexpected restart is caught rather than
+/// hanging.
 type private SequenceRunner(replies: Result<ProcessResult<string>, ProcessError> list) =
     let queue = Queue<Result<ProcessResult<string>, ProcessError>>(replies)
 
@@ -46,7 +46,7 @@ type private CapturingRunner() =
             failwith "CapturingRunner only scripts OutputString"
 
 /// A virtual clock: `Sleep` records the requested delay and advances `Now` instead of waiting, so
-/// backoff and storm-decay timing is deterministic and instant (the analog of tokio's paused clock).
+/// backoff and storm-decay timing is deterministic and instant (a virtual/paused clock).
 type private FakeClock() =
     let mutable now = 0.0
     let delays = ResizeArray<TimeSpan>()

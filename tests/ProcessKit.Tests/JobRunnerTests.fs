@@ -91,6 +91,21 @@ type JobRunnerTests() =
         :> Task
 
     [<Test>]
+    member _.``Start with an already-cancelled token reports Cancelled without spawning``() : Task =
+        task {
+            use cts = new CancellationTokenSource()
+            cts.Cancel()
+
+            match! runner.Start(shell "echo hi", cts.Token) with
+            | Error(ProcessError.Cancelled _) -> ()
+            | Error other -> Assert.Fail $"expected Cancelled, got {other}"
+            | Ok running ->
+                do! (running :> IAsyncDisposable).DisposeAsync()
+                Assert.Fail "expected Cancelled, but a process was started"
+        }
+        :> Task
+
+    [<Test>]
     member _.``cancelling terminates the contained process promptly``() : Task =
         task {
             use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 300.0)

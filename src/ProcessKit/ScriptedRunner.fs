@@ -1,7 +1,6 @@
 namespace ProcessKit.Testing
 
 open System
-open System.Text
 open System.Threading.Tasks
 open ProcessKit
 
@@ -51,18 +50,16 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
             match reply.ErrorOverride with
             | Some error -> Task.FromResult(Error error)
             | None ->
-                let result =
-                    ProcessResult<string>(
-                        command.Program,
-                        reply.StdoutText,
-                        reply.StderrText,
-                        reply.Outcome,
-                        TimeSpan.Zero,
-                        false,
-                        command.Config.OkCodes
-                    )
-
-                Task.FromResult(Ok result)
+                // Route capture through the same in-memory FakeProcess as `Start`, so all three seam
+                // paths agree byte-for-byte with a real run: line-ending normalization, the command's
+                // encoding, OkCodes, and output-buffer truncation are applied identically.
+                FakeProcess
+                    .OfCommand(command)
+                    .WithStdout(reply.StdoutText)
+                    .WithStderr(reply.StderrText)
+                    .WithOutcome(reply.Outcome)
+                    .Build()
+                    .OutputString()
 
         member this.Start(command, _) =
             let reply = this.Resolve command
@@ -89,15 +86,12 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
             match reply.ErrorOverride with
             | Some error -> Task.FromResult(Error error)
             | None ->
-                let result =
-                    ProcessResult<byte[]>(
-                        command.Program,
-                        Encoding.UTF8.GetBytes reply.StdoutText,
-                        reply.StderrText,
-                        reply.Outcome,
-                        TimeSpan.Zero,
-                        false,
-                        command.Config.OkCodes
-                    )
-
-                Task.FromResult(Ok result)
+                // Same FakeProcess path as OutputString/Start, so the captured bytes honour the
+                // command's StdoutEncoding instead of a hardcoded UTF-8.
+                FakeProcess
+                    .OfCommand(command)
+                    .WithStdout(reply.StdoutText)
+                    .WithStderr(reply.StderrText)
+                    .WithOutcome(reply.Outcome)
+                    .Build()
+                    .OutputBytes()

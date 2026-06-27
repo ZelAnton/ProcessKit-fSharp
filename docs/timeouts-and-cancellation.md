@@ -31,6 +31,8 @@ pipe-friendly `Command.*` mirror (`Command.timeout`, `Command.retry`,
 tree** at the deadline — not just the direct child, so a wrapper script's
 grandchildren die too. The run's `Outcome` becomes `Outcome.TimedOut`.
 
+**F#**
+
 ```fsharp
 open ProcessKit
 open System
@@ -50,8 +52,30 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+// Captured: a non-zero exit / timeout is data on the capture verbs.
+var cmd = new Command("slow-tool")
+    .Timeout(TimeSpan.FromSeconds(5));
+
+var result = await cmd.OutputString();
+if (result.IsOk && result.ResultValue.IsTimedOut)
+    // Code is None on a timeout; the partial output captured before the kill is kept.
+    Console.WriteLine($"timed out; partial stdout before the kill: {result.ResultValue.Stdout}");
+else if (result.IsOk)
+    Console.WriteLine($"exited {result.ResultValue.Code}: {result.ResultValue.Stdout}");
+else
+    Console.Error.WriteLine(result.ErrorValue.Message);
+```
+
 The same command finished with a success-checking verb raises the deadline as a
 typed error instead:
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -68,6 +92,27 @@ task {
         eprintfn $"{program} exceeded {timeout}"
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var cmd = new Command("slow-tool")
+    .Timeout(TimeSpan.FromSeconds(5));
+
+var result = await cmd.Run();
+if (result.IsOk)
+    Console.WriteLine(result.ResultValue);
+else if (result.ErrorValue.IsTimeout)
+{
+    var err = (ProcessError.Timeout)result.ErrorValue;
+    Console.Error.WriteLine($"{err.program} exceeded {err.timeout}");
+}
+else
+    Console.Error.WriteLine(result.ErrorValue.Message);
 ```
 
 `ProcessError.Timeout(program, timeout, stdout, stderr)` carries the partial
@@ -90,6 +135,8 @@ window to exit, then `SIGKILL`ed — the same SIGTERM → wait → SIGKILL tier 
 [`ProcessGroup.Shutdown`](process-groups.md). A signal-handling child that exits
 ends the grace early.
 
+**F#**
+
 ```fsharp
 open ProcessKit
 open System
@@ -103,6 +150,19 @@ task {
     let! _ = cmd.OutputString()
     ()
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var cmd = new Command("slow-tool")
+    .Timeout(TimeSpan.FromSeconds(30))
+    .TimeoutGrace(TimeSpan.FromSeconds(5)); // SIGTERM, wait up to 5s, then SIGKILL
+
+await cmd.OutputString();
 ```
 
 `IsTimedOut` is `true` regardless of whether the child exited on the signal or was
@@ -128,6 +188,8 @@ capture verbs treat the deadline as *data*; the success-checking verbs raise it.
 
 Streaming makes the "captured" half concrete — the deadline bounds the stream,
 and the outcome is readable afterwards:
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -161,6 +223,33 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var cmd = new Command("chatty-job")
+    .Timeout(TimeSpan.FromSeconds(10));
+
+var started = await cmd.Start();
+if (started.IsOk)
+{
+    await using var proc = started.ResultValue;
+
+    await foreach (var line in proc.StdoutLines())
+        Console.WriteLine($"> {line}"); // the stream ends when the deadline kills the tree
+
+    var finished = await proc.Finish();
+    if (finished.IsOk && finished.ResultValue.Outcome.IsTimedOut)
+        Console.Error.WriteLine("killed at the deadline");
+    else if (finished.IsError)
+        Console.Error.WriteLine(finished.ErrorValue.Message);
+}
+else
+    Console.Error.WriteLine(started.ErrorValue.Message);
+```
+
 ## Retries
 
 `Command.Retry(maxAttempts, delay, predicate)` (mirror: `Command.retry`) replays a
@@ -170,6 +259,8 @@ plain `ProcessError -> bool` through the module mirror).
 
 `maxAttempts` counts **additional** attempts *after* the first, so `Retry 3` runs
 the command at most four times.
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -197,17 +288,51 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var cmd = new Command("curl")
+    .Args(new[] { "-fsS", "https://example.com/api" })
+    .Timeout(TimeSpan.FromSeconds(10))
+    .Retry(
+        3,
+        TimeSpan.FromMilliseconds(250),
+        err =>
+            // transient (spawn/I/O), a timeout, or curl's "couldn't connect" (exit 7)
+            err.IsTransient
+            || err.IsTimeout
+            || (err.IsExit && ((ProcessError.Exit)err).code == 7));
+
+var result = await cmd.Run();
+if (result.IsOk)
+    Console.WriteLine(result.ResultValue);
+else
+    Console.Error.WriteLine($"gave up: {result.ErrorValue.Message}");
+```
+
 The two built-in classifiers are ready to drop in as predicates:
 
-- `ProcessError.isTransient` — `true` for `Spawn` and `Io` errors (spawn races,
-  transient I/O blips) that may succeed on another try.
-- `ProcessError.isNotFound` — `true` for a program-not-found failure (usually a
-  reason to install-then-retry rather than to blindly replay).
+- `ProcessError.isTransient` (from C#, `err.IsTransient`) — `true` for `Spawn` and `Io` errors
+  (spawn races, transient I/O blips) that may succeed on another try.
+- `ProcessError.isNotFound` (from C#, the generated `err.IsNotFound` tester) — `true` for a
+  program-not-found failure (usually a reason to install-then-retry rather than to blindly replay).
+
+**F#**
 
 ```fsharp
 let cmd =
     Command.create "flaky-tool"
     |> Command.retry 5 (TimeSpan.FromMilliseconds 200.0) ProcessError.isTransient
+```
+
+**C#**
+
+```csharp
+var cmd = new Command("flaky-tool")
+    .Retry(5, TimeSpan.FromMilliseconds(200), err => err.IsTransient);
 ```
 
 **Where retry earns its keep.** Retry replays the run whenever a verb yields an
@@ -238,6 +363,8 @@ the run's tree and makes every consuming path report `ProcessError.Cancelled`.
 Every verb has a `CancellationToken` overload (`cmd.Run(token)`,
 `cmd.OutputString(token)`, …):
 
+**F#**
+
 ```fsharp
 open ProcessKit
 open System.Threading
@@ -255,13 +382,43 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+using System.Threading;
+
+using var cts = new CancellationTokenSource();
+var job = new Command("long-export").Run(cts.Token);
+
+// elsewhere — a shutdown signal, a sibling failure, a UI button:
+cts.Cancel();
+
+var result = await job;
+if (result.IsError && result.ErrorValue.IsCancelled)
+{
+    var cancelled = (ProcessError.Cancelled)result.ErrorValue;
+    Console.WriteLine($"{cancelled.program} cancelled");
+}
+```
+
 Or tie a token to a command for its whole lifetime with `Command.CancelOn(token)`
 (mirror: `Command.cancelOn`) — it is **linked in addition to** any per-verb token,
 so either source cancels the run:
 
+**F#**
+
 ```fsharp
 let cmd = Command.create "long-export" |> Command.cancelOn shutdownToken
 let! _ = cmd.Run() // also cancels if shutdownToken fires
+```
+
+**C#**
+
+```csharp
+var cmd = new Command("long-export").CancelOn(shutdownToken);
+await cmd.Run(); // also cancels if shutdownToken fires
 ```
 
 The contract, path by path:
@@ -283,6 +440,8 @@ token cancelled before the run starts short-circuits without spawning anything.
 
 A whole **pipeline** has its own deadline and token, bounding the entire chain:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 open System
@@ -300,6 +459,24 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var pipeline = new Command("producer")
+    .Pipe(new Command("consumer"))
+    .Timeout(TimeSpan.FromSeconds(30))   // whole-chain deadline (mirror: Pipeline.timeout)
+    .CancelOn(shutdownToken);            // whole-chain token   (mirror: Pipeline.cancelOn)
+
+var result = await pipeline.OutputString();
+if (result.IsOk)
+    Console.WriteLine($"timedOut={result.ResultValue.IsTimedOut}");
+else
+    Console.Error.WriteLine(result.ErrorValue.Message); // ProcessError.Cancelled when the token fires
+```
+
 `Pipeline.Timeout` tears the shared group down at the deadline and reports the
 timeout (`IsTimedOut` on `OutputString`, `Error` on `Run`) — but, unlike a single
 command's *captured* timeout, there is no salvaged partial stdout to read back. A
@@ -309,6 +486,8 @@ See [pipelines.md](pipelines.md) for the full chain model.
 A **`CliClient`** usually builds and consumes its `Command`s internally, so set
 the deadline and token **once on the client** and every command it builds carries
 them:
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -320,6 +499,19 @@ let gh =
             c
                 .Timeout(TimeSpan.FromSeconds 30.0)  // applied to every built command
                 .CancelOn(shutdownToken))            // …controller cancels → all in-flight runs die
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var gh = new CliClient("gh")
+    .WithDefaults(c =>
+        c
+            .Timeout(TimeSpan.FromSeconds(30))  // applied to every built command
+            .CancelOn(shutdownToken));          // …controller cancels → all in-flight runs die
 ```
 
 Clients are cheap — scope cancellation by building **one client per cancellable

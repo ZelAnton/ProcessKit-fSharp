@@ -31,14 +31,35 @@ module Runner =
                     match! action () with
                     | Ok value -> final <- Some(Ok value)
                     | Error error ->
+                        // A cancelled run is always terminal: never retry a `Cancelled` error (even if a
+                        // custom `shouldRetry` would), or each attempt would re-fail instantly through the
+                        // still-cancelled token, burning every attempt and its backoff. Mirrors how the
+                        // supervisor treats cancellation as terminal.
+                        let isCancelled =
+                            match error with
+                            | ProcessError.Cancelled _ -> true
+                            | _ -> false
+
                         if
                             attempt < maxAttempts
                             && shouldRetry.Invoke error
                             && not cancellationToken.IsCancellationRequested
+                            && not isCancelled
                         then
                             attempt <- attempt + 1
                             Log.retry command.Config.Logger command.Program attempt delay
-                            do! Task.Delay delay
+
+                            try
+                                // Clamp the backoff into the armable timer range so a misconfigured delay
+                                // (negative / `InfiniteTimeSpan` / over-long) can't throw synchronously out
+                                // of `Task.Delay` — which would break the honest-result contract — the same
+                                // guard `Timeouts` applies to `Command.Timeout`.
+                                do! Task.Delay(Timeouts.clampArmable delay, cancellationToken)
+                            with :? System.OperationCanceledException ->
+                                // Cancelled mid-backoff: don't sleep out the rest of the delay before
+                                // observing the token; surface the last attempt's error (a cancelled
+                                // token would not have been retried anyway).
+                                final <- Some(Error error)
                         else
                             final <- Some(Error error)
 
@@ -153,7 +174,17 @@ module Runner =
         (command: Command)
         : Task<Result<string option, ProcessError>> =
         task {
-            match! runner.Start(command, cancellationToken) with
+            // Honour the command's `CancelOn` alongside the verb token: `firstLine` is a completion verb
+            // (it runs the child to its first matching line, then reaps it), so dropping `CancelOn` here
+            // would be a silent downgrade of `command.CancelOn(tok).FirstLine(pred)`.
+            use linkedCts =
+                match command.Config.CancelOn with
+                | Some extra -> CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, extra)
+                | None -> CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+
+            let effectiveToken = linkedCts.Token
+
+            match! runner.Start(command, effectiveToken) with
             | Error error -> return Error error
             | Ok running ->
                 // `use` reaps the process tree on every exit path (match below / a throwing
@@ -163,7 +194,7 @@ module Runner =
 
                 try
                     let mutable found = None
-                    use enumerator = running.StdoutLines().GetAsyncEnumerator(cancellationToken)
+                    use enumerator = running.StdoutLines().GetAsyncEnumerator(effectiveToken)
                     let mutable more = true
 
                     while more do

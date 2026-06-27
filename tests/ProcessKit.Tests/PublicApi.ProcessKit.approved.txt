@@ -362,6 +362,7 @@ class ProcessKit.ProcessError
   property IsSpawn : System.Boolean { get }
   property IsStdin : System.Boolean { get }
   property IsTimeout : System.Boolean { get }
+  property IsTransient : System.Boolean { get }
   property IsUnsupported : System.Boolean { get }
   property Message : System.String { get }
   property Tag : System.Int32 { get }

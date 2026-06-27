@@ -91,6 +91,15 @@ type ProcessError =
 
     override this.ToString() = this.Message
 
+    /// True for errors that may succeed on a retry (a spawn race or transient I/O). The instance
+    /// form of `ProcessError.isTransient`, so it reads cleanly from C# as `err.IsTransient` (the
+    /// not-found classifier already has the generated `err.IsNotFound` tester).
+    member this.IsTransient =
+        match this with
+        | ProcessError.Spawn _
+        | ProcessError.Io _ -> true
+        | _ -> false
+
 [<RequireQualifiedAccess>]
 module ProcessError =
 
@@ -100,9 +109,6 @@ module ProcessError =
         | ProcessError.NotFound _ -> true
         | _ -> false
 
-    /// True for errors that may succeed on a retry (spawn races, transient I/O).
-    let isTransient (error: ProcessError) =
-        match error with
-        | ProcessError.Spawn _
-        | ProcessError.Io _ -> true
-        | _ -> false
+    /// True for errors that may succeed on a retry (spawn races, transient I/O). Delegates to the
+    /// instance `ProcessError.IsTransient` so the two never drift.
+    let isTransient (error: ProcessError) = error.IsTransient

@@ -102,3 +102,69 @@ type TestabilityTests() =
                 Assert.That(counter.Count, Is.EqualTo 1)
             | Error error -> Assert.Fail $"forwarded OutputString failed: {error.Message}"
         }
+
+    [<Test>]
+    member _.``ScriptedRunner capture and Start agree byte-for-byte``() : Task =
+        task {
+            // Both seam paths route through the same FakeProcess, so a reply with internal *and*
+            // trailing newlines is captured identically whether read via OutputString or via a
+            // started RunningProcess — guarding against the capture path drifting from Start.
+            let runner: IProcessRunner =
+                ScriptedRunner().On([ "svc" ], Reply.Ok "first\nsecond\n")
+
+            let command = Command.create "svc"
+
+            let! captured = runner.OutputString(command, CancellationToken.None)
+
+            match! runner.Start(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"Start failed: {error.Message}"
+            | Ok proc ->
+                use proc = proc
+                let! streamed = proc.OutputString()
+
+                match captured, streamed with
+                | Ok cap, Ok str ->
+                    Assert.That(str.Stdout, Is.EqualTo cap.Stdout)
+                    Assert.That(str.Code, Is.EqualTo cap.Code)
+                | _ -> Assert.Fail "expected both capture paths to succeed"
+        }
+
+    [<Test>]
+    member _.``ScriptedRunner.OutputBytes captures the scripted output``() : Task =
+        task {
+            let runner: IProcessRunner = ScriptedRunner().On([ "x" ], Reply.Ok "payload-bytes")
+
+            match! runner.OutputBytes(Command.create "x", CancellationToken.None) with
+            | Ok result ->
+                // ASCII payload, so the decoded bytes are encoding-agnostic.
+                Assert.That(System.Text.Encoding.UTF8.GetString result.Stdout, Is.EqualTo "payload-bytes")
+            | Error error -> Assert.Fail $"OutputBytes failed: {error.Message}"
+        }
+
+    [<Test>]
+    member _.``ScriptedRunner honours the command's OkCodes``() : Task =
+        task {
+            // A non-zero exit the command accepts must surface as success through the scripted seam.
+            let runner: IProcessRunner = ScriptedRunner().On([ "svc" ], Reply.Exit 3)
+            let command = Command.create "svc" |> Command.okCodes [ 0; 3 ]
+
+            match! runner.OutputString(command, CancellationToken.None) with
+            | Ok result ->
+                Assert.That(result.IsSuccess, Is.True)
+                Assert.That(result.Code, Is.EqualTo(Some 3))
+                CollectionAssert.AreEqual([| 0; 3 |], result.AcceptedCodes)
+            | Error error -> Assert.Fail $"OutputString failed: {error.Message}"
+        }
+
+    [<Test>]
+    member _.``FakeProcess.OfCommand carries the command's OkCodes into IsSuccess``() : Task =
+        task {
+            let command = Command.create "svc" |> Command.okCodes [ 0; 3 ]
+            use proc = FakeProcess.OfCommand(command).WithExit(3).Build()
+
+            match! proc.OutputString() with
+            | Ok result ->
+                Assert.That(result.IsSuccess, Is.True)
+                CollectionAssert.AreEqual([| 0; 3 |], result.AcceptedCodes)
+            | Error error -> Assert.Fail $"OutputString failed: {error.Message}"
+        }

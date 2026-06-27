@@ -86,16 +86,19 @@ type CommandVerbs =
     /// becomes `ProcessError.Parse`.
     [<Extension>]
     static member Parse(command: Command, parser: Func<string, 'T>) =
+        ArgumentNullException.ThrowIfNull parser
         Runner.parse CommandVerbs.DefaultRunner CancellationToken.None parser.Invoke command
 
     /// `Parse`, cancellable through `cancellationToken`.
     [<Extension>]
     static member Parse(command: Command, parser: Func<string, 'T>, cancellationToken: CancellationToken) =
+        ArgumentNullException.ThrowIfNull parser
         Runner.parse CommandVerbs.DefaultRunner cancellationToken parser.Invoke command
 
     /// Like `Parse`, but the parser returns its own `Result` (its error becomes `Parse`).
     [<Extension>]
     static member TryParse(command: Command, parser: Func<string, Result<'T, string>>) =
+        ArgumentNullException.ThrowIfNull parser
         Runner.tryParse CommandVerbs.DefaultRunner CancellationToken.None parser.Invoke command
 
     /// `TryParse`, cancellable through `cancellationToken`.
@@ -103,14 +106,17 @@ type CommandVerbs =
     static member TryParse
         (command: Command, parser: Func<string, Result<'T, string>>, cancellationToken: CancellationToken)
         =
+        ArgumentNullException.ThrowIfNull parser
         Runner.tryParse CommandVerbs.DefaultRunner cancellationToken parser.Invoke command
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     [<Extension>]
     static member FirstLine(command: Command, predicate: Func<string, bool>) =
+        ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine CommandVerbs.DefaultRunner CancellationToken.None predicate.Invoke command
 
     /// `FirstLine`, cancellable through `cancellationToken`.
     [<Extension>]
     static member FirstLine(command: Command, predicate: Func<string, bool>, cancellationToken: CancellationToken) =
+        ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine CommandVerbs.DefaultRunner cancellationToken predicate.Invoke command

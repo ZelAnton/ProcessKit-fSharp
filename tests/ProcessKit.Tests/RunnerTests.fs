@@ -1,5 +1,6 @@
 namespace ProcessKit.Tests
 
+open System
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
@@ -79,5 +80,36 @@ type RunnerTests() =
             match result with
             | Error(ProcessError.Exit(_, 2, _, _)) -> Assert.Pass()
             | other -> Assert.Fail $"expected an Exit error, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``retry never re-runs a cancelled error``() : Task =
+        task {
+            let mutable calls = 0
+
+            let cancelling =
+                { new IProcessRunner with
+                    member _.OutputString(command, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Error(ProcessError.Cancelled command.Program))
+
+                    member _.OutputBytes(command, _) =
+                        Task.FromResult(Error(ProcessError.Cancelled command.Program))
+
+                    member _.Start(command, _) =
+                        Task.FromResult(Error(ProcessError.Cancelled command.Program)) }
+
+            // A retry policy that would re-run on ANY error, to prove the Cancelled short-circuit wins
+            // (otherwise each attempt re-fails instantly and burns the whole budget).
+            let command = Command.create "svc" |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.outputString cancelling CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+            Assert.That(calls, Is.EqualTo 1)
         }
         :> Task

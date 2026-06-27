@@ -245,7 +245,9 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             if interval <= TimeSpan.Zero then
                 TimeSpan.FromMilliseconds 1.0
             else
-                interval
+                // Cap an over-long interval into the armable range so the sampler's `Task.Delay` can't
+                // throw synchronously (it then samples at the max ~24.8-day cadence instead of faulting).
+                Timeouts.clampArmable interval
 
         StatsSamplerSeq((fun () -> this.Stats()), period)
 
@@ -279,37 +281,44 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     let stderrTask = Pump.drainRawOrEmpty spawned.Stderr None CancellationToken.None
                     let waitTask = waitOutcome spawned.Handle
 
-                    // Honour the command's `Timeout`: on the deadline, hard-kill just this child's
-                    // subtree (a shared group may hold siblings, so the graceful whole-tree path is not
-                    // used here) and report `TimedOut`. An over-long span is treated as no timeout.
-                    let! outcome =
-                        Timeouts.raceTimeout
-                            command.Config.Logger
-                            command.Program
-                            command.Config.Timeout
-                            (fun () -> task { backend.KillChild spawned } :> Task)
-                            waitTask
+                    try
+                        // Honour the command's `Timeout`: on the deadline, hard-kill just this child's
+                        // subtree (a shared group may hold siblings, so the graceful whole-tree path is not
+                        // used here) and report `TimedOut`. An over-long span is treated as no timeout.
+                        let! outcome =
+                            Timeouts.raceTimeout
+                                command.Config.Logger
+                                command.Program
+                                command.Config.Timeout
+                                (fun () -> task { backend.KillChild spawned } :> Task)
+                                waitTask
 
-                    let! stdoutBytes = stdoutTask
-                    let! stderrBytes = stderrTask
-                    // Stop reacting to cancellation before closing the child's handle, so a late
-                    // cancellation can't fire KillChild on a since-reused handle value.
-                    registration.Dispose()
-                    Pump.closeSpawned spawned
-                    // The child is reaped: stop tracking it (close its Windows handle) so a long-lived
-                    // shared group does not accumulate handles/pgids across many captured runs.
-                    backend.Release spawned
-                    let duration = Stopwatch.GetElapsedTime startedAt
+                        // Observe both pumps before reading either, so a throwing stderr handler (or a
+                        // raw-drain I/O fault) can't orphan the other as an unobserved task.
+                        do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
+                        let! stdoutBytes = stdoutTask
+                        let! stderrBytes = stderrTask
+                        let duration = Stopwatch.GetElapsedTime startedAt
 
-                    if effectiveToken.IsCancellationRequested then
-                        return Error(ProcessError.Cancelled command.Program)
-                    else
-                        return
-                            Ok
-                                { Stdout = stdoutBytes
-                                  Stderr = Encoding.UTF8.GetString stderrBytes
-                                  Outcome = outcome
-                                  Duration = duration }
+                        if effectiveToken.IsCancellationRequested then
+                            return Error(ProcessError.Cancelled command.Program)
+                        else
+                            return
+                                Ok
+                                    { Stdout = stdoutBytes
+                                      Stderr = Encoding.UTF8.GetString stderrBytes
+                                      Outcome = outcome
+                                      Duration = duration }
+                    finally
+                        // Stop reacting to cancellation before closing the child's handle, so a late
+                        // cancellation can't fire KillChild on a since-reused handle value. Runs on every
+                        // exit path (including a faulting drain/timeout), so a long-lived shared group
+                        // never leaks the child's handle/pgid even when capture fails.
+                        registration.Dispose()
+                        Pump.closeSpawned spawned
+                        // The child is reaped: stop tracking it (close its Windows handle) so a long-lived
+                        // shared group does not accumulate handles/pgids across many captured runs.
+                        backend.Release spawned
         }
 
     /// Gracefully kill the contained tree (SIGTERM, then SIGKILL after `grace`) WITHOUT releasing

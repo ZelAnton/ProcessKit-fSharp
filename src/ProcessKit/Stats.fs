@@ -87,6 +87,8 @@ type internal StatsSampler
                             first <- false
                         else
                             try
+                                // `period` is pre-clamped by the caller (`SampleStats`) into the armable
+                                // range, so `Task.Delay` here can't throw on an over-long interval.
                                 do! Task.Delay(period, cancellationToken)
                             with :? OperationCanceledException ->
                                 finished <- true

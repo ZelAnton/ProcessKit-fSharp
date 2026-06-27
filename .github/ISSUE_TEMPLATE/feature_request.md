@@ -16,4 +16,4 @@ What you'd like ProcessKit to do — API shape, behavior, etc.
 Other approaches you've thought about or worked around.
 
 **Additional context**
-Links, prior art (e.g. the Rust `ProcessKit-rs` equivalent), or examples.
+Links, prior art, or examples.

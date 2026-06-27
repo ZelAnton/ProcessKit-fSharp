@@ -60,7 +60,10 @@ module Exec =
         (commands: seq<Command>)
         (cancellationToken: CancellationToken)
         =
-        runAll concurrency runner commands (fun r c -> r.OutputString(c, cancellationToken))
+        // Route through the verb layer (not the raw seam) so each command's own `Retry` policy applies,
+        // matching `cmd.OutputString()` / `CliClient.OutputString` — retry still fires only on a genuine
+        // error, never on a non-zero exit (which stays data).
+        runAll concurrency runner commands (fun r c -> Runner.outputString r cancellationToken c)
 
     /// The raw-bytes companion to `outputAll` — captures each command's stdout as bytes.
     let outputAllBytes
@@ -69,4 +72,4 @@ module Exec =
         (commands: seq<Command>)
         (cancellationToken: CancellationToken)
         =
-        runAll concurrency runner commands (fun r c -> r.OutputBytes(c, cancellationToken))
+        runAll concurrency runner commands (fun r c -> Runner.outputBytes r cancellationToken c)

@@ -8,8 +8,14 @@ open System.Threading
 /// (`OutputString`/`OutputBytes`/`Start`). So a chosen or injected runner — a shared `ProcessGroup`,
 /// a `ScriptedRunner`, a `JobRunner` — gets `run`/`exitCode`/`probe`/`parse`/… uniformly
 /// (`group.Run command`, `scripted.Probe command`), callable from F# and C#. The verb *logic* lives
-/// once in the `Runner` module; these are thin sugar over it (and over the interface's own
-/// `OutputString`/`OutputBytes`/`Start`, which already take a `CancellationToken`).
+/// once in the `Runner` module; these are thin sugar over it.
+///
+/// Retry contract: every terminal verb here (`Run`/`RunUnit`/`OutputString`/`OutputBytes`/`ExitCode`/
+/// `Probe`/`Parse`/`TryParse`) applies the command's `Retry` policy, exactly like the `Command`/
+/// `CliClient` verbs — because they all route through the `Runner` module. The raw
+/// `IProcessRunner.OutputString`/`OutputBytes`/`Start` interface methods (the ones taking a
+/// `CancellationToken`) are the single-run *seam* and never retry; retry is layered on top here.
+/// Streaming verbs (`Start`/`FirstLine`) never retry on any surface.
 [<Extension>]
 type ProcessRunnerExtensions =
 
@@ -33,18 +39,18 @@ type ProcessRunnerExtensions =
     static member RunUnit(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
         Runner.runUnit runner cancellationToken command
 
-    /// Run to completion, capturing stdout as decoded text (a non-zero exit is data). Forwards to the
-    /// runner's own seam method, so its behaviour matches `runner.OutputString(command, ct)` exactly
-    /// (no extra retry layer — retry is applied by the derived verbs and the `Command` verbs).
+    /// Run to completion, capturing stdout as decoded text (a non-zero exit is data). Applies the
+    /// command's `Retry` policy (like the `Command`/`CliClient` verbs); for a single uncancellable run
+    /// with no retry, call the seam directly: `runner.OutputString(command, ct)`.
     [<Extension>]
     static member OutputString(runner: IProcessRunner, command: Command) =
-        runner.OutputString(command, CancellationToken.None)
+        Runner.outputString runner CancellationToken.None command
 
-    /// Run to completion, capturing stdout as raw bytes (a non-zero exit is data). Forwards to the
-    /// runner's own seam method, matching `runner.OutputBytes(command, ct)`.
+    /// Run to completion, capturing stdout as raw bytes (a non-zero exit is data). Applies the
+    /// command's `Retry` policy; the raw seam `runner.OutputBytes(command, ct)` is the no-retry path.
     [<Extension>]
     static member OutputBytes(runner: IProcessRunner, command: Command) =
-        runner.OutputBytes(command, CancellationToken.None)
+        Runner.outputBytes runner CancellationToken.None command
 
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel.
     [<Extension>]
@@ -75,6 +81,7 @@ type ProcessRunnerExtensions =
     /// becomes `ProcessError.Parse`.
     [<Extension>]
     static member Parse(runner: IProcessRunner, command: Command, parser: Func<string, 'T>) =
+        ArgumentNullException.ThrowIfNull parser
         Runner.parse runner CancellationToken.None parser.Invoke command
 
     /// `Parse`, cancellable through `cancellationToken`.
@@ -82,11 +89,13 @@ type ProcessRunnerExtensions =
     static member Parse
         (runner: IProcessRunner, command: Command, parser: Func<string, 'T>, cancellationToken: CancellationToken)
         =
+        ArgumentNullException.ThrowIfNull parser
         Runner.parse runner cancellationToken parser.Invoke command
 
     /// Like `Parse`, but the parser returns its own `Result` (its error becomes `Parse`).
     [<Extension>]
     static member TryParse(runner: IProcessRunner, command: Command, parser: Func<string, Result<'T, string>>) =
+        ArgumentNullException.ThrowIfNull parser
         Runner.tryParse runner CancellationToken.None parser.Invoke command
 
     /// `TryParse`, cancellable through `cancellationToken`.
@@ -98,11 +107,13 @@ type ProcessRunnerExtensions =
             parser: Func<string, Result<'T, string>>,
             cancellationToken: CancellationToken
         ) =
+        ArgumentNullException.ThrowIfNull parser
         Runner.tryParse runner cancellationToken parser.Invoke command
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     [<Extension>]
     static member FirstLine(runner: IProcessRunner, command: Command, predicate: Func<string, bool>) =
+        ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine runner CancellationToken.None predicate.Invoke command
 
     /// `FirstLine`, cancellable through `cancellationToken`.
@@ -110,4 +121,5 @@ type ProcessRunnerExtensions =
     static member FirstLine
         (runner: IProcessRunner, command: Command, predicate: Func<string, bool>, cancellationToken: CancellationToken)
         =
+        ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine runner cancellationToken predicate.Invoke command

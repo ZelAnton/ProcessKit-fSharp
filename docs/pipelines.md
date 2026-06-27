@@ -35,6 +35,8 @@ to build a chain.
 The fluent way: `Command.Pipe(next)` turns a `Command` into a `Pipeline`, and chaining
 `.Pipe(...)` again appends another stage. Finish with a verb.
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -51,9 +53,29 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+// git log --format=%an | sort | uniq -c
+var pipeline = new Command("git").Args(new[] { "log", "--format=%an" })
+    .Pipe(new Command("sort"))
+    .Pipe(new Command("uniq").Arg("-c"));
+
+var authors = await pipeline.Run();
+if (authors.IsOk)
+    Console.WriteLine(authors.ResultValue);
+else
+    Console.Error.WriteLine(authors.ErrorValue.Message);
+```
+
 The pipe-style module mirror builds the same value: `Pipeline.create first second` seeds
 a two-stage chain, and `Pipeline.pipe next pipeline` appends a stage — so it threads
 naturally through `|>`:
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -69,6 +91,23 @@ task {
     | Ok result -> printfn $"{result.Stdout}"
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var pipeline = new Command("git").Args(new[] { "log", "--format=%an" })
+    .Pipe(new Command("sort"))
+    .Pipe(new Command("uniq").Arg("-c"));
+
+var result = await pipeline.OutputString();
+if (result.IsOk)
+    Console.WriteLine(result.ResultValue.Stdout);
+else
+    Console.Error.WriteLine(result.ErrorValue.Message);
 ```
 
 `Pipeline.timeout` and `Pipeline.cancelOn` round out the module mirror; they correspond
@@ -121,6 +160,8 @@ The outcome follows shell **pipefail** (`set -o pipefail`):
 So when an inner stage fails, the result's stdout is whatever the tail still printed,
 while the diagnostics point at the culprit:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -139,9 +180,34 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var pipeline = new Command("cat").Arg("data.txt")
+    .Pipe(new Command("grep").Arg("ERROR")) // suppose grep exits 2 (bad regex)
+    .Pipe(new Command("wc").Arg("-l"));
+
+var result = await pipeline.OutputString();
+if (result.IsOk)
+{
+    // Blame points at grep — the rightmost unclean stage — while Stdout is whatever wc managed.
+    Console.WriteLine($"code={result.ResultValue.Code} program={result.ResultValue.Program} success={result.ResultValue.IsSuccess}");
+    // code=Some 2  program=grep  success=false
+}
+else
+{
+    Console.Error.WriteLine(result.ErrorValue.Message);
+}
+```
+
 The success-requiring verbs turn that same pipefail outcome into a typed error attributed
 to the blamed stage. `ProcessResult.ensureSuccess` does it explicitly, and `Run` does it
 for you:
+
+**F#**
 
 ```fsharp
 match! pipeline.Run() with
@@ -149,6 +215,18 @@ match! pipeline.Run() with
 | Error(ProcessError.Exit(program, code, _, stderr)) ->
     eprintfn $"{program} exited {code}: {stderr}" // program = "grep", code = 2
 | Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+var result = await pipeline.Run();
+if (result.IsOk)
+    Console.WriteLine(result.ResultValue);
+else if (result.ErrorValue is ProcessError.Exit exit)
+    Console.Error.WriteLine($"{exit.program} exited {exit.code}: {exit.stderr}"); // program = "grep", code = 2
+else
+    Console.Error.WriteLine(result.ErrorValue.Message);
 ```
 
 The two ends of the chain behave like a single `Command`:
@@ -162,6 +240,8 @@ The two ends of the chain behave like a single `Command`:
   chain connected.
 - Each inner stage's **stderr** is captured per-stage for pipefail diagnostics; only the
   last stage's stdout reaches you.
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -178,6 +258,23 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var uniqueCount = new Command("sort").Stdin(Stdin.FromString("b\na\nb\nc\n"))
+    .Pipe(new Command("uniq"))
+    .Pipe(new Command("wc").Arg("-l"));
+
+var n = await uniqueCount.Run();
+if (n.IsOk)
+    Console.WriteLine(n.ResultValue); // "3"
+else
+    Console.Error.WriteLine(n.ErrorValue.Message);
+```
+
 ## Unchecked stages
 
 Strict pipefail has one classic false positive: a consumer that legitimately stops
@@ -187,6 +284,8 @@ relay's downstream is gone (a failed write on Windows, possibly delivered as `SI
 POSIX). That is a perfectly normal death, but strict pipefail would blame the chain for
 it. Mark the producer `Command.uncheckedInPipe` (fluent: `.UncheckedInPipe()`) and
 pipefail skips it:
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -201,6 +300,23 @@ task {
     | Ok line -> printfn $"{line}" // "1"
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+// seq 1 1000000 | head -n 1 — the producer's broken-pipe death is expected.
+var first = new Command("seq").Args(new[] { "1", "1000000" }).UncheckedInPipe()
+    .Pipe(new Command("head").Args(new[] { "-n", "1" }));
+
+var line = await first.Run();
+if (line.IsOk)
+    Console.WriteLine(line.ResultValue); // "1"
+else
+    Console.Error.WriteLine(line.ErrorValue.Message);
 ```
 
 The rules:
@@ -222,6 +338,8 @@ The rules:
 
 There are two distinct timeout scopes:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 open System
@@ -236,6 +354,23 @@ task {
     | Ok result -> printfn $"timedOut={result.IsTimedOut}"
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var pipeline = new Command("producer").Timeout(TimeSpan.FromSeconds(10)) // per-STAGE: kills just producer
+    .Pipe(new Command("consumer"))
+    .Timeout(TimeSpan.FromSeconds(30));                                  // whole-CHAIN
+
+var result = await pipeline.OutputString();
+if (result.IsOk)
+    Console.WriteLine($"timedOut={result.ResultValue.IsTimedOut}");
+else
+    Console.Error.WriteLine(result.ErrorValue.Message);
 ```
 
 - **`Pipeline.Timeout`** (module mirror: `Pipeline.timeout`) bounds the **whole chain**:

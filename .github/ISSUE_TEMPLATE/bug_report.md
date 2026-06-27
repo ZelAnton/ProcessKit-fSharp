@@ -12,8 +12,8 @@ A clear and concise description of what the bug is.
 **To reproduce**
 A minimal code sample or steps that trigger the problem.
 
-```fsharp
-// minimal repro
+```
+// minimal repro (F# or C#)
 ```
 
 **Expected behavior**

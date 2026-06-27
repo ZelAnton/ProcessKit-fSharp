@@ -39,6 +39,8 @@ The samples below run inside a `task { }` block and use `match!`; from C# the sa
 There are two equivalent entry points. The module function threads naturally through `|>`, and
 the constructor reads the same from F# and C#:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -46,8 +48,18 @@ let supervisor = Supervisor.create (Command.create "worker") // module
 let supervisor = Supervisor(Command.create "worker")         // constructor
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+
+var supervisor = new Supervisor(new Command("worker")); // constructor
+```
+
 The builder is fluent and immutable — every method returns a new `Supervisor`, and building one
 spawns nothing. Nothing runs until you call a verb (`Run`):
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -67,6 +79,27 @@ task {
     | Ok outcome -> printfn $"ended after {outcome.Restarts} restarts: {outcome.Stopped}"
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var supervisor = new Supervisor(new Command("my-server").Args(new[] { "--port", "8080" }))
+    .Restart(RestartPolicy.OnCrash)               // Always | OnCrash | Never
+    .MaxRestarts(5)                               // default: unlimited
+    .Backoff(TimeSpan.FromMilliseconds(200), 2.0) // base delay, multiplier
+    .MaxBackoff(TimeSpan.FromSeconds(30))         // cap on any single delay
+    .Jitter(true)                                 // default: on
+    .StormPause(TimeSpan.FromSeconds(15));        // crash-loop guard (off by default)
+
+var outcome = await supervisor.Run();
+if (outcome.IsOk)
+    Console.WriteLine($"ended after {outcome.ResultValue.Restarts} restarts: {outcome.ResultValue.Stopped}");
+else
+    Console.Error.WriteLine(outcome.ErrorValue.Message);
 ```
 
 The defaults, if you set nothing, are: `RestartPolicy.OnCrash`, **unlimited** restarts, backoff
@@ -109,6 +142,8 @@ base = 200ms, factor = 2.0, cap = 30s (before jitter):
 #5 → 6.4s    #6 → 12.8s   #7 → 25.6s   #8+ → 30s (capped)
 ```
 
+**F#**
+
 ```fsharp
 open ProcessKit
 open System
@@ -118,6 +153,18 @@ let supervisor =
         .Backoff(TimeSpan.FromSeconds 1.0, 1.5) // start at 1s, grow ×1.5
         .MaxBackoff(TimeSpan.FromMinutes 2.0)   // never wait longer than 2 minutes
         .Jitter(false)                          // exact, reproducible delays
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var supervisor = new Supervisor(new Command("worker"))
+    .Backoff(TimeSpan.FromSeconds(1), 1.5) // start at 1s, grow ×1.5
+    .MaxBackoff(TimeSpan.FromMinutes(2))   // never wait longer than 2 minutes
+    .Jitter(false);                        // exact, reproducible delays
 ```
 
 ## Failure storms
@@ -138,6 +185,8 @@ score := score × 0.5^(Δt / FailureDecay) + 1     (Δt = time since the previou
   past `FailureThreshold` (default `5.0`), and the supervisor takes **one collective pause** of
   `StormPause` (jittered per `Jitter`, like the backoff), resets the score, and resumes.
 
+**F#**
+
 ```fsharp
 open ProcessKit
 open System
@@ -153,6 +202,24 @@ task {
     | Ok outcome -> printfn $"storm pauses taken: {outcome.StormPauses}"
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var supervisor = new Supervisor(new Command("worker"))
+    .StormPause(TimeSpan.FromSeconds(15))   // master switch — off by default
+    .FailureDecay(TimeSpan.FromSeconds(30)) // score half-life (default 30s)
+    .FailureThreshold(5.0);                 // trip point (default 5.0)
+
+var outcome = await supervisor.Run();
+if (outcome.IsOk)
+    Console.WriteLine($"storm pauses taken: {outcome.ResultValue.StormPauses}");
+else
+    Console.Error.WriteLine(outcome.ErrorValue.Message);
 ```
 
 The fine print:
@@ -178,6 +245,8 @@ fail-loud command stays fail-loud).
 
 Widen or narrow it with `Capture`:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -188,6 +257,18 @@ let keepEverything =
 let smallerTail =
     (Supervisor.create (Command.create "worker"))
         .Capture(OutputBufferPolicy.Bounded 200) // keep only the last 200 lines per run
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+
+var keepEverything = new Supervisor(new Command("worker"))
+    .Capture(OutputBufferPolicy.Unbounded); // retain all output of every incarnation
+
+var smallerTail = new Supervisor(new Command("worker"))
+    .Capture(OutputBufferPolicy.Bounded(200)); // keep only the last 200 lines per run
 ```
 
 The captured output is what you read back from `SupervisionOutcome.FinalResult` after
@@ -208,6 +289,8 @@ After every completed run three gates are checked, in this order:
    reports the last result (→ `StopReason.RestartsExhausted`). `MaxRestarts(0)` means exactly one
    run.
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -224,6 +307,25 @@ task {
     | Ok outcome -> printfn $"gave up: {outcome.Stopped}"
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+
+var supervisor = new Supervisor(new Command("batch-worker"))
+    .Restart(RestartPolicy.Always)                                     // restart on every exit…
+    .StopWhen(result => result.Code != null && result.Code.Value == 0) // …until one exits cleanly
+    .MaxRestarts(50);                                                  // but give up after 50 restarts
+
+var outcome = await supervisor.Run();
+if (outcome.IsOk && outcome.ResultValue.Stopped.IsPredicate)
+    Console.WriteLine("worker finished cleanly");
+else if (outcome.IsOk)
+    Console.WriteLine($"gave up: {outcome.ResultValue.Stopped}");
+else
+    Console.Error.WriteLine(outcome.ErrorValue.Message);
 ```
 
 `StopWhen` never sees a run that *failed to start* — a spawn error has no `ProcessResult` to
@@ -248,6 +350,8 @@ An `Ok` outcome means supervision *concluded*, **not** that the child succeeded 
 exhausted on a still-crashing child. Inspect `FinalResult` for the child's own verdict, or turn
 it into a success-or-error with `ProcessResult.ensureSuccess`:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -263,6 +367,29 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+
+var outcome = await new Supervisor(new Command("job")).Run();
+if (outcome.IsOk)
+{
+    var o = outcome.ResultValue;
+    Console.WriteLine($"runs={o.Restarts + 1} reason={o.Stopped} pauses={o.StormPauses}");
+
+    var final = o.FinalResult.EnsureSuccess();
+    if (final.IsOk)
+        Console.WriteLine($"last run ok: {final.ResultValue.Stdout}");
+    else
+        Console.Error.WriteLine($"last run failed: {final.ErrorValue.Message}");
+}
+else
+{
+    Console.Error.WriteLine(outcome.ErrorValue.Message);
+}
+```
+
 ## Supervising inside a shared group
 
 The supervisor runs every incarnation through an `IProcessRunner` — the default is a private
@@ -270,6 +397,8 @@ The supervisor runs every incarnation through an `IProcessRunner` — the defaul
 headline production variant injects a [`ProcessGroup`](process-groups.md), which is itself an
 `IProcessRunner`, so every incarnation — and everything it spawns — lives in one shared
 kill-on-dispose container:
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -293,6 +422,33 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var created = ProcessGroup.Create();
+if (created.IsError)
+{
+    Console.Error.WriteLine(created.ErrorValue.Message);
+    return;
+}
+
+using var group = created.ResultValue; // the group outlives supervision; disposing it reaps any strays
+
+var supervisor = new Supervisor(new Command("worker"))
+    .WithRunner(group)
+    .Restart(RestartPolicy.OnCrash)
+    .MaxRestarts(10);
+
+var outcome = await supervisor.Run();
+if (outcome.IsOk)
+    Console.WriteLine($"stopped: {outcome.ResultValue.Stopped}");
+else
+    Console.Error.WriteLine(outcome.ErrorValue.Message);
+```
+
 The group is yours: it outlives supervision, so dispose it (or `Shutdown` it) to tear down
 anything still running once the keeper has stopped. One interaction to mind — do not supervise
 into a group you have [suspended](process-groups.md); under the cgroup mechanism a restarted
@@ -304,6 +460,8 @@ The same injection point makes supervision logic testable with **no real process
 `ScriptedRunner` (from [`ProcessKit.Testing`](testing.md)) that returns canned replies, and
 assert the restart and stop behavior deterministically — pair it with `.Jitter(false)` for
 reproducible timing:
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -332,6 +490,32 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using ProcessKit.Testing;
+
+// Fail twice, then succeed — under OnCrash this should restart twice and stop clean.
+var calls = 0;
+
+var runner = new ScriptedRunner()
+    .When(_ => { calls++; return calls <= 2; }, Reply.Fail(1, "boom"))
+    .Fallback(Reply.Ok("ready"));
+
+var supervisor = new Supervisor(new Command("worker"))
+    .WithRunner(runner)
+    .Restart(RestartPolicy.OnCrash)
+    .Jitter(false);
+
+var outcome = await supervisor.Run();
+if (outcome.IsOk)
+    // Restarts = 2, Stopped = PolicySatisfied (the clean third run ends OnCrash supervision).
+    Console.WriteLine($"restarts={outcome.ResultValue.Restarts} reason={outcome.ResultValue.Stopped}");
+else
+    Console.Error.WriteLine(outcome.ErrorValue.Message);
+```
+
 `Reply.Ok` / `Reply.Fail` / `Reply.Exit` / `Reply.Signalled` cover the result shapes a crash
 classifier cares about. See [testing.md](testing.md) for the full seam, including scripting by
 exact argv (`On`) versus predicate (`When`) and record/replay cassettes.
@@ -350,6 +534,8 @@ iteration, or an incarnation resolves to `ProcessError.Cancelled`, `Run` returns
 so a restart could only produce another instantly-cancelled run; the supervisor refuses the
 futile loop. Pass the token to `Run(token)`:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 open System.Threading
@@ -365,6 +551,23 @@ task {
     | Error(ProcessError.Cancelled _) -> printfn "supervision cancelled"
     | _ -> ()
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System.Threading;
+
+using var cts = new CancellationTokenSource();
+var supervised = new Supervisor(new Command("worker")).Run(cts.Token);
+
+// elsewhere — a shutdown signal, a sibling failure:
+cts.Cancel();
+
+var outcome = await supervised;
+if (outcome.IsError && outcome.ErrorValue.IsCancelled)
+    Console.WriteLine("supervision cancelled");
 ```
 
 For the full model of captured-versus-raised deadlines and how cancellation differs from a

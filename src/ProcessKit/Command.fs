@@ -293,7 +293,9 @@ type Command internal (config: CommandConfig) =
                 TimeoutGrace = Some grace }
         )
 
-    /// Also cancel the run when `cancellationToken` fires (in addition to any verb token).
+    /// Also cancel the run when `cancellationToken` fires (in addition to any verb token). Applies to
+    /// the run/capture/completion verbs (`Run`/`Output*`/`ExitCode`/`Probe`/`Parse`/`FirstLine`); the
+    /// live `Start` handle is driven by its caller, so it observes only the token passed to `Start`.
     member _.CancelOn(cancellationToken: CancellationToken) =
         Command(
             { config with
@@ -315,8 +317,10 @@ type Command internal (config: CommandConfig) =
     member _.UncheckedInPipe() =
         Command({ config with UncheckedInPipe = true })
 
-    /// Treat these exit codes (in addition to `0`) as success — widening `ProcessResult.IsSuccess`,
-    /// `ensureSuccess`, and the `Run` verbs. An empty set resets to the default `{0}`.
+    /// Replace the set of exit codes treated as success (the default is `{0}`) — this is what
+    /// `ProcessResult.IsSuccess`, `ensureSuccess`, and the `Run` verbs check. The codes *replace* the
+    /// default rather than adding to it, so pass `[0; 3]` to accept both `0` and `3`; an empty set
+    /// resets to the default `{0}`.
     member _.OkCodes(codes: seq<int>) =
         ArgumentNullException.ThrowIfNull codes
         let list = List.ofSeq codes
@@ -418,7 +422,8 @@ module Command =
     /// Inside a pipeline, allow this stage to exit non-zero without failing the pipeline.
     let uncheckedInPipe (command: Command) = command.UncheckedInPipe()
 
-    /// Treat these exit codes (in addition to `0`) as success.
+    /// Replace the success exit-code set with these codes (default `{0}`; include `0` to keep it, an
+    /// empty set resets to `{0}`).
     let okCodes (codes: seq<int>) (command: Command) = command.OkCodes codes
 
     /// Windows: run the child with `CREATE_NO_WINDOW` (no effect on Unix).

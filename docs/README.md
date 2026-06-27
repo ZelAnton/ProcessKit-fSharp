@@ -45,6 +45,8 @@ one place.
 
 ## The 60-second tour
 
+**F#**
+
 ```fsharp
 open ProcessKit
 open System
@@ -76,6 +78,45 @@ task {
         () // disposing the group reaps the server — and everything it spawned
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+// One-shot: capture everything. A non-zero exit is data, not an Error.
+var head = await new Command("git").Args(new[] { "rev-parse", "HEAD" }).OutputString();
+if (head.IsOk)
+    Console.WriteLine($"HEAD = {head.ResultValue.Stdout.Trim()}");
+else
+    Console.Error.WriteLine(head.ErrorValue.Message);
+
+// Success-checking: a non-zero exit / timeout / signal-kill becomes a typed error.
+var version = await new Command("dotnet").Arg("--version").Run();
+if (version.IsOk)
+    Console.WriteLine(version.ResultValue);
+else
+    Console.Error.WriteLine(version.ErrorValue.Message);
+
+// Stdin + timeout (streaming, pipelines, supervision … see the guides).
+var sort = new Command("sort")
+    .Stdin(Stdin.FromString("b\na\n"))
+    .Timeout(TimeSpan.FromSeconds(5));
+
+await sort.Run();
+
+// Containment: anything spawned through a group dies with it.
+var created = ProcessGroup.Create();
+if (created.IsOk)
+{
+    using var group = created.ResultValue;
+    await group.Start(new Command("dev-server"));
+    // disposing the group reaps the server — and everything it spawned
+}
+else
+    Console.Error.WriteLine(created.ErrorValue.Message);
 ```
 
 ## API reference

@@ -52,7 +52,7 @@ type ProcessResult<'T>
     /// The exit codes treated as success (from `Command.OkCodes`; `{0}` by default).
     member _.AcceptedCodes: IReadOnlyList<int> = List.toArray okCodes
 
-    /// True when the process exited with an accepted code (`0`, or any code in `Command.OkCodes`).
+    /// True when the process exited with one of the accepted codes (`Command.OkCodes`; `{0}` by default).
     member _.IsSuccess =
         match outcome with
         | Outcome.Exited code -> List.contains code okCodes
@@ -74,7 +74,7 @@ type ProcessResult<'T>
         | Outcome.Signalled signal -> ProcessError.Signalled(program, signal, stdoutText, stderr)
         | Outcome.TimedOut -> ProcessError.Timeout(program, duration, stdoutText, stderr)
 
-    /// Demand a successful run (an **accepted** exit code — `0`, or any in `Command.OkCodes`):
+    /// Demand a successful run (an **accepted** exit code — one in `Command.OkCodes`, `{0}` by default):
     /// returns the result unchanged on success, otherwise the corresponding `ProcessError`
     /// (`Exit` / `Signalled` / `Timeout`). The instance form for C# fluency.
     member this.EnsureSuccess() : Result<ProcessResult<'T>, ProcessError> =
@@ -87,7 +87,7 @@ module ProcessResult =
     /// `FailureError` so there is exactly one source of truth).
     let internal failureError (result: ProcessResult<'T>) : ProcessError = result.FailureError
 
-    /// Demand a successful run (an **accepted** exit code — `0`, or any in `Command.OkCodes`):
+    /// Demand a successful run (an **accepted** exit code — one in `Command.OkCodes`, `{0}` by default):
     /// returns the result unchanged on success, otherwise the corresponding `ProcessError`
     /// (`Exit` / `Signalled` / `Timeout`). Generic over the captured-stdout type.
     let ensureSuccess (result: ProcessResult<'T>) : Result<ProcessResult<'T>, ProcessError> = result.EnsureSuccess()

@@ -1067,6 +1067,8 @@ module internal Native =
             (try
                 File.WriteAllText(Path.Combine(cgroupPath, "cgroup.freeze"), "1")
              with _ ->
+                 // Best-effort freeze to stop members forking faster than the sweep can kill them; if
+                 // the freeze controller is unavailable we still SIGKILL the members below.
                  ())
 
             let mutable sweep = 0
@@ -1081,6 +1083,8 @@ module internal Native =
             (try
                 File.WriteAllText(Path.Combine(cgroupPath, "cgroup.freeze"), "0")
              with _ ->
+                 // Best-effort thaw so a survivor of the sweep isn't left frozen; the cgroup is being
+                 // torn down regardless, so a failure here is not actionable.
                  ())
 
     /// SIGTERM every member (graceful); the caller polls then escalates with `killCgroup`.
@@ -1098,6 +1102,8 @@ module internal Native =
         try
             File.WriteAllText(Path.Combine(cgroupPath, "cgroup.freeze"), (if frozen then "1" else "0"))
         with _ ->
+            // Suspend/Resume of a cgroup is best-effort: the freeze controller may be absent, or the
+            // write may race the group's teardown. Leave the tree in its current state on failure.
             ()
 
     /// cgroup accounting for `stats`: cumulative CPU (cpu.stat `usage_usec`) and peak memory

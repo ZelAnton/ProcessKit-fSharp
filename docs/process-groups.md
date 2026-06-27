@@ -33,6 +33,8 @@ suspend/resume, member listing, resource limits, or stats.
 It returns a `Result<ProcessGroup, ProcessError>` — match it, then bind the group
 with `use` so it (and the tree it contains) is reaped on scope exit:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -46,9 +48,27 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var created = ProcessGroup.Create();
+if (created.IsOk)
+{
+    using var group = created.ResultValue; // disposes — and hard-kills the whole tree — on scope exit
+    // ... start children into `group` ...
+}
+else
+    Console.Error.WriteLine($"could not create a group: {created.ErrorValue.Message}");
+```
+
 `ProcessGroup.Create(options)` takes a `ProcessGroupOptions` to tune the
 graceful-shutdown window and apply whole-tree resource limits (see
 [Resource limits](#resource-limits)):
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -57,13 +77,34 @@ open System
 let options = ProcessGroupOptions().WithShutdownTimeout(TimeSpan.FromSeconds 10.0)
 
 match ProcessGroup.Create options with
-| Ok group -> use group = group // ...
+| Ok group ->
+    use group = group
+    () // ...
 | Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var options = new ProcessGroupOptions().WithShutdownTimeout(TimeSpan.FromSeconds(10));
+
+var created = ProcessGroup.Create(options);
+if (created.IsOk)
+{
+    using var group = created.ResultValue; // ...
+}
+else
+    Console.Error.WriteLine(created.ErrorValue.Message);
 ```
 
 Two read-only properties report what you actually got. `Options` echoes back the
 `ProcessGroupOptions` the group was created with (its `ShutdownTimeout` and
 `Limits`); `Mechanism` reports the OS primitive containing the tree:
+
+**F#**
 
 ```fsharp
 match group.Mechanism with
@@ -71,6 +112,18 @@ match group.Mechanism with
 | Mechanism.CgroupV2 -> printfn "Linux cgroup v2"
 | Mechanism.ProcessGroup -> printfn "POSIX process group"
 | _ -> ()
+```
+
+**C#**
+
+```csharp
+var mechanism = group.Mechanism;
+if (mechanism.IsJobObject)
+    Console.WriteLine("Windows Job Object");
+else if (mechanism.IsCgroupV2)
+    Console.WriteLine("Linux cgroup v2");
+else if (mechanism.IsProcessGroup)
+    Console.WriteLine("POSIX process group");
 ```
 
 Which mechanism you get is not a free choice — it follows the platform and
@@ -100,6 +153,8 @@ child's lifetime.** Disposing the returned `RunningProcess` detaches only that
 run's I/O; the child keeps running until you reap the whole tree
 (`Shutdown` / dispose) or kill just that run with its own `StartKill`.
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -118,9 +173,35 @@ task {
 }
 ```
 
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var created = ProcessGroup.Create();
+if (created.IsOk)
+{
+    using var group = created.ResultValue;
+
+    var server = await group.Start(new Command("dev-server"));
+    if (server.IsOk)
+    {
+        // `server` streams/probes as usual, but the GROUP owns its lifetime.
+        var _ready = await server.ResultValue.WaitForLine(l => l.Contains("ready"), System.TimeSpan.FromSeconds(10));
+    }
+    else
+        Console.Error.WriteLine(server.ErrorValue.Message);
+}
+else
+    Console.Error.WriteLine(created.ErrorValue.Message);
+```
+
 To **capture** a child to completion inside the shared group, drive the group
 through the `IProcessRunner` verbs in the `Runner` module — they take the runner,
 a `CancellationToken`, and the `Command`:
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -137,6 +218,29 @@ task {
     // `Runner.outputBytes` is the binary companion; `Runner.start` mirrors `group.Start`.
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+using System.Threading;
+
+var created = ProcessGroup.Create();
+if (created.IsOk)
+{
+    using var group = created.ResultValue;
+
+    var result = await Runner.outputString(group, CancellationToken.None, new Command("probe-tool"));
+    if (result.IsOk)
+        Console.WriteLine($"exit={result.ResultValue.Code}: {result.ResultValue.Stdout}");
+    else
+        Console.Error.WriteLine(result.ErrorValue.Message);
+    // `Runner.outputBytes` is the binary companion; `Runner.start` mirrors `group.Start`.
+}
+else
+    Console.Error.WriteLine(created.ErrorValue.Message);
 ```
 
 Because a group satisfies `IProcessRunner`, you can also hand it to anything that
@@ -160,6 +264,8 @@ binding reaps the tree deterministically on scope exit — disposing is a pure h
 kill with no grace, which is exactly what you want as the guaranteed backstop.
 For an orderly stop, prefer `Shutdown`, which awaits a `Task`:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 open System
@@ -174,6 +280,25 @@ task {
         do! group.Shutdown(TimeSpan.FromSeconds 5.0)
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var created = ProcessGroup.Create();
+if (created.IsOk)
+{
+    using var group = created.ResultValue;
+    var _service = await group.Start(new Command("my-service"));
+
+    // SIGTERM, give it 5s to flush and exit, then SIGKILL any straggler:
+    await group.Shutdown(TimeSpan.FromSeconds(5));
+}
+else
+    Console.Error.WriteLine(created.ErrorValue.Message);
 ```
 
 `Shutdown()` with no argument uses the group's configured
@@ -194,6 +319,8 @@ thaw the whole tree. All of these are synchronous and return
 
 `Signal(signal)` delivers a portable `Signal` to every process in the group:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -201,6 +328,20 @@ let reload (group: ProcessGroup) =
     match group.Signal Signal.Hup with // "reload your configuration"
     | Ok () -> ()
     | Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+void reload(ProcessGroup group)
+{
+    var result = group.Signal(Signal.Hup); // "reload your configuration"
+    if (result.IsError)
+        Console.Error.WriteLine(result.ErrorValue.Message);
+}
 ```
 
 The portable `Signal` values are `Signal.Term`, `Signal.Kill`, `Signal.Int`,
@@ -218,6 +359,8 @@ a best-effort per-member broadcast against a tree that may be forking at that
 instant. An already-exited member is skipped, and an empty group accepts any
 deliverable signal trivially. On Windows, a non-`Kill` signal fails fast:
 
+**F#**
+
 ```fsharp
 match group.Signal Signal.Hup with
 | Ok () -> ()
@@ -225,14 +368,40 @@ match group.Signal Signal.Hup with
 | Error err -> eprintfn $"{err.Message}"
 ```
 
+**C#**
+
+```csharp
+var result = group.Signal(Signal.Hup);
+if (result.IsError)
+{
+    if (result.ErrorValue.IsUnsupported)
+        Console.Error.WriteLine($"not on this platform: {((ProcessError.Unsupported)result.ErrorValue).operation}");
+    else
+        Console.Error.WriteLine(result.ErrorValue.Message);
+}
+```
+
 `Suspend()` freezes the whole tree (to snapshot it, to starve a runaway while you
 investigate, or to pause background work) and `Resume()` thaws it:
+
+**F#**
 
 ```fsharp
 let pauseWhile (group: ProcessGroup) (inspect: unit -> unit) =
     group.Suspend() |> ignore // the whole tree stops consuming CPU
     inspect ()
     group.Resume() |> ignore
+```
+
+**C#**
+
+```csharp
+void pauseWhile(ProcessGroup group, Action inspect)
+{
+    group.Suspend(); // the whole tree stops consuming CPU
+    inspect();
+    group.Resume();
+}
 ```
 
 Suspend/resume work wherever a container exists, but the machinery differs:
@@ -253,6 +422,8 @@ the caveats in full.
 `Members()` returns a point-in-time snapshot of the live member pids as an
 `IReadOnlyList<int>`, wrapped in a `Result`:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -264,10 +435,33 @@ task {
         let! _b = group.Start(Command.create "worker-b")
 
         match group.Members() with
-        | Ok pids -> printfn $"{List.length pids} live members: {pids}"
+        | Ok pids -> printfn $"{pids.Count} live members: {pids}"
         | Error err -> eprintfn $"{err.Message}"
     | Error err -> eprintfn $"{err.Message}"
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var created = ProcessGroup.Create();
+if (created.IsOk)
+{
+    using var group = created.ResultValue;
+    var _a = await group.Start(new Command("worker-a"));
+    var _b = await group.Start(new Command("worker-b"));
+
+    var members = group.Members();
+    if (members.IsOk)
+        Console.WriteLine($"{members.ResultValue.Count} live members: {string.Join(", ", members.ResultValue)}");
+    else
+        Console.Error.WriteLine(members.ErrorValue.Message);
+}
+else
+    Console.Error.WriteLine(created.ErrorValue.Message);
 ```
 
 What "members" means depends on the mechanism. On **Windows** (Job Object) and
@@ -287,6 +481,8 @@ Caps are a property of the group, set once at creation through
 `ProcessGroupOptions` and enforced by the same kernel object that contains the
 tree. The builder is fluent and immutable:
 
+**F#**
+
 ```fsharp
 open ProcessKit
 
@@ -304,6 +500,28 @@ task {
         () // ... runs within the limited group ...
     | Error err -> eprintfn $"limits unavailable: {err.Message}" // ProcessError.ResourceLimit
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+var options =
+    new ProcessGroupOptions()
+        .WithMemoryMax(512L * 1024L * 1024L) // bytes, whole tree (512 MiB)
+        .WithMaxProcesses(64)                 // fork-bomb ceiling
+        .WithCpuQuota(0.5);                   // half of one core
+
+var created = ProcessGroup.Create(options);
+if (created.IsOk)
+{
+    using var group = created.ResultValue;
+    var _sandboxed = await group.Start(new Command("untrusted-tool")); // ... runs within the limited group ...
+}
+else
+    Console.Error.WriteLine($"limits unavailable: {created.ErrorValue.Message}"); // ProcessError.ResourceLimit
 ```
 
 The three caps are:
@@ -340,11 +558,29 @@ the controllers be enabled only there) — so an ordinary container or a
 systemd-managed process fails too. The prerequisites are spelled out in
 [platform-support.md](platform-support.md).
 
+**F#**
+
 ```fsharp
 match ProcessGroup.Create options with
-| Ok group -> use group = group // ...
+| Ok group ->
+    use group = group
+    () // ...
 | Error(ProcessError.ResourceLimit message) -> eprintfn $"cannot enforce limits here: {message}"
 | Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+var created = ProcessGroup.Create(options);
+if (created.IsOk)
+{
+    using var group = created.ResultValue; // ...
+}
+else if (created.ErrorValue.IsResourceLimit)
+    Console.Error.WriteLine($"cannot enforce limits here: {((ProcessError.ResourceLimit)created.ErrorValue).message}");
+else
+    Console.Error.WriteLine(created.ErrorValue.Message);
 ```
 
 ## Stats
@@ -352,11 +588,23 @@ match ProcessGroup.Create options with
 `Stats()` returns a point-in-time `ProcessGroupStats` snapshot of the group's
 resource usage, wrapped in a `Result`:
 
+**F#**
+
 ```fsharp
 match group.Stats() with
 | Ok stats ->
     printfn $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}"
 | Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+var stats = group.Stats();
+if (stats.IsOk)
+    Console.WriteLine($"procs={stats.ResultValue.ActiveProcessCount} cpu={stats.ResultValue.TotalCpuTime} peak={stats.ResultValue.PeakMemoryBytes}");
+else
+    Console.Error.WriteLine(stats.ErrorValue.Message);
 ```
 
 `ProcessGroupStats` carries `ActiveProcessCount` (an `int`, always populated),
@@ -369,6 +617,8 @@ time and peak memory are available where the kernel accounts for the whole tree 
 `SampleStats(interval)` turns the snapshot into a periodic series as an
 `IAsyncEnumerable<ProcessGroupStats>` — the first sample immediately, then one per
 `interval`:
+
+**F#**
 
 ```fsharp
 open ProcessKit
@@ -388,6 +638,16 @@ task {
     finally
         e.DisposeAsync().AsTask().Wait()
 }
+```
+
+**C#**
+
+```csharp
+using ProcessKit;
+using System;
+
+await foreach (var s in group.SampleStats(TimeSpan.FromSeconds(1)))
+    Console.WriteLine($"rss now: {s.PeakMemoryBytes}");
 ```
 
 From C# this is simply `await foreach (var s in group.SampleStats(interval))`. The

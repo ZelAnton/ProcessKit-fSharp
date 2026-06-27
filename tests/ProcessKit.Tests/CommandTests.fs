@@ -51,3 +51,12 @@ type CommandTests() =
         Assert.That(ProcessError.isTransient (ProcessError.Io "pipe"), Is.True)
         Assert.That(ProcessError.isTransient (ProcessError.NotFound("git", None)), Is.False)
         Assert.That(ProcessError.isTransient (ProcessError.Cancelled "git"), Is.False)
+
+    [<Test>]
+    member _.``ProcessError.IsTransient instance member classifies spawn and I/O as retriable``() =
+        // The C#-friendly instance form (err.IsTransient); the module function delegates to it.
+        Assert.That((ProcessError.Spawn("git", "EAGAIN")).IsTransient, Is.True)
+        Assert.That((ProcessError.Io "pipe").IsTransient, Is.True)
+        Assert.That((ProcessError.NotFound("git", None)).IsTransient, Is.False)
+        Assert.That((ProcessError.Cancelled "git").IsTransient, Is.False)
+        Assert.That((ProcessError.Exit("git", 1, "", "")).IsTransient, Is.False)
