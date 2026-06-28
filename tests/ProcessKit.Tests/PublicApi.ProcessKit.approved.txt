@@ -380,8 +380,8 @@ class ProcessKit.ProcessError+Exit : ProcessKit.ProcessError
 class ProcessKit.ProcessError+Io : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.ProcessError>
-  member get_message() : System.String
-  property message : System.String { get }
+  member get_Detail() : System.String
+  property Detail : System.String { get }
 
 class ProcessKit.ProcessError+NotFound : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
@@ -416,16 +416,16 @@ class ProcessKit.ProcessError+OutputTooLarge : ProcessKit.ProcessError
 class ProcessKit.ProcessError+Parse : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.ProcessError>
+  member get_Detail() : System.String
   member get_Program() : System.String
-  member get_message() : System.String
+  property Detail : System.String { get }
   property Program : System.String { get }
-  property message : System.String { get }
 
 class ProcessKit.ProcessError+ResourceLimit : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.ProcessError>
-  member get_message() : System.String
-  property message : System.String { get }
+  member get_Detail() : System.String
+  property Detail : System.String { get }
 
 class ProcessKit.ProcessError+Signalled : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
@@ -442,18 +442,18 @@ class ProcessKit.ProcessError+Signalled : ProcessKit.ProcessError
 class ProcessKit.ProcessError+Spawn : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.ProcessError>
+  member get_Detail() : System.String
   member get_Program() : System.String
-  member get_message() : System.String
+  property Detail : System.String { get }
   property Program : System.String { get }
-  property message : System.String { get }
 
 class ProcessKit.ProcessError+Stdin : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.ProcessError>
+  member get_Detail() : System.String
   member get_Program() : System.String
-  member get_message() : System.String
+  property Detail : System.String { get }
   property Program : System.String { get }
-  property message : System.String { get }
 
 module ProcessKit.ProcessError+Tags
   field literal Cancelled : System.Int32

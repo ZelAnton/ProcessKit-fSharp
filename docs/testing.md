@@ -63,21 +63,21 @@ gives every runner the full verb vocabulary, each verb taking
 
 | Verb | Returns | Routes through |
 |---|---|---|
-| `Runner.run` | trimmed `string`, success required | `OutputStringAsync` |
-| `Runner.runUnit` | `unit`, success required | `OutputStringAsync` |
-| `Runner.outputString` | `ProcessResult<string>` (exit code is data) | `OutputStringAsync` |
-| `Runner.outputBytes` | `ProcessResult<byte[]>` | `OutputBytesAsync` |
-| `Runner.exitCode` | `int` | `OutputStringAsync` |
-| `Runner.probe` | `bool` (exit 0 → `true`, 1 → `false`) | `OutputStringAsync` |
-| `Runner.parse runner ct parser command` | `'T`, success required | `OutputStringAsync` |
-| `Runner.tryParse runner ct parser command` | `'T` (parser may fail) | `OutputStringAsync` |
-| `Runner.firstLine runner ct predicate command` | `string option` | `StartAsync` |
-| `Runner.start` | `RunningProcess` | `StartAsync` |
+| `Runner.run` | trimmed `string`, success required | `CaptureStringAsync` |
+| `Runner.runUnit` | `unit`, success required | `CaptureStringAsync` |
+| `Runner.outputString` | `ProcessResult<string>` (exit code is data) | `CaptureStringAsync` |
+| `Runner.outputBytes` | `ProcessResult<byte[]>` | `CaptureBytesAsync` |
+| `Runner.exitCode` | `int` | `CaptureStringAsync` |
+| `Runner.probe` | `bool` (exit 0 → `true`, 1 → `false`) | `CaptureStringAsync` |
+| `Runner.parse runner ct parser command` | `'T`, success required | `CaptureStringAsync` |
+| `Runner.tryParse runner ct parser command` | `'T` (parser may fail) | `CaptureStringAsync` |
+| `Runner.firstLine runner ct predicate command` | `string option` | `SpawnAsync` |
+| `Runner.start` | `RunningProcess` | `SpawnAsync` |
 
-Everything in the first eight rows reaches a child only through `OutputStringAsync`
-(or `OutputBytesAsync`), so it runs hermetically against the subprocess-free doubles
+Everything in the first eight rows reaches a child only through `CaptureStringAsync`
+(or `CaptureBytesAsync`), so it runs hermetically against the subprocess-free doubles
 below. The last two — `firstLine` and `start` — need a live handle and go through
-`StartAsync`; see [what the doubles don't cover](#what-the-doubles-dont-cover).
+`SpawnAsync`; see [what the doubles don't cover](#what-the-doubles-dont-cover).
 
 Production code, generic over the runner:
 
@@ -414,8 +414,8 @@ Semantics worth knowing before you commit a cassette:
 | Environment | override **values never reach the file** — only the variable names are stored, so env secrets can't leak, and env is not part of the match key |
 | Miss | an unmatched call is `ProcessError.CassetteMiss` (distinct from a missing program) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded before/after sequence replays faithfully, while retry/probe loops keep getting a stable final answer |
-| Bytes | `OutputBytesAsync` replays by round-tripping the recorded stdout through UTF-8 |
-| `StartAsync` | unsupported — replay serves the bulk verbs only (see [above](#what-the-doubles-dont-cover)) |
+| Bytes | `CaptureBytesAsync` replays by round-tripping the recorded stdout through UTF-8 |
+| `SpawnAsync` | unsupported — replay serves the bulk capture primitives only (see [above](#what-the-doubles-dont-cover)) |
 | Err results | not recorded — only completed runs (a non-zero exit and a captured timeout *are* results and are recorded) |
 | One-shot stdin | `Stdin.FromReader` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
 | Format | a versioned JSON envelope — `{ "Version", "Entries" }`; a cassette whose format version this build doesn't understand is rejected on load, and a partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |

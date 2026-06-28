@@ -551,7 +551,7 @@ Console.WriteLine($"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu=
 ```
 
 `ProfileAsync()` with no argument uses a default sampling interval; `ProfileAsync(interval)`
-samples at the cadence you pick. The resulting `RunProfile` exposes `ExitCodeAsync`,
+samples at the cadence you pick. The resulting `RunProfile` exposes `ExitCode`,
 `Duration` (wall clock), `CpuTime` (user + kernel), `PeakMemoryBytes`, the number of
 `Samples` taken, and `AvgCpu` — CPU time over wall time, so a value near `1.7` means
 roughly 1.7 cores were busy on average.
