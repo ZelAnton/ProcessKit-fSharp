@@ -4,7 +4,7 @@
 
 Task-oriented, idiomatic examples for every part of the public API. The run and capture
 verbs return `Task<Result<_, ProcessError>>`, so the F# samples below run inside a `task { }`
-block and use `match!` (a few `RunningProcess` members — `Wait`, `Profile` — return their
+block and use `match!` (a few `RunningProcess` members — `WaitAsync`, `ProfileAsync` — return their
 value directly). Where a snippet writes `let! r = cmd.Verb()` for brevity, `r` is the
 `Result<_, ProcessError>` you then match. From C# the same surface is `await`-able fluent
 methods.
@@ -32,7 +32,7 @@ methods.
 
 ## Running a command
 
-Build a `Command` (an immutable value), then call a verb. `Run` requires a zero (or
+Build a `Command` (an immutable value), then call a verb. `RunAsync` requires a zero (or
 accepted) exit and returns stdout with trailing whitespace trimmed.
 
 **F#**
@@ -41,7 +41,7 @@ accepted) exit and returns stdout with trailing whitespace trimmed.
 task {
     let cmd = Command.create "git" |> Command.args [ "rev-parse"; "HEAD" ]
 
-    match! cmd.Run() with
+    match! cmd.RunAsync() with
     | Ok sha -> printfn $"HEAD is {sha}"
     | Error err -> eprintfn $"git failed: {err.Message}"
 }
@@ -52,10 +52,10 @@ task {
 ```csharp
 var cmd = new Command("git").Args(["rev-parse", "HEAD"]);
 
-Console.WriteLine((await cmd.Run()).AsRun() switch
+Console.WriteLine(await cmd.RunAsync() switch
 {
-    { IsOk: true, Value: var sha }  => $"HEAD is {sha}",
-    { IsOk: false, Error: var err } => $"git failed: {err.Message}",
+    { IsOk: true, ResultValue: var sha }  => $"HEAD is {sha}",
+    { IsOk: false, ErrorValue: var err } => $"git failed: {err.Message}",
 });
 ```
 
@@ -94,12 +94,12 @@ let cmd = (Command "dotnet").Args([ "build"; "-c"; "Release" ]).CurrentDir("/rep
 var cmd = new Command("dotnet").Args(["build", "-c", "Release"]).CurrentDir("/repo");
 ```
 
-Use `RunUnit` when you only care that it succeeded:
+Use `RunUnitAsync` when you only care that it succeeded:
 
 **F#**
 
 ```fsharp
-match! (Command.create "mkdir" |> Command.arg "out").RunUnit() with
+match! (Command.create "mkdir" |> Command.arg "out").RunUnitAsync() with
 | Ok () -> ()
 | Error err -> eprintfn $"{err.Message}"
 ```
@@ -107,19 +107,19 @@ match! (Command.create "mkdir" |> Command.arg "out").RunUnit() with
 **C#**
 
 ```csharp
-if ((await new Command("mkdir").Arg("out").RunUnit()).AsRun() is { IsOk: false, Error: var err })
+if (await new Command("mkdir").Arg("out").RunUnitAsync() is { IsOk: false, ErrorValue: var err })
     Console.Error.WriteLine(err.Message);
 ```
 
 ## Capturing output
 
-`OutputString` / `OutputBytes` return a `ProcessResult<_>` — a *non-zero exit is data here,
+`OutputStringAsync` / `OutputBytesAsync` return a `ProcessResult<_>` — a *non-zero exit is data here,
 not an error*. Inspect `Stdout`, `Stderr`, `Code`, `IsSuccess`, `Duration`, `Outcome`.
 
 **F#**
 
 ```fsharp
-match! (Command.create "ls" |> Command.arg "-la").OutputString() with
+match! (Command.create "ls" |> Command.arg "-la").OutputStringAsync() with
 | Ok result ->
     printfn $"exit={result.Code} success={result.IsSuccess} in {result.Duration}"
     printfn $"{result.Stdout}"
@@ -129,19 +129,19 @@ match! (Command.create "ls" |> Command.arg "-la").OutputString() with
 **C#**
 
 ```csharp
-switch ((await new Command("ls").Arg("-la").OutputString()).AsRun())
+switch (await new Command("ls").Arg("-la").OutputStringAsync())
 {
-    case { IsOk: true, Value: var result }:
+    case { IsOk: true, ResultValue: var result }:
         Console.WriteLine($"exit={result.Code} success={result.IsSuccess} in {result.Duration}");
         Console.WriteLine(result.Stdout);
         break;
-    case { IsOk: false, Error: var err }:
+    case { IsOk: false, ErrorValue: var err }:
         Console.Error.WriteLine(err.Message);
         break;
 }
 ```
 
-`OutputBytes` is the binary companion (`ProcessResult<byte[]>`), for non-text output.
+`OutputBytesAsync` is the binary companion (`ProcessResult<byte[]>`), for non-text output.
 
 ## Error handling
 
@@ -152,7 +152,7 @@ timeout / cancellation), never on a non-zero exit.
 **F#**
 
 ```fsharp
-match! (Command.create "definitely-not-a-program").OutputString() with
+match! (Command.create "definitely-not-a-program").OutputStringAsync() with
 | Ok result -> printfn $"{result.Stdout}"
 | Error(ProcessError.NotFound(program, _)) -> eprintfn $"not installed: {program}"
 | Error(ProcessError.Timeout(program, timeout, _, _)) -> eprintfn $"{program} timed out after {timeout}"
@@ -162,12 +162,12 @@ match! (Command.create "definitely-not-a-program").OutputString() with
 **C#**
 
 ```csharp
-Console.WriteLine((await new Command("definitely-not-a-program").OutputString()).AsRun() switch
+Console.WriteLine(await new Command("definitely-not-a-program").OutputStringAsync() switch
 {
-    { IsOk: true, Value: var result }                => result.Stdout,
-    { IsOk: false, Error: ProcessError.NotFound n }  => $"not installed: {n.program}",
-    { IsOk: false, Error: ProcessError.Timeout t }   => $"{t.program} timed out after {t.timeout}",
-    { IsOk: false, Error: var err }                  => err.Message,
+    { IsOk: true, ResultValue: var result }                => result.Stdout,
+    { IsOk: false, ErrorValue: ProcessError.NotFound n }  => $"not installed: {n.Program}",
+    { IsOk: false, ErrorValue: ProcessError.Timeout t }   => $"{t.Program} timed out after {t.Timeout}",
+    { IsOk: false, ErrorValue: var err }                  => err.Message,
 });
 ```
 
@@ -176,7 +176,7 @@ Classifiers help with retry/diagnostic logic:
 **F#**
 
 ```fsharp
-match! cmd.Run() with
+match! cmd.RunAsync() with
 | Ok _ -> ()
 | Error err when ProcessError.isNotFound err -> installThenRetry ()
 | Error err when ProcessError.isTransient err -> scheduleRetry ()   // spawn / I/O blips
@@ -186,23 +186,23 @@ match! cmd.Run() with
 **C#**
 
 ```csharp
-switch ((await cmd.Run()).AsRun())
+switch (await cmd.RunAsync())
 {
     case { IsOk: true }:
         break;
-    case { IsOk: false, Error: { IsNotFound: true } }:
+    case { IsOk: false, ErrorValue: { IsNotFound: true } }:
         installThenRetry();
         break;
-    case { IsOk: false, Error: { IsTransient: true } }:
+    case { IsOk: false, ErrorValue: { IsTransient: true } }:
         scheduleRetry();   // spawn / I/O blips
         break;
-    case { IsOk: false, Error: var err }:
+    case { IsOk: false, ErrorValue: var err }:
         fail(err);
         break;
 }
 ```
 
-The success-requiring verbs (`Run` / `RunUnit`) additionally turn a non-zero exit into
+The success-requiring verbs (`RunAsync` / `RunUnitAsync`) additionally turn a non-zero exit into
 `ProcessError.Exit(program, code, stdout, stderr)`.
 
 ## Exit codes and probing
@@ -210,18 +210,18 @@ The success-requiring verbs (`Run` / `RunUnit`) additionally turn a non-zero exi
 **F#**
 
 ```fsharp
-let! code = (Command.create "grep" |> Command.args [ "pattern"; "file" ]).ExitCode()  // Ok 0 / Ok 1 / ...
-let! found = (Command.create "which" |> Command.arg "git").Probe()                     // Ok true if exit 0
+let! code = (Command.create "grep" |> Command.args [ "pattern"; "file" ]).ExitCodeAsync()  // Ok 0 / Ok 1 / ...
+let! found = (Command.create "which" |> Command.arg "git").ProbeAsync()                     // Ok true if exit 0
 ```
 
 **C#**
 
 ```csharp
-var code = await new Command("grep").Args(["pattern", "file"]).ExitCode();  // Ok 0 / Ok 1 / ...
-var found = await new Command("which").Arg("git").Probe();                  // Ok true if exit 0
+var code = await new Command("grep").Args(["pattern", "file"]).ExitCodeAsync();  // Ok 0 / Ok 1 / ...
+var found = await new Command("which").Arg("git").ProbeAsync();                  // Ok true if exit 0
 ```
 
-`Probe` is `true` when the command runs and exits zero — handy for feature detection.
+`ProbeAsync` is `true` when the command runs and exits zero — handy for feature detection.
 
 ## Accepting non-zero exits
 
@@ -236,7 +236,7 @@ let grep =
     |> Command.args [ "ERROR"; "app.log" ]
     |> Command.okCodes [ 0; 1 ]   // 1 ("no match") is not a failure
 
-match! grep.Run() with
+match! grep.RunAsync() with
 | Ok output -> printfn $"matches:\n{output}"
 | Error err -> eprintfn $"{err.Message}"   // a real failure (e.g. exit 2)
 ```
@@ -248,34 +248,34 @@ var grep = new Command("grep")
     .Args(["ERROR", "app.log"])
     .OkCodes([0, 1]);   // 1 ("no match") is not a failure
 
-Console.WriteLine((await grep.Run()).AsRun() switch
+Console.WriteLine(await grep.RunAsync() switch
 {
-    { IsOk: true, Value: var output } => $"matches:\n{output}",
-    { IsOk: false, Error: var err }   => err.Message,   // a real failure (e.g. exit 2)
+    { IsOk: true, ResultValue: var output } => $"matches:\n{output}",
+    { IsOk: false, ErrorValue: var err }   => err.Message,   // a real failure (e.g. exit 2)
 });
 ```
 
-`OkCodes` sets which exit codes `ProcessResult.IsSuccess`, `Run`/`RunUnit`, and supervisor crash
+`OkCodes` sets which exit codes `ProcessResult.IsSuccess`, `RunAsync`/`RunUnitAsync`, and supervisor crash
 detection accept — the codes *replace* the default `{0}` (include `0` to keep it, as `[ 0; 1 ]` does
 above).
 
 ## Parsing output
 
-`Parse` maps stdout through a function (requires success); `TryParse` lets the parser fail;
-`FirstLine` returns the first stdout line matching a predicate.
+`ParseAsync` maps stdout through a function (requires success); `TryParseAsync` lets the parser fail;
+`FirstLineAsync` returns the first stdout line matching a predicate.
 
 **F#**
 
 ```fsharp
-let! version = (Command.create "node" |> Command.arg "--version").Parse(fun s -> s.TrimStart('v'))
-let! port    = (Command.create "myserver").FirstLine(fun line -> line.StartsWith "Listening on ")
+let! version = (Command.create "node" |> Command.arg "--version").ParseAsync(fun s -> s.TrimStart('v'))
+let! port    = (Command.create "myserver").FirstLineAsync(fun line -> line.StartsWith "Listening on ")
 ```
 
 **C#**
 
 ```csharp
-var version = await new Command("node").Arg("--version").Parse(s => s.TrimStart('v'));
-var port = await new Command("myserver").FirstLine(line => line.StartsWith("Listening on "));
+var version = await new Command("node").Arg("--version").ParseAsync(s => s.TrimStart('v'));
+var port = await new Command("myserver").FirstLineAsync(line => line.StartsWith("Listening on "));
 ```
 
 ## Standard input
@@ -316,7 +316,7 @@ let pipeline =
         .Pipe(Command.create "grep" |> Command.arg "ERROR")
         .Pipe(Command.create "wc" |> Command.arg "-l")
 
-match! pipeline.Run() with
+match! pipeline.RunAsync() with
 | Ok count -> printfn $"{count} error lines"
 | Error err -> eprintfn $"{err.Message}"
 ```
@@ -328,31 +328,31 @@ var pipeline = new Command("cat").Arg("access.log")
     .Pipe(new Command("grep").Arg("ERROR"))
     .Pipe(new Command("wc").Arg("-l"));
 
-Console.WriteLine((await pipeline.Run()).AsRun() switch
+Console.WriteLine(await pipeline.RunAsync() switch
 {
-    { IsOk: true, Value: var count } => $"{count} error lines",
-    { IsOk: false, Error: var err }  => err.Message,
+    { IsOk: true, ResultValue: var count } => $"{count} error lines",
+    { IsOk: false, ErrorValue: var err }  => err.Message,
 });
 ```
 
-A pipeline supports the same verbs as a command (`Run`/`OutputString`/`ExitCode`/…) plus
+A pipeline supports the same verbs as a command (`RunAsync`/`OutputStringAsync`/`ExitCodeAsync`/…) plus
 `Timeout` / `CancelOn`. Let a stage fail without failing the pipeline with
 `Command.uncheckedInPipe`. The pipe-style module mirror is `Pipeline.create` / `Pipeline.pipe`.
 
 ## Streaming and interactive I/O
 
-`Start()` returns a live `RunningProcess`. Stream stdout line by line as an
+`StartAsync()` returns a live `RunningProcess`. Stream stdout line by line as an
 `IAsyncEnumerable`. (`use` ensures the tree is killed on scope exit.)
 
 **F#**
 
 ```fsharp
 task {
-    match! (Command.create "dotnet" |> Command.arg "watch").Start() with
+    match! (Command.create "dotnet" |> Command.arg "watch").StartAsync() with
     | Error err -> eprintfn $"{err.Message}"
     | Ok proc ->
         use _ = proc
-        let lines = proc.StdoutLines()
+        let lines = proc.StdoutLinesAsync()
         let e = lines.GetAsyncEnumerator()
 
         try
@@ -369,15 +369,15 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("dotnet").Arg("watch").Start()).GetValueOrThrow();
+await using var proc = (await new Command("dotnet").Arg("watch").StartAsync()).GetValueOrThrow();
 
-await foreach (var line in proc.StdoutLines())
+await foreach (var line in proc.StdoutLinesAsync())
     Console.WriteLine($"> {line}");
 ```
 
-From C# this is simply `await foreach (var line in proc.StdoutLines()) { ... }`.
+From C# this is simply `await foreach (var line in proc.StdoutLinesAsync()) { ... }`.
 
-`OutputEvents()` interleaves stdout and stderr as `OutputEvent` values (`IsStdout`/`IsStderr`,
+`OutputEventsAsync()` interleaves stdout and stderr as `OutputEvent` values (`IsStdout`/`IsStderr`,
 `.Text`). Write to a running process's stdin via `TakeStdin()`:
 
 **F#**
@@ -387,7 +387,7 @@ match proc.TakeStdin() with
 | Some stdin ->
     do! stdin.WriteLine "command one"
     do! stdin.Flush()
-    do! stdin.Finish()   // close stdin (EOF)
+    do! stdin.FinishAsync()   // close stdin (EOF)
 | None -> ()
 ```
 
@@ -398,11 +398,11 @@ if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and w
 {
     await stdin.WriteLine("command one");
     await stdin.Flush();
-    await stdin.Finish();   // close stdin (EOF)
+    await stdin.FinishAsync();   // close stdin (EOF)
 }
 ```
 
-Race or await several started processes with `RunningProcess.WaitAny` / `WaitAll`.
+Race or await several started processes with `RunningProcess.WaitAny` / `WaitAllAsync`.
 
 ## Readiness probes
 
@@ -411,11 +411,11 @@ Wait for a started process to become ready before proceeding:
 **F#**
 
 ```fsharp
-match! (Command.create "myserver").Start() with
+match! (Command.create "myserver").StartAsync() with
 | Ok proc ->
     use _ = proc
     // Wait up to 10s for a log line, a TCP port, or a custom predicate.
-    match! proc.WaitForLine((fun l -> l.Contains "ready"), TimeSpan.FromSeconds 10.0) with
+    match! proc.WaitForLineAsync((fun l -> l.Contains "ready"), TimeSpan.FromSeconds 10.0) with
     | Ok _ -> printfn "server is up"
     | Error err -> eprintfn $"never became ready: {err.Message}"   // ProcessError.NotReady on timeout
 | Error err -> eprintfn $"{err.Message}"
@@ -424,13 +424,13 @@ match! (Command.create "myserver").Start() with
 **C#**
 
 ```csharp
-await using var proc = (await new Command("myserver").Start()).GetValueOrThrow();
+await using var proc = (await new Command("myserver").StartAsync()).GetValueOrThrow();
 
 // Wait up to 10s for a log line, a TCP port, or a custom predicate.
-Console.WriteLine((await proc.WaitForLine(l => l.Contains("ready"), TimeSpan.FromSeconds(10))).AsRun() switch
+Console.WriteLine(await proc.WaitForLineAsync(l => l.Contains("ready"), TimeSpan.FromSeconds(10)) switch
 {
     { IsOk: true }        => "server is up",
-    { IsOk: false, Error: var err } => $"never became ready: {err.Message}",   // ProcessError.NotReady on timeout
+    { IsOk: false, ErrorValue: var err } => $"never became ready: {err.Message}",   // ProcessError.NotReady on timeout
 });
 ```
 
@@ -457,7 +457,7 @@ var cmd = new Command("slow-job")
 
 `TimeoutGrace` sends SIGTERM, waits a grace window, then SIGKILL (atomic on Windows). Tie a
 run to a `CancellationToken` with `CancelOn`, or pass a token to any verb overload
-(`cmd.Run(ct)`). A cancelled run is always an `Error` (`ProcessError.Cancelled`).
+(`cmd.RunAsync(ct)`). A cancelled run is always an `Error` (`ProcessError.Cancelled`).
 
 ## Process groups and tree control
 
@@ -473,7 +473,7 @@ task {
     | Ok group ->
         use group = group   // disposes (and reaps the whole tree) on scope exit
 
-        match! group.Start(Command.create "build-everything") with
+        match! group.StartAsync(Command.create "build-everything") with
         | Ok _proc ->
             group.Signal Signal.Term |> ignore     // signal the whole tree
             group.Suspend() |> ignore              // freeze it
@@ -481,7 +481,7 @@ task {
             match group.Members() with
             | Ok pids -> printfn $"{pids.Count} processes in the tree"
             | Error _ -> ()
-            do! group.Shutdown(TimeSpan.FromSeconds 5.0)   // graceful: SIGTERM -> grace -> SIGKILL
+            do! group.ShutdownAsync(TimeSpan.FromSeconds 5.0)   // graceful: SIGTERM -> grace -> SIGKILL
         | Error err -> eprintfn $"{err.Message}"
 }
 ```
@@ -491,14 +491,14 @@ task {
 ```csharp
 using var group = ProcessGroup.Create().GetValueOrThrow();   // disposes (and reaps the whole tree) on scope exit
 
-await group.Start(new Command("build-everything"));
+await group.StartAsync(new Command("build-everything"));
 
 group.Signal(Signal.Term);     // signal the whole tree
 group.Suspend();               // freeze it
 group.Resume();                // thaw it
-if (group.Members().AsRun() is { IsOk: true, Value: var pids })
+if (group.Members() is { IsOk: true, ResultValue: var pids })
     Console.WriteLine($"{pids.Count} processes in the tree");
-await group.Shutdown(TimeSpan.FromSeconds(5));   // graceful: SIGTERM -> grace -> SIGKILL
+await group.ShutdownAsync(TimeSpan.FromSeconds(5));   // graceful: SIGTERM -> grace -> SIGKILL
 ```
 
 Portable `Signal` values: `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`,
@@ -536,7 +536,7 @@ var options = new ProcessGroupOptions()
     .WithCpuQuota(1.5);                     // 1.5 cores
 
 var created = ProcessGroup.Create(options);
-if (created.AsRun() is { IsOk: false, Error: var err })
+if (created is { IsOk: false, ErrorValue: var err })
 {
     Console.Error.WriteLine($"limits unavailable: {err.Message}");
     return;
@@ -556,17 +556,17 @@ match group.Stats() with
 | Error _ -> ()
 
 // A periodic series (IAsyncEnumerable) for live dashboards:
-let series = group.SampleStats(TimeSpan.FromSeconds 1.0)
+let series = group.SampleStatsAsync(TimeSpan.FromSeconds 1.0)
 ```
 
 **C#**
 
 ```csharp
-if (group.Stats().AsRun() is { IsOk: true, Value: var stats })
+if (group.Stats() is { IsOk: true, ResultValue: var stats })
     Console.WriteLine($"active={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}");
 
 // A periodic series (IAsyncEnumerable) for live dashboards:
-var series = group.SampleStats(TimeSpan.FromSeconds(1));
+var series = group.SampleStatsAsync(TimeSpan.FromSeconds(1));
 ```
 
 Per-run profiling captures exit code, duration, CPU, and peak memory:
@@ -574,10 +574,10 @@ Per-run profiling captures exit code, duration, CPU, and peak memory:
 **F#**
 
 ```fsharp
-match! (Command.create "heavy-job").Start() with
+match! (Command.create "heavy-job").StartAsync() with
 | Ok proc ->
     use _ = proc
-    let! profile = proc.Profile()
+    let! profile = proc.ProfileAsync()
     printfn $"exit={profile.ExitCode} cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} samples={profile.Samples}"
 | Error _ -> ()
 ```
@@ -585,8 +585,8 @@ match! (Command.create "heavy-job").Start() with
 **C#**
 
 ```csharp
-await using var proc = (await new Command("heavy-job").Start()).GetValueOrThrow();
-var profile = await proc.Profile();
+await using var proc = (await new Command("heavy-job").StartAsync()).GetValueOrThrow();
+var profile = await proc.ProfileAsync();
 Console.WriteLine($"exit={profile.ExitCode} cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} samples={profile.Samples}");
 ```
 
@@ -606,7 +606,7 @@ let outcome =
         .Jitter(true)
         .MaxRestarts(20)
         .StormPause(TimeSpan.FromMinutes 5.0)          // pause after a burst of failures
-        .Run()
+        .RunAsync()
 
 match! outcome with
 | Ok result -> printfn $"stopped: {result.Stopped} after {result.Restarts} restarts"
@@ -623,12 +623,12 @@ var outcome = new Supervisor(new Command("worker"))
     .Jitter(true)
     .MaxRestarts(20)
     .StormPause(TimeSpan.FromMinutes(5))          // pause after a burst of failures
-    .Run();
+    .RunAsync();
 
-Console.WriteLine((await outcome).AsRun() switch
+Console.WriteLine(await outcome switch
 {
-    { IsOk: true, Value: var result } => $"stopped: {result.Stopped} after {result.Restarts} restarts",
-    { IsOk: false, Error: var err }   => err.Message,
+    { IsOk: true, ResultValue: var result } => $"stopped: {result.Stopped} after {result.Restarts} restarts",
+    { IsOk: false, ErrorValue: var err }   => err.Message,
 });
 ```
 
@@ -646,8 +646,8 @@ let git =
     (CliClient.create "git")
         .WithDefaults(fun c -> c.CurrentDir("/repo").Timeout(TimeSpan.FromSeconds 30.0))
 
-let! sha = git.Run [ "rev-parse"; "HEAD" ]
-let! log = git.OutputString [ "log"; "--oneline"; "-n"; "10" ]
+let! sha = git.RunAsync [ "rev-parse"; "HEAD" ]
+let! log = git.OutputStringAsync [ "log"; "--oneline"; "-n"; "10" ]
 ```
 
 **C#**
@@ -656,8 +656,8 @@ let! log = git.OutputString [ "log"; "--oneline"; "-n"; "10" ]
 var git = new CliClient("git")
     .WithDefaults(c => c.CurrentDir("/repo").Timeout(TimeSpan.FromSeconds(30)));
 
-var sha = await git.Run(["rev-parse", "HEAD"]);
-var log = await git.OutputString(["log", "--oneline", "-n", "10"]);
+var sha = await git.RunAsync(["rev-parse", "HEAD"]);
+var log = await git.OutputStringAsync(["log", "--oneline", "-n", "10"]);
 ```
 
 `WithDefaults` configures the shared defaults with the full `Command` builder; `client.Command args`
@@ -744,7 +744,7 @@ services.AddProcessKit();
 public class Deployer(IProcessRunner runner)
 {
     public Task<FSharpResult<string, ProcessError>> Deploy() =>
-        runner.Run(new Command("deploy"), CancellationToken.None);
+        runner.RunAsync(new Command("deploy"), CancellationToken.None);
 }
 ```
 
@@ -777,7 +777,7 @@ var runner = new ScriptedRunner()
     .Fallback(Reply.Ok(""));
 
 // Inject `runner` wherever an IProcessRunner is expected — no real processes run.
-var sha = await runner.Run(new Command("git").Args(["rev-parse", "HEAD"]), CancellationToken.None);
+var sha = await runner.RunAsync(new Command("git").Args(["rev-parse", "HEAD"]), CancellationToken.None);
 ```
 
 `RecordReplayRunner` records real runs to a JSON cassette and replays them hermetically:
@@ -805,11 +805,11 @@ var recorder = RecordReplayRunner.Record("fixture.json", new JobRunner());
 recorder.Save();
 
 // Replay later with no subprocess (an unmatched call is ProcessError.CassetteMiss):
-var loaded = RecordReplayRunner.Replay("fixture.json").AsRun();
+var loaded = RecordReplayRunner.Replay("fixture.json");
 if (loaded.IsOk)
 {
-    var replay = loaded.Value; // use `replay` as an IProcessRunner
+    var replay = loaded.ResultValue; // use `replay` as an IProcessRunner
 }
 else
-    Console.Error.WriteLine(loaded.Error.Message);
+    Console.Error.WriteLine(loaded.ErrorValue.Message);
 ```

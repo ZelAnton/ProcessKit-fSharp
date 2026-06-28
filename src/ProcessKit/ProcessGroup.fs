@@ -190,7 +190,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// Start `command` into this shared group and return a live `RunningProcess`. The **group** owns
     /// the child's lifetime: disposing the returned process detaches its I/O but does not kill it —
     /// reap the tree with `Shutdown`/`Dispose`, or this one run with its `StartKill`.
-    member this.Start(command: Command) : Task<Result<RunningProcess, ProcessError>> =
+    member this.StartAsync(command: Command) : Task<Result<RunningProcess, ProcessError>> =
         task {
             match this.StartShared command with
             | Error error -> return Error error
@@ -249,7 +249,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// **Pull-based** — it samples only as the enumeration is pulled and runs no background task, so
     /// it neither keeps the group alive nor leaks if abandoned. The series ends on the first snapshot
     /// the group fails to report (notably after it is torn down) or when the enumerator's token fires.
-    member this.SampleStats(interval: TimeSpan) : IAsyncEnumerable<ProcessGroupStats> =
+    member this.SampleStatsAsync(interval: TimeSpan) : IAsyncEnumerable<ProcessGroupStats> =
         let period =
             if interval <= TimeSpan.Zero then
                 TimeSpan.FromMilliseconds 1.0
@@ -337,7 +337,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// Tear the group down gracefully, then release it. On Unix: SIGTERM, then SIGKILL if still
     /// alive after `gracePeriod`. On Windows: an atomic Job kill. Idempotent with `Dispose`.
-    member this.Shutdown(gracePeriod: TimeSpan) : Task =
+    member this.ShutdownAsync(gracePeriod: TimeSpan) : Task =
         task {
             if Interlocked.Exchange(&releasedFlag, 1) = 0 then
                 do! backend.GracefulKillTree gracePeriod
@@ -347,7 +347,8 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         :> Task
 
     /// `Shutdown` using the group's configured `Options.ShutdownTimeout`.
-    member this.Shutdown() : Task = this.Shutdown options.ShutdownTimeout
+    member this.ShutdownAsync() : Task =
+        this.ShutdownAsync options.ShutdownTimeout
 
     // The finalizer is the GC-time safety net for a group that was never disposed: it reaps the
     // tree. Deterministic teardown still comes from `use`/`Dispose`.
@@ -360,15 +361,15 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // they do not apply the line-level `OutputBufferPolicy` or `TimeoutGrace` (a shared group has no
     // per-child graceful kill) — use `Start` + the `RunningProcess` verbs for those.
     interface IProcessRunner with
-        member this.Start(command, cancellationToken) =
+        member this.StartAsync(command, cancellationToken) =
             task {
                 if cancellationToken.IsCancellationRequested then
                     return Error(ProcessError.Cancelled command.Program)
                 else
-                    return! this.Start command
+                    return! this.StartAsync command
             }
 
-        member this.OutputString(command, cancellationToken) =
+        member this.OutputStringAsync(command, cancellationToken) =
             task {
                 match! this.SpawnAndCapture(command, cancellationToken) with
                 | Error error -> return Error error
@@ -389,7 +390,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                         )
             }
 
-        member this.OutputBytes(command, cancellationToken) =
+        member this.OutputBytesAsync(command, cancellationToken) =
             task {
                 match! this.SpawnAndCapture(command, cancellationToken) with
                 | Error error -> return Error error

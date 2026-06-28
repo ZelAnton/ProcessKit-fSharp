@@ -14,7 +14,7 @@ compiler children, the real payload behind a `cmd /c …` / `sh -c …` wrapper,
 test's helper servers can outlive a timeout or an exception as orphans.
 
 You rarely create a group by hand for one-shot runs: every one-shot verb
-(`Run`, `OutputString`, …) already spawns into a fresh private group that dies
+(`RunAsync`, `OutputStringAsync`, …) already spawns into a fresh private group that dies
 with the run. Reach for an explicit `ProcessGroup` when **several children should
 share one fate**, or when you need the group-level verbs below — signals,
 suspend/resume, member listing, resource limits, or stats.
@@ -50,7 +50,7 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created.AsRun() is { IsOk: false, Error: var err })
+if (created is { IsOk: false, ErrorValue: var err })
 {
     Console.Error.WriteLine($"could not create a group: {err.Message}");
     return;
@@ -82,7 +82,7 @@ match ProcessGroup.Create options with
 var options = new ProcessGroupOptions().WithShutdownTimeout(TimeSpan.FromSeconds(10));
 
 var created = ProcessGroup.Create(options);
-if (created.AsRun() is { IsOk: false, Error: var err })
+if (created is { IsOk: false, ErrorValue: var err })
 {
     Console.Error.WriteLine(err.Message);
     return;
@@ -142,7 +142,7 @@ full streaming / stdin / readiness surface from
 [streaming.md](streaming.md)). The key ownership rule: **the group owns the
 child's lifetime.** Disposing the returned `RunningProcess` detaches only that
 run's I/O; the child keeps running until you reap the whole tree
-(`Shutdown` / dispose) or kill just that run with its own `StartKill`.
+(`ShutdownAsync` / dispose) or kill just that run with its own `StartKill`.
 
 **F#**
 
@@ -153,10 +153,10 @@ task {
     | Ok group ->
         use group = group
 
-        match! group.Start(Command.create "dev-server") with
+        match! group.StartAsync(Command.create "dev-server") with
         | Ok server ->
             // `server` streams/probes as usual, but the GROUP owns its lifetime.
-            let! _ready = server.WaitForLine((fun l -> l.Contains "ready"), System.TimeSpan.FromSeconds 10.0)
+            let! _ready = server.WaitForLineAsync((fun l -> l.Contains "ready"), System.TimeSpan.FromSeconds 10.0)
             ()
         | Error err -> eprintfn $"{err.Message}"
 }
@@ -166,7 +166,7 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created.AsRun() is { IsOk: false, Error: var err })
+if (created is { IsOk: false, ErrorValue: var err })
 {
     Console.Error.WriteLine(err.Message);
     return;
@@ -174,8 +174,8 @@ if (created.AsRun() is { IsOk: false, Error: var err })
 
 using var group = created.GetValueOrThrow();
 
-var started = await group.Start(new Command("dev-server"));
-if (started.AsRun() is { IsOk: false, Error: var startErr })
+var started = await group.StartAsync(new Command("dev-server"));
+if (started is { IsOk: false, ErrorValue: var startErr })
 {
     Console.Error.WriteLine(startErr.Message);
     return;
@@ -183,7 +183,7 @@ if (started.AsRun() is { IsOk: false, Error: var startErr })
 
 var server = started.GetValueOrThrow();
 // `server` streams/probes as usual, but the GROUP owns its lifetime.
-var ready = await server.WaitForLine(l => l.Contains("ready"), TimeSpan.FromSeconds(10));
+var ready = await server.WaitForLineAsync(l => l.Contains("ready"), TimeSpan.FromSeconds(10));
 ```
 
 To **capture** a child to completion inside the shared group, drive the group
@@ -210,7 +210,7 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created.AsRun() is { IsOk: false, Error: var err })
+if (created is { IsOk: false, ErrorValue: var err })
 {
     Console.Error.WriteLine(err.Message);
     return;
@@ -218,10 +218,10 @@ if (created.AsRun() is { IsOk: false, Error: var err })
 
 using var group = created.GetValueOrThrow();
 
-Console.WriteLine((await Runner.outputString(group, CancellationToken.None, new Command("probe-tool"))).AsRun() switch
+Console.WriteLine(await Runner.outputString(group, CancellationToken.None, new Command("probe-tool")) switch
 {
-    { IsOk: true, Value: var result }  => $"exit={result.Code}: {result.Stdout}",
-    { IsOk: false, Error: var runErr } => runErr.Message,
+    { IsOk: true, ResultValue: var result }  => $"exit={result.Code}: {result.Stdout}",
+    { IsOk: false, ErrorValue: var runErr } => runErr.Message,
 });
 // `Runner.outputBytes` is the binary companion; `Runner.start` mirrors `group.Start`.
 ```
@@ -240,12 +240,12 @@ There are three ways out, from blunt to graceful:
 |---|---|---|
 | dispose (`use` / `Dispose()` / `DisposeAsync()`) | Immediate **hard kill** of the whole tree, then releases the container | The safety net — always on, even on an exception or early return |
 | `group.TerminateAll()` | The same hard kill, but the group **stays usable** for further spawns; idempotent | Explicit teardown mid-flight when you want to keep the group |
-| `group.Shutdown()` / `group.Shutdown(grace)` | **Graceful**: on Unix `SIGTERM` → wait the grace window → `SIGKILL` survivors; on Windows the atomic Job kill. Releases the group | A clean service stop |
+| `group.ShutdownAsync()` / `group.ShutdownAsync(grace)` | **Graceful**: on Unix `SIGTERM` → wait the grace window → `SIGKILL` survivors; on Windows the atomic Job kill. Releases the group | A clean service stop |
 
 `ProcessGroup` implements both `IDisposable` and `IAsyncDisposable`, so a `use`
 binding reaps the tree deterministically on scope exit — disposing is a pure hard
 kill with no grace, which is exactly what you want as the guaranteed backstop.
-For an orderly stop, prefer `Shutdown`, which awaits a `Task`:
+For an orderly stop, prefer `ShutdownAsync`, which awaits a `Task`:
 
 **F#**
 
@@ -254,10 +254,10 @@ task {
     match ProcessGroup.Create() with
     | Ok group ->
         use group = group
-        let! _service = group.Start(Command.create "my-service")
+        let! _service = group.StartAsync(Command.create "my-service")
 
         // SIGTERM, give it 5s to flush and exit, then SIGKILL any straggler:
-        do! group.Shutdown(TimeSpan.FromSeconds 5.0)
+        do! group.ShutdownAsync(TimeSpan.FromSeconds 5.0)
     | Error err -> eprintfn $"{err.Message}"
 }
 ```
@@ -266,26 +266,26 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created.AsRun() is { IsOk: false, Error: var err })
+if (created is { IsOk: false, ErrorValue: var err })
 {
     Console.Error.WriteLine(err.Message);
     return;
 }
 
 using var group = created.GetValueOrThrow();
-await group.Start(new Command("my-service"));
+await group.StartAsync(new Command("my-service"));
 
 // SIGTERM, give it 5s to flush and exit, then SIGKILL any straggler:
-await group.Shutdown(TimeSpan.FromSeconds(5));
+await group.ShutdownAsync(TimeSpan.FromSeconds(5));
 ```
 
-`Shutdown()` with no argument uses the group's configured
+`ShutdownAsync()` with no argument uses the group's configured
 `Options.ShutdownTimeout` (the default is 2 seconds; set it with
 `WithShutdownTimeout`). A child that handles `SIGTERM` and exits ends the grace
-**early** — `Shutdown` returns as soon as the tree is empty, not after the full
-window. `Shutdown` and dispose are idempotent with each other, so a `use`-bound
-group you also `Shutdown` explicitly is safe. Note that a *suspended* tree can
-still be hard-killed (dispose / `TerminateAll`), but a graceful `Shutdown` opens
+**early** — `ShutdownAsync` returns as soon as the tree is empty, not after the full
+window. `ShutdownAsync` and dispose are idempotent with each other, so a `use`-bound
+group you also `ShutdownAsync` explicitly is safe. Note that a *suspended* tree can
+still be hard-killed (dispose / `TerminateAll`), but a graceful `ShutdownAsync` opens
 with a `SIGTERM` a frozen tree cannot act on — `Resume` first for a clean stop
 (see below).
 
@@ -311,7 +311,7 @@ let reload (group: ProcessGroup) =
 ```csharp
 void reload(ProcessGroup group)
 {
-    if (group.Signal(Signal.Hup).AsRun() is { IsOk: false, Error: var err }) // "reload your configuration"
+    if (group.Signal(Signal.Hup) is { IsOk: false, ErrorValue: var err }) // "reload your configuration"
         Console.Error.WriteLine(err.Message);
 }
 ```
@@ -343,10 +343,10 @@ match group.Signal Signal.Hup with
 **C#**
 
 ```csharp
-if (group.Signal(Signal.Hup).AsRun() is { IsOk: false, Error: var err })
+if (group.Signal(Signal.Hup) is { IsOk: false, ErrorValue: var err })
     Console.Error.WriteLine(err switch
     {
-        ProcessError.Unsupported { operation: var op } => $"not on this platform: {op}",
+        ProcessError.Unsupported { Operation: var op } => $"not on this platform: {op}",
         _                                              => err.Message,
     });
 ```
@@ -384,7 +384,7 @@ Suspend/resume work wherever a container exists, but the machinery differs:
   calls.
 
 A practical rule: `Resume` before starting new work into the group, and `Resume`
-before a graceful `Shutdown`. See [platform-support.md](platform-support.md) for
+before a graceful `ShutdownAsync`. See [platform-support.md](platform-support.md) for
 the caveats in full.
 
 ## Listing members
@@ -399,8 +399,8 @@ task {
     match ProcessGroup.Create() with
     | Ok group ->
         use group = group
-        let! _a = group.Start(Command.create "worker-a")
-        let! _b = group.Start(Command.create "worker-b")
+        let! _a = group.StartAsync(Command.create "worker-a")
+        let! _b = group.StartAsync(Command.create "worker-b")
 
         match group.Members() with
         | Ok pids -> printfn $"{pids.Count} live members: {pids}"
@@ -413,20 +413,20 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created.AsRun() is { IsOk: false, Error: var err })
+if (created is { IsOk: false, ErrorValue: var err })
 {
     Console.Error.WriteLine(err.Message);
     return;
 }
 
 using var group = created.GetValueOrThrow();
-await group.Start(new Command("worker-a"));
-await group.Start(new Command("worker-b"));
+await group.StartAsync(new Command("worker-a"));
+await group.StartAsync(new Command("worker-b"));
 
-Console.WriteLine((group.Members()).AsRun() switch
+Console.WriteLine((group.Members()) switch
 {
-    { IsOk: true, Value: var pids }        => $"{pids.Count} live members: {string.Join(", ", pids)}",
-    { IsOk: false, Error: var membersErr } => membersErr.Message,
+    { IsOk: true, ResultValue: var pids }        => $"{pids.Count} live members: {string.Join(", ", pids)}",
+    { IsOk: false, ErrorValue: var membersErr } => membersErr.Message,
 });
 ```
 
@@ -460,7 +460,7 @@ task {
     match ProcessGroup.Create options with
     | Ok group ->
         use group = group
-        let! _sandboxed = group.Start(Command.create "untrusted-tool")
+        let! _sandboxed = group.StartAsync(Command.create "untrusted-tool")
         () // ... runs within the limited group ...
     | Error err -> eprintfn $"limits unavailable: {err.Message}" // ProcessError.ResourceLimit
 }
@@ -475,14 +475,14 @@ var options = new ProcessGroupOptions()
     .WithCpuQuota(0.5);                   // half of one core
 
 var created = ProcessGroup.Create(options);
-if (created.AsRun() is { IsOk: false, Error: var err })
+if (created is { IsOk: false, ErrorValue: var err })
 {
     Console.Error.WriteLine($"limits unavailable: {err.Message}"); // ProcessError.ResourceLimit
     return;
 }
 
 using var group = created.GetValueOrThrow();
-await group.Start(new Command("untrusted-tool")); // ... runs within the limited group ...
+await group.StartAsync(new Command("untrusted-tool")); // ... runs within the limited group ...
 ```
 
 The three caps are:
@@ -534,7 +534,7 @@ match ProcessGroup.Create options with
 
 ```csharp
 var created = ProcessGroup.Create(options);
-if (created.AsRun() is { IsOk: false, Error: var err })
+if (created is { IsOk: false, ErrorValue: var err })
 {
     Console.Error.WriteLine(err switch
     {
@@ -564,10 +564,10 @@ match group.Stats() with
 **C#**
 
 ```csharp
-Console.WriteLine((group.Stats()).AsRun() switch
+Console.WriteLine((group.Stats()) switch
 {
-    { IsOk: true, Value: var stats } => $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}",
-    { IsOk: false, Error: var err }  => err.Message,
+    { IsOk: true, ResultValue: var stats } => $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}",
+    { IsOk: false, ErrorValue: var err }  => err.Message,
 });
 ```
 
@@ -586,7 +586,7 @@ time and peak memory are available where the kernel accounts for the whole tree 
 
 ```fsharp
 task {
-    let series = group.SampleStats(TimeSpan.FromSeconds 1.0)
+    let series = group.SampleStatsAsync(TimeSpan.FromSeconds 1.0)
     let e = series.GetAsyncEnumerator()
 
     try
@@ -604,11 +604,11 @@ task {
 **C#**
 
 ```csharp
-await foreach (var s in group.SampleStats(TimeSpan.FromSeconds(1)))
+await foreach (var s in group.SampleStatsAsync(TimeSpan.FromSeconds(1)))
     Console.WriteLine($"rss now: {s.PeakMemoryBytes}");
 ```
 
-From C# this is simply `await foreach (var s in group.SampleStats(interval))`. The
+From C# this is simply `await foreach (var s in group.SampleStatsAsync(interval))`. The
 sampler is **pull-based**: it samples only as you pull the enumeration and runs no
 background task, so it neither keeps the group alive nor leaks if you abandon it.
 The series ends on the first snapshot the group can no longer report (notably once

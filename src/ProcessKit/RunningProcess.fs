@@ -270,7 +270,7 @@ type RunningProcess internal (host: RunningHost) =
 
     /// Run to completion, capturing stdout as decoded text. A non-zero exit is data; the tree is
     /// reaped when the call returns.
-    member _.OutputString() : Task<Result<ProcessResult<string>, ProcessError>> =
+    member _.OutputStringAsync() : Task<Result<ProcessResult<string>, ProcessError>> =
         if not (claimBuffered ()) then
             Task.FromResult(Error(alreadyConsumedError ()))
         else
@@ -310,7 +310,7 @@ type RunningProcess internal (host: RunningHost) =
             }
 
     /// Run to completion, capturing stdout as raw bytes (no line splitting) and stderr as text.
-    member _.OutputBytes() : Task<Result<ProcessResult<byte[]>, ProcessError>> =
+    member _.OutputBytesAsync() : Task<Result<ProcessResult<byte[]>, ProcessError>> =
         if not (claimBuffered ()) then
             Task.FromResult(Error(alreadyConsumedError ()))
         else
@@ -348,7 +348,7 @@ type RunningProcess internal (host: RunningHost) =
             }
 
     /// Wait for the process to exit, discarding its output. Reaps the tree.
-    member _.Wait() : Task<Outcome> =
+    member _.WaitAsync() : Task<Outcome> =
         if not (claimBuffered ()) then
             raise (InvalidOperationException alreadyConsumedMessage)
 
@@ -366,7 +366,7 @@ type RunningProcess internal (host: RunningHost) =
 
     /// Run to completion while periodically sampling the child's CPU/memory every `interval`, and
     /// return a `RunProfile`. Drains and discards output (like `Wait`) and reaps the tree.
-    member _.Profile(interval: TimeSpan) : Task<RunProfile> =
+    member _.ProfileAsync(interval: TimeSpan) : Task<RunProfile> =
         if not (claimBuffered ()) then
             raise (InvalidOperationException alreadyConsumedMessage)
 
@@ -446,8 +446,8 @@ type RunningProcess internal (host: RunningHost) =
         }
 
     /// `Profile` sampling every 100 ms.
-    member this.Profile() =
-        this.Profile(TimeSpan.FromMilliseconds 100.0)
+    member this.ProfileAsync() =
+        this.ProfileAsync(TimeSpan.FromMilliseconds 100.0)
 
     // Returns false when a different consumption (a buffered verb, or event streaming) already owns the
     // pipes; true once the stdout streaming session is (or already was) ours.
@@ -504,14 +504,14 @@ type RunningProcess internal (host: RunningHost) =
             true
 
     /// Stream stdout line by line as it arrives. Call `Finish` afterwards for stderr + outcome.
-    member this.StdoutLines() : IAsyncEnumerable<string> =
+    member this.StdoutLinesAsync() : IAsyncEnumerable<string> =
         if not (this.StartStdoutStreaming()) then
             raise (InvalidOperationException alreadyConsumedMessage)
 
         stdoutChannel.Reader.ReadAllAsync()
 
     /// After streaming stdout, wait for exit and return the captured stderr. Reaps the tree.
-    member this.Finish() : Task<Result<Finished, ProcessError>> =
+    member this.FinishAsync() : Task<Result<Finished, ProcessError>> =
         if not (this.StartStdoutStreaming()) then
             Task.FromResult(Error(alreadyConsumedError ()))
         else
@@ -601,7 +601,7 @@ type RunningProcess internal (host: RunningHost) =
             true
 
     /// Stream merged stdout+stderr line events as they arrive.
-    member this.OutputEvents() : IAsyncEnumerable<OutputEvent> =
+    member this.OutputEventsAsync() : IAsyncEnumerable<OutputEvent> =
         if not (this.StartEventStreaming()) then
             raise (InvalidOperationException alreadyConsumedMessage)
 
@@ -610,7 +610,7 @@ type RunningProcess internal (host: RunningHost) =
     /// Wait until a stdout line satisfies `predicate`, or fail with `NotReady` after `timeout`
     /// (or `Cancelled` if `cancellationToken` fires first). Consumed lines are not re-delivered; a
     /// later `StdoutLines`/`Finish` sees the rest.
-    member this.WaitForLine
+    member this.WaitForLineAsync
         (predicate: Func<string, bool>, timeout: TimeSpan, cancellationToken: CancellationToken)
         : Task<Result<string, ProcessError>> =
         ArgumentNullException.ThrowIfNull predicate
@@ -649,15 +649,17 @@ type RunningProcess internal (host: RunningHost) =
             }
 
     /// `WaitForLine` with no extra cancellation token.
-    member this.WaitForLine(predicate: Func<string, bool>, timeout: TimeSpan) : Task<Result<string, ProcessError>> =
-        this.WaitForLine(predicate, timeout, CancellationToken.None)
+    member this.WaitForLineAsync
+        (predicate: Func<string, bool>, timeout: TimeSpan)
+        : Task<Result<string, ProcessError>> =
+        this.WaitForLineAsync(predicate, timeout, CancellationToken.None)
 
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`
     /// (or `Cancelled` if `cancellationToken` fires first). Unlike `WaitForLine`, this does not read
     /// the child's stdout/stderr while polling — a child that floods a *piped* stream before it is
     /// ready can block on a full pipe; consume its output concurrently (`StdoutLines`/`OutputEvents`)
     /// or run it with `Stdout`/`Stderr` set to `Inherit`/`Null` when polling a chatty process.
-    member _.WaitForPort
+    member _.WaitForPortAsync
         (endpoint: IPEndPoint, timeout: TimeSpan, cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull endpoint
@@ -696,14 +698,14 @@ type RunningProcess internal (host: RunningHost) =
         }
 
     /// `WaitForPort` with no extra cancellation token.
-    member this.WaitForPort(endpoint: IPEndPoint, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
-        this.WaitForPort(endpoint, timeout, CancellationToken.None)
+    member this.WaitForPortAsync(endpoint: IPEndPoint, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
+        this.WaitForPortAsync(endpoint, timeout, CancellationToken.None)
 
     /// Poll `probe` until it returns true, or fail with `NotReady` after `timeout` (or `Cancelled`
     /// if `cancellationToken` fires first). Like `WaitForPort`, this does not drain the child's
     /// stdout/stderr while polling — consume a piped, chatty child's output concurrently (or run it
     /// with `Stdout`/`Stderr` `Inherit`/`Null`) so it can't block on a full pipe before becoming ready.
-    member _.WaitFor
+    member _.WaitForAsync
         (probe: Func<Task<bool>>, timeout: TimeSpan, cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull probe
@@ -735,8 +737,8 @@ type RunningProcess internal (host: RunningHost) =
         }
 
     /// `WaitFor` with no extra cancellation token.
-    member this.WaitFor(probe: Func<Task<bool>>, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
-        this.WaitFor(probe, timeout, CancellationToken.None)
+    member this.WaitForAsync(probe: Func<Task<bool>>, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
+        this.WaitForAsync(probe, timeout, CancellationToken.None)
 
     /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
     /// the racing primitive behind `WaitAny`/`WaitAll`.
@@ -774,7 +776,7 @@ type RunningProcess internal (host: RunningHost) =
 
     /// Wait for the first of `processes` to exit; returns its index and outcome. Does not reap any
     /// of them — dispose them yourself.
-    static member WaitAny(processes: RunningProcess[]) : Task<Result<WaitAnyResult, ProcessError>> =
+    static member WaitAnyAsync(processes: RunningProcess[]) : Task<Result<WaitAnyResult, ProcessError>> =
         task {
             if processes.Length = 0 then
                 return Error(ProcessError.Unsupported "WaitAny requires at least one process")
@@ -787,7 +789,7 @@ type RunningProcess internal (host: RunningHost) =
         }
 
     /// Wait for all of `processes` to exit; returns their outcomes in order. Does not reap them.
-    static member WaitAll(processes: RunningProcess[]) : Task<Outcome[]> =
+    static member WaitAllAsync(processes: RunningProcess[]) : Task<Outcome[]> =
         processes |> Array.map (fun p -> p.ExitTask) |> Task.WhenAll
 
     interface IAsyncDisposable with

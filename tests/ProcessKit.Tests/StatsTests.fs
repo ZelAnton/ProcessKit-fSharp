@@ -39,10 +39,10 @@ type StatsTests() =
                 else
                     shell "sleep 0.3"
 
-            match! workload.Start() with
+            match! workload.StartAsync() with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
-                let! profile = running.Profile(TimeSpan.FromMilliseconds 50.0)
+                let! profile = running.ProfileAsync(TimeSpan.FromMilliseconds 50.0)
                 Assert.That(profile.ExitCode, Is.EqualTo(Some 0))
                 Assert.That(profile.Duration, Is.GreaterThan TimeSpan.Zero)
                 Assert.That(profile.Samples, Is.GreaterThanOrEqualTo 1)
@@ -54,7 +54,7 @@ type StatsTests() =
         task {
             use group = create ()
 
-            match! group.Start sleeper with
+            match! group.StartAsync sleeper with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 match group.Stats() with
@@ -72,7 +72,7 @@ type StatsTests() =
                 | Error error -> Assert.Fail $"{error}"
 
                 running.StartKill()
-                let! _ = running.Wait()
+                let! _ = running.WaitAsync()
                 ()
         }
         :> Task
@@ -82,11 +82,11 @@ type StatsTests() =
         task {
             use group = create ()
 
-            match! group.Start sleeper with
+            match! group.StartAsync sleeper with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 let enumerator =
-                    group.SampleStats(TimeSpan.FromMilliseconds 50.0).GetAsyncEnumerator(CancellationToken.None)
+                    group.SampleStatsAsync(TimeSpan.FromMilliseconds 50.0).GetAsyncEnumerator(CancellationToken.None)
 
                 let! first = enumerator.MoveNextAsync()
                 Assert.That(first, Is.True)
@@ -97,7 +97,7 @@ type StatsTests() =
 
                 do! enumerator.DisposeAsync()
                 running.StartKill()
-                let! _ = running.Wait()
+                let! _ = running.WaitAsync()
                 ()
         }
         :> Task
@@ -107,7 +107,7 @@ type StatsTests() =
         task {
             use group = create ()
 
-            match! group.Start sleeper with
+            match! group.StartAsync sleeper with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 if not isMacOs then
@@ -120,7 +120,7 @@ type StatsTests() =
                     running.PeakMemoryBytes |> ignore
 
                 running.StartKill()
-                let! _ = running.Wait()
+                let! _ = running.WaitAsync()
                 ()
         }
         :> Task

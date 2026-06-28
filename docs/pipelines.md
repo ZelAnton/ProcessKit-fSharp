@@ -45,7 +45,7 @@ task {
             .Pipe(Command.create "sort")
             .Pipe(Command.create "uniq" |> Command.arg "-c")
 
-    match! pipeline.Run() with
+    match! pipeline.RunAsync() with
     | Ok authors -> printfn $"{authors}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -59,10 +59,10 @@ var pipeline = new Command("git").Args(["log", "--format=%an"])
     .Pipe(new Command("sort"))
     .Pipe(new Command("uniq").Arg("-c"));
 
-Console.WriteLine((await pipeline.Run()).AsRun() switch
+Console.WriteLine(await pipeline.RunAsync() switch
 {
-    { IsOk: true, Value: var authors } => authors,
-    { IsOk: false, Error: var err }    => err.Message,
+    { IsOk: true, ResultValue: var authors } => authors,
+    { IsOk: false, ErrorValue: var err }    => err.Message,
 });
 ```
 
@@ -80,7 +80,7 @@ task {
             (Command.create "sort")
         |> Pipeline.pipe (Command.create "uniq" |> Command.arg "-c")
 
-    match! pipeline.OutputString() with
+    match! pipeline.OutputStringAsync() with
     | Ok result -> printfn $"{result.Stdout}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -93,10 +93,10 @@ var pipeline = new Command("git").Args(["log", "--format=%an"])
     .Pipe(new Command("sort"))
     .Pipe(new Command("uniq").Arg("-c"));
 
-Console.WriteLine((await pipeline.OutputString()).AsRun() switch
+Console.WriteLine(await pipeline.OutputStringAsync() switch
 {
-    { IsOk: true, Value: var result } => result.Stdout,
-    { IsOk: false, Error: var err }   => err.Message,
+    { IsOk: true, ResultValue: var result } => result.Stdout,
+    { IsOk: false, ErrorValue: var err }   => err.Message,
 });
 ```
 
@@ -114,29 +114,29 @@ returns `Task<Result<_, ProcessError>>`:
 
 | Verb | On success you get | A failing stage is… |
 |---|---|---|
-| `Run()` | trimmed final `string` | …raised as the first unclean checked stage's `ProcessError.Exit` |
-| `RunUnit()` | `unit` | …same success rule; the output is discarded |
-| `OutputString()` | `ProcessResult<string>` | …folded into the result (code / stderr / program of the first unclean stage); never an `Error` on its own |
-| `OutputBytes()` | `ProcessResult<byte[]>` | …same, with the last stage's stdout captured raw — for binary pipes |
-| `ExitCode()` | `int` | …its attributed code (a timed-out / signalled chain errors rather than inventing a number) |
-| `Probe()` | `bool` | exit `0` → `true`, `1` → `false`, anything else → `Error` |
-| `Parse(f)` / `TryParse(f)` | `'T` | …raised as that stage's `ProcessError.Exit`; `Parse` requires success |
+| `RunAsync()` | trimmed final `string` | …raised as the first unclean checked stage's `ProcessError.Exit` |
+| `RunUnitAsync()` | `unit` | …same success rule; the output is discarded |
+| `OutputStringAsync()` | `ProcessResult<string>` | …folded into the result (code / stderr / program of the first unclean stage); never an `Error` on its own |
+| `OutputBytesAsync()` | `ProcessResult<byte[]>` | …same, with the last stage's stdout captured raw — for binary pipes |
+| `ExitCodeAsync()` | `int` | …its attributed code (a timed-out / signalled chain errors rather than inventing a number) |
+| `ProbeAsync()` | `bool` | exit `0` → `true`, `1` → `false`, anything else → `Error` |
+| `ParseAsync(f)` / `TryParseAsync(f)` | `'T` | …raised as that stage's `ProcessError.Exit`; `ParseAsync` requires success |
 
-Every verb also has a `CancellationToken` overload — `pipeline.Run(token)`,
-`pipeline.OutputString(token)`, and so on — for a per-call token alongside the
+Every verb also has a `CancellationToken` overload — `pipeline.RunAsync(token)`,
+`pipeline.OutputStringAsync(token)`, and so on — for a per-call token alongside the
 chain-level [`CancelOn`](#timeouts-and-cancellation).
 
-An `Error` from a capture verb such as `OutputString` means a stage couldn't be *started
+An `Error` from a capture verb such as `OutputStringAsync` means a stage couldn't be *started
 or driven* at all — a spawn failure, a not-found program, broken plumbing — **never** a
 mere non-zero exit. A non-zero exit is data in the `ProcessResult`.
 
-There is deliberately no streaming verb and no `FirstLine` on a `Pipeline`: a chain
+There is deliberately no streaming verb and no `FirstLineAsync` on a `Pipeline`: a chain
 consumes its last stage in full to fold the pipefail outcome, so there is no live handle
 to stream from. To *capture* the first matching line of a finished chain, append a
 `head -n 1` (POSIX) / `findstr` (Windows) stage and capture its stdout. If you instead
 need a streaming readiness probe over a chain that must keep running — wait for a banner
 line, then leave it alive — a `head` stage would tear it down; reach for a single
-`Command` with `WaitForLine` instead (see [streaming.md](streaming.md)).
+`Command` with `WaitForLineAsync` instead (see [streaming.md](streaming.md)).
 
 ## Pipefail: the result and the ends
 
@@ -159,7 +159,7 @@ task {
             .Pipe(Command.create "grep" |> Command.arg "ERROR") // suppose grep exits 2 (bad regex)
             .Pipe(Command.create "wc" |> Command.arg "-l")
 
-    match! pipeline.OutputString() with
+    match! pipeline.OutputStringAsync() with
     | Ok result ->
         // Blame points at grep — the rightmost unclean stage — while Stdout is whatever wc managed.
         printfn $"code={result.Code} program={result.Program} success={result.IsSuccess}"
@@ -175,22 +175,22 @@ var pipeline = new Command("cat").Arg("data.txt")
     .Pipe(new Command("grep").Arg("ERROR")) // suppose grep exits 2 (bad regex)
     .Pipe(new Command("wc").Arg("-l"));
 
-Console.WriteLine((await pipeline.OutputString()).AsRun() switch
+Console.WriteLine(await pipeline.OutputStringAsync() switch
 {
     // Blame points at grep — the rightmost unclean stage — while Stdout is whatever wc managed.
-    { IsOk: true, Value: var result } => $"code={result.Code} program={result.Program} success={result.IsSuccess}", // code=Some 2  program=grep  success=false
-    { IsOk: false, Error: var err }   => err.Message,
+    { IsOk: true, ResultValue: var result } => $"code={result.Code} program={result.Program} success={result.IsSuccess}", // code=Some 2  program=grep  success=false
+    { IsOk: false, ErrorValue: var err }   => err.Message,
 });
 ```
 
 The success-requiring verbs turn that same pipefail outcome into a typed error attributed
-to the blamed stage. `ProcessResult.ensureSuccess` does it explicitly, and `Run` does it
+to the blamed stage. `ProcessResult.ensureSuccess` does it explicitly, and `RunAsync` does it
 for you:
 
 **F#**
 
 ```fsharp
-match! pipeline.Run() with
+match! pipeline.RunAsync() with
 | Ok out -> printfn $"{out}"
 | Error(ProcessError.Exit(program, code, _, stderr)) ->
     eprintfn $"{program} exited {code}: {stderr}" // program = "grep", code = 2
@@ -200,11 +200,11 @@ match! pipeline.Run() with
 **C#**
 
 ```csharp
-Console.WriteLine((await pipeline.Run()).AsRun() switch
+Console.WriteLine(await pipeline.RunAsync() switch
 {
-    { IsOk: true, Value: var output } => output,
-    { IsOk: false, Error: ProcessError.Exit { program: var p, code: var c, stderr: var s } } => $"{p} exited {c}: {s}", // program = "grep", code = 2
-    { IsOk: false, Error: var err } => err.Message,
+    { IsOk: true, ResultValue: var output } => output,
+    { IsOk: false, ErrorValue: ProcessError.Exit { Program: var p, Code: var c, Stderr: var s } } => $"{p} exited {c}: {s}", // program = "grep", code = 2
+    { IsOk: false, ErrorValue: var err } => err.Message,
 });
 ```
 
@@ -229,7 +229,7 @@ task {
             .Pipe(Command.create "uniq")
             .Pipe(Command.create "wc" |> Command.arg "-l")
 
-    match! uniqueCount.Run() with
+    match! uniqueCount.RunAsync() with
     | Ok n -> printfn $"{n}" // "3"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -242,10 +242,10 @@ var uniqueCount = new Command("sort").Stdin(Stdin.FromString("b\na\nb\nc\n"))
     .Pipe(new Command("uniq"))
     .Pipe(new Command("wc").Arg("-l"));
 
-Console.WriteLine((await uniqueCount.Run()).AsRun() switch
+Console.WriteLine(await uniqueCount.RunAsync() switch
 {
-    { IsOk: true, Value: var n }    => n, // "3"
-    { IsOk: false, Error: var err } => err.Message,
+    { IsOk: true, ResultValue: var n }    => n, // "3"
+    { IsOk: false, ErrorValue: var err } => err.Message,
 });
 ```
 
@@ -268,7 +268,7 @@ task {
         (Command.create "seq" |> Command.args [ "1"; "1000000" ] |> Command.uncheckedInPipe)
             .Pipe(Command.create "head" |> Command.args [ "-n"; "1" ])
 
-    match! first.Run() with
+    match! first.RunAsync() with
     | Ok line -> printfn $"{line}" // "1"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -281,10 +281,10 @@ task {
 var first = new Command("seq").Args(["1", "1000000"]).UncheckedInPipe()
     .Pipe(new Command("head").Args(["-n", "1"]));
 
-Console.WriteLine((await first.Run()).AsRun() switch
+Console.WriteLine(await first.RunAsync() switch
 {
-    { IsOk: true, Value: var line } => line, // "1"
-    { IsOk: false, Error: var err } => err.Message,
+    { IsOk: true, ResultValue: var line } => line, // "1"
+    { IsOk: false, ErrorValue: var err } => err.Message,
 });
 ```
 
@@ -316,7 +316,7 @@ task {
             .Pipe(Command.create "consumer")
             .Timeout(TimeSpan.FromSeconds 30.0)                                     // whole-CHAIN
 
-    match! pipeline.OutputString() with
+    match! pipeline.OutputStringAsync() with
     | Ok result -> printfn $"timedOut={result.IsTimedOut}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -329,19 +329,19 @@ var pipeline = new Command("producer").Timeout(TimeSpan.FromSeconds(10)) // per-
     .Pipe(new Command("consumer"))
     .Timeout(TimeSpan.FromSeconds(30));                                  // whole-CHAIN
 
-Console.WriteLine((await pipeline.OutputString()).AsRun() switch
+Console.WriteLine(await pipeline.OutputStringAsync() switch
 {
-    { IsOk: true, Value: var result } => $"timedOut={result.IsTimedOut}",
-    { IsOk: false, Error: var err }   => err.Message,
+    { IsOk: true, ResultValue: var result } => $"timedOut={result.IsTimedOut}",
+    { IsOk: false, ErrorValue: var err }   => err.Message,
 });
 ```
 
 - **`Pipeline.Timeout`** (module mirror: `Pipeline.timeout`) bounds the **whole chain**:
   at the deadline the shared group is torn down and the run reports the timeout — on
-  `OutputString` as `IsTimedOut`, on `Run` as an `Error`. Unlike a single command's
+  `OutputStringAsync` as `IsTimedOut`, on `RunAsync` as an `Error`. Unlike a single command's
   *captured* timeout, there is no salvaged partial stdout to read back.
 - A per-stage **`Command.Timeout`** kills just that stage. The same pipefail rule then
-  applies: a stage that hit its own deadline — inner or last — surfaces on `Run` as that
+  applies: a stage that hit its own deadline — inner or last — surfaces on `RunAsync` as that
   stage's `ProcessError.Timeout`, reporting **that stage's own deadline** (not the
   chain's).
 
@@ -350,7 +350,7 @@ Cancellation has two forms:
 - **`Pipeline.CancelOn(token)`** (module mirror: `Pipeline.cancelOn`) is the chain-level
   control: the token is applied to every stage, so firing it tears the whole chain down
   and the run resolves to `ProcessError.Cancelled`.
-- Each verb's **`CancellationToken` overload** (`pipeline.Run(token)`) ties a single call
+- Each verb's **`CancellationToken` overload** (`pipeline.RunAsync(token)`) ties a single call
   to a token without baking it into the pipeline.
 
 A `Command.CancelOn` token set on an individual stage also cancels that stage and errors

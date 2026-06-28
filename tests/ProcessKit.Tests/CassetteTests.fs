@@ -13,12 +13,12 @@ open ProcessKit.Testing
 /// A deterministic inner `IProcessRunner` for record-mode tests: every call returns `stdout`/`code`.
 type private FixedRunner(stdout: string, code: int) =
     interface IProcessRunner with
-        member _.OutputString(command, _cancellationToken) =
+        member _.OutputStringAsync(command, _cancellationToken) =
             Task.FromResult(
                 Ok(ProcessResult<string>(command.Program, stdout, "", Outcome.Exited code, TimeSpan.Zero, false, [ 0 ]))
             )
 
-        member _.OutputBytes(command, _cancellationToken) =
+        member _.OutputBytesAsync(command, _cancellationToken) =
             Task.FromResult(
                 Ok(
                     ProcessResult<byte[]>(
@@ -33,7 +33,7 @@ type private FixedRunner(stdout: string, code: int) =
                 )
             )
 
-        member _.Start(_command, _cancellationToken) =
+        member _.StartAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "FixedRunner has no Start"))
 
 [<TestFixture>]
@@ -71,7 +71,7 @@ type CassetteTests() =
                 | Ok replayer ->
                     let command = Command.create "partial-tool" |> Command.arg "x"
 
-                    match! (runner replayer).OutputString(command, CancellationToken.None) with
+                    match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
                     | Error error -> Assert.Fail $"replay failed: {error}"
                     | Ok result ->
                         Assert.That(result.Stdout, Is.EqualTo "")
@@ -101,7 +101,7 @@ type CassetteTests() =
             try
                 let recorder = RecordReplayRunner.Record(path, FixedRunner("secret-output", 0))
                 let command = Command.create "tool" |> Command.arg "x"
-                let! _ = (runner recorder).OutputString(command, CancellationToken.None)
+                let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
 
                 match recorder.Save() with
                 | Error error -> Assert.Fail $"save failed: {error}"
@@ -125,7 +125,7 @@ type CassetteTests() =
                 let recorder = RecordReplayRunner.Record(path, FixedRunner("recorded-output", 0))
                 let command = Command.create "tool" |> Command.args [ "build"; "--fast" ]
 
-                match! (runner recorder).OutputString(command, CancellationToken.None) with
+                match! (runner recorder).OutputStringAsync(command, CancellationToken.None) with
                 | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded-output")
                 | Error error -> Assert.Fail $"{error}"
 
@@ -136,7 +136,7 @@ type CassetteTests() =
                 match RecordReplayRunner.Replay path with
                 | Error error -> Assert.Fail $"replay load: {error}"
                 | Ok replayer ->
-                    match! (runner replayer).OutputString(command, CancellationToken.None) with
+                    match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
                     | Ok result ->
                         Assert.That(result.Stdout, Is.EqualTo "recorded-output")
                         Assert.That(result.Code, Is.EqualTo(Some 0))
@@ -149,7 +149,7 @@ type CassetteTests() =
             task {
                 let recorder = RecordReplayRunner.Record(path, FixedRunner("out", 0))
                 let recorded = Command.create "tool" |> Command.arg "x"
-                let! _ = (runner recorder).OutputString(recorded, CancellationToken.None)
+                let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
                 recorder.Save() |> ignore
 
                 match RecordReplayRunner.Replay path with
@@ -157,7 +157,7 @@ type CassetteTests() =
                 | Ok replayer ->
                     let unseen = Command.create "tool" |> Command.arg "y"
 
-                    match! (runner replayer).OutputString(unseen, CancellationToken.None) with
+                    match! (runner replayer).OutputStringAsync(unseen, CancellationToken.None) with
                     | Error(ProcessError.CassetteMiss "tool") -> Assert.Pass()
                     | other -> Assert.Fail $"expected CassetteMiss, got {other}"
             })
@@ -168,7 +168,7 @@ type CassetteTests() =
             task {
                 let recorder = RecordReplayRunner.Record(path, FixedRunner("with-input", 0))
                 let recorded = Command.create "tool" |> Command.stdin (Stdin.FromString "input-a")
-                let! _ = (runner recorder).OutputString(recorded, CancellationToken.None)
+                let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
                 recorder.Save() |> ignore
 
                 match RecordReplayRunner.Replay path with
@@ -177,14 +177,14 @@ type CassetteTests() =
                     // Same stdin matches.
                     let same = Command.create "tool" |> Command.stdin (Stdin.FromString "input-a")
 
-                    match! (runner replayer).OutputString(same, CancellationToken.None) with
+                    match! (runner replayer).OutputStringAsync(same, CancellationToken.None) with
                     | Ok result -> Assert.That(result.Stdout, Is.EqualTo "with-input")
                     | Error error -> Assert.Fail $"same stdin should match: {error}"
 
                     // Different stdin misses.
                     let different = Command.create "tool" |> Command.stdin (Stdin.FromString "input-b")
 
-                    match! (runner replayer).OutputString(different, CancellationToken.None) with
+                    match! (runner replayer).OutputStringAsync(different, CancellationToken.None) with
                     | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
                     | other -> Assert.Fail $"different stdin should miss, got {other}"
             })
@@ -197,7 +197,7 @@ type CassetteTests() =
                 use reader = new MemoryStream(Encoding.UTF8.GetBytes "data")
                 let command = Command.create "tool" |> Command.stdin (Stdin.FromReader reader)
 
-                match! (runner recorder).OutputString(command, CancellationToken.None) with
+                match! (runner recorder).OutputStringAsync(command, CancellationToken.None) with
                 | Error(ProcessError.Unsupported _) -> Assert.Pass()
                 | other -> Assert.Fail $"expected Unsupported for a one-shot stdin source, got {other}"
             })
@@ -212,14 +212,14 @@ type CassetteTests() =
                 do!
                     task {
                         use recorder = RecordReplayRunner.Record(path, FixedRunner("byte-output", 0))
-                        let! _ = (runner recorder).OutputString(command, CancellationToken.None)
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
                         ()
                     }
 
                 match RecordReplayRunner.Replay path with
                 | Error error -> Assert.Fail $"{error}"
                 | Ok replayer ->
-                    match! (runner replayer).OutputBytes(command, CancellationToken.None) with
+                    match! (runner replayer).OutputBytesAsync(command, CancellationToken.None) with
                     | Ok result -> Assert.That(Encoding.UTF8.GetString result.Stdout, Is.EqualTo "byte-output")
                     | Error error -> Assert.Fail $"{error}"
             })

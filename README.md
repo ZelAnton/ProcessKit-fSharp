@@ -18,7 +18,7 @@ mockable runner seam for subprocess-free tests.
 
 ```fsharp
 task {
-    match! (Command.create "dotnet" |> Command.arg "--version").Run() with
+    match! (Command.create "dotnet" |> Command.arg "--version").RunAsync() with
     | Ok version -> printfn $"{version}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -27,10 +27,10 @@ task {
 **C#**
 
 ```csharp
-Console.WriteLine((await new Command("dotnet").Arg("--version").Run()).AsRun() switch
+Console.WriteLine(await new Command("dotnet").Arg("--version").RunAsync() switch
 {
-    { IsOk: true, Value: var version } => version,
-    { IsOk: false, Error: var err }    => $"error: {err.Message}",
+    { IsOk: true, ResultValue: var version } => version,
+    { IsOk: false, ErrorValue: var err }    => $"error: {err.Message}",
 });
 ```
 
@@ -92,7 +92,7 @@ every example below is shown in both. To keep them on the usage code, the snippe
 `using` directives: assume `open ProcessKit` (plus the relevant `System` opens) inside a `task { }`
 in F#, and `using ProcessKit;` (plus the implicit `System` usings) inside an `async` method in C#.
 Every verb returns `Task<Result<_, ProcessError>>`; from C# you pattern-match it —
-`result.AsRun() switch { { IsOk: true, Value: var value } => …, { IsOk: false, Error: var err } => … }`,
+`result switch { { IsOk: true, ResultValue: var value } => …, { IsOk: false, ErrorValue: var err } => … }`,
 `result.Match(onOk, onError)`, `if (result.TryGetValue(out var value, out var error))`, or
 `result.GetValueOrThrow()` (throws `ProcessException`).
 
@@ -103,13 +103,13 @@ verb returns `Task<Result<_, ProcessError>>`:
 
 | You want | Call | You get |
 |---|---|---|
-| stdout, success required | `.Run()` | trimmed `string`; non-zero exit / timeout / kill → `Error` |
-| the full outcome, exit code as data | `.OutputString()` / `.OutputBytes()` | `ProcessResult<_>` — code, stdout, stderr, `IsTimedOut`; never errors on a non-zero exit |
-| just the exit code | `.ExitCode()` | `int` (a timed-out / killed run errors instead of inventing `-1`) |
-| a yes/no answer | `.Probe()` | `bool` — exit 0 → `true`, 1 → `false`, anything else errors |
-| a typed value from stdout | `.Parse(f)` / `.TryParse(f)` | `'T` — success required |
-| the first matching output line | `.FirstLine(p)` | `string option` — `None` when stdout closes without a match |
-| a live handle — streaming, stdin, probes | `.Start()` | `RunningProcess` |
+| stdout, success required | `.RunAsync()` | trimmed `string`; non-zero exit / timeout / kill → `Error` |
+| the full outcome, exit code as data | `.OutputStringAsync()` / `.OutputBytesAsync()` | `ProcessResult<_>` — code, stdout, stderr, `IsTimedOut`; never errors on a non-zero exit |
+| just the exit code | `.ExitCodeAsync()` | `int` (a timed-out / killed run errors instead of inventing `-1`) |
+| a yes/no answer | `.ProbeAsync()` | `bool` — exit 0 → `true`, 1 → `false`, anything else errors |
+| a typed value from stdout | `.ParseAsync(f)` / `.TryParseAsync(f)` | `'T` — success required |
+| the first matching output line | `.FirstLineAsync(p)` | `string option` — `None` when stdout closes without a match |
+| a live handle — streaming, stdin, probes | `.StartAsync()` | `RunningProcess` |
 
 The same vocabulary repeats on every layer (`IProcessRunner`, `CliClient`, `Pipeline`), and
 `Exec.run "git" [ "status" ]` / `Exec.outputString …` skip the builder for one-liners.
@@ -121,19 +121,19 @@ The same vocabulary repeats on every layer (`IProcessRunner`, `CliClient`, `Pipe
 ```fsharp
 task {
     // Capture output; a non-zero exit does not error on its own.
-    match! (Command.create "git" |> Command.args [ "rev-parse"; "HEAD" ]).OutputString() with
+    match! (Command.create "git" |> Command.args [ "rev-parse"; "HEAD" ]).OutputStringAsync() with
     | Ok result -> printfn $"HEAD is {result.Stdout.Trim()}"
     | Error err -> eprintfn $"{err.Message}"
 
     // Require success and get trimmed stdout directly.
-    match! (Command.create "dotnet" |> Command.arg "--version").Run() with
+    match! (Command.create "dotnet" |> Command.arg "--version").RunAsync() with
     | Ok version -> printfn $"{version}"
     | Error err -> eprintfn $"{err.Message}"
 
     // Feed stdin.
     let sort = Command.create "sort" |> Command.stdin (Stdin.FromString "banana\napple\n")
 
-    match! sort.OutputString() with
+    match! sort.OutputStringAsync() with
     | Ok sorted -> printfn $"{sorted.Stdout}"
     | Error err -> eprintfn $"{err.Message}"
 
@@ -142,9 +142,9 @@ task {
     match ProcessGroup.Create() with
     | Ok group ->
         use group = group
-        let! _server = group.Start(Command.create "some-server")
+        let! _server = group.StartAsync(Command.create "some-server")
         // ... work ...
-        do! group.Shutdown(TimeSpan.FromSeconds 5.0) // graceful: SIGTERM → wait → SIGKILL (Unix); atomic on Windows
+        do! group.ShutdownAsync(TimeSpan.FromSeconds 5.0) // graceful: SIGTERM → wait → SIGKILL (Unix); atomic on Windows
     | Error err -> eprintfn $"{err.Message}"
 }
 ```
@@ -153,31 +153,31 @@ task {
 
 ```csharp
 // Capture output; a non-zero exit does not error on its own.
-Console.WriteLine((await new Command("git").Args(["rev-parse", "HEAD"]).OutputString()).AsRun() switch
+Console.WriteLine(await new Command("git").Args(["rev-parse", "HEAD"]).OutputStringAsync() switch
 {
-    { IsOk: true, Value: var result } => $"HEAD is {result.Stdout.Trim()}",
-    { IsOk: false, Error: var err }   => err.Message,
+    { IsOk: true, ResultValue: var result } => $"HEAD is {result.Stdout.Trim()}",
+    { IsOk: false, ErrorValue: var err }   => err.Message,
 });
 
 // Require success and get trimmed stdout directly.
-Console.WriteLine((await new Command("dotnet").Arg("--version").Run()).AsRun() switch
+Console.WriteLine(await new Command("dotnet").Arg("--version").RunAsync() switch
 {
-    { IsOk: true, Value: var version } => version,
-    { IsOk: false, Error: var err }    => err.Message,
+    { IsOk: true, ResultValue: var version } => version,
+    { IsOk: false, ErrorValue: var err }    => err.Message,
 });
 
 // Feed stdin.
-Console.WriteLine((await new Command("sort").Stdin(Stdin.FromString("banana\napple\n")).OutputString()).AsRun() switch
+Console.WriteLine(await new Command("sort").Stdin(Stdin.FromString("banana\napple\n")).OutputStringAsync() switch
 {
-    { IsOk: true, Value: var sorted } => sorted.Stdout,
-    { IsOk: false, Error: var err }   => err.Message,
+    { IsOk: true, ResultValue: var sorted } => sorted.Stdout,
+    { IsOk: false, ErrorValue: var err }   => err.Message,
 });
 
 // Share one kill-on-dispose group across several children; disposing the group reaps the whole tree.
 using var group = ProcessGroup.Create().GetValueOrThrow();
-await group.Start(new Command("some-server"));
+await group.StartAsync(new Command("some-server"));
 // ... work ...
-await group.Shutdown(TimeSpan.FromSeconds(5)); // graceful: SIGTERM → wait → SIGKILL (Unix); atomic on Windows
+await group.ShutdownAsync(TimeSpan.FromSeconds(5)); // graceful: SIGTERM → wait → SIGKILL (Unix); atomic on Windows
 ```
 
 ## Documentation
@@ -192,7 +192,7 @@ read [Running commands](docs/commands.md) end to end:
 | [Cookbook](docs/cookbook.md) | Task → snippet recipes for everything below; the fastest way in |
 | [Running commands](docs/commands.md) | The full `Command` builder and every consuming verb, with error semantics |
 | [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
-| [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, readiness probes, `WaitAny`, profiling |
+| [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, readiness probes, `WaitAnyAsync`, profiling |
 | [Pipelines](docs/pipelines.md) | Shell-free `a → b → c`, pipefail attribution, chain timeouts |
 | [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md) | Captured vs raised deadlines, retry classifiers, `CancellationToken` |
 | [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
@@ -211,7 +211,7 @@ kill-on-dispose tree guarantee is unconditional.
 |---|---|
 | Tree control — `Signal` / `Suspend` / `Resume` / `Members` | `ProcessGroup` |
 | Resource caps — memory / process count / CPU | `ProcessGroupOptions` → `ProcessGroup.Create` |
-| Stats & profiling — `Stats` / `SampleStats` / `Profile` | `ProcessGroup`, `RunningProcess` |
+| Stats & profiling — `Stats` / `SampleStatsAsync` / `ProfileAsync` | `ProcessGroup`, `RunningProcess` |
 | Record / replay cassettes | `ProcessKit.Testing.RecordReplayRunner` |
 | Lifecycle logging (`Microsoft.Extensions.Logging`) | `Command.WithLogger` |
 | Dependency-injection wiring | `ProcessKit.Extensions.DependencyInjection` (separate package) |
@@ -234,7 +234,7 @@ task {
     match ProcessGroup.Create options with
     | Ok group ->
         use group = group
-        let! _job = group.Start(Command.create "untrusted-tool")
+        let! _job = group.StartAsync(Command.create "untrusted-tool")
         () // ... work ...
     | Error err -> eprintfn $"limits unavailable: {err.Message}" // ProcessError.ResourceLimit
 }
@@ -249,14 +249,14 @@ var options = new ProcessGroupOptions()
     .WithCpuQuota(0.5);                   // half of one core
 
 var created = ProcessGroup.Create(options);
-if (created.AsRun() is { IsOk: false, Error: var limitErr })
+if (created is { IsOk: false, ErrorValue: var limitErr })
 {
     Console.Error.WriteLine($"limits unavailable: {limitErr.Message}"); // ProcessError.ResourceLimit
     return;
 }
 
 using var group = created.GetValueOrThrow();
-await group.Start(new Command("untrusted-tool"));
+await group.StartAsync(new Command("untrusted-tool"));
 // ... work ...
 ```
 
@@ -280,7 +280,7 @@ task {
     match ProcessGroup.Create() with
     | Ok group ->
         use group = group
-        let! _server = group.Start(Command.create "my-server")
+        let! _server = group.StartAsync(Command.create "my-server")
 
         group.Signal Signal.Hup |> ignore // e.g. "reload configuration"
         group.Suspend() |> ignore         // freeze the whole tree…
@@ -293,7 +293,7 @@ task {
 
 ```csharp
 using var group = ProcessGroup.Create().GetValueOrThrow();
-await group.Start(new Command("my-server"));
+await group.StartAsync(new Command("my-server"));
 
 group.Signal(Signal.Hup); // e.g. "reload configuration"
 group.Suspend();          // freeze the whole tree…
@@ -320,8 +320,8 @@ task {
     match ProcessGroup.Create() with
     | Ok group ->
         use group = group
-        let! a = group.Start(Command.create "server-a")
-        let! b = group.Start(Command.create "server-b")
+        let! a = group.StartAsync(Command.create "server-a")
+        let! b = group.StartAsync(Command.create "server-b")
 
         match a, b with
         | Ok a, Ok b ->
@@ -329,7 +329,7 @@ task {
             | Ok pids -> printfn $"live pids: {pids}"
             | Error _ -> ()
 
-            match! RunningProcess.WaitAny [| a; b |] with
+            match! RunningProcess.WaitAnyAsync [| a; b |] with
             | Ok result -> printfn $"contender #{result.Index} exited first with {result.Outcome}"
             | Error err -> eprintfn $"{err.Message}"
         | _ -> ()
@@ -341,21 +341,21 @@ task {
 
 ```csharp
 using var group = ProcessGroup.Create().GetValueOrThrow();
-var a = (await group.Start(new Command("server-a"))).GetValueOrThrow();
-var b = (await group.Start(new Command("server-b"))).GetValueOrThrow();
+var a = (await group.StartAsync(new Command("server-a"))).GetValueOrThrow();
+var b = (await group.StartAsync(new Command("server-b"))).GetValueOrThrow();
 
-if (group.Members().AsRun() is { IsOk: true, Value: var pids })
+if (group.Members() is { IsOk: true, ResultValue: var pids })
     Console.WriteLine($"live pids: {string.Join(", ", pids)}");
 
-Console.WriteLine((await RunningProcess.WaitAny([a, b])).AsRun() switch
+Console.WriteLine(await RunningProcess.WaitAnyAsync([a, b]) switch
 {
-    { IsOk: true, Value: var first } => $"contender #{first.Index} exited first with {first.Outcome}",
-    { IsOk: false, Error: var err }  => err.Message,
+    { IsOk: true, ResultValue: var first } => $"contender #{first.Index} exited first with {first.Outcome}",
+    { IsOk: false, ErrorValue: var err }  => err.Message,
 });
 ```
 
 `Members()` lists the whole tree on Windows (Job Object) and Linux (cgroup); the POSIX
-process-group backend lists the tracked group *leaders* only. `WaitAny` applies no per-process
+process-group backend lists the tracked group *leaders* only. `WaitAnyAsync` applies no per-process
 timeout (bound the race with a `Command.Timeout`) and does no output pumping — drain chatty
 children first.
 
@@ -364,7 +364,7 @@ children first.
 
 ## Running many at once
 
-`WaitAll` joins a fixed set of started handles, returning every outcome in order;
+`WaitAllAsync` joins a fixed set of started handles, returning every outcome in order;
 `Exec.outputAll` runs a whole batch of commands with a **concurrency cap**, so fanning out
 hundreds of commands can't exhaust file descriptors or the process table:
 
@@ -392,7 +392,7 @@ var commands = Enumerable.Range(0, 200).Select(i => new Command("convert").Arg($
 var results = await Exec.outputAll(8, runner, commands, CancellationToken.None);
 
 // A failure is either an Error, or an Ok whose run was not successful.
-var failed = results.Count(r => r.AsRun() is { IsOk: false } or { IsOk: true, Value: { IsSuccess: false } });
+var failed = results.Count(r => r is { IsOk: false } or { IsOk: true, ResultValue: { IsSuccess: false } });
 Console.WriteLine($"{failed} conversions failed");
 ```
 
@@ -404,7 +404,7 @@ result captured as `byte[]`.
 
 ## Sampling stats over time
 
-A point-in-time `Stats()` becomes a series with `SampleStats`, and a single run can be profiled
+A point-in-time `Stats()` becomes a series with `SampleStatsAsync`, and a single run can be profiled
 end-to-end:
 
 **F#**
@@ -412,10 +412,10 @@ end-to-end:
 ```fsharp
 task {
     // A one-shot summary of a single run:
-    match! (Command.create "crunch").Start() with
+    match! (Command.create "crunch").StartAsync() with
     | Ok proc ->
         use _ = proc
-        let! profile = proc.Profile()
+        let! profile = proc.ProfileAsync()
         printfn $"exit={profile.ExitCode} took={profile.Duration} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -425,13 +425,13 @@ task {
 
 ```csharp
 // A one-shot summary of a single run:
-await using var proc = (await new Command("crunch").Start()).GetValueOrThrow();
-var profile = await proc.Profile();
+await using var proc = (await new Command("crunch").StartAsync()).GetValueOrThrow();
+var profile = await proc.ProfileAsync();
 Console.WriteLine($"exit={profile.ExitCode} took={profile.Duration} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}");
 ```
 
-`Stats()`/`SampleStats` report full CPU/memory on Windows and the Linux cgroup backend, and active
-counts only on the POSIX process-group fallback; `Profile` samples the started child itself.
+`Stats()`/`SampleStatsAsync` report full CPU/memory on Windows and the Linux cgroup backend, and active
+counts only on the POSIX process-group fallback; `ProfileAsync` samples the started child itself.
 
 *Deeper: [Process groups → stats](docs/process-groups.md#stats) ·
 [Streaming → profiling a run](docs/streaming.md#profiling-a-run).*
@@ -453,7 +453,7 @@ task {
             .Backoff(TimeSpan.FromMilliseconds 200.0, 2.0) // base, multiplier (cap: MaxBackoff)
             .StormPause(TimeSpan.FromSeconds 15.0)   // crash-loop guard (off by default)
 
-    match! supervisor.Run() with
+    match! supervisor.RunAsync() with
     | Ok outcome -> printfn $"ended after {outcome.Restarts} restarts: {outcome.Stopped}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -468,14 +468,14 @@ var supervisor = new Supervisor(new Command("my-server").Args(["--port", "8080"]
     .Backoff(TimeSpan.FromMilliseconds(200), 2.0) // base, multiplier (cap: MaxBackoff)
     .StormPause(TimeSpan.FromSeconds(15));         // crash-loop guard (off by default)
 
-Console.WriteLine((await supervisor.Run()).AsRun() switch
+Console.WriteLine(await supervisor.RunAsync() switch
 {
-    { IsOk: true, Value: var outcome } => $"ended after {outcome.Restarts} restarts: {outcome.Stopped}",
-    { IsOk: false, Error: var err }    => err.Message,
+    { IsOk: true, ResultValue: var outcome } => $"ended after {outcome.Restarts} restarts: {outcome.Stopped}",
+    { IsOk: false, ErrorValue: var err }    => err.Message,
 });
 ```
 
-`Run()` reports a `SupervisionOutcome` — the final run's result, the restart count, and why
+`RunAsync()` reports a `SupervisionOutcome` — the final run's result, the restart count, and why
 supervision stopped. The opt-in **failure-storm guard** distinguishes "fails rarely" from
 "crash-looping": past `FailureThreshold` the supervisor takes one collective `StormPause` instead
 of hammering restarts at backoff speed. Supervision runs through the `IProcessRunner` seam: pass
@@ -493,18 +493,18 @@ replace the arbitrary sleep:
 
 ```fsharp
 task {
-    match! (Command.create "my-server").Start() with
+    match! (Command.create "my-server").StartAsync() with
     | Ok proc ->
         use _ = proc
 
         // Wait for the startup banner (returns the matching line)…
-        match! proc.WaitForLine((fun l -> l.Contains "listening on"), TimeSpan.FromSeconds 10.0) with
+        match! proc.WaitForLineAsync((fun l -> l.Contains "listening on"), TimeSpan.FromSeconds 10.0) with
         | Ok banner -> printfn $"server says: {banner}"
         | Error err -> eprintfn $"never became ready: {err.Message}" // ProcessError.NotReady
 
         // …or for a TCP port to accept connections, or any async health check:
-        // do! proc.WaitForPort(endpoint, TimeSpan.FromSeconds 10.0)
-        // do! proc.WaitFor((fun () -> healthCheck ()), TimeSpan.FromSeconds 10.0)
+        // do! proc.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 10.0)
+        // do! proc.WaitForAsync((fun () -> healthCheck ()), TimeSpan.FromSeconds 10.0)
         ()
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -513,22 +513,22 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("my-server").Start()).GetValueOrThrow();
+await using var proc = (await new Command("my-server").StartAsync()).GetValueOrThrow();
 
 // Wait for the startup banner (returns the matching line)…
-Console.WriteLine((await proc.WaitForLine(l => l.Contains("listening on"), TimeSpan.FromSeconds(10))).AsRun() switch
+Console.WriteLine(await proc.WaitForLineAsync(l => l.Contains("listening on"), TimeSpan.FromSeconds(10)) switch
 {
-    { IsOk: true, Value: var banner } => $"server says: {banner}",
-    { IsOk: false, Error: var err }   => $"never became ready: {err.Message}", // ProcessError.NotReady
+    { IsOk: true, ResultValue: var banner } => $"server says: {banner}",
+    { IsOk: false, ErrorValue: var err }   => $"never became ready: {err.Message}", // ProcessError.NotReady
 });
 
 // …or for a TCP port to accept connections, or any async health check:
-// await proc.WaitForPort(endpoint, TimeSpan.FromSeconds(10));
-// await proc.WaitFor(() => healthCheck(), TimeSpan.FromSeconds(10));
+// await proc.WaitForPortAsync(endpoint, TimeSpan.FromSeconds(10));
+// await proc.WaitForAsync(() => healthCheck(), TimeSpan.FromSeconds(10));
 ```
 
 A probe that doesn't pass within its deadline — or that can no longer pass (the child exits; for
-`WaitForLine`, its stdout closes) — fails with `ProcessError.NotReady` (distinct from a timeout)
+`WaitForLineAsync`, its stdout closes) — fails with `ProcessError.NotReady` (distinct from a timeout)
 and **does not kill the child**: the caller decides what happens next.
 
 *Deeper: [Streaming → readiness probes](docs/streaming.md#readiness-probes).*
@@ -547,7 +547,7 @@ task {
             .Pipe(Command.create "sort")
             .Pipe(Command.create "uniq" |> Command.arg "-c")
 
-    match! pipeline.OutputString() with
+    match! pipeline.OutputStringAsync() with
     | Ok out -> printfn $"{out.Stdout}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -560,10 +560,10 @@ var pipeline = new Command("git").Args(["log", "--format=%an"])
     .Pipe(new Command("sort"))
     .Pipe(new Command("uniq").Arg("-c"));
 
-Console.WriteLine((await pipeline.OutputString()).AsRun() switch
+Console.WriteLine(await pipeline.OutputStringAsync() switch
 {
-    { IsOk: true, Value: var output } => output.Stdout,
-    { IsOk: false, Error: var err }   => err.Message,
+    { IsOk: true, ResultValue: var output } => output.Stdout,
+    { IsOk: false, ErrorValue: var err }   => err.Message,
 });
 ```
 
@@ -586,13 +586,13 @@ task {
         (Command.create "worker"
          |> Command.env "DOTNET_ENVIRONMENT" "Production"
          |> Command.envRemove "GIT_DIR")
-            .Run()
+            .RunAsync()
 
     // Scorched earth: the child starts with an empty environment.
-    let! _ = (Command.create "hermetic-tool" |> Command.envClear).Run()
+    let! _ = (Command.create "hermetic-tool" |> Command.envClear).RunAsync()
 
     // Windows: no console window flashing up from a GUI app (a harmless no-op elsewhere).
-    let! _ = (Command.create "helper" |> Command.createNoWindow).Run()
+    let! _ = (Command.create "helper" |> Command.createNoWindow).RunAsync()
     ()
 }
 ```
@@ -604,13 +604,13 @@ task {
 await new Command("worker")
     .Env("DOTNET_ENVIRONMENT", "Production")
     .EnvRemove("GIT_DIR")
-    .Run();
+    .RunAsync();
 
 // Scorched earth: the child starts with an empty environment.
-await new Command("hermetic-tool").EnvClear().Run();
+await new Command("hermetic-tool").EnvClear().RunAsync();
 
 // Windows: no console window flashing up from a GUI app (a harmless no-op elsewhere).
-await new Command("helper").CreateNoWindow().Run();
+await new Command("helper").CreateNoWindow().RunAsync();
 ```
 
 ProcessKit wires **pipes**, not a pseudo-terminal, so a tool that *demands* a tty — an `ssh` /
@@ -630,7 +630,7 @@ consuming path reports `ProcessError.Cancelled`:
 ```fsharp
 task {
     use cts = new CancellationTokenSource()
-    let job = (Command.create "long-job").Run(cts.Token)
+    let job = (Command.create "long-job").RunAsync(cts.Token)
 
     // elsewhere — a shutdown signal, a sibling failure, a UI button:
     cts.Cancel()
@@ -645,12 +645,12 @@ task {
 
 ```csharp
 using var cts = new CancellationTokenSource();
-var job = new Command("long-job").Run(cts.Token);
+var job = new Command("long-job").RunAsync(cts.Token);
 
 // elsewhere — a shutdown signal, a sibling failure, a UI button:
 cts.Cancel();
 
-if ((await job).AsRun() is { IsOk: false, Error: { IsCancelled: true } })
+if (await job is { IsOk: false, ErrorValue: { IsCancelled: true } })
     Console.WriteLine("cancelled");
 ```
 
@@ -665,22 +665,22 @@ whole lifetime with `Command.CancelOn(token)`, or set it once on a `CliClient` w
 ## Async streaming and interactive I/O
 
 The one-shot helpers above buffer the whole output. For long-running or conversational children,
-`Start()` returns a live `RunningProcess` you can drive asynchronously.
+`StartAsync()` returns a live `RunningProcess` you can drive asynchronously.
 
 ### Stream stdout line by line
 
-`StdoutLines()` is an `IAsyncEnumerable<string>` — process each line as it arrives, no waiting for
-the child to exit. From C# this is `await foreach (var line in proc.StdoutLines())`; from F#,
+`StdoutLinesAsync()` is an `IAsyncEnumerable<string>` — process each line as it arrives, no waiting for
+the child to exit. From C# this is `await foreach (var line in proc.StdoutLinesAsync())`; from F#,
 enumerate it (`open FSharp.Control` for `TaskSeq`, or use the enumerator directly):
 
 **F#**
 
 ```fsharp
 task {
-    match! (Command.create "git" |> Command.args [ "log"; "--oneline"; "-n"; "50" ]).Start() with
+    match! (Command.create "git" |> Command.args [ "log"; "--oneline"; "-n"; "50" ]).StartAsync() with
     | Ok proc ->
         use _ = proc
-        let e = proc.StdoutLines().GetAsyncEnumerator()
+        let e = proc.StdoutLinesAsync().GetAsyncEnumerator()
 
         try
             let mutable go = true
@@ -693,7 +693,7 @@ task {
             e.DisposeAsync().AsTask().Wait()
 
         // After the stream ends, collect the outcome and stderr (drained in the background).
-        match! proc.Finish() with
+        match! proc.FinishAsync() with
         | Ok finished -> if finished.Outcome <> Outcome.Exited 0 then eprintfn $"{finished.Stderr}"
         | Error err -> eprintfn $"{err.Message}"
     | Error err -> eprintfn $"{err.Message}"
@@ -703,13 +703,13 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("git").Args(["log", "--oneline", "-n", "50"]).Start()).GetValueOrThrow();
+await using var proc = (await new Command("git").Args(["log", "--oneline", "-n", "50"]).StartAsync()).GetValueOrThrow();
 
-await foreach (var line in proc.StdoutLines())
+await foreach (var line in proc.StdoutLinesAsync())
     Console.WriteLine($"commit: {line}");
 
 // After the stream ends, collect the outcome and stderr (drained in the background).
-var finished = (await proc.Finish()).GetValueOrThrow();
+var finished = (await proc.FinishAsync()).GetValueOrThrow();
 if (finished.Outcome is not { IsExited: true, Code.Value: 0 }) // anything but a clean exit 0
     Console.Error.WriteLine(finished.Stderr);
 ```
@@ -726,7 +726,7 @@ and reads:
 
 ```fsharp
 task {
-    match! (Command.create "bc" |> Command.keepStdinOpen).Start() with
+    match! (Command.create "bc" |> Command.keepStdinOpen).StartAsync() with
     | Ok proc ->
         use _ = proc
 
@@ -734,9 +734,9 @@ task {
         | Some stdin ->
             do! stdin.WriteLine "2 + 2"
             do! stdin.WriteLine "6 * 7"
-            do! stdin.Finish() // send EOF so bc finishes
+            do! stdin.FinishAsync() // send EOF so bc finishes
         | None -> ()
-        // …then read proc.StdoutLines() for the answers.
+        // …then read proc.StdoutLinesAsync() for the answers.
         ()
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -745,18 +745,18 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("bc").KeepStdinOpen().Start()).GetValueOrThrow();
+await using var proc = (await new Command("bc").KeepStdinOpen().StartAsync()).GetValueOrThrow();
 
 if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
     await stdin.WriteLine("2 + 2");
     await stdin.WriteLine("6 * 7");
-    await stdin.Finish(); // send EOF so bc finishes
+    await stdin.FinishAsync(); // send EOF so bc finishes
 }
-// …then read proc.StdoutLines() for the answers.
+// …then read proc.StdoutLinesAsync() for the answers.
 ```
 
-> For a **large** interactive stdin, write from one task and read `StdoutLines()` from another —
+> For a **large** interactive stdin, write from one task and read `StdoutLinesAsync()` from another —
 > otherwise the child can block writing stdout while you block writing stdin, a full-duplex
 > deadlock. The non-interactive `Stdin.From*` sources are written on a background task and never
 > deadlock.
@@ -777,7 +777,7 @@ task {
         (CliClient.create "git")
             .WithDefaults(fun c -> c.CurrentDir("/repo").Timeout(TimeSpan.FromSeconds 30.0))
 
-    match! git.Run [ "rev-parse"; "HEAD" ] with
+    match! git.RunAsync [ "rev-parse"; "HEAD" ] with
     | Ok sha -> printfn $"{sha}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -789,10 +789,10 @@ task {
 var git = new CliClient("git")
     .WithDefaults(c => c.CurrentDir("/repo").Timeout(TimeSpan.FromSeconds(30)));
 
-Console.WriteLine((await git.Run(["rev-parse", "HEAD"])).AsRun() switch
+Console.WriteLine(await git.RunAsync(["rev-parse", "HEAD"]) switch
 {
-    { IsOk: true, Value: var sha }  => sha,
-    { IsOk: false, Error: var err } => err.Message,
+    { IsOk: true, ResultValue: var sha }  => sha,
+    { IsOk: false, ErrorValue: var err } => err.Message,
 });
 ```
 
@@ -824,11 +824,11 @@ task {
 ```csharp
 // Record once against the real tool, then save:
 var recorder = RecordReplayRunner.Record("fixtures/git.json", new JobRunner());
-await recorder.Run(new Command("git").Arg("--version"), CancellationToken.None);
+await recorder.RunAsync(new Command("git").Arg("--version"), CancellationToken.None);
 recorder.Save();
 
 // Replay everywhere else — no subprocess, identical results:
-if (RecordReplayRunner.Replay("fixtures/git.json").AsRun() is { IsOk: true, Value: var replay })
+if (RecordReplayRunner.Replay("fixtures/git.json") is { IsOk: true, ResultValue: var replay })
 {
     // use `replay` as an IProcessRunner
 }

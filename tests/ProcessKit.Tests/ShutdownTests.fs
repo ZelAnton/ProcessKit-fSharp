@@ -45,7 +45,7 @@ type ShutdownTests() =
             // Start the run but do not await it; Shutdown must kill the still-running child.
             let capture = group.SpawnAndCapture(sleeper, CancellationToken.None)
             do! Task.Delay 300
-            do! group.Shutdown(TimeSpan.FromSeconds 1.0)
+            do! group.ShutdownAsync(TimeSpan.FromSeconds 1.0)
             let! result = capture
             stopwatch.Stop()
 
@@ -62,8 +62,8 @@ type ShutdownTests() =
         task {
             let group = createGroup ()
             // The second Shutdown and the Dispose must be no-ops, not signal a released handle/pgid.
-            do! group.Shutdown(TimeSpan.FromSeconds 1.0)
-            do! group.Shutdown(TimeSpan.FromSeconds 1.0)
+            do! group.ShutdownAsync(TimeSpan.FromSeconds 1.0)
+            do! group.ShutdownAsync(TimeSpan.FromSeconds 1.0)
             (group :> IDisposable).Dispose()
             Assert.Pass()
         }
@@ -87,7 +87,7 @@ type ShutdownTests() =
                 | Error error -> Assert.Fail $"spawn failed: {error}"
                 | Ok _ -> ()
 
-                do! group.Shutdown(TimeSpan.FromSeconds 1.0)
+                do! group.ShutdownAsync(TimeSpan.FromSeconds 1.0)
                 do! Task.Delay 4000
                 Assert.That(File.Exists marker, Is.False, "grandchild escaped the group and wrote its marker")
             finally
@@ -119,7 +119,7 @@ type ShutdownTests() =
                 // Let setsid finish establishing the new session before teardown, so we test an
                 // *established* escapee rather than racing the detach.
                 do! Task.Delay 1000
-                do! group.Shutdown(TimeSpan.FromSeconds 1.0)
+                do! group.ShutdownAsync(TimeSpan.FromSeconds 1.0)
                 do! Task.Delay 4000
 
                 Assert.That(

@@ -25,4 +25,4 @@ type ProcessStdin internal (stream: Stream) =
     member _.Flush() : Task = stream.FlushAsync()
 
     /// Close the child's stdin — the child sees end-of-file.
-    member _.Finish() : Task = stream.DisposeAsync().AsTask()
+    member _.FinishAsync() : Task = stream.DisposeAsync().AsTask()

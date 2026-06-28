@@ -5,7 +5,7 @@ open System.Runtime.CompilerServices
 open System.Threading
 
 /// Default-runner convenience verbs on `Command`, callable from F# and C# as
-/// `command.Start()` / `command.Run()` etc. They use a shared `JobRunner`; for a custom or
+/// `command.StartAsync()` / `command.RunAsync()` etc. They use a shared `JobRunner`; for a custom or
 /// injected runner, go through `Runner.*` or call the runner directly.
 [<Extension>]
 type CommandVerbs =
@@ -14,96 +14,96 @@ type CommandVerbs =
 
     /// Start the command and return a live `RunningProcess`.
     [<Extension>]
-    static member Start(command: Command) =
-        CommandVerbs.DefaultRunner.Start(command, CancellationToken.None)
+    static member StartAsync(command: Command) =
+        CommandVerbs.DefaultRunner.StartAsync(command, CancellationToken.None)
 
     /// Start the command, cancellable through `cancellationToken`.
     [<Extension>]
-    static member Start(command: Command, cancellationToken: CancellationToken) =
-        CommandVerbs.DefaultRunner.Start(command, cancellationToken)
+    static member StartAsync(command: Command, cancellationToken: CancellationToken) =
+        CommandVerbs.DefaultRunner.StartAsync(command, cancellationToken)
 
     /// Require a zero exit and return stdout, trailing whitespace trimmed.
     [<Extension>]
-    static member Run(command: Command) =
+    static member RunAsync(command: Command) =
         Runner.run CommandVerbs.DefaultRunner CancellationToken.None command
 
     /// Require a zero exit and return stdout, cancellable through `cancellationToken`.
     [<Extension>]
-    static member Run(command: Command, cancellationToken: CancellationToken) =
+    static member RunAsync(command: Command, cancellationToken: CancellationToken) =
         Runner.run CommandVerbs.DefaultRunner cancellationToken command
 
     /// Require a zero exit, discarding the captured output.
     [<Extension>]
-    static member RunUnit(command: Command) =
+    static member RunUnitAsync(command: Command) =
         Runner.runUnit CommandVerbs.DefaultRunner CancellationToken.None command
 
     /// Require a zero exit (discarding output), cancellable through `cancellationToken`.
     [<Extension>]
-    static member RunUnit(command: Command, cancellationToken: CancellationToken) =
+    static member RunUnitAsync(command: Command, cancellationToken: CancellationToken) =
         Runner.runUnit CommandVerbs.DefaultRunner cancellationToken command
 
     /// Run to completion, capturing stdout as decoded text (a non-zero exit is data).
     [<Extension>]
-    static member OutputString(command: Command) =
+    static member OutputStringAsync(command: Command) =
         Runner.outputString CommandVerbs.DefaultRunner CancellationToken.None command
 
     /// Run to completion capturing stdout as text, cancellable through `cancellationToken`.
     [<Extension>]
-    static member OutputString(command: Command, cancellationToken: CancellationToken) =
+    static member OutputStringAsync(command: Command, cancellationToken: CancellationToken) =
         Runner.outputString CommandVerbs.DefaultRunner cancellationToken command
 
     /// Run to completion, capturing stdout as raw bytes.
     [<Extension>]
-    static member OutputBytes(command: Command) =
+    static member OutputBytesAsync(command: Command) =
         Runner.outputBytes CommandVerbs.DefaultRunner CancellationToken.None command
 
     /// Run to completion capturing stdout as raw bytes, cancellable through `cancellationToken`.
     [<Extension>]
-    static member OutputBytes(command: Command, cancellationToken: CancellationToken) =
+    static member OutputBytesAsync(command: Command, cancellationToken: CancellationToken) =
         Runner.outputBytes CommandVerbs.DefaultRunner cancellationToken command
 
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel code.
     [<Extension>]
-    static member ExitCode(command: Command) =
+    static member ExitCodeAsync(command: Command) =
         Runner.exitCode CommandVerbs.DefaultRunner CancellationToken.None command
 
     /// The exit code, cancellable through `cancellationToken`.
     [<Extension>]
-    static member ExitCode(command: Command, cancellationToken: CancellationToken) =
+    static member ExitCodeAsync(command: Command, cancellationToken: CancellationToken) =
         Runner.exitCode CommandVerbs.DefaultRunner cancellationToken command
 
     /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
     [<Extension>]
-    static member Probe(command: Command) =
+    static member ProbeAsync(command: Command) =
         Runner.probe CommandVerbs.DefaultRunner CancellationToken.None command
 
     /// Read the exit code as a yes/no answer, cancellable through `cancellationToken`.
     [<Extension>]
-    static member Probe(command: Command, cancellationToken: CancellationToken) =
+    static member ProbeAsync(command: Command, cancellationToken: CancellationToken) =
         Runner.probe CommandVerbs.DefaultRunner cancellationToken command
 
     /// Require a zero/accepted exit and parse the trimmed stdout into a `'T`; a thrown parser error
     /// becomes `ProcessError.Parse`.
     [<Extension>]
-    static member Parse(command: Command, parser: Func<string, 'T>) =
+    static member ParseAsync(command: Command, parser: Func<string, 'T>) =
         ArgumentNullException.ThrowIfNull parser
         Runner.parse CommandVerbs.DefaultRunner CancellationToken.None parser.Invoke command
 
     /// `Parse`, cancellable through `cancellationToken`.
     [<Extension>]
-    static member Parse(command: Command, parser: Func<string, 'T>, cancellationToken: CancellationToken) =
+    static member ParseAsync(command: Command, parser: Func<string, 'T>, cancellationToken: CancellationToken) =
         ArgumentNullException.ThrowIfNull parser
         Runner.parse CommandVerbs.DefaultRunner cancellationToken parser.Invoke command
 
     /// Like `Parse`, but the parser returns its own `Result` (its error becomes `Parse`).
     [<Extension>]
-    static member TryParse(command: Command, parser: Func<string, Result<'T, string>>) =
+    static member TryParseAsync(command: Command, parser: Func<string, Result<'T, string>>) =
         ArgumentNullException.ThrowIfNull parser
         Runner.tryParse CommandVerbs.DefaultRunner CancellationToken.None parser.Invoke command
 
     /// `TryParse`, cancellable through `cancellationToken`.
     [<Extension>]
-    static member TryParse
+    static member TryParseAsync
         (command: Command, parser: Func<string, Result<'T, string>>, cancellationToken: CancellationToken)
         =
         ArgumentNullException.ThrowIfNull parser
@@ -111,12 +111,14 @@ type CommandVerbs =
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     [<Extension>]
-    static member FirstLine(command: Command, predicate: Func<string, bool>) =
+    static member FirstLineAsync(command: Command, predicate: Func<string, bool>) =
         ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine CommandVerbs.DefaultRunner CancellationToken.None predicate.Invoke command
 
     /// `FirstLine`, cancellable through `cancellationToken`.
     [<Extension>]
-    static member FirstLine(command: Command, predicate: Func<string, bool>, cancellationToken: CancellationToken) =
+    static member FirstLineAsync
+        (command: Command, predicate: Func<string, bool>, cancellationToken: CancellationToken)
+        =
         ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine CommandVerbs.DefaultRunner cancellationToken predicate.Invoke command

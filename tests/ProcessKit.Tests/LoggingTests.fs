@@ -27,15 +27,15 @@ type private CapturingLogger() =
 /// A runner that always reports a crash — to drive a supervisor restart deterministically.
 type private AlwaysCrash() =
     interface IProcessRunner with
-        member _.OutputString(command, _cancellationToken) =
+        member _.OutputStringAsync(command, _cancellationToken) =
             Task.FromResult(
                 Ok(ProcessResult<string>(command.Program, "", "boom", Outcome.Exited 1, TimeSpan.Zero, false, [ 0 ]))
             )
 
-        member _.OutputBytes(_command, _cancellationToken) =
+        member _.OutputBytesAsync(_command, _cancellationToken) =
             failwith "AlwaysCrash has no OutputBytes"
 
-        member _.Start(_command, _cancellationToken) = failwith "AlwaysCrash has no Start"
+        member _.StartAsync(_command, _cancellationToken) = failwith "AlwaysCrash has no Start"
 
 [<TestFixture>]
 type LoggingTests() =
@@ -54,7 +54,7 @@ type LoggingTests() =
             let logger = CapturingLogger()
             let command = shell "echo logged" |> Command.withLogger logger
 
-            match! command.Run() with
+            match! command.RunAsync() with
             | Ok _ ->
                 Assert.That(logger.Text, Does.Contain "spawned")
                 Assert.That(logger.Text, Does.Contain "finished")
@@ -78,7 +78,7 @@ type LoggingTests() =
                 |> Command.timeout (TimeSpan.FromMilliseconds 300.0)
                 |> Command.withLogger logger
 
-            let! _ = command.OutputString()
+            let! _ = command.OutputStringAsync()
             Assert.That(logger.Text, Does.Contain "timed out")
         }
         :> Task
@@ -93,7 +93,7 @@ type LoggingTests() =
                 |> Command.args [ (if isWindows then "/c" else "-c"); "echo ok"; "--token=SUPERSECRET" ]
                 |> Command.withLogger logger
 
-            let! _ = command.OutputString()
+            let! _ = command.OutputStringAsync()
             Assert.That(logger.Text, Does.Not.Contain "SUPERSECRET")
             // ...but the lifecycle events that do not carry argv are present.
             Assert.That(logger.Text, Does.Contain "spawned")
@@ -112,7 +112,7 @@ type LoggingTests() =
                     .Backoff(TimeSpan.Zero, 1.0)
                     .Jitter(false)
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok _ -> Assert.That(logger.Text, Does.Contain "restarting")
             | Error error -> Assert.Fail $"{error}"
         }

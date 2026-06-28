@@ -11,40 +11,40 @@ open System
 type ProcessError =
 
     /// The process could not be spawned (a failure before or during launch).
-    | Spawn of program: string * message: string
+    | Spawn of Program: string * message: string
 
     /// The program could not be found. `searched` is the search path that was probed, when known.
-    | NotFound of program: string * searched: string option
+    | NotFound of Program: string * Searched: string option
 
     /// A success-requiring verb (`run`) observed a non-zero exit code.
-    | Exit of program: string * code: int * stdout: string * stderr: string
+    | Exit of Program: string * Code: int * Stdout: string * Stderr: string
 
     /// The process was terminated by a signal (Unix) or otherwise killed without a code.
-    | Signalled of program: string * signal: int option * stdout: string * stderr: string
+    | Signalled of Program: string * Signal: int option * Stdout: string * Stderr: string
 
     /// The run exceeded its configured timeout.
-    | Timeout of program: string * timeout: TimeSpan * stdout: string * stderr: string
+    | Timeout of Program: string * Timeout: TimeSpan * Stdout: string * Stderr: string
 
     /// The run was cancelled through its `CancellationToken`. A cancellation is always an error.
-    | Cancelled of program: string
+    | Cancelled of Program: string
 
     /// A readiness probe (`WaitForLine` / `WaitForPort` / `WaitFor`) did not succeed within its timeout.
-    | NotReady of program: string * timeout: TimeSpan
+    | NotReady of Program: string * Timeout: TimeSpan
 
     /// Parsing the captured output into a typed value failed.
-    | Parse of program: string * message: string
+    | Parse of Program: string * message: string
 
     /// Captured line output exceeded the configured `OutputBufferPolicy` ceiling
     /// (`OverflowMode.Error`). Carries the configured caps and the cumulative totals seen.
     | OutputTooLarge of
-        program: string *
-        lineLimit: int option *
-        byteLimit: int option *
-        totalLines: int *
-        totalBytes: int
+        Program: string *
+        LineLimit: int option *
+        ByteLimit: int option *
+        TotalLines: int *
+        TotalBytes: int
 
     /// Writing to the child's standard input failed.
-    | Stdin of program: string * message: string
+    | Stdin of Program: string * message: string
 
     /// A `ResourceLimits` cap was requested but could not be enforced — the platform has no
     /// whole-tree limit primitive (macOS / the Linux process-group fallback), or the Linux cgroup v2
@@ -52,13 +52,13 @@ type ProcessError =
     | ResourceLimit of message: string
 
     /// A `RecordReplayRunner` in replay mode found no recorded entry matching the invocation.
-    | CassetteMiss of program: string
+    | CassetteMiss of Program: string
 
     /// An underlying I/O failure not attributable to a specific exit.
     | Io of message: string
 
     /// The requested operation is unsupported on this platform or in this configuration.
-    | Unsupported of operation: string
+    | Unsupported of Operation: string
 
     /// A short, human-readable description for logs and diagnostics.
     member this.Message =

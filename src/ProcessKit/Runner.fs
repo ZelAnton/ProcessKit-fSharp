@@ -69,11 +69,11 @@ module Runner =
 
     /// Run to completion, capturing stdout as decoded text. A non-zero exit is data, not an error.
     let outputString (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
-        withRetry command cancellationToken (fun () -> runner.OutputString(command, cancellationToken))
+        withRetry command cancellationToken (fun () -> runner.OutputStringAsync(command, cancellationToken))
 
     /// Run to completion, capturing stdout as raw bytes.
     let outputBytes (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
-        withRetry command cancellationToken (fun () -> runner.OutputBytes(command, cancellationToken))
+        withRetry command cancellationToken (fun () -> runner.OutputBytesAsync(command, cancellationToken))
 
     /// Require a zero exit and return stdout with trailing whitespace trimmed.
     let run
@@ -83,7 +83,7 @@ module Runner =
         : Task<Result<string, ProcessError>> =
         withRetry command cancellationToken (fun () ->
             task {
-                match! runner.OutputString(command, cancellationToken) with
+                match! runner.OutputStringAsync(command, cancellationToken) with
                 | Error error -> return Error error
                 | Ok result ->
                     match ProcessResult.ensureSuccess result with
@@ -111,7 +111,7 @@ module Runner =
         : Task<Result<int, ProcessError>> =
         withRetry command cancellationToken (fun () ->
             task {
-                match! runner.OutputString(command, cancellationToken) with
+                match! runner.OutputStringAsync(command, cancellationToken) with
                 | Error error -> return Error error
                 | Ok result -> return ProcessResult.exitCode result
             })
@@ -124,14 +124,14 @@ module Runner =
         : Task<Result<bool, ProcessError>> =
         withRetry command cancellationToken (fun () ->
             task {
-                match! runner.OutputString(command, cancellationToken) with
+                match! runner.OutputStringAsync(command, cancellationToken) with
                 | Error error -> return Error error
                 | Ok result -> return ProcessResult.probe result
             })
 
     /// Start the command and return a live `RunningProcess` for streaming and interactive I/O.
     let start (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
-        runner.Start(command, cancellationToken)
+        runner.StartAsync(command, cancellationToken)
 
     /// Require a zero exit and parse the trimmed stdout into a `'T`; a thrown parser error
     /// becomes `ProcessError.Parse`.
@@ -177,7 +177,7 @@ module Runner =
         task {
             // Honour the command's `CancelOn` alongside the verb token: `firstLine` is a completion verb
             // (it runs the child to its first matching line, then reaps it), so dropping `CancelOn` here
-            // would be a silent downgrade of `command.CancelOn(tok).FirstLine(pred)`.
+            // would be a silent downgrade of `command.CancelOn(tok).FirstLineAsync(pred)`.
             use linkedCts =
                 match command.Config.CancelOn with
                 | Some extra -> CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, extra)
@@ -185,7 +185,7 @@ module Runner =
 
             let effectiveToken = linkedCts.Token
 
-            match! runner.Start(command, effectiveToken) with
+            match! runner.StartAsync(command, effectiveToken) with
             | Error error -> return Error error
             | Ok running ->
                 // `use` reaps the process tree on every exit path (match below / a throwing
@@ -195,7 +195,7 @@ module Runner =
 
                 try
                     let mutable found = None
-                    use enumerator = running.StdoutLines().GetAsyncEnumerator(effectiveToken)
+                    use enumerator = running.StdoutLinesAsync().GetAsyncEnumerator(effectiveToken)
                     let mutable more = true
 
                     while more do
@@ -208,7 +208,7 @@ module Runner =
                             more <- false
 
                     running.StartKill()
-                    let! _ = running.Finish()
+                    let! _ = running.FinishAsync()
                     return Ok found
                 with :? System.OperationCanceledException ->
                     // Faithful to the contract: a cancelled run is always an error, not a raised

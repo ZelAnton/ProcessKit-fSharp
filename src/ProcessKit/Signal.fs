@@ -40,4 +40,4 @@ type Signal =
     /// A raw signal number, passed through verbatim (Unix only). It must be a valid signal; it
     /// lands in the *signal* argument of `kill(pid, sig)` (never the pid/target), so an
     /// out-of-range value simply fails the send — it cannot retarget the signal.
-    | Other of signalNumber: int
+    | Other of SignalNumber: int

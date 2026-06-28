@@ -26,15 +26,15 @@ type IProcessRunner =
 // One interface, three methods — each takes a CancellationToken:
 public interface IProcessRunner
 {
-    Task<FSharpResult<ProcessResult<string>, ProcessError>> OutputString(Command command, CancellationToken cancellationToken);
-    Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> OutputBytes(Command command, CancellationToken cancellationToken);
-    Task<FSharpResult<RunningProcess, ProcessError>> Start(Command command, CancellationToken cancellationToken);
+    Task<FSharpResult<ProcessResult<string>, ProcessError>> OutputStringAsync(Command command, CancellationToken cancellationToken);
+    Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> OutputBytesAsync(Command command, CancellationToken cancellationToken);
+    Task<FSharpResult<RunningProcess, ProcessError>> StartAsync(Command command, CancellationToken cancellationToken);
 }
 ```
 
 Unlike some interfaces, none of the three is defaulted: a hand-rolled
 `IProcessRunner` implements all three (the doubles that ship with ProcessKit do
-this for you). `OutputString` and `OutputBytes` are the bulk verbs; `Start`
+this for you). `OutputStringAsync` and `OutputBytesAsync` are the bulk verbs; `StartAsync`
 returns a live handle for streaming and probes.
 
 - [The `IProcessRunner` seam](#the-iprocessrunner-seam)
@@ -58,21 +58,21 @@ gives every runner the full verb vocabulary, each verb taking
 
 | Verb | Returns | Routes through |
 |---|---|---|
-| `Runner.run` | trimmed `string`, success required | `OutputString` |
-| `Runner.runUnit` | `unit`, success required | `OutputString` |
-| `Runner.outputString` | `ProcessResult<string>` (exit code is data) | `OutputString` |
-| `Runner.outputBytes` | `ProcessResult<byte[]>` | `OutputBytes` |
-| `Runner.exitCode` | `int` | `OutputString` |
-| `Runner.probe` | `bool` (exit 0 → `true`, 1 → `false`) | `OutputString` |
-| `Runner.parse runner ct parser command` | `'T`, success required | `OutputString` |
-| `Runner.tryParse runner ct parser command` | `'T` (parser may fail) | `OutputString` |
-| `Runner.firstLine runner ct predicate command` | `string option` | `Start` |
-| `Runner.start` | `RunningProcess` | `Start` |
+| `Runner.run` | trimmed `string`, success required | `OutputStringAsync` |
+| `Runner.runUnit` | `unit`, success required | `OutputStringAsync` |
+| `Runner.outputString` | `ProcessResult<string>` (exit code is data) | `OutputStringAsync` |
+| `Runner.outputBytes` | `ProcessResult<byte[]>` | `OutputBytesAsync` |
+| `Runner.exitCode` | `int` | `OutputStringAsync` |
+| `Runner.probe` | `bool` (exit 0 → `true`, 1 → `false`) | `OutputStringAsync` |
+| `Runner.parse runner ct parser command` | `'T`, success required | `OutputStringAsync` |
+| `Runner.tryParse runner ct parser command` | `'T` (parser may fail) | `OutputStringAsync` |
+| `Runner.firstLine runner ct predicate command` | `string option` | `StartAsync` |
+| `Runner.start` | `RunningProcess` | `StartAsync` |
 
-Everything in the first eight rows reaches a child only through `OutputString`
-(or `OutputBytes`), so it runs hermetically against the subprocess-free doubles
+Everything in the first eight rows reaches a child only through `OutputStringAsync`
+(or `OutputBytesAsync`), so it runs hermetically against the subprocess-free doubles
 below. The last two — `firstLine` and `start` — need a live handle and go through
-`Start`; see [what the doubles don't cover](#what-the-doubles-dont-cover).
+`StartAsync`; see [what the doubles don't cover](#what-the-doubles-dont-cover).
 
 Production code, generic over the runner:
 
@@ -89,7 +89,7 @@ let head (runner: IProcessRunner) (ct: CancellationToken) =
 ```csharp
 /// HEAD's commit id, run through whatever runner the caller injects.
 Task<FSharpResult<string, ProcessError>> Head(IProcessRunner runner, CancellationToken ct) =>
-    runner.Run(new Command("git").Args(["rev-parse", "HEAD"]), ct);
+    runner.RunAsync(new Command("git").Args(["rev-parse", "HEAD"]), ct);
 ```
 
 In production you pass `JobRunner()`; in a test you pass a double and no process
@@ -184,10 +184,10 @@ public class GitTests
         var runner = new ScriptedRunner()
             .On(["git", "rev-parse", "HEAD"], Reply.Ok("abc123\n"));
 
-        switch ((await Head(runner, CancellationToken.None)).AsRun())
+        switch (await Head(runner, CancellationToken.None))
         {
-            case { IsOk: true, Value: var sha }:  Assert.That(sha, Is.EqualTo("abc123")); break;
-            case { IsOk: false, Error: var err }: Assert.Fail(err.Message); break;
+            case { IsOk: true, ResultValue: var sha }:  Assert.That(sha, Is.EqualTo("abc123")); break;
+            case { IsOk: false, ErrorValue: var err }: Assert.Fail(err.Message); break;
         }
     }
 }
@@ -225,13 +225,13 @@ var runner = new ScriptedRunner().Fallback(Reply.Fail(2, "boom"));
 var grep = new Command("grep").Args(["needle", "file"]);
 
 // Success-requiring verb: the non-zero exit surfaces as an error.
-if ((await runner.Run(grep)).AsRun() is { IsOk: false, Error: { IsExit: true } }) { } // program="grep", code=2, stderr="boom"
+if (await runner.RunAsync(grep) is { IsOk: false, ErrorValue: { IsExit: true } }) { } // program="grep", code=2, stderr="boom"
 
 // Honest-result verb: the non-zero exit is data.
-switch ((await runner.OutputString(grep)).AsRun())
+switch (await runner.OutputStringAsync(grep))
 {
-    case { IsOk: true, Value: var output }: Assert.That(output.IsSuccess, Is.False); break;
-    case { IsOk: false, Error: var err }:   Assert.Fail(err.Message); break;
+    case { IsOk: true, ResultValue: var output }: Assert.That(output.IsSuccess, Is.False); break;
+    case { IsOk: false, ErrorValue: var err }:   Assert.Fail(err.Message); break;
 }
 ```
 
@@ -239,7 +239,7 @@ switch ((await runner.OutputString(grep)).AsRun())
 
 `IProcessRunner` is a plain interface, so **any** .NET mocking framework (Moq,
 NSubstitute, FakeItEasy) can stand in for it — handy when the *interaction* is
-what you want to assert (was `Start` called? with which command?) or when you
+what you want to assert (was `StartAsync` called? with which command?) or when you
 want to return specific `Error` outcomes. The error cases are easy: every
 `ProcessError` case has a public constructor, so a double can return
 `Error(ProcessError.NotFound("git", None))`, `Error(ProcessError.Io "...")`, and
@@ -260,18 +260,18 @@ let failOnce (inner: IProcessRunner) : IProcessRunner =
     let mutable calls = 0
 
     { new IProcessRunner with
-        member _.OutputString(command, ct) =
+        member _.OutputStringAsync(command, ct) =
             task {
                 calls <- calls + 1
 
                 if calls = 1 then
                     return Error(ProcessError.Io "transient blip") // ProcessError.isTransient -> true
                 else
-                    return! inner.OutputString(command, ct)
+                    return! inner.OutputStringAsync(command, ct)
             }
 
-        member _.OutputBytes(command, ct) = inner.OutputBytes(command, ct)
-        member _.Start(command, ct) = inner.Start(command, ct) }
+        member _.OutputBytesAsync(command, ct) = inner.OutputBytesAsync(command, ct)
+        member _.StartAsync(command, ct) = inner.StartAsync(command, ct) }
 ```
 
 **C#**
@@ -281,36 +281,36 @@ public sealed class FailOnce(IProcessRunner inner) : IProcessRunner
 {
     private int calls;
 
-    public Task<FSharpResult<ProcessResult<string>, ProcessError>> OutputString(Command command, CancellationToken ct) =>
+    public Task<FSharpResult<ProcessResult<string>, ProcessError>> OutputStringAsync(Command command, CancellationToken ct) =>
         ++calls == 1
             ? Task.FromResult(
                 FSharpResult<ProcessResult<string>, ProcessError>.NewError(ProcessError.NewIo("transient blip"))) // ProcessError.isTransient -> true
-            : inner.OutputString(command, ct);
+            : inner.OutputStringAsync(command, ct);
 
-    public Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> OutputBytes(Command command, CancellationToken ct) =>
-        inner.OutputBytes(command, ct);
+    public Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> OutputBytesAsync(Command command, CancellationToken ct) =>
+        inner.OutputBytesAsync(command, ct);
 
-    public Task<FSharpResult<RunningProcess, ProcessError>> Start(Command command, CancellationToken ct) =>
-        inner.Start(command, ct);
+    public Task<FSharpResult<RunningProcess, ProcessError>> StartAsync(Command command, CancellationToken ct) =>
+        inner.StartAsync(command, ct);
 }
 ```
 
 Wrap a `ScriptedRunner` with it and drive a retrying verb to prove the retry
-fires. If a double is bulk-only and you want `Start` to be a hard error, return
-`Error(ProcessError.Unsupported "no streaming in this double")` from `Start` —
+fires. If a double is bulk-only and you want `StartAsync` to be a hard error, return
+`Error(ProcessError.Unsupported "no streaming in this double")` from `StartAsync` —
 exactly what the shipped doubles do.
 
 ## What the doubles don't cover
 
 The subprocess-free doubles serve the **bulk** verbs only. `ScriptedRunner` and
-[`RecordReplayRunner`](#record-and-replay) both implement `OutputString` /
-`OutputBytes` and return `Error(ProcessError.Unsupported …)` from `Start`.
+[`RecordReplayRunner`](#record-and-replay) both implement `OutputStringAsync` /
+`OutputBytesAsync` and return `Error(ProcessError.Unsupported …)` from `StartAsync`.
 Because `Runner.start` and `Runner.firstLine` (and the matching `Command`
-verbs) route through `Start`, they are not served by these doubles — nor is the
-live [`RunningProcess`](streaming.md) surface (`StdoutLines`, `WaitForLine`,
-`WaitForPort`, `TakeStdin`, `Profile`) or a [`Pipeline`](pipelines.md). Test
+verbs) route through `StartAsync`, they are not served by these doubles — nor is the
+live [`RunningProcess`](streaming.md) surface (`StdoutLinesAsync`, `WaitForLineAsync`,
+`WaitForPortAsync`, `TakeStdin`, `ProfileAsync`) or a [`Pipeline`](pipelines.md). Test
 those paths against a real (possibly trivial) child process, then keep the
-scripted/cassette doubles for everything that flows through `OutputString`.
+scripted/cassette doubles for everything that flows through `OutputStringAsync`.
 
 ## Record and replay
 
@@ -342,18 +342,18 @@ task {
 ```csharp
 // Record once against the real tool (wraps a real runner), then save:
 var recorder = RecordReplayRunner.Record("fixtures/git.json", new JobRunner());
-await recorder.Run(new Command("git").Arg("--version"), CancellationToken.None);
+await recorder.RunAsync(new Command("git").Arg("--version"), CancellationToken.None);
 recorder.Save(); // Result<unit, ProcessError> — surfaces write errors
 
 // Replay everywhere else — no subprocess, identical results:
 var replayResult = RecordReplayRunner.Replay("fixtures/git.json");
-if (replayResult.AsRun() is { IsOk: true, Value: var replay })
+if (replayResult is { IsOk: true, ResultValue: var replay })
 {
     // the recorded stdout, replayed
-    if ((await replay.Run(new Command("git").Arg("--version"), CancellationToken.None)).AsRun() is { IsOk: false, Error: var err })
+    if (await replay.RunAsync(new Command("git").Arg("--version"), CancellationToken.None) is { IsOk: false, ErrorValue: var err })
         Console.Error.WriteLine(err.Message);
 }
-else if (replayResult.AsRun() is { IsOk: false, Error: var loadErr })
+else if (replayResult is { IsOk: false, ErrorValue: var loadErr })
     Console.Error.WriteLine(loadErr.Message);
 ```
 
@@ -371,8 +371,8 @@ Semantics worth knowing before you commit a cassette:
 | Environment | override **values never reach the file** — only the variable names are stored, so env secrets can't leak, and env is not part of the match key |
 | Miss | an unmatched call is `ProcessError.CassetteMiss` (distinct from a missing program) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded before/after sequence replays faithfully, while retry/probe loops keep getting a stable final answer |
-| Bytes | `OutputBytes` replays by round-tripping the recorded stdout through UTF-8 |
-| `Start` | unsupported — replay serves the bulk verbs only (see [above](#what-the-doubles-dont-cover)) |
+| Bytes | `OutputBytesAsync` replays by round-tripping the recorded stdout through UTF-8 |
+| `StartAsync` | unsupported — replay serves the bulk verbs only (see [above](#what-the-doubles-dont-cover)) |
 | Err results | not recorded — only completed runs (a non-zero exit and a captured timeout *are* results and are recorded) |
 | One-shot stdin | `Stdin.FromReader` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
 | Format | a versioned JSON envelope — `{ "Version", "Entries" }`; a cassette whose format version this build doesn't understand is rejected on load, and a partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
@@ -407,8 +407,8 @@ each call returning a new client:
   default `JobRunner` (this is the test seam)
 
 `.Command(args)` builds a configured `Command` without running it (the template's
-defaults applied), and `.Run(args)` / `.OutputString(args)` / `.OutputBytes(args)`
-(plus `ExitCode`/`Probe`/`Parse`/…) build and run through the client's runner:
+defaults applied), and `.RunAsync(args)` / `.OutputStringAsync(args)` / `.OutputBytesAsync(args)`
+(plus `ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/…) build and run through the client's runner:
 
 **F#**
 
@@ -418,11 +418,11 @@ type Git(client: CliClient) =
 
     /// HEAD's commit id (trimmed stdout, success required).
     member _.Head(repo: string) =
-        client.Run [ "-C"; repo; "rev-parse"; "HEAD" ]
+        client.RunAsync [ "-C"; repo; "rev-parse"; "HEAD" ]
 
     /// Is the work tree clean? The exit code *is* the answer, so probe it.
     member _.IsClean(repo: string) =
-        client.Probe [ "-C"; repo; "diff"; "--quiet" ]
+        client.ProbeAsync [ "-C"; repo; "diff"; "--quiet" ]
 ```
 
 **C#**
@@ -433,11 +433,11 @@ public class Git(CliClient client)
 {
     /// HEAD's commit id (trimmed stdout, success required).
     public Task<FSharpResult<string, ProcessError>> Head(string repo) =>
-        client.Run(["-C", repo, "rev-parse", "HEAD"]);
+        client.RunAsync(["-C", repo, "rev-parse", "HEAD"]);
 
     /// Is the work tree clean? The exit code *is* the answer, so probe it.
     public Task<FSharpResult<bool, ProcessError>> IsClean(string repo) =>
-        client.Probe(["-C", repo, "diff", "--quiet"]);
+        client.ProbeAsync(["-C", repo, "diff", "--quiet"]);
 }
 ```
 
@@ -492,10 +492,10 @@ public class GitWrapperTests
 
         var git = new Git(new CliClient("git").WithRunner(scripted));
 
-        switch ((await git.Head("/repo")).AsRun())
+        switch (await git.Head("/repo"))
         {
-            case { IsOk: true, Value: var sha }:  Assert.That(sha, Is.EqualTo("abc123")); break;
-            case { IsOk: false, Error: var err }: Assert.Fail(err.Message); break;
+            case { IsOk: true, ResultValue: var sha }:  Assert.That(sha, Is.EqualTo("abc123")); break;
+            case { IsOk: false, ErrorValue: var err }: Assert.Fail(err.Message); break;
         }
     }
 }
@@ -531,7 +531,7 @@ services.AddProcessKit();
 public class Deployer(IProcessRunner runner)
 {
     public Task<FSharpResult<string, ProcessError>> Deploy() =>
-        runner.Run(new Command("deploy"), CancellationToken.None);
+        runner.RunAsync(new Command("deploy"), CancellationToken.None);
 }
 ```
 

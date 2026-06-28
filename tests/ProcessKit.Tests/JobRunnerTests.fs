@@ -96,7 +96,7 @@ type JobRunnerTests() =
             use cts = new CancellationTokenSource()
             cts.Cancel()
 
-            match! runner.Start(shell "echo hi", cts.Token) with
+            match! runner.StartAsync(shell "echo hi", cts.Token) with
             | Error(ProcessError.Cancelled _) -> ()
             | Error other -> Assert.Fail $"expected Cancelled, got {other}"
             | Ok running ->

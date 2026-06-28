@@ -283,7 +283,7 @@ type Supervisor internal (config: SupervisorConfig) =
     /// spawn failure with restarts remaining counts as a crash and is retried. An incarnation
     /// cancelled via its token is terminal: supervision returns that `Cancelled` immediately,
     /// regardless of policy or budget.
-    member _.Run(cancellationToken: CancellationToken) : Task<Result<SupervisionOutcome, ProcessError>> =
+    member _.RunAsync(cancellationToken: CancellationToken) : Task<Result<SupervisionOutcome, ProcessError>> =
         let factor =
             if Double.IsFinite config.BackoffFactor then
                 max config.BackoffFactor 1.0
@@ -351,7 +351,7 @@ type Supervisor internal (config: SupervisorConfig) =
                 if cancellationToken.IsCancellationRequested then
                     final <- Some(Error(ProcessError.Cancelled program))
                 else
-                    match! config.Runner.OutputString(command, cancellationToken) with
+                    match! config.Runner.OutputStringAsync(command, cancellationToken) with
                     | Ok result ->
                         let predicateMatched =
                             match config.StopWhen with
@@ -419,7 +419,7 @@ type Supervisor internal (config: SupervisorConfig) =
         }
 
     /// `Run` against `CancellationToken.None`.
-    member this.Run() = this.Run CancellationToken.None
+    member this.RunAsync() = this.RunAsync CancellationToken.None
 
 /// Pipe-friendly entry points for `Supervisor`.
 [<RequireQualifiedAccess>]
@@ -428,4 +428,4 @@ module Supervisor =
     /// Supervise `command` with the default `JobRunner`.
     let create (command: Command) = Supervisor(command)
 
-// `Run` is an instance method on `Supervisor` — call `supervisor.Run()` directly.
+// `Run` is an instance method on `Supervisor` — call `supervisor.RunAsync()` directly.

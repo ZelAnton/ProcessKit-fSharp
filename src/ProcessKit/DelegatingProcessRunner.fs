@@ -18,30 +18,32 @@ type DelegatingProcessRunner(inner: IProcessRunner) =
 
     /// Run to completion, capturing stdout as decoded text. Override to intercept; the default
     /// forwards to the wrapped runner.
-    abstract member OutputString:
+    abstract member OutputStringAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<ProcessResult<string>, ProcessError>>
 
-    default _.OutputString(command, cancellationToken) =
-        inner.OutputString(command, cancellationToken)
+    default _.OutputStringAsync(command, cancellationToken) =
+        inner.OutputStringAsync(command, cancellationToken)
 
     /// Run to completion, capturing stdout as raw bytes. Override to intercept; the default forwards.
-    abstract member OutputBytes:
+    abstract member OutputBytesAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<ProcessResult<byte[]>, ProcessError>>
 
-    default _.OutputBytes(command, cancellationToken) =
-        inner.OutputBytes(command, cancellationToken)
+    default _.OutputBytesAsync(command, cancellationToken) =
+        inner.OutputBytesAsync(command, cancellationToken)
 
     /// Start the command and return a live handle. Override to intercept; the default forwards.
-    abstract member Start:
+    abstract member StartAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<RunningProcess, ProcessError>>
 
-    default _.Start(command, cancellationToken) = inner.Start(command, cancellationToken)
+    default _.StartAsync(command, cancellationToken) =
+        inner.StartAsync(command, cancellationToken)
 
     interface IProcessRunner with
-        member this.OutputString(command, cancellationToken) =
-            this.OutputString(command, cancellationToken)
+        member this.OutputStringAsync(command, cancellationToken) =
+            this.OutputStringAsync(command, cancellationToken)
 
-        member this.OutputBytes(command, cancellationToken) =
-            this.OutputBytes(command, cancellationToken)
+        member this.OutputBytesAsync(command, cancellationToken) =
+            this.OutputBytesAsync(command, cancellationToken)
 
-        member this.Start(command, cancellationToken) = this.Start(command, cancellationToken)
+        member this.StartAsync(command, cancellationToken) =
+            this.StartAsync(command, cancellationToken)

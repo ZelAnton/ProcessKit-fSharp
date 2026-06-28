@@ -90,14 +90,14 @@ type RunnerTests() =
 
             let cancelling =
                 { new IProcessRunner with
-                    member _.OutputString(command, _) =
+                    member _.OutputStringAsync(command, _) =
                         calls <- calls + 1
                         Task.FromResult(Error(ProcessError.Cancelled command.Program))
 
-                    member _.OutputBytes(command, _) =
+                    member _.OutputBytesAsync(command, _) =
                         Task.FromResult(Error(ProcessError.Cancelled command.Program))
 
-                    member _.Start(command, _) =
+                    member _.StartAsync(command, _) =
                         Task.FromResult(Error(ProcessError.Cancelled command.Program)) }
 
             // A retry policy that would re-run on ANY error, to prove the Cancelled short-circuit wins

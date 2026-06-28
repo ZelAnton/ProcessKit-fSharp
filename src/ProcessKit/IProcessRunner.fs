@@ -13,13 +13,13 @@ type IProcessRunner =
 
     /// Run to completion, capturing stdout as decoded text. A non-zero exit is reported in
     /// the `ProcessResult`, not raised as an error.
-    abstract member OutputString:
+    abstract member OutputStringAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<ProcessResult<string>, ProcessError>>
 
     /// Run to completion, capturing stdout as raw bytes.
-    abstract member OutputBytes:
+    abstract member OutputBytesAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<ProcessResult<byte[]>, ProcessError>>
 
     /// Start the command and return a live handle for streaming, interactive stdin, and waiting.
-    abstract member Start:
+    abstract member StartAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<RunningProcess, ProcessError>>

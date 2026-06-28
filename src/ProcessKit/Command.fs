@@ -343,7 +343,7 @@ type Command internal (config: CommandConfig) =
 
 /// Pipe-friendly functions over `Command`, mirroring the instance **builder** methods. The run
 /// verbs (`Run`/`OutputString`/`Parse`/…) are instance methods only — end a pipeline with method
-/// syntax (`(cmd |> Command.arg "x").Run()`), or go through `Runner.*` with an explicit runner.
+/// syntax (`(cmd |> Command.arg "x").RunAsync()`), or go through `Runner.*` with an explicit runner.
 [<RequireQualifiedAccess>]
 module Command =
 

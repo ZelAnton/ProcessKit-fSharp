@@ -24,7 +24,7 @@ type ErgonomicsTests() =
     [<Test>]
     member _.``OkCodes accepts a configured non-zero exit``() : Task =
         task {
-            match! (shell "exit 2" |> Command.okCodes [ 0; 2 ]).Run() with
+            match! (shell "exit 2" |> Command.okCodes [ 0; 2 ]).RunAsync() with
             | Ok _ -> Assert.Pass()
             | Error error -> Assert.Fail $"expected success (2 is accepted), got {error}"
         }
@@ -33,7 +33,7 @@ type ErgonomicsTests() =
     [<Test>]
     member _.``a non-zero exit outside OkCodes still fails Run``() : Task =
         task {
-            match! (shell "exit 2").Run() with
+            match! (shell "exit 2").RunAsync() with
             | Error(ProcessError.Exit(_, 2, _, _)) -> Assert.Pass()
             | other -> Assert.Fail $"expected Exit 2, got {other}"
         }
@@ -44,13 +44,13 @@ type ErgonomicsTests() =
         task {
             let command = shell "exit 0" |> Command.okCodes [ 1 ]
 
-            match! command.OutputString() with
+            match! command.OutputStringAsync() with
             | Ok result ->
                 Assert.That(result.IsSuccess, Is.False)
                 CollectionAssert.AreEqual([| 1 |], result.AcceptedCodes)
             | Error error -> Assert.Fail $"{error}"
 
-            match! command.Run() with
+            match! command.RunAsync() with
             | Error(ProcessError.Exit(_, 0, _, _)) -> Assert.Pass()
             | other -> Assert.Fail $"expected Exit 0, got {other}"
         }
@@ -59,7 +59,7 @@ type ErgonomicsTests() =
     [<Test>]
     member _.``CreateNoWindow does not break a normal run``() : Task =
         task {
-            match! (shell "echo nowindow" |> Command.createNoWindow).Run() with
+            match! (shell "echo nowindow" |> Command.createNoWindow).RunAsync() with
             | Ok output -> Assert.That(output, Does.Contain "nowindow")
             | Error error -> Assert.Fail $"{error}"
         }
@@ -78,7 +78,7 @@ type ErgonomicsTests() =
                     |> Command.args [ "-c"; "echo [${PK_INHERIT_PROBE}]" ]
                     |> Command.envClear
 
-                match! command.Run() with
+                match! command.RunAsync() with
                 | Ok output -> Assert.That(output.Trim(), Is.EqualTo "[]")
                 | Error error -> Assert.Fail $"{error}"
         }
@@ -99,7 +99,7 @@ type ErgonomicsTests() =
         task {
             let client = CliClient.create shellProgram
 
-            match! client.Run [ shellFlag; "echo client" ] with
+            match! client.RunAsync [ shellFlag; "echo client" ] with
             | Ok output -> Assert.That(output, Does.Contain "client")
             | Error error -> Assert.Fail $"{error}"
         }
@@ -114,7 +114,7 @@ type ErgonomicsTests() =
                 let client =
                     CliClient("/bin/sh").WithDefaults(fun c -> c.Env("PK_CLIENT_VAR", "configured"))
 
-                match! client.Run [ "-c"; "echo env-$PK_CLIENT_VAR" ] with
+                match! client.RunAsync [ "-c"; "echo env-$PK_CLIENT_VAR" ] with
                 | Ok output -> Assert.That(output, Does.Contain "env-configured")
                 | Error error -> Assert.Fail $"{error}"
         }

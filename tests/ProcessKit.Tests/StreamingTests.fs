@@ -75,10 +75,10 @@ type StreamingTests() =
     [<Test>]
     member _.``start then OutputString captures stdout``() : Task =
         task {
-            match! runner.Start(threeLines, CancellationToken.None) with
+            match! runner.StartAsync(threeLines, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
-                match! running.OutputString() with
+                match! running.OutputStringAsync() with
                 | Ok result ->
                     Assert.That(result.Stdout, Does.Contain "line1")
                     Assert.That(result.Stdout, Does.Contain "line3")
@@ -89,11 +89,11 @@ type StreamingTests() =
     [<Test>]
     member _.``StdoutLines streams each line, then Finish reaps``() : Task =
         task {
-            match! runner.Start(threeLines, CancellationToken.None) with
+            match! runner.StartAsync(threeLines, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
-                let! lines = collect (running.StdoutLines())
-                let! finished = running.Finish()
+                let! lines = collect (running.StdoutLinesAsync())
+                let! finished = running.FinishAsync()
                 Assert.That(lines, Does.Contain "line1")
                 Assert.That(lines.Count, Is.GreaterThanOrEqualTo 3)
 
@@ -112,10 +112,10 @@ type StreamingTests() =
                 "echo out; echo err 1>&2"
 
         task {
-            match! runner.Start(shell script, CancellationToken.None) with
+            match! runner.StartAsync(shell script, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
-                let! events = collect (running.OutputEvents())
+                let! events = collect (running.OutputEventsAsync())
 
                 let hasStdout =
                     events
@@ -141,10 +141,10 @@ type StreamingTests() =
         task {
             let command = shell "sort" |> Command.stdin (Stdin.FromString "hello\n")
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
-                match! running.OutputString() with
+                match! running.OutputStringAsync() with
                 | Ok result -> Assert.That(result.Stdout.Trim(), Is.EqualTo "hello")
                 | Error error -> Assert.Fail $"{error}"
         }
@@ -155,7 +155,7 @@ type StreamingTests() =
         task {
             let command = shell "sort" |> Command.keepStdinOpen
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 match running.TakeStdin() with
@@ -163,9 +163,9 @@ type StreamingTests() =
                 | Some stdin ->
                     do! stdin.WriteLine "banana"
                     do! stdin.WriteLine "apple"
-                    do! stdin.Finish() // close stdin -> sort emits and exits
+                    do! stdin.FinishAsync() // close stdin -> sort emits and exits
 
-                    match! running.OutputString() with
+                    match! running.OutputStringAsync() with
                     | Ok result ->
                         Assert.That(result.Stdout, Does.Contain "apple")
                         Assert.That(result.Stdout, Does.Contain "banana")
@@ -180,7 +180,7 @@ type StreamingTests() =
                 task {
                     let command = shell "sort" |> Command.stdin (Stdin.FromString $"value{i}\n")
 
-                    match! runner.OutputString(command, CancellationToken.None) with
+                    match! runner.OutputStringAsync(command, CancellationToken.None) with
                     | Ok result -> return result.Stdout.Trim()
                     | Error error -> return $"ERR:{error}"
                 }
@@ -202,10 +202,10 @@ type StreamingTests() =
                 threeLines
                 |> Command.onStdoutLine (fun line -> lock captured (fun () -> captured.Add line))
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
-                let! _ = running.OutputString()
+                let! _ = running.OutputStringAsync()
                 Assert.That(captured, Does.Contain "line1")
         }
         :> Task
@@ -217,11 +217,11 @@ type StreamingTests() =
                 threeLines
                 |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom"))
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 use running = running
-                let! drain = drainWithDeadline (running.StdoutLines()) 10000
+                let! drain = drainWithDeadline (running.StdoutLinesAsync()) 10000
                 let! message = faultMessage drain
                 Assert.That(message, Is.EqualTo(Some "boom"), "expected the throwing handler to surface")
         }
@@ -234,11 +234,11 @@ type StreamingTests() =
                 threeLines
                 |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom"))
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 use running = running
-                let! drain = drainWithDeadline (running.OutputEvents()) 10000
+                let! drain = drainWithDeadline (running.OutputEventsAsync()) 10000
                 let! message = faultMessage drain
                 Assert.That(message, Is.EqualTo(Some "boom"), "expected the throwing handler to surface")
         }
@@ -251,13 +251,13 @@ type StreamingTests() =
                 threeLines
                 |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom"))
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 use running = running
                 // Finish awaits streamOutcome, which the stdout pump faults via the re-raise — so the
                 // error must propagate here (not be swallowed into an Ok result).
-                let finish = running.Finish() :> Task
+                let finish = running.FinishAsync() :> Task
                 let! winner = Task.WhenAny(finish, Task.Delay 10000)
 
                 Assert.That(
@@ -320,11 +320,11 @@ type StreamingTests() =
                 { baseHost () with
                     Wait = fun () -> Task.FromException<Outcome>(InvalidOperationException "boom") }
 
-            do! faultsAndReaps faultingWait (fun p -> p.OutputString() :> Task)
-            do! faultsAndReaps faultingWait (fun p -> p.OutputBytes() :> Task)
-            do! faultsAndReaps faultingWait (fun p -> p.Wait() :> Task)
-            do! faultsAndReaps faultingWait (fun p -> p.Profile(TimeSpan.FromMilliseconds 5.0) :> Task)
-            do! faultsAndReaps faultingWait (fun p -> p.Finish() :> Task)
+            do! faultsAndReaps faultingWait (fun p -> p.OutputStringAsync() :> Task)
+            do! faultsAndReaps faultingWait (fun p -> p.OutputBytesAsync() :> Task)
+            do! faultsAndReaps faultingWait (fun p -> p.WaitAsync() :> Task)
+            do! faultsAndReaps faultingWait (fun p -> p.ProfileAsync(TimeSpan.FromMilliseconds 5.0) :> Task)
+            do! faultsAndReaps faultingWait (fun p -> p.FinishAsync() :> Task)
 
             // (2) A throwing OnStdoutLine with a LIVE stderr pump drives the capture path's two-pump
             //     WhenAll: the verb must fault and still reap. (Like the Profile sampler, the
@@ -336,7 +336,7 @@ type StreamingTests() =
                     Stdout = oneLine "line1\n"
                     Stderr = oneLine "err1\n" }
 
-            do! faultsAndReaps throwingStdout (fun p -> p.OutputString() :> Task)
+            do! faultsAndReaps throwingStdout (fun p -> p.OutputStringAsync() :> Task)
 
             // (3) A throwing OnStderrLine faults both capture verbs (stderr is buffered in each), again
             //     with a live stdout pump. For OutputBytes the fault must come through the stderr
@@ -347,8 +347,8 @@ type StreamingTests() =
                     Stdout = oneLine "out1\n"
                     Stderr = oneLine "err1\n" }
 
-            do! faultsAndReaps throwingStderr (fun p -> p.OutputString() :> Task)
-            do! faultsAndReaps throwingStderr (fun p -> p.OutputBytes() :> Task)
+            do! faultsAndReaps throwingStderr (fun p -> p.OutputStringAsync() :> Task)
+            do! faultsAndReaps throwingStderr (fun p -> p.OutputBytesAsync() :> Task)
         }
         :> Task
 
@@ -371,7 +371,7 @@ type StreamingTests() =
                   Teardown = fun () -> ValueTask() }
 
             let profile =
-                (new RunningProcess(host)).Profile(TimeSpan.FromMilliseconds 5.0) :> Task
+                (new RunningProcess(host)).ProfileAsync(TimeSpan.FromMilliseconds 5.0) :> Task
 
             let! winner = Task.WhenAny(profile, Task.Delay 10000)
 
@@ -391,10 +391,10 @@ type StreamingTests() =
         task {
             let command = threeLines |> Command.stdout StdioMode.Null
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
-                match! running.OutputString() with
+                match! running.OutputStringAsync() with
                 | Ok result -> Assert.That(result.Stdout, Is.Empty)
                 | Error error -> Assert.Fail $"{error}"
         }
@@ -405,10 +405,10 @@ type StreamingTests() =
         task {
             let command = threeLines |> Command.outputBuffer (OutputBufferPolicy.FailLoud 1)
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
-                match! running.OutputString() with
+                match! running.OutputStringAsync() with
                 | Error(ProcessError.OutputTooLarge _) -> Assert.Pass()
                 | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
         }

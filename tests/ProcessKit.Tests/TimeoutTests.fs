@@ -31,7 +31,7 @@ type TimeoutTests() =
         task {
             let command = sleeper () |> Command.timeout (TimeSpan.FromMilliseconds 400.0)
             let stopwatch = Stopwatch.StartNew()
-            let! result = command.Run()
+            let! result = command.RunAsync()
             stopwatch.Stop()
 
             match result with
@@ -47,7 +47,7 @@ type TimeoutTests() =
         task {
             let command = sleeper () |> Command.timeout (TimeSpan.FromMilliseconds 400.0)
 
-            match! command.OutputString() with
+            match! command.OutputStringAsync() with
             | Ok result -> Assert.That(result.IsTimedOut, Is.True)
             | Error error -> Assert.Fail $"{error}"
         }
@@ -61,7 +61,7 @@ type TimeoutTests() =
                 |> Command.timeout (TimeSpan.FromMilliseconds 300.0)
                 |> Command.timeoutGrace (TimeSpan.FromMilliseconds 200.0)
 
-            match! command.OutputString() with
+            match! command.OutputStringAsync() with
             | Ok result -> Assert.That(result.IsTimedOut, Is.True)
             | Error error -> Assert.Fail $"{error}"
         }
@@ -83,7 +83,7 @@ type TimeoutTests() =
                 let command =
                     shell script |> Command.retry 2 (TimeSpan.FromMilliseconds 50.0) (fun _ -> true)
 
-                match! command.Run() with
+                match! command.RunAsync() with
                 | Error _ -> ()
                 | Ok _ -> Assert.Fail "expected the command to fail"
 
@@ -105,7 +105,7 @@ type TimeoutTests() =
         task {
             use cts = new CancellationTokenSource()
             let command = sleeper () |> Command.cancelOn cts.Token
-            let runTask = command.Run()
+            let runTask = command.RunAsync()
             do! Task.Delay 300
             cts.Cancel()
 

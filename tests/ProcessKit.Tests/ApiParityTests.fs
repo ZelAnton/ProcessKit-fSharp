@@ -55,7 +55,7 @@ type ApiParityTests() =
             // A ScriptedRunner gains ExitCode (a derived verb) for free via the runner extensions.
             let scripted: IProcessRunner = ScriptedRunner().On([ "tool" ], Reply.Fail(2, ""))
 
-            match! scripted.ExitCode(Command.create "tool") with
+            match! scripted.ExitCodeAsync(Command.create "tool") with
             | Ok code -> Assert.That(code, Is.EqualTo 2)
             | Error error -> Assert.Fail $"expected ExitCode 2, got {error.Message}"
 
@@ -67,9 +67,9 @@ type ApiParityTests() =
 
             use group = group
 
-            match! (group :> IProcessRunner).Run(shell "echo hi") with
+            match! (group :> IProcessRunner).RunAsync(shell "echo hi") with
             | Ok out -> Assert.That(out.Trim(), Is.EqualTo "hi")
-            | Error error -> Assert.Fail $"group.Run failed: {error.Message}"
+            | Error error -> Assert.Fail $"group.RunAsync failed: {error.Message}"
         }
 
     [<Test>]
@@ -83,7 +83,7 @@ type ApiParityTests() =
 
             let client = CliClient("pk-fake-tool").WithRunner scripted
 
-            match! client.ExitCode [ "status" ] with
+            match! client.ExitCodeAsync [ "status" ] with
             | Ok code -> Assert.That(code, Is.EqualTo 3)
             | Error error -> Assert.Fail $"expected the scripted exit code, got {error.Message}"
         }
@@ -99,7 +99,7 @@ type ApiParityTests() =
             use group = group
             let command = sleeper () |> Command.timeout (TimeSpan.FromMilliseconds 400.0)
 
-            match! (group :> IProcessRunner).OutputString(command, CancellationToken.None) with
+            match! (group :> IProcessRunner).OutputStringAsync(command, CancellationToken.None) with
             | Ok result -> Assert.That(result.IsTimedOut, Is.True)
             | Error error -> Assert.Fail $"expected a timed-out result, got {error.Message}"
         }
@@ -109,7 +109,7 @@ type ApiParityTests() =
         task {
             // ensureSuccess is generic over the captured-stdout type: a failing bytes capture maps to
             // an Exit error just like the text capture does.
-            match! (shell "exit 7").OutputBytes() with
+            match! (shell "exit 7").OutputBytesAsync() with
             | Error error -> Assert.Fail $"OutputBytes errored: {error.Message}"
             | Ok result ->
                 match ProcessResult.ensureSuccess result with
@@ -135,7 +135,7 @@ type ApiParityTests() =
             let pipeline =
                 ((shell "echo hi") |> Command.uncheckedInPipe).Pipe((shell "exit 5") |> Command.uncheckedInPipe)
 
-            match! pipeline.Run() with
+            match! pipeline.RunAsync() with
             | Ok _ -> ()
             | Error error -> Assert.Fail $"expected an all-unchecked pipeline to succeed, got {error.Message}"
         }
@@ -145,12 +145,12 @@ type ApiParityTests() =
         task {
             let runner: IProcessRunner = JobRunner()
 
-            match! runner.Start(sleeper (), CancellationToken.None) with
+            match! runner.StartAsync(sleeper (), CancellationToken.None) with
             | Error e -> failwith $"Start failed: {e}"
             | Ok running ->
                 use _ = running
                 // A negative timeout must not throw out of the CTS constructor; it resolves to NotReady.
-                match! running.WaitForLine((fun _ -> false), TimeSpan.FromSeconds -1.0) with
+                match! running.WaitForLineAsync((fun _ -> false), TimeSpan.FromSeconds -1.0) with
                 | Error(ProcessError.NotReady _) -> ()
                 | other -> Assert.Fail $"expected NotReady for a negative timeout, got {other}"
         }
@@ -160,13 +160,14 @@ type ApiParityTests() =
         task {
             let runner: IProcessRunner = JobRunner()
 
-            match! runner.Start(sleeper (), CancellationToken.None) with
+            match! runner.StartAsync(sleeper (), CancellationToken.None) with
             | Error e -> failwith $"Start failed: {e}"
             | Ok running ->
                 use cts = new CancellationTokenSource()
                 cts.Cancel()
 
-                let! outcome = running.WaitFor((fun () -> Task.FromResult false), TimeSpan.FromSeconds 5.0, cts.Token)
+                let! outcome =
+                    running.WaitForAsync((fun () -> Task.FromResult false), TimeSpan.FromSeconds 5.0, cts.Token)
 
                 match outcome with
                 | Error(ProcessError.Cancelled _) -> ()

@@ -13,16 +13,16 @@ module Exec =
     /// Run `program` with `args` in a private kill-on-dispose group, require a zero/accepted exit,
     /// and return stdout with trailing whitespace trimmed.
     let run (program: string) (args: seq<string>) =
-        (Command.create program |> Command.args args).Run()
+        (Command.create program |> Command.args args).RunAsync()
 
     /// Run `program` with `args` to completion and return the full `ProcessResult` (a non-zero exit
     /// is data, not an error).
     let outputString (program: string) (args: seq<string>) =
-        (Command.create program |> Command.args args).OutputString()
+        (Command.create program |> Command.args args).OutputStringAsync()
 
     /// The raw-bytes companion to `outputString` — captures `program`'s stdout as bytes.
     let outputBytes (program: string) (args: seq<string>) =
-        (Command.create program |> Command.args args).OutputBytes()
+        (Command.create program |> Command.args args).OutputBytesAsync()
 
     // Run every command through `runner`, capping how many are live at once, and collect ALL results
     // in input order — the batch never short-circuits. `capture` selects the text / bytes verb.
@@ -67,7 +67,7 @@ module Exec =
         (cancellationToken: CancellationToken)
         =
         // Route through the verb layer (not the raw seam) so each command's own `Retry` policy applies,
-        // matching `cmd.OutputString()` / `CliClient.OutputString` — retry still fires only on a genuine
+        // matching `cmd.OutputStringAsync()` / `CliClient.OutputString` — retry still fires only on a genuine
         // error, never on a non-zero exit (which stays data).
         runAll concurrency runner commands (fun r c -> Runner.outputString r cancellationToken c)
 

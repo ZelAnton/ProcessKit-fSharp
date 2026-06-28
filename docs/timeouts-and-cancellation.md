@@ -40,7 +40,7 @@ task {
         Command.create "slow-tool"
         |> Command.timeout (TimeSpan.FromSeconds 5.0)
 
-    match! cmd.OutputString() with
+    match! cmd.OutputStringAsync() with
     | Ok result when result.IsTimedOut ->
         // Code is None on a timeout; the partial output captured before the kill is kept.
         printfn $"timed out; partial stdout before the kill: {result.Stdout}"
@@ -56,12 +56,12 @@ task {
 var cmd = new Command("slow-tool")
     .Timeout(TimeSpan.FromSeconds(5));
 
-Console.WriteLine((await cmd.OutputString()).AsRun() switch
+Console.WriteLine(await cmd.OutputStringAsync() switch
 {
     // Code is None on a timeout; the partial output captured before the kill is kept.
-    { IsOk: true, Value: { IsTimedOut: true } result } => $"timed out; partial stdout before the kill: {result.Stdout}",
-    { IsOk: true, Value: var result }                  => $"exited {result.Code}: {result.Stdout}",
-    { IsOk: false, Error: var err }                    => err.Message,
+    { IsOk: true, ResultValue: { IsTimedOut: true } result } => $"timed out; partial stdout before the kill: {result.Stdout}",
+    { IsOk: true, ResultValue: var result }                  => $"exited {result.Code}: {result.Stdout}",
+    { IsOk: false, ErrorValue: var err }                    => err.Message,
 });
 ```
 
@@ -76,7 +76,7 @@ task {
         Command.create "slow-tool"
         |> Command.timeout (TimeSpan.FromSeconds 5.0)
 
-    match! cmd.Run() with
+    match! cmd.RunAsync() with
     | Ok stdout -> printfn $"{stdout}"
     | Error(ProcessError.Timeout(program, timeout, _, _)) ->
         eprintfn $"{program} exceeded {timeout}"
@@ -90,11 +90,11 @@ task {
 var cmd = new Command("slow-tool")
     .Timeout(TimeSpan.FromSeconds(5));
 
-Console.WriteLine((await cmd.Run()).AsRun() switch
+Console.WriteLine(await cmd.RunAsync() switch
 {
-    { IsOk: true, Value: var stdout } => stdout,
-    { IsOk: false, Error: ProcessError.Timeout { program: var p, timeout: var t } } => $"{p} exceeded {t}",
-    { IsOk: false, Error: var err } => err.Message,
+    { IsOk: true, ResultValue: var stdout } => stdout,
+    { IsOk: false, ErrorValue: ProcessError.Timeout { Program: var p, Timeout: var t } } => $"{p} exceeded {t}",
+    { IsOk: false, ErrorValue: var err } => err.Message,
 });
 ```
 
@@ -104,7 +104,7 @@ available on the error, not discarded.
 
 > **Two distinct deadline families — keep them apart.** `Command.Timeout` is the
 > *run's own contract* (this guide): it kills the tree. The readiness probes'
-> `within` parameter (`WaitForLine` / `WaitForPort` / `WaitFor`, see
+> `within` parameter (`WaitForLineAsync` / `WaitForPortAsync` / `WaitForAsync`, see
 > [streaming.md](streaming.md)) is a different deadline: it gives
 > `ProcessError.NotReady` and **never kills the child** — the caller decides what
 > happens next.
@@ -127,7 +127,7 @@ task {
         |> Command.timeout (TimeSpan.FromSeconds 30.0)
         |> Command.timeoutGrace (TimeSpan.FromSeconds 5.0) // SIGTERM, wait up to 5s, then SIGKILL
 
-    let! _ = cmd.OutputString()
+    let! _ = cmd.OutputStringAsync()
     ()
 }
 ```
@@ -139,7 +139,7 @@ var cmd = new Command("slow-tool")
     .Timeout(TimeSpan.FromSeconds(30))
     .TimeoutGrace(TimeSpan.FromSeconds(5)); // SIGTERM, wait up to 5s, then SIGKILL
 
-await cmd.OutputString();
+await cmd.OutputStringAsync();
 ```
 
 `IsTimedOut` is `true` regardless of whether the child exited on the signal or was
@@ -154,13 +154,13 @@ capture verbs treat the deadline as *data*; the success-checking verbs raise it.
 
 | Verb | A timeout deadline becomes |
 |---|---|
-| `OutputString()` / `OutputBytes()` | `Ok` result with `IsTimedOut = true`, `Code = None`, `Outcome = Outcome.TimedOut`, partial output kept |
-| `Run()` / `RunUnit()` | `Error (ProcessError.Timeout(program, timeout, stdout, stderr))` — partial output attached |
-| `ExitCode()` | `Error (ProcessError.Timeout …)` — it will not invent a sentinel code |
-| `Probe()` | `Error (ProcessError.Timeout …)` |
-| `Parse(f)` / `TryParse(f)` | `Error (ProcessError.Timeout …)` — both require success, so the deadline is raised |
-| `Start()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); a following `Finish()` reports `Outcome.TimedOut` |
-| `ProcessResult.ensureSuccess` on a captured result | `Error (ProcessError.Timeout …)` — the same conversion `Run` does for you |
+| `OutputStringAsync()` / `OutputBytesAsync()` | `Ok` result with `IsTimedOut = true`, `Code = None`, `Outcome = Outcome.TimedOut`, partial output kept |
+| `RunAsync()` / `RunUnitAsync()` | `Error (ProcessError.Timeout(program, timeout, stdout, stderr))` — partial output attached |
+| `ExitCodeAsync()` | `Error (ProcessError.Timeout …)` — it will not invent a sentinel code |
+| `ProbeAsync()` | `Error (ProcessError.Timeout …)` |
+| `ParseAsync(f)` / `TryParseAsync(f)` | `Error (ProcessError.Timeout …)` — both require success, so the deadline is raised |
+| `StartAsync()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); a following `FinishAsync()` reports `Outcome.TimedOut` |
+| `ProcessResult.ensureSuccess` on a captured result | `Error (ProcessError.Timeout …)` — the same conversion `RunAsync` does for you |
 | `FirstLine(p)` | the stream closes at the deadline; if no line matched first, you get `Ok None` (it is not a success-checking verb) |
 
 Streaming makes the "captured" half concrete — the deadline bounds the stream,
@@ -174,10 +174,10 @@ task {
         Command.create "chatty-job"
         |> Command.timeout (TimeSpan.FromSeconds 10.0)
 
-    match! cmd.Start() with
+    match! cmd.StartAsync() with
     | Ok proc ->
         use _ = proc
-        let e = proc.StdoutLines().GetAsyncEnumerator()
+        let e = proc.StdoutLinesAsync().GetAsyncEnumerator()
 
         try
             let mutable go = true
@@ -189,7 +189,7 @@ task {
         finally
             e.DisposeAsync().AsTask().Wait()
 
-        match! proc.Finish() with
+        match! proc.FinishAsync() with
         | Ok finished when finished.Outcome.IsTimedOut -> eprintfn "killed at the deadline"
         | Ok _ -> ()
         | Error err -> eprintfn $"{err.Message}"
@@ -203,15 +203,15 @@ task {
 var cmd = new Command("chatty-job")
     .Timeout(TimeSpan.FromSeconds(10));
 
-await using var proc = (await cmd.Start()).GetValueOrThrow();
+await using var proc = (await cmd.StartAsync()).GetValueOrThrow();
 
-await foreach (var line in proc.StdoutLines())
+await foreach (var line in proc.StdoutLinesAsync())
     Console.WriteLine($"> {line}"); // the stream ends when the deadline kills the tree
 
-var finished = await proc.Finish();
-if (finished.AsRun() is { IsOk: true, Value: { Outcome.IsTimedOut: true } })
+var finished = await proc.FinishAsync();
+if (finished is { IsOk: true, ResultValue: { Outcome.IsTimedOut: true } })
     Console.Error.WriteLine("killed at the deadline");
-else if (finished.AsRun() is { IsOk: false, Error: var err })
+else if (finished is { IsOk: false, ErrorValue: var err })
     Console.Error.WriteLine(err.Message);
 ```
 
@@ -244,7 +244,7 @@ task {
                     | ProcessError.Exit(_, 7, _, _) -> true
                     | _ -> false))
 
-    match! cmd.Run() with
+    match! cmd.RunAsync() with
     | Ok body -> printfn $"{body}"
     | Error err -> eprintfn $"gave up: {err.Message}"
 }
@@ -263,12 +263,12 @@ var cmd = new Command("curl")
             // transient (spawn/I/O), a timeout, or curl's "couldn't connect" (exit 7)
             err.IsTransient
             || err.IsTimeout
-            || err is ProcessError.Exit { code: 7 });
+            || err is ProcessError.Exit { Code: 7 });
 
-Console.WriteLine((await cmd.Run()).AsRun() switch
+Console.WriteLine(await cmd.RunAsync() switch
 {
-    { IsOk: true, Value: var body } => body,
-    { IsOk: false, Error: var err } => $"gave up: {err.Message}",
+    { IsOk: true, ResultValue: var body } => body,
+    { IsOk: false, ErrorValue: var err } => $"gave up: {err.Message}",
 });
 ```
 
@@ -295,11 +295,11 @@ var cmd = new Command("flaky-tool")
 ```
 
 **Where retry earns its keep.** Retry replays the run whenever a verb yields an
-`Error` your predicate accepts. The success-checking verbs (`Run` / `RunUnit` /
-`ExitCode` / `Probe` / `Parse` / `TryParse`) are where that matters: they turn a
+`Error` your predicate accepts. The success-checking verbs (`RunAsync` / `RunUnitAsync` /
+`ExitCodeAsync` / `ProbeAsync` / `ParseAsync` / `TryParseAsync`) are where that matters: they turn a
 non-zero exit into `ProcessError.Exit` and a timeout into `ProcessError.Timeout`,
 so your classifier can act on the *outcome* of the run. The capture verbs
-(`OutputString` / `OutputBytes`) keep a non-zero exit **and** a timeout as data —
+(`OutputStringAsync` / `OutputBytesAsync`) keep a non-zero exit **and** a timeout as data —
 an `Ok` result — so a retry there can only ever fire on a genuine failure-to-run
 (a transient spawn or I/O error), never on an exit code or a deadline.
 
@@ -319,15 +319,15 @@ backoff shape, a different loop condition.
 
 Hand any verb a `System.Threading.CancellationToken`; cancelling the token kills
 the run's tree and makes every consuming path report `ProcessError.Cancelled`.
-Every verb has a `CancellationToken` overload (`cmd.Run(token)`,
-`cmd.OutputString(token)`, …):
+Every verb has a `CancellationToken` overload (`cmd.RunAsync(token)`,
+`cmd.OutputStringAsync(token)`, …):
 
 **F#**
 
 ```fsharp
 task {
     use cts = new CancellationTokenSource()
-    let job = (Command.create "long-export").Run(cts.Token)
+    let job = (Command.create "long-export").RunAsync(cts.Token)
 
     // elsewhere — a shutdown signal, a sibling failure, a UI button:
     cts.Cancel()
@@ -342,12 +342,12 @@ task {
 
 ```csharp
 using var cts = new CancellationTokenSource();
-var job = new Command("long-export").Run(cts.Token);
+var job = new Command("long-export").RunAsync(cts.Token);
 
 // elsewhere — a shutdown signal, a sibling failure, a UI button:
 cts.Cancel();
 
-if ((await job).AsRun() is { IsOk: false, Error: ProcessError.Cancelled { program: var p } })
+if (await job is { IsOk: false, ErrorValue: ProcessError.Cancelled { Program: var p } })
     Console.WriteLine($"{p} cancelled");
 ```
 
@@ -359,24 +359,24 @@ so either source cancels the run:
 
 ```fsharp
 let cmd = Command.create "long-export" |> Command.cancelOn shutdownToken
-let! _ = cmd.Run() // also cancels if shutdownToken fires
+let! _ = cmd.RunAsync() // also cancels if shutdownToken fires
 ```
 
 **C#**
 
 ```csharp
 var cmd = new Command("long-export").CancelOn(shutdownToken);
-await cmd.Run(); // also cancels if shutdownToken fires
+await cmd.RunAsync(); // also cancels if shutdownToken fires
 ```
 
 The contract, path by path:
 
 | Situation | Behavior |
 |---|---|
-| Cancel during `Run` / `OutputString` / `OutputBytes` / `ExitCode` / `Probe` / `Parse` | tree killed → `Error (ProcessError.Cancelled program)` |
-| Cancel during streaming (`StdoutLines`) | the stream **ends**; the following `Finish()` reports `ProcessError.Cancelled` |
+| Cancel during `RunAsync` / `OutputStringAsync` / `OutputBytesAsync` / `ExitCodeAsync` / `ProbeAsync` / `ParseAsync` | tree killed → `Error (ProcessError.Cancelled program)` |
+| Cancel during streaming (`StdoutLinesAsync`) | the stream **ends**; the following `FinishAsync()` reports `ProcessError.Cancelled` |
 | Token already cancelled **before** the run | short-circuits before spawning — no process is ever created |
-| `FirstLine` mid-run | surfaces `ProcessError.Cancelled` once the token fires (not `Ok None`) |
+| `FirstLineAsync` mid-run | surfaces `ProcessError.Cancelled` once the token fires (not `Ok None`) |
 | Under `Retry` | terminal — the built-in classifiers reject `Cancelled` and the loop stops re-trying |
 | Under a [supervision.md](supervision.md) `Supervisor` | terminal — supervision returns `Cancelled` instead of restarting into a still-cancelled token |
 
@@ -398,7 +398,7 @@ task {
             .Timeout(TimeSpan.FromSeconds 30.0)   // whole-chain deadline (mirror: Pipeline.timeout)
             .CancelOn(shutdownToken)              // whole-chain token   (mirror: Pipeline.cancelOn)
 
-    match! pipeline.OutputString() with
+    match! pipeline.OutputStringAsync() with
     | Ok result -> printfn $"timedOut={result.IsTimedOut}"
     | Error err -> eprintfn $"{err.Message}" // ProcessError.Cancelled when the token fires
 }
@@ -412,15 +412,15 @@ var pipeline = new Command("producer")
     .Timeout(TimeSpan.FromSeconds(30))   // whole-chain deadline (mirror: Pipeline.timeout)
     .CancelOn(shutdownToken);            // whole-chain token   (mirror: Pipeline.cancelOn)
 
-Console.WriteLine((await pipeline.OutputString()).AsRun() switch
+Console.WriteLine(await pipeline.OutputStringAsync() switch
 {
-    { IsOk: true, Value: var result } => $"timedOut={result.IsTimedOut}",
-    { IsOk: false, Error: var err }   => err.Message, // ProcessError.Cancelled when the token fires
+    { IsOk: true, ResultValue: var result } => $"timedOut={result.IsTimedOut}",
+    { IsOk: false, ErrorValue: var err }   => err.Message, // ProcessError.Cancelled when the token fires
 });
 ```
 
 `Pipeline.Timeout` tears the shared group down at the deadline and reports the
-timeout (`IsTimedOut` on `OutputString`, `Error` on `Run`) — but, unlike a single
+timeout (`IsTimedOut` on `OutputStringAsync`, `Error` on `RunAsync`) — but, unlike a single
 command's *captured* timeout, there is no salvaged partial stdout to read back. A
 per-stage `Command.Timeout` instead kills just that stage and folds into pipefail.
 See [pipelines.md](pipelines.md) for the full chain model.

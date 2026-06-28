@@ -327,7 +327,7 @@ type RecordReplayRunner private (mode: Mode, path: string) =
                 | Ok digest ->
                     match mode with
                     | RecordMode(inner, recorded, dirty) ->
-                        match! inner.OutputString(command, cancellationToken) with
+                        match! inner.OutputStringAsync(command, cancellationToken) with
                         | Error error -> return Error error
                         | Ok result ->
                             lock gate (fun () ->
@@ -342,10 +342,10 @@ type RecordReplayRunner private (mode: Mode, path: string) =
         }
 
     interface IProcessRunner with
-        member this.OutputString(command, cancellationToken) =
+        member this.OutputStringAsync(command, cancellationToken) =
             this.Capture(command, cancellationToken)
 
-        member this.OutputBytes(command, cancellationToken) =
+        member this.OutputBytesAsync(command, cancellationToken) =
             task {
                 match! this.Capture(command, cancellationToken) with
                 | Error error -> return Error error
@@ -365,7 +365,7 @@ type RecordReplayRunner private (mode: Mode, path: string) =
                         )
             }
 
-        member _.Start(_command, _cancellationToken) =
+        member _.StartAsync(_command, _cancellationToken) =
             Task.FromResult(
                 Error(ProcessError.Unsupported "RecordReplayRunner does not support Start (live streaming)")
             )

@@ -22,7 +22,7 @@ type LimitsTests() =
     let runInGroup (group: ProcessGroup) =
         task {
             let runner: IProcessRunner = group
-            return! runner.OutputString(shell "echo limited", CancellationToken.None)
+            return! runner.OutputStringAsync(shell "echo limited", CancellationToken.None)
         }
 
     [<Test>]
@@ -112,7 +112,7 @@ type LimitsTests() =
                     use group = group
                     Assert.That(group.Mechanism, Is.EqualTo Mechanism.CgroupV2)
 
-                    match! group.Start(shell "sleep 3") with
+                    match! group.StartAsync(shell "sleep 3") with
                     | Error error -> Assert.Fail $"{error}"
                     | Ok running ->
                         // Membership comes from cgroup.procs.
@@ -135,7 +135,7 @@ type LimitsTests() =
                         | Error error -> Assert.Fail $"resume: {error}"
 
                         running.StartKill()
-                        let! _ = running.Wait()
+                        let! _ = running.WaitAsync()
                         ()
         }
         :> Task

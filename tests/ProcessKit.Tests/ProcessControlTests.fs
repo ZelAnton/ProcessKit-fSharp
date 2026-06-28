@@ -36,7 +36,7 @@ type ProcessControlTests() =
         task {
             use group = create ()
 
-            match! group.Start sleeper with
+            match! group.StartAsync sleeper with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 let members =
@@ -51,7 +51,7 @@ type ProcessControlTests() =
                 | None -> Assert.Fail "expected a pid"
 
                 running.StartKill()
-                let! _ = running.Wait()
+                let! _ = running.WaitAsync()
                 ()
         }
         :> Task
@@ -61,7 +61,7 @@ type ProcessControlTests() =
         task {
             use group = create ()
 
-            match! group.Start sleeper with
+            match! group.StartAsync sleeper with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 if isWindows then
@@ -73,14 +73,14 @@ type ProcessControlTests() =
                     | Ok() -> ()
                     | Error error -> Assert.Fail $"{error}"
 
-                    let! outcome = running.Wait()
+                    let! outcome = running.WaitAsync()
                     Assert.That(outcome.IsExited, Is.True)
                 else
                     match group.Signal Signal.Term with
                     | Ok() -> ()
                     | Error error -> Assert.Fail $"{error}"
 
-                    let! outcome = running.Wait()
+                    let! outcome = running.WaitAsync()
 
                     match outcome with
                     | Outcome.Signalled _ -> Assert.Pass()
@@ -102,7 +102,7 @@ type ProcessControlTests() =
                     shell "sleep 0.5; echo done"
                 |> Command.timeout (TimeSpan.FromSeconds 10.0)
 
-            match! group.Start printer with
+            match! group.StartAsync printer with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 match group.Suspend() with
@@ -113,7 +113,7 @@ type ProcessControlTests() =
                 | Ok() -> ()
                 | Error error -> Assert.Fail $"resume: {error}"
 
-                let! outcome = running.Wait()
+                let! outcome = running.WaitAsync()
 
                 match outcome with
                 | Outcome.Exited _ -> Assert.Pass()
@@ -128,7 +128,7 @@ type ProcessControlTests() =
             use group = create ()
             let runner: IProcessRunner = group
 
-            match! runner.OutputString(shell "echo shared", CancellationToken.None) with
+            match! runner.OutputStringAsync(shell "echo shared", CancellationToken.None) with
             | Ok result -> Assert.That(result.Stdout, Does.Contain "shared")
             | Error error -> Assert.Fail $"{error}"
         }
@@ -142,7 +142,7 @@ type ProcessControlTests() =
             let sup =
                 Supervisor(shell "echo supervised").Restart(RestartPolicy.Never).WithRunner(group :> IProcessRunner)
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome -> Assert.That(outcome.FinalResult.Stdout, Does.Contain "supervised")
             | Error error -> Assert.Fail $"{error}"
         }
@@ -164,7 +164,7 @@ type ProcessControlTests() =
                 longSleeper.Pipe(shell "echo done").Timeout(TimeSpan.FromMilliseconds 300.0)
 
             let stopwatch = Stopwatch.StartNew()
-            let! result = pipeline.Run()
+            let! result = pipeline.RunAsync()
             stopwatch.Stop()
 
             match result with

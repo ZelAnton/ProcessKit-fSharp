@@ -42,7 +42,7 @@ type PipelineTests() =
         task {
             let pipeline = (emit [ "banana"; "apple" ]).Pipe sortStage
 
-            match! pipeline.Run() with
+            match! pipeline.RunAsync() with
             | Ok output -> Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana" ]))
             | Error error -> Assert.Fail $"{error}"
         }
@@ -54,7 +54,7 @@ type PipelineTests() =
             let pipeline =
                 (emit [ "cherry"; "apple"; "banana" ]).Pipe(sortStage).Pipe(sortStage)
 
-            match! pipeline.Run() with
+            match! pipeline.RunAsync() with
             | Ok output -> Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana"; "cherry" ]))
             | Error error -> Assert.Fail $"{error}"
         }
@@ -65,7 +65,7 @@ type PipelineTests() =
         task {
             let pipeline = (emit [ "banana"; "apple" ]).Pipe sortStage
 
-            match! pipeline.OutputBytes() with
+            match! pipeline.OutputBytesAsync() with
             | Ok result ->
                 let text = Encoding.UTF8.GetString result.Stdout
                 Assert.That(lines text, Is.EqualTo(box [ "apple"; "banana" ]))
@@ -78,7 +78,7 @@ type PipelineTests() =
         task {
             let pipeline = (shell "exit 3").Pipe sortStage
 
-            match! pipeline.Run() with
+            match! pipeline.RunAsync() with
             | Error(ProcessError.Exit(_, 3, _, _)) -> Assert.Pass()
             | other -> Assert.Fail $"expected Exit 3, got {other}"
         }
@@ -89,7 +89,7 @@ type PipelineTests() =
         task {
             let pipeline = (shell "exit 3").Pipe sortStage
 
-            match! pipeline.OutputString() with
+            match! pipeline.OutputStringAsync() with
             | Ok result -> Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 3))
             | Error error -> Assert.Fail $"{error}"
         }
@@ -101,7 +101,7 @@ type PipelineTests() =
             let failing = (shell "exit 3").UncheckedInPipe()
             let pipeline = failing.Pipe(shell "echo done")
 
-            match! pipeline.Run() with
+            match! pipeline.RunAsync() with
             | Ok output -> Assert.That(output, Does.Contain "done")
             | Error error -> Assert.Fail $"{error}"
         }
@@ -113,7 +113,7 @@ type PipelineTests() =
             let failingLast = (shell "exit 5").UncheckedInPipe()
             let pipeline = (emit [ "x" ]).Pipe failingLast
 
-            match! pipeline.Run() with
+            match! pipeline.RunAsync() with
             | Ok _ -> Assert.Pass()
             | Error error -> Assert.Fail $"expected success (last stage unchecked), got {error}"
         }
@@ -133,7 +133,7 @@ type PipelineTests() =
                 let head = Command.create "head" |> Command.args [ "-n"; "1" ]
                 let pipeline = (yes.Pipe head).Timeout(TimeSpan.FromSeconds 15.0)
 
-                match! pipeline.Run() with
+                match! pipeline.RunAsync() with
                 | Ok output -> Assert.That(output.Trim(), Is.EqualTo "y")
                 | Error error -> Assert.Fail $"expected the pipeline to complete, got {error}"
         }
@@ -151,7 +151,7 @@ type PipelineTests() =
             let pipeline =
                 (emit [ "hi" ]).Pipe(sleeper).Timeout(TimeSpan.FromMilliseconds 300.0)
 
-            match! pipeline.Run() with
+            match! pipeline.RunAsync() with
             | Error(ProcessError.Timeout _) -> Assert.Pass()
             | other -> Assert.Fail $"expected Timeout, got {other}"
         }
@@ -169,7 +169,7 @@ type PipelineTests() =
             let pipeline = (emit [ "hi" ]).Pipe sleeper
             use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 300.0)
 
-            match! pipeline.Run cts.Token with
+            match! pipeline.RunAsync cts.Token with
             | Error(ProcessError.Cancelled _) -> Assert.Pass()
             | other -> Assert.Fail $"expected Cancelled, got {other}"
         }
@@ -183,7 +183,7 @@ type PipelineTests() =
                 Pipeline.create (emit [ "banana"; "apple" ]) sortStage
                 |> Pipeline.timeout (TimeSpan.FromSeconds 30.0)
 
-            match! pipeline.Run() with
+            match! pipeline.RunAsync() with
             | Ok output -> Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana" ]))
             | Error error -> Assert.Fail $"{error}"
         }
@@ -194,7 +194,7 @@ type PipelineTests() =
         task {
             let pipeline = (emit [ "42" ]).Pipe sortStage
 
-            match! pipeline.Parse(fun s -> int (s.Trim())) with
+            match! pipeline.ParseAsync(fun s -> int (s.Trim())) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"{error}"
         }

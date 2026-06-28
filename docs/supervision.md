@@ -11,7 +11,7 @@ built entirely on the [`IProcessRunner`](testing.md) seam, so it never touches t
 and is fully testable without spawning a process.
 
 Each *incarnation* is one full captured run of the command, driven through the runner's
-`OutputString` verb. The command's own `Timeout`, `Stdin`, environment, encoding, and
+`OutputStringAsync` verb. The command's own `Timeout`, `Stdin`, environment, encoding, and
 `OkCodes` therefore apply to every incarnation — with the usual
 [one-shot-stdin caveat](commands.md) for the second run onward (feed a reusable source such as
 `Stdin.FromString` rather than a stream you can read only once). One thing that does **not**
@@ -53,7 +53,7 @@ var supervisor = new Supervisor(new Command("worker")); // constructor
 ```
 
 The builder is fluent and immutable — every method returns a new `Supervisor`, and building one
-spawns nothing. Nothing runs until you call a verb (`Run`):
+spawns nothing. Nothing runs until you call a verb (`RunAsync`):
 
 **F#**
 
@@ -68,7 +68,7 @@ task {
             .Jitter(true)                                    // default: on
             .StormPause(TimeSpan.FromSeconds 15.0)           // crash-loop guard (off by default)
 
-    match! supervisor.Run() with
+    match! supervisor.RunAsync() with
     | Ok outcome -> printfn $"ended after {outcome.Restarts} restarts: {outcome.Stopped}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -85,10 +85,10 @@ var supervisor = new Supervisor(new Command("my-server").Args(["--port", "8080"]
     .Jitter(true)                                 // default: on
     .StormPause(TimeSpan.FromSeconds(15));        // crash-loop guard (off by default)
 
-Console.WriteLine((await supervisor.Run()).AsRun() switch
+Console.WriteLine(await supervisor.RunAsync() switch
 {
-    { IsOk: true, Value: var outcome } => $"ended after {outcome.Restarts} restarts: {outcome.Stopped}",
-    { IsOk: false, Error: var err }    => err.Message,
+    { IsOk: true, ResultValue: var outcome } => $"ended after {outcome.Restarts} restarts: {outcome.Stopped}",
+    { IsOk: false, ErrorValue: var err }    => err.Message,
 });
 ```
 
@@ -179,7 +179,7 @@ task {
             .FailureDecay(TimeSpan.FromSeconds 30.0) // score half-life (default 30s)
             .FailureThreshold(5.0)                   // trip point (default 5.0)
 
-    match! supervisor.Run() with
+    match! supervisor.RunAsync() with
     | Ok outcome -> printfn $"storm pauses taken: {outcome.StormPauses}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -193,10 +193,10 @@ var supervisor = new Supervisor(new Command("worker"))
     .FailureDecay(TimeSpan.FromSeconds(30)) // score half-life (default 30s)
     .FailureThreshold(5.0);                 // trip point (default 5.0)
 
-Console.WriteLine((await supervisor.Run()).AsRun() switch
+Console.WriteLine(await supervisor.RunAsync() switch
 {
-    { IsOk: true, Value: var outcome } => $"storm pauses taken: {outcome.StormPauses}",
-    { IsOk: false, Error: var err }    => err.Message,
+    { IsOk: true, ResultValue: var outcome } => $"storm pauses taken: {outcome.StormPauses}",
+    { IsOk: false, ErrorValue: var err }    => err.Message,
 });
 ```
 
@@ -273,7 +273,7 @@ task {
             .StopWhen(fun result -> result.Code = Some 0) // …until one exits cleanly
             .MaxRestarts(50)                              // but give up after 50 restarts
 
-    match! supervisor.Run() with
+    match! supervisor.RunAsync() with
     | Ok outcome when outcome.Stopped = StopReason.Predicate ->
         printfn "worker finished cleanly"
     | Ok outcome -> printfn $"gave up: {outcome.Stopped}"
@@ -289,11 +289,11 @@ var supervisor = new Supervisor(new Command("batch-worker"))
     .StopWhen(result => result.Code is { Value: 0 }) // …until one exits cleanly
     .MaxRestarts(50);                                // but give up after 50 restarts
 
-Console.WriteLine((await supervisor.Run()).AsRun() switch
+Console.WriteLine(await supervisor.RunAsync() switch
 {
-    { IsOk: true, Value: { Stopped.IsPredicate: true } } => "worker finished cleanly",
-    { IsOk: true, Value: var outcome }                   => $"gave up: {outcome.Stopped}",
-    { IsOk: false, Error: var err }                      => err.Message,
+    { IsOk: true, ResultValue: { Stopped.IsPredicate: true } } => "worker finished cleanly",
+    { IsOk: true, ResultValue: var outcome }                   => $"gave up: {outcome.Stopped}",
+    { IsOk: false, ErrorValue: var err }                      => err.Message,
 });
 ```
 
@@ -305,7 +305,7 @@ inspect, so it is classified by the policy alone (see
 
 ## The outcome
 
-`Run()` resolves to a `Task<Result<SupervisionOutcome, ProcessError>>`. On `Ok`, the
+`RunAsync()` resolves to a `Task<Result<SupervisionOutcome, ProcessError>>`. On `Ok`, the
 `SupervisionOutcome` reports the last run plus the keeper's telemetry:
 
 | Field | Meaning |
@@ -323,7 +323,7 @@ it into a success-or-error with `ProcessResult.ensureSuccess`:
 
 ```fsharp
 task {
-    match! (Supervisor.create (Command.create "job")).Run() with
+    match! (Supervisor.create (Command.create "job")).RunAsync() with
     | Ok outcome ->
         printfn $"runs={outcome.Restarts + 1} reason={outcome.Stopped} pauses={outcome.StormPauses}"
 
@@ -337,18 +337,18 @@ task {
 **C#**
 
 ```csharp
-var outcome = await new Supervisor(new Command("job")).Run();
-if (outcome.AsRun() is { IsOk: true, Value: var o })
+var outcome = await new Supervisor(new Command("job")).RunAsync();
+if (outcome is { IsOk: true, ResultValue: var o })
 {
     Console.WriteLine($"runs={o.Restarts + 1} reason={o.Stopped} pauses={o.StormPauses}");
 
-    Console.WriteLine((o.FinalResult.EnsureSuccess()).AsRun() switch
+    Console.WriteLine((o.FinalResult.EnsureSuccess()) switch
     {
-        { IsOk: true, Value: var final } => $"last run ok: {final.Stdout}",
-        { IsOk: false, Error: var err }  => $"last run failed: {err.Message}",
+        { IsOk: true, ResultValue: var final } => $"last run ok: {final.Stdout}",
+        { IsOk: false, ErrorValue: var err }  => $"last run failed: {err.Message}",
     });
 }
-else if (outcome.AsRun() is { IsOk: false, Error: var err })
+else if (outcome is { IsOk: false, ErrorValue: var err })
     Console.Error.WriteLine(err.Message);
 ```
 
@@ -375,7 +375,7 @@ task {
                 .Restart(RestartPolicy.OnCrash)
                 .MaxRestarts(10)
 
-        match! supervisor.Run() with
+        match! supervisor.RunAsync() with
         | Ok outcome -> printfn $"stopped: {outcome.Stopped}"
         | Error err -> eprintfn $"{err.Message}"
 }
@@ -385,7 +385,7 @@ task {
 
 ```csharp
 var created = ProcessGroup.Create();
-if (created.AsRun() is { IsOk: false, Error: var createErr })
+if (created is { IsOk: false, ErrorValue: var createErr })
 {
     Console.Error.WriteLine(createErr.Message);
     return;
@@ -398,14 +398,14 @@ var supervisor = new Supervisor(new Command("worker"))
     .Restart(RestartPolicy.OnCrash)
     .MaxRestarts(10);
 
-Console.WriteLine((await supervisor.Run()).AsRun() switch
+Console.WriteLine(await supervisor.RunAsync() switch
 {
-    { IsOk: true, Value: var outcome } => $"stopped: {outcome.Stopped}",
-    { IsOk: false, Error: var err }    => err.Message,
+    { IsOk: true, ResultValue: var outcome } => $"stopped: {outcome.Stopped}",
+    { IsOk: false, ErrorValue: var err }    => err.Message,
 });
 ```
 
-The group is yours: it outlives supervision, so dispose it (or `Shutdown` it) to tear down
+The group is yours: it outlives supervision, so dispose it (or `ShutdownAsync` it) to tear down
 anything still running once the keeper has stopped. One interaction to mind — do not supervise
 into a group you have [suspended](process-groups.md); under the cgroup mechanism a restarted
 child would start frozen (and the spawn itself can block). Resume the group first.
@@ -435,7 +435,7 @@ task {
             .Restart(RestartPolicy.OnCrash)
             .Jitter(false)
 
-    match! supervisor.Run() with
+    match! supervisor.RunAsync() with
     | Ok outcome ->
         // Restarts = 2, Stopped = PolicySatisfied (the clean third run ends OnCrash supervision).
         printfn $"restarts={outcome.Restarts} reason={outcome.Stopped}"
@@ -458,11 +458,11 @@ var supervisor = new Supervisor(new Command("worker"))
     .Restart(RestartPolicy.OnCrash)
     .Jitter(false);
 
-Console.WriteLine((await supervisor.Run()).AsRun() switch
+Console.WriteLine(await supervisor.RunAsync() switch
 {
     // Restarts = 2, Stopped = PolicySatisfied (the clean third run ends OnCrash supervision).
-    { IsOk: true, Value: var outcome } => $"restarts={outcome.Restarts} reason={outcome.Stopped}",
-    { IsOk: false, Error: var err }    => err.Message,
+    { IsOk: true, ResultValue: var outcome } => $"restarts={outcome.Restarts} reason={outcome.Stopped}",
+    { IsOk: false, ErrorValue: var err }    => err.Message,
 });
 ```
 
@@ -475,11 +475,11 @@ exact argv (`On`) versus predicate (`When`) and record/replay cassettes.
 A run that produces **no result at all** — a spawn or I/O failure, where there is no
 `ProcessResult` to judge — is treated as a crash: the supervisor restarts it (with backoff)
 unless the policy is `Never` or the budget is exhausted, in which case that `ProcessError`
-surfaces as `Run`'s `Error`. Because such a run never started, `StopWhen` does not see it; only
+surfaces as `RunAsync`'s `Error`. Because such a run never started, `StopWhen` does not see it; only
 the policy and the budget apply.
 
 A **cancelled** incarnation is terminal. If the token is already cancelled at the top of an
-iteration, or an incarnation resolves to `ProcessError.Cancelled`, `Run` returns that
+iteration, or an incarnation resolves to `ProcessError.Cancelled`, `RunAsync` returns that
 `Cancelled` immediately — regardless of policy or remaining budget. The token never un-cancels,
 so a restart could only produce another instantly-cancelled run; the supervisor refuses the
 futile loop. Pass the token to `Run(token)`:
@@ -489,7 +489,7 @@ futile loop. Pass the token to `Run(token)`:
 ```fsharp
 task {
     use cts = new CancellationTokenSource()
-    let supervised = (Supervisor.create (Command.create "worker")).Run(cts.Token)
+    let supervised = (Supervisor.create (Command.create "worker")).RunAsync(cts.Token)
 
     // elsewhere — a shutdown signal, a sibling failure:
     cts.Cancel()
@@ -504,12 +504,12 @@ task {
 
 ```csharp
 using var cts = new CancellationTokenSource();
-var supervised = new Supervisor(new Command("worker")).Run(cts.Token);
+var supervised = new Supervisor(new Command("worker")).RunAsync(cts.Token);
 
 // elsewhere — a shutdown signal, a sibling failure:
 cts.Cancel();
 
-if ((await supervised).AsRun() is { IsOk: false, Error: { IsCancelled: true } })
+if (await supervised is { IsOk: false, ErrorValue: { IsCancelled: true } })
     Console.WriteLine("supervision cancelled");
 ```
 

@@ -37,12 +37,12 @@ type ReadinessTests() =
                 else
                     shell "echo ready; sleep 4"
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 use running = running
 
-                match! running.WaitForLine((fun line -> line.Contains "ready"), TimeSpan.FromSeconds 5.0) with
+                match! running.WaitForLineAsync((fun line -> line.Contains "ready"), TimeSpan.FromSeconds 5.0) with
                 | Ok line -> Assert.That(line, Does.Contain "ready")
                 | Error error -> Assert.Fail $"{error}"
         }
@@ -51,12 +51,14 @@ type ReadinessTests() =
     [<Test>]
     member _.``WaitForLine times out with NotReady when the line never appears``() : Task =
         task {
-            match! runner.Start(lingering (), CancellationToken.None) with
+            match! runner.StartAsync(lingering (), CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 use running = running
 
-                match! running.WaitForLine((fun line -> line.Contains "never"), TimeSpan.FromMilliseconds 300.0) with
+                match!
+                    running.WaitForLineAsync((fun line -> line.Contains "never"), TimeSpan.FromMilliseconds 300.0)
+                with
                 | Error(ProcessError.NotReady _) -> Assert.Pass()
                 | other -> Assert.Fail $"expected NotReady, got {other}"
         }
@@ -70,13 +72,13 @@ type ReadinessTests() =
 
         task {
             try
-                match! runner.Start(lingering (), CancellationToken.None) with
+                match! runner.StartAsync(lingering (), CancellationToken.None) with
                 | Error error -> Assert.Fail $"{error}"
                 | Ok running ->
                     use running = running
                     let endpoint = IPEndPoint(IPAddress.Loopback, port)
 
-                    match! running.WaitForPort(endpoint, TimeSpan.FromSeconds 3.0) with
+                    match! running.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 3.0) with
                     | Ok() -> Assert.Pass()
                     | Error error -> Assert.Fail $"{error}"
             finally
@@ -87,7 +89,7 @@ type ReadinessTests() =
     [<Test>]
     member _.``WaitFor polls a custom predicate``() : Task =
         task {
-            match! runner.Start(lingering (), CancellationToken.None) with
+            match! runner.StartAsync(lingering (), CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 use running = running
@@ -96,7 +98,7 @@ type ReadinessTests() =
                 let probe () =
                     Task.FromResult((DateTime.UtcNow - started).TotalMilliseconds > 200.0)
 
-                match! running.WaitFor(probe, TimeSpan.FromSeconds 3.0) with
+                match! running.WaitForAsync(probe, TimeSpan.FromSeconds 3.0) with
                 | Ok() -> Assert.Pass()
                 | Error error -> Assert.Fail $"{error}"
         }
@@ -105,16 +107,16 @@ type ReadinessTests() =
     [<Test>]
     member _.``WaitAny returns the first process to exit``() : Task =
         task {
-            match! runner.Start(shell "exit 0", CancellationToken.None) with
+            match! runner.StartAsync(shell "exit 0", CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok fast ->
-                match! runner.Start(lingering (), CancellationToken.None) with
+                match! runner.StartAsync(lingering (), CancellationToken.None) with
                 | Error error -> Assert.Fail $"{error}"
                 | Ok slow ->
                     use fast = fast
                     use slow = slow
 
-                    match! RunningProcess.WaitAny [| fast; slow |] with
+                    match! RunningProcess.WaitAnyAsync [| fast; slow |] with
                     | Ok result -> Assert.That(result.Index, Is.EqualTo 0)
                     | Error error -> Assert.Fail $"{error}"
         }
@@ -123,15 +125,15 @@ type ReadinessTests() =
     [<Test>]
     member _.``WaitAll waits for every process``() : Task =
         task {
-            match! runner.Start(shell "exit 3", CancellationToken.None) with
+            match! runner.StartAsync(shell "exit 3", CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok first ->
-                match! runner.Start(shell "exit 0", CancellationToken.None) with
+                match! runner.StartAsync(shell "exit 0", CancellationToken.None) with
                 | Error error -> Assert.Fail $"{error}"
                 | Ok second ->
                     use first = first
                     use second = second
-                    let! outcomes = RunningProcess.WaitAll [| first; second |]
+                    let! outcomes = RunningProcess.WaitAllAsync [| first; second |]
                     Assert.That(outcomes.Length, Is.EqualTo 2)
         }
         :> Task

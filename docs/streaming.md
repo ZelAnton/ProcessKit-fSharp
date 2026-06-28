@@ -5,13 +5,13 @@
 The one-shot verbs in [Running commands](commands.md) buffer the whole output and
 hand it back when the child exits. For a long-running or conversational child you
 want the output *as it arrives* — and sometimes a back-channel to write to it.
-`Command.Start()` (and the equivalent `IProcessRunner.Start` / `ProcessGroup.Start`)
+`Command.StartAsync()` (and the equivalent `IProcessRunner.Start` / `ProcessGroup.Start`)
 returns a live `RunningProcess` you drive yourself: stream stdout line by line,
 interleave stdout and stderr, write stdin incrementally, wait for the child to
 become *ready*, race several children, or profile a run end to end.
 
 The samples below run inside a `task { }` block and use `match!`; the verbs that
-return a value directly (`Wait`, `Profile`, `WaitAll`) use a plain `let!`. From C#
+return a value directly (`WaitAsync`, `ProfileAsync`, `WaitAllAsync`) use a plain `let!`. From C#
 the same surface is `await`-able fluent methods, and the `IAsyncEnumerable<_>`
 streams are `await foreach`.
 
@@ -26,7 +26,7 @@ streams are `await foreach`.
 
 ## Lifecycle
 
-`Start()` spawns the child and returns a `RunningProcess` without waiting for it to
+`StartAsync()` spawns the child and returns a `RunningProcess` without waiting for it to
 exit. The handle is an `IAsyncDisposable`: a `use` binding inside `task { }` reaps
 the whole process tree on scope exit, exactly like the disposal at the end of a
 one-shot run.
@@ -35,7 +35,7 @@ one-shot run.
 
 ```fsharp
 task {
-    match! (Command.create "dev-server").Start() with
+    match! (Command.create "dev-server").StartAsync() with
     | Error err -> eprintfn $"could not start: {err.Message}"
     | Ok proc ->
         use _ = proc // disposing the handle kills the whole tree
@@ -44,7 +44,7 @@ task {
         // ... drive the process: stream, write stdin, probe for readiness ...
         printfn $"alive for {proc.Elapsed}; {proc.StdoutLineCount} stdout lines so far"
 
-        let! outcome = proc.Wait() // Outcome: Exited code / Signalled sig / TimedOut
+        let! outcome = proc.WaitAsync() // Outcome: Exited code / Signalled sig / TimedOut
         printfn $"exited: {outcome}"
 }
 ```
@@ -52,44 +52,44 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("dev-server").Start()).GetValueOrThrow(); // disposing the handle kills the whole tree
+await using var proc = (await new Command("dev-server").StartAsync()).GetValueOrThrow(); // disposing the handle kills the whole tree
 
 Console.WriteLine($"pid={proc.Pid} started {proc.StartTime:o}");
 // ... drive the process: stream, write stdin, probe for readiness ...
 Console.WriteLine($"alive for {proc.Elapsed}; {proc.StdoutLineCount} stdout lines so far");
 
-var outcome = await proc.Wait(); // Outcome: Exited code / Signalled sig / TimedOut
+var outcome = await proc.WaitAsync(); // Outcome: Exited code / Signalled sig / TimedOut
 Console.WriteLine($"exited: {outcome}");
 ```
 
-`Start()` puts the child in a **private group the handle owns**: dropping the
+`StartAsync()` puts the child in a **private group the handle owns**: dropping the
 `RunningProcess` kills the tree, grandchildren included. The shared-group
-variant — `group.Start(cmd)` — returns the same kind of handle, but the *group*
+variant — `group.StartAsync(cmd)` — returns the same kind of handle, but the *group*
 controls the tree's fate (see [Process groups](process-groups.md)).
 
 Consume the handle **exactly one way** — stdout is read once:
 
-- `StdoutLines()` / `OutputEvents()` — stream output as it arrives (below).
-- `OutputString()` / `OutputBytes()` — capture everything, like the one-shot verbs.
-- `Wait()` — just the `Outcome`; output is discarded.
-- `Finish()` — after streaming stdout, collect the `Outcome` and drained stderr.
-- `Profile()` — capture plus periodic resource samples ([profiling](#profiling-a-run)).
+- `StdoutLinesAsync()` / `OutputEventsAsync()` — stream output as it arrives (below).
+- `OutputStringAsync()` / `OutputBytesAsync()` — capture everything, like the one-shot verbs.
+- `WaitAsync()` — just the `Outcome`; output is discarded.
+- `FinishAsync()` — after streaming stdout, collect the `Outcome` and drained stderr.
+- `ProfileAsync()` — capture plus periodic resource samples ([profiling](#profiling-a-run)).
 
-`StdoutLines()` / `OutputEvents()` need a **piped** stdout, which is the default for
-`Start()`; if you set `Command.Stdout` to `StdioMode.Inherit` or `StdioMode.Null`
+`StdoutLinesAsync()` / `OutputEventsAsync()` need a **piped** stdout, which is the default for
+`StartAsync()`; if you set `Command.Stdout` to `StdioMode.Inherit` or `StdioMode.Null`
 there is nothing to stream. The live gauges `Pid`, `Elapsed`, `StartTime`,
 `StdoutLineCount`, and `StderrLineCount` are cheap to read at any time, including
-mid-stream. There is also `StartKill()` — "stop it now, I'll `Wait()` for the
+mid-stream. There is also `StartKill()` — "stop it now, I'll `WaitAsync()` for the
 `Outcome` myself" — which begins teardown without blocking.
 
 A command's [`Timeout`](timeouts-and-cancellation.md) and `CancelOn` token **bound
 the stream**: at the deadline (or on cancellation) the tree is killed, the pipes
 close, and the stream ends — a streamed run can't hang past its deadline. After a
-cancelled run, `Finish()` reports `ProcessError.Cancelled`.
+cancelled run, `FinishAsync()` reports `ProcessError.Cancelled`.
 
 ## Streaming stdout line by line
 
-`StdoutLines()` returns an `IAsyncEnumerable<string>` that yields decoded lines as
+`StdoutLinesAsync()` returns an `IAsyncEnumerable<string>` that yields decoded lines as
 the child produces them — no waiting for exit, no full-output buffering. In F#,
 drive the enumerator directly:
 
@@ -97,11 +97,11 @@ drive the enumerator directly:
 
 ```fsharp
 task {
-    match! (Command.create "git" |> Command.args [ "log"; "--oneline"; "-n"; "50" ]).Start() with
+    match! (Command.create "git" |> Command.args [ "log"; "--oneline"; "-n"; "50" ]).StartAsync() with
     | Error err -> eprintfn $"{err.Message}"
     | Ok proc ->
         use _ = proc
-        let e = proc.StdoutLines().GetAsyncEnumerator()
+        let e = proc.StdoutLinesAsync().GetAsyncEnumerator()
 
         try
             let mutable go = true
@@ -118,13 +118,13 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("git").Args(["log", "--oneline", "-n", "50"]).Start()).GetValueOrThrow();
+await using var proc = (await new Command("git").Args(["log", "--oneline", "-n", "50"]).StartAsync()).GetValueOrThrow();
 
-await foreach (var line in proc.StdoutLines())
+await foreach (var line in proc.StdoutLinesAsync())
     Console.WriteLine($"commit: {line}");
 ```
 
-From C# the same loop is simply `await foreach (var line in proc.StdoutLines()) { ... }`.
+From C# the same loop is simply `await foreach (var line in proc.StdoutLinesAsync()) { ... }`.
 
 While you stream stdout, stderr is drained in the background, so a noisy child can
 never block on a full stderr pipe. The `OnStdoutLine` / `OnStderrLine` handlers and
@@ -134,7 +134,7 @@ streamed run — a handler sees each line on the pump, in addition to your loop.
 ## Interleaving stdout and stderr
 
 When the *order* of stdout relative to stderr matters — a build tool that prints
-progress to one and diagnostics to the other — `OutputEvents()` returns an
+progress to one and diagnostics to the other — `OutputEventsAsync()` returns an
 `IAsyncEnumerable<OutputEvent>` that merges both channels in arrival order. Each
 `OutputEvent` carries `IsStdout` / `IsStderr` and the line `Text`:
 
@@ -142,11 +142,11 @@ progress to one and diagnostics to the other — `OutputEvents()` returns an
 
 ```fsharp
 task {
-    match! (Command.create "dotnet" |> Command.args [ "build"; "-c"; "Release" ]).Start() with
+    match! (Command.create "dotnet" |> Command.args [ "build"; "-c"; "Release" ]).StartAsync() with
     | Error err -> eprintfn $"{err.Message}"
     | Ok proc ->
         use _ = proc
-        let e = proc.OutputEvents().GetAsyncEnumerator()
+        let e = proc.OutputEventsAsync().GetAsyncEnumerator()
 
         try
             let mutable go = true
@@ -166,9 +166,9 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("dotnet").Args(["build", "-c", "Release"]).Start()).GetValueOrThrow();
+await using var proc = (await new Command("dotnet").Args(["build", "-c", "Release"]).StartAsync()).GetValueOrThrow();
 
-await foreach (var ev in proc.OutputEvents())
+await foreach (var ev in proc.OutputEventsAsync())
 {
     if (ev.IsStdout)
         Console.WriteLine($"out| {ev.Text}");
@@ -177,13 +177,13 @@ await foreach (var ev in proc.OutputEvents())
 }
 ```
 
-From C#, `await foreach (var ev in proc.OutputEvents()) { ... }`. Choose `OutputEvents()`
-*or* `StdoutLines()` for a given run — both consume stdout, so they are alternatives,
+From C#, `await foreach (var ev in proc.OutputEventsAsync()) { ... }`. Choose `OutputEventsAsync()`
+*or* `StdoutLinesAsync()` for a given run — both consume stdout, so they are alternatives,
 not companions.
 
 ## Finishing a streamed run
 
-When the stream ends (stdout closed), collect the rest with `Finish()`, which returns
+When the stream ends (stdout closed), collect the rest with `FinishAsync()`, which returns
 `Result<Finished, ProcessError>`. `Finished` carries the `Outcome` and the `Stderr`
 that was drained while you streamed:
 
@@ -191,11 +191,11 @@ that was drained while you streamed:
 
 ```fsharp
 task {
-    match! (Command.create "build-everything").Start() with
+    match! (Command.create "build-everything").StartAsync() with
     | Error err -> eprintfn $"{err.Message}"
     | Ok proc ->
         use _ = proc
-        let e = proc.StdoutLines().GetAsyncEnumerator()
+        let e = proc.StdoutLinesAsync().GetAsyncEnumerator()
 
         try
             let mutable go = true
@@ -207,7 +207,7 @@ task {
         finally
             e.DisposeAsync().AsTask().Wait()
 
-        match! proc.Finish() with
+        match! proc.FinishAsync() with
         | Ok finished ->
             if finished.Outcome <> Outcome.Exited 0 then
                 eprintfn $"failed ({finished.Outcome}):\n{finished.Stderr}"
@@ -218,20 +218,20 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("build-everything").Start()).GetValueOrThrow();
+await using var proc = (await new Command("build-everything").StartAsync()).GetValueOrThrow();
 
-await foreach (var line in proc.StdoutLines())
+await foreach (var line in proc.StdoutLinesAsync())
     Console.WriteLine($"> {line}");
 
-var finished = (await proc.Finish()).GetValueOrThrow();
+var finished = (await proc.FinishAsync()).GetValueOrThrow();
 if (finished.Outcome is not { IsExited: true, Code.Value: 0 }) // anything but a clean exit 0
     Console.Error.WriteLine($"failed ({finished.Outcome}):\n{finished.Stderr}");
 ```
 
-Use `Finish()` after you have streamed stdout. If you only need the exit status and
-don't care about output, `Wait()` returns the `Outcome` directly and discards the
-captured output; if you skipped streaming altogether, `OutputString()` /
-`OutputBytes()` buffer and return everything just like the one-shot verbs.
+Use `FinishAsync()` after you have streamed stdout. If you only need the exit status and
+don't care about output, `WaitAsync()` returns the `Outcome` directly and discards the
+captured output; if you skipped streaming altogether, `OutputStringAsync()` /
+`OutputBytesAsync()` buffer and return everything just like the one-shot verbs.
 
 ## Interactive stdin
 
@@ -245,7 +245,7 @@ taken):
 ```fsharp
 task {
     // `bc` evaluates each stdin line and prints the result.
-    match! (Command.create "bc" |> Command.keepStdinOpen).Start() with
+    match! (Command.create "bc" |> Command.keepStdinOpen).StartAsync() with
     | Error err -> eprintfn $"{err.Message}"
     | Ok proc ->
         use _ = proc
@@ -254,10 +254,10 @@ task {
         | Some stdin ->
             do! stdin.WriteLine "2 + 2" // writes "2 + 2\n", flushed
             do! stdin.WriteLine "6 * 7"
-            do! stdin.Finish() // send EOF so bc exits
+            do! stdin.FinishAsync() // send EOF so bc exits
         | None -> ()
 
-        // ... then read proc.StdoutLines() for the answers.
+        // ... then read proc.StdoutLinesAsync() for the answers.
         ()
 }
 ```
@@ -266,22 +266,22 @@ task {
 
 ```csharp
 // `bc` evaluates each stdin line and prints the result.
-await using var proc = (await new Command("bc").KeepStdinOpen().Start()).GetValueOrThrow();
+await using var proc = (await new Command("bc").KeepStdinOpen().StartAsync()).GetValueOrThrow();
 
 if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
     await stdin.WriteLine("2 + 2"); // writes "2 + 2\n", flushed
     await stdin.WriteLine("6 * 7");
-    await stdin.Finish(); // send EOF so bc exits
+    await stdin.FinishAsync(); // send EOF so bc exits
 }
 
-// ... then read proc.StdoutLines() for the answers.
+// ... then read proc.StdoutLinesAsync() for the answers.
 ```
 
 `ProcessStdin` offers `WriteLine(line)` (appends a newline and flushes),
-`Write(bytes)` (raw bytes, for binary input), `Flush()`, and `Finish()` (close
+`Write(bytes)` (raw bytes, for binary input), `Flush()`, and `FinishAsync()` (close
 stdin / send EOF). Disposing the writer — or the whole `RunningProcess` — closes
-stdin too; `Finish()` just makes the EOF explicit and awaitable.
+stdin too; `FinishAsync()` just makes the EOF explicit and awaitable.
 
 **Avoid the full-duplex deadlock.** A child's stdout pipe has a finite OS buffer;
 once it fills, the child blocks *writing* stdout until something reads it. If you
@@ -295,7 +295,7 @@ the child produces output, write stdin from one task and drain stdout from anoth
 
 ```fsharp
 task {
-    match! (Command.create "transform" |> Command.keepStdinOpen).Start() with
+    match! (Command.create "transform" |> Command.keepStdinOpen).StartAsync() with
     | Error err -> eprintfn $"{err.Message}"
     | Ok proc ->
         use _ = proc
@@ -308,11 +308,11 @@ task {
                     for line in bigInput do
                         do! stdin.WriteLine line
 
-                    do! stdin.Finish()
+                    do! stdin.FinishAsync()
                 }
 
             // Consumer: drain stdout concurrently on this task.
-            let e = proc.StdoutLines().GetAsyncEnumerator()
+            let e = proc.StdoutLinesAsync().GetAsyncEnumerator()
 
             try
                 let mutable go = true
@@ -332,7 +332,7 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("transform").KeepStdinOpen().Start()).GetValueOrThrow();
+await using var proc = (await new Command("transform").KeepStdinOpen().StartAsync()).GetValueOrThrow();
 
 if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
@@ -342,11 +342,11 @@ if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and w
         foreach (var line in bigInput)
             await stdin.WriteLine(line);
 
-        await stdin.Finish();
+        await stdin.FinishAsync();
     });
 
     // Consumer: drain stdout concurrently on this task.
-    await foreach (var line in proc.StdoutLines())
+    await foreach (var line in proc.StdoutLinesAsync())
         handle(line);
 
     await writer;
@@ -369,13 +369,13 @@ returning a `Result`:
 
 ```fsharp
 task {
-    match! (Command.create "my-server").Start() with
+    match! (Command.create "my-server").StartAsync() with
     | Error err -> eprintfn $"{err.Message}"
     | Ok proc ->
         use _ = proc
 
         // 1. A line on stdout (returns the matching line):
-        match! proc.WaitForLine((fun line -> line.Contains "listening on"), TimeSpan.FromSeconds 10.0) with
+        match! proc.WaitForLineAsync((fun line -> line.Contains "listening on"), TimeSpan.FromSeconds 10.0) with
         | Ok banner -> printfn $"server says: {banner}"
         | Error(ProcessError.NotReady(program, timeout)) -> eprintfn $"{program} not ready after {timeout}"
         | Error err -> eprintfn $"{err.Message}"
@@ -383,12 +383,12 @@ task {
         // 2. A TCP port accepting connections:
         let endpoint = IPEndPoint(IPAddress.Loopback, 8080)
 
-        match! proc.WaitForPort(endpoint, TimeSpan.FromSeconds 10.0) with
+        match! proc.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 10.0) with
         | Ok() -> printfn "port is open"
         | Error err -> eprintfn $"{err.Message}"
 
         // 3. Any async predicate (an HTTP /health endpoint, a file appearing, …):
-        match! proc.WaitFor((fun () -> healthCheck ()), TimeSpan.FromSeconds 10.0) with
+        match! proc.WaitForAsync((fun () -> healthCheck ()), TimeSpan.FromSeconds 10.0) with
         | Ok() -> printfn "healthy"
         | Error err -> eprintfn $"{err.Message}"
 }
@@ -397,30 +397,30 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("my-server").Start()).GetValueOrThrow();
+await using var proc = (await new Command("my-server").StartAsync()).GetValueOrThrow();
 
 // 1. A line on stdout (returns the matching line):
-Console.WriteLine((await proc.WaitForLine(line => line.Contains("listening on"), TimeSpan.FromSeconds(10))).AsRun() switch
+Console.WriteLine(await proc.WaitForLineAsync(line => line.Contains("listening on"), TimeSpan.FromSeconds(10)) switch
 {
-    { IsOk: true, Value: var banner }                => $"server says: {banner}",
-    { IsOk: false, Error: ProcessError.NotReady nr } => $"{nr.program} not ready after {nr.timeout}",
-    { IsOk: false, Error: var err }                  => err.Message,
+    { IsOk: true, ResultValue: var banner }                => $"server says: {banner}",
+    { IsOk: false, ErrorValue: ProcessError.NotReady nr } => $"{nr.Program} not ready after {nr.Timeout}",
+    { IsOk: false, ErrorValue: var err }                  => err.Message,
 });
 
 // 2. A TCP port accepting connections:
 var endpoint = new IPEndPoint(IPAddress.Loopback, 8080);
 
-Console.WriteLine((await proc.WaitForPort(endpoint, TimeSpan.FromSeconds(10))).AsRun() switch
+Console.WriteLine(await proc.WaitForPortAsync(endpoint, TimeSpan.FromSeconds(10)) switch
 {
     { IsOk: true }        => "port is open",
-    { IsOk: false, Error: var err } => err.Message,
+    { IsOk: false, ErrorValue: var err } => err.Message,
 });
 
 // 3. Any async predicate (an HTTP /health endpoint, a file appearing, …):
-Console.WriteLine((await proc.WaitFor(() => healthCheck(), TimeSpan.FromSeconds(10))).AsRun() switch
+Console.WriteLine(await proc.WaitForAsync(() => healthCheck(), TimeSpan.FromSeconds(10)) switch
 {
     { IsOk: true }        => "healthy",
-    { IsOk: false, Error: var err } => err.Message,
+    { IsOk: false, ErrorValue: var err } => err.Message,
 });
 ```
 
@@ -429,15 +429,15 @@ Probe semantics are deliberately uniform:
 - A probe that can't pass within its deadline fails with **`ProcessError.NotReady`** —
   distinct from `ProcessError.Timeout`, which is the run's own deadline.
 - A probe also fails *fast* once readiness can no longer happen: the child exits, or
-  (for `WaitForLine`) its stdout closes — no waiting out a 10s deadline on a dead
+  (for `WaitForLineAsync`) its stdout closes — no waiting out a 10s deadline on a dead
   server.
 - A failed probe **never kills the child.** You decide what happens next: retry, log
   and continue, or tear down.
-- `WaitForLine` consumes stdout up to (and including) the matching line — continue with
-  `Finish()` or further streaming afterwards. `WaitForPort` / `WaitFor` don't touch the
+- `WaitForLineAsync` consumes stdout up to (and including) the matching line — continue with
+  `FinishAsync()` or further streaming afterwards. `WaitForPortAsync` / `WaitForAsync` don't touch the
   pipes at all.
 
-`WaitFor` takes a function returning `Task<bool>` (`Func<Task<bool>>` from C#), so any
+`WaitForAsync` takes a function returning `Task<bool>` (`Func<Task<bool>>` from C#), so any
 async health check fits — re-evaluated until it returns `true` or the deadline elapses.
 
 ## Racing several children
@@ -455,17 +455,17 @@ task {
     let withDeadline name =
         Command.create name |> Command.timeout (TimeSpan.FromSeconds 30.0)
 
-    match! (withDeadline "replica-a").Start() with
+    match! (withDeadline "replica-a").StartAsync() with
     | Error err -> eprintfn $"{err.Message}"
     | Ok a ->
         use _ = a
 
-        match! (withDeadline "replica-b").Start() with
+        match! (withDeadline "replica-b").StartAsync() with
         | Error err -> eprintfn $"{err.Message}"
         | Ok b ->
             use _ = b
 
-            match! RunningProcess.WaitAny [| a; b |] with
+            match! RunningProcess.WaitAnyAsync [| a; b |] with
             | Ok result -> printfn $"contender #{result.Index} exited first with {result.Outcome}"
             | Error err -> eprintfn $"{err.Message}"
 }
@@ -478,13 +478,13 @@ task {
 Command withDeadline(string name) =>
     new Command(name).Timeout(TimeSpan.FromSeconds(30));
 
-await using var a = (await withDeadline("replica-a").Start()).GetValueOrThrow();
-await using var b = (await withDeadline("replica-b").Start()).GetValueOrThrow();
+await using var a = (await withDeadline("replica-a").StartAsync()).GetValueOrThrow();
+await using var b = (await withDeadline("replica-b").StartAsync()).GetValueOrThrow();
 
-Console.WriteLine((await RunningProcess.WaitAny([a, b])).AsRun() switch
+Console.WriteLine(await RunningProcess.WaitAnyAsync([a, b]) switch
 {
-    { IsOk: true, Value: var first } => $"contender #{first.Index} exited first with {first.Outcome}",
-    { IsOk: false, Error: var err }  => err.Message,
+    { IsOk: true, ResultValue: var first } => $"contender #{first.Index} exited first with {first.Outcome}",
+    { IsOk: false, ErrorValue: var err }  => err.Message,
 });
 ```
 
@@ -495,14 +495,14 @@ wrapper):
 **F#**
 
 ```fsharp
-let! outcomes = RunningProcess.WaitAll [| a; b |]
+let! outcomes = RunningProcess.WaitAllAsync [| a; b |]
 printfn $"{outcomes.Length} children done"
 ```
 
 **C#**
 
 ```csharp
-var outcomes = await RunningProcess.WaitAll([a, b]);
+var outcomes = await RunningProcess.WaitAllAsync([a, b]);
 Console.WriteLine($"{outcomes.Length} children done");
 ```
 
@@ -512,14 +512,14 @@ bounded output buffer policy, so a child can't stall on a full pipe while you wa
 
 ## Profiling a run
 
-A `RunningProcess` reports its own resource usage live, and `Profile()` turns a whole
+A `RunningProcess` reports its own resource usage live, and `ProfileAsync()` turns a whole
 run into a summary. The live gauges read the *child process itself* at any moment:
 
 **F#**
 
 ```fsharp
 task {
-    match! (Command.create "crunch").Start() with
+    match! (Command.create "crunch").StartAsync() with
     | Error err -> eprintfn $"{err.Message}"
     | Ok proc ->
         use _ = proc
@@ -528,7 +528,7 @@ task {
         printfn $"pid={proc.Pid} elapsed={proc.Elapsed} cpu={proc.CpuTime} peak={proc.PeakMemoryBytes}"
 
         // Capture + sample on an interval until exit (returns a RunProfile directly):
-        let! profile = proc.Profile(TimeSpan.FromMilliseconds 100.0)
+        let! profile = proc.ProfileAsync(TimeSpan.FromMilliseconds 100.0)
 
         printfn $"exit={profile.ExitCode} wall={profile.Duration} samples={profile.Samples}"
         printfn $"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}"
@@ -538,26 +538,26 @@ task {
 **C#**
 
 ```csharp
-await using var proc = (await new Command("crunch").Start()).GetValueOrThrow();
+await using var proc = (await new Command("crunch").StartAsync()).GetValueOrThrow();
 
 // Live, mid-run:
 Console.WriteLine($"pid={proc.Pid} elapsed={proc.Elapsed} cpu={proc.CpuTime} peak={proc.PeakMemoryBytes}");
 
 // Capture + sample on an interval until exit (returns a RunProfile directly):
-var profile = await proc.Profile(TimeSpan.FromMilliseconds(100));
+var profile = await proc.ProfileAsync(TimeSpan.FromMilliseconds(100));
 
 Console.WriteLine($"exit={profile.ExitCode} wall={profile.Duration} samples={profile.Samples}");
 Console.WriteLine($"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}");
 ```
 
-`Profile()` with no argument uses a default sampling interval; `Profile(interval)`
-samples at the cadence you pick. The resulting `RunProfile` exposes `ExitCode`,
+`ProfileAsync()` with no argument uses a default sampling interval; `Profile(interval)`
+samples at the cadence you pick. The resulting `RunProfile` exposes `ExitCodeAsync`,
 `Duration` (wall clock), `CpuTime` (user + kernel), `PeakMemoryBytes`, the number of
 `Samples` taken, and `AvgCpu` — CPU time over wall time, so a value near `1.7` means
 roughly 1.7 cores were busy on average.
 
 These figures describe the started child, not a whole tree — for the tree's
-aggregate use `ProcessGroup.Stats` / `SampleStats` ([Process groups](process-groups.md)).
+aggregate use `ProcessGroup.Stats` / `SampleStatsAsync` ([Process groups](process-groups.md)).
 Availability follows the platform: full CPU and memory on Windows and the Linux
 cgroup backend, and `None` where the kernel doesn't account per-process cheaply — see
 [Platform support](platform-support.md).

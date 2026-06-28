@@ -18,14 +18,14 @@ type internal LoggingRunner(inner: IProcessRunner, logger: ILogger) =
             command
 
     interface IProcessRunner with
-        member _.OutputString(command, cancellationToken) =
-            inner.OutputString(withLogger command, cancellationToken)
+        member _.OutputStringAsync(command, cancellationToken) =
+            inner.OutputStringAsync(withLogger command, cancellationToken)
 
-        member _.OutputBytes(command, cancellationToken) =
-            inner.OutputBytes(withLogger command, cancellationToken)
+        member _.OutputBytesAsync(command, cancellationToken) =
+            inner.OutputBytesAsync(withLogger command, cancellationToken)
 
-        member _.Start(command, cancellationToken) =
-            inner.Start(withLogger command, cancellationToken)
+        member _.StartAsync(command, cancellationToken) =
+            inner.StartAsync(withLogger command, cancellationToken)
 
 /// `IServiceCollection.AddProcessKit()` extensions.
 [<Extension>]

@@ -32,10 +32,10 @@ type VerbTests() =
             use sink = new MemoryStream()
             let command = shell "echo teed" |> Command.stdoutTee sink
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
-                match! running.OutputString() with
+                match! running.OutputStringAsync() with
                 | Ok result ->
                     let teed = Encoding.UTF8.GetString(sink.ToArray())
                     Assert.That(teed, Does.Contain "teed")
@@ -75,31 +75,31 @@ type VerbTests() =
         :> Task
 
     [<Test>]
-    member _.``Command.ExitCode returns the process exit code``() : Task =
+    member _.``Command.ExitCodeAsync returns the process exit code``() : Task =
         task {
-            match! (shell "exit 7").ExitCode() with
+            match! (shell "exit 7").ExitCodeAsync() with
             | Ok code -> Assert.That(code, Is.EqualTo 7)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
 
     [<Test>]
-    member _.``Command.Probe reads exit 0/1 as true/false``() : Task =
+    member _.``Command.ProbeAsync reads exit 0/1 as true/false``() : Task =
         task {
-            match! (shell "exit 0").Probe() with
+            match! (shell "exit 0").ProbeAsync() with
             | Ok value -> Assert.That(value, Is.True)
             | Error error -> Assert.Fail $"{error}"
 
-            match! (shell "exit 1").Probe() with
+            match! (shell "exit 1").ProbeAsync() with
             | Ok value -> Assert.That(value, Is.False)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
 
     [<Test>]
-    member _.``Command.RunUnit succeeds on a zero exit and is cancellable``() : Task =
+    member _.``Command.RunUnitAsync succeeds on a zero exit and is cancellable``() : Task =
         task {
-            match! (shell "echo hi").RunUnit(CancellationToken.None) with
+            match! (shell "echo hi").RunUnitAsync(CancellationToken.None) with
             | Ok() -> Assert.Pass()
             | Error error -> Assert.Fail $"{error}"
         }
@@ -109,30 +109,30 @@ type VerbTests() =
     member _.``Command.Parse/TryParse/FirstLine are reachable on the default runner (both overloads)``() : Task =
         task {
             // Parse — no-token and cancellation-token overloads.
-            match! (shell "echo 42").Parse(fun s -> int (s.Trim())) with
+            match! (shell "echo 42").ParseAsync(fun s -> int (s.Trim())) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"parse: {error}"
 
-            match! (shell "echo 42").Parse((fun s -> int (s.Trim())), CancellationToken.None) with
+            match! (shell "echo 42").ParseAsync((fun s -> int (s.Trim())), CancellationToken.None) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"parse(ct): {error}"
 
             // TryParse — no-token and cancellation-token overloads.
-            match! (shell "echo 42").TryParse(fun s -> Ok(int (s.Trim()))) with
+            match! (shell "echo 42").TryParseAsync(fun s -> Ok(int (s.Trim()))) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"tryParse: {error}"
 
-            match! (shell "echo 42").TryParse((fun s -> Ok(int (s.Trim()))), CancellationToken.None) with
+            match! (shell "echo 42").TryParseAsync((fun s -> Ok(int (s.Trim()))), CancellationToken.None) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"tryParse(ct): {error}"
 
             // FirstLine — no-token and cancellation-token overloads.
-            match! threeLines.FirstLine(fun line -> line.Contains "line2") with
+            match! threeLines.FirstLineAsync(fun line -> line.Contains "line2") with
             | Ok(Some line) -> Assert.That(line, Does.Contain "line2")
             | Ok None -> Assert.Fail "expected a matching line"
             | Error error -> Assert.Fail $"firstLine: {error}"
 
-            match! threeLines.FirstLine((fun line -> line.Contains "line2"), CancellationToken.None) with
+            match! threeLines.FirstLineAsync((fun line -> line.Contains "line2"), CancellationToken.None) with
             | Ok(Some line) -> Assert.That(line, Does.Contain "line2")
             | Ok None -> Assert.Fail "expected a matching line"
             | Error error -> Assert.Fail $"firstLine(ct): {error}"

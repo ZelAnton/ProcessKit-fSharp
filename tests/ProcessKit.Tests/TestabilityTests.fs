@@ -13,9 +13,9 @@ type private CountingRunner(inner: IProcessRunner) =
     let mutable count = 0
     member _.Count = count
 
-    override this.OutputString(command, cancellationToken) =
+    override this.OutputStringAsync(command, cancellationToken) =
         count <- count + 1
-        base.OutputString(command, cancellationToken)
+        base.OutputStringAsync(command, cancellationToken)
 
 /// Tests for the additive testability seams: FakeProcess, failable/timed-out Reply, ScriptedRunner.Start,
 /// and DelegatingProcessRunner.
@@ -27,7 +27,7 @@ type TestabilityTests() =
         task {
             use proc = FakeProcess.Create("svc").WithStdout("hello\nworld").WithExit(3).Build()
 
-            match! proc.OutputString() with
+            match! proc.OutputStringAsync() with
             | Ok result ->
                 Assert.That(result.Stdout, Is.EqualTo "hello\nworld")
                 Assert.That(result.Code, Is.EqualTo(Some 3))
@@ -39,7 +39,7 @@ type TestabilityTests() =
         task {
             use proc = FakeProcess.Create().WithStdoutLines([ "a"; "b"; "c" ]).Build()
             let collected = ResizeArray<string>()
-            let enumerator = proc.StdoutLines().GetAsyncEnumerator()
+            let enumerator = proc.StdoutLinesAsync().GetAsyncEnumerator()
             let mutable more = true
 
             while more do
@@ -55,16 +55,16 @@ type TestabilityTests() =
         }
 
     [<Test>]
-    member _.``ScriptedRunner.Start serves a fake streaming process``() : Task =
+    member _.``ScriptedRunner.StartAsync serves a fake streaming process``() : Task =
         task {
             let runner: IProcessRunner = ScriptedRunner().On([ "svc" ], Reply.Ok "ready\ngo")
 
-            match! runner.Start(Command.create "svc", CancellationToken.None) with
+            match! runner.StartAsync(Command.create "svc", CancellationToken.None) with
             | Error error -> Assert.Fail $"Start failed: {error.Message}"
             | Ok proc ->
                 use proc = proc
 
-                match! proc.OutputString() with
+                match! proc.OutputStringAsync() with
                 | Ok result -> Assert.That(result.Stdout, Is.EqualTo "ready\ngo")
                 | Error error -> Assert.Fail $"OutputString failed: {error.Message}"
         }
@@ -75,7 +75,7 @@ type TestabilityTests() =
             let runner: IProcessRunner =
                 ScriptedRunner().On([ "x" ], Reply.Error(ProcessError.NotFound("x", None)))
 
-            match! runner.OutputString(Command.create "x", CancellationToken.None) with
+            match! runner.OutputStringAsync(Command.create "x", CancellationToken.None) with
             | Error(ProcessError.NotFound _) -> ()
             | other -> Assert.Fail $"expected a NotFound error, got {other}"
         }
@@ -85,7 +85,7 @@ type TestabilityTests() =
         task {
             let runner: IProcessRunner = ScriptedRunner().On([ "x" ], Reply.TimedOut)
 
-            match! runner.OutputString(Command.create "x", CancellationToken.None) with
+            match! runner.OutputStringAsync(Command.create "x", CancellationToken.None) with
             | Ok result -> Assert.That(result.IsTimedOut, Is.True)
             | Error error -> Assert.Fail $"expected a timed-out result, got {error.Message}"
         }
@@ -96,7 +96,7 @@ type TestabilityTests() =
             let scripted: IProcessRunner = ScriptedRunner().On([ "x" ], Reply.Ok "hi")
             let counter = CountingRunner scripted
 
-            match! (counter :> IProcessRunner).OutputString(Command.create "x", CancellationToken.None) with
+            match! (counter :> IProcessRunner).OutputStringAsync(Command.create "x", CancellationToken.None) with
             | Ok result ->
                 Assert.That(result.Stdout, Is.EqualTo "hi")
                 Assert.That(counter.Count, Is.EqualTo 1)
@@ -114,13 +114,13 @@ type TestabilityTests() =
 
             let command = Command.create "svc"
 
-            let! captured = runner.OutputString(command, CancellationToken.None)
+            let! captured = runner.OutputStringAsync(command, CancellationToken.None)
 
-            match! runner.Start(command, CancellationToken.None) with
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"Start failed: {error.Message}"
             | Ok proc ->
                 use proc = proc
-                let! streamed = proc.OutputString()
+                let! streamed = proc.OutputStringAsync()
 
                 match captured, streamed with
                 | Ok cap, Ok str ->
@@ -130,11 +130,11 @@ type TestabilityTests() =
         }
 
     [<Test>]
-    member _.``ScriptedRunner.OutputBytes captures the scripted output``() : Task =
+    member _.``ScriptedRunner.OutputBytesAsync captures the scripted output``() : Task =
         task {
             let runner: IProcessRunner = ScriptedRunner().On([ "x" ], Reply.Ok "payload-bytes")
 
-            match! runner.OutputBytes(Command.create "x", CancellationToken.None) with
+            match! runner.OutputBytesAsync(Command.create "x", CancellationToken.None) with
             | Ok result ->
                 // ASCII payload, so the decoded bytes are encoding-agnostic.
                 Assert.That(System.Text.Encoding.UTF8.GetString result.Stdout, Is.EqualTo "payload-bytes")
@@ -148,7 +148,7 @@ type TestabilityTests() =
             let runner: IProcessRunner = ScriptedRunner().On([ "svc" ], Reply.Exit 3)
             let command = Command.create "svc" |> Command.okCodes [ 0; 3 ]
 
-            match! runner.OutputString(command, CancellationToken.None) with
+            match! runner.OutputStringAsync(command, CancellationToken.None) with
             | Ok result ->
                 Assert.That(result.IsSuccess, Is.True)
                 Assert.That(result.Code, Is.EqualTo(Some 3))
@@ -162,7 +162,7 @@ type TestabilityTests() =
             let command = Command.create "svc" |> Command.okCodes [ 0; 3 ]
             use proc = FakeProcess.OfCommand(command).WithExit(3).Build()
 
-            match! proc.OutputString() with
+            match! proc.OutputStringAsync() with
             | Ok result ->
                 Assert.That(result.IsSuccess, Is.True)
                 CollectionAssert.AreEqual([| 0; 3 |], result.AcceptedCodes)

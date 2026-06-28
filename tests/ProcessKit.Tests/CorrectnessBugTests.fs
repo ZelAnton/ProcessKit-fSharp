@@ -48,7 +48,7 @@ type CorrectnessBugTests() =
             // orphaning the pumps; it must instead run as if no timeout were set.
             let cmd = (shell "exit 0") |> Command.timeout TimeSpan.MaxValue
 
-            match! cmd.Run() with
+            match! cmd.RunAsync() with
             | Ok _ -> ()
             | Error err -> Assert.Fail $"expected the run to complete, got {err.Message}"
         }
@@ -56,21 +56,21 @@ type CorrectnessBugTests() =
     [<Test>]
     member _.``a second terminal verb on a consumed RunningProcess is refused, not a double-pump``() : Task =
         task {
-            match! runner.Start(shell "echo hi", CancellationToken.None) with
+            match! runner.StartAsync(shell "echo hi", CancellationToken.None) with
             | Error e -> failwith $"Start failed: {e}"
             | Ok running ->
-                match! running.OutputString() with
+                match! running.OutputStringAsync() with
                 | Error e -> Assert.Fail $"first OutputString failed: {e.Message}"
                 | Ok _ ->
                     // A second buffered verb is refused with a clean error rather than racing a second
                     // reader on the (now torn-down) pipe.
-                    match! running.OutputString() with
+                    match! running.OutputStringAsync() with
                     | Error(ProcessError.Unsupported _) -> ()
                     | Error other -> Assert.Fail $"expected Unsupported, got {other.Message}"
                     | Ok _ -> Assert.Fail "expected the second OutputString to be refused"
 
                     // A non-Result terminal verb refuses by throwing.
-                    Assert.Throws<InvalidOperationException>(Action(fun () -> running.Wait() |> ignore))
+                    Assert.Throws<InvalidOperationException>(Action(fun () -> running.WaitAsync() |> ignore))
                     |> ignore
 
                 do! (running :> IAsyncDisposable).DisposeAsync()
@@ -84,7 +84,7 @@ type CorrectnessBugTests() =
             // {0}).
             let pipeline = (shell "echo hi").Pipe((shell "exit 3") |> Command.okCodes [ 0; 3 ])
 
-            match! pipeline.OutputString() with
+            match! pipeline.OutputStringAsync() with
             | Error e -> Assert.Fail $"pipeline errored: {e.Message}"
             | Ok result ->
                 match ProcessResult.ensureSuccess result with
@@ -97,7 +97,7 @@ type CorrectnessBugTests() =
         task {
             let pipeline = (shell "echo hi").Pipe(shell "exit 4")
 
-            match! pipeline.Run() with
+            match! pipeline.RunAsync() with
             | Error _ -> ()
             | Ok _ -> Assert.Fail "expected the pipeline to fail on the unaccepted exit 4"
         }
@@ -115,7 +115,7 @@ type CorrectnessBugTests() =
                 ((shell "echo hello") |> Command.stdout StdioMode.Inherit).Pipe(shell "sort")
                 |> Pipeline.timeout (TimeSpan.FromSeconds 10.0)
 
-            match! pipeline.OutputString() with
+            match! pipeline.OutputStringAsync() with
             | Error e -> Assert.Fail $"pipeline errored: {e.Message}"
             | Ok result ->
                 match result.Outcome with

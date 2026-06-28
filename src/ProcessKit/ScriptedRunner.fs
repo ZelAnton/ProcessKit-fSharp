@@ -44,7 +44,7 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
             | None -> invalidOp $"ScriptedRunner: no scripted reply matched command '{command.Program}'."
 
     interface IProcessRunner with
-        member this.OutputString(command, cancellationToken) =
+        member this.OutputStringAsync(command, cancellationToken) =
             if cancellationToken.IsCancellationRequested then
                 // Honour the contract that a cancelled run is always an error, matching `JobRunner` /
                 // `ProcessGroup`, so the cancelled path is testable through the scripted seam too.
@@ -64,9 +64,9 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
                         .WithStderr(reply.StderrText)
                         .WithOutcome(reply.Outcome)
                         .Build()
-                        .OutputString()
+                        .OutputStringAsync()
 
-        member this.Start(command, cancellationToken) =
+        member this.StartAsync(command, cancellationToken) =
             if cancellationToken.IsCancellationRequested then
                 Task.FromResult(Error(ProcessError.Cancelled command.Program))
             else
@@ -88,7 +88,7 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
 
                     Task.FromResult(Ok running)
 
-        member this.OutputBytes(command, cancellationToken) =
+        member this.OutputBytesAsync(command, cancellationToken) =
             if cancellationToken.IsCancellationRequested then
                 Task.FromResult(Error(ProcessError.Cancelled command.Program))
             else
@@ -105,4 +105,4 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
                         .WithStderr(reply.StderrText)
                         .WithOutcome(reply.Outcome)
                         .Build()
-                        .OutputBytes()
+                        .OutputBytesAsync()

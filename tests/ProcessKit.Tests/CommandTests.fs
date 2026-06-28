@@ -115,21 +115,3 @@ type CommandTests() =
         )
 
         Assert.That(seen, Is.EqualTo "err:cancelled")
-
-    [<Test>]
-    member _.``AsRun exposes IsOk / Value / Error and throws reading the wrong case``() =
-        let ok = ResultExtensions.AsRun(Ok 5: Result<int, ProcessError>)
-        Assert.That(ok.IsOk, Is.True)
-        Assert.That(ok.Value, Is.EqualTo 5)
-
-        Assert.Throws<System.InvalidOperationException>(System.Action(fun () -> ok.Error |> ignore))
-        |> ignore
-
-        let err =
-            ResultExtensions.AsRun(Error(ProcessError.Cancelled "x"): Result<int, ProcessError>)
-
-        Assert.That(err.IsOk, Is.False)
-        Assert.That(err.Error.IsCancelled, Is.True)
-
-        Assert.Throws<System.InvalidOperationException>(System.Action(fun () -> err.Value |> ignore))
-        |> ignore

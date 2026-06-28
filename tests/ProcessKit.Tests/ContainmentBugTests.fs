@@ -49,7 +49,7 @@ type ContainmentBugTests() =
 
             (group :> IDisposable).Dispose()
 
-            match! group.Start(shell "exit 0") with
+            match! group.StartAsync(shell "exit 0") with
             | Error _ -> ()
             | Ok _ -> Assert.Fail "expected an error starting into a released group"
         }
@@ -62,7 +62,7 @@ type ContainmentBugTests() =
             let pipeline =
                 (shell "echo hello").Pipe(Command.create "pk-definitely-not-a-program-xyz")
 
-            match! pipeline.Run() with
+            match! pipeline.RunAsync() with
             | Error _ -> ()
             | Ok _ -> Assert.Fail "expected an error from the missing pipeline stage"
         }
@@ -74,7 +74,7 @@ type ContainmentBugTests() =
             // run cleanly (on macOS the spawn must keep fd 1 open under CLOEXEC_DEFAULT).
             let cmd = (shell "echo inherited-ok") |> Command.stdout StdioMode.Inherit
 
-            match! cmd.Run() with
+            match! cmd.RunAsync() with
             | Ok _ -> ()
             | Error err -> Assert.Fail $"inherited-stdout run failed: {err.Message}"
         }
@@ -93,7 +93,7 @@ type ContainmentBugTests() =
 
             // Start a child but deliberately never consume the RunningProcess, so the group's teardown
             // is the only thing that can reap the leader.
-            let! started = group.Start(shell "sleep 30")
+            let! started = group.StartAsync(shell "sleep 30")
 
             let _running =
                 match started with

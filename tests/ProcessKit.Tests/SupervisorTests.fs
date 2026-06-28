@@ -14,16 +14,16 @@ type private SequenceRunner(replies: Result<ProcessResult<string>, ProcessError>
     let queue = Queue<Result<ProcessResult<string>, ProcessError>>(replies)
 
     interface IProcessRunner with
-        member _.OutputString(_command, _cancellationToken) =
+        member _.OutputStringAsync(_command, _cancellationToken) =
             if queue.Count = 0 then
                 failwith "SequenceRunner ran out of scripted replies"
 
             Task.FromResult(queue.Dequeue())
 
-        member _.OutputBytes(_command, _cancellationToken) =
+        member _.OutputBytesAsync(_command, _cancellationToken) =
             failwith "SequenceRunner only scripts OutputString"
 
-        member _.Start(_command, _cancellationToken) =
+        member _.StartAsync(_command, _cancellationToken) =
             failwith "SequenceRunner only scripts OutputString"
 
 /// Records the output-buffer policy of the command it is asked to run, so a test can assert the
@@ -32,17 +32,17 @@ type private CapturingRunner() =
     member val SeenPolicy: OutputBufferPolicy option = None with get, set
 
     interface IProcessRunner with
-        member this.OutputString(command, _cancellationToken) =
+        member this.OutputStringAsync(command, _cancellationToken) =
             this.SeenPolicy <- Some command.Config.OutputBuffer
 
             Task.FromResult(
                 Ok(ProcessResult<string>(command.Program, "out", "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ]))
             )
 
-        member _.OutputBytes(_command, _cancellationToken) =
+        member _.OutputBytesAsync(_command, _cancellationToken) =
             failwith "CapturingRunner only scripts OutputString"
 
-        member _.Start(_command, _cancellationToken) =
+        member _.StartAsync(_command, _cancellationToken) =
             failwith "CapturingRunner only scripts OutputString"
 
 /// A virtual clock: `Sleep` records the requested delay and advances `Now` instead of waiting, so
@@ -99,7 +99,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``OnCrash restarts until success``() : Task =
         task {
-            match! supervise([ failWith 1; failWith 1; ok () ]).Run() with
+            match! supervise([ failWith 1; failWith 1; ok () ]).RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 2)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
@@ -111,7 +111,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``zero MaxRestarts means a single run``() : Task =
         task {
-            match! supervise([ failWith 1; ok () ]).MaxRestarts(0).Run() with
+            match! supervise([ failWith 1; ok () ]).MaxRestarts(0).RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 0)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.RestartsExhausted)
@@ -123,7 +123,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``OnCrash accepts a clean first run``() : Task =
         task {
-            match! supervise([ ok () ]).Run() with
+            match! supervise([ ok () ]).RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 0)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
@@ -137,7 +137,7 @@ type SupervisorTests() =
             let sup =
                 supervise([ ok () ]).Restart(RestartPolicy.Always).StopWhen(fun result -> result.Code = Some 0)
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 0)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.Predicate)
@@ -158,7 +158,7 @@ type SupervisorTests() =
                         seen <- seen + 1
                         n = 2)
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 2)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.Predicate)
@@ -169,7 +169,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``Never reports a failing run without restarting``() : Task =
         task {
-            match! supervise([ failWith 3 ]).Restart(RestartPolicy.Never).Run() with
+            match! supervise([ failWith 3 ]).Restart(RestartPolicy.Never).RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 0)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
@@ -181,7 +181,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``exhausting the budget reports the last failure``() : Task =
         task {
-            match! supervise([ failWith 7; failWith 7; failWith 7 ]).MaxRestarts(2).Run() with
+            match! supervise([ failWith 7; failWith 7; failWith 7 ]).MaxRestarts(2).RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 2)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.RestartsExhausted)
@@ -193,7 +193,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``an accepted non-zero exit is not a crash``() : Task =
         task {
-            match! supervise([ accepted 2 [ 0; 2 ] ]).Run() with
+            match! supervise([ accepted 2 [ 0; 2 ] ]).RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 0)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
@@ -205,7 +205,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``a rejected zero exit is a crash``() : Task =
         task {
-            match! supervise([ accepted 0 [ 1 ]; ok () ]).Run() with
+            match! supervise([ accepted 0 [ 1 ]; ok () ]).RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 1)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
@@ -216,7 +216,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``a timeout counts as a crash``() : Task =
         task {
-            match! supervise([ timedOut (); ok () ]).Run() with
+            match! supervise([ timedOut (); ok () ]).RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 1)
                 Assert.That(outcome.FinalResult.IsSuccess, Is.True)
@@ -227,7 +227,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``a terminal spawn error surfaces as Error``() : Task =
         task {
-            match! supervise([ spawnErr (); spawnErr () ]).MaxRestarts(1).Run() with
+            match! supervise([ spawnErr (); spawnErr () ]).MaxRestarts(1).RunAsync() with
             | Error(ProcessError.Spawn _) -> Assert.Pass()
             | other -> Assert.Fail $"expected Spawn, got {other}"
         }
@@ -236,7 +236,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``a spawn error is retried like a crash``() : Task =
         task {
-            match! supervise([ spawnErr (); ok () ]).Run() with
+            match! supervise([ spawnErr (); ok () ]).RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 1)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
@@ -252,7 +252,7 @@ type SupervisorTests() =
             let sup =
                 supervise([ cancelledErr (); ok () ]).Restart(RestartPolicy.Always).MaxRestarts(5)
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Error(ProcessError.Cancelled _) -> Assert.Pass()
             | other -> Assert.Fail $"expected Cancelled, got {other}"
         }
@@ -261,7 +261,7 @@ type SupervisorTests() =
     [<Test>]
     member _.``Never returns a spawn error directly``() : Task =
         task {
-            match! supervise([ spawnErr () ]).Restart(RestartPolicy.Never).Run() with
+            match! supervise([ spawnErr () ]).Restart(RestartPolicy.Never).RunAsync() with
             | Error(ProcessError.Spawn _) -> Assert.Pass()
             | other -> Assert.Fail $"expected Spawn, got {other}"
         }
@@ -281,7 +281,7 @@ type SupervisorTests() =
                     .Jitter(false)
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 2)
                 Assert.That(clock.Delays.Count, Is.EqualTo 2)
@@ -303,7 +303,7 @@ type SupervisorTests() =
                     .Jitter(false)
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 2)
                 Assert.That(totalMs clock, Is.EqualTo(500.0).Within 1.0) // 200 + 400->300
@@ -323,7 +323,7 @@ type SupervisorTests() =
                     .Jitter(false)
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 2)
                 Assert.That(totalMs clock, Is.EqualTo(200.0).Within 1.0) // 100 + 100
@@ -342,7 +342,7 @@ type SupervisorTests() =
                     .Backoff(TimeSpan.FromMilliseconds 1000.0, 1.0)
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 1)
                 let waited = (Seq.head clock.Delays).TotalMilliseconds
@@ -362,7 +362,7 @@ type SupervisorTests() =
                 supervise [ failWith 1; failWith 1; failWith 1; failWith 1; ok () ]
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.StormPauses, Is.EqualTo 0)
                 Assert.That(totalMs clock, Is.EqualTo 0.0) // no hidden pauses
@@ -383,7 +383,7 @@ type SupervisorTests() =
                     .FailureDecay(TimeSpan.FromSeconds 1000.0)
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 3)
                 Assert.That(outcome.StormPauses, Is.EqualTo 1)
@@ -407,7 +407,7 @@ type SupervisorTests() =
                     .FailureDecay(TimeSpan.FromSeconds 1.0)
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 3)
                 Assert.That(outcome.StormPauses, Is.EqualTo 0)
@@ -428,7 +428,7 @@ type SupervisorTests() =
                     .FailureDecay(TimeSpan.FromSeconds 1000.0)
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 4)
                 Assert.That(outcome.StormPauses, Is.EqualTo 2)
@@ -449,7 +449,7 @@ type SupervisorTests() =
                     .FailureDecay(TimeSpan.FromSeconds 1000.0)
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.RestartsExhausted)
                 Assert.That(outcome.StormPauses, Is.EqualTo 0)
@@ -476,7 +476,7 @@ type SupervisorTests() =
                         n = 2)
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 2)
                 Assert.That(outcome.StormPauses, Is.EqualTo 0)
@@ -493,7 +493,7 @@ type SupervisorTests() =
                 supervise([ cancelledErr () ]).StormPause(TimeSpan.FromSeconds 60.0).FailureThreshold(0.0)
                 |> withClock clock
 
-            match! sup.Run() with
+            match! sup.RunAsync() with
             | Error(ProcessError.Cancelled _) -> Assert.That(totalMs clock, Is.EqualTo 0.0) // no storm pause was taken
             | other -> Assert.Fail $"expected Cancelled, got {other}"
         }
@@ -504,7 +504,9 @@ type SupervisorTests() =
         task {
             let capturing = CapturingRunner()
 
-            match! Supervisor(Command.create "server").Restart(RestartPolicy.Never).WithRunner(capturing).Run() with
+            match!
+                Supervisor(Command.create "server").Restart(RestartPolicy.Never).WithRunner(capturing).RunAsync()
+            with
             | Ok _ ->
                 Assert.That(capturing.SeenPolicy.Value.MaxLines, Is.EqualTo(Some Supervision.DefaultSupervisionTail))
             | Error error -> Assert.Fail $"{error}"
@@ -516,7 +518,7 @@ type SupervisorTests() =
                     .Restart(RestartPolicy.Never)
                     .Capture(OutputBufferPolicy.Unbounded)
                     .WithRunner(unboundedRunner)
-                    .Run()
+                    .RunAsync()
             with
             | Ok _ -> Assert.That(unboundedRunner.SeenPolicy.Value.MaxLines.IsNone, Is.True)
             | Error error -> Assert.Fail $"{error}"
