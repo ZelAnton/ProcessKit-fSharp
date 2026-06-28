@@ -225,6 +225,14 @@ type RunningProcess internal (host: RunningHost) =
         { new IAsyncDisposable with
             member _.DisposeAsync() = host.Teardown() }
 
+    // Observe any fault on an otherwise fire-and-forget outcome task, so it can never surface as an
+    // unobserved task exception at finalization when nothing awaits it (a streaming-only consumer that
+    // abandons `FinishAsync`). A consumer that *does* await (`FinishAsync`/`WaitAnyAsync`/`WaitAllAsync`)
+    // still re-throws it. Used by both streaming sessions.
+    let observeFault (outcomeTask: Task<Outcome>) =
+        outcomeTask.ContinueWith(Action<Task<Outcome>>(fun t -> t.Exception |> ignore))
+        |> ignore
+
     // Log the spawn once, at construction.
     do Log.spawn config.Logger config.Program host.Pid
 
@@ -495,12 +503,10 @@ type RunningProcess internal (host: RunningHost) =
                     return outcome
                 }
 
-            // A `StdoutLinesAsync()` consumer can abandon `FinishAsync()` — e.g. its enumeration throws because a
-            // faulting `OnStdoutLine` handler completed the channel with the error. Observe `streamOutcome`'s
-            // fault here so that abandoned task can't surface as an unobserved exception at finalization;
-            // a consumer that does await (`FinishAsync`/`WaitAnyAsync`/`WaitAllAsync`) still re-throws it.
-            streamOutcome.ContinueWith(Action<Task<Outcome>>(fun t -> t.Exception |> ignore))
-            |> ignore
+            // A `StdoutLinesAsync()` consumer can abandon `FinishAsync()` (e.g. its enumeration throws
+            // because a faulting `OnStdoutLine` handler completed the channel with the error), so observe
+            // the outcome fault here.
+            observeFault streamOutcome
 
             true
 
@@ -541,31 +547,44 @@ type RunningProcess internal (host: RunningHost) =
             // process exits — `eventOutcome` below only completes the channel after the exit wait, which
             // for a long-running child can be far away. `TryComplete` because the two pumps and the
             // combined task below all race to complete the one channel; re-raise so `eventOutcome` faults.
-            let stdoutPump =
+            // One helper for both streams so the fault-completion invariant lives in a single place.
+            let eventPump
+                (stream: Stream option)
+                encoding
+                tee
+                (onLine: Action<string> option)
+                (bump: unit -> unit)
+                (wrap: OutputLine -> OutputEvent)
+                =
                 task {
                     try
                         do!
-                            pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
-                                invokeLine config.OnStdoutLine line
-                                stdoutLineCount <- stdoutLineCount + 1
-                                eventChannel.Writer.TryWrite(OutputEvent.Stdout(OutputLine line)) |> ignore)
+                            pumpLines stream encoding tee (fun line ->
+                                invokeLine onLine line
+                                bump ()
+                                eventChannel.Writer.TryWrite(wrap (OutputLine line)) |> ignore)
                     with ex ->
                         eventChannel.Writer.TryComplete ex |> ignore
                         ExceptionDispatchInfo.Throw ex
                 }
 
+            let stdoutPump =
+                eventPump
+                    host.Stdout
+                    config.StdoutEncoding
+                    config.StdoutTee
+                    config.OnStdoutLine
+                    (fun () -> stdoutLineCount <- stdoutLineCount + 1)
+                    OutputEvent.Stdout
+
             let stderrPump =
-                task {
-                    try
-                        do!
-                            pumpLines host.Stderr config.StderrEncoding config.StderrTee (fun line ->
-                                invokeLine config.OnStderrLine line
-                                stderrLineCount <- stderrLineCount + 1
-                                eventChannel.Writer.TryWrite(OutputEvent.Stderr(OutputLine line)) |> ignore)
-                    with ex ->
-                        eventChannel.Writer.TryComplete ex |> ignore
-                        ExceptionDispatchInfo.Throw ex
-                }
+                eventPump
+                    host.Stderr
+                    config.StderrEncoding
+                    config.StderrTee
+                    config.OnStderrLine
+                    (fun () -> stderrLineCount <- stderrLineCount + 1)
+                    OutputEvent.Stderr
 
             eventOutcome <-
                 task {
@@ -594,10 +613,9 @@ type RunningProcess internal (host: RunningHost) =
                     | None -> return outcome
                 }
 
-            // Observe any fault on this otherwise fire-and-forget task, so it is never an unobserved task
-            // exception at finalization when nothing awaits ExitTask (the OutputEvents-only case).
-            eventOutcome.ContinueWith(Action<Task<Outcome>>(fun t -> t.Exception |> ignore))
-            |> ignore
+            // Observe any fault on this otherwise fire-and-forget task (the OutputEvents-only case, where
+            // nothing awaits `ExitTask`).
+            observeFault eventOutcome
 
             true
 
