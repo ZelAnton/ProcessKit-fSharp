@@ -150,41 +150,27 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                     )
         }
 
+    // The capture-derived verbs share one implementation with the `Runner` module (`CaptureVerbs`),
+    // over this pipeline's own stdout capture (`OutputStringAsync`, which carries the pipefail
+    // representative stage), so trimming / success-checking / parse-error wrapping can't drift between
+    // a single command and a pipeline.
+
     /// Require a successful pipefail exit and return the last stage's stdout, trailing whitespace
     /// trimmed. Any checked stage that did not exit 0 fails the pipeline.
     member this.RunAsync(cancellationToken: CancellationToken) : Task<Result<string, ProcessError>> =
-        task {
-            match! this.OutputStringAsync cancellationToken with
-            | Error error -> return Error error
-            | Ok result ->
-                match ProcessResult.ensureSuccess result with
-                | Error error -> return Error error
-                | Ok ok -> return Ok(ok.Stdout.TrimEnd())
-        }
+        CaptureVerbs.run (fun () -> this.OutputStringAsync cancellationToken)
 
     /// Like `RunAsync`, but discard the captured output.
     member this.RunUnitAsync(cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
-        task {
-            match! this.RunAsync cancellationToken with
-            | Error error -> return Error error
-            | Ok _ -> return Ok()
-        }
+        CaptureVerbs.runUnit (fun () -> this.OutputStringAsync cancellationToken)
 
     /// The pipefail exit code. A signal kill or timeout errors instead of inventing a sentinel.
     member this.ExitCodeAsync(cancellationToken: CancellationToken) : Task<Result<int, ProcessError>> =
-        task {
-            match! this.OutputStringAsync cancellationToken with
-            | Error error -> return Error error
-            | Ok result -> return ProcessResult.exitCode result
-        }
+        CaptureVerbs.exitCode (fun () -> this.OutputStringAsync cancellationToken)
 
     /// Read the pipefail exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
     member this.ProbeAsync(cancellationToken: CancellationToken) : Task<Result<bool, ProcessError>> =
-        task {
-            match! this.OutputStringAsync cancellationToken with
-            | Error error -> return Error error
-            | Ok result -> return ProcessResult.probe result
-        }
+        CaptureVerbs.probe (fun () -> this.OutputStringAsync cancellationToken)
 
     /// `OutputBytesAsync` against `CancellationToken.None`.
     member this.OutputBytesAsync() =
@@ -215,15 +201,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         : Task<Result<'T, ProcessError>> =
         ArgumentNullException.ThrowIfNull parser
 
-        task {
-            match! this.RunAsync cancellationToken with
-            | Error error -> return Error error
-            | Ok text ->
-                try
-                    return Ok(parser.Invoke text)
-                with ex ->
-                    return Error(ProcessError.Parse((List.last commands).Program, ex.Message))
-        }
+        CaptureVerbs.parse (List.last commands).Program parser.Invoke (fun () -> this.RunAsync cancellationToken)
 
     /// `ParseAsync` against `CancellationToken.None`.
     member this.ParseAsync(parser: Func<string, 'T>) =
@@ -237,21 +215,9 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         (parser: TryParser<'T>, cancellationToken: CancellationToken)
         : Task<Result<'T, ProcessError>> =
         ArgumentNullException.ThrowIfNull parser
-        let toResult = TryParser.toResult parser
 
-        task {
-            match! this.RunAsync cancellationToken with
-            | Error error -> return Error error
-            | Ok text ->
-                try
-                    match toResult text with
-                    | Ok value -> return Ok value
-                    | Error message -> return Error(ProcessError.Parse((List.last commands).Program, message))
-                with ex ->
-                    // A parser that throws rather than returning false is still a parse failure — mirror
-                    // `ParseAsync` (and `Runner.tryParse`) and surface a typed Parse error, not a faulted task.
-                    return Error(ProcessError.Parse((List.last commands).Program, ex.Message))
-        }
+        CaptureVerbs.tryParse (List.last commands).Program (TryParser.toResult parser) (fun () ->
+            this.RunAsync cancellationToken)
 
     /// `TryParseAsync` against `CancellationToken.None`.
     member this.TryParseAsync(parser: TryParser<'T>) =

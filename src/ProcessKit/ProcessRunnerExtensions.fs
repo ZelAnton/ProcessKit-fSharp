@@ -4,19 +4,18 @@ open System
 open System.Runtime.CompilerServices
 open System.Threading
 
-/// The full run-verb vocabulary on *any* `IProcessRunner`, derived from the three-method seam
-/// (`OutputStringAsync`/`OutputBytesAsync`/`StartAsync`). So a chosen or injected runner — a shared `ProcessGroup`,
-/// a `ScriptedRunner`, a `JobRunner` — gets `run`/`exitCode`/`probe`/`parse`/… uniformly
+/// The full run-verb vocabulary on *any* `IProcessRunner`, layered over the three-method seam
+/// (`CaptureStringAsync`/`CaptureBytesAsync`/`SpawnAsync`). So a chosen or injected runner — a shared
+/// `ProcessGroup`, a `ScriptedRunner`, a `JobRunner` — gets `run`/`exitCode`/`probe`/`parse`/… uniformly
 /// (`group.RunAsync command`, `scripted.ProbeAsync command`), callable from F# and C#. The verb *logic* lives
 /// once in the `Runner` module; these are thin sugar over it.
 ///
-/// Retry contract: the verbs here apply the command's `Retry` policy (they route through the `Runner`
-/// module), exactly like the `Command`/`CliClient` verbs. One asymmetry to know: `OutputStringAsync`/
-/// `OutputBytesAsync` have no `CancellationToken` overload (it would be shadowed by the seam), so a call
-/// like `runner.OutputStringAsync(command, ct)` binds to the raw `IProcessRunner` seam method and does NOT
-/// retry — for capture with a token *and* retry, call `Runner.outputString runner ct command`. The
-/// raw `IProcessRunner.OutputStringAsync`/`OutputBytesAsync`/`StartAsync` seam never retries; streaming verbs
-/// (`StartAsync`/`FirstLineAsync`) never retry on any surface.
+/// Retry contract: every capture verb here applies the command's `Retry` policy (it routes through the
+/// `Runner` module), with both a no-token and a `CancellationToken` overload that behave identically on
+/// retry — exactly like the `Command`/`CliClient` verbs. (Because the seam primitives are named
+/// `Capture*`/`Spawn`, the verb names never collide with them, so adding a token can't silently bypass
+/// retry.) For a raw, single, no-retry capture call the seam primitive directly:
+/// `runner.CaptureStringAsync(command, ct)`. Streaming verbs (`StartAsync`/`FirstLineAsync`) never retry.
 [<Extension>]
 type ProcessRunnerExtensions =
 
@@ -41,17 +40,27 @@ type ProcessRunnerExtensions =
         Runner.runUnit runner cancellationToken command
 
     /// Run to completion, capturing stdout as decoded text (a non-zero exit is data). Applies the
-    /// command's `Retry` policy (like the `Command`/`CliClient` verbs); for a single uncancellable run
-    /// with no retry, call the seam directly: `runner.OutputStringAsync(command, ct)`.
+    /// command's `Retry` policy; for a single raw capture with no retry, call the seam primitive
+    /// directly: `runner.CaptureStringAsync(command, ct)`.
     [<Extension>]
     static member OutputStringAsync(runner: IProcessRunner, command: Command) =
         Runner.outputString runner CancellationToken.None command
 
+    /// `OutputStringAsync`, cancellable through `cancellationToken` (still applies the `Retry` policy).
+    [<Extension>]
+    static member OutputStringAsync(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
+        Runner.outputString runner cancellationToken command
+
     /// Run to completion, capturing stdout as raw bytes (a non-zero exit is data). Applies the
-    /// command's `Retry` policy; the raw seam `runner.OutputBytesAsync(command, ct)` is the no-retry path.
+    /// command's `Retry` policy; the raw seam `runner.CaptureBytesAsync(command, ct)` is the no-retry path.
     [<Extension>]
     static member OutputBytesAsync(runner: IProcessRunner, command: Command) =
         Runner.outputBytes runner CancellationToken.None command
+
+    /// `OutputBytesAsync`, cancellable through `cancellationToken` (still applies the `Retry` policy).
+    [<Extension>]
+    static member OutputBytesAsync(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
+        Runner.outputBytes runner cancellationToken command
 
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel.
     [<Extension>]
@@ -73,10 +82,15 @@ type ProcessRunnerExtensions =
     static member ProbeAsync(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
         Runner.probe runner cancellationToken command
 
-    /// Start the command and return a live `RunningProcess`. Forwards to the runner's own seam method.
+    /// Start the command and return a live `RunningProcess`. Forwards to the runner's `SpawnAsync` seam.
     [<Extension>]
     static member StartAsync(runner: IProcessRunner, command: Command) =
-        runner.StartAsync(command, CancellationToken.None)
+        Runner.start runner CancellationToken.None command
+
+    /// `StartAsync`, cancellable through `cancellationToken`.
+    [<Extension>]
+    static member StartAsync(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
+        Runner.start runner cancellationToken command
 
     /// Require a zero/accepted exit and parse the trimmed stdout into a `'T`; a thrown parser error
     /// becomes `ProcessError.Parse`.

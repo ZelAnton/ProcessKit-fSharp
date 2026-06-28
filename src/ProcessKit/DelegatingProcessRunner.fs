@@ -18,32 +18,32 @@ type DelegatingProcessRunner(inner: IProcessRunner) =
 
     /// Run to completion, capturing stdout as decoded text. Override to intercept; the default
     /// forwards to the wrapped runner.
-    abstract member OutputStringAsync:
+    abstract member CaptureStringAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<ProcessResult<string>, ProcessError>>
 
-    default _.OutputStringAsync(command, cancellationToken) =
-        inner.OutputStringAsync(command, cancellationToken)
+    default _.CaptureStringAsync(command, cancellationToken) =
+        inner.CaptureStringAsync(command, cancellationToken)
 
     /// Run to completion, capturing stdout as raw bytes. Override to intercept; the default forwards.
-    abstract member OutputBytesAsync:
+    abstract member CaptureBytesAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<ProcessResult<byte[]>, ProcessError>>
 
-    default _.OutputBytesAsync(command, cancellationToken) =
-        inner.OutputBytesAsync(command, cancellationToken)
+    default _.CaptureBytesAsync(command, cancellationToken) =
+        inner.CaptureBytesAsync(command, cancellationToken)
 
     /// Start the command and return a live handle. Override to intercept; the default forwards.
-    abstract member StartAsync:
+    abstract member SpawnAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<RunningProcess, ProcessError>>
 
-    default _.StartAsync(command, cancellationToken) =
-        inner.StartAsync(command, cancellationToken)
+    default _.SpawnAsync(command, cancellationToken) =
+        inner.SpawnAsync(command, cancellationToken)
 
     interface IProcessRunner with
-        member this.OutputStringAsync(command, cancellationToken) =
-            this.OutputStringAsync(command, cancellationToken)
+        member this.CaptureStringAsync(command, cancellationToken) =
+            this.CaptureStringAsync(command, cancellationToken)
 
-        member this.OutputBytesAsync(command, cancellationToken) =
-            this.OutputBytesAsync(command, cancellationToken)
+        member this.CaptureBytesAsync(command, cancellationToken) =
+            this.CaptureBytesAsync(command, cancellationToken)
 
-        member this.StartAsync(command, cancellationToken) =
-            this.StartAsync(command, cancellationToken)
+        member this.SpawnAsync(command, cancellationToken) =
+            this.SpawnAsync(command, cancellationToken)

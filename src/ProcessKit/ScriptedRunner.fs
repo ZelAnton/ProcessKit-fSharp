@@ -44,7 +44,7 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
             | None -> invalidOp $"ScriptedRunner: no scripted reply matched command '{command.Program}'."
 
     interface IProcessRunner with
-        member this.OutputStringAsync(command, cancellationToken) =
+        member this.CaptureStringAsync(command, cancellationToken) =
             if cancellationToken.IsCancellationRequested then
                 // Honour the contract that a cancelled run is always an error, matching `JobRunner` /
                 // `ProcessGroup`, so the cancelled path is testable through the scripted seam too.
@@ -55,7 +55,7 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
                 match reply.ErrorOverride with
                 | Some error -> Task.FromResult(Error error)
                 | None ->
-                    // Route capture through the same in-memory FakeProcess as `StartAsync`, so all three seam
+                    // Route capture through the same in-memory FakeProcess as `SpawnAsync`, so all three seam
                     // paths agree byte-for-byte with a real run: line-ending normalization, the command's
                     // encoding, OkCodes, and output-buffer truncation are applied identically.
                     FakeProcess
@@ -66,7 +66,7 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
                         .Build()
                         .OutputStringAsync()
 
-        member this.StartAsync(command, cancellationToken) =
+        member this.SpawnAsync(command, cancellationToken) =
             if cancellationToken.IsCancellationRequested then
                 Task.FromResult(Error(ProcessError.Cancelled command.Program))
             else
@@ -88,7 +88,7 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
 
                     Task.FromResult(Ok running)
 
-        member this.OutputBytesAsync(command, cancellationToken) =
+        member this.CaptureBytesAsync(command, cancellationToken) =
             if cancellationToken.IsCancellationRequested then
                 Task.FromResult(Error(ProcessError.Cancelled command.Program))
             else

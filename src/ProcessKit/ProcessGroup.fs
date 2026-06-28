@@ -323,7 +323,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // the capture's completion until it too exits) and `CancelOn`. `TimeoutGrace` has no per-child
     // graceful kill in a shared group, so it falls back to the immediate kill.
     interface IProcessRunner with
-        member this.StartAsync(command, cancellationToken) =
+        member this.SpawnAsync(command, cancellationToken) =
             task {
                 if cancellationToken.IsCancellationRequested then
                     return Error(ProcessError.Cancelled command.Program)
@@ -331,10 +331,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     return! this.StartAsync command
             }
 
-        member this.OutputStringAsync(command, cancellationToken) =
+        member this.CaptureStringAsync(command, cancellationToken) =
             this.CaptureShared command cancellationToken (fun running -> running.OutputStringAsync())
 
-        member this.OutputBytesAsync(command, cancellationToken) =
+        member this.CaptureBytesAsync(command, cancellationToken) =
             this.CaptureShared command cancellationToken (fun running -> running.OutputBytesAsync())
 
     interface IDisposable with

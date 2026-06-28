@@ -15,12 +15,12 @@ type CommandVerbs =
     /// Start the command and return a live `RunningProcess`.
     [<Extension>]
     static member StartAsync(command: Command) =
-        CommandVerbs.DefaultRunner.StartAsync(command, CancellationToken.None)
+        Runner.start CommandVerbs.DefaultRunner CancellationToken.None command
 
     /// Start the command, cancellable through `cancellationToken`.
     [<Extension>]
     static member StartAsync(command: Command, cancellationToken: CancellationToken) =
-        CommandVerbs.DefaultRunner.StartAsync(command, cancellationToken)
+        Runner.start CommandVerbs.DefaultRunner cancellationToken command
 
     /// Require a zero exit and return stdout, trailing whitespace trimmed.
     [<Extension>]

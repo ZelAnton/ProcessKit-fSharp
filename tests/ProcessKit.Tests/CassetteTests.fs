@@ -13,12 +13,12 @@ open ProcessKit.Testing
 /// A deterministic inner `IProcessRunner` for record-mode tests: every call returns `stdout`/`code`.
 type private FixedRunner(stdout: string, code: int) =
     interface IProcessRunner with
-        member _.OutputStringAsync(command, _cancellationToken) =
+        member _.CaptureStringAsync(command, _cancellationToken) =
             Task.FromResult(
                 Ok(ProcessResult<string>(command.Program, stdout, "", Outcome.Exited code, TimeSpan.Zero, false, [ 0 ]))
             )
 
-        member _.OutputBytesAsync(command, _cancellationToken) =
+        member _.CaptureBytesAsync(command, _cancellationToken) =
             Task.FromResult(
                 Ok(
                     ProcessResult<byte[]>(
@@ -33,8 +33,8 @@ type private FixedRunner(stdout: string, code: int) =
                 )
             )
 
-        member _.StartAsync(_command, _cancellationToken) =
-            Task.FromResult(Error(ProcessError.Unsupported "FixedRunner has no Start"))
+        member _.SpawnAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "FixedRunner has no Spawn"))
 
 [<TestFixture>]
 type CassetteTests() =

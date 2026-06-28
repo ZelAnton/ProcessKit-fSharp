@@ -27,15 +27,15 @@ type private CapturingLogger() =
 /// A runner that always reports a crash — to drive a supervisor restart deterministically.
 type private AlwaysCrash() =
     interface IProcessRunner with
-        member _.OutputStringAsync(command, _cancellationToken) =
+        member _.CaptureStringAsync(command, _cancellationToken) =
             Task.FromResult(
                 Ok(ProcessResult<string>(command.Program, "", "boom", Outcome.Exited 1, TimeSpan.Zero, false, [ 0 ]))
             )
 
-        member _.OutputBytesAsync(_command, _cancellationToken) =
-            failwith "AlwaysCrash has no OutputBytes"
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "AlwaysCrash has no CaptureBytes"
 
-        member _.StartAsync(_command, _cancellationToken) = failwith "AlwaysCrash has no Start"
+        member _.SpawnAsync(_command, _cancellationToken) = failwith "AlwaysCrash has no Spawn"
 
 [<TestFixture>]
 type LoggingTests() =

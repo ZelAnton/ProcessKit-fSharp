@@ -13,29 +13,34 @@ a double so your tests never touch the operating system.
 **F#**
 
 ```fsharp
-// One interface, three methods — each takes a CancellationToken:
+// One interface, three primitives — each takes a CancellationToken:
 type IProcessRunner =
-    abstract OutputString: Command * System.Threading.CancellationToken -> System.Threading.Tasks.Task<Result<ProcessResult<string>, ProcessError>>
-    abstract OutputBytes: Command * System.Threading.CancellationToken -> System.Threading.Tasks.Task<Result<ProcessResult<byte[]>, ProcessError>>
-    abstract Start: Command * System.Threading.CancellationToken -> System.Threading.Tasks.Task<Result<RunningProcess, ProcessError>>
+    abstract CaptureStringAsync: Command * System.Threading.CancellationToken -> System.Threading.Tasks.Task<Result<ProcessResult<string>, ProcessError>>
+    abstract CaptureBytesAsync: Command * System.Threading.CancellationToken -> System.Threading.Tasks.Task<Result<ProcessResult<byte[]>, ProcessError>>
+    abstract SpawnAsync: Command * System.Threading.CancellationToken -> System.Threading.Tasks.Task<Result<RunningProcess, ProcessError>>
 ```
 
 **C#**
 
 ```csharp
-// One interface, three methods — each takes a CancellationToken:
+// One interface, three primitives — each takes a CancellationToken:
 public interface IProcessRunner
 {
-    Task<FSharpResult<ProcessResult<string>, ProcessError>> OutputStringAsync(Command command, CancellationToken cancellationToken);
-    Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> OutputBytesAsync(Command command, CancellationToken cancellationToken);
-    Task<FSharpResult<RunningProcess, ProcessError>> StartAsync(Command command, CancellationToken cancellationToken);
+    Task<FSharpResult<ProcessResult<string>, ProcessError>> CaptureStringAsync(Command command, CancellationToken cancellationToken);
+    Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> CaptureBytesAsync(Command command, CancellationToken cancellationToken);
+    Task<FSharpResult<RunningProcess, ProcessError>> SpawnAsync(Command command, CancellationToken cancellationToken);
 }
 ```
 
 Unlike some interfaces, none of the three is defaulted: a hand-rolled
 `IProcessRunner` implements all three (the doubles that ship with ProcessKit do
-this for you). `OutputStringAsync` and `OutputBytesAsync` are the bulk verbs; `StartAsync`
-returns a live handle for streaming and probes.
+this for you). `CaptureStringAsync` and `CaptureBytesAsync` are the bulk primitives;
+`SpawnAsync` returns a live handle for streaming and probes. These are deliberately
+*named apart* from the consuming verbs (`OutputStringAsync`/`RunAsync`/`StartAsync`/…):
+the verbs layer on top of the primitives — applying the command's `Retry` policy and
+the success/parse semantics — so you implement only the three primitives and get the
+whole verb vocabulary for free. (Calling a verb routes through these primitives; for a
+single raw capture with no retry, call `CaptureStringAsync` directly.)
 
 - [The `IProcessRunner` seam](#the-iprocessrunner-seam)
 - [Scripting replies](#scripting-replies)
@@ -259,9 +264,9 @@ that *consumes* a `ProcessResult`:
 ```fsharp
 let fixedSha: IProcessRunner =
     { new IProcessRunner with
-        member _.OutputStringAsync(_, _) = task { return Ok(ProcessResult.Success "abc123\n") }
-        member _.OutputBytesAsync(_, _) = task { return Ok(ProcessResult.Success [| 1uy; 2uy |]) }
-        member _.StartAsync(_, _) =
+        member _.CaptureStringAsync(_, _) = task { return Ok(ProcessResult.Success "abc123\n") }
+        member _.CaptureBytesAsync(_, _) = task { return Ok(ProcessResult.Success [| 1uy; 2uy |]) }
+        member _.SpawnAsync(_, _) =
             task { return Error(ProcessError.Unsupported "no streaming in this double") } }
 ```
 
@@ -270,13 +275,13 @@ let fixedSha: IProcessRunner =
 ```csharp
 public sealed class FixedSha : IProcessRunner
 {
-    public Task<FSharpResult<ProcessResult<string>, ProcessError>> OutputStringAsync(Command command, CancellationToken ct) =>
+    public Task<FSharpResult<ProcessResult<string>, ProcessError>> CaptureStringAsync(Command command, CancellationToken ct) =>
         Task.FromResult(FSharpResult<ProcessResult<string>, ProcessError>.NewOk(ProcessResult.Success("abc123\n")));
 
-    public Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> OutputBytesAsync(Command command, CancellationToken ct) =>
+    public Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> CaptureBytesAsync(Command command, CancellationToken ct) =>
         Task.FromResult(FSharpResult<ProcessResult<byte[]>, ProcessError>.NewOk(ProcessResult.Success(new byte[] { 1, 2 })));
 
-    public Task<FSharpResult<RunningProcess, ProcessError>> StartAsync(Command command, CancellationToken ct) =>
+    public Task<FSharpResult<RunningProcess, ProcessError>> SpawnAsync(Command command, CancellationToken ct) =>
         Task.FromResult(FSharpResult<RunningProcess, ProcessError>.NewError(ProcessError.NewUnsupported("no streaming in this double")));
 }
 ```
@@ -295,18 +300,18 @@ let failOnce (inner: IProcessRunner) : IProcessRunner =
     let mutable calls = 0
 
     { new IProcessRunner with
-        member _.OutputStringAsync(command, ct) =
+        member _.CaptureStringAsync(command, ct) =
             task {
                 calls <- calls + 1
 
                 if calls = 1 then
                     return Error(ProcessError.Io "transient blip") // ProcessError.isTransient -> true
                 else
-                    return! inner.OutputStringAsync(command, ct)
+                    return! inner.CaptureStringAsync(command, ct)
             }
 
-        member _.OutputBytesAsync(command, ct) = inner.OutputBytesAsync(command, ct)
-        member _.StartAsync(command, ct) = inner.StartAsync(command, ct) }
+        member _.CaptureBytesAsync(command, ct) = inner.CaptureBytesAsync(command, ct)
+        member _.SpawnAsync(command, ct) = inner.SpawnAsync(command, ct) }
 ```
 
 **C#**
@@ -316,36 +321,39 @@ public sealed class FailOnce(IProcessRunner inner) : IProcessRunner
 {
     private int calls;
 
-    public Task<FSharpResult<ProcessResult<string>, ProcessError>> OutputStringAsync(Command command, CancellationToken ct) =>
+    public Task<FSharpResult<ProcessResult<string>, ProcessError>> CaptureStringAsync(Command command, CancellationToken ct) =>
         ++calls == 1
             ? Task.FromResult(
                 FSharpResult<ProcessResult<string>, ProcessError>.NewError(ProcessError.NewIo("transient blip"))) // ProcessError.isTransient -> true
-            : inner.OutputStringAsync(command, ct);
+            : inner.CaptureStringAsync(command, ct);
 
-    public Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> OutputBytesAsync(Command command, CancellationToken ct) =>
-        inner.OutputBytesAsync(command, ct);
+    public Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> CaptureBytesAsync(Command command, CancellationToken ct) =>
+        inner.CaptureBytesAsync(command, ct);
 
-    public Task<FSharpResult<RunningProcess, ProcessError>> StartAsync(Command command, CancellationToken ct) =>
-        inner.StartAsync(command, ct);
+    public Task<FSharpResult<RunningProcess, ProcessError>> SpawnAsync(Command command, CancellationToken ct) =>
+        inner.SpawnAsync(command, ct);
 }
 ```
 
 Wrap a `ScriptedRunner` with it and drive a retrying verb to prove the retry
-fires. If a double is bulk-only and you want `StartAsync` to be a hard error, return
-`Error(ProcessError.Unsupported "no streaming in this double")` from `StartAsync` —
-exactly what the shipped doubles do.
+fires — because retry lives in the verb layer over the `CaptureStringAsync` primitive,
+`failOnce`'s single transient error is retried away. If a double is bulk-only and you
+want spawning to be a hard error, return
+`Error(ProcessError.Unsupported "no streaming in this double")` from `SpawnAsync` —
+exactly what `RecordReplayRunner` does.
 
 ## What the doubles don't cover
 
-The subprocess-free doubles serve the **bulk** verbs only. `ScriptedRunner` and
-[`RecordReplayRunner`](#record-and-replay) both implement `OutputStringAsync` /
-`OutputBytesAsync` and return `Error(ProcessError.Unsupported …)` from `StartAsync`.
-Because `Runner.start` and `Runner.firstLine` (and the matching `Command`
-verbs) route through `StartAsync`, they are not served by these doubles — nor is the
-live [`RunningProcess`](streaming.md) surface (`StdoutLinesAsync`, `WaitForLineAsync`,
-`WaitForPortAsync`, `TakeStdin`, `ProfileAsync`) or a [`Pipeline`](pipelines.md). Test
-those paths against a real (possibly trivial) child process, then keep the
-scripted/cassette doubles for everything that flows through `OutputStringAsync`.
+The subprocess-free doubles center on the **bulk** primitives. `ScriptedRunner` and
+[`RecordReplayRunner`](#record-and-replay) both implement `CaptureStringAsync` /
+`CaptureBytesAsync`; `RecordReplayRunner` returns `Error(ProcessError.Unsupported …)`
+from `SpawnAsync`, while `ScriptedRunner` serves a [`FakeProcess`](#scripting-replies)
+from `SpawnAsync` (so the parts of the live surface a fake can replay — `StdoutLinesAsync`,
+the readiness probes — *are* testable through it). The full live
+[`RunningProcess`](streaming.md) surface (`WaitForPortAsync`, `TakeStdin`, `ProfileAsync`, …)
+and a [`Pipeline`](pipelines.md) are best tested against a real (possibly trivial) child
+process; keep the scripted/cassette doubles for everything that flows through
+`CaptureStringAsync`.
 
 ## Record and replay
 

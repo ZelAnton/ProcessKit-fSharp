@@ -79,7 +79,7 @@ type private Mode =
 /// **Replay** mode loads the cassette and serves results with **no subprocess**: a match is keyed on
 /// program + args + cwd + stdin-source digest; duplicates replay in capture order then repeat the
 /// last; an unmatched call is `ProcessError.CassetteMiss` (never a surprise subprocess). Covers
-/// `OutputStringAsync` (and `OutputBytesAsync` via a UTF-8 round-trip of the recorded stdout); `StartAsync` is
+/// `CaptureStringAsync` (and `CaptureBytesAsync` via a UTF-8 round-trip of the recorded stdout); `SpawnAsync` is
 /// unsupported. A one-shot stdin source (`FromReader` / `FromLines` / `FromAsyncLines`) cannot be
 /// keyed and errors.
 [<Sealed>]
@@ -327,7 +327,7 @@ type RecordReplayRunner private (mode: Mode, path: string) =
                 | Ok digest ->
                     match mode with
                     | RecordMode(inner, recorded, dirty) ->
-                        match! inner.OutputStringAsync(command, cancellationToken) with
+                        match! inner.CaptureStringAsync(command, cancellationToken) with
                         | Error error -> return Error error
                         | Ok result ->
                             lock gate (fun () ->
@@ -342,10 +342,10 @@ type RecordReplayRunner private (mode: Mode, path: string) =
         }
 
     interface IProcessRunner with
-        member this.OutputStringAsync(command, cancellationToken) =
+        member this.CaptureStringAsync(command, cancellationToken) =
             this.Capture(command, cancellationToken)
 
-        member this.OutputBytesAsync(command, cancellationToken) =
+        member this.CaptureBytesAsync(command, cancellationToken) =
             task {
                 match! this.Capture(command, cancellationToken) with
                 | Error error -> return Error error
@@ -365,9 +365,9 @@ type RecordReplayRunner private (mode: Mode, path: string) =
                         )
             }
 
-        member _.StartAsync(_command, _cancellationToken) =
+        member _.SpawnAsync(_command, _cancellationToken) =
             Task.FromResult(
-                Error(ProcessError.Unsupported "RecordReplayRunner does not support StartAsync (live streaming)")
+                Error(ProcessError.Unsupported "RecordReplayRunner does not support SpawnAsync (live streaming)")
             )
 
     interface IDisposable with

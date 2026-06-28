@@ -23,7 +23,7 @@ type FakeProcess private (template: Command, stdout: string, stderr: string, out
 
     /// A fake whose built `RunningProcess` inherits `command`'s config — encodings, `OkCodes`, output
     /// buffer, line handlers — so it behaves like a real run of that command. Internal: `ScriptedRunner`
-    /// uses it so `StartAsync` and the capture verbs agree on success/encoding semantics.
+    /// uses it so `SpawnAsync` and the capture verbs agree on success/encoding semantics.
     static member internal OfCommand(command: Command) =
         FakeProcess(command, "", "", Outcome.Exited 0, None)
 

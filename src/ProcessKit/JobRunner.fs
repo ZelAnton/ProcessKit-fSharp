@@ -57,17 +57,17 @@ type JobRunner() =
         }
 
     interface IProcessRunner with
-        member _.StartAsync(command, cancellationToken) =
+        member _.SpawnAsync(command, cancellationToken) =
             // An already-cancelled token must not spawn a tree the caller has to remember to dispose:
-            // report it as an error up front, matching `ProcessGroup.StartAsync` so both runners honour the
+            // report it as an error up front, matching `ProcessGroup` so both runners honour the
             // contract that a cancelled run is always an error.
             if cancellationToken.IsCancellationRequested then
                 Task.FromResult(Error(ProcessError.Cancelled command.Program))
             else
                 start command
 
-        member _.OutputStringAsync(command, cancellationToken) =
+        member _.CaptureStringAsync(command, cancellationToken) =
             runToCompletion command cancellationToken (fun running -> running.OutputStringAsync())
 
-        member _.OutputBytesAsync(command, cancellationToken) =
+        member _.CaptureBytesAsync(command, cancellationToken) =
             runToCompletion command cancellationToken (fun running -> running.OutputBytesAsync())

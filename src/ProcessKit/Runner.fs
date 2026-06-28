@@ -3,6 +3,96 @@ namespace ProcessKit
 open System.Threading
 open System.Threading.Tasks
 
+/// The capture-derived verbs, factored out so `Runner` (over an `IProcessRunner`) and `Pipeline` (over
+/// a chain) derive `run`/`runUnit`/`exitCode`/`probe`/`parse`/`tryParse` from ONE implementation
+/// instead of maintaining parallel copies that could drift on trimming, success-checking, or
+/// parse-error wrapping. `run`/`runUnit`/`exitCode`/`probe` take a stdout `capture` thunk (the full
+/// `ProcessResult`); `parse`/`tryParse` take a `runText` thunk (the trimmed-text `run` verb) so the
+/// parser is applied outside whatever retry the caller wraps the run in. The caller controls
+/// invocation — e.g. `Runner` wraps the capture in the command's retry policy, `Pipeline` does not.
+[<RequireQualifiedAccess>]
+module internal CaptureVerbs =
+
+    /// Require an accepted exit; return stdout with trailing whitespace trimmed.
+    let run (capture: unit -> Task<Result<ProcessResult<string>, ProcessError>>) : Task<Result<string, ProcessError>> =
+        task {
+            match! capture () with
+            | Error error -> return Error error
+            | Ok result ->
+                match ProcessResult.ensureSuccess result with
+                | Error error -> return Error error
+                | Ok ok -> return Ok(ok.Stdout.TrimEnd())
+        }
+
+    /// Like `run`, but discard the captured output.
+    let runUnit capture : Task<Result<unit, ProcessError>> =
+        task {
+            match! run capture with
+            | Error error -> return Error error
+            | Ok _ -> return Ok()
+        }
+
+    /// The exit code; a signal kill or timeout errors instead of inventing a sentinel.
+    let exitCode capture : Task<Result<int, ProcessError>> =
+        task {
+            match! capture () with
+            | Error error -> return Error error
+            | Ok result -> return ProcessResult.exitCode result
+        }
+
+    /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
+    let probe capture : Task<Result<bool, ProcessError>> =
+        task {
+            match! capture () with
+            | Error error -> return Error error
+            | Ok result -> return ProcessResult.probe result
+        }
+
+    // `parse`/`tryParse` apply a parser to the trimmed text from a `runText` thunk (the `run` verb of a
+    // command or a pipeline) — NOT a raw `capture` thunk. The distinction is deliberate: the caller's
+    // `runText` decides whether the *run* retries (e.g. `Runner.run` applies the command's `Retry`
+    // policy), while the parse step itself is always applied exactly once, outside any retry. Re-running
+    // a command because *your* parser rejected its (successfully produced) output is a different concern
+    // from a flaky run, and folding the parser into the retry loop would let a custom `shouldRetry`
+    // silently re-spawn the command on a parse failure.
+
+    /// Parse the trimmed stdout from `runText` into a `'T`; a thrown parser becomes `ProcessError.Parse`.
+    let parse
+        (program: string)
+        (parser: string -> 'T)
+        (runText: unit -> Task<Result<string, ProcessError>>)
+        : Task<Result<'T, ProcessError>> =
+        task {
+            match! runText () with
+            | Error error -> return Error error
+            | Ok text ->
+                try
+                    return Ok(parser text)
+                with ex ->
+                    return Error(ProcessError.Parse(program, ex.Message))
+        }
+
+    /// Apply a `Result`-returning parser to the trimmed stdout from `runText`; an `Error` message — or,
+    /// like `parse`, a thrown exception's message — becomes `ProcessError.Parse`, never a faulted task.
+    let tryParse
+        (program: string)
+        (parser: string -> Result<'T, string>)
+        (runText: unit -> Task<Result<string, ProcessError>>)
+        : Task<Result<'T, ProcessError>> =
+        task {
+            match! runText () with
+            | Error error -> return Error error
+            | Ok text ->
+                try
+                    match parser text with
+                    | Ok value -> return Ok value
+                    | Error message -> return Error(ProcessError.Parse(program, message))
+                with ex ->
+                    // A parser that throws rather than returning Error (e.g. a TryParser delegate that
+                    // wraps int.Parse) is still a parse failure: surface it as a typed ProcessError.Parse.
+                    return Error(ProcessError.Parse(program, ex.Message))
+        }
+
 /// The run verbs, expressed over any `IProcessRunner`. One verb, one meaning:
 ///
 /// - `run` — require a zero exit; return stdout, trailing whitespace trimmed.
@@ -67,13 +157,18 @@ module Runner =
                 return final.Value
             }
 
+    // Each capture verb is `withRetry` wrapped around a `CaptureVerbs` derivation of the runner's
+    // `CaptureStringAsync` primitive, so retry applies uniformly and the verb logic lives in one place.
+    let private captureString (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
+        fun () -> runner.CaptureStringAsync(command, cancellationToken)
+
     /// Run to completion, capturing stdout as decoded text. A non-zero exit is data, not an error.
     let outputString (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
-        withRetry command cancellationToken (fun () -> runner.OutputStringAsync(command, cancellationToken))
+        withRetry command cancellationToken (fun () -> runner.CaptureStringAsync(command, cancellationToken))
 
     /// Run to completion, capturing stdout as raw bytes.
     let outputBytes (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
-        withRetry command cancellationToken (fun () -> runner.OutputBytesAsync(command, cancellationToken))
+        withRetry command cancellationToken (fun () -> runner.CaptureBytesAsync(command, cancellationToken))
 
     /// Require a zero exit and return stdout with trailing whitespace trimmed.
     let run
@@ -82,14 +177,7 @@ module Runner =
         (command: Command)
         : Task<Result<string, ProcessError>> =
         withRetry command cancellationToken (fun () ->
-            task {
-                match! runner.OutputStringAsync(command, cancellationToken) with
-                | Error error -> return Error error
-                | Ok result ->
-                    match ProcessResult.ensureSuccess result with
-                    | Error error -> return Error error
-                    | Ok ok -> return Ok(ok.Stdout.TrimEnd())
-            })
+            CaptureVerbs.run (captureString runner cancellationToken command))
 
     /// Like `run`, but discard the captured output.
     let runUnit
@@ -97,11 +185,8 @@ module Runner =
         (cancellationToken: CancellationToken)
         (command: Command)
         : Task<Result<unit, ProcessError>> =
-        task {
-            match! run runner cancellationToken command with
-            | Error error -> return Error error
-            | Ok _ -> return Ok()
-        }
+        withRetry command cancellationToken (fun () ->
+            CaptureVerbs.runUnit (captureString runner cancellationToken command))
 
     /// The exit code. A signal kill or timeout errors instead of inventing a sentinel code.
     let exitCode
@@ -110,11 +195,7 @@ module Runner =
         (command: Command)
         : Task<Result<int, ProcessError>> =
         withRetry command cancellationToken (fun () ->
-            task {
-                match! runner.OutputStringAsync(command, cancellationToken) with
-                | Error error -> return Error error
-                | Ok result -> return ProcessResult.exitCode result
-            })
+            CaptureVerbs.exitCode (captureString runner cancellationToken command))
 
     /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
     let probe
@@ -123,15 +204,11 @@ module Runner =
         (command: Command)
         : Task<Result<bool, ProcessError>> =
         withRetry command cancellationToken (fun () ->
-            task {
-                match! runner.OutputStringAsync(command, cancellationToken) with
-                | Error error -> return Error error
-                | Ok result -> return ProcessResult.probe result
-            })
+            CaptureVerbs.probe (captureString runner cancellationToken command))
 
     /// Start the command and return a live `RunningProcess` for streaming and interactive I/O.
     let start (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
-        runner.StartAsync(command, cancellationToken)
+        runner.SpawnAsync(command, cancellationToken)
 
     /// Require a zero exit and parse the trimmed stdout into a `'T`; a thrown parser error
     /// becomes `ProcessError.Parse`.
@@ -141,38 +218,19 @@ module Runner =
         (parser: string -> 'T)
         (command: Command)
         : Task<Result<'T, ProcessError>> =
-        task {
-            match! run runner cancellationToken command with
-            | Error error -> return Error error
-            | Ok text ->
-                try
-                    return Ok(parser text)
-                with ex ->
-                    return Error(ProcessError.Parse(command.Program, ex.Message))
-        }
+        // The run (capture + success check) carries the retry policy; the parser is applied once,
+        // outside retry — a parse failure never re-spawns the command.
+        CaptureVerbs.parse command.Program parser (fun () -> run runner cancellationToken command)
 
-    /// Like `parse`, but the parser returns its own `Result` (its error message — or, like `parse`, a
-    /// thrown exception's message — becomes `ProcessError.Parse`).
+    /// Like `parse`, but the parser returns its own `Result` (its error message — or a thrown
+    /// exception's message — becomes `ProcessError.Parse`).
     let tryParse
         (runner: IProcessRunner)
         (cancellationToken: CancellationToken)
         (parser: string -> Result<'T, string>)
         (command: Command)
         : Task<Result<'T, ProcessError>> =
-        task {
-            match! run runner cancellationToken command with
-            | Error error -> return Error error
-            | Ok text ->
-                try
-                    match parser text with
-                    | Ok value -> return Ok value
-                    | Error message -> return Error(ProcessError.Parse(command.Program, message))
-                with ex ->
-                    // A parser that throws rather than returning Error (e.g. a TryParser delegate that
-                    // wraps int.Parse) is still a parse failure: mirror `parse` and surface it as a typed
-                    // ProcessError.Parse, keeping the honest-result contract instead of faulting the task.
-                    return Error(ProcessError.Parse(command.Program, ex.Message))
-        }
+        CaptureVerbs.tryParse command.Program parser (fun () -> run runner cancellationToken command)
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     let firstLine
@@ -192,7 +250,7 @@ module Runner =
 
             let effectiveToken = linkedCts.Token
 
-            match! runner.StartAsync(command, effectiveToken) with
+            match! runner.SpawnAsync(command, effectiveToken) with
             | Error error -> return Error error
             | Ok running ->
                 // `use` reaps the process tree on every exit path (match below / a throwing

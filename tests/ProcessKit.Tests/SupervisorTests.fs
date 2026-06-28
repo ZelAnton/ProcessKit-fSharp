@@ -14,17 +14,17 @@ type private SequenceRunner(replies: Result<ProcessResult<string>, ProcessError>
     let queue = Queue<Result<ProcessResult<string>, ProcessError>>(replies)
 
     interface IProcessRunner with
-        member _.OutputStringAsync(_command, _cancellationToken) =
+        member _.CaptureStringAsync(_command, _cancellationToken) =
             if queue.Count = 0 then
                 failwith "SequenceRunner ran out of scripted replies"
 
             Task.FromResult(queue.Dequeue())
 
-        member _.OutputBytesAsync(_command, _cancellationToken) =
-            failwith "SequenceRunner only scripts OutputString"
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "SequenceRunner only scripts CaptureString"
 
-        member _.StartAsync(_command, _cancellationToken) =
-            failwith "SequenceRunner only scripts OutputString"
+        member _.SpawnAsync(_command, _cancellationToken) =
+            failwith "SequenceRunner only scripts CaptureString"
 
 /// Records the output-buffer policy of the command it is asked to run, so a test can assert the
 /// supervisor applied its capture policy to each incarnation.
@@ -32,18 +32,18 @@ type private CapturingRunner() =
     member val SeenPolicy: OutputBufferPolicy option = None with get, set
 
     interface IProcessRunner with
-        member this.OutputStringAsync(command, _cancellationToken) =
+        member this.CaptureStringAsync(command, _cancellationToken) =
             this.SeenPolicy <- Some command.Config.OutputBuffer
 
             Task.FromResult(
                 Ok(ProcessResult<string>(command.Program, "out", "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ]))
             )
 
-        member _.OutputBytesAsync(_command, _cancellationToken) =
-            failwith "CapturingRunner only scripts OutputString"
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "CapturingRunner only scripts CaptureString"
 
-        member _.StartAsync(_command, _cancellationToken) =
-            failwith "CapturingRunner only scripts OutputString"
+        member _.SpawnAsync(_command, _cancellationToken) =
+            failwith "CapturingRunner only scripts CaptureString"
 
 /// A virtual clock: `Sleep` records the requested delay and advances `Now` instead of waiting, so
 /// backoff and storm-decay timing is deterministic and instant (a virtual/paused clock).

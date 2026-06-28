@@ -351,7 +351,9 @@ type Supervisor internal (config: SupervisorConfig) =
                 if cancellationToken.IsCancellationRequested then
                     final <- Some(Error(ProcessError.Cancelled program))
                 else
-                    match! config.Runner.OutputStringAsync(command, cancellationToken) with
+                    // Capture through the seam primitive directly: the supervisor owns the retry/restart
+                    // policy, so it must not also pick up the command's verb-level `Retry` here.
+                    match! config.Runner.CaptureStringAsync(command, cancellationToken) with
                     | Ok result ->
                         let predicateMatched =
                             match config.StopWhen with

@@ -90,14 +90,14 @@ type RunnerTests() =
 
             let cancelling =
                 { new IProcessRunner with
-                    member _.OutputStringAsync(command, _) =
+                    member _.CaptureStringAsync(command, _) =
                         calls <- calls + 1
                         Task.FromResult(Error(ProcessError.Cancelled command.Program))
 
-                    member _.OutputBytesAsync(command, _) =
+                    member _.CaptureBytesAsync(command, _) =
                         Task.FromResult(Error(ProcessError.Cancelled command.Program))
 
-                    member _.StartAsync(command, _) =
+                    member _.SpawnAsync(command, _) =
                         Task.FromResult(Error(ProcessError.Cancelled command.Program)) }
 
             // A retry policy that would re-run on ANY error, to prove the Cancelled short-circuit wins
@@ -109,6 +109,39 @@ type RunnerTests() =
             match result with
             | Error(ProcessError.Cancelled _) -> ()
             | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+            Assert.That(calls, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``retry does not re-run the command when only the parser fails``() : Task =
+        task {
+            let mutable calls = 0
+
+            let succeeding =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Ok(ProcessResult.Success "raw output"))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            // Retry on ANY error, including a parse failure — yet a parser that rejects a *successfully*
+            // produced output must not re-spawn the command: the run is retried, the parse is not.
+            let command = Command.create "svc" |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result =
+                command
+                |> Runner.parse succeeding CancellationToken.None (fun _ -> failwith "boom")
+
+            match result with
+            | Error(ProcessError.Parse _) -> ()
+            | other -> Assert.Fail $"expected a Parse error, got {other}"
 
             Assert.That(calls, Is.EqualTo 1)
         }

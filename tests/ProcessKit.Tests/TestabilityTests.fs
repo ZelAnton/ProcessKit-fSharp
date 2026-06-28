@@ -7,15 +7,15 @@ open NUnit.Framework.Legacy
 open ProcessKit
 open ProcessKit.Testing
 
-/// A decorator over `DelegatingProcessRunner` that counts and forwards `OutputString`.
+/// A decorator over `DelegatingProcessRunner` that counts and forwards the `CaptureString` seam.
 type private CountingRunner(inner: IProcessRunner) =
     inherit DelegatingProcessRunner(inner)
     let mutable count = 0
     member _.Count = count
 
-    override this.OutputStringAsync(command, cancellationToken) =
+    override this.CaptureStringAsync(command, cancellationToken) =
         count <- count + 1
-        base.OutputStringAsync(command, cancellationToken)
+        base.CaptureStringAsync(command, cancellationToken)
 
 /// Tests for the additive testability seams: FakeProcess, failable/timed-out Reply, ScriptedRunner.Start,
 /// and DelegatingProcessRunner.
