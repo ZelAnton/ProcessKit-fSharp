@@ -732,8 +732,8 @@ task {
 
         match proc.TakeStdin() with
         | Some stdin ->
-            do! stdin.WriteLine "2 + 2"
-            do! stdin.WriteLine "6 * 7"
+            do! stdin.WriteLineAsync "2 + 2"
+            do! stdin.WriteLineAsync "6 * 7"
             do! stdin.FinishAsync() // send EOF so bc finishes
         | None -> ()
         // …then read proc.StdoutLinesAsync() for the answers.
@@ -749,8 +749,8 @@ await using var proc = (await new Command("bc").KeepStdinOpen().StartAsync()).Ge
 
 if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
-    await stdin.WriteLine("2 + 2");
-    await stdin.WriteLine("6 * 7");
+    await stdin.WriteLineAsync("2 + 2");
+    await stdin.WriteLineAsync("6 * 7");
     await stdin.FinishAsync(); // send EOF so bc finishes
 }
 // …then read proc.StdoutLinesAsync() for the answers.

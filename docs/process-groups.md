@@ -137,7 +137,7 @@ A `ProcessGroup` **is itself an `IProcessRunner`**, so the same run/capture
 vocabulary you use on a `Command` works against the shared group — every child
 lands in the one container.
 
-The direct door is `Start(command)`, which returns a live `RunningProcess` (the
+The direct door is `StartAsync(command)`, which returns a live `RunningProcess` (the
 full streaming / stdin / readiness surface from
 [streaming.md](streaming.md)). The key ownership rule: **the group owns the
 child's lifetime.** Disposing the returned `RunningProcess` detaches only that
@@ -201,7 +201,7 @@ task {
         match! Runner.outputString group CancellationToken.None (Command.create "probe-tool") with
         | Ok result -> printfn $"exit={result.Code}: {result.Stdout}"
         | Error err -> eprintfn $"{err.Message}"
-    // `Runner.outputBytes` is the binary companion; `Runner.start` mirrors `group.Start`.
+    // `Runner.outputBytes` is the binary companion; `Runner.start` mirrors `group.StartAsync`.
     | Error err -> eprintfn $"{err.Message}"
 }
 ```
@@ -223,8 +223,18 @@ Console.WriteLine(await Runner.outputString(group, CancellationToken.None, new C
     { IsOk: true, ResultValue: var result }  => $"exit={result.Code}: {result.Stdout}",
     { IsOk: false, ErrorValue: var runErr } => runErr.Message,
 });
-// `Runner.outputBytes` is the binary companion; `Runner.start` mirrors `group.Start`.
+// `Runner.outputBytes` is the binary companion; `Runner.start` mirrors `group.StartAsync`.
 ```
+
+> **Capture normalization, and a Windows caveat.** A capture through a shared group goes through the
+> same path as the default runner, so output encoding, line-ending normalization, `OkCodes`, and the
+> `OutputBuffer` policy match exactly — a `ProcessGroup` runner is interchangeable with the default one.
+> One platform caveat: on Windows a per-run `Timeout` / `CancelOn` hard-kills only the run's *leader*
+> process (its descendants stay in the shared Job until the group is torn down). So if a descendant
+> inherited the leader's stdout/stderr pipe and outlives it, the capture can stall past the deadline
+> until that descendant exits or the group is disposed. POSIX kills the leader's whole process group, so
+> it is unaffected. For a hard per-run deadline on Windows, give the run its own group (the default
+> runner) rather than a shared one.
 
 Because a group satisfies `IProcessRunner`, you can also hand it to anything that
 accepts a runner so a whole fleet shares one kill-on-dispose container: pass it as
@@ -578,7 +588,7 @@ time and peak memory are available where the kernel accounts for the whole tree 
 **POSIX process-group** backend only the live count is reported and the two
 `option` fields stay `None`.
 
-`SampleStats(interval)` turns the snapshot into a periodic series as an
+`SampleStatsAsync(interval)` turns the snapshot into a periodic series as an
 `IAsyncEnumerable<ProcessGroupStats>` — the first sample immediately, then one per
 `interval`:
 

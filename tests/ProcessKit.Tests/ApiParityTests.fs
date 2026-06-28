@@ -105,6 +105,32 @@ type ApiParityTests() =
         }
 
     [<Test>]
+    member _.``ProcessGroup runner captures identically to JobRunner (same normalization)``() : Task =
+        task {
+            // The shared-group runner captures through the same RunningProcess path as JobRunner, so the
+            // captured stdout is normalized identically (CRLF -> LF, trailing newline trimmed) rather
+            // than raw-decoded — `group.OutputStringAsync cmd` must equal `JobRunner` for the same command.
+            let command = shell "echo hi"
+            let jobRunner: IProcessRunner = JobRunner()
+
+            let group =
+                match ProcessGroup.Create() with
+                | Ok g -> g
+                | Error e -> failwith $"ProcessGroup.Create failed: {e}"
+
+            use group = group
+
+            let! viaJob = jobRunner.OutputStringAsync(command, CancellationToken.None)
+            let! viaGroup = (group :> IProcessRunner).OutputStringAsync(command, CancellationToken.None)
+
+            match viaJob, viaGroup with
+            | Ok j, Ok g ->
+                Assert.That(j.Stdout, Is.EqualTo "hi") // trailing newline trimmed, CRLF collapsed
+                Assert.That(g.Stdout, Is.EqualTo j.Stdout) // shared-group runner agrees with JobRunner
+            | _ -> Assert.Fail "expected both runners to capture successfully"
+        }
+
+    [<Test>]
     member _.``ensureSuccess works on a byte[] result``() : Task =
         task {
             // ensureSuccess is generic over the captured-stdout type: a failing bytes capture maps to

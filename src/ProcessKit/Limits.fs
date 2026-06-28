@@ -50,7 +50,7 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, limits: ResourceLi
     /// The defaults: a 2-second shutdown grace, no limits.
     new() = ProcessGroupOptions(TimeSpan.FromSeconds 2.0, ResourceLimits.None)
 
-    /// How long `Shutdown` waits after SIGTERM before escalating to SIGKILL (Unix; default 2s).
+    /// How long `ShutdownAsync` waits after SIGTERM before escalating to SIGKILL (Unix; default 2s).
     member _.ShutdownTimeout = shutdownTimeout
 
     /// The whole-tree resource caps applied at creation.

@@ -79,7 +79,7 @@ type private Mode =
 /// **Replay** mode loads the cassette and serves results with **no subprocess**: a match is keyed on
 /// program + args + cwd + stdin-source digest; duplicates replay in capture order then repeat the
 /// last; an unmatched call is `ProcessError.CassetteMiss` (never a surprise subprocess). Covers
-/// `OutputString` (and `OutputBytes` via a UTF-8 round-trip of the recorded stdout); `Start` is
+/// `OutputStringAsync` (and `OutputBytesAsync` via a UTF-8 round-trip of the recorded stdout); `StartAsync` is
 /// unsupported. A one-shot stdin source (`FromReader` / `FromLines` / `FromAsyncLines`) cannot be
 /// keyed and errors.
 [<Sealed>]
@@ -367,7 +367,7 @@ type RecordReplayRunner private (mode: Mode, path: string) =
 
         member _.StartAsync(_command, _cancellationToken) =
             Task.FromResult(
-                Error(ProcessError.Unsupported "RecordReplayRunner does not support Start (live streaming)")
+                Error(ProcessError.Unsupported "RecordReplayRunner does not support StartAsync (live streaming)")
             )
 
     interface IDisposable with

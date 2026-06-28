@@ -161,8 +161,8 @@ type StreamingTests() =
                 match running.TakeStdin() with
                 | None -> Assert.Fail "expected an interactive stdin handle"
                 | Some stdin ->
-                    do! stdin.WriteLine "banana"
-                    do! stdin.WriteLine "apple"
+                    do! stdin.WriteLineAsync "banana"
+                    do! stdin.WriteLineAsync "apple"
                     do! stdin.FinishAsync() // close stdin -> sort emits and exits
 
                     match! running.OutputStringAsync() with

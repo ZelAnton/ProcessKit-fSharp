@@ -12,9 +12,9 @@ open System.Threading.Tasks
 /// reaps every stage together.
 ///
 /// Build it by piping commands (`a.Pipe(b).Pipe(c)`), then run it to completion with the same
-/// run-and-capture verbs a single command exposes (`Run`/`OutputString`/`OutputBytes`/`ExitCode`/
-/// `Probe`/`Parse`/`TryParse`). A pipeline runs as a whole, so the *streaming* verbs (`FirstLine`,
-/// `StdoutLines`) are deliberately not offered — capture the last stage's output instead. The exit
+/// run-and-capture verbs a single command exposes (`RunAsync`/`OutputStringAsync`/`OutputBytesAsync`/`ExitCodeAsync`/
+/// `ProbeAsync`/`ParseAsync`/`TryParseAsync`). A pipeline runs as a whole, so the *streaming* verbs (`FirstLineAsync`,
+/// `StdoutLinesAsync`) are deliberately not offered — capture the last stage's output instead. The exit
 /// status follows shell **pipefail**: the rightmost stage that did not exit with an accepted code
 /// (its `Command.OkCodes`, `{0}` by default) determines the result, unless that stage opted out with
 /// `Command.UncheckedInPipe`.
@@ -59,7 +59,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                     // Every stage opted out of pipefail (`UncheckedInPipe`): nothing can fail the
                     // pipeline, so report success against the last stage regardless of its raw exit
                     // (otherwise an all-unchecked chain with a failing last stage would wrongly fail
-                    // `Run`/`ExitCode`). Use the last stage's own first accepted code.
+                    // `RunAsync`/`ExitCodeAsync`). Use the last stage's own first accepted code.
                     let okCode = last.OkCodes |> List.tryHead |> Option.defaultValue 0
 
                     { last with
@@ -162,7 +162,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                 | Ok ok -> return Ok(ok.Stdout.TrimEnd())
         }
 
-    /// Like `Run`, but discard the captured output.
+    /// Like `RunAsync`, but discard the captured output.
     member this.RunUnitAsync(cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
         task {
             match! this.RunAsync cancellationToken with
@@ -186,26 +186,26 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             | Ok result -> return ProcessResult.probe result
         }
 
-    /// `OutputBytes` against `CancellationToken.None`.
+    /// `OutputBytesAsync` against `CancellationToken.None`.
     member this.OutputBytesAsync() =
         this.OutputBytesAsync CancellationToken.None
 
-    /// `OutputString` against `CancellationToken.None`.
+    /// `OutputStringAsync` against `CancellationToken.None`.
     member this.OutputStringAsync() =
         this.OutputStringAsync CancellationToken.None
 
-    /// `Run` against `CancellationToken.None`.
+    /// `RunAsync` against `CancellationToken.None`.
     member this.RunAsync() = this.RunAsync CancellationToken.None
 
-    /// `RunUnit` against `CancellationToken.None`.
+    /// `RunUnitAsync` against `CancellationToken.None`.
     member this.RunUnitAsync() =
         this.RunUnitAsync CancellationToken.None
 
-    /// `ExitCode` against `CancellationToken.None`.
+    /// `ExitCodeAsync` against `CancellationToken.None`.
     member this.ExitCodeAsync() =
         this.ExitCodeAsync CancellationToken.None
 
-    /// `Probe` against `CancellationToken.None`.
+    /// `ProbeAsync` against `CancellationToken.None`.
     member this.ProbeAsync() = this.ProbeAsync CancellationToken.None
 
     /// Require a successful pipefail exit and parse the trimmed stdout into a `'T`; a thrown parser
@@ -225,11 +225,11 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                     return Error(ProcessError.Parse((List.last commands).Program, ex.Message))
         }
 
-    /// `Parse` against `CancellationToken.None`.
+    /// `ParseAsync` against `CancellationToken.None`.
     member this.ParseAsync(parser: Func<string, 'T>) =
         this.ParseAsync(parser, CancellationToken.None)
 
-    /// Like `Parse`, but the parser returns its own `Result` (its error message becomes `Parse`).
+    /// Like `ParseAsync`, but the parser returns its own `Result` (its error message becomes `Parse`).
     member this.TryParseAsync
         (parser: Func<string, Result<'T, string>>, cancellationToken: CancellationToken)
         : Task<Result<'T, ProcessError>> =
@@ -244,7 +244,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                 | Error message -> return Error(ProcessError.Parse((List.last commands).Program, message))
         }
 
-    /// `TryParse` against `CancellationToken.None`.
+    /// `TryParseAsync` against `CancellationToken.None`.
     member this.TryParseAsync(parser: Func<string, Result<'T, string>>) =
         this.TryParseAsync(parser, CancellationToken.None)
 

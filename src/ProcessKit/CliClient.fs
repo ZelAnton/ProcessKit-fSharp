@@ -64,7 +64,7 @@ type CliClient internal (config: CliClientConfig) =
     member this.RunAsync(args: seq<string>, cancellationToken: CancellationToken) =
         Runner.run config.Runner cancellationToken (this.Command args)
 
-    /// `Run` against `CancellationToken.None`.
+    /// `RunAsync` against `CancellationToken.None`.
     member this.RunAsync(args: seq<string>) =
         this.RunAsync(args, CancellationToken.None)
 
@@ -72,7 +72,7 @@ type CliClient internal (config: CliClientConfig) =
     member this.RunUnitAsync(args: seq<string>, cancellationToken: CancellationToken) =
         Runner.runUnit config.Runner cancellationToken (this.Command args)
 
-    /// `RunUnit` against `CancellationToken.None`.
+    /// `RunUnitAsync` against `CancellationToken.None`.
     member this.RunUnitAsync(args: seq<string>) =
         this.RunUnitAsync(args, CancellationToken.None)
 
@@ -80,7 +80,7 @@ type CliClient internal (config: CliClientConfig) =
     member this.OutputStringAsync(args: seq<string>, cancellationToken: CancellationToken) =
         Runner.outputString config.Runner cancellationToken (this.Command args)
 
-    /// `OutputString` against `CancellationToken.None`.
+    /// `OutputStringAsync` against `CancellationToken.None`.
     member this.OutputStringAsync(args: seq<string>) =
         this.OutputStringAsync(args, CancellationToken.None)
 
@@ -88,7 +88,7 @@ type CliClient internal (config: CliClientConfig) =
     member this.OutputBytesAsync(args: seq<string>, cancellationToken: CancellationToken) =
         Runner.outputBytes config.Runner cancellationToken (this.Command args)
 
-    /// `OutputBytes` against `CancellationToken.None`.
+    /// `OutputBytesAsync` against `CancellationToken.None`.
     member this.OutputBytesAsync(args: seq<string>) =
         this.OutputBytesAsync(args, CancellationToken.None)
 
@@ -96,7 +96,7 @@ type CliClient internal (config: CliClientConfig) =
     member this.ExitCodeAsync(args: seq<string>, cancellationToken: CancellationToken) =
         Runner.exitCode config.Runner cancellationToken (this.Command args)
 
-    /// `ExitCode` against `CancellationToken.None`.
+    /// `ExitCodeAsync` against `CancellationToken.None`.
     member this.ExitCodeAsync(args: seq<string>) =
         this.ExitCodeAsync(args, CancellationToken.None)
 
@@ -104,7 +104,7 @@ type CliClient internal (config: CliClientConfig) =
     member this.ProbeAsync(args: seq<string>, cancellationToken: CancellationToken) =
         Runner.probe config.Runner cancellationToken (this.Command args)
 
-    /// `Probe` against `CancellationToken.None`.
+    /// `ProbeAsync` against `CancellationToken.None`.
     member this.ProbeAsync(args: seq<string>) =
         this.ProbeAsync(args, CancellationToken.None)
 
@@ -112,7 +112,7 @@ type CliClient internal (config: CliClientConfig) =
     member this.StartAsync(args: seq<string>, cancellationToken: CancellationToken) =
         Runner.start config.Runner cancellationToken (this.Command args)
 
-    /// `Start` against `CancellationToken.None`.
+    /// `StartAsync` against `CancellationToken.None`.
     member this.StartAsync(args: seq<string>) =
         this.StartAsync(args, CancellationToken.None)
 
@@ -122,18 +122,18 @@ type CliClient internal (config: CliClientConfig) =
         ArgumentNullException.ThrowIfNull parser
         Runner.parse config.Runner cancellationToken parser.Invoke (this.Command args)
 
-    /// `Parse` against `CancellationToken.None`.
+    /// `ParseAsync` against `CancellationToken.None`.
     member this.ParseAsync(args: seq<string>, parser: Func<string, 'T>) =
         this.ParseAsync(args, parser, CancellationToken.None)
 
-    /// Like `Parse`, but the parser returns its own `Result` (its error message becomes `Parse`).
+    /// Like `ParseAsync`, but the parser returns its own `Result` (its error message becomes `Parse`).
     member this.TryParseAsync
         (args: seq<string>, parser: Func<string, Result<'T, string>>, cancellationToken: CancellationToken)
         =
         ArgumentNullException.ThrowIfNull parser
         Runner.tryParse config.Runner cancellationToken parser.Invoke (this.Command args)
 
-    /// `TryParse` against `CancellationToken.None`.
+    /// `TryParseAsync` against `CancellationToken.None`.
     member this.TryParseAsync(args: seq<string>, parser: Func<string, Result<'T, string>>) =
         this.TryParseAsync(args, parser, CancellationToken.None)
 
@@ -142,7 +142,7 @@ type CliClient internal (config: CliClientConfig) =
         ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine config.Runner cancellationToken predicate.Invoke (this.Command args)
 
-    /// `FirstLine` against `CancellationToken.None`.
+    /// `FirstLineAsync` against `CancellationToken.None`.
     member this.FirstLineAsync(args: seq<string>, predicate: Func<string, bool>) =
         this.FirstLineAsync(args, predicate, CancellationToken.None)
 

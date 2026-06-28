@@ -597,9 +597,9 @@ class ProcessKit.ProcessRunnerExtensions
 
 class ProcessKit.ProcessStdin
   member FinishAsync() : System.Threading.Tasks.Task
-  member Flush() : System.Threading.Tasks.Task
-  member Write(System.Byte[]) : System.Threading.Tasks.Task
-  member WriteLine(System.String) : System.Threading.Tasks.Task
+  member FlushAsync() : System.Threading.Tasks.Task
+  member WriteAsync(System.Byte[]) : System.Threading.Tasks.Task
+  member WriteLineAsync(System.String) : System.Threading.Tasks.Task
 
 class ProcessKit.ResourceLimits
   member WithCpuQuota(System.Double) : ProcessKit.ResourceLimits

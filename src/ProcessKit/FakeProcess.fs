@@ -7,7 +7,7 @@ open System.Threading.Tasks
 open ProcessKit
 
 /// Builds an in-memory `RunningProcess` for unit-testing code that consumes a live handle —
-/// `StdoutLines` / `OutputEvents` / `Finish` / the readiness probes / the buffered verbs — without
+/// `StdoutLinesAsync` / `OutputEventsAsync` / `FinishAsync` / the readiness probes / the buffered verbs — without
 /// spawning a real process. Immutable and fluent; `Build()` returns a real `RunningProcess` whose
 /// stdout/stderr are `MemoryStream`s of the scripted text, whose wait resolves to the scripted
 /// outcome, and whose kill/teardown are no-ops.
@@ -23,7 +23,7 @@ type FakeProcess private (template: Command, stdout: string, stderr: string, out
 
     /// A fake whose built `RunningProcess` inherits `command`'s config — encodings, `OkCodes`, output
     /// buffer, line handlers — so it behaves like a real run of that command. Internal: `ScriptedRunner`
-    /// uses it so `Start` and the capture verbs agree on success/encoding semantics.
+    /// uses it so `StartAsync` and the capture verbs agree on success/encoding semantics.
     static member internal OfCommand(command: Command) =
         FakeProcess(command, "", "", Outcome.Exited 0, None)
 

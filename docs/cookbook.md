@@ -385,8 +385,8 @@ From C# this is simply `await foreach (var line in proc.StdoutLinesAsync()) { ..
 ```fsharp
 match proc.TakeStdin() with
 | Some stdin ->
-    do! stdin.WriteLine "command one"
-    do! stdin.Flush()
+    do! stdin.WriteLineAsync "command one"
+    do! stdin.FlushAsync()
     do! stdin.FinishAsync()   // close stdin (EOF)
 | None -> ()
 ```
@@ -396,8 +396,8 @@ match proc.TakeStdin() with
 ```csharp
 if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
-    await stdin.WriteLine("command one");
-    await stdin.Flush();
+    await stdin.WriteLineAsync("command one");
+    await stdin.FlushAsync();
     await stdin.FinishAsync();   // close stdin (EOF)
 }
 ```
@@ -434,7 +434,7 @@ Console.WriteLine(await proc.WaitForLineAsync(l => l.Contains("ready"), TimeSpan
 });
 ```
 
-Also `WaitForPort(endpoint, timeout)` and `WaitFor(predicateReturningTask, timeout)`.
+Also `WaitForPortAsync(endpoint, timeout)` and `WaitForAsync(predicateReturningTask, timeout)`.
 
 ## Timeouts, cancellation, retry
 

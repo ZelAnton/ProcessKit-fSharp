@@ -5,17 +5,8 @@ open System.Collections.Generic
 open System.Diagnostics
 open System.IO
 open System.Runtime.InteropServices
-open System.Text
 open System.Threading
 open System.Threading.Tasks
-
-/// A captured run before it is shaped into a `ProcessResult` (stdout kept as raw bytes so the
-/// text and bytes verbs share one capture path).
-type internal CapturedRun =
-    { Stdout: byte[]
-      Stderr: string
-      Outcome: Outcome
-      Duration: TimeSpan }
 
 /// A kill-on-dispose container for a process *tree*.
 ///
@@ -124,7 +115,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// Spawn `command` into the group and build a `RunningHost`. `ownsGroup` decides what disposing
     /// the resulting `RunningProcess` does: when **true** (a private per-run group) it reaps this
     /// whole group; when **false** (a shared group) it only detaches this run's I/O — the group owns
-    /// the child's lifetime and reaps it on `Shutdown`/`Dispose`. That ownership choice is the only
+    /// the child's lifetime and reaps it on `ShutdownAsync`/`Dispose`. That ownership choice is the only
     /// difference between the two start paths, so it lives here as one branch each on `StartKill`,
     /// `GracefulKill`, and `Teardown`.
     member private this.BuildHost(command: Command, ownsGroup: bool) : Result<RunningHost, ProcessError> =
@@ -183,13 +174,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// Spawn `command` into this *shared* group and build a `RunningHost`. Unlike `StartInternal`,
     /// disposing the resulting `RunningProcess` does **not** reap the group — the group owns the
-    /// child's lifetime (reaped on `Shutdown`/`Dispose`). Internal — `Start` wraps it.
+    /// child's lifetime (reaped on `ShutdownAsync`/`Dispose`). Internal — `StartAsync` wraps it.
     member internal this.StartShared(command: Command) : Result<RunningHost, ProcessError> =
         this.BuildHost(command, ownsGroup = false)
 
     /// Start `command` into this shared group and return a live `RunningProcess`. The **group** owns
     /// the child's lifetime: disposing the returned process detaches its I/O but does not kill it —
-    /// reap the tree with `Shutdown`/`Dispose`, or this one run with its `StartKill`.
+    /// reap the tree with `ShutdownAsync`/`Dispose`, or this one run with its `StartKill`.
     member this.StartAsync(command: Command) : Task<Result<RunningProcess, ProcessError>> =
         task {
             match this.StartShared command with
@@ -200,7 +191,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // Tree-control / accounting verbs become an error once the group is released: after teardown the
     // backend's Job handle is closed (and POSIX pgids may have been recycled), so calling in would be
     // a use-after-close or a wrong-target kill. Guarding here (as `Stats` already did) closes the
-    // window for a verb racing a concurrent `Dispose`/`Shutdown`.
+    // window for a verb racing a concurrent `Dispose`/`ShutdownAsync`.
     member private _.WhenLive(action: unit -> Result<'T, ProcessError>) : Result<'T, ProcessError> =
         // A released group is a permanent condition, not a transient I/O blip — use `Unsupported`
         // (which `ProcessError.isTransient` rejects) so a retry classifier never re-tries a dead group.
@@ -260,12 +251,17 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
         StatsSamplerSeq((fun () -> this.Stats()), period)
 
-    /// Spawn `command` into the group, capture stdout/stderr to completion, and reap it. Does
-    /// **not** release the group (the caller keeps it for `Shutdown`/`Dispose`). A cancelled token
-    /// terminates the whole tree and resolves to `ProcessError.Cancelled`.
-    member internal this.SpawnAndCapture
-        (command: Command, cancellationToken: CancellationToken)
-        : Task<Result<CapturedRun, ProcessError>> =
+    /// Capture a run through this *shared* group, exactly as `JobRunner` captures through a private one:
+    /// build a `RunningProcess` over the shared group and run it to completion via the `RunningProcess`
+    /// verb, so encoding, line-ending/BOM/trailing-newline normalization, `OkCodes`, and
+    /// `OutputBufferPolicy` all match every other runner. If the (CancelOn-linked) token fires, just this
+    /// child is killed and the run resolves to `ProcessError.Cancelled`. The child's I/O is detached on
+    /// completion (via the run's teardown); the group keeps owning the child until `ShutdownAsync`/`Dispose`.
+    member private this.CaptureShared
+        (command: Command)
+        (cancellationToken: CancellationToken)
+        (consume: RunningProcess -> Task<Result<'T, ProcessError>>)
+        : Task<Result<'T, ProcessError>> =
         task {
             // Honour the command's own CancelOn in addition to the verb's token, so a Command.CancelOn
             // (or a CliClient default) ties this run to its token even through a ProcessGroup runner.
@@ -279,55 +275,17 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             if effectiveToken.IsCancellationRequested then
                 return Error(ProcessError.Cancelled command.Program)
             else
-                match this.SpawnInto command with
+                match this.StartShared command with
                 | Error error -> return Error error
-                | Ok spawned ->
-                    let startedAt = Stopwatch.GetTimestamp()
-                    let registration = effectiveToken.Register(fun () -> backend.KillChild spawned)
+                | Ok host ->
+                    let running = RunningProcess host
+                    use _registration = effectiveToken.Register(fun () -> running.StartKill())
+                    let! result = consume running
 
-                    Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
-                    let stdoutTask = Pump.drainRawOrEmpty spawned.Stdout None CancellationToken.None
-                    let stderrTask = Pump.drainRawOrEmpty spawned.Stderr None CancellationToken.None
-                    let waitTask = waitOutcome spawned.Handle
-
-                    try
-                        // Honour the command's `Timeout`: on the deadline, hard-kill just this child's
-                        // subtree (a shared group may hold siblings, so the graceful whole-tree path is not
-                        // used here) and report `TimedOut`. An over-long span is treated as no timeout.
-                        let! outcome =
-                            Timeouts.raceTimeout
-                                command.Config.Logger
-                                command.Program
-                                command.Config.Timeout
-                                (fun () -> task { backend.KillChild spawned } :> Task)
-                                waitTask
-
-                        // Observe both pumps before reading either, so a throwing stderr handler (or a
-                        // raw-drain I/O fault) can't orphan the other as an unobserved task.
-                        do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
-                        let! stdoutBytes = stdoutTask
-                        let! stderrBytes = stderrTask
-                        let duration = Stopwatch.GetElapsedTime startedAt
-
-                        if effectiveToken.IsCancellationRequested then
-                            return Error(ProcessError.Cancelled command.Program)
-                        else
-                            return
-                                Ok
-                                    { Stdout = stdoutBytes
-                                      Stderr = Encoding.UTF8.GetString stderrBytes
-                                      Outcome = outcome
-                                      Duration = duration }
-                    finally
-                        // Stop reacting to cancellation before closing the child's handle, so a late
-                        // cancellation can't fire KillChild on a since-reused handle value. Runs on every
-                        // exit path (including a faulting drain/timeout), so a long-lived shared group
-                        // never leaks the child's handle/pgid even when capture fails.
-                        registration.Dispose()
-                        Pump.closeSpawned spawned
-                        // The child is reaped: stop tracking it (close its Windows handle) so a long-lived
-                        // shared group does not accumulate handles/pgids across many captured runs.
-                        backend.Release spawned
+                    if effectiveToken.IsCancellationRequested then
+                        return Error(ProcessError.Cancelled command.Program)
+                    else
+                        return result
         }
 
     /// Gracefully kill the contained tree (SIGTERM, then SIGKILL after `grace`) WITHOUT releasing
@@ -346,7 +304,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         }
         :> Task
 
-    /// `Shutdown` using the group's configured `Options.ShutdownTimeout`.
+    /// `ShutdownAsync` using the group's configured `Options.ShutdownTimeout`.
     member this.ShutdownAsync() : Task =
         this.ShutdownAsync options.ShutdownTimeout
 
@@ -356,10 +314,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     // A `ProcessGroup` is itself an `IProcessRunner` — every run goes into THIS shared group rather
     // than a fresh private one, so a whole fleet shares one kill-on-dispose container (pass it to
-    // `Supervisor.WithRunner`). Captured runs decode stdout with the command's encoding and honour the
-    // per-run `Command.Timeout` (hard-kill of just that child's subtree → `TimedOut`) and `CancelOn`;
-    // they do not apply the line-level `OutputBufferPolicy` or `TimeoutGrace` (a shared group has no
-    // per-child graceful kill) — use `Start` + the `RunningProcess` verbs for those.
+    // `Supervisor.WithRunner`). Captured runs go through the same `RunningProcess` verbs as the default
+    // `JobRunner`, so encoding, line-ending/BOM/trailing-newline normalization, `OkCodes`, and the
+    // line-level `OutputBufferPolicy` all match every other runner. They honour the per-run
+    // `Command.Timeout` (hard-kill of just that child → `TimedOut`: its process group/subtree on POSIX,
+    // only the leader process on Windows — descendants stay in the shared Job and are reaped at group
+    // teardown, so a Windows descendant that inherited the output pipe and outlives the leader can delay
+    // the capture's completion until it too exits) and `CancelOn`. `TimeoutGrace` has no per-child
+    // graceful kill in a shared group, so it falls back to the immediate kill.
     interface IProcessRunner with
         member this.StartAsync(command, cancellationToken) =
             task {
@@ -370,44 +332,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             }
 
         member this.OutputStringAsync(command, cancellationToken) =
-            task {
-                match! this.SpawnAndCapture(command, cancellationToken) with
-                | Error error -> return Error error
-                | Ok captured ->
-                    let text = command.Config.StdoutEncoding.GetString captured.Stdout
-
-                    return
-                        Ok(
-                            ProcessResult<string>(
-                                command.Program,
-                                text,
-                                captured.Stderr,
-                                captured.Outcome,
-                                captured.Duration,
-                                false,
-                                command.Config.OkCodes
-                            )
-                        )
-            }
+            this.CaptureShared command cancellationToken (fun running -> running.OutputStringAsync())
 
         member this.OutputBytesAsync(command, cancellationToken) =
-            task {
-                match! this.SpawnAndCapture(command, cancellationToken) with
-                | Error error -> return Error error
-                | Ok captured ->
-                    return
-                        Ok(
-                            ProcessResult<byte[]>(
-                                command.Program,
-                                captured.Stdout,
-                                captured.Stderr,
-                                captured.Outcome,
-                                captured.Duration,
-                                false,
-                                command.Config.OkCodes
-                            )
-                        )
-            }
+            this.CaptureShared command cancellationToken (fun running -> running.OutputBytesAsync())
 
     interface IDisposable with
         member this.Dispose() =

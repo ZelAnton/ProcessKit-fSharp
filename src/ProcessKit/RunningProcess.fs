@@ -11,7 +11,7 @@ open System.Threading
 open System.Threading.Tasks
 open System.Threading.Channels
 
-/// The closures and state a `RunningProcess` is built from. Internal — `ProcessGroup.Start`
+/// The closures and state a `RunningProcess` is built from. Internal — `ProcessGroup.StartAsync`
 /// constructs it, so `RunningProcess` need not reference `ProcessGroup` (no compile cycle).
 type internal RunningHost =
     {
@@ -33,12 +33,12 @@ type internal RunningHost =
         Teardown: unit -> ValueTask
     }
 
-/// The result of `RunningProcess.WaitAny`: which started process finished first and how it
+/// The result of `RunningProcess.WaitAnyAsync`: which started process finished first and how it
 /// concluded. A named type (rather than a tuple) so the fields read clearly from C#.
 [<Sealed; NoComparison>]
 type WaitAnyResult internal (index: int, outcome: Outcome) =
 
-    /// The index, into the array passed to `WaitAny`, of the process that finished first.
+    /// The index, into the array passed to `WaitAnyAsync`, of the process that finished first.
     member _.Index = index
 
     /// How that process concluded.
@@ -365,7 +365,7 @@ type RunningProcess internal (host: RunningHost) =
         }
 
     /// Run to completion while periodically sampling the child's CPU/memory every `interval`, and
-    /// return a `RunProfile`. Drains and discards output (like `Wait`) and reaps the tree.
+    /// return a `RunProfile`. Drains and discards output (like `WaitAsync`) and reaps the tree.
     member _.ProfileAsync(interval: TimeSpan) : Task<RunProfile> =
         if not (claimBuffered ()) then
             raise (InvalidOperationException alreadyConsumedMessage)
@@ -445,7 +445,7 @@ type RunningProcess internal (host: RunningHost) =
             | None -> return RunProfile(outcome.Code, elapsed (), lastCpu, peakMemory, samples)
         }
 
-    /// `Profile` sampling every 100 ms.
+    /// `ProfileAsync` sampling every 100 ms.
     member this.ProfileAsync() =
         this.ProfileAsync(TimeSpan.FromMilliseconds 100.0)
 
@@ -472,10 +472,10 @@ type RunningProcess internal (host: RunningHost) =
                         stdoutChannel.Writer.Complete()
                     with ex ->
                         // A pump fault — most plausibly a throwing `OnStdoutLine` handler — must still
-                        // complete the channel, carrying the error, so a `StdoutLines` consumer observes
+                        // complete the channel, carrying the error, so a `StdoutLinesAsync` consumer observes
                         // it instead of hanging on a reader that never ends. Re-raise (preserving the
                         // original stack; `reraise` is unavailable inside a task CE) so `streamOutcome`
-                        // / `Finish` surface the same fault.
+                        // / `FinishAsync` surface the same fault.
                         stdoutChannel.Writer.Complete ex
                         ExceptionDispatchInfo.Throw ex
                 }
@@ -494,16 +494,16 @@ type RunningProcess internal (host: RunningHost) =
                     return outcome
                 }
 
-            // A `StdoutLines()` consumer can abandon `Finish()` — e.g. its enumeration throws because a
+            // A `StdoutLinesAsync()` consumer can abandon `FinishAsync()` — e.g. its enumeration throws because a
             // faulting `OnStdoutLine` handler completed the channel with the error. Observe `streamOutcome`'s
             // fault here so that abandoned task can't surface as an unobserved exception at finalization;
-            // a consumer that does await (`Finish`/`WaitAny`/`WaitAll`) still re-throws it.
+            // a consumer that does await (`FinishAsync`/`WaitAnyAsync`/`WaitAllAsync`) still re-throws it.
             streamOutcome.ContinueWith(Action<Task<Outcome>>(fun t -> t.Exception |> ignore))
             |> ignore
 
             true
 
-    /// Stream stdout line by line as it arrives. Call `Finish` afterwards for stderr + outcome.
+    /// Stream stdout line by line as it arrives. Call `FinishAsync` afterwards for stderr + outcome.
     member this.StdoutLinesAsync() : IAsyncEnumerable<string> =
         if not (this.StartStdoutStreaming()) then
             raise (InvalidOperationException alreadyConsumedMessage)
@@ -536,7 +536,7 @@ type RunningProcess internal (host: RunningHost) =
             false
         else
             // Each pump completes the shared event channel on its own fault (carrying the error), so an
-            // `OutputEvents` consumer observes a throwing handler promptly rather than hanging until the
+            // `OutputEventsAsync` consumer observes a throwing handler promptly rather than hanging until the
             // process exits — `eventOutcome` below only completes the channel after the exit wait, which
             // for a long-running child can be far away. `TryComplete` because the two pumps and the
             // combined task below all race to complete the one channel; re-raise so `eventOutcome` faults.
@@ -580,7 +580,7 @@ type RunningProcess internal (host: RunningHost) =
                     with ex ->
                         error <- Some ex
                         // A fault (a throwing handler, or the exit wait itself) completes the channel WITH
-                        // the error so an `OutputEvents` consumer observes it instead of hanging — idempotent
+                        // the error so an `OutputEventsAsync` consumer observes it instead of hanging — idempotent
                         // with the per-pump completion above. The fault is otherwise consumed here (and by
                         // the ContinueWith below) rather than surfacing as an unobserved task exception.
                         eventChannel.Writer.TryComplete ex |> ignore
@@ -609,7 +609,7 @@ type RunningProcess internal (host: RunningHost) =
 
     /// Wait until a stdout line satisfies `predicate`, or fail with `NotReady` after `timeout`
     /// (or `Cancelled` if `cancellationToken` fires first). Consumed lines are not re-delivered; a
-    /// later `StdoutLines`/`Finish` sees the rest.
+    /// later `StdoutLinesAsync`/`FinishAsync` sees the rest.
     member this.WaitForLineAsync
         (predicate: Func<string, bool>, timeout: TimeSpan, cancellationToken: CancellationToken)
         : Task<Result<string, ProcessError>> =
@@ -648,16 +648,16 @@ type RunningProcess internal (host: RunningHost) =
                 | :? ChannelClosedException -> return Error(ProcessError.NotReady(config.Program, timeout))
             }
 
-    /// `WaitForLine` with no extra cancellation token.
+    /// `WaitForLineAsync` with no extra cancellation token.
     member this.WaitForLineAsync
         (predicate: Func<string, bool>, timeout: TimeSpan)
         : Task<Result<string, ProcessError>> =
         this.WaitForLineAsync(predicate, timeout, CancellationToken.None)
 
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`
-    /// (or `Cancelled` if `cancellationToken` fires first). Unlike `WaitForLine`, this does not read
+    /// (or `Cancelled` if `cancellationToken` fires first). Unlike `WaitForLineAsync`, this does not read
     /// the child's stdout/stderr while polling — a child that floods a *piped* stream before it is
-    /// ready can block on a full pipe; consume its output concurrently (`StdoutLines`/`OutputEvents`)
+    /// ready can block on a full pipe; consume its output concurrently (`StdoutLinesAsync`/`OutputEventsAsync`)
     /// or run it with `Stdout`/`Stderr` set to `Inherit`/`Null` when polling a chatty process.
     member _.WaitForPortAsync
         (endpoint: IPEndPoint, timeout: TimeSpan, cancellationToken: CancellationToken)
@@ -697,12 +697,12 @@ type RunningProcess internal (host: RunningHost) =
                 return Error(ProcessError.NotReady(config.Program, timeout))
         }
 
-    /// `WaitForPort` with no extra cancellation token.
+    /// `WaitForPortAsync` with no extra cancellation token.
     member this.WaitForPortAsync(endpoint: IPEndPoint, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
         this.WaitForPortAsync(endpoint, timeout, CancellationToken.None)
 
     /// Poll `probe` until it returns true, or fail with `NotReady` after `timeout` (or `Cancelled`
-    /// if `cancellationToken` fires first). Like `WaitForPort`, this does not drain the child's
+    /// if `cancellationToken` fires first). Like `WaitForPortAsync`, this does not drain the child's
     /// stdout/stderr while polling — consume a piped, chatty child's output concurrently (or run it
     /// with `Stdout`/`Stderr` `Inherit`/`Null`) so it can't block on a full pipe before becoming ready.
     member _.WaitForAsync
@@ -736,12 +736,12 @@ type RunningProcess internal (host: RunningHost) =
                 return Error(ProcessError.NotReady(config.Program, timeout))
         }
 
-    /// `WaitFor` with no extra cancellation token.
+    /// `WaitForAsync` with no extra cancellation token.
     member this.WaitForAsync(probe: Func<Task<bool>>, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
         this.WaitForAsync(probe, timeout, CancellationToken.None)
 
     /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
-    /// the racing primitive behind `WaitAny`/`WaitAll`.
+    /// the racing primitive behind `WaitAnyAsync`/`WaitAllAsync`.
     member internal _.ExitTask: Task<Outcome> =
         if not exitStarted then
             exitStarted <- true
@@ -779,7 +779,7 @@ type RunningProcess internal (host: RunningHost) =
     static member WaitAnyAsync(processes: RunningProcess[]) : Task<Result<WaitAnyResult, ProcessError>> =
         task {
             if processes.Length = 0 then
-                return Error(ProcessError.Unsupported "WaitAny requires at least one process")
+                return Error(ProcessError.Unsupported "WaitAnyAsync requires at least one process")
             else
                 let tasks = processes |> Array.map (fun p -> p.ExitTask)
                 let! completed = Task.WhenAny tasks

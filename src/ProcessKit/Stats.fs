@@ -28,7 +28,7 @@ type ProcessGroupStats internal (activeProcessCount: int, totalCpuTime: TimeSpan
     /// (Windows: the Job's peak *committed* memory). Not directly comparable across platforms.
     member _.PeakMemoryBytes = peakMemoryBytes
 
-/// Resource summary of one finished run — produced by `RunningProcess.Profile`.
+/// Resource summary of one finished run — produced by `RunningProcess.ProfileAsync`.
 ///
 /// CPU and memory come from the started child process (the same source as `RunningProcess.CpuTime`
 /// / `PeakMemoryBytes`), so they are `None` where per-process metrics are unavailable or when the
@@ -61,7 +61,7 @@ type RunProfile
         | Some cpu when duration > TimeSpan.Zero -> Some(cpu.TotalSeconds / duration.TotalSeconds)
         | _ -> None
 
-/// A **pull-based** periodic `ProcessGroupStats` series (the iterator behind `ProcessGroup.SampleStats`):
+/// A **pull-based** periodic `ProcessGroupStats` series (the iterator behind `ProcessGroup.SampleStatsAsync`):
 /// the first sample lands on the first `MoveNextAsync`, then one per `period`. It samples only when
 /// pulled and runs no background task, so abandoning it does no work and — crucially — does not keep
 /// the group alive, preserving kill-on-drop. The series ends on the first failing snapshot (e.g.
@@ -87,7 +87,7 @@ type internal StatsSampler
                             first <- false
                         else
                             try
-                                // `period` is pre-clamped by the caller (`SampleStats`) into the armable
+                                // `period` is pre-clamped by the caller (`SampleStatsAsync`) into the armable
                                 // range, so `Task.Delay` here can't throw on an over-long interval.
                                 do! Task.Delay(period, cancellationToken)
                             with :? OperationCanceledException ->

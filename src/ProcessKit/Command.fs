@@ -294,8 +294,8 @@ type Command internal (config: CommandConfig) =
         )
 
     /// Also cancel the run when `cancellationToken` fires (in addition to any verb token). Applies to
-    /// the run/capture/completion verbs (`Run`/`Output*`/`ExitCode`/`Probe`/`Parse`/`FirstLine`); the
-    /// live `Start` handle is driven by its caller, so it observes only the token passed to `Start`.
+    /// the run/capture/completion verbs (`RunAsync`/`Output*`/`ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/`FirstLineAsync`); the
+    /// live `StartAsync` handle is driven by its caller, so it observes only the token passed to `StartAsync`.
     member _.CancelOn(cancellationToken: CancellationToken) =
         Command(
             { config with
@@ -318,7 +318,7 @@ type Command internal (config: CommandConfig) =
         Command({ config with UncheckedInPipe = true })
 
     /// Replace the set of exit codes treated as success (the default is `{0}`) — this is what
-    /// `ProcessResult.IsSuccess`, `ensureSuccess`, and the `Run` verbs check. The codes *replace* the
+    /// `ProcessResult.IsSuccess`, `ensureSuccess`, and the `RunAsync` verbs check. The codes *replace* the
     /// default rather than adding to it, so pass `[0; 3]` to accept both `0` and `3`; an empty set
     /// resets to the default `{0}`.
     member _.OkCodes(codes: seq<int>) =
@@ -342,7 +342,7 @@ type Command internal (config: CommandConfig) =
         Command({ config with Logger = Some logger })
 
 /// Pipe-friendly functions over `Command`, mirroring the instance **builder** methods. The run
-/// verbs (`Run`/`OutputString`/`Parse`/…) are instance methods only — end a pipeline with method
+/// verbs (`RunAsync`/`OutputStringAsync`/`ParseAsync`/…) are instance methods only — end a pipeline with method
 /// syntax (`(cmd |> Command.arg "x").RunAsync()`), or go through `Runner.*` with an explicit runner.
 [<RequireQualifiedAccess>]
 module Command =

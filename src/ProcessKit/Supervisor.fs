@@ -418,7 +418,7 @@ type Supervisor internal (config: SupervisorConfig) =
             return final.Value
         }
 
-    /// `Run` against `CancellationToken.None`.
+    /// `RunAsync` against `CancellationToken.None`.
     member this.RunAsync() = this.RunAsync CancellationToken.None
 
 /// Pipe-friendly entry points for `Supervisor`.
@@ -428,4 +428,4 @@ module Supervisor =
     /// Supervise `command` with the default `JobRunner`.
     let create (command: Command) = Supervisor(command)
 
-// `Run` is an instance method on `Supervisor` — call `supervisor.RunAsync()` directly.
+// `RunAsync` is an instance method on `Supervisor` — call `supervisor.RunAsync()` directly.

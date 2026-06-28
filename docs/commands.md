@@ -517,7 +517,7 @@ Every verb returns `Task<Result<_, ProcessError>>`, and every verb has a
 | `ExitCodeAsync()` | `int` | the code, as `Ok` | The code *is* the answer |
 | `ProbeAsync()` | `bool` | `0`→`true`, `1`→`false`, else error | Predicate commands: `git diff --quiet`, `grep -q` |
 | `ParseAsync(f)` / `TryParseAsync(f)` | `'T` | `ProcessError.Exit` | A typed value from stdout (success required) |
-| `FirstLine(p)` | `string option` | — (stream-based) | Grab one matching line, kill the rest |
+| `FirstLineAsync(p)` | `string option` | — (stream-based) | Grab one matching line, kill the rest |
 | `StartAsync()` | `RunningProcess` | — | A live handle: [streaming, stdin, probes](streaming.md) |
 
 `RunAsync` returns stdout with trailing whitespace trimmed. `ExitCodeAsync` hands back a

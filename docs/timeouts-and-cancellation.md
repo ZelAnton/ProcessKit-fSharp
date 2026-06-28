@@ -115,7 +115,7 @@ By default the deadline **hard-kills** the tree at once. Add
 `Command.TimeoutGrace(grace)` (mirror: `Command.timeoutGrace`) to give the tree a
 chance to clean up: at the deadline it is sent `SIGTERM`, allowed up to the grace
 window to exit, then `SIGKILL`ed — the same SIGTERM → wait → SIGKILL tier as
-[`ProcessGroup.Shutdown`](process-groups.md). A signal-handling child that exits
+[`ProcessGroup.ShutdownAsync`](process-groups.md). A signal-handling child that exits
 ends the grace early.
 
 **F#**
@@ -161,7 +161,7 @@ capture verbs treat the deadline as *data*; the success-checking verbs raise it.
 | `ParseAsync(f)` / `TryParseAsync(f)` | `Error (ProcessError.Timeout …)` — both require success, so the deadline is raised |
 | `StartAsync()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); a following `FinishAsync()` reports `Outcome.TimedOut` |
 | `ProcessResult.ensureSuccess` on a captured result | `Error (ProcessError.Timeout …)` — the same conversion `RunAsync` does for you |
-| `FirstLine(p)` | the stream closes at the deadline; if no line matched first, you get `Ok None` (it is not a success-checking verb) |
+| `FirstLineAsync(p)` | the stream closes at the deadline; if no line matched first, you get `Ok None` (it is not a success-checking verb) |
 
 Streaming makes the "captured" half concrete — the deadline bounds the stream,
 and the outcome is readable afterwards:

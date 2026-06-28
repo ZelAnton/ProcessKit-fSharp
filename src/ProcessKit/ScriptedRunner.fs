@@ -55,7 +55,7 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
                 match reply.ErrorOverride with
                 | Some error -> Task.FromResult(Error error)
                 | None ->
-                    // Route capture through the same in-memory FakeProcess as `Start`, so all three seam
+                    // Route capture through the same in-memory FakeProcess as `StartAsync`, so all three seam
                     // paths agree byte-for-byte with a real run: line-ending normalization, the command's
                     // encoding, OkCodes, and output-buffer truncation are applied identically.
                     FakeProcess

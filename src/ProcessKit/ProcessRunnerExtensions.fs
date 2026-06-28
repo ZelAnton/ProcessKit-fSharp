@@ -5,18 +5,18 @@ open System.Runtime.CompilerServices
 open System.Threading
 
 /// The full run-verb vocabulary on *any* `IProcessRunner`, derived from the three-method seam
-/// (`OutputString`/`OutputBytes`/`Start`). So a chosen or injected runner — a shared `ProcessGroup`,
+/// (`OutputStringAsync`/`OutputBytesAsync`/`StartAsync`). So a chosen or injected runner — a shared `ProcessGroup`,
 /// a `ScriptedRunner`, a `JobRunner` — gets `run`/`exitCode`/`probe`/`parse`/… uniformly
 /// (`group.RunAsync command`, `scripted.ProbeAsync command`), callable from F# and C#. The verb *logic* lives
 /// once in the `Runner` module; these are thin sugar over it.
 ///
 /// Retry contract: the verbs here apply the command's `Retry` policy (they route through the `Runner`
-/// module), exactly like the `Command`/`CliClient` verbs. One asymmetry to know: `OutputString`/
-/// `OutputBytes` have no `CancellationToken` overload (it would be shadowed by the seam), so a call
+/// module), exactly like the `Command`/`CliClient` verbs. One asymmetry to know: `OutputStringAsync`/
+/// `OutputBytesAsync` have no `CancellationToken` overload (it would be shadowed by the seam), so a call
 /// like `runner.OutputStringAsync(command, ct)` binds to the raw `IProcessRunner` seam method and does NOT
 /// retry — for capture with a token *and* retry, call `Runner.outputString runner ct command`. The
-/// raw `IProcessRunner.OutputString`/`OutputBytes`/`Start` seam never retries; streaming verbs
-/// (`Start`/`FirstLine`) never retry on any surface.
+/// raw `IProcessRunner.OutputStringAsync`/`OutputBytesAsync`/`StartAsync` seam never retries; streaming verbs
+/// (`StartAsync`/`FirstLineAsync`) never retry on any surface.
 [<Extension>]
 type ProcessRunnerExtensions =
 
@@ -25,7 +25,7 @@ type ProcessRunnerExtensions =
     static member RunAsync(runner: IProcessRunner, command: Command) =
         Runner.run runner CancellationToken.None command
 
-    /// `Run`, cancellable through `cancellationToken`.
+    /// `RunAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member RunAsync(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
         Runner.run runner cancellationToken command
@@ -35,7 +35,7 @@ type ProcessRunnerExtensions =
     static member RunUnitAsync(runner: IProcessRunner, command: Command) =
         Runner.runUnit runner CancellationToken.None command
 
-    /// `RunUnit`, cancellable through `cancellationToken`.
+    /// `RunUnitAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member RunUnitAsync(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
         Runner.runUnit runner cancellationToken command
@@ -58,7 +58,7 @@ type ProcessRunnerExtensions =
     static member ExitCodeAsync(runner: IProcessRunner, command: Command) =
         Runner.exitCode runner CancellationToken.None command
 
-    /// `ExitCode`, cancellable through `cancellationToken`.
+    /// `ExitCodeAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member ExitCodeAsync(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
         Runner.exitCode runner cancellationToken command
@@ -68,7 +68,7 @@ type ProcessRunnerExtensions =
     static member ProbeAsync(runner: IProcessRunner, command: Command) =
         Runner.probe runner CancellationToken.None command
 
-    /// `Probe`, cancellable through `cancellationToken`.
+    /// `ProbeAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member ProbeAsync(runner: IProcessRunner, command: Command, cancellationToken: CancellationToken) =
         Runner.probe runner cancellationToken command
@@ -85,7 +85,7 @@ type ProcessRunnerExtensions =
         ArgumentNullException.ThrowIfNull parser
         Runner.parse runner CancellationToken.None parser.Invoke command
 
-    /// `Parse`, cancellable through `cancellationToken`.
+    /// `ParseAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member ParseAsync
         (runner: IProcessRunner, command: Command, parser: Func<string, 'T>, cancellationToken: CancellationToken)
@@ -93,13 +93,13 @@ type ProcessRunnerExtensions =
         ArgumentNullException.ThrowIfNull parser
         Runner.parse runner cancellationToken parser.Invoke command
 
-    /// Like `Parse`, but the parser returns its own `Result` (its error becomes `Parse`).
+    /// Like `ParseAsync`, but the parser returns its own `Result` (its error becomes `Parse`).
     [<Extension>]
     static member TryParseAsync(runner: IProcessRunner, command: Command, parser: Func<string, Result<'T, string>>) =
         ArgumentNullException.ThrowIfNull parser
         Runner.tryParse runner CancellationToken.None parser.Invoke command
 
-    /// `TryParse`, cancellable through `cancellationToken`.
+    /// `TryParseAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member TryParseAsync
         (
@@ -117,7 +117,7 @@ type ProcessRunnerExtensions =
         ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine runner CancellationToken.None predicate.Invoke command
 
-    /// `FirstLine`, cancellable through `cancellationToken`.
+    /// `FirstLineAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member FirstLineAsync
         (runner: IProcessRunner, command: Command, predicate: Func<string, bool>, cancellationToken: CancellationToken)

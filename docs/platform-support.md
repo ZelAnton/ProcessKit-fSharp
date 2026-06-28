@@ -97,7 +97,7 @@ Legend: ✅ full support · 🟡 supported with a documented qualification · �
 | Kill-on-dispose, whole tree | ✅ | ✅ | ✅ |
 | Graceful `ShutdownAsync` (TERM → grace → KILL) | 🟡 atomic kill only | ✅ | ✅ |
 
-`Shutdown(grace)` on Windows has no per-job graceful signal, so it is the atomic Job terminate;
+`ShutdownAsync(grace)` on Windows has no per-job graceful signal, so it is the atomic Job terminate;
 on the Unix mechanisms it is `SIGTERM`, then a grace window, then `SIGKILL`.
 
 **Signals (`Signal`)**

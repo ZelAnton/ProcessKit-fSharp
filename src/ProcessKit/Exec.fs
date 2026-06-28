@@ -67,7 +67,7 @@ module Exec =
         (cancellationToken: CancellationToken)
         =
         // Route through the verb layer (not the raw seam) so each command's own `Retry` policy applies,
-        // matching `cmd.OutputStringAsync()` / `CliClient.OutputString` — retry still fires only on a genuine
+        // matching `cmd.OutputStringAsync()` / `CliClient.OutputStringAsync` — retry still fires only on a genuine
         // error, never on a non-zero exit (which stays data).
         runAll concurrency runner commands (fun r c -> Runner.outputString r cancellationToken c)
 

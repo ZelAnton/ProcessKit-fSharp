@@ -482,7 +482,7 @@ A **cancelled** incarnation is terminal. If the token is already cancelled at th
 iteration, or an incarnation resolves to `ProcessError.Cancelled`, `RunAsync` returns that
 `Cancelled` immediately — regardless of policy or remaining budget. The token never un-cancels,
 so a restart could only produce another instantly-cancelled run; the supervisor refuses the
-futile loop. Pass the token to `Run(token)`:
+futile loop. Pass the token to `RunAsync(token)`:
 
 **F#**
 

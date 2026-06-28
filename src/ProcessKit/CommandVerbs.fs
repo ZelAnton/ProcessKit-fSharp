@@ -89,19 +89,19 @@ type CommandVerbs =
         ArgumentNullException.ThrowIfNull parser
         Runner.parse CommandVerbs.DefaultRunner CancellationToken.None parser.Invoke command
 
-    /// `Parse`, cancellable through `cancellationToken`.
+    /// `ParseAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member ParseAsync(command: Command, parser: Func<string, 'T>, cancellationToken: CancellationToken) =
         ArgumentNullException.ThrowIfNull parser
         Runner.parse CommandVerbs.DefaultRunner cancellationToken parser.Invoke command
 
-    /// Like `Parse`, but the parser returns its own `Result` (its error becomes `Parse`).
+    /// Like `ParseAsync`, but the parser returns its own `Result` (its error becomes `Parse`).
     [<Extension>]
     static member TryParseAsync(command: Command, parser: Func<string, Result<'T, string>>) =
         ArgumentNullException.ThrowIfNull parser
         Runner.tryParse CommandVerbs.DefaultRunner CancellationToken.None parser.Invoke command
 
-    /// `TryParse`, cancellable through `cancellationToken`.
+    /// `TryParseAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member TryParseAsync
         (command: Command, parser: Func<string, Result<'T, string>>, cancellationToken: CancellationToken)
@@ -115,7 +115,7 @@ type CommandVerbs =
         ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine CommandVerbs.DefaultRunner CancellationToken.None predicate.Invoke command
 
-    /// `FirstLine`, cancellable through `cancellationToken`.
+    /// `FirstLineAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member FirstLineAsync
         (command: Command, predicate: Func<string, bool>, cancellationToken: CancellationToken)

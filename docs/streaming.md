@@ -252,8 +252,8 @@ task {
 
         match proc.TakeStdin() with
         | Some stdin ->
-            do! stdin.WriteLine "2 + 2" // writes "2 + 2\n", flushed
-            do! stdin.WriteLine "6 * 7"
+            do! stdin.WriteLineAsync "2 + 2" // writes "2 + 2\n", flushed
+            do! stdin.WriteLineAsync "6 * 7"
             do! stdin.FinishAsync() // send EOF so bc exits
         | None -> ()
 
@@ -270,23 +270,23 @@ await using var proc = (await new Command("bc").KeepStdinOpen().StartAsync()).Ge
 
 if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
-    await stdin.WriteLine("2 + 2"); // writes "2 + 2\n", flushed
-    await stdin.WriteLine("6 * 7");
+    await stdin.WriteLineAsync("2 + 2"); // writes "2 + 2\n", flushed
+    await stdin.WriteLineAsync("6 * 7");
     await stdin.FinishAsync(); // send EOF so bc exits
 }
 
 // ... then read proc.StdoutLinesAsync() for the answers.
 ```
 
-`ProcessStdin` offers `WriteLine(line)` (appends a newline and flushes),
-`Write(bytes)` (raw bytes, for binary input), `Flush()`, and `FinishAsync()` (close
+`ProcessStdin` offers `WriteLineAsync(line)` (appends a newline and flushes),
+`WriteAsync(bytes)` (raw bytes, for binary input), `FlushAsync()`, and `FinishAsync()` (close
 stdin / send EOF). Disposing the writer — or the whole `RunningProcess` — closes
 stdin too; `FinishAsync()` just makes the EOF explicit and awaitable.
 
 **Avoid the full-duplex deadlock.** A child's stdout pipe has a finite OS buffer;
 once it fills, the child blocks *writing* stdout until something reads it. If you
 push a large interactive stdin while nothing drains the child's stdout, the child
-stops reading stdin (blocked on stdout), your `Write` parks waiting for stdin buffer
+stops reading stdin (blocked on stdout), your `WriteAsync` parks waiting for stdin buffer
 space, and neither side progresses. The `bc` example above is safe because it
 interleaves one small write with one read. When you both feed a sizable stdin **and**
 the child produces output, write stdin from one task and drain stdout from another:
@@ -306,7 +306,7 @@ task {
             let writer =
                 task {
                     for line in bigInput do
-                        do! stdin.WriteLine line
+                        do! stdin.WriteLineAsync line
 
                     do! stdin.FinishAsync()
                 }
@@ -340,7 +340,7 @@ if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and w
     var writer = Task.Run(async () =>
     {
         foreach (var line in bigInput)
-            await stdin.WriteLine(line);
+            await stdin.WriteLineAsync(line);
 
         await stdin.FinishAsync();
     });
@@ -550,7 +550,7 @@ Console.WriteLine($"exit={profile.ExitCode} wall={profile.Duration} samples={pro
 Console.WriteLine($"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}");
 ```
 
-`ProfileAsync()` with no argument uses a default sampling interval; `Profile(interval)`
+`ProfileAsync()` with no argument uses a default sampling interval; `ProfileAsync(interval)`
 samples at the cadence you pick. The resulting `RunProfile` exposes `ExitCodeAsync`,
 `Duration` (wall clock), `CpuTime` (user + kernel), `PeakMemoryBytes`, the number of
 `Samples` taken, and `AvgCpu` — CPU time over wall time, so a value near `1.7` means

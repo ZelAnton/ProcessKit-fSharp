@@ -43,7 +43,9 @@ type ShutdownTests() =
 
             let stopwatch = Stopwatch.StartNew()
             // Start the run but do not await it; Shutdown must kill the still-running child.
-            let capture = group.SpawnAndCapture(sleeper, CancellationToken.None)
+            let capture =
+                (group :> IProcessRunner).OutputStringAsync(sleeper, CancellationToken.None)
+
             do! Task.Delay 300
             do! group.ShutdownAsync(TimeSpan.FromSeconds 1.0)
             let! result = capture
@@ -83,7 +85,7 @@ type ShutdownTests() =
                 use group = createGroup ()
                 let script = $"( sleep 3 && touch {marker} ) </dev/null >/dev/null 2>&1 &"
 
-                match! group.SpawnAndCapture(shell script, CancellationToken.None) with
+                match! (group :> IProcessRunner).OutputStringAsync(shell script, CancellationToken.None) with
                 | Error error -> Assert.Fail $"spawn failed: {error}"
                 | Ok _ -> ()
 
@@ -112,7 +114,7 @@ type ShutdownTests() =
                 let script =
                     $"( setsid sh -c 'sleep 3 && touch {marker}' ) </dev/null >/dev/null 2>&1 &"
 
-                match! group.SpawnAndCapture(shell script, CancellationToken.None) with
+                match! (group :> IProcessRunner).OutputStringAsync(shell script, CancellationToken.None) with
                 | Error error -> Assert.Fail $"spawn failed: {error}"
                 | Ok _ -> ()
 
