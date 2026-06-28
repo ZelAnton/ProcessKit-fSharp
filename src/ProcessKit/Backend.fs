@@ -23,6 +23,40 @@ module private GracefulTeardown =
         }
         :> Task
 
+/// Kill and reap a single POSIX leader we `posix_spawn`ed, in this exact order: `killpg` SIGKILLs its
+/// whole process group (any subtree it backgrounded), then `waitpid` reaps the leader itself (`killpg`
+/// does not reap our own child). Shared by the cgroup and process-group backends' escapee/teardown
+/// cleanup so the kill-then-reap pairing lives in one place.
+module private PosixReap =
+
+    let leader (id: int) =
+        Native.killProcessGroup id
+        Native.reapLeader id
+
+/// The set of children a backend tracks, behind a single lock — the concurrency invariant every
+/// backend needs: a spawn racing a `Dispose`/teardown must serialize on add / remove / snapshot so a
+/// child can never be missed by teardown or double-released. One small type so the lock is applied
+/// consistently and can't be forgotten.
+type internal TrackedChildren<'T when 'T: equality>() =
+    let gate = obj ()
+    let items = List<'T>()
+
+    /// Track a freshly-spawned child.
+    member _.Add(item: 'T) = lock gate (fun () -> items.Add item)
+
+    /// Stop tracking a child; returns true when it was still tracked (false if already removed).
+    member _.Remove(item: 'T) : bool = lock gate (fun () -> items.Remove item)
+
+    /// A point-in-time copy of the tracked children.
+    member _.Snapshot() : 'T list = lock gate (fun () -> List.ofSeq items)
+
+    /// Atomically take and clear the tracked children — for the one-shot teardown drain.
+    member _.Drain() : 'T list =
+        lock gate (fun () ->
+            let copy = List.ofSeq items
+            items.Clear()
+            copy)
+
 /// One OS containment primitive behind a `ProcessGroup`. Each implementation owns exactly the state
 /// its mechanism needs — a Windows Job handle, a Linux cgroup path, or the tracked POSIX pgids — so
 /// the type-state that used to be a runtime `match mechanism` is now structural, and `ProcessGroup`
@@ -84,22 +118,18 @@ type internal IContainmentBackend =
 /// Windows Job Object backend. Closing the job handle triggers `KILL_ON_JOB_CLOSE`; the tracked
 /// process handles (closed on reap or teardown) are only for waiting.
 type internal JobObjectBackend(jobHandle: nativeint) =
-    let childLock = obj ()
-    let processHandles = List<nativeint>()
+    let children = TrackedChildren<nativeint>()
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.JobObject
         member _.Spawn(command) = Native.spawnWindows jobHandle command
 
-        member _.Track(spawned) =
-            lock childLock (fun () -> processHandles.Add spawned.Handle)
+        member _.Track(spawned) = children.Add spawned.Handle
 
         member _.Release(spawned) =
             // Remove the handle before closing so the teardown drain can't double-close a reused
             // handle value; the Job still contains the tree.
-            let wasTracked = lock childLock (fun () -> processHandles.Remove spawned.Handle)
-
-            if wasTracked then
+            if children.Remove spawned.Handle then
                 Native.closeWindowsHandle spawned.Handle
 
         member _.Wait(handle) = Native.waitWindows handle
@@ -114,9 +144,7 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             // The child was assigned to the Job at spawn, so KILL_ON_JOB_CLOSE kills it when HardRelease
             // closes the job handle — no TerminateProcess here (a concurrent HardRelease may already have
             // closed this handle value). Just drop our wait-handle if still tracked, so it is not leaked.
-            let wasTracked = lock childLock (fun () -> processHandles.Remove spawned.Handle)
-
-            if wasTracked then
+            if children.Remove spawned.Handle then
                 Native.closeWindowsHandle spawned.Handle
 
         member _.KillTree() = Native.terminateWindowsJob jobHandle
@@ -148,13 +176,7 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             | None -> Error(ProcessError.Io "failed to query Job Object accounting")
 
         member _.HardRelease() =
-            let handles =
-                lock childLock (fun () ->
-                    let copy = List.ofSeq processHandles
-                    processHandles.Clear()
-                    copy)
-
-            for handle in handles do
+            for handle in children.Drain() do
                 Native.closeWindowsHandle handle
 
             Native.closeWindowsHandle jobHandle
@@ -162,11 +184,7 @@ type internal JobObjectBackend(jobHandle: nativeint) =
 /// Linux cgroup v2 backend (the `limits` mechanism). Membership lives in `cgroup.procs`; the tree is
 /// reaped with `cgroup.kill` and the directory removed.
 type internal CgroupBackend(cgroupPath: string) =
-    let childLock = obj ()
-    let childPids = List<int>()
-
-    let pidSnapshot () =
-        lock childLock (fun () -> List.ofSeq childPids)
+    let children = TrackedChildren<int>()
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.CgroupV2
@@ -176,13 +194,13 @@ type internal CgroupBackend(cgroupPath: string) =
             // Track the pid so teardown can reap it (cgroup.kill SIGKILLs but does not waitpid our own
             // children) and clean it up as a fallback if it failed to migrate into the cgroup and so
             // escapes cgroup.kill.
-            lock childLock (fun () -> childPids.Add(int spawned.Handle))
+            children.Add(int spawned.Handle)
             Native.migrateToCgroup cgroupPath (int spawned.Handle)
 
         member _.Release(spawned) =
             // A run verb has reaped this child; stop tracking so teardown does not waitpid it again.
             // (The kernel already removed it from cgroup.procs.)
-            lock childLock (fun () -> childPids.Remove(int spawned.Handle) |> ignore)
+            children.Remove(int spawned.Handle) |> ignore
 
         member _.Wait(handle) = Native.waitPosix handle
         member _.PidOf(spawned) = Some(int spawned.Handle)
@@ -190,11 +208,10 @@ type internal CgroupBackend(cgroupPath: string) =
 
         member _.ReapEscapee(spawned) =
             let pid = int spawned.Handle
-            lock childLock (fun () -> childPids.Remove pid |> ignore)
+            children.Remove pid |> ignore
             // Mirror HardRelease's per-child cleanup: the child is its own pgid leader, so killpg covers
             // any subtree it spawned (whether or not it migrated into the cgroup), then reap the leader.
-            Native.killProcessGroup pid
-            Native.reapLeader pid
+            PosixReap.leader pid
 
         member _.KillTree() = Native.killCgroup cgroupPath
 
@@ -233,30 +250,24 @@ type internal CgroupBackend(cgroupPath: string) =
             // cgroup.kill SIGKILLs everything in the cgroup but does not reap our own children, and a
             // child that failed to migrate runs outside the cgroup entirely. Every child is also its own
             // process-group leader, so killpg cleans up an escapee's subtree; then reap the leader.
-            for pid in pidSnapshot () do
-                Native.killProcessGroup pid
-                Native.reapLeader pid
+            for pid in children.Snapshot() do
+                PosixReap.leader pid
 
             Native.removeCgroup cgroupPath
 
 /// POSIX process-group backend (macOS/BSD, or Linux without cgroup delegation). Every `posix_spawn`
 /// forms its own pgid, so a multi-child group holds several; `killpg` is the teardown.
 type internal ProcessGroupBackend() =
-    let childLock = obj ()
-    let childPgids = List<int>()
-
-    let pgidSnapshot () =
-        lock childLock (fun () -> List.ofSeq childPgids)
+    let children = TrackedChildren<int>()
 
     let anyChildAlive () =
-        pgidSnapshot () |> List.exists Native.processGroupAlive
+        children.Snapshot() |> List.exists Native.processGroupAlive
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.ProcessGroup
         member _.Spawn(command) = Native.spawnPosix command
 
-        member _.Track(spawned) =
-            lock childLock (fun () -> childPgids.Add(int spawned.Handle))
+        member _.Track(spawned) = children.Add(int spawned.Handle)
 
         member _.Release(spawned) =
             // A pgid is a whole group; the reaped leader may have left backgrounded members behind,
@@ -264,7 +275,7 @@ type internal ProcessGroupBackend() =
             let pgid = int spawned.Handle
 
             if not (Native.processGroupAlive pgid) then
-                lock childLock (fun () -> childPgids.Remove pgid |> ignore)
+                children.Remove pgid |> ignore
 
         member _.Wait(handle) = Native.waitPosix handle
         member _.PidOf(spawned) = Some(int spawned.Handle)
@@ -274,19 +285,18 @@ type internal ProcessGroupBackend() =
 
         member _.ReapEscapee(spawned) =
             let pgid = int spawned.Handle
-            lock childLock (fun () -> childPgids.Remove pgid |> ignore)
+            children.Remove pgid |> ignore
             // killpg the leader's group, then reap the leader we posix_spawned (killpg does not waitpid
             // our own child), matching HardRelease's per-pgid cleanup.
-            Native.killProcessGroup pgid
-            Native.reapLeader pgid
+            PosixReap.leader pgid
 
         member _.KillTree() =
-            for pgid in pgidSnapshot () do
+            for pgid in children.Snapshot() do
                 Native.killProcessGroup pgid
 
         member _.GracefulKillTree(grace) =
             // Snapshot the pgids once so terminate and the final force-kill act on the same set.
-            let pgids = pgidSnapshot ()
+            let pgids = children.Snapshot()
 
             GracefulTeardown.poll
                 (fun () ->
@@ -299,36 +309,37 @@ type internal ProcessGroupBackend() =
                             Native.killProcessGroup pgid)
                 grace
 
-        member _.Members() = Ok(pgidSnapshot ())
+        member _.Members() = Ok(children.Snapshot())
 
         member _.Signal(signal) =
             let signalNum = Native.signalNumber signal
 
-            for pgid in pgidSnapshot () do
+            for pgid in children.Snapshot() do
                 Native.signalProcessGroup pgid signalNum |> ignore
 
             Ok()
 
         member _.Suspend() =
-            for pgid in pgidSnapshot () do
+            for pgid in children.Snapshot() do
                 Native.suspendProcessGroup pgid
 
             Ok()
 
         member _.Resume() =
-            for pgid in pgidSnapshot () do
+            for pgid in children.Snapshot() do
                 Native.resumeProcessGroup pgid
 
             Ok()
 
         member _.Stats() =
-            let active = pgidSnapshot () |> List.filter Native.processGroupAlive |> List.length
+            let active =
+                children.Snapshot() |> List.filter Native.processGroupAlive |> List.length
+
             Ok(ProcessGroupStats(active, None, None))
 
         member _.HardRelease() =
             // Each pgid's leader is a child we posix_spawned, so we must waitpid it ourselves — `killpg`
             // SIGKILLs the group but does not reap our own children. Reap the leaders we still track (a
             // run verb Releases the ones it already reaped); other group members reparent to init.
-            for pgid in pgidSnapshot () do
-                Native.killProcessGroup pgid
-                Native.reapLeader pgid
+            for pgid in children.Snapshot() do
+                PosixReap.leader pgid
