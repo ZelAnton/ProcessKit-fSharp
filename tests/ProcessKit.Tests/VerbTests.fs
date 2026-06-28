@@ -106,9 +106,11 @@ type VerbTests() =
         :> Task
 
     [<Test>]
-    member _.``Command.Parse/TryParse/FirstLine are reachable on the default runner (both overloads)``() : Task =
+    member _.``Command.Parse/TryParse/FirstLine are reachable on the default runner (token omitted and passed)``
+        ()
+        : Task =
         task {
-            // Parse — no-token and cancellation-token overloads.
+            // Parse — cancellation token omitted, then passed.
             match! (shell "echo 42").ParseAsync(fun s -> int (s.Trim())) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"parse: {error}"
@@ -117,7 +119,7 @@ type VerbTests() =
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"parse(ct): {error}"
 
-            // TryParse — the C#-friendly TryParser delegate (BCL try-parse shape), no-token and ct overloads.
+            // TryParse — the C#-friendly TryParser delegate (BCL try-parse shape), token omitted then passed.
             let tryInt =
                 TryParser(fun (s: string) (v: byref<int>) -> System.Int32.TryParse(s.Trim(), &v))
 
@@ -143,7 +145,7 @@ type VerbTests() =
             | Error(ProcessError.Parse _) -> ()
             | other -> Assert.Fail $"expected a Parse error from a throwing parser, got {other}"
 
-            // FirstLine — no-token and cancellation-token overloads.
+            // FirstLine — cancellation token omitted, then passed.
             match! threeLines.FirstLineAsync(fun line -> line.Contains "line2") with
             | Ok(Some line) -> Assert.That(line, Does.Contain "line2")
             | Ok None -> Assert.Fail "expected a matching line"

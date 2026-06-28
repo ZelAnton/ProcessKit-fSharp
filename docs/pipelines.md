@@ -122,7 +122,7 @@ returns `Task<Result<_, ProcessError>>`:
 | `ProbeAsync()` | `bool` | exit `0` → `true`, `1` → `false`, anything else → `Error` |
 | `ParseAsync(f)` / `TryParseAsync(f)` | `'T` | …raised as that stage's `ProcessError.Exit`; `ParseAsync` requires success |
 
-Every verb also has a `CancellationToken` overload — `pipeline.RunAsync(token)`,
+Every verb also accepts an optional `CancellationToken` — `pipeline.RunAsync(token)`,
 `pipeline.OutputStringAsync(token)`, and so on — for a per-call token alongside the
 chain-level [`CancelOn`](#timeouts-and-cancellation).
 
@@ -350,7 +350,7 @@ Cancellation has two forms:
 - **`Pipeline.CancelOn(token)`** (module mirror: `Pipeline.cancelOn`) is the chain-level
   control: the token is applied to every stage, so firing it tears the whole chain down
   and the run resolves to `ProcessError.Cancelled`.
-- Each verb's **`CancellationToken` overload** (`pipeline.RunAsync(token)`) ties a single call
+- Each verb's optional **`CancellationToken`** (`pipeline.RunAsync(token)`) ties a single call
   to a token without baking it into the pipeline.
 
 A `Command.CancelOn` token set on an individual stage also cancels that stage and errors

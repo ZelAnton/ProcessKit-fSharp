@@ -460,8 +460,8 @@ var cmd = new Command("slow-job")
 ```
 
 `TimeoutGrace` sends SIGTERM, waits a grace window, then SIGKILL (atomic on Windows). Tie a
-run to a `CancellationToken` with `CancelOn`, or pass a token to any verb overload
-(`cmd.RunAsync(ct)`). A cancelled run is always an `Error` (`ProcessError.Cancelled`).
+run to a `CancellationToken` with `CancelOn`, or pass a token to any verb's optional
+token parameter (`cmd.RunAsync(ct)`). A cancelled run is always an `Error` (`ProcessError.Cancelled`).
 
 ## Process groups and tree control
 

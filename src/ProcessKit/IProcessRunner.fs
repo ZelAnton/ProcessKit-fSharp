@@ -8,8 +8,8 @@ open System.Threading.Tasks
 /// `Command`, a runner, a `CliClient`, or a `Pipeline`) is layered on top of these by the `Runner`
 /// module and its extension methods — so the primitives are named distinctly (`Capture*`/`Spawn`) and
 /// never collide with the verbs. (That collision used to force the capture verbs to silently drop the
-/// retry policy when called with a `CancellationToken`; with distinct names every verb overload retries
-/// uniformly.)
+/// retry policy when called with a `CancellationToken`; with distinct names each verb is a single method
+/// taking an optional `CancellationToken` that retries uniformly whether or not a token is passed.)
 ///
 /// The default runner spawns real processes into a kill-on-drop group; test doubles
 /// (`ProcessKit.Testing.ScriptedRunner`) script replies with no subprocess. This interface

@@ -2,6 +2,7 @@ namespace ProcessKit
 
 open System
 open System.Diagnostics
+open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
 
@@ -283,7 +284,9 @@ type Supervisor internal (config: SupervisorConfig) =
     /// spawn failure with restarts remaining counts as a crash and is retried. An incarnation
     /// cancelled via its token is terminal: supervision returns that `Cancelled` immediately,
     /// regardless of policy or budget.
-    member _.RunAsync(cancellationToken: CancellationToken) : Task<Result<SupervisionOutcome, ProcessError>> =
+    member _.RunAsync
+        ([<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<SupervisionOutcome, ProcessError>> =
         let factor =
             if Double.IsFinite config.BackoffFactor then
                 max config.BackoffFactor 1.0
@@ -419,9 +422,6 @@ type Supervisor internal (config: SupervisorConfig) =
 
             return final.Value
         }
-
-    /// `RunAsync` against `CancellationToken.None`.
-    member this.RunAsync() = this.RunAsync CancellationToken.None
 
 /// Pipe-friendly entry points for `Supervisor`.
 [<RequireQualifiedAccess>]

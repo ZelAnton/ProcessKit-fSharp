@@ -7,6 +7,7 @@ open System.IO
 open System.Net
 open System.Net.Sockets
 open System.Runtime.ExceptionServices
+open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
 open System.Threading.Channels
@@ -611,7 +612,7 @@ type RunningProcess internal (host: RunningHost) =
     /// (or `Cancelled` if `cancellationToken` fires first). Consumed lines are not re-delivered; a
     /// later `StdoutLinesAsync`/`FinishAsync` sees the rest.
     member this.WaitForLineAsync
-        (predicate: Func<string, bool>, timeout: TimeSpan, cancellationToken: CancellationToken)
+        (predicate: Func<string, bool>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<string, ProcessError>> =
         ArgumentNullException.ThrowIfNull predicate
 
@@ -648,19 +649,13 @@ type RunningProcess internal (host: RunningHost) =
                 | :? ChannelClosedException -> return Error(ProcessError.NotReady(config.Program, timeout))
             }
 
-    /// `WaitForLineAsync` with no extra cancellation token.
-    member this.WaitForLineAsync
-        (predicate: Func<string, bool>, timeout: TimeSpan)
-        : Task<Result<string, ProcessError>> =
-        this.WaitForLineAsync(predicate, timeout, CancellationToken.None)
-
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`
     /// (or `Cancelled` if `cancellationToken` fires first). Unlike `WaitForLineAsync`, this does not read
     /// the child's stdout/stderr while polling — a child that floods a *piped* stream before it is
     /// ready can block on a full pipe; consume its output concurrently (`StdoutLinesAsync`/`OutputEventsAsync`)
     /// or run it with `Stdout`/`Stderr` set to `Inherit`/`Null` when polling a chatty process.
     member _.WaitForPortAsync
-        (endpoint: IPEndPoint, timeout: TimeSpan, cancellationToken: CancellationToken)
+        (endpoint: IPEndPoint, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull endpoint
 
@@ -697,16 +692,12 @@ type RunningProcess internal (host: RunningHost) =
                 return Error(ProcessError.NotReady(config.Program, timeout))
         }
 
-    /// `WaitForPortAsync` with no extra cancellation token.
-    member this.WaitForPortAsync(endpoint: IPEndPoint, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
-        this.WaitForPortAsync(endpoint, timeout, CancellationToken.None)
-
     /// Poll `probe` until it returns true, or fail with `NotReady` after `timeout` (or `Cancelled`
     /// if `cancellationToken` fires first). Like `WaitForPortAsync`, this does not drain the child's
     /// stdout/stderr while polling — consume a piped, chatty child's output concurrently (or run it
     /// with `Stdout`/`Stderr` `Inherit`/`Null`) so it can't block on a full pipe before becoming ready.
     member _.WaitForAsync
-        (probe: Func<Task<bool>>, timeout: TimeSpan, cancellationToken: CancellationToken)
+        (probe: Func<Task<bool>>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull probe
 
@@ -735,10 +726,6 @@ type RunningProcess internal (host: RunningHost) =
             else
                 return Error(ProcessError.NotReady(config.Program, timeout))
         }
-
-    /// `WaitForAsync` with no extra cancellation token.
-    member this.WaitForAsync(probe: Func<Task<bool>>, timeout: TimeSpan) : Task<Result<unit, ProcessError>> =
-        this.WaitForAsync(probe, timeout, CancellationToken.None)
 
     /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
     /// the racing primitive behind `WaitAnyAsync`/`WaitAllAsync`.

@@ -3,6 +3,7 @@ namespace ProcessKit
 open System
 open System.IO
 open System.Runtime.CompilerServices
+open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
 
@@ -101,7 +102,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     /// Run the pipeline to completion, capturing the last stage's stdout as raw bytes. A non-zero
     /// pipefail exit is data here, not an error.
     member this.OutputBytesAsync
-        (cancellationToken: CancellationToken)
+        ([<Optional>] cancellationToken: CancellationToken)
         : Task<Result<ProcessResult<byte[]>, ProcessError>> =
         task {
             match! this.Execute cancellationToken with
@@ -126,7 +127,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     /// Run the pipeline to completion, capturing the last stage's stdout as decoded text (using the
     /// last stage's stdout encoding). A non-zero pipefail exit is data here, not an error.
     member this.OutputStringAsync
-        (cancellationToken: CancellationToken)
+        ([<Optional>] cancellationToken: CancellationToken)
         : Task<Result<ProcessResult<string>, ProcessError>> =
         task {
             match! this.Execute cancellationToken with
@@ -157,71 +158,41 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
 
     /// Require a successful pipefail exit and return the last stage's stdout, trailing whitespace
     /// trimmed. Any checked stage that did not exit 0 fails the pipeline.
-    member this.RunAsync(cancellationToken: CancellationToken) : Task<Result<string, ProcessError>> =
+    member this.RunAsync([<Optional>] cancellationToken: CancellationToken) : Task<Result<string, ProcessError>> =
         CaptureVerbs.run (fun () -> this.OutputStringAsync cancellationToken)
 
     /// Like `RunAsync`, but discard the captured output.
-    member this.RunUnitAsync(cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
+    member this.RunUnitAsync([<Optional>] cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
         CaptureVerbs.runUnit (fun () -> this.OutputStringAsync cancellationToken)
 
     /// The pipefail exit code. A signal kill or timeout errors instead of inventing a sentinel.
-    member this.ExitCodeAsync(cancellationToken: CancellationToken) : Task<Result<int, ProcessError>> =
+    member this.ExitCodeAsync([<Optional>] cancellationToken: CancellationToken) : Task<Result<int, ProcessError>> =
         CaptureVerbs.exitCode (fun () -> this.OutputStringAsync cancellationToken)
 
     /// Read the pipefail exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
-    member this.ProbeAsync(cancellationToken: CancellationToken) : Task<Result<bool, ProcessError>> =
+    member this.ProbeAsync([<Optional>] cancellationToken: CancellationToken) : Task<Result<bool, ProcessError>> =
         CaptureVerbs.probe (fun () -> this.OutputStringAsync cancellationToken)
-
-    /// `OutputBytesAsync` against `CancellationToken.None`.
-    member this.OutputBytesAsync() =
-        this.OutputBytesAsync CancellationToken.None
-
-    /// `OutputStringAsync` against `CancellationToken.None`.
-    member this.OutputStringAsync() =
-        this.OutputStringAsync CancellationToken.None
-
-    /// `RunAsync` against `CancellationToken.None`.
-    member this.RunAsync() = this.RunAsync CancellationToken.None
-
-    /// `RunUnitAsync` against `CancellationToken.None`.
-    member this.RunUnitAsync() =
-        this.RunUnitAsync CancellationToken.None
-
-    /// `ExitCodeAsync` against `CancellationToken.None`.
-    member this.ExitCodeAsync() =
-        this.ExitCodeAsync CancellationToken.None
-
-    /// `ProbeAsync` against `CancellationToken.None`.
-    member this.ProbeAsync() = this.ProbeAsync CancellationToken.None
 
     /// Require a successful pipefail exit and parse the trimmed stdout into a `'T`; a thrown parser
     /// error becomes `ProcessError.Parse`.
     member this.ParseAsync
-        (parser: Func<string, 'T>, cancellationToken: CancellationToken)
+        (parser: Func<string, 'T>, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<'T, ProcessError>> =
         ArgumentNullException.ThrowIfNull parser
 
         CaptureVerbs.parse (List.last commands).Program parser.Invoke (fun () -> this.RunAsync cancellationToken)
-
-    /// `ParseAsync` against `CancellationToken.None`.
-    member this.ParseAsync(parser: Func<string, 'T>) =
-        this.ParseAsync(parser, CancellationToken.None)
 
     /// Like `ParseAsync`, but with the standard .NET try-parse shape: pass a BCL parser like
     /// `int.TryParse` with an explicit type argument (`TryParseAsync&lt;int&gt;(int.TryParse)` — needed
     /// because BCL `TryParse` is overloaded). A `false` return becomes `ProcessError.Parse`.
     /// (F# can use the `Result`-returning `Runner.tryParse`.)
     member this.TryParseAsync
-        (parser: TryParser<'T>, cancellationToken: CancellationToken)
+        (parser: TryParser<'T>, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<'T, ProcessError>> =
         ArgumentNullException.ThrowIfNull parser
 
         CaptureVerbs.tryParse (List.last commands).Program (TryParser.toResult parser) (fun () ->
             this.RunAsync cancellationToken)
-
-    /// `TryParseAsync` against `CancellationToken.None`.
-    member this.TryParseAsync(parser: TryParser<'T>) =
-        this.TryParseAsync(parser, CancellationToken.None)
 
 /// `Command.Pipe` builds a two-stage `Pipeline`; further `Pipeline.Pipe` calls extend it.
 [<Extension>]

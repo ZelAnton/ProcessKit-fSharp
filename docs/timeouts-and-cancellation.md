@@ -319,7 +319,7 @@ backoff shape, a different loop condition.
 
 Hand any verb a `System.Threading.CancellationToken`; cancelling the token kills
 the run's tree and makes every consuming path report `ProcessError.Cancelled`.
-Every verb has a `CancellationToken` overload (`cmd.RunAsync(token)`,
+Every verb takes an optional `CancellationToken` (`cmd.RunAsync(token)`,
 `cmd.OutputStringAsync(token)`, …):
 
 **F#**

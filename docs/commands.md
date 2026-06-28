@@ -466,8 +466,8 @@ Console.WriteLine(await cmd.RunAsync() switch
   for the error (`ProcessError.isTransient` covers spawn races and I/O blips). The
   classifier sees the typed `ProcessError`; a cancelled token stops the loop.
 
-To tie a run to a `CancellationToken`, use `CancelOn` (or pass a token to any verb
-overload, `cmd.RunAsync(ct)`). A cancelled run is **always** an error
+To tie a run to a `CancellationToken`, use `CancelOn` (or pass a token to any verb's
+optional token parameter, `cmd.RunAsync(ct)`). A cancelled run is **always** an error
 (`ProcessError.Cancelled`), never a captured outcome — see
 [Timeouts, retries & cancellation](timeouts-and-cancellation.md).
 
@@ -505,8 +505,8 @@ Drive such tools non-interactively instead (key-based auth, `ssh -o BatchMode=ye
 ## Consuming verbs
 
 The builder describes the run; the verb you finish with decides what you get back.
-Every verb returns `Task<Result<_, ProcessError>>`, and every verb has a
-`CancellationToken` overload (`cmd.RunAsync(ct)`).
+Every verb returns `Task<Result<_, ProcessError>>`, and every verb takes an optional
+`CancellationToken` (omit it, or pass one: `cmd.RunAsync()` / `cmd.RunAsync(ct)`).
 
 | Verb | `Ok` payload | Non-zero exit | Use when |
 |---|---|---|---|
