@@ -151,7 +151,8 @@ module Runner =
                     return Error(ProcessError.Parse(command.Program, ex.Message))
         }
 
-    /// Like `parse`, but the parser returns its own `Result` (its error message becomes `Parse`).
+    /// Like `parse`, but the parser returns its own `Result` (its error message — or, like `parse`, a
+    /// thrown exception's message — becomes `ProcessError.Parse`).
     let tryParse
         (runner: IProcessRunner)
         (cancellationToken: CancellationToken)
@@ -162,9 +163,15 @@ module Runner =
             match! run runner cancellationToken command with
             | Error error -> return Error error
             | Ok text ->
-                match parser text with
-                | Ok value -> return Ok value
-                | Error message -> return Error(ProcessError.Parse(command.Program, message))
+                try
+                    match parser text with
+                    | Ok value -> return Ok value
+                    | Error message -> return Error(ProcessError.Parse(command.Program, message))
+                with ex ->
+                    // A parser that throws rather than returning Error (e.g. a TryParser delegate that
+                    // wraps int.Parse) is still a parse failure: mirror `parse` and surface it as a typed
+                    // ProcessError.Parse, keeping the honest-result contract instead of faulting the task.
+                    return Error(ProcessError.Parse(command.Program, ex.Message))
         }
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.

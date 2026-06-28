@@ -524,8 +524,12 @@ Every verb returns `Task<Result<_, ProcessError>>`, and every verb has a
 non-zero exit as `Ok` data, but a signal kill or timeout errors rather than
 inventing a sentinel like `-1`. `ProbeAsync` errors on any exit other than `0` or `1`.
 `ParseAsync` maps the trimmed stdout through `f` (a thrown parser becomes
-`ProcessError.Parse`); `TryParseAsync` lets `f` return its own `Result<'T, string>`
-whose error message becomes `ProcessError.Parse`. `FirstLineAsync` returns the first
+`ProcessError.Parse`); `TryParseAsync` takes the standard .NET try-parse shape —
+pass a `bool TryX(string, out 'T)` such as `int.TryParse`, with an explicit type
+argument (`TryParseAsync<int>(int.TryParse)`, since the BCL parsers are overloaded) —
+and turns a `false` return into `ProcessError.Parse`. (From F#, `Runner.tryParse` keeps the
+`Result<'T, string>`-returning shape, so the parser can supply its own error message.)
+`FirstLineAsync` returns the first
 stdout line matching the predicate and kills the (private-group) child the moment
 it has its answer — you never wait out a long log for one line — and returns
 `Ok None` when stdout closes without a match.

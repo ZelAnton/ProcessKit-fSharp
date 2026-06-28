@@ -27,6 +27,7 @@
 		<Compile Include="Signal.fs" />
 		<Compile Include="Limits.fs" />
 		<Compile Include="ProcessResult.fs" />
+		<Compile Include="TryParser.fs" />
 		<Compile Include="OutputPolicy.fs" />
 		<Compile Include="OutputEvent.fs" />
 		<Compile Include="Finished.fs" />

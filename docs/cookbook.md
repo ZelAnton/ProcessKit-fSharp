@@ -261,7 +261,10 @@ above).
 
 ## Parsing output
 
-`ParseAsync` maps stdout through a function (requires success); `TryParseAsync` lets the parser fail;
+`ParseAsync` maps stdout through a function (requires success); `TryParseAsync` uses the standard
+.NET try-parse shape, so C# can pass `int.TryParse` (and friends) with an explicit type argument
+(`TryParseAsync<int>(int.TryParse)` — needed because the BCL parsers are overloaded) and a `false`
+return becomes `ProcessError.Parse` — F# reaches for the `Result`-returning `Runner.tryParse` instead;
 `FirstLineAsync` returns the first stdout line matching a predicate.
 
 **F#**
@@ -275,6 +278,7 @@ let! port    = (Command.create "myserver").FirstLineAsync(fun line -> line.Start
 
 ```csharp
 var version = await new Command("node").Arg("--version").ParseAsync(s => s.TrimStart('v'));
+var count = await new Command("git").Args(["rev-list", "--count", "HEAD"]).TryParseAsync<int>(int.TryParse);
 var port = await new Command("myserver").FirstLineAsync(line => line.StartsWith("Listening on "));
 ```
 

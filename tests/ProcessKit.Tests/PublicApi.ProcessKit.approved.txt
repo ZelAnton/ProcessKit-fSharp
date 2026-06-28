@@ -18,8 +18,8 @@ class ProcessKit.CliClient
   member RunUnitAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member StartAsync(System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
   member StartAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
-  member TryParseAsync<T>(System.Collections.Generic.IEnumerable<System.String>, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
-  member TryParseAsync<T>(System.Collections.Generic.IEnumerable<System.String>, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  member TryParseAsync<T>(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.TryParser<T>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  member TryParseAsync<T>(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.TryParser<T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   member WithDefaults(System.Func<ProcessKit.Command, ProcessKit.Command>) : ProcessKit.CliClient
   member WithRunner(ProcessKit.IProcessRunner) : ProcessKit.CliClient
   new(System.String)
@@ -109,8 +109,8 @@ class ProcessKit.CommandVerbs
   static member RunUnitAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   static member StartAsync(ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
   static member StartAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
-  static member TryParseAsync<T>(ProcessKit.Command, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
-  static member TryParseAsync<T>(ProcessKit.Command, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member TryParseAsync<T>(ProcessKit.Command, ProcessKit.TryParser<T>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member TryParseAsync<T>(ProcessKit.Command, ProcessKit.TryParser<T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
 
 class ProcessKit.DelegatingProcessRunner
   :> ProcessKit.IProcessRunner
@@ -312,8 +312,8 @@ class ProcessKit.Pipeline
   member RunUnitAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member RunUnitAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member Timeout(System.TimeSpan) : ProcessKit.Pipeline
-  member TryParseAsync<T>(System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
-  member TryParseAsync<T>(System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  member TryParseAsync<T>(ProcessKit.TryParser<T>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  member TryParseAsync<T>(ProcessKit.TryParser<T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
 
 class ProcessKit.PipelineExtensions
   static member Pipe(ProcessKit.Command, ProcessKit.Command) : ProcessKit.Pipeline
@@ -560,6 +560,9 @@ class ProcessKit.ProcessGroupStats
   property TotalCpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
 
 module ProcessKit.ProcessResult
+  static member Create<T>(T, System.String, ProcessKit.Outcome, System.TimeSpan) : ProcessKit.ProcessResult<T>
+  static member Failure<T>(T, System.String, System.Int32) : ProcessKit.ProcessResult<T>
+  static member Success<T>(T) : ProcessKit.ProcessResult<T>
   static member ensureSuccess<T>(ProcessKit.ProcessResult<T>) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<T>, ProcessKit.ProcessError>
 
 class ProcessKit.ProcessResult`1
@@ -592,8 +595,8 @@ class ProcessKit.ProcessRunnerExtensions
   static member RunUnitAsync(ProcessKit.IProcessRunner, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   static member RunUnitAsync(ProcessKit.IProcessRunner, ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   static member StartAsync(ProcessKit.IProcessRunner, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
-  static member TryParseAsync<T>(ProcessKit.IProcessRunner, ProcessKit.Command, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
-  static member TryParseAsync<T>(ProcessKit.IProcessRunner, ProcessKit.Command, System.Func<System.String, Microsoft.FSharp.Core.FSharpResult<T, System.String>>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member TryParseAsync<T>(ProcessKit.IProcessRunner, ProcessKit.Command, ProcessKit.TryParser<T>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+  static member TryParseAsync<T>(ProcessKit.IProcessRunner, ProcessKit.Command, ProcessKit.TryParser<T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
 
 class ProcessKit.ProcessStdin
   member FinishAsync() : System.Threading.Tasks.Task
@@ -921,6 +924,14 @@ class ProcessKit.Testing.ScriptedRunner
   member On(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
   member When(System.Func<ProcessKit.Command, System.Boolean>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
   new()
+
+delegate ProcessKit.TryParser`1 : System.MulticastDelegate
+  :> System.ICloneable
+  :> System.Runtime.Serialization.ISerializable
+  member BeginInvoke(System.String, T&, System.AsyncCallback, System.Object) : System.IAsyncResult
+  member EndInvoke(System.IAsyncResult) : System.Boolean
+  member Invoke(System.String, T&) : System.Boolean
+  new(System.Object, System.IntPtr)
 
 class ProcessKit.WaitAnyResult
   property Index : System.Int32 { get }

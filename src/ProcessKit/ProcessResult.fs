@@ -92,6 +92,27 @@ module ProcessResult =
     /// (`Exit` / `Signalled` / `Timeout`). Generic over the captured-stdout type.
     let ensureSuccess (result: ProcessResult<'T>) : Result<ProcessResult<'T>, ProcessError> = result.EnsureSuccess()
 
+    // Test factories: build a `ProcessResult<'T>` directly (no real process), to unit-test code that
+    // consumes one. Generic over the captured-stdout type, so C# infers it (`ProcessResult.Success("x")`,
+    // no type argument) and F# does too (`ProcessResult.Success "x"`). The program name is empty.
+
+    /// Build a successful `ProcessResult` (exit 0, given stdout) for tests.
+    let Success (stdout: 'T) : ProcessResult<'T> =
+        ProcessResult<'T>("", stdout, "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ])
+
+    /// Build a failed `ProcessResult` (a non-zero exit) for tests. `exitCode` must be non-zero — `0`
+    /// is rejected because the result is judged against the default `{0}` ok-codes, so a zero exit
+    /// would make `IsSuccess` `true` (use `Success` for that). Negative codes are allowed (Windows
+    /// reports them).
+    let Failure (stdout: 'T) (stderr: string) (exitCode: int) : ProcessResult<'T> =
+        ArgumentOutOfRangeException.ThrowIfZero exitCode
+        ProcessResult<'T>("", stdout, stderr, Outcome.Exited exitCode, TimeSpan.Zero, false, [ 0 ])
+
+    /// Build a `ProcessResult` with full control over stderr, the `Outcome` (e.g. `Outcome.Signalled` /
+    /// `Outcome.TimedOut`), and the duration. Success is judged against the default `{0}` ok-codes.
+    let Create (stdout: 'T) (stderr: string) (outcome: Outcome) (duration: TimeSpan) : ProcessResult<'T> =
+        ProcessResult<'T>("", stdout, stderr, outcome, duration, false, [ 0 ])
+
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel.
     let internal exitCode (result: ProcessResult<string>) : Result<int, ProcessError> =
         match result.Outcome with

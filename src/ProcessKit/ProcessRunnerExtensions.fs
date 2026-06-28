@@ -93,23 +93,22 @@ type ProcessRunnerExtensions =
         ArgumentNullException.ThrowIfNull parser
         Runner.parse runner cancellationToken parser.Invoke command
 
-    /// Like `ParseAsync`, but the parser returns its own `Result` (its error becomes `Parse`).
+    /// Like `ParseAsync`, but with the standard .NET try-parse shape: pass a BCL parser like
+    /// `int.TryParse` with an explicit type argument (`TryParseAsync&lt;int&gt;(int.TryParse)` — needed
+    /// because BCL `TryParse` is overloaded). A `false` return becomes `ProcessError.Parse`.
+    /// (F# can use the `Result`-returning `Runner.tryParse`.)
     [<Extension>]
-    static member TryParseAsync(runner: IProcessRunner, command: Command, parser: Func<string, Result<'T, string>>) =
+    static member TryParseAsync(runner: IProcessRunner, command: Command, parser: TryParser<'T>) =
         ArgumentNullException.ThrowIfNull parser
-        Runner.tryParse runner CancellationToken.None parser.Invoke command
+        Runner.tryParse runner CancellationToken.None (TryParser.toResult parser) command
 
     /// `TryParseAsync`, cancellable through `cancellationToken`.
     [<Extension>]
     static member TryParseAsync
-        (
-            runner: IProcessRunner,
-            command: Command,
-            parser: Func<string, Result<'T, string>>,
-            cancellationToken: CancellationToken
-        ) =
+        (runner: IProcessRunner, command: Command, parser: TryParser<'T>, cancellationToken: CancellationToken)
+        =
         ArgumentNullException.ThrowIfNull parser
-        Runner.tryParse runner cancellationToken parser.Invoke command
+        Runner.tryParse runner cancellationToken (TryParser.toResult parser) command
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     [<Extension>]

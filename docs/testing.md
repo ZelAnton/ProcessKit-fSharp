@@ -245,13 +245,48 @@ want to return specific `Error` outcomes. The error cases are easy: every
 `Error(ProcessError.NotFound("git", None))`, `Error(ProcessError.Io "...")`, and
 so on directly.
 
-Returning a **successful** `ProcessResult`, though, is the library's job: its
-constructor is internal, so you can't fabricate one by hand. For canned
-successes use `ScriptedRunner` (it builds the result for you), and have any other
-double **delegate** its success path to an inner runner. A custom
-`IProcessRunner` written as an object expression — implementing all three
-methods — composes cleanly. This one injects a single transient failure before
-delegating, so you can test that retry handling actually retries:
+Returning a `ProcessResult` is almost as easy. Its constructor is internal, but
+the `ProcessResult` *test factories* build one directly:
+`ProcessResult.Success(stdout)` for a clean exit, `ProcessResult.Failure(stdout, stderr, exitCode)`
+for a non-zero exit, and `ProcessResult.Create(stdout, stderr, outcome, duration)` for full control
+over the `Outcome` (e.g. `Outcome.TimedOut`). The captured-stdout type is inferred — C# writes
+`ProcessResult.Success("out")`, F# writes `ProcessResult.Success "out"` — and the result behaves
+like a real one (`IsSuccess`, `EnsureSuccess`, `Code`, …), so they double as fixtures for any code
+that *consumes* a `ProcessResult`:
+
+**F#**
+
+```fsharp
+let fixedSha: IProcessRunner =
+    { new IProcessRunner with
+        member _.OutputStringAsync(_, _) = task { return Ok(ProcessResult.Success "abc123\n") }
+        member _.OutputBytesAsync(_, _) = task { return Ok(ProcessResult.Success [| 1uy; 2uy |]) }
+        member _.StartAsync(_, _) =
+            task { return Error(ProcessError.Unsupported "no streaming in this double") } }
+```
+
+**C#**
+
+```csharp
+public sealed class FixedSha : IProcessRunner
+{
+    public Task<FSharpResult<ProcessResult<string>, ProcessError>> OutputStringAsync(Command command, CancellationToken ct) =>
+        Task.FromResult(FSharpResult<ProcessResult<string>, ProcessError>.NewOk(ProcessResult.Success("abc123\n")));
+
+    public Task<FSharpResult<ProcessResult<byte[]>, ProcessError>> OutputBytesAsync(Command command, CancellationToken ct) =>
+        Task.FromResult(FSharpResult<ProcessResult<byte[]>, ProcessError>.NewOk(ProcessResult.Success(new byte[] { 1, 2 })));
+
+    public Task<FSharpResult<RunningProcess, ProcessError>> StartAsync(Command command, CancellationToken ct) =>
+        Task.FromResult(FSharpResult<RunningProcess, ProcessError>.NewError(ProcessError.NewUnsupported("no streaming in this double")));
+}
+```
+
+For canned successes wired through a matcher, `ScriptedRunner` is still the most
+convenient seam (it builds the result for you). Doubles can also **delegate**
+their success path to an inner runner. A custom `IProcessRunner` written as an
+object expression — implementing all three methods — composes cleanly. This one
+injects a single transient failure before delegating, so you can test that retry
+handling actually retries:
 
 **F#**
 

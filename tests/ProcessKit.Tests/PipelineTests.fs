@@ -199,3 +199,25 @@ type PipelineTests() =
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
+
+    [<Test>]
+    member _.``Pipeline tryParse uses the TryParser delegate and maps a thrown parser to Parse``() : Task =
+        task {
+            let pipeline = (emit [ "42" ]).Pipe sortStage
+
+            // Success: the C#-friendly delegate parses the trimmed pipefail output.
+            let tryInt =
+                TryParser(fun (s: string) (v: byref<int>) -> Int32.TryParse(s.Trim(), &v))
+
+            match! pipeline.TryParseAsync tryInt with
+            | Ok value -> Assert.That(value, Is.EqualTo 42)
+            | Error error -> Assert.Fail $"{error}"
+
+            // A parser that throws is surfaced as ProcessError.Parse, not a faulted task.
+            let tryThrow = TryParser(fun (_: string) (_: byref<int>) -> failwith "boom")
+
+            match! pipeline.TryParseAsync tryThrow with
+            | Error(ProcessError.Parse _) -> ()
+            | other -> Assert.Fail $"expected a Parse error, got {other}"
+        }
+        :> Task

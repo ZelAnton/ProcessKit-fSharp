@@ -168,3 +168,53 @@ type TestabilityTests() =
                 CollectionAssert.AreEqual([| 0; 3 |], result.AcceptedCodes)
             | Error error -> Assert.Fail $"OutputString failed: {error.Message}"
         }
+
+    [<Test>]
+    member _.``ProcessResult.Success builds an accepted result``() =
+        let result = ProcessResult.Success "hello"
+        Assert.That(result.Stdout, Is.EqualTo "hello")
+        Assert.That(result.Code, Is.EqualTo(Some 0))
+        Assert.That(result.IsSuccess, Is.True)
+
+        match ProcessResult.ensureSuccess result with
+        | Ok ok -> Assert.That(ok.Stdout, Is.EqualTo "hello")
+        | Error error -> Assert.Fail $"expected success, got {error}"
+
+    [<Test>]
+    member _.``ProcessResult.Success works for a byte[] capture``() =
+        let result = ProcessResult.Success [| 1uy; 2uy; 3uy |]
+        CollectionAssert.AreEqual([| 1uy; 2uy; 3uy |], result.Stdout)
+        Assert.That(result.IsSuccess, Is.True)
+
+    [<Test>]
+    member _.``ProcessResult.Failure rejects a zero exit code``() =
+        Assert.Throws<System.ArgumentOutOfRangeException>(
+            System.Action(fun () -> ProcessResult.Failure "" "" 0 |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``ProcessResult.Failure builds a non-zero exit that EnsureSuccess rejects``() =
+        let result = ProcessResult.Failure "out" "boom" 2
+        Assert.That(result.Code, Is.EqualTo(Some 2))
+        Assert.That(result.Stderr, Is.EqualTo "boom")
+        Assert.That(result.IsSuccess, Is.False)
+
+        match ProcessResult.ensureSuccess result with
+        | Error(ProcessError.Exit(_, code, _, stderr)) ->
+            Assert.That(code, Is.EqualTo 2)
+            Assert.That(stderr, Is.EqualTo "boom")
+        | other -> Assert.Fail $"expected an Exit error, got {other}"
+
+    [<Test>]
+    member _.``ProcessResult.Create carries a chosen Outcome and duration``() =
+        let result =
+            ProcessResult.Create "" "" Outcome.TimedOut (System.TimeSpan.FromSeconds 5.0)
+
+        Assert.That(result.IsTimedOut, Is.True)
+        Assert.That(result.IsSuccess, Is.False)
+        Assert.That(result.Duration, Is.EqualTo(System.TimeSpan.FromSeconds 5.0))
+
+        match ProcessResult.ensureSuccess result with
+        | Error(ProcessError.Timeout _) -> ()
+        | other -> Assert.Fail $"expected a Timeout error, got {other}"

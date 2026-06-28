@@ -229,23 +229,32 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     member this.ParseAsync(parser: Func<string, 'T>) =
         this.ParseAsync(parser, CancellationToken.None)
 
-    /// Like `ParseAsync`, but the parser returns its own `Result` (its error message becomes `Parse`).
+    /// Like `ParseAsync`, but with the standard .NET try-parse shape: pass a BCL parser like
+    /// `int.TryParse` with an explicit type argument (`TryParseAsync&lt;int&gt;(int.TryParse)` — needed
+    /// because BCL `TryParse` is overloaded). A `false` return becomes `ProcessError.Parse`.
+    /// (F# can use the `Result`-returning `Runner.tryParse`.)
     member this.TryParseAsync
-        (parser: Func<string, Result<'T, string>>, cancellationToken: CancellationToken)
+        (parser: TryParser<'T>, cancellationToken: CancellationToken)
         : Task<Result<'T, ProcessError>> =
         ArgumentNullException.ThrowIfNull parser
+        let toResult = TryParser.toResult parser
 
         task {
             match! this.RunAsync cancellationToken with
             | Error error -> return Error error
             | Ok text ->
-                match parser.Invoke text with
-                | Ok value -> return Ok value
-                | Error message -> return Error(ProcessError.Parse((List.last commands).Program, message))
+                try
+                    match toResult text with
+                    | Ok value -> return Ok value
+                    | Error message -> return Error(ProcessError.Parse((List.last commands).Program, message))
+                with ex ->
+                    // A parser that throws rather than returning false is still a parse failure — mirror
+                    // `ParseAsync` (and `Runner.tryParse`) and surface a typed Parse error, not a faulted task.
+                    return Error(ProcessError.Parse((List.last commands).Program, ex.Message))
         }
 
     /// `TryParseAsync` against `CancellationToken.None`.
-    member this.TryParseAsync(parser: Func<string, Result<'T, string>>) =
+    member this.TryParseAsync(parser: TryParser<'T>) =
         this.TryParseAsync(parser, CancellationToken.None)
 
 /// `Command.Pipe` builds a two-stage `Pipeline`; further `Pipeline.Pipe` calls extend it.

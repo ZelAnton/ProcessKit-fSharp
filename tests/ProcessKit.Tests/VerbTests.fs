@@ -117,14 +117,31 @@ type VerbTests() =
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"parse(ct): {error}"
 
-            // TryParse — no-token and cancellation-token overloads.
-            match! (shell "echo 42").TryParseAsync(fun s -> Ok(int (s.Trim()))) with
+            // TryParse — the C#-friendly TryParser delegate (BCL try-parse shape), no-token and ct overloads.
+            let tryInt =
+                TryParser(fun (s: string) (v: byref<int>) -> System.Int32.TryParse(s.Trim(), &v))
+
+            match! (shell "echo 42").TryParseAsync tryInt with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"tryParse: {error}"
 
-            match! (shell "echo 42").TryParseAsync((fun s -> Ok(int (s.Trim()))), CancellationToken.None) with
+            match! (shell "echo 42").TryParseAsync(tryInt, CancellationToken.None) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"tryParse(ct): {error}"
+
+            // A parser that rejects the output becomes ProcessError.Parse.
+            let tryFail = TryParser(fun (_: string) (_: byref<int>) -> false)
+
+            match! (shell "echo 42").TryParseAsync tryFail with
+            | Error(ProcessError.Parse _) -> ()
+            | other -> Assert.Fail $"expected a Parse error, got {other}"
+
+            // A parser that *throws* (rather than returning false) is also surfaced as ProcessError.Parse.
+            let tryThrow = TryParser(fun (_: string) (_: byref<int>) -> failwith "boom")
+
+            match! (shell "echo 42").TryParseAsync tryThrow with
+            | Error(ProcessError.Parse _) -> ()
+            | other -> Assert.Fail $"expected a Parse error from a throwing parser, got {other}"
 
             // FirstLine — no-token and cancellation-token overloads.
             match! threeLines.FirstLineAsync(fun line -> line.Contains "line2") with

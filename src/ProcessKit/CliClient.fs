@@ -126,15 +126,16 @@ type CliClient internal (config: CliClientConfig) =
     member this.ParseAsync(args: seq<string>, parser: Func<string, 'T>) =
         this.ParseAsync(args, parser, CancellationToken.None)
 
-    /// Like `ParseAsync`, but the parser returns its own `Result` (its error message becomes `Parse`).
-    member this.TryParseAsync
-        (args: seq<string>, parser: Func<string, Result<'T, string>>, cancellationToken: CancellationToken)
-        =
+    /// Like `ParseAsync`, but with the standard .NET try-parse shape: pass a BCL parser like
+    /// `int.TryParse` with an explicit type argument (`TryParseAsync&lt;int&gt;(int.TryParse)` — needed
+    /// because BCL `TryParse` is overloaded). A `false` return becomes `ProcessError.Parse`.
+    /// (F# can use the `Result`-returning `Runner.tryParse`.)
+    member this.TryParseAsync(args: seq<string>, parser: TryParser<'T>, cancellationToken: CancellationToken) =
         ArgumentNullException.ThrowIfNull parser
-        Runner.tryParse config.Runner cancellationToken parser.Invoke (this.Command args)
+        Runner.tryParse config.Runner cancellationToken (TryParser.toResult parser) (this.Command args)
 
     /// `TryParseAsync` against `CancellationToken.None`.
-    member this.TryParseAsync(args: seq<string>, parser: Func<string, Result<'T, string>>) =
+    member this.TryParseAsync(args: seq<string>, parser: TryParser<'T>) =
         this.TryParseAsync(args, parser, CancellationToken.None)
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
