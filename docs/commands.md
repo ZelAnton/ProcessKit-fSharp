@@ -313,8 +313,10 @@ the head; `OverflowMode.Error` makes the ceiling **fail loud** instead of droppi
 [line handler](#line-handlers-and-tees) is the real consumer. `Unbounded`
 (the `Default`) retains everything.
 
-A line cap alone doesn't bound memory — one enormous newline-free "line" is held
-whole. Add `WithMaxBytes` to cap the retained bytes too (either ceiling, or both):
+A line cap alone doesn't bound memory — without a byte cap an enormous newline-free
+"line" grows whole. `WithMaxBytes` caps the retained bytes **and** the in-flight
+(not-yet-terminated) line — force-flushed at the cap — so even a newline-free flood
+stays bounded (set either ceiling, or both):
 
 **F#**
 

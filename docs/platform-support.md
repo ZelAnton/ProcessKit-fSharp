@@ -199,12 +199,13 @@ unrelated process. The backend prunes dead entries on every probe to keep the wi
 it cannot be eliminated at the process-group layer — the cgroup v2 mechanism (used when limits are
 requested) closes it, since membership is kernel-enforced.
 
-**Unbounded in-flight line, and streaming backlog.** `OutputBufferPolicy` caps bound the *retained
-complete lines* (and total bytes) of the buffered verbs; a single not-yet-terminated line — a
-newline-free flood — still grows until end of stream. Likewise, a streamed consumer
-(`StdoutLinesAsync` / `OutputEventsAsync`) that stops draining while the child keeps writing grows the
-backing channel, since streaming is consumer-paced. Pair an untrusted or chatty child with a
-`Command.Timeout`, which bounds the run and ends the stream at the deadline.
+**In-flight line without a byte cap, and streaming backlog.** `OutputBufferPolicy.MaxBytes` bounds the
+in-flight (not-yet-terminated) line too for the buffered verbs — it is force-flushed at the cap, so a
+newline-free flood can't outgrow the buffer. Without a byte cap, a single not-yet-terminated line still
+grows until end of stream. Likewise, a streamed consumer (`StdoutLinesAsync` / `OutputEventsAsync`) that
+stops draining while the child keeps writing grows the backing channel, since streaming is
+consumer-paced. Set `MaxBytes`, or pair an untrusted or chatty child with a `Command.Timeout`, which
+bounds the run and ends the stream at the deadline.
 
 **One consumption per `RunningProcess`.** The streaming verbs compose in one session
 (`WaitForLineAsync` → `StdoutLinesAsync` → `FinishAsync`); `OutputStringAsync` / `OutputBytesAsync` / `WaitAsync` / `ProfileAsync` are
