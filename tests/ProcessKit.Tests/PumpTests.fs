@@ -20,7 +20,7 @@ type PumpTests() =
     let collect (bytes: byte[]) (encoding: Encoding) : string list =
         use stream = new MemoryStream(bytes)
         let lines = ResizeArray<string>()
-        (Pump.readLines stream encoding None (fun l -> lines.Add l) CancellationToken.None).Wait()
+        (Pump.readLines stream encoding None (fun l -> lines.Add l) None CancellationToken.None).Wait()
         List.ofSeq lines
 
     [<Test>]
@@ -70,3 +70,25 @@ type PumpTests() =
         [ "aa"; "bb" ] |> List.iter buf.Add
         Assert.That(buf.Text, Is.EqualTo "bb")
         Assert.That(buf.Truncated, Is.True)
+
+    [<Test>]
+    member _.``readLines force-flushes an over-long unterminated line at the cap``() =
+        // A 7-char newline-free blob with a cap of 3 is flushed as <=3-char segments, so the in-flight
+        // buffer never grows past the cap — a newline-free flood can't outgrow it.
+        use stream = new MemoryStream(Encoding.UTF8.GetBytes "aaabbbc")
+        let segments = ResizeArray<string>()
+
+        (Pump.readLines stream Encoding.UTF8 None (fun l -> segments.Add l) (Some 3) CancellationToken.None).Wait()
+
+        CollectionAssert.AreEqual([ "aaa"; "bbb"; "c" ], segments)
+
+    [<Test>]
+    member _.``a newline-free flood still trips the byte-cap fail-loud ceiling via the in-flight cap``() =
+        // The force-flushed segments flow through the buffer policy, so a fail-loud byte ceiling still
+        // errors on a newline-free flood (and the in-flight buffer stays bounded to the cap).
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes(3).WithOverflow OverflowMode.Error)
+
+        use stream = new MemoryStream(Encoding.UTF8.GetBytes "aaaaaaaaaa")
+        (Pump.readLines stream Encoding.UTF8 None buf.Add (Some 3) CancellationToken.None).Wait()
+        Assert.That(buf.TooLarge, Is.True)

@@ -161,7 +161,9 @@ type RunningProcess internal (host: RunningHost) =
                 counter ()
                 buffer.Add line
 
-            do! Pump.readLines stream encoding tee onLine CancellationToken.None
+            // Pass the buffer's byte cap as the in-flight line ceiling too, so a newline-free flood
+            // can't grow the assembly buffer past it (the forced segments go through `buffer`'s policy).
+            do! Pump.readLines stream encoding tee onLine config.OutputBuffer.MaxBytes CancellationToken.None
             return buffer
         }
 
@@ -185,7 +187,9 @@ type RunningProcess internal (host: RunningHost) =
     let pumpLines (stream: Stream option) encoding tee (onLine: string -> unit) =
         task {
             match stream with
-            | Some s -> do! Pump.readLinesUntilDone s encoding tee onLine CancellationToken.None
+            // No in-flight line cap for streaming: it is consumer-paced and applies no buffer policy, so
+            // a consumer receives whole lines (the in-flight cap is a buffered-verb concern).
+            | Some s -> do! Pump.readLinesUntilDone s encoding tee onLine None CancellationToken.None
             | None -> ()
         }
 

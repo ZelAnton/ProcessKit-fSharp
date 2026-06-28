@@ -81,12 +81,15 @@ module internal Pump =
 
     /// Read `stream` to EOF: tee the raw bytes (if a sink is set), decode with `encoding`, split
     /// into lines (stripping `\n` / `\r\n`), and pass each complete line — including a final
-    /// unterminated one — to `onLine`.
+    /// unterminated one — to `onLine`. When `maxLineLength` is set, an unterminated line that reaches
+    /// that many characters is force-flushed to `onLine` as a segment, so a newline-free flood can't
+    /// grow the in-flight buffer without bound (the segment then goes through the caller's buffer policy).
     let readLines
         (stream: Stream)
         (encoding: Encoding)
         (tee: Stream option)
         (onLine: string -> unit)
+        (maxLineLength: int option)
         (cancellationToken: CancellationToken)
         : Task =
         task {
@@ -128,6 +131,15 @@ module internal Pump =
                                 onLine (line.ToString())
                                 line.Clear() |> ignore
                             else
+                                match maxLineLength with
+                                | Some cap when line.Length >= cap ->
+                                    // Force-flush an over-long unterminated line so a newline-free flood
+                                    // can't grow the in-flight buffer past the cap; the flushed segment
+                                    // then goes through the caller's buffer policy (dropped / errored).
+                                    onLine (line.ToString())
+                                    line.Clear() |> ignore
+                                | _ -> ()
+
                                 line.Append c |> ignore
 
                         i <- i + 1
@@ -148,11 +160,12 @@ module internal Pump =
         (encoding: Encoding)
         (tee: Stream option)
         (onLine: string -> unit)
+        (maxLineLength: int option)
         (cancellationToken: CancellationToken)
         : Task =
         task {
             try
-                do! readLines stream encoding tee onLine cancellationToken
+                do! readLines stream encoding tee onLine maxLineLength cancellationToken
             with
             | :? ObjectDisposedException ->
                 // The stream was torn down (early dispose) while reading. Stop quietly.

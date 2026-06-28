@@ -38,9 +38,11 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
 - **Streaming backlog.** A streamed (`StdoutLines` / `OutputEvents`) consumer that stops draining
   while the child floods grows the channel unbounded; the `OutputBufferPolicy` ceiling applies to
   the *buffered* verbs, and streaming is consumer-paced (pair it with a `Timeout`).
-- **Unbounded in-flight line.** The `OutputBufferPolicy` line/byte caps bound the *retained complete
-  lines*; a single not-yet-terminated line (a newline-free flood) still grows until EOF. Pair an
-  untrusted child with a `Timeout`. (A future hardening caps the in-flight assembly buffer.)
+- **In-flight line without a byte cap.** With `OutputBufferPolicy.MaxBytes` set, the in-flight
+  (not-yet-terminated) line is bounded too — it is force-flushed at the cap, so a newline-free flood
+  can't outgrow the buffer. Without a byte cap, or for the consumer-paced *streaming* verbs, a single
+  not-yet-terminated line still grows until EOF; bound it with `MaxBytes`, or pair an untrusted child
+  with a `Timeout`.
 - **Default UTF-8 decoding.** Captured text is decoded UTF-8 by default; a Windows console program
   emitting a legacy OEM code page needs an explicit `StdoutEncoding` / `StderrEncoding`.
 - **POSIX pgid-reuse window.** The process-group teardown has a small pid-reuse window on Unix; the
@@ -52,8 +54,6 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
   overlapped (named-pipe) reads on Windows and an async exit wait on POSIX (`pidfd` on Linux ≥5.3, a
   single reaper thread otherwise) so heavy concurrency no longer parks a thread per piped stream /
   per POSIX child. An internal change, no public-API impact; best driven by a concurrency benchmark.
-- **In-flight assembly buffer cap.** Cap the not-yet-terminated line buffer so a newline-free flood
-  can't outgrow `OutputBufferPolicy`.
 
 ## Not currently supported
 

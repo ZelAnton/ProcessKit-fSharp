@@ -45,7 +45,11 @@ type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, ov
     /// Maximum retained lines: `None` is unbounded, `Some 0` retains nothing, `Some n` keeps at most `n`.
     member _.MaxLines = maxLines
 
-    /// Maximum retained bytes (sum of the retained lines' UTF-8 lengths): `None` is unbounded.
+    /// Maximum retained bytes (sum of the retained lines' UTF-8 lengths): `None` is unbounded. Also
+    /// bounds the in-flight (not-yet-newline-terminated) line for the buffered verbs: an unterminated
+    /// line is force-flushed once it reaches this many characters, so a child emitting a newline-free
+    /// flood can't grow the assembly buffer past the cap (the flushed segments are dropped/errored per
+    /// `Overflow`, like any other over-cap output).
     member _.MaxBytes = maxBytes
 
     /// Which line to drop, or whether to error, when a cap is reached.
