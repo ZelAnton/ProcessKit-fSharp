@@ -140,8 +140,8 @@ The pieces:
 
 - **`Reply.Ok stdout`** — exit 0 with that stdout. **`Reply.Fail(code, stderr)`**
   — a non-zero exit with that stderr. **`Reply.Exit code`** — an explicit exit
-  code with empty stdout/stderr. **`Reply.Signalled (Some n)`** — terminated by
-  signal `n` (`Reply.Signalled None` when the number is unavailable).
+  code with empty stdout/stderr. **`Reply.Signalled n`** — terminated by
+  signal `n` (**`Reply.Signalled ()`** when the number is unavailable).
 - **`.WithStdout text`** / **`.WithStderr text`** refine any reply — e.g.
   `Reply.Fail(1, "merge failed").WithStdout("CONFLICT in app.fs")` to model a
   tool that writes to both streams.
@@ -417,7 +417,7 @@ Semantics worth knowing before you commit a cassette:
 | Bytes | `CaptureBytesAsync` replays by round-tripping the recorded stdout through UTF-8 |
 | `SpawnAsync` | unsupported — replay serves the bulk capture primitives only (see [above](#what-the-doubles-dont-cover)) |
 | Err results | not recorded — only completed runs (a non-zero exit and a captured timeout *are* results and are recorded) |
-| One-shot stdin | `Stdin.FromReader` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
+| One-shot stdin | `Stdin.FromStream` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
 | Format | a versioned JSON envelope — `{ "Version", "Entries" }`; a cassette whose format version this build doesn't understand is rejected on load, and a partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
 
 Only env *values* are redacted. `program`, `args`, `stdout`, and `stderr` are

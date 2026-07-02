@@ -180,12 +180,17 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// Start `command` into this shared group and return a live `RunningProcess`. The **group** owns
     /// the child's lifetime: disposing the returned process detaches its I/O but does not kill it —
-    /// reap the tree with `ShutdownAsync`/`Dispose`, or this one run with its `StartKill`.
-    member this.StartAsync(command: Command) : Task<Result<RunningProcess, ProcessError>> =
+    /// reap the tree with `ShutdownAsync`/`Dispose`, or this one run with its `Kill`.
+    member this.StartAsync
+        (command: Command, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<RunningProcess, ProcessError>> =
         task {
-            match this.StartShared command with
-            | Error error -> return Error error
-            | Ok host -> return Ok(RunningProcess host)
+            if cancellationToken.IsCancellationRequested then
+                return Error(ProcessError.Cancelled command.Program)
+            else
+                match this.StartShared command with
+                | Error error -> return Error error
+                | Ok host -> return Ok(RunningProcess host)
         }
 
     // Tree-control / accounting verbs become an error once the group is released: after teardown the
@@ -279,7 +284,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                 | Error error -> return Error error
                 | Ok host ->
                     let running = RunningProcess host
-                    use _registration = effectiveToken.Register(fun () -> running.StartKill())
+                    use _registration = effectiveToken.Register(fun () -> running.Kill())
                     let! result = consume running
 
                     if effectiveToken.IsCancellationRequested then
@@ -324,12 +329,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // graceful kill in a shared group, so it falls back to the immediate kill.
     interface IProcessRunner with
         member this.SpawnAsync(command, cancellationToken) =
-            task {
-                if cancellationToken.IsCancellationRequested then
-                    return Error(ProcessError.Cancelled command.Program)
-                else
-                    return! this.StartAsync command
-            }
+            this.StartAsync(command, cancellationToken)
 
         member this.CaptureStringAsync(command, cancellationToken) =
             this.CaptureShared command cancellationToken (fun running -> running.OutputStringAsync())

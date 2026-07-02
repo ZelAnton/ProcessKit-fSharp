@@ -195,7 +195,7 @@ type CassetteTests() =
             task {
                 let recorder = RecordReplayRunner.Record(path, FixedRunner("out", 0))
                 use reader = new MemoryStream(Encoding.UTF8.GetBytes "data")
-                let command = Command.create "tool" |> Command.stdin (Stdin.FromReader reader)
+                let command = Command.create "tool" |> Command.stdin (Stdin.FromStream reader)
 
                 match! (runner recorder).OutputStringAsync(command, CancellationToken.None) with
                 | Error(ProcessError.Unsupported _) -> Assert.Pass()

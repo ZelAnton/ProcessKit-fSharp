@@ -303,7 +303,7 @@ var cmd = new Command("grep")
     .Stdin(Stdin.FromString("haystack\nneedle\nmore"));
 ```
 
-Sources: `Stdin.FromString`, `FromBytes`, `FromFile path`, `FromReader stream`,
+Sources: `Stdin.FromString`, `FromBytes`, `FromFile path`, `FromStream stream`,
 `FromLines seq`, `FromAsyncLines asyncSeq`, and `Stdin.Empty`. For interactive writing, see
 [streaming](#streaming-and-interactive-io).
 
@@ -712,13 +712,13 @@ Opt in to structured lifecycle events (spawn, exit, timeout, retry, supervisor r
 **F#**
 
 ```fsharp
-let cmd = Command.create "deploy" |> Command.withLogger logger   // any Microsoft.Extensions.Logging ILogger
+let cmd = Command.create "deploy" |> Command.logger logger   // any Microsoft.Extensions.Logging ILogger
 ```
 
 **C#**
 
 ```csharp
-var cmd = new Command("deploy").WithLogger(logger);   // any Microsoft.Extensions.Logging ILogger
+var cmd = new Command("deploy").Logger(logger);   // any Microsoft.Extensions.Logging ILogger
 ```
 
 No-op and free when no logger is set.

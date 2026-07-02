@@ -50,7 +50,7 @@ type ProcessControlTests() =
                 | Some pid -> Assert.That(members, Does.Contain pid)
                 | None -> Assert.Fail "expected a pid"
 
-                running.StartKill()
+                running.Kill()
                 let! _ = running.WaitAsync()
                 ()
         }

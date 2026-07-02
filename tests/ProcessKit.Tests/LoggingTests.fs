@@ -52,7 +52,7 @@ type LoggingTests() =
     member _.``a run logs spawn and exit``() : Task =
         task {
             let logger = CapturingLogger()
-            let command = shell "echo logged" |> Command.withLogger logger
+            let command = shell "echo logged" |> Command.logger logger
 
             match! command.RunAsync() with
             | Ok _ ->
@@ -76,7 +76,7 @@ type LoggingTests() =
             let command =
                 sleeper
                 |> Command.timeout (TimeSpan.FromMilliseconds 300.0)
-                |> Command.withLogger logger
+                |> Command.logger logger
 
             let! _ = command.OutputStringAsync()
             Assert.That(logger.Text, Does.Contain "timed out")
@@ -91,7 +91,7 @@ type LoggingTests() =
             let command =
                 Command.create (if isWindows then "cmd.exe" else "/bin/sh")
                 |> Command.args [ (if isWindows then "/c" else "-c"); "echo ok"; "--token=SUPERSECRET" ]
-                |> Command.withLogger logger
+                |> Command.logger logger
 
             let! _ = command.OutputStringAsync()
             Assert.That(logger.Text, Does.Not.Contain "SUPERSECRET")
@@ -106,7 +106,7 @@ type LoggingTests() =
             let logger = CapturingLogger()
 
             let sup =
-                Supervisor(Command.create "worker" |> Command.withLogger logger)
+                Supervisor(Command.create "worker" |> Command.logger logger)
                     .WithRunner(AlwaysCrash())
                     .MaxRestarts(1)
                     .Backoff(TimeSpan.Zero, 1.0)

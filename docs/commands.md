@@ -171,7 +171,7 @@ can never hang waiting for input. Everything else is opt-in via `Stdin`:
 | `Stdin.FromBytes bytes` | yes | Binary payloads |
 | `Stdin.FromFile path` | yes (re-opened per run) | Large inputs streamed from disk |
 | `Stdin.FromLines seq` | one-shot | A sequence of lines, each written `\n`-terminated |
-| `Stdin.FromReader stream` | one-shot | Any readable `Stream` — a socket, a decompressor, … |
+| `Stdin.FromStream stream` | one-shot | Any readable `Stream` — a socket, a decompressor, … |
 | `Stdin.FromAsyncLines asyncSeq` | one-shot | An `IAsyncEnumerable<string>` — a channel, a tail, … |
 
 **F#**
@@ -209,7 +209,7 @@ exhausted, unless you also set [`KeepStdinOpen`](#spawn-flags).
 The two **in-memory** sources (`FromString` / `FromBytes`) and `FromFile` are
 safe to send again: a retried command (or a record/replay match) re-sends the
 identical bytes, and `FromFile` is re-opened each run. The three **streaming**
-sources (`FromLines` / `FromReader` / `FromAsyncLines`) wrap a live stream or
+sources (`FromLines` / `FromStream` / `FromAsyncLines`) wrap a live stream or
 sequence that the first run drains, so they are one-shot — prefer a reusable
 source whenever a command may run more than once (under [`Retry`](#timeouts-and-retries)
 or [record/replay](testing.md)).

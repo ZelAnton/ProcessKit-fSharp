@@ -142,7 +142,7 @@ full streaming / stdin / readiness surface from
 [streaming.md](streaming.md)). The key ownership rule: **the group owns the
 child's lifetime.** Disposing the returned `RunningProcess` detaches only that
 run's I/O; the child keeps running until you reap the whole tree
-(`ShutdownAsync` / dispose) or kill just that run with its own `StartKill`.
+(`ShutdownAsync` / dispose) or kill just that run with its own `Kill`.
 
 **F#**
 

@@ -79,7 +79,7 @@ Consume the handle **exactly one way** — stdout is read once:
 `StartAsync()`; if you set `Command.Stdout` to `StdioMode.Inherit` or `StdioMode.Null`
 there is nothing to stream. The live gauges `Pid`, `Elapsed`, `StartTime`,
 `StdoutLineCount`, and `StderrLineCount` are cheap to read at any time, including
-mid-stream. There is also `StartKill()` — "stop it now, I'll `WaitAsync()` for the
+mid-stream. There is also `Kill()` — "stop it now, I'll `WaitAsync()` for the
 `Outcome` myself" — which begins teardown without blocking.
 
 A command's [`Timeout`](timeouts-and-cancellation.md) and `CancelOn` token **bound
@@ -355,7 +355,7 @@ if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and w
 
 For *one-directional* streamed input (a channel, a file tail) you don't need
 interactivity at all — give the command `Stdin.FromLines seq`,
-`Stdin.FromAsyncLines asyncSeq`, or `Stdin.FromReader stream` and let ProcessKit's
+`Stdin.FromAsyncLines asyncSeq`, or `Stdin.FromStream stream` and let ProcessKit's
 background writer feed it; those sources run concurrently with the output pumps and
 never deadlock. See the stdin source table in [Running commands](commands.md).
 

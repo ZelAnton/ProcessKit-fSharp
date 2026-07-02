@@ -278,8 +278,9 @@ type RunningProcess internal (host: RunningHost) =
             Some(ProcessStdin stream)
         | _ -> None
 
-    /// Signal the process tree to die without waiting.
-    member _.StartKill() = host.StartKill()
+    /// Signal the process tree to die without waiting (fire-and-forget, like `Process.Kill()`); the
+    /// tree is fully reaped when the handle is disposed. For a blocking kill, dispose the handle.
+    member _.Kill() = host.StartKill()
 
     /// Run to completion, capturing stdout as decoded text. A non-zero exit is data; the tree is
     /// reaped when the call returns.

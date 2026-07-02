@@ -272,7 +272,7 @@ module Runner =
                             found <- Some enumerator.Current
                             more <- false
 
-                    running.StartKill()
+                    running.Kill()
                     let! _ = running.FinishAsync()
                     return Ok found
                 with :? System.OperationCanceledException ->

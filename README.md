@@ -213,7 +213,7 @@ kill-on-dispose tree guarantee is unconditional.
 | Resource caps — memory / process count / CPU | `ProcessGroupOptions` → `ProcessGroup.Create` |
 | Stats & profiling — `Stats` / `SampleStatsAsync` / `ProfileAsync` | `ProcessGroup`, `RunningProcess` |
 | Record / replay cassettes | `ProcessKit.Testing.RecordReplayRunner` |
-| Lifecycle logging (`Microsoft.Extensions.Logging`) | `Command.WithLogger` |
+| Lifecycle logging (`Microsoft.Extensions.Logging`) | `Command.Logger` |
 | Dependency-injection wiring | `ProcessKit.Extensions.DependencyInjection` (separate package) |
 
 ## Capping a group's resources
@@ -848,7 +848,7 @@ file is written `0600`.
 ## Observability and dependency injection
 
 Opt into structured lifecycle events (spawn, exit, timeout, retry, supervisor restart) with
-`Command.WithLogger` — **argv and the environment are never logged**, only the program name and
+`Command.Logger` — **argv and the environment are never logged**, only the program name and
 non-secret facts. The separate `ProcessKit.Extensions.DependencyInjection` package registers an
 `IProcessRunner` for `Microsoft.Extensions.DependencyInjection` consumers with `AddProcessKit()`
 (logger-aware when the container has an `ILoggerFactory`).

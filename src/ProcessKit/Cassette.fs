@@ -80,7 +80,7 @@ type private Mode =
 /// program + args + cwd + stdin-source digest; duplicates replay in capture order then repeat the
 /// last; an unmatched call is `ProcessError.CassetteMiss` (never a surprise subprocess). Covers
 /// `CaptureStringAsync` (and `CaptureBytesAsync` via a UTF-8 round-trip of the recorded stdout); `SpawnAsync` is
-/// unsupported. A one-shot stdin source (`FromReader` / `FromLines` / `FromAsyncLines`) cannot be
+/// unsupported. A one-shot stdin source (`FromStream` / `FromLines` / `FromAsyncLines`) cannot be
 /// keyed and errors.
 [<Sealed>]
 type RecordReplayRunner private (mode: Mode, path: string) =
@@ -183,7 +183,7 @@ type RecordReplayRunner private (mode: Mode, path: string) =
             | StdinSource.AsyncLines _ ->
                 Error(
                     ProcessError.Unsupported
-                        "record/replay cannot key a one-shot stdin source (FromReader / FromLines / FromAsyncLines)"
+                        "record/replay cannot key a one-shot stdin source (FromStream / FromLines / FromAsyncLines)"
                 )
 
     let keyOf (command: Command) (digest: string option) : Key =

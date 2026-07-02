@@ -337,7 +337,7 @@ type Command internal (config: CommandConfig) =
 
     /// Emit structured lifecycle events (spawn / exit / timeout / retry) to `logger`. The program
     /// name and non-secret facts only — **argv and environment are never logged**.
-    member _.WithLogger(logger: ILogger) =
+    member _.Logger(logger: ILogger) =
         ArgumentNullException.ThrowIfNull logger
         Command({ config with Logger = Some logger })
 
@@ -430,4 +430,4 @@ module Command =
     let createNoWindow (command: Command) = command.CreateNoWindow()
 
     /// Emit structured lifecycle events to `logger` (argv/env never logged).
-    let withLogger (logger: ILogger) (command: Command) = command.WithLogger logger
+    let logger (logger: ILogger) (command: Command) = command.Logger logger

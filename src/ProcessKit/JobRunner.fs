@@ -47,7 +47,7 @@ type JobRunner() =
                 match! start command with
                 | Error error -> return Error error
                 | Ok running ->
-                    use _registration = effectiveToken.Register(fun () -> running.StartKill())
+                    use _registration = effectiveToken.Register(fun () -> running.Kill())
                     let! result = consume running
 
                     if effectiveToken.IsCancellationRequested then

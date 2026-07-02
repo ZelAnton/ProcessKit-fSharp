@@ -17,10 +17,10 @@ type OutputLine internal (text: string) =
 type OutputEvent =
 
     /// A line from standard output.
-    | Stdout of OutputLine
+    | Stdout of Line: OutputLine
 
     /// A line from standard error.
-    | Stderr of OutputLine
+    | Stderr of Line: OutputLine
 
     /// The line text, regardless of origin.
     member this.Text =

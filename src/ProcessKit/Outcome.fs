@@ -5,10 +5,10 @@ namespace ProcessKit
 type Outcome =
 
     /// Exited with the given code.
-    | Exited of code: int
+    | Exited of ExitCode: int
 
     /// Terminated by a signal (Unix). `None` when the signal number is unavailable.
-    | Signalled of signal: int option
+    | Signalled of SignalNumber: int option
 
     /// Killed because it exceeded its timeout.
     | TimedOut

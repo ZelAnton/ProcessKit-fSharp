@@ -8,12 +8,12 @@ open ProcessKit
 
 /// An `IProcessRunner` that attaches `logger` to every command it runs (unless the command already
 /// carries one), so DI-resolved runs emit ProcessKit's lifecycle events. argv/env are never logged
-/// — see `Command.WithLogger`.
+/// — see `Command.Logger`.
 type internal LoggingRunner(inner: IProcessRunner, logger: ILogger) =
 
     let withLogger (command: Command) =
         if command.Config.Logger.IsNone then
-            command.WithLogger logger
+            command.Logger logger
         else
             command
 

@@ -71,7 +71,7 @@ type StatsTests() =
                         Assert.That(stats.PeakMemoryBytes.IsNone, Is.True)
                 | Error error -> Assert.Fail $"{error}"
 
-                running.StartKill()
+                running.Kill()
                 let! _ = running.WaitAsync()
                 ()
         }
@@ -96,7 +96,7 @@ type StatsTests() =
                 Assert.That(second, Is.True)
 
                 do! enumerator.DisposeAsync()
-                running.StartKill()
+                running.Kill()
                 let! _ = running.WaitAsync()
                 ()
         }
@@ -119,7 +119,7 @@ type StatsTests() =
                     running.CpuTime |> ignore
                     running.PeakMemoryBytes |> ignore
 
-                running.StartKill()
+                running.Kill()
                 let! _ = running.WaitAsync()
                 ()
         }

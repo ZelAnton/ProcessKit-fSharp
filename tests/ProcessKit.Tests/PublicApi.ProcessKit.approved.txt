@@ -29,6 +29,7 @@ class ProcessKit.Command
   member EnvClear() : ProcessKit.Command
   member EnvRemove(System.String) : ProcessKit.Command
   member KeepStdinOpen() : ProcessKit.Command
+  member Logger(Microsoft.Extensions.Logging.ILogger) : ProcessKit.Command
   member OkCodes(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.Command
   member OnStderrLine(System.Action<System.String>) : ProcessKit.Command
   member OnStdoutLine(System.Action<System.String>) : ProcessKit.Command
@@ -44,7 +45,6 @@ class ProcessKit.Command
   member Timeout(System.TimeSpan) : ProcessKit.Command
   member TimeoutGrace(System.TimeSpan) : ProcessKit.Command
   member UncheckedInPipe() : ProcessKit.Command
-  member WithLogger(Microsoft.Extensions.Logging.ILogger) : ProcessKit.Command
   new(System.String)
   property Arguments : System.Collections.Generic.IReadOnlyList<System.String> { get }
   property ConfiguredTimeout : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
@@ -63,6 +63,7 @@ module ProcessKit.CommandModule
   static member envClear(ProcessKit.Command) : ProcessKit.Command
   static member envRemove(System.String, ProcessKit.Command) : ProcessKit.Command
   static member keepStdinOpen(ProcessKit.Command) : ProcessKit.Command
+  static member logger(Microsoft.Extensions.Logging.ILogger, ProcessKit.Command) : ProcessKit.Command
   static member okCodes(System.Collections.Generic.IEnumerable<System.Int32>, ProcessKit.Command) : ProcessKit.Command
   static member onStderrLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command
   static member onStdoutLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command
@@ -78,7 +79,6 @@ module ProcessKit.CommandModule
   static member timeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member timeoutGrace(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member uncheckedInPipe(ProcessKit.Command) : ProcessKit.Command
-  static member withLogger(Microsoft.Extensions.Logging.ILogger, ProcessKit.Command) : ProcessKit.Command
 
 class ProcessKit.CommandVerbs
   static member ExitCodeAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
@@ -178,14 +178,14 @@ class ProcessKit.Outcome
 class ProcessKit.Outcome+Exited : ProcessKit.Outcome
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.Outcome>
-  member get_code() : System.Int32
-  property code : System.Int32 { get }
+  member get_ExitCode() : System.Int32
+  property ExitCode : System.Int32 { get }
 
 class ProcessKit.Outcome+Signalled : ProcessKit.Outcome
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.Outcome>
-  member get_signal() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
-  property signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  member get_SignalNumber() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
+  property SignalNumber : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
 
 module ProcessKit.Outcome+Tags
   field literal Exited : System.Int32
@@ -227,14 +227,14 @@ class ProcessKit.OutputEvent
 class ProcessKit.OutputEvent+Stderr : ProcessKit.OutputEvent
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.OutputEvent>
-  member get_Item() : ProcessKit.OutputLine
-  property Item : ProcessKit.OutputLine { get }
+  member get_Line() : ProcessKit.OutputLine
+  property Line : ProcessKit.OutputLine { get }
 
 class ProcessKit.OutputEvent+Stdout : ProcessKit.OutputEvent
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.OutputEvent>
-  member get_Item() : ProcessKit.OutputLine
-  property Item : ProcessKit.OutputLine { get }
+  member get_Line() : ProcessKit.OutputLine
+  property Line : ProcessKit.OutputLine { get }
 
 module ProcessKit.OutputEvent+Tags
   field literal Stderr : System.Int32
@@ -508,7 +508,7 @@ class ProcessKit.ProcessGroup
   member ShutdownAsync() : System.Threading.Tasks.Task
   member ShutdownAsync(System.TimeSpan) : System.Threading.Tasks.Task
   member Signal(ProcessKit.Signal) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
-  member StartAsync(ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
+  member StartAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
   member Stats() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroupStats, ProcessKit.ProcessError>
   member Suspend() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member TerminateAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
@@ -637,12 +637,12 @@ module ProcessKit.Runner
 class ProcessKit.RunningProcess
   :> System.IAsyncDisposable
   member FinishAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.Finished, ProcessKit.ProcessError>>
+  member Kill() : System.Void
   member OutputBytesAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
   member OutputEventsAsync() : System.Collections.Generic.IAsyncEnumerable<ProcessKit.OutputEvent>
   member OutputStringAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   member ProfileAsync() : System.Threading.Tasks.Task<ProcessKit.RunProfile>
   member ProfileAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.RunProfile>
-  member StartKill() : System.Void
   member StdoutLinesAsync() : System.Collections.Generic.IAsyncEnumerable<System.String>
   member TakeStdin() : Microsoft.FSharp.Core.FSharpOption<ProcessKit.ProcessStdin>
   member WaitAsync() : System.Threading.Tasks.Task<ProcessKit.Outcome>
@@ -725,7 +725,7 @@ class ProcessKit.Stdin
   static member FromBytes(System.Byte[]) : ProcessKit.Stdin
   static member FromFile(System.String) : ProcessKit.Stdin
   static member FromLines(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Stdin
-  static member FromReader(System.IO.Stream) : ProcessKit.Stdin
+  static member FromStream(System.IO.Stream) : ProcessKit.Stdin
   static member FromString(System.String) : ProcessKit.Stdin
 
 class ProcessKit.StdioMode
@@ -877,7 +877,8 @@ class ProcessKit.Testing.Reply
   static member Exit(System.Int32) : ProcessKit.Testing.Reply
   static member Fail(System.Int32, System.String) : ProcessKit.Testing.Reply
   static member Ok(System.String) : ProcessKit.Testing.Reply
-  static member Signalled(Microsoft.FSharp.Core.FSharpOption<System.Int32>) : ProcessKit.Testing.Reply
+  static member Signalled() : ProcessKit.Testing.Reply
+  static member Signalled(System.Int32) : ProcessKit.Testing.Reply
 
 class ProcessKit.Testing.ScriptedRunner
   :> ProcessKit.IProcessRunner

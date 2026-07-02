@@ -36,7 +36,7 @@ type Stdin internal (source: StdinSource) =
     static member FromFile(path: string) = Stdin(StdinSource.File path)
 
     /// An open readable stream, copied to the child.
-    static member FromReader(reader: Stream) = Stdin(StdinSource.Reader reader)
+    static member FromStream(stream: Stream) = Stdin(StdinSource.Reader stream)
 
     /// Lines (each written followed by `\n`) produced eagerly from a sequence.
     static member FromLines(lines: seq<string>) = Stdin(StdinSource.Lines lines)

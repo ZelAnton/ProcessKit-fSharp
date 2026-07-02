@@ -134,7 +134,7 @@ type LimitsTests() =
                         | Ok() -> ()
                         | Error error -> Assert.Fail $"resume: {error}"
 
-                        running.StartKill()
+                        running.Kill()
                         let! _ = running.WaitAsync()
                         ()
         }

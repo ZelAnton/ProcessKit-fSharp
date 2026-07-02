@@ -27,9 +27,13 @@ type Reply private (outcome: Outcome, stdout: string, stderr: string, error: Pro
     static member Exit(code: int) =
         Reply(Outcome.Exited code, "", "", None)
 
-    /// Terminated by a signal (Unix); `None` when the signal number is unavailable.
-    static member Signalled(signal: int option) =
-        Reply(Outcome.Signalled signal, "", "", None)
+    /// Terminated by a signal (Unix) whose number is unavailable.
+    static member Signalled() =
+        Reply(Outcome.Signalled None, "", "", None)
+
+    /// Terminated by signal `signalNumber` (Unix).
+    static member Signalled(signalNumber: int) =
+        Reply(Outcome.Signalled(Some signalNumber), "", "", None)
 
     /// Killed by its timeout (`Outcome.TimedOut`).
     static member TimedOut = Reply(Outcome.TimedOut, "", "", None)
