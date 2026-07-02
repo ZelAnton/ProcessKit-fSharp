@@ -764,7 +764,7 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 | `ProcessError.NotReady` | `program, timeout` | A [readiness probe](streaming.md) gave up — distinct from a timeout. |
 | `ProcessError.Parse` | `program, message` | A `ParseAsync` / `TryParseAsync` parser rejected the output. |
 | `ProcessError.OutputTooLarge` | `program, lineLimit, byteLimit, totalLines, totalBytes` | A `FailLoud` (`OverflowMode.Error`) buffer ceiling was exceeded. |
-| `ProcessError.Stdin` | `program, message` | Feeding the child's stdin failed for a non-broken-pipe reason on an otherwise-successful run (a louder exit/signal/timeout failure wins instead). |
+| `ProcessError.Stdin` | `program, message` | The child's stdin source could not be read — a missing/unreadable `FromFile` path, say — on an otherwise-successful run. A routine broken pipe (the child closed stdin early, as `head` does) is never reported, and a louder exit/signal/timeout failure wins instead. |
 | `ProcessError.CassetteMiss` | `program` | A record/replay cassette found no matching recording — kept distinct from not-found, so `isNotFound` is `false`. |
 | `ProcessError.Unsupported` | `operation` | The platform can't do what was asked (e.g. a POSIX signal on Windows) and silently skipping would be wrong. |
 | `ProcessError.Cancelled` | `program` | The run's `CancellationToken` fired. Always an error. |

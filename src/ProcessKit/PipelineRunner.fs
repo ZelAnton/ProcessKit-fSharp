@@ -92,8 +92,11 @@ module internal PipelineRunner =
                             spawned.Add sp
 
                             if index = 0 then
-                                // Only the first stage may carry its own stdin source; feed it.
-                                Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource
+                                // Only the first stage may carry its own stdin source; feed it. A
+                                // pipeline does not surface a stage-0 stdin-source failure as
+                                // `ProcessError.Stdin` (that is a single-command verb concern), so the
+                                // feed task's observed-fault result is discarded here.
+                                Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource |> ignore
                             else
                                 match prevStdout, sp.Stdin with
                                 | Some upstream, Some downstream ->

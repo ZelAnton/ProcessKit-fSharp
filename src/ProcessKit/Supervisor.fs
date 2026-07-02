@@ -408,10 +408,19 @@ type Supervisor internal (config: SupervisorConfig) =
                         match error with
                         | ProcessError.Cancelled _ -> final <- Some(Error error)
                         | _ ->
+                            // Restart only a *transient* error (a spawn race, transient I/O) — the only
+                            // kind that can succeed on a re-run. Every other error is terminal: a
+                            // deterministic startup/config failure (the program isn't found, the stdin
+                            // source can't be read, a resource limit can't be enforced) would fail
+                            // identically forever, and even a variable failure like an output-cap overflow
+                            // is better surfaced than hidden behind an unbounded restart storm. Defers to
+                            // `ProcessError.isTransient` so the classification lives in one place. An actual
+                            // crash arrives on the `Ok` branch (a non-zero exit is data), so crash-restart
+                            // is unaffected; `Cancelled` is already terminal above.
                             let wantsRestart =
                                 match config.Policy with
                                 | RestartPolicy.Never -> false
-                                | _ -> true
+                                | _ -> ProcessError.isTransient error
 
                             if not wantsRestart || budgetExhausted () then
                                 final <- Some(Error error)

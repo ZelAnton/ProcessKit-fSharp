@@ -22,6 +22,11 @@ type CorrectnessBugTests() =
         else
             Command.create "/bin/sh" |> Command.args [ "-c"; script ]
 
+    // A path in an existing directory (temp) with a random leaf, so `File.OpenRead` fails with a
+    // genuine source error (FileNotFound), not a directory-not-found or a permissions quirk.
+    let missingStdinPath () =
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"pk-missing-{Guid.NewGuid():N}.txt")
+
     [<Test>]
     member _.``a negative command timeout is rejected at configuration time``() =
         Assert.Throws<ArgumentOutOfRangeException>(
@@ -121,4 +126,49 @@ type CorrectnessBugTests() =
                 match result.Outcome with
                 | Outcome.TimedOut -> Assert.Fail "pipeline deadlocked (timed out) — intermediate stdout was not wired"
                 | _ -> Assert.That(result.Stdout.Trim(), Is.EqualTo "hello")
+        }
+
+    [<Test>]
+    member _.``a missing FromFile stdin source surfaces as ProcessError.Stdin on a successful run``() : Task =
+        task {
+            // The source can't be opened, so the child gets empty stdin and still exits 0. That silent
+            // failure must surface as `ProcessError.Stdin` rather than a spurious `Ok` — otherwise a
+            // consumer never learns its input was dropped.
+            let cmd = (shell "exit 0") |> Command.stdin (Stdin.FromFile(missingStdinPath ()))
+
+            match! cmd.OutputStringAsync() with
+            | Error(ProcessError.Stdin _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Stdin, got {other.Message}"
+            | Ok _ -> Assert.Fail "expected a missing stdin source to surface as ProcessError.Stdin"
+        }
+
+    [<Test>]
+    member _.``a louder non-zero exit wins over a stdin-source failure``() : Task =
+        task {
+            // The stdin source is missing (a genuine feed failure) but the process exits non-zero. The
+            // "realer" failure wins: the outcome passes through as data, not `ProcessError.Stdin`.
+            let cmd = (shell "exit 7") |> Command.stdin (Stdin.FromFile(missingStdinPath ()))
+
+            match! cmd.OutputStringAsync() with
+            | Ok result ->
+                match result.Outcome with
+                | Outcome.Exited 7 -> ()
+                | other -> Assert.Fail $"expected exit 7 to pass through, got {other}"
+            | Error(ProcessError.Stdin _) ->
+                Assert.Fail "a non-zero exit must win over the stdin failure, not surface ProcessError.Stdin"
+            | Error other -> Assert.Fail $"unexpected error: {other.Message}"
+        }
+
+    [<Test>]
+    member _.``a readable stdin source on a successful run never surfaces a stdin error``() : Task =
+        task {
+            // A valid source feeding a child that may close stdin early (a broken pipe) must never be
+            // misreported as `ProcessError.Stdin` — only a genuine source-acquisition failure is.
+            let cmd =
+                (shell "exit 0")
+                |> Command.stdin (Stdin.FromString "payload the child may ignore")
+
+            match! cmd.OutputStringAsync() with
+            | Ok _ -> ()
+            | Error err -> Assert.Fail $"a readable stdin source must not error, got {err.Message}"
         }

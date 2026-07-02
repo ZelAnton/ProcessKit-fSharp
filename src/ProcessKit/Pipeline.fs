@@ -45,9 +45,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             let failed (stage: PipelineStage) =
                 // A stage succeeds when it exits with one of *its own* accepted codes (`Command.OkCodes`,
                 // default `{0}`); a signal/timeout is always a failure.
-                match stage.Outcome with
-                | Outcome.Exited code -> not (List.contains code stage.OkCodes)
-                | _ -> true
+                not (stage.Outcome.IsAcceptedBy stage.OkCodes)
 
             match checkedStages |> List.filter failed |> List.tryLast with
             | Some stage -> stage // rightmost checked failure -> the pipeline failed here

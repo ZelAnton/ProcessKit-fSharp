@@ -67,6 +67,8 @@ type FakeProcess private (template: Command, stdout: string, stderr: string, out
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
               Wait = fun () -> Task.FromResult outcome
+              // A fake process feeds no stdin, so it never has a source failure to surface.
+              StdinError = fun () -> None
               StartKill = fun () -> ()
               GracefulKill = fun _ -> Task.CompletedTask
               Teardown =

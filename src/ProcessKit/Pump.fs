@@ -271,15 +271,34 @@ module internal Pump =
         spawned.Stderr |> Option.iter disposeQuietly
         spawned.Stdin |> Option.iter disposeQuietly
 
+    /// Classify a stdin-feed exception. A genuine *source-acquisition* failure — the input could not
+    /// be opened or accessed (a missing `FromFile` path, a directory in its place, no read
+    /// permission) — is actionable and returned so it can surface as `ProcessError.Stdin`. Everything
+    /// else is `None` (swallowed): a broken pipe (the child closed stdin early — routine, and the
+    /// child decides when to stop reading), a stream disposed at teardown, or a cancelled write are
+    /// not the caller's error. The set is deliberately conservative and matched by exception *type*,
+    /// which is identical across Windows/Linux/macOS — never by a platform-specific error code — so a
+    /// routine broken-pipe write can never be misclassified as a failure (which would spuriously fail
+    /// the common `producer | head` early-exit pattern).
+    let private genuineStdinFault (ex: exn) : exn option =
+        match ex with
+        | :? FileNotFoundException
+        | :? DirectoryNotFoundException
+        | :? UnauthorizedAccessException -> Some ex
+        | _ -> None
+
     /// Write a stdin source to the child's stdin stream; close it (EOF) afterwards unless the
-    /// caller is keeping it open for interactive writing.
+    /// caller is keeping it open for interactive writing. Never faults: returns a genuine
+    /// source-acquisition failure (per `genuineStdinFault`) for the caller to surface, or `None`.
     let feedStdin
         (source: StdinSource)
         (stdinStream: Stream)
         (closeWhenDone: bool)
         (cancellationToken: CancellationToken)
-        : Task =
+        : Task<exn option> =
         task {
+            let mutable fault = None
+
             try
                 match source with
                 | StdinSource.Empty -> ()
@@ -310,22 +329,24 @@ module internal Pump =
                         enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult()
 
                 do! stdinStream.FlushAsync cancellationToken
-            with _ ->
-                // The stdin writer is best-effort and runs detached: a broken pipe (child closed
-                // stdin early), a missing FromFile path, or a torn-down stream all mean the child
-                // gets partial/no input, which the run's outcome already reflects. Swallowing keeps
-                // the detached task from faulting unobserved; the failure is never actionable here.
-                ()
+            with ex ->
+                // The stdin writer runs detached, so swallow to keep it from faulting unobserved; but
+                // stash a genuine source failure so an otherwise-successful run can surface it as
+                // `ProcessError.Stdin` instead of silently feeding the child empty input. A broken
+                // pipe / torn-down stream / cancelled write classifies as `None` — see `genuineStdinFault`.
+                fault <- genuineStdinFault ex
 
             if closeWhenDone then
                 disposeQuietly stdinStream
+
+            return fault
         }
-        :> Task
 
     /// Feed a stdin `source` (if any) into the child's `stdin` (if piped) in the background, then EOF.
-    /// Detached fire-and-forget: a source is the child's complete input, so stdin is closed after.
-    /// (The no-source interactive case keeps the stream for `TakeStdin` instead of feeding here.)
-    let feedStdinSource (stdin: Stream option) (source: Stdin option) =
+    /// A source is the child's complete input, so stdin is closed after. Returns the feed task so the
+    /// run can observe a genuine source failure once it has finished (`Task.FromResult None` when
+    /// there is nothing to feed). (The no-source interactive case keeps the stream for `TakeStdin`.)
+    let feedStdinSource (stdin: Stream option) (source: Stdin option) : Task<exn option> =
         match stdin, source with
-        | Some stdinStream, Some src -> feedStdin src.Source stdinStream true CancellationToken.None |> ignore
-        | _ -> ()
+        | Some stdinStream, Some src -> feedStdin src.Source stdinStream true CancellationToken.None
+        | _ -> Task.FromResult(None: exn option)

@@ -273,6 +273,13 @@ module Runner =
                             more <- false
 
                     running.Kill()
+
+                    // `firstLine` force-kills the child at the first match, so it never runs to the
+                    // natural accepted-exit completion that a stdin-source failure surfaces through
+                    // (`ProcessError.Stdin` fires only on an otherwise-successful run). Reporting it here
+                    // would hinge on whether the child happened to exit 0 before `Kill` landed — i.e. be
+                    // non-deterministic — so `firstLine` deliberately does not surface it: the matched
+                    // line is the result. `FinishAsync` is still awaited to reap the tree.
                     let! _ = running.FinishAsync()
                     return Ok found
                 with :? System.OperationCanceledException ->

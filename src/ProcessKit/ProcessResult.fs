@@ -53,10 +53,7 @@ type ProcessResult<'T>
     member _.AcceptedCodes: IReadOnlyList<int> = List.toArray okCodes
 
     /// True when the process exited with one of the accepted codes (`Command.OkCodes`; `{0}` by default).
-    member _.IsSuccess =
-        match outcome with
-        | Outcome.Exited code -> List.contains code okCodes
-        | _ -> false
+    member _.IsSuccess = outcome.IsAcceptedBy okCodes
 
     /// The single mapping from a non-success outcome to its `ProcessError`. Lives on the type so the
     /// instance `EnsureSuccess` and the module verbs (`ensureSuccess` / `exitCode` / `probe`, on a

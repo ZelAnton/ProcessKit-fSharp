@@ -81,6 +81,10 @@ type SupervisorTests() =
 
     let cancelledErr () : Result<ProcessResult<string>, ProcessError> = Error(ProcessError.Cancelled "fake")
 
+    // A deterministic, non-transient error: the program will never appear, so a restart is futile.
+    let notFoundErr () : Result<ProcessResult<string>, ProcessError> =
+        Error(ProcessError.NotFound("fake", None))
+
     let runner (replies: Result<ProcessResult<string>, ProcessError> list) =
         SequenceRunner replies :> IProcessRunner
 
@@ -241,6 +245,21 @@ type SupervisorTests() =
                 Assert.That(outcome.Restarts, Is.EqualTo 1)
                 Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a deterministic (non-transient) error is terminal under Always``() : Task =
+        task {
+            // Always would restart any failure, but a non-transient error (here NotFound — the program
+            // will never appear) can never succeed on a restart, so supervision must end at once rather
+            // than storm forever. The second reply is never consumed (SequenceRunner fails loudly if so).
+            let sup =
+                supervise([ notFoundErr (); ok () ]).Restart(RestartPolicy.Always).MaxRestarts(5)
+
+            match! sup.RunAsync() with
+            | Error(ProcessError.NotFound _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected NotFound, got {other}"
         }
         :> Task
 

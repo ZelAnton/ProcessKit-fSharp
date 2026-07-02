@@ -25,6 +25,10 @@ type internal RunningHost =
         StartedTimestamp: int64
         /// Wait for the process to exit and report how it concluded.
         Wait: unit -> Task<Outcome>
+        /// Observe a genuine stdin-source failure stashed by the background feeder, but only once the
+        /// feed has finished — a still-running feed yields `None` and never blocks. A Result-producing
+        /// verb surfaces it as `ProcessError.Stdin`, but only on an otherwise-successful run.
+        StdinError: unit -> exn option
         /// Signal the tree to die without waiting (start_kill).
         StartKill: unit -> unit
         /// Gracefully kill the tree (SIGTERM, then SIGKILL after the grace period) without
@@ -202,6 +206,17 @@ type RunningProcess internal (host: RunningHost) =
             totalBytes
         )
 
+    // A genuine stdin-source failure surfaces as `ProcessError.Stdin` only on an otherwise-successful
+    // run — an accepted exit code. A non-zero/unaccepted exit or a signal is the "realer" failure and
+    // wins: the outcome passes through unchanged so the caller's own classifier sees it. (A cancelled
+    // run is already turned into `ProcessError.Cancelled` upstream, before this is reached.)
+    let stdinErrorOnSuccess (outcome: Outcome) : ProcessError option =
+        if outcome.IsAcceptedBy config.OkCodes then
+            host.StdinError()
+            |> Option.map (fun ex -> ProcessError.Stdin(config.Program, ex.Message))
+        else
+            None
+
     // Wait for exit, applying a configured timeout: on the deadline, kill the tree (gracefully if
     // `TimeoutGrace` is set, else hard) and report `Outcome.TimedOut`.
     let waitWithTimeout () : Task<Outcome> =
@@ -309,18 +324,21 @@ type RunningProcess internal (host: RunningHost) =
                                 (outBuf.TotalBytes + errBuf.TotalBytes)
                         )
                 else
-                    return
-                        Ok(
-                            ProcessResult<string>(
-                                config.Program,
-                                outBuf.Text,
-                                errBuf.Text,
-                                outcome,
-                                elapsed (),
-                                outBuf.Truncated || errBuf.Truncated,
-                                config.OkCodes
+                    match stdinErrorOnSuccess outcome with
+                    | Some err -> return Error err
+                    | None ->
+                        return
+                            Ok(
+                                ProcessResult<string>(
+                                    config.Program,
+                                    outBuf.Text,
+                                    errBuf.Text,
+                                    outcome,
+                                    elapsed (),
+                                    outBuf.Truncated || errBuf.Truncated,
+                                    config.OkCodes
+                                )
                             )
-                        )
             }
 
     /// Run to completion, capturing stdout as raw bytes (no line splitting) and stderr as text.
@@ -347,18 +365,21 @@ type RunningProcess internal (host: RunningHost) =
                 if errBuf.TooLarge then
                     return Error(tooLargeError errBuf.TotalLines errBuf.TotalBytes)
                 else
-                    return
-                        Ok(
-                            ProcessResult<byte[]>(
-                                config.Program,
-                                stdoutBytes,
-                                errBuf.Text,
-                                outcome,
-                                elapsed (),
-                                errBuf.Truncated,
-                                config.OkCodes
+                    match stdinErrorOnSuccess outcome with
+                    | Some err -> return Error err
+                    | None ->
+                        return
+                            Ok(
+                                ProcessResult<byte[]>(
+                                    config.Program,
+                                    stdoutBytes,
+                                    errBuf.Text,
+                                    outcome,
+                                    elapsed (),
+                                    errBuf.Truncated,
+                                    config.OkCodes
+                                )
                             )
-                        )
             }
 
     /// Wait for the process to exit, discarding its output. Reaps the tree.
@@ -536,7 +557,9 @@ type RunningProcess internal (host: RunningHost) =
                 if stderrStreamBuffer.TooLarge then
                     return Error(tooLargeError stderrStreamBuffer.TotalLines stderrStreamBuffer.TotalBytes)
                 else
-                    return Ok(Finished(outcome, stderrStreamBuffer.Text))
+                    match stdinErrorOnSuccess outcome with
+                    | Some err -> return Error err
+                    | None -> return Ok(Finished(outcome, stderrStreamBuffer.Text))
             }
 
     // Returns false when a different consumption (a buffered verb, or stdout streaming) already owns the

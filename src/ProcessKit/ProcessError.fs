@@ -43,7 +43,8 @@ type ProcessError =
         TotalLines: int *
         TotalBytes: int
 
-    /// Writing to the child's standard input failed.
+    /// The child's stdin source could not be read (e.g. a missing `FromFile` path) on an otherwise-
+    /// successful run. A routine broken pipe — the child closed stdin early — is never reported here.
     | Stdin of Program: string * Detail: string
 
     /// A `ResourceLimits` cap was requested but could not be enforced — the platform has no
@@ -83,7 +84,7 @@ type ProcessError =
         | ProcessError.Parse(program, detail) -> $"failed to parse output of '{program}': {detail}"
         | ProcessError.OutputTooLarge(program, _, _, totalLines, totalBytes) ->
             $"'{program}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
-        | ProcessError.Stdin(program, detail) -> $"failed writing stdin to '{program}': {detail}"
+        | ProcessError.Stdin(program, detail) -> $"could not read the stdin source for '{program}': {detail}"
         | ProcessError.ResourceLimit detail -> $"resource limit could not be enforced: {detail}"
         | ProcessError.CassetteMiss program -> $"no recorded cassette entry for '{program}'"
         | ProcessError.Io detail -> $"I/O error: {detail}"

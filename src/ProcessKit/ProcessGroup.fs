@@ -122,7 +122,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         match this.SpawnInto command with
         | Error error -> Error error
         | Ok spawned ->
-            Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
+            let stdinFeed = Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
 
             let closeStreams () =
                 // Close the pipe streams (OS handles/fds) before releasing/detaching.
@@ -141,6 +141,19 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                   StartTime = DateTime.UtcNow
                   StartedTimestamp = Stopwatch.GetTimestamp()
                   Wait = (fun () -> waitOutcome spawned.Handle)
+                  // Observe the stashed source failure without blocking: read it only once the feed has
+                  // finished, else `None`. `IsCompletedSuccessfully` + `.Result` is race-free — `feedStdin`
+                  // never faults, so completion establishes the happens-before for the stashed value. We
+                  // deliberately do NOT await the feed (a source parked mid-read would hang the verb), so
+                  // an async-manifesting source fault that loses the race with the child's own exit is not
+                  // surfaced — matching ProcessKit-rs. The common case, a missing `FromFile`, faults
+                  // synchronously at spawn (`File.OpenRead`), so it is always observed.
+                  StdinError =
+                    (fun () ->
+                        if stdinFeed.IsCompletedSuccessfully then
+                            stdinFeed.Result
+                        else
+                            None)
                   StartKill =
                     (if ownsGroup then
                          backend.KillTree
