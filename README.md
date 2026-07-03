@@ -857,8 +857,8 @@ non-secret facts. The separate `ProcessKit.Extensions.DependencyInjection` packa
 
 ## Contributing
 
-Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[Code of Conduct](CODE_OF_CONDUCT.md). To report a security issue, follow [SECURITY.md](SECURITY.md).
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). To report a
+security issue, follow [SECURITY.md](SECURITY.md).
 
 ## License
 

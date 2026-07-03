@@ -2,11 +2,6 @@
 
 Thanks for your interest in improving **ProcessKit**.
 
-## Code of Conduct
-
-This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). By
-participating, you are expected to uphold it.
-
 ## Prerequisites
 
 - .NET 10 SDK (the exact band is pinned in [`global.json`](global.json)).
