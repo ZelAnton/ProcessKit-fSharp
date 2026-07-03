@@ -125,7 +125,7 @@ type RunningProcess internal (host: RunningHost) =
 
     // Per-process CPU / peak-memory via the BCL `Process` (reads /proc on Linux, the OS APIs
     // elsewhere) — no metrics once the child has exited or where the platform does not report them.
-    let processMetrics (pid: int) : TimeSpan option * uint64 option =
+    let processMetrics (pid: int) : TimeSpan option * int64 option =
         try
             use proc = Process.GetProcessById pid
 
@@ -139,7 +139,7 @@ type RunningProcess internal (host: RunningHost) =
             let memory =
                 try
                     let peak = proc.PeakWorkingSet64
-                    if peak > 0L then Some(uint64 peak) else None
+                    if peak > 0L then Some peak else None
                 with _ ->
                     // Peak working set unavailable (some platforms report 0 / throw); omit it.
                     None
@@ -273,7 +273,7 @@ type RunningProcess internal (host: RunningHost) =
 
     /// Peak resident memory of the child in bytes, if reported (some platforms, e.g. macOS, may
     /// not) and the process is still alive.
-    member _.PeakMemoryBytes: uint64 option =
+    member _.PeakMemoryBytes: int64 option =
         match host.Pid with
         | Some pid -> snd (processMetrics pid)
         | None -> None

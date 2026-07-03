@@ -500,7 +500,7 @@ module internal Native =
     /// Snapshot a Job's accounting: `(activeProcesses, totalCpuTime, peakCommittedBytes)`. `None` if
     /// either query fails (e.g. the job handle was closed). CPU is user + kernel (100ns units, the
     /// same as a `TimeSpan` tick).
-    let jobStatsWindows (job: nativeint) : (int * TimeSpan * uint64) option =
+    let jobStatsWindows (job: nativeint) : (int * TimeSpan * int64) option =
         let accSize = Marshal.SizeOf<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>()
         let extSize = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()
         let accBuffer = Marshal.AllocHGlobal accSize
@@ -537,7 +537,7 @@ module internal Native =
                     :?> JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 
                 let cpu = TimeSpan.FromTicks(acc.TotalUserTime + acc.TotalKernelTime)
-                Some(int acc.ActiveProcesses, cpu, uint64 ext.PeakJobMemoryUsed)
+                Some(int acc.ActiveProcesses, cpu, int64 ext.PeakJobMemoryUsed)
             else
                 None
         finally
@@ -1108,7 +1108,7 @@ module internal Native =
 
     /// cgroup accounting for `stats`: cumulative CPU (cpu.stat `usage_usec`) and peak memory
     /// (`memory.peak`), each `None` when the file is absent.
-    let cgroupStats (cgroupPath: string) : TimeSpan option * uint64 option =
+    let cgroupStats (cgroupPath: string) : TimeSpan option * int64 option =
         let cpu =
             try
                 File.ReadAllLines(Path.Combine(cgroupPath, "cpu.stat"))
@@ -1125,7 +1125,7 @@ module internal Native =
         let memory =
             try
                 match Int64.TryParse((File.ReadAllText(Path.Combine(cgroupPath, "memory.peak"))).Trim()) with
-                | true, peak -> Some(uint64 peak)
+                | true, peak -> Some peak
                 | _ -> None
             with _ ->
                 None

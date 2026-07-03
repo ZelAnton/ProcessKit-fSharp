@@ -528,7 +528,7 @@ class ProcessKit.ProcessGroupOptions
 
 class ProcessKit.ProcessGroupStats
   property ActiveProcessCount : System.Int32 { get }
-  property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.UInt64> { get }
+  property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property TotalCpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
 
 module ProcessKit.ProcessResult
@@ -565,9 +565,9 @@ class ProcessKit.ProcessRunnerExtensions
 
 class ProcessKit.ProcessStdin
   member FinishAsync() : System.Threading.Tasks.Task
-  member FlushAsync() : System.Threading.Tasks.Task
-  member WriteAsync(System.Byte[]) : System.Threading.Tasks.Task
-  member WriteLineAsync(System.String) : System.Threading.Tasks.Task
+  member FlushAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task
+  member WriteAsync(System.Byte[], System.Threading.CancellationToken) : System.Threading.Tasks.Task
+  member WriteLineAsync(System.String, System.Threading.CancellationToken) : System.Threading.Tasks.Task
 
 class ProcessKit.ResourceLimits
   member WithCpuQuota(System.Double) : ProcessKit.ResourceLimits
@@ -619,7 +619,7 @@ class ProcessKit.RunProfile
   property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
   property Duration : System.TimeSpan { get }
   property ExitCode : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
-  property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.UInt64> { get }
+  property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property Samples : System.Int32 { get }
 
 module ProcessKit.Runner
@@ -651,7 +651,7 @@ class ProcessKit.RunningProcess
   member WaitForPortAsync(System.Net.IPEndPoint, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
   property Elapsed : System.TimeSpan { get }
-  property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.UInt64> { get }
+  property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property Pid : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property StartTime : System.DateTime { get }
   property StderrLineCount : System.Int32 { get }

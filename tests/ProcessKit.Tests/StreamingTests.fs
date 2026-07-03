@@ -174,6 +174,56 @@ type StreamingTests() =
         :> Task
 
     [<Test>]
+    member _.``interactive stdin writer verbs accept a CancellationToken``() : Task =
+        task {
+            // The write verbs each take an optional CancellationToken; passing a live (non-cancelled)
+            // token must thread through to the underlying stream and feed the child normally.
+            let command = shell "sort" |> Command.keepStdinOpen
+            use cts = new CancellationTokenSource()
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match running.TakeStdin() with
+                | None -> Assert.Fail "expected an interactive stdin handle"
+                | Some stdin ->
+                    do! stdin.WriteLineAsync("cherry", cts.Token)
+                    do! stdin.WriteAsync(System.Text.Encoding.UTF8.GetBytes "date\n", cts.Token)
+                    do! stdin.FlushAsync cts.Token
+                    do! stdin.FinishAsync() // close -> sort emits (close is uncancellable, like DisposeAsync)
+
+                    match! running.OutputStringAsync() with
+                    | Ok result ->
+                        Assert.That(result.Stdout, Does.Contain "cherry")
+                        Assert.That(result.Stdout, Does.Contain "date")
+                    | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ProcessStdin FinishAsync is idempotent``() : Task =
+        task {
+            // Closing stdin twice — or once after the run's own teardown has closed it — must be a safe
+            // no-op, not throw (mirrors IAsyncDisposable.DisposeAsync).
+            let command = shell "sort" |> Command.keepStdinOpen
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match running.TakeStdin() with
+                | None -> Assert.Fail "expected an interactive stdin handle"
+                | Some stdin ->
+                    do! stdin.WriteLineAsync "x"
+                    do! stdin.FinishAsync()
+                    do! stdin.FinishAsync() // second close: no-op, must not throw
+
+                    match! running.OutputStringAsync() with
+                    | Ok _ -> ()
+                    | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``concurrent stdin runs do not cross-inherit pipes and deadlock``() : Task =
         task {
             let runOne (i: int) =

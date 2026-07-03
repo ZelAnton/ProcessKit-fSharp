@@ -12,7 +12,7 @@ open System.Threading.Tasks
 /// cgroup v2 backend (the `limits` feature) supplies them. Sealed with an internal constructor so
 /// it can gain metrics without breaking the frozen API.
 [<Sealed>]
-type ProcessGroupStats internal (activeProcessCount: int, totalCpuTime: TimeSpan option, peakMemoryBytes: uint64 option)
+type ProcessGroupStats internal (activeProcessCount: int, totalCpuTime: TimeSpan option, peakMemoryBytes: int64 option)
     =
 
     /// Number of live processes currently in the group. Under the POSIX process-group mechanism
@@ -36,7 +36,7 @@ type ProcessGroupStats internal (activeProcessCount: int, totalCpuTime: TimeSpan
 [<Sealed>]
 type RunProfile
     internal
-    (exitCode: int option, duration: TimeSpan, cpuTime: TimeSpan option, peakMemoryBytes: uint64 option, samples: int) =
+    (exitCode: int option, duration: TimeSpan, cpuTime: TimeSpan option, peakMemoryBytes: int64 option, samples: int) =
 
     /// The exit code; `None` for a run killed by its timeout or a signal.
     member _.ExitCode = exitCode

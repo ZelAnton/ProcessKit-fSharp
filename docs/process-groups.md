@@ -582,7 +582,7 @@ Console.WriteLine((group.Stats()) switch
 ```
 
 `ProcessGroupStats` carries `ActiveProcessCount` (an `int`, always populated),
-`TotalCpuTime` (`TimeSpan option`), and `PeakMemoryBytes` (`uint64 option`). CPU
+`TotalCpuTime` (`TimeSpan option`), and `PeakMemoryBytes` (`int64 option`). CPU
 time and peak memory are available where the kernel accounts for the whole tree —
 **Windows** (Job Object accounting) and the **Linux cgroup v2** backend; on the
 **POSIX process-group** backend only the live count is reported and the two

@@ -281,7 +281,13 @@ if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and w
 `ProcessStdin` offers `WriteLineAsync(line)` (appends a newline and flushes),
 `WriteAsync(bytes)` (raw bytes, for binary input), `FlushAsync()`, and `FinishAsync()` (close
 stdin / send EOF). Disposing the writer — or the whole `RunningProcess` — closes
-stdin too; `FinishAsync()` just makes the EOF explicit and awaitable.
+stdin too; `FinishAsync()` just makes the EOF explicit and awaitable. The write verbs
+(`WriteAsync` / `WriteLineAsync` / `FlushAsync`) each take an optional `CancellationToken`, so a
+write to a child that has stopped reading (a full stdin pipe) can be bounded rather than blocking
+forever — a cancelled write throws `OperationCanceledException` (and, as with any cancellable stream
+write, may already have delivered part of its bytes, so abandon the session rather than retrying a
+timed-out write). `FinishAsync` is idempotent and uncancellable (it mirrors `DisposeAsync`); bound
+the writes/flush before closing, not the close.
 
 **Avoid the full-duplex deadlock.** A child's stdout pipe has a finite OS buffer;
 once it fills, the child blocks *writing* stdout until something reads it. If you
