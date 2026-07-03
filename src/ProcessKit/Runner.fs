@@ -150,6 +150,11 @@ module Runner =
         | None -> action ()
         | Some(maxAttempts, delay, shouldRetry) ->
             task {
+                // `maxAttempts` is the TOTAL number of runs (the initial run plus retries), so the
+                // command always runs at least once: `0`/`1` (and any non-positive value) mean a single
+                // run, `3` means one run and up to two retries. (Matches the vocabulary of the source
+                // crate's `retry`.) Guard the `- 1` so `Int32.MinValue` can't wrap to a huge retry count.
+                let maxRetries = if maxAttempts <= 1 then 0 else maxAttempts - 1
                 let mutable attempt = 0
                 let mutable final = None
 
@@ -167,7 +172,7 @@ module Runner =
                             | _ -> false
 
                         if
-                            attempt < maxAttempts
+                            attempt < maxRetries
                             && shouldRetry.Invoke error
                             && not cancellationToken.IsCancellationRequested
                             && not isCancelled

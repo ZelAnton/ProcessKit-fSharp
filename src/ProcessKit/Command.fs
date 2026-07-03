@@ -302,8 +302,10 @@ type Command internal (config: CommandConfig) =
                 CancelOn = Some cancellationToken }
         )
 
-    /// Retry a failed run up to `maxAttempts` extra times, waiting `delay` between attempts, while
-    /// `shouldRetry` returns true for the error.
+    /// Run the command up to `maxAttempts` times **in total** (the initial run plus up to
+    /// `maxAttempts - 1` retries), waiting `delay` between attempts, while `shouldRetry` returns true
+    /// for the error. `maxAttempts` of `0` or `1` both mean a single run — a command always runs at
+    /// least once.
     member _.Retry(maxAttempts: int, delay: TimeSpan, shouldRetry: Func<ProcessError, bool>) =
         ArgumentNullException.ThrowIfNull shouldRetry
 
@@ -319,15 +321,16 @@ type Command internal (config: CommandConfig) =
 
     /// Replace the set of exit codes treated as success (the default is `{0}`) — this is what
     /// `ProcessResult.IsSuccess`, `ensureSuccess`, and the `RunAsync` verbs check. The codes *replace* the
-    /// default rather than adding to it, so pass `[0; 3]` to accept both `0` and `3`; an empty set
-    /// resets to the default `{0}`.
+    /// default rather than adding to it, so pass `[0; 3]` to accept both `0` and `3`. An empty set is a
+    /// **no-op** — the previously configured codes are kept (it never resets the accepted set), so it
+    /// can't accidentally clear a caller's `[0; 3]` down to nothing.
     member _.OkCodes(codes: seq<int>) =
         ArgumentNullException.ThrowIfNull codes
         let list = List.ofSeq codes
 
         Command(
             { config with
-                OkCodes = (if List.isEmpty list then [ 0 ] else list) }
+                OkCodes = (if List.isEmpty list then config.OkCodes else list) }
         )
 
     /// Windows: run the child with `CREATE_NO_WINDOW`, so a console child spawned from a GUI app
@@ -415,15 +418,16 @@ module Command =
     /// Also cancel the run when `cancellationToken` fires.
     let cancelOn (cancellationToken: CancellationToken) (command: Command) = command.CancelOn cancellationToken
 
-    /// Retry a failed run up to `maxAttempts` extra times, waiting `delay` between attempts.
+    /// Run the command up to `maxAttempts` times in total (initial run plus retries), waiting `delay`
+    /// between attempts (`0`/`1` both mean a single run).
     let retry (maxAttempts: int) (delay: TimeSpan) (shouldRetry: ProcessError -> bool) (command: Command) =
         command.Retry(maxAttempts, delay, Func<ProcessError, bool> shouldRetry)
 
     /// Inside a pipeline, allow this stage to exit non-zero without failing the pipeline.
     let uncheckedInPipe (command: Command) = command.UncheckedInPipe()
 
-    /// Replace the success exit-code set with these codes (default `{0}`; include `0` to keep it, an
-    /// empty set resets to `{0}`).
+    /// Replace the success exit-code set with these codes (default `{0}`; include `0` to keep it; an
+    /// empty set is a no-op that keeps the previously configured codes).
     let okCodes (codes: seq<int>) (command: Command) = command.OkCodes codes
 
     /// Windows: run the child with `CREATE_NO_WINDOW` (no effect on Unix).

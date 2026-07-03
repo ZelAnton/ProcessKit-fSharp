@@ -502,6 +502,7 @@ class ProcessKit.ProcessGroup
   :> System.IAsyncDisposable
   :> System.IDisposable
   member Finalize() : System.Void
+  member KillAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member Members() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<System.Int32>, ProcessKit.ProcessError>
   member Resume() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member SampleStatsAsync(System.TimeSpan) : System.Collections.Generic.IAsyncEnumerable<ProcessKit.ProcessGroupStats>
@@ -511,7 +512,6 @@ class ProcessKit.ProcessGroup
   member StartAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
   member Stats() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroupStats, ProcessKit.ProcessError>
   member Suspend() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
-  member TerminateAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   property Mechanism : ProcessKit.Mechanism { get }
   property Options : ProcessKit.ProcessGroupOptions { get }
   static member Create() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroup, ProcessKit.ProcessError>
@@ -615,12 +615,15 @@ class ProcessKit.ResultExtensions
   static member TryGetValue<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, T&, ProcessKit.ProcessError&) : System.Boolean
 
 class ProcessKit.RunProfile
-  property AvgCpu : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
+  property AvgCpuCores : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
   property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
   property Duration : System.TimeSpan { get }
   property ExitCode : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Outcome : ProcessKit.Outcome { get }
   property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property Samples : System.Int32 { get }
+  property Signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property TimedOut : System.Boolean { get }
 
 module ProcessKit.Runner
   static member exitCode(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>

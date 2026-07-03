@@ -416,7 +416,7 @@ task {
     | Ok proc ->
         use _ = proc
         let! profile = proc.ProfileAsync()
-        printfn $"exit={profile.ExitCode} took={profile.Duration} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}"
+        printfn $"exit={profile.ExitCode} took={profile.Duration} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpuCores}"
     | Error err -> eprintfn $"{err.Message}"
 }
 ```
@@ -427,7 +427,7 @@ task {
 // A one-shot summary of a single run:
 await using var proc = (await new Command("crunch").StartAsync()).GetValueOrThrow();
 var profile = await proc.ProfileAsync();
-Console.WriteLine($"exit={profile.ExitCode} took={profile.Duration} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}");
+Console.WriteLine($"exit={profile.ExitCode} took={profile.Duration} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpuCores}");
 ```
 
 `Stats()`/`SampleStatsAsync` report full CPU/memory on Windows and the Linux cgroup backend, and active

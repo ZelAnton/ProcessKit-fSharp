@@ -16,7 +16,7 @@ Shipped changes are in [`CHANGELOG.md`](CHANGELOG.md).
   per-run profiling.
 - Shell-free **`Pipeline`s** with pipefail semantics.
 - **`Supervisor`** — restart policies, exponential backoff + jitter, and a failure-storm guard.
-- Tree control on **`ProcessGroup`** (`Signal` / `Suspend` / `Resume` / `Members` / `TerminateAll` /
+- Tree control on **`ProcessGroup`** (`Signal` / `Suspend` / `Resume` / `Members` / `KillAll` /
   `Shutdown`), whole-tree **resource limits**, and **stats** sampling.
 - The **`IProcessRunner`** seam with subprocess-free doubles (`ScriptedRunner`,
   `RecordReplayRunner`), the **`CliClient`** wrapper, and the top-level **`Exec`** helpers.

@@ -81,7 +81,7 @@ type TimeoutTests() =
                         $"echo x >> {marker}; exit 1"
 
                 let command =
-                    shell script |> Command.retry 2 (TimeSpan.FromMilliseconds 50.0) (fun _ -> true)
+                    shell script |> Command.retry 3 (TimeSpan.FromMilliseconds 50.0) (fun _ -> true)
 
                 match! command.RunAsync() with
                 | Error _ -> ()
@@ -93,7 +93,40 @@ type TimeoutTests() =
                     else
                         0
 
-                Assert.That(attempts, Is.EqualTo 3) // initial + 2 retries
+                Assert.That(attempts, Is.EqualTo 3) // retry 3 = 3 runs total (initial + 2 retries)
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Retry 0 (or any non-positive maxAttempts) runs the command exactly once``() : Task =
+        let id = Guid.NewGuid().ToString("N")
+        let marker = Path.Combine(Path.GetTempPath(), $"pk-retry0-{id}.txt")
+
+        task {
+            try
+                let script =
+                    if isWindows then
+                        $"echo x>>{marker}&exit 1"
+                    else
+                        $"echo x >> {marker}; exit 1"
+
+                // `maxAttempts` counts total runs, so 0 (a non-positive value) is still a single run — a
+                // command always runs at least once, and the `- 1` guard can't underflow into a storm.
+                let command =
+                    shell script |> Command.retry 0 (TimeSpan.FromMilliseconds 50.0) (fun _ -> true)
+
+                let! _ = command.RunAsync()
+
+                let attempts =
+                    if File.Exists marker then
+                        File.ReadAllLines(marker).Length
+                    else
+                        0
+
+                Assert.That(attempts, Is.EqualTo 1)
             finally
                 if File.Exists marker then
                     File.Delete marker

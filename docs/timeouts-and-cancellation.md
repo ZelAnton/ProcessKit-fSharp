@@ -222,8 +222,9 @@ failed run, sleeping `delay` between tries, retrying only while `predicate`
 accepts the error. The predicate is a `Func<ProcessError, bool>` (from F#, a
 plain `ProcessError -> bool` through the module mirror).
 
-`maxAttempts` counts **additional** attempts *after* the first, so `Retry 3` runs
-the command at most four times.
+`maxAttempts` is the **total** number of runs (the first run plus up to
+`maxAttempts - 1` retries), so `Retry 3` runs the command at most three times, and
+`0`/`1` both mean a single run — a command always runs at least once.
 
 **F#**
 

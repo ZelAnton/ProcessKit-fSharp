@@ -249,7 +249,7 @@ There are three ways out, from blunt to graceful:
 | Verb | What happens | When to use it |
 |---|---|---|
 | dispose (`use` / `Dispose()` / `DisposeAsync()`) | Immediate **hard kill** of the whole tree, then releases the container | The safety net — always on, even on an exception or early return |
-| `group.TerminateAll()` | The same hard kill, but the group **stays usable** for further spawns; idempotent | Explicit teardown mid-flight when you want to keep the group |
+| `group.KillAll()` | The same hard kill, but the group **stays usable** for further spawns; idempotent | Explicit teardown mid-flight when you want to keep the group |
 | `group.ShutdownAsync()` / `group.ShutdownAsync(grace)` | **Graceful**: on Unix `SIGTERM` → wait the grace window → `SIGKILL` survivors; on Windows the atomic Job kill. Releases the group | A clean service stop |
 
 `ProcessGroup` implements both `IDisposable` and `IAsyncDisposable`, so a `use`
@@ -295,7 +295,7 @@ await group.ShutdownAsync(TimeSpan.FromSeconds(5));
 **early** — `ShutdownAsync` returns as soon as the tree is empty, not after the full
 window. `ShutdownAsync` and dispose are idempotent with each other, so a `use`-bound
 group you also `ShutdownAsync` explicitly is safe. Note that a *suspended* tree can
-still be hard-killed (dispose / `TerminateAll`), but a graceful `ShutdownAsync` opens
+still be hard-killed (dispose / `KillAll`), but a graceful `ShutdownAsync` opens
 with a `SIGTERM` a frozen tree cannot act on — `Resume` first for a clean stop
 (see below).
 
@@ -336,7 +336,7 @@ hatch `Signal.Other n` for any other signal number.
 | Windows | `Kill` only (maps to the Job terminate); anything else → `ProcessError.Unsupported` |
 
 `Signal.Kill` always takes the same atomic whole-tree kill path as
-`TerminateAll`, so it can't miss a process forked mid-broadcast; other signals are
+`KillAll`, so it can't miss a process forked mid-broadcast; other signals are
 a best-effort per-member broadcast against a tree that may be forking at that
 instant. An already-exited member is skipped, and an empty group accepts any
 deliverable signal trivially. On Windows, a non-`Kill` signal fails fast:

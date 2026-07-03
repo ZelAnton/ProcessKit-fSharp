@@ -36,10 +36,23 @@ type ProcessGroupStats internal (activeProcessCount: int, totalCpuTime: TimeSpan
 [<Sealed>]
 type RunProfile
     internal
-    (exitCode: int option, duration: TimeSpan, cpuTime: TimeSpan option, peakMemoryBytes: int64 option, samples: int) =
+    (outcome: Outcome, duration: TimeSpan, cpuTime: TimeSpan option, peakMemoryBytes: int64 option, samples: int) =
 
-    /// The exit code; `None` for a run killed by its timeout or a signal.
-    member _.ExitCode = exitCode
+    /// How the profiled run concluded — a clean exit, a signal kill, or a timeout. `ExitCode` /
+    /// `Signal` / `TimedOut` are the convenience reads over it, so a profile is a superset of `Wait`:
+    /// one call yields both the telemetry and the outcome. A signal kill and a timeout both leave
+    /// `ExitCode` `None` (a clean exit is `Some code`), so `Outcome` / `TimedOut` / `Signal` are how you
+    /// tell those two apart.
+    member _.Outcome = outcome
+
+    /// The exit code; `None` for a run killed by its timeout or a signal (see `Outcome`).
+    member _.ExitCode = outcome.Code
+
+    /// The terminating signal number when the run was signal-killed (Unix); `None` otherwise.
+    member _.Signal = outcome.Signal
+
+    /// True when the run was killed by its timeout.
+    member _.TimedOut = outcome.IsTimedOut
 
     /// Wall-clock time from process start until the run finished (exit reaped and output drained).
     member _.Duration = duration
@@ -53,10 +66,10 @@ type RunProfile
     /// How many sampling ticks ran (including ones that found no data).
     member _.Samples = samples
 
-    /// Average CPU utilisation over the run, in cores (`0.5` = half a core busy on average; can
+    /// Average CPU utilisation over the run, **in cores** (`0.5` = half a core busy on average; can
     /// exceed `1.0` for multi-threaded children). `None` when CPU time was never observed or the
     /// run had no duration.
-    member _.AvgCpu =
+    member _.AvgCpuCores =
         match cpuTime with
         | Some cpu when duration > TimeSpan.Zero -> Some(cpu.TotalSeconds / duration.TotalSeconds)
         | _ -> None

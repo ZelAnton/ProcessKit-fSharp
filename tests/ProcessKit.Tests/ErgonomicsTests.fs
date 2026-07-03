@@ -31,6 +31,17 @@ type ErgonomicsTests() =
         :> Task
 
     [<Test>]
+    member _.``OkCodes with an empty set is a no-op that keeps the configured codes``() : Task =
+        task {
+            // A later empty OkCodes must not clear a caller's accepted set back to {0} — it is a no-op,
+            // so exit 2 is still accepted.
+            match! (shell "exit 2" |> Command.okCodes [ 0; 2 ] |> Command.okCodes []).RunAsync() with
+            | Ok _ -> Assert.Pass()
+            | Error error -> Assert.Fail $"expected the empty OkCodes to keep [0;2], got {error}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``a non-zero exit outside OkCodes still fails Run``() : Task =
         task {
             match! (shell "exit 2").RunAsync() with

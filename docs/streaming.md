@@ -537,7 +537,7 @@ task {
         let! profile = proc.ProfileAsync(TimeSpan.FromMilliseconds 100.0)
 
         printfn $"exit={profile.ExitCode} wall={profile.Duration} samples={profile.Samples}"
-        printfn $"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}"
+        printfn $"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpuCores}"
 }
 ```
 
@@ -553,13 +553,13 @@ Console.WriteLine($"pid={proc.Pid} elapsed={proc.Elapsed} cpu={proc.CpuTime} pea
 var profile = await proc.ProfileAsync(TimeSpan.FromMilliseconds(100));
 
 Console.WriteLine($"exit={profile.ExitCode} wall={profile.Duration} samples={profile.Samples}");
-Console.WriteLine($"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpu}");
+Console.WriteLine($"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpuCores}");
 ```
 
 `ProfileAsync()` with no argument uses a default sampling interval; `ProfileAsync(interval)`
 samples at the cadence you pick. The resulting `RunProfile` exposes `ExitCode`,
 `Duration` (wall clock), `CpuTime` (user + kernel), `PeakMemoryBytes`, the number of
-`Samples` taken, and `AvgCpu` — CPU time over wall time, so a value near `1.7` means
+`Samples` taken, and `AvgCpuCores` — CPU time over wall time, so a value near `1.7` means
 roughly 1.7 cores were busy on average.
 
 These figures describe the started child, not a whole tree — for the tree's

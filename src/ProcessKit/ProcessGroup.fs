@@ -218,10 +218,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         else
             action ()
 
-    /// Immediately hard-kill every process currently in the group. Idempotent; the group stays
-    /// usable for further spawns. Returns `Result` for parity with the other tree-control verbs (a
-    /// future backend can report an undrained tree); the current backends always succeed.
-    member this.TerminateAll() : Result<unit, ProcessError> =
+    /// Immediately hard-kill every process currently in the group (the honest name for the tree kill —
+    /// no graceful signal). Idempotent; the group stays usable for further spawns. Returns `Result` for
+    /// parity with the other tree-control verbs (a future backend can report an undrained tree); the
+    /// current backends always succeed.
+    member this.KillAll() : Result<unit, ProcessError> =
         this.WhenLive(fun () ->
             backend.KillTree()
             Ok())

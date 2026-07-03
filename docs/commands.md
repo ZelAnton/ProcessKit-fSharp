@@ -463,10 +463,12 @@ Console.WriteLine(await cmd.RunAsync() switch
 - **`TimeoutGrace`** softens the kill: on timeout it terminates gracefully
   (SIGTERM), waits the grace window, then force-kills only if the child is still
   alive. On Windows this degrades to the atomic Job-object kill.
-- **`Retry`** re-runs the command up to `maxAttempts` *additional* times after the
-  first, waiting `delay` between attempts, while your classifier returns `true`
-  for the error (`ProcessError.isTransient` covers spawn races and I/O blips). The
-  classifier sees the typed `ProcessError`; a cancelled token stops the loop.
+- **`Retry`** runs the command up to `maxAttempts` times **in total** (the first run
+  plus up to `maxAttempts - 1` retries — so `retry 3` is one run and up to two
+  retries, and `0`/`1` both mean a single run), waiting `delay` between attempts,
+  while your classifier returns `true` for the error (`ProcessError.isTransient`
+  covers spawn races and I/O blips). The classifier sees the typed `ProcessError`; a
+  cancelled token stops the loop.
 
 To tie a run to a `CancellationToken`, use `CancelOn` (or pass a token to any verb's
 optional token parameter, `cmd.RunAsync(ct)`). A cancelled run is **always** an error
@@ -683,8 +685,8 @@ Console.WriteLine(await grep.RunAsync() switch
 
 `OkCodes` sets which exit codes `ProcessResult.IsSuccess`, `ensureSuccess`, and
 `RunAsync` / `RunUnitAsync` accept. The codes *replace* the default rather than adding to it, so
-include `0` if you still want it (as `[ 0; 1 ]` above does); an empty set resets to the
-default `{0}`.
+include `0` if you still want it (as `[ 0; 1 ]` above does); an empty set is a **no-op** that
+keeps the previously configured codes (it never clears them).
 
 ### The `Outcome` enum
 

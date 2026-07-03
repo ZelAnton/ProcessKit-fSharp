@@ -126,15 +126,35 @@ type StatsTests() =
         :> Task
 
     [<Test>]
-    member _.``AvgCpu divides CPU time by duration``() =
+    member _.``AvgCpuCores divides CPU time by duration``() =
         let profile =
-            RunProfile(Some 0, TimeSpan.FromSeconds 2.0, Some(TimeSpan.FromSeconds 1.0), None, 5)
+            RunProfile(Outcome.Exited 0, TimeSpan.FromSeconds 2.0, Some(TimeSpan.FromSeconds 1.0), None, 5)
 
-        match profile.AvgCpu with
+        match profile.AvgCpuCores with
         | Some avg -> Assert.That(avg, Is.EqualTo(0.5).Within 1e-9)
         | None -> Assert.Fail "expected an average"
 
         let noDuration =
-            RunProfile(Some 0, TimeSpan.Zero, Some(TimeSpan.FromSeconds 1.0), None, 1)
+            RunProfile(Outcome.Exited 0, TimeSpan.Zero, Some(TimeSpan.FromSeconds 1.0), None, 1)
 
-        Assert.That(noDuration.AvgCpu.IsNone, Is.True)
+        Assert.That(noDuration.AvgCpuCores.IsNone, Is.True)
+
+    [<Test>]
+    member _.``RunProfile.Outcome distinguishes a timeout and a signal kill (both leave ExitCode None)``() =
+        // The point of carrying the full Outcome: ExitCode is None for both a timeout and a signal kill,
+        // so a profiled run can only tell them apart via Outcome / TimedOut / Signal.
+        let timedOut = RunProfile(Outcome.TimedOut, TimeSpan.FromSeconds 1.0, None, None, 1)
+        Assert.That(timedOut.ExitCode.IsNone, Is.True)
+        Assert.That(timedOut.TimedOut, Is.True)
+        Assert.That(timedOut.Signal.IsNone, Is.True)
+
+        let signalled =
+            RunProfile(Outcome.Signalled(Some 9), TimeSpan.FromSeconds 1.0, None, None, 1)
+
+        Assert.That(signalled.ExitCode.IsNone, Is.True)
+        Assert.That(signalled.TimedOut, Is.False)
+        Assert.That(signalled.Signal, Is.EqualTo(Some 9))
+
+        let exited = RunProfile(Outcome.Exited 3, TimeSpan.FromSeconds 1.0, None, None, 1)
+        Assert.That(exited.ExitCode, Is.EqualTo(Some 3))
+        Assert.That(exited.Outcome, Is.EqualTo(Outcome.Exited 3))

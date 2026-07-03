@@ -477,7 +477,7 @@ type RunningProcess internal (host: RunningHost) =
 
             match error with
             | Some ex -> return! Task.FromException<RunProfile> ex
-            | None -> return RunProfile(outcome.Code, elapsed (), lastCpu, peakMemory, samples)
+            | None -> return RunProfile(outcome, elapsed (), lastCpu, peakMemory, samples)
         }
 
     /// `ProfileAsync` sampling every 100 ms.

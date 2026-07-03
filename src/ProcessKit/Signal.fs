@@ -4,7 +4,7 @@ namespace ProcessKit
 ///
 /// The curated variants map to the POSIX signal of the same name on Unix. On **Windows** only
 /// `Kill` is deliverable (it maps to the Job Object terminate, the same hard kill as
-/// `ProcessGroup.TerminateAll`); every other variant yields `ProcessError.Unsupported`.
+/// `ProcessGroup.KillAll`); every other variant yields `ProcessError.Unsupported`.
 ///
 /// `Other` is an escape hatch carrying a raw signal number on Unix (e.g. `SIGWINCH`); it is always
 /// unsupported on Windows.
