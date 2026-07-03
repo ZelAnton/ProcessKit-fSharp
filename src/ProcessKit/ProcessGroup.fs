@@ -295,6 +295,12 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// there is no per-job graceful signal, so this is the atomic Job kill.
     member internal _.GracefulKillTree(grace: TimeSpan) : Task = backend.GracefulKillTree grace
 
+    // Deliberate divergence from ProcessKit-rs (`shutdown(escalate_to_kill = false)`): we do NOT offer a
+    // graceful shutdown that *keeps the group usable* by sparing the processes that ignore SIGTERM. That
+    // mode makes kill-on-drop conditional (spared survivors outlive a drop), and this port keeps the
+    // kill-on-drop tree guarantee UNCONDITIONAL. The four teardown needs are still covered without it:
+    // immediate+terminal = `Dispose`; immediate+keep-usable = `KillAll`; graceful+terminal = `ShutdownAsync`.
+
     /// Tear the group down gracefully, then release it. On Unix: SIGTERM, then SIGKILL if still
     /// alive after `gracePeriod`. On Windows: an atomic Job kill. Idempotent with `Dispose`.
     member this.ShutdownAsync(gracePeriod: TimeSpan) : Task =
