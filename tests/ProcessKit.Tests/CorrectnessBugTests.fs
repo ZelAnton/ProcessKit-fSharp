@@ -172,3 +172,36 @@ type CorrectnessBugTests() =
             | Ok _ -> ()
             | Error err -> Assert.Fail $"a readable stdin source must not error, got {err.Message}"
         }
+
+    [<Test>]
+    member _.``a pipeline surfaces a missing first-stage stdin source as ProcessError.Stdin``() : Task =
+        task {
+            // The first stage's stdin source can't be read; the pipeline otherwise succeeds (both stages
+            // exit 0), so it must surface `ProcessError.Stdin` — uniformly with a single command — rather
+            // than silently feeding stage 0 empty input.
+            let pipeline =
+                ((shell "exit 0") |> Command.stdin (Stdin.FromFile(missingStdinPath ()))).Pipe(shell "sort")
+
+            match! pipeline.OutputStringAsync() with
+            | Error(ProcessError.Stdin _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Stdin, got {other.Message}"
+            | Ok _ -> Assert.Fail "expected a missing first-stage stdin source to surface as ProcessError.Stdin"
+        }
+
+    [<Test>]
+    member _.``a pipefail failure wins over a first-stage stdin-source failure``() : Task =
+        task {
+            // The first stage's stdin source is missing, but the pipeline fails pipefail (last stage exits
+            // 4, unaccepted). That louder failure wins: the outcome passes through as data, not Stdin.
+            let pipeline =
+                ((shell "exit 0") |> Command.stdin (Stdin.FromFile(missingStdinPath ()))).Pipe(shell "exit 4")
+
+            match! pipeline.OutputStringAsync() with
+            | Ok result ->
+                match result.Outcome with
+                | Outcome.Exited 4 -> ()
+                | other -> Assert.Fail $"expected pipefail exit 4 to pass through, got {other}"
+            | Error(ProcessError.Stdin _) ->
+                Assert.Fail "a pipefail failure must win over the stdin failure, not surface ProcessError.Stdin"
+            | Error other -> Assert.Fail $"unexpected error: {other.Message}"
+        }

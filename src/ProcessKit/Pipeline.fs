@@ -64,6 +64,17 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                     { last with
                         Outcome = Outcome.Exited okCode }
 
+    // A genuine stage-0 stdin source failure surfaces as `ProcessError.Stdin` — uniformly with a single
+    // command — but only on an otherwise-successful pipeline (the pipefail representative exited with an
+    // accepted code); a pipefail failure or a timeout is the "realer" failure and passes through. The
+    // program is stage 0's, whose source could not be read.
+    static let stdinErrorOnSuccess (program: string) (capture: PipelineCapture) (representative: PipelineStage) =
+        if representative.Outcome.IsAcceptedBy representative.OkCodes then
+            capture.Stdin0Error
+            |> Option.map (fun ex -> ProcessError.Stdin(program, ex.Message))
+        else
+            None
+
     /// Append another stage; its stdin is fed from the current last stage's stdout.
     member _.Pipe(command: Command) =
         ArgumentNullException.ThrowIfNull command
@@ -108,18 +119,21 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             | Ok capture ->
                 let stage = representative capture
 
-                return
-                    Ok(
-                        ProcessResult<byte[]>(
-                            stage.Program,
-                            capture.LastStdout,
-                            stage.Stderr,
-                            stage.Outcome,
-                            capture.Duration,
-                            false,
-                            stage.OkCodes
+                match stdinErrorOnSuccess (List.head commands).Program capture stage with
+                | Some err -> return Error err
+                | None ->
+                    return
+                        Ok(
+                            ProcessResult<byte[]>(
+                                stage.Program,
+                                capture.LastStdout,
+                                stage.Stderr,
+                                stage.Outcome,
+                                capture.Duration,
+                                false,
+                                stage.OkCodes
+                            )
                         )
-                    )
         }
 
     /// Run the pipeline to completion, capturing the last stage's stdout as decoded text (using the
@@ -132,21 +146,25 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             | Error error -> return Error error
             | Ok capture ->
                 let stage = representative capture
-                let encoding = (List.last commands).Config.StdoutEncoding
-                let text = encoding.GetString capture.LastStdout
 
-                return
-                    Ok(
-                        ProcessResult<string>(
-                            stage.Program,
-                            text,
-                            stage.Stderr,
-                            stage.Outcome,
-                            capture.Duration,
-                            false,
-                            stage.OkCodes
+                match stdinErrorOnSuccess (List.head commands).Program capture stage with
+                | Some err -> return Error err
+                | None ->
+                    let encoding = (List.last commands).Config.StdoutEncoding
+                    let text = encoding.GetString capture.LastStdout
+
+                    return
+                        Ok(
+                            ProcessResult<string>(
+                                stage.Program,
+                                text,
+                                stage.Stderr,
+                                stage.Outcome,
+                                capture.Duration,
+                                false,
+                                stage.OkCodes
+                            )
                         )
-                    )
         }
 
     // The capture-derived verbs share one implementation with the `Runner` module (`CaptureVerbs`),

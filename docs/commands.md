@@ -756,20 +756,20 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 
 | Variant | Fields | Meaning |
 |---|---|---|
-| `ProcessError.Spawn` | `program, message` | The program was located but the OS couldn't start it (permissions, a bad working directory, a Windows `.cmd`/`.bat` needing `cmd.exe`, …). **Not** `isNotFound`. |
+| `ProcessError.Spawn` | `program, detail` | The program was located but the OS couldn't start it (permissions, a bad working directory, a Windows `.cmd`/`.bat` needing `cmd.exe`, …). **Not** `isNotFound`. |
 | `ProcessError.NotFound` | `program, Searched: string option` | The program couldn't be located (`isNotFound` is `true`); `searched` is the probed path when known. |
 | `ProcessError.Exit` | `program, code, stdout, stderr` | A success-requiring verb saw a non-zero exit; both streams attached in full. |
 | `ProcessError.Signalled` | `program, signal: int option, stdout, stderr` | Killed by a signal with no exit code; `signal` carries the number on Unix, `None` elsewhere; the partial streams captured before the kill are attached. |
 | `ProcessError.Timeout` | `program, timeout, stdout, stderr` | The run's own deadline killed it; whatever it captured before the kill is attached. |
 | `ProcessError.NotReady` | `program, timeout` | A [readiness probe](streaming.md) gave up — distinct from a timeout. |
-| `ProcessError.Parse` | `program, message` | A `ParseAsync` / `TryParseAsync` parser rejected the output. |
+| `ProcessError.Parse` | `program, detail` | A `ParseAsync` / `TryParseAsync` parser rejected the output. |
 | `ProcessError.OutputTooLarge` | `program, lineLimit, byteLimit, totalLines, totalBytes` | A `FailLoud` (`OverflowMode.Error`) buffer ceiling was exceeded. |
-| `ProcessError.Stdin` | `program, message` | The child's stdin source could not be read — a missing/unreadable `FromFile` path, say — on an otherwise-successful run. A routine broken pipe (the child closed stdin early, as `head` does) is never reported, and a louder exit/signal/timeout failure wins instead. |
+| `ProcessError.Stdin` | `program, detail` | The child's stdin source could not be read — a missing/unreadable `FromFile` path, say — on an otherwise-successful run. A routine broken pipe (the child closed stdin early, as `head` does) is never reported, and a louder exit/signal/timeout failure wins instead. Also surfaces for a pipeline's first stage. |
 | `ProcessError.CassetteMiss` | `program` | A record/replay cassette found no matching recording — kept distinct from not-found, so `isNotFound` is `false`. |
 | `ProcessError.Unsupported` | `operation` | The platform can't do what was asked (e.g. a POSIX signal on Windows) and silently skipping would be wrong. |
 | `ProcessError.Cancelled` | `program` | The run's `CancellationToken` fired. Always an error. |
-| `ProcessError.ResourceLimit` | `message` | A requested [resource cap](process-groups.md) couldn't be enforced. |
-| `ProcessError.Io` | `message` | A low-level I/O failure from ProcessKit's own machinery (driving a child, group control, cassette files). |
+| `ProcessError.ResourceLimit` | `detail` | A requested [resource cap](process-groups.md) couldn't be enforced. |
+| `ProcessError.Io` | `detail` | A low-level I/O failure from ProcessKit's own machinery (driving a child, group control, cassette files). |
 
 Two classifiers help with retry and diagnostic logic:
 

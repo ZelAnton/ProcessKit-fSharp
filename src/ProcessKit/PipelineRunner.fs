@@ -15,12 +15,15 @@ type internal PipelineStage =
       OkCodes: int list }
 
 /// The captured result of running a whole pipeline: the last stage's stdout, every stage's
-/// terminal state (left-to-right), the wall-clock duration, and whether the pipeline timed out.
+/// terminal state (left-to-right), the wall-clock duration, whether the pipeline timed out, and a
+/// genuine stage-0 stdin source-acquisition failure observed by the feeder (surfaced by `Pipeline`
+/// as `ProcessError.Stdin` on an otherwise-successful run, like a single command).
 type internal PipelineCapture =
     { LastStdout: byte[]
       Stages: PipelineStage list
       Duration: TimeSpan
-      TimedOut: bool }
+      TimedOut: bool
+      Stdin0Error: exn option }
 
 /// Runs a multi-stage pipeline inside one fresh shared `ProcessGroup` — the staging/wiring/teardown
 /// for the `Pipeline` type. Kept next to `Pipeline` (its only consumer) rather than inside
@@ -72,6 +75,7 @@ module internal PipelineRunner =
                     let stderrTasks = ResizeArray<Task<byte[]>>()
                     let mutable prevStdout: Stream option = None
                     let mutable spawnError = None
+                    let mutable stage0Feed: Task<exn option> option = None
                     let mutable index = 0
 
                     while index < stages.Length && spawnError.IsNone do
@@ -92,11 +96,12 @@ module internal PipelineRunner =
                             spawned.Add sp
 
                             if index = 0 then
-                                // Only the first stage may carry its own stdin source; feed it. A
-                                // pipeline does not surface a stage-0 stdin-source failure as
-                                // `ProcessError.Stdin` (that is a single-command verb concern), so the
-                                // feed task's observed-fault result is discarded here.
-                                Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource |> ignore
+                                // Only the first stage may carry its own stdin source; feed it and keep the
+                                // feed task so a genuine source-acquisition failure (a missing `FromFile`
+                                // path, say) can surface as `ProcessError.Stdin` on an otherwise-successful
+                                // pipeline — uniformly with a single command — instead of silently feeding
+                                // the stage empty input.
+                                stage0Feed <- Some(Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource)
                             else
                                 match prevStdout, sp.Stdin with
                                 | Some upstream, Some downstream ->
@@ -182,10 +187,19 @@ module internal PipelineRunner =
                                         Stderr = stages[i].Config.StderrEncoding.GetString stderrBytes[i]
                                         OkCodes = stages[i].Config.OkCodes } ]
 
+                            // Observe the stage-0 stdin fault without blocking: only a feed that has
+                            // finished (a missing `FromFile` faults synchronously at spawn) yields its
+                            // stashed source failure — matching the single-command observer.
+                            let stdin0Error =
+                                match stage0Feed with
+                                | Some feed when feed.IsCompletedSuccessfully -> feed.Result
+                                | _ -> None
+
                             return
                                 Ok
                                     { LastStdout = lastStdout
                                       Stages = stageResults
                                       Duration = duration
-                                      TimedOut = timeoutCts.IsCancellationRequested }
+                                      TimedOut = timeoutCts.IsCancellationRequested
+                                      Stdin0Error = stdin0Error }
         }

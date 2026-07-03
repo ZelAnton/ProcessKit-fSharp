@@ -548,8 +548,8 @@ if (created is { IsOk: false, ErrorValue: var err })
 {
     Console.Error.WriteLine(err switch
     {
-        ProcessError.ResourceLimit { message: var m } => $"cannot enforce limits here: {m}",
-        _                                             => err.Message,
+        ProcessError.ResourceLimit { Detail: var m } => $"cannot enforce limits here: {m}",
+        _                                            => err.Message,
     });
     return;
 }
