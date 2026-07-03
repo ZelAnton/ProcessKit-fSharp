@@ -321,6 +321,8 @@ class ProcessKit.ProcessError
   member get_IsTimeout() : System.Boolean
   member get_IsUnsupported() : System.Boolean
   member get_Tag() : System.Int32
+  property Code : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Combined : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
   property IsCancelled : System.Boolean { get }
   property IsCassetteMiss : System.Boolean { get }
   property IsExit : System.Boolean { get }
@@ -337,6 +339,10 @@ class ProcessKit.ProcessError
   property IsTransient : System.Boolean { get }
   property IsUnsupported : System.Boolean { get }
   property Message : System.String { get }
+  property Program : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property Signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Stderr : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property Stdout : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
   property Tag : System.Int32 { get }
   static member NewCancelled(System.String) : ProcessKit.ProcessError
   static member NewCassetteMiss(System.String) : ProcessKit.ProcessError
@@ -539,8 +545,10 @@ module ProcessKit.ProcessResult
 
 class ProcessKit.ProcessResult`1
   member EnsureSuccess() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<T>, ProcessKit.ProcessError>
+  member OutputContainsAny(System.Collections.Generic.IEnumerable<System.String>) : System.Boolean
   property AcceptedCodes : System.Collections.Generic.IReadOnlyList<System.Int32> { get }
   property Code : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Combined : System.String { get }
   property Duration : System.TimeSpan { get }
   property IsSuccess : System.Boolean { get }
   property IsTimedOut : System.Boolean { get }

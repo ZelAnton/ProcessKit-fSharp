@@ -30,6 +30,70 @@ type ApiParityTests() =
             shell "sleep 8"
 
     [<Test>]
+    member _.``ProcessError accessors read fields across cases without destructuring``() =
+        let exit = ProcessError.Exit("git", 2, "out", "err")
+        Assert.That(exit.Program, Is.EqualTo(Some "git"))
+        Assert.That(exit.Code, Is.EqualTo(Some 2))
+        Assert.That(exit.Stdout, Is.EqualTo(Some "out"))
+        Assert.That(exit.Stderr, Is.EqualTo(Some "err"))
+        Assert.That(exit.Signal, Is.EqualTo(None: int option))
+        Assert.That(exit.Combined, Is.EqualTo(Some "out\nerr"))
+
+        let signalled = ProcessError.Signalled("tool", Some 9, "", "boom")
+        Assert.That(signalled.Program, Is.EqualTo(Some "tool"))
+        Assert.That(signalled.Signal, Is.EqualTo(Some 9))
+        Assert.That(signalled.Code, Is.EqualTo(None: int option))
+        Assert.That(signalled.Combined, Is.EqualTo(Some "boom")) // stdout empty -> just stderr
+
+        // Cases with no program / no streams read as None rather than forcing a match on every variant.
+        let io = ProcessError.Io "disk full"
+        Assert.That(io.Program, Is.EqualTo(None: string option))
+        Assert.That(io.Stdout, Is.EqualTo(None: string option))
+        Assert.That(io.Combined, Is.EqualTo(None: string option))
+
+        let cancelled = ProcessError.Cancelled "svc"
+        Assert.That(cancelled.Program, Is.EqualTo(Some "svc"))
+        Assert.That(cancelled.Combined, Is.EqualTo(None: string option))
+
+    [<Test>]
+    member _.``ProcessResult Combined joins the streams and OutputContainsAny searches both``() =
+        let r = ProcessResult.Failure "stdout line" "stderr line" 1
+        Assert.That(r.Combined, Is.EqualTo "stdout line\nstderr line")
+        Assert.That(r.OutputContainsAny [ "STDOUT" ], Is.True) // case-insensitive, in stdout
+        Assert.That(r.OutputContainsAny [ "STDERR" ], Is.True) // in stderr
+        Assert.That(r.OutputContainsAny [ "absent" ], Is.False)
+        Assert.That(r.OutputContainsAny [], Is.False) // empty needles -> false
+        Assert.That(r.OutputContainsAny [ "nope"; "stdout" ], Is.True) // any-of
+
+        // A needle never matches across the stdout/stderr boundary — each stream is searched on its own.
+        let split = ProcessResult.Failure "foo" "bar" 1
+        Assert.That(split.OutputContainsAny [ "foobar" ], Is.False)
+
+        // A byte[] capture decodes for both the search and the join.
+        let bytesResult =
+            ProcessResult.Failure (System.Text.Encoding.UTF8.GetBytes "binary MARKER here") "" 1
+
+        Assert.That(bytesResult.OutputContainsAny [ "marker" ], Is.True)
+        Assert.That(bytesResult.Combined, Is.EqualTo "binary MARKER here")
+
+        // Null-tolerance: a null needle element (as a non-nullable-unaware C# caller could pass) is
+        // skipped, not a crash — other needles still match.
+        let nullStr = Unchecked.defaultof<string>
+        Assert.That(r.OutputContainsAny [ nullStr; "stdout" ], Is.True)
+        Assert.That(r.OutputContainsAny [ nullStr ], Is.False)
+        Assert.That(r.OutputContainsAny [ "" ], Is.True) // empty needle matches (String.Contains parity)
+
+        // A null stderr (constructible via the factories) must not crash and reads as empty.
+        let nullErr = ProcessResult.Failure "out" nullStr 1
+        Assert.That(nullErr.OutputContainsAny [ "absent" ], Is.False)
+        Assert.That(nullErr.Combined, Is.EqualTo "out")
+
+        // A non-string/byte[] capture (via the generic factory) uses ToString for the text form.
+        let intResult = ProcessResult.Success 42
+        Assert.That(intResult.Combined, Is.EqualTo "42")
+        Assert.That(intResult.OutputContainsAny [ "42" ], Is.True)
+
+    [<Test>]
     member _.``many concurrent runs all complete (async wait under load)``() : Task =
         task {
             // Exercises the OS-wait path under concurrency (Windows registered-wait / POSIX wait): 40

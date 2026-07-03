@@ -643,6 +643,8 @@ The accessors:
 | `Duration` | Wall-clock duration of the run |
 | `Truncated` | A buffer policy dropped output |
 | `AcceptedCodes` | The exit codes treated as success — `OkCodes` (`{0}` by default) |
+| `Combined` | Stdout and stderr joined (stdout, then stderr on a new line when both are non-empty) |
+| `OutputContainsAny(needles)` | Case-insensitive search of both streams — for the "a known marker makes a non-zero exit benign" idiom below |
 
 `ProcessResult.ensureSuccess` (or the instance `result.EnsureSuccess()`) converts a
 `ProcessResult<'T>` — text or bytes — into a `Result`: the result unchanged on success,
@@ -807,6 +809,13 @@ switch (await cmd.RunAsync())
 `ProcessError.isNotFound` is `true` only for `NotFound`; `ProcessError.isTransient`
 is `true` for `Spawn` and `Io` — failures that may succeed on a retry. From C# these are
 the instance forms `err.IsNotFound` and `err.IsTransient`.
+
+To read a failure's fields without matching every case — the only practical way from C#, which
+can't destructure an F# union — `ProcessError` exposes `.Program`, `.Stdout`, `.Stderr`,
+`.Combined`, `.Code`, and `.Signal`, each an `option`/`Option<T>` populated for the cases that
+carry that field (e.g. `.Code` is set only on `Exit`, `.Stdout`/`.Stderr`/`.Combined` on
+`Exit`/`Signalled`/`Timeout`) and `None` elsewhere. The generated `err.IsExit` / `IsSignalled` /
+`IsTimeout` / `IsCancelled` case testers pair with them.
 
 ---
 

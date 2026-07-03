@@ -101,6 +101,76 @@ type ProcessError =
         | ProcessError.Io _ -> true
         | _ -> false
 
+    // The read-without-destructure accessors below let a consumer read a failure's fields off the base
+    // `ProcessError` without pattern-matching each case — the only practical way to do it from C#, which
+    // can't destructure an F# union. Each returns the field for the cases that carry it, `None` otherwise.
+
+    /// The program the error is about, when it carries one — `None` for `ResourceLimit` / `Io` /
+    /// `Unsupported`, which are not tied to a specific program.
+    member this.Program: string option =
+        match this with
+        | ProcessError.Spawn(program, _)
+        | ProcessError.NotFound(program, _)
+        | ProcessError.Exit(program, _, _, _)
+        | ProcessError.Signalled(program, _, _, _)
+        | ProcessError.Timeout(program, _, _, _)
+        | ProcessError.Cancelled program
+        | ProcessError.NotReady(program, _)
+        | ProcessError.Parse(program, _)
+        | ProcessError.OutputTooLarge(program, _, _, _, _)
+        | ProcessError.Stdin(program, _)
+        | ProcessError.CassetteMiss program -> Some program
+        | ProcessError.ResourceLimit _
+        | ProcessError.Io _
+        | ProcessError.Unsupported _ -> None
+
+    /// The captured stdout when the error carries it (`Exit` / `Signalled` / `Timeout`); `None` otherwise.
+    member this.Stdout: string option =
+        match this with
+        | ProcessError.Exit(_, _, stdout, _)
+        | ProcessError.Signalled(_, _, stdout, _)
+        | ProcessError.Timeout(_, _, stdout, _) -> Some stdout
+        | _ -> None
+
+    /// The captured stderr when the error carries it (`Exit` / `Signalled` / `Timeout`); `None` otherwise.
+    member this.Stderr: string option =
+        match this with
+        | ProcessError.Exit(_, _, _, stderr)
+        | ProcessError.Signalled(_, _, _, stderr)
+        | ProcessError.Timeout(_, _, _, stderr) -> Some stderr
+        | _ -> None
+
+    /// The captured stdout and stderr joined (stdout, then stderr on a new line when both are non-empty)
+    /// for the stream-carrying cases (`Exit` / `Signalled` / `Timeout`); `None` otherwise.
+    member this.Combined: string option =
+        match this with
+        | ProcessError.Exit(_, _, stdout, stderr)
+        | ProcessError.Signalled(_, _, stdout, stderr)
+        | ProcessError.Timeout(_, _, stdout, stderr) -> Some(ProcessError.CombineStreams(stdout, stderr))
+        | _ -> None
+
+    /// The exit code when the error is an `Exit`; `None` otherwise (a signal kill or timeout has none).
+    member this.Code: int option =
+        match this with
+        | ProcessError.Exit(_, code, _, _) -> Some code
+        | _ -> None
+
+    /// The terminating signal number when the error is a `Signalled` with a known number; `None` otherwise.
+    member this.Signal: int option =
+        match this with
+        | ProcessError.Signalled(_, signal, _, _) -> signal
+        | _ -> None
+
+    /// The shared combined-output join: both streams non-empty → `stdout` + newline + `stderr`; else the
+    /// non-empty one (or `""` when both are empty). One rule for `ProcessError.Combined` and
+    /// `ProcessResult.Combined`, so the two views can't drift. Internal.
+    static member internal CombineStreams(stdout: string, stderr: string) : string =
+        match String.IsNullOrEmpty stdout, String.IsNullOrEmpty stderr with
+        | false, false -> stdout + "\n" + stderr
+        | false, true -> stdout
+        | true, false -> stderr
+        | true, true -> ""
+
 [<RequireQualifiedAccess>]
 module ProcessError =
 
