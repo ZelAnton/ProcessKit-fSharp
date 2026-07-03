@@ -280,31 +280,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         (cancellationToken: CancellationToken)
         (consume: RunningProcess -> Task<Result<'T, ProcessError>>)
         : Task<Result<'T, ProcessError>> =
-        task {
-            // Honour the command's own CancelOn in addition to the verb's token, so a Command.CancelOn
-            // (or a CliClient default) ties this run to its token even through a ProcessGroup runner.
-            use linkedCts =
-                match command.Config.CancelOn with
-                | Some extra -> CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, extra)
-                | None -> CancellationTokenSource.CreateLinkedTokenSource cancellationToken
-
-            let effectiveToken = linkedCts.Token
-
-            if effectiveToken.IsCancellationRequested then
-                return Error(ProcessError.Cancelled command.Program)
-            else
-                match this.StartShared command with
-                | Error error -> return Error error
-                | Ok host ->
-                    let running = RunningProcess host
-                    use _registration = effectiveToken.Register(fun () -> running.Kill())
-                    let! result = consume running
-
-                    if effectiveToken.IsCancellationRequested then
-                        return Error(ProcessError.Cancelled command.Program)
-                    else
-                        return result
-        }
+        // Run into THIS shared group — `StartAsync` is `StartShared` + wrap, so the run's teardown
+        // detaches only its own I/O and the group keeps owning the child until `Shutdown`/`Dispose`. The
+        // register → consume → cancel-map loop is single-sourced with `JobRunner` via `CaptureVerbs`.
+        CaptureVerbs.runToCompletion
+            command
+            cancellationToken
+            (fun () -> this.StartAsync(command, cancellationToken))
+            consume
 
     /// Gracefully kill the contained tree (SIGTERM, then SIGKILL after `grace`) WITHOUT releasing
     /// the group — used by per-run timeouts (the run's own teardown releases the group). On Windows

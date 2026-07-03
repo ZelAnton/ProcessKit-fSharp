@@ -93,6 +93,42 @@ module internal CaptureVerbs =
                     return Error(ProcessError.Parse(program, ex.Message))
         }
 
+    /// Run a *started* process to a completion result under the command's `CancelOn`-linked token: kill
+    /// the tree if the token fires and report the cancellation as an error. The `start` thunk absorbs the
+    /// only per-runner difference — a fresh owned group (`JobRunner`) vs. a shared group (`ProcessGroup`)
+    /// — since teardown/ownership is baked into the started `RunningProcess`'s host, leaving this
+    /// register → consume → cancel-map loop single-sourced for both runners.
+    let runToCompletion
+        (command: Command)
+        (cancellationToken: CancellationToken)
+        (start: unit -> Task<Result<RunningProcess, ProcessError>>)
+        (consume: RunningProcess -> Task<Result<'T, ProcessError>>)
+        : Task<Result<'T, ProcessError>> =
+        task {
+            // Honour the command's own `CancelOn` in addition to the verb's token, so a `Command.CancelOn`
+            // (or a `CliClient` default) ties this run to its token through any runner.
+            use linkedCts =
+                match command.Config.CancelOn with
+                | Some extra -> CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, extra)
+                | None -> CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+
+            let effectiveToken = linkedCts.Token
+
+            if effectiveToken.IsCancellationRequested then
+                return Error(ProcessError.Cancelled command.Program)
+            else
+                match! start () with
+                | Error error -> return Error error
+                | Ok running ->
+                    use _registration = effectiveToken.Register(fun () -> running.Kill())
+                    let! result = consume running
+
+                    if effectiveToken.IsCancellationRequested then
+                        return Error(ProcessError.Cancelled command.Program)
+                    else
+                        return result
+        }
+
 /// The run verbs, expressed over any `IProcessRunner`. One verb, one meaning:
 ///
 /// - `run` — require a zero exit; return stdout, trailing whitespace trimmed.

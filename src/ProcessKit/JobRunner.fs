@@ -22,39 +22,16 @@ type JobRunner() =
                 | Ok host -> return Ok(RunningProcess host)
         }
 
-    // Run a started process to a completion result, killing the tree if the (possibly
-    // CancelOn-linked) token fires and reporting the cancellation as an error.
+    // Run a started process to a completion result via the shared `CaptureVerbs.runToCompletion`,
+    // supplying JobRunner's own `start` — a fresh owned kill-on-dispose group per run. Retry is applied
+    // by the `Runner` verbs (it must wrap `ensureSuccess`, since a non-zero exit is data here, not an
+    // error), so this path runs the command exactly once.
     let runToCompletion
         (command: Command)
         (cancellationToken: CancellationToken)
         (consume: RunningProcess -> Task<Result<'T, ProcessError>>)
         : Task<Result<'T, ProcessError>> =
-        task {
-            let config = command.Config
-
-            use linkedCts =
-                match config.CancelOn with
-                | Some cancelOn -> CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, cancelOn)
-                | None -> CancellationTokenSource.CreateLinkedTokenSource cancellationToken
-
-            let effectiveToken = linkedCts.Token
-
-            // Retry is applied by the `Runner` verbs (it must wrap `ensureSuccess`, since a
-            // non-zero exit is data here, not an error). This path runs the command exactly once.
-            if effectiveToken.IsCancellationRequested then
-                return Error(ProcessError.Cancelled command.Program)
-            else
-                match! start command with
-                | Error error -> return Error error
-                | Ok running ->
-                    use _registration = effectiveToken.Register(fun () -> running.Kill())
-                    let! result = consume running
-
-                    if effectiveToken.IsCancellationRequested then
-                        return Error(ProcessError.Cancelled command.Program)
-                    else
-                        return result
-        }
+        CaptureVerbs.runToCompletion command cancellationToken (fun () -> start command) consume
 
     interface IProcessRunner with
         member _.SpawnAsync(command, cancellationToken) =
