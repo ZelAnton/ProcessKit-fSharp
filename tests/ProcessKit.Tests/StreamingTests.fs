@@ -322,6 +322,65 @@ type StreamingTests() =
         :> Task
 
     [<Test>]
+    member _.``a throwing OnStdoutLine handler surfaces on WaitForLine, not a spurious NotReady``() : Task =
+        task {
+            let command =
+                threeLines
+                |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom"))
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+
+                // The handler throws on the first line, faulting the stdout pump before the (never-
+                // matching) predicate can match. That fault must surface here — re-raised — not be
+                // masked as a spurious `NotReady` that also returns before the 5s deadline.
+                let mutable caught = None
+
+                try
+                    let! _ =
+                        running.WaitForLineAsync((fun line -> line.Contains "no-such-line"), TimeSpan.FromSeconds 5.0)
+
+                    ()
+                with ex ->
+                    caught <- Some ex.Message
+
+                Assert.That(
+                    caught,
+                    Is.EqualTo(Some "boom"),
+                    "the throwing handler must surface as a fault, not a spurious NotReady"
+                )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing OnStdoutLine handler surfaces on FirstLine, not a raw channel exception``() : Task =
+        task {
+            let command =
+                threeLines
+                |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom"))
+
+            // The handler throws on the first line, faulting the stdout pump before the (never-matching)
+            // predicate can match. `firstLine` must surface that ORIGINAL fault — re-raised — not leak a
+            // raw `ChannelClosedException` wrapper (nor a spurious `Ok None`).
+            let mutable caught = None
+
+            try
+                let! _ = command.FirstLineAsync(fun _ -> false)
+                ()
+            with ex ->
+                caught <- Some ex.Message
+
+            Assert.That(
+                caught,
+                Is.EqualTo(Some "boom"),
+                "FirstLine must surface the handler fault, not a raw ChannelClosedException"
+            )
+        }
+        :> Task
+
+    [<Test>]
     member _.``a faulted terminal verb still reaps the tree``() : Task =
         task {
             let mutable teardowns = 0

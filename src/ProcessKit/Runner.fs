@@ -282,8 +282,23 @@ module Runner =
                     // line is the result. `FinishAsync` is still awaited to reap the tree.
                     let! _ = running.FinishAsync()
                     return Ok found
-                with :? System.OperationCanceledException ->
+                with
+                | :? System.OperationCanceledException ->
                     // Faithful to the contract: a cancelled run is always an error, not a raised
                     // OperationCanceledException.
                     return Error(ProcessError.Cancelled command.Program)
+                | :? System.Threading.Channels.ChannelClosedException as ex ->
+                    // A stdout-pump fault (a throwing `OnStdoutLine`/`StdoutTee` handler, or a decode/IO
+                    // error) completed the channel with that exception; re-raise the ORIGINAL fault
+                    // (preserving its stack) so it surfaces like `FinishAsync`/`StdoutLinesAsync`/
+                    // `WaitForLineAsync`, not as a raw `ChannelClosedException` wrapper. The tree is
+                    // still reaped by the `use running` above on this exceptional unwind. (A clean stdout
+                    // EOF ends the loop via `not has`, so it never reaches here.)
+                    let fault =
+                        match ex.InnerException with
+                        | null -> ex :> exn
+                        | inner -> inner
+
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw fault
+                    return Unchecked.defaultof<_>
         }

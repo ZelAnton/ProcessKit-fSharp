@@ -692,7 +692,18 @@ type RunningProcess internal (host: RunningHost) =
                         return Error(ProcessError.Cancelled config.Program)
                     else
                         return Error(ProcessError.NotReady(config.Program, timeout))
-                | :? ChannelClosedException -> return Error(ProcessError.NotReady(config.Program, timeout))
+                | :? ChannelClosedException as ex ->
+                    // The stdout pump completed the channel. A clean EOF (stdout ended before a matching
+                    // line) means the readiness condition was never met → NotReady. But a pump FAULT (a
+                    // throwing `OnStdoutLine`/`StdoutTee` handler, or a decode/IO error) completed it WITH
+                    // that exception as the InnerException; re-raise it (preserving its stack) so a real
+                    // bug surfaces exactly as it does through `FinishAsync`/`StdoutLinesAsync`, rather than
+                    // being masked as a spurious readiness timeout that also returns before the deadline.
+                    match ex.InnerException with
+                    | null -> return Error(ProcessError.NotReady(config.Program, timeout))
+                    | inner ->
+                        ExceptionDispatchInfo.Throw inner
+                        return Unchecked.defaultof<_>
             }
 
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`
