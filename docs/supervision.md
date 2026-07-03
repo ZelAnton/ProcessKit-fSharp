@@ -114,22 +114,31 @@ full.
 
 ## Backoff and jitter
 
-Before each restart the supervisor sleeps. The *n*-th restart (0-based) waits:
+Before each restart the supervisor sleeps for an exponentially growing delay:
 
 ```text
 delay(n) = min(base × factor^n, MaxBackoff) × jitter
 ```
 
-with `jitter` drawn uniformly from `[0.5, 1.5)` per restart when enabled. Jitter is **on by
+where `n` is an **escalation exponent**: it starts at `0` and climbs by one per restart, but
+**resets to `0` after a healthy incarnation** — one that stayed up at least as long as `MaxBackoff`
+and wasn't a hang killed by its own timeout. So a long-lived service that crashes only occasionally
+restarts promptly at the base delay, while a tight crash loop — or a per-incarnation timeout/hang
+loop — keeps climbing and self-throttles. (`n` is **not** the lifetime restart count, which is what
+`SupervisionOutcome.Restarts` reports.)
+
+`jitter` is drawn uniformly from `[0.5, 1.5)` per restart when enabled. Jitter is **on by
 default** so a fleet of supervised workers restarted by one shared incident does not stampede
 back in lockstep; call `.Jitter(false)` for deterministic delays. A `factor` below `1.0` (or
 non-finite) is treated as `1.0` — a constant delay, never a shrinking one — and a base delay of
 zero (or less) means no wait at all.
 
+For a run that keeps crashing without ever clearing the healthy bar, `n` tracks the restart count:
+
 ```text
 base = 200ms, factor = 2.0, cap = 30s (before jitter):
-#0 → 200ms   #1 → 400ms   #2 → 800ms   #3 → 1.6s   #4 → 3.2s
-#5 → 6.4s    #6 → 12.8s   #7 → 25.6s   #8+ → 30s (capped)
+n=0 → 200ms   n=1 → 400ms   n=2 → 800ms   n=3 → 1.6s   n=4 → 3.2s
+n=5 → 6.4s    n=6 → 12.8s   n=7 → 25.6s   n=8+ → 30s (capped)
 ```
 
 **F#**

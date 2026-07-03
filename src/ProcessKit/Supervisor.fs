@@ -221,9 +221,13 @@ type Supervisor internal (config: SupervisorConfig) =
     member _.MaxRestarts(count: int) =
         Supervisor({ config with MaxRestarts = Some count })
 
-    /// Exponential backoff before each restart: the n-th restart (0-based) waits
-    /// `base × factor^n`, capped by `MaxBackoff`. A `factor` below `1.0` (or non-finite) is
-    /// treated as `1.0`. Default: `200ms × 2.0`.
+    /// Exponential backoff before each restart: the delay is `base × factor^n`, capped by `MaxBackoff`,
+    /// where `n` is an escalation exponent that climbs by one per restart but **resets to 0 after a
+    /// healthy incarnation** (one that stayed up at least as long as `MaxBackoff` and wasn't a hang
+    /// killed by its timeout) — so a long-lived service that crashes occasionally restarts promptly
+    /// instead of being pinned at the ceiling. `n` is not the lifetime restart count
+    /// (`SupervisionOutcome.Restarts`). A `factor` below `1.0` (or non-finite) is treated as `1.0`.
+    /// Default: `200ms × 2.0`.
     member _.Backoff(baseDelay: TimeSpan, factor: float) =
         Supervisor(
             { config with
