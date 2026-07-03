@@ -76,8 +76,11 @@ gives every runner the full verb vocabulary, each verb taking
 
 Everything in the first eight rows reaches a child only through `CaptureStringAsync`
 (or `CaptureBytesAsync`), so it runs hermetically against the subprocess-free doubles
-below. The last two — `firstLine` and `start` — need a live handle and go through
-`SpawnAsync`; see [what the doubles don't cover](#what-the-doubles-dont-cover).
+below — with one exception: `RecordReplayRunner` rejects the **bytes** verb
+(`outputBytes` / `CaptureBytesAsync`) with `ProcessError.Unsupported`, since a cassette
+stores text and can't reproduce exact bytes. The last two — `firstLine` and `start` —
+need a live handle and go through `SpawnAsync`; see
+[what the doubles don't cover](#what-the-doubles-dont-cover).
 
 Production code, generic over the runner:
 
@@ -345,11 +348,12 @@ exactly what `RecordReplayRunner` does.
 ## What the doubles don't cover
 
 The subprocess-free doubles center on the **bulk** primitives. `ScriptedRunner` and
-[`RecordReplayRunner`](#record-and-replay) both implement `CaptureStringAsync` /
-`CaptureBytesAsync`; `RecordReplayRunner` returns `Error(ProcessError.Unsupported …)`
-from `SpawnAsync`, while `ScriptedRunner` serves a [`FakeProcess`](#scripting-replies)
+[`RecordReplayRunner`](#record-and-replay) both implement `CaptureStringAsync`.
+`ScriptedRunner` also serves `CaptureBytesAsync` and a [`FakeProcess`](#scripting-replies)
 from `SpawnAsync` (so the parts of the live surface a fake can replay — `StdoutLinesAsync`,
-the readiness probes — *are* testable through it). The full live
+the readiness probes — *are* testable through it); `RecordReplayRunner` returns
+`Error(ProcessError.Unsupported …)` from both `CaptureBytesAsync` (a cassette stores text,
+not exact bytes) and `SpawnAsync`. The full live
 [`RunningProcess`](streaming.md) surface (`WaitForPortAsync`, `TakeStdin`, `ProfileAsync`, …)
 and a [`Pipeline`](pipelines.md) are best tested against a real (possibly trivial) child
 process; keep the scripted/cassette doubles for everything that flows through
@@ -414,8 +418,9 @@ Semantics worth knowing before you commit a cassette:
 | Environment | override **values never reach the file** — only the variable names are stored, so env secrets can't leak, and env is not part of the match key |
 | Miss | an unmatched call is `ProcessError.CassetteMiss` (distinct from a missing program) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded before/after sequence replays faithfully, while retry/probe loops keep getting a stable final answer |
-| Bytes | `CaptureBytesAsync` replays by round-tripping the recorded stdout through UTF-8 |
+| Bytes | `CaptureBytesAsync` is **rejected** with `ProcessError.Unsupported` — a cassette stores text, so it can't reproduce the exact bytes a `byte[]` capture promises (record and replay both) |
 | `SpawnAsync` | unsupported — replay serves the bulk capture primitives only (see [above](#what-the-doubles-dont-cover)) |
+| Fidelity | a recording's **truncation** flag and wall-clock **duration** survive replay, so `ProcessResult.Truncated` / `Duration` read true on replay (not a synthetic `false` / `0`) |
 | Err results | not recorded — only completed runs (a non-zero exit and a captured timeout *are* results and are recorded) |
 | One-shot stdin | `Stdin.FromStream` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
 | Format | a versioned JSON envelope — `{ "Version", "Entries" }`; a cassette whose format version this build doesn't understand is rejected on load, and a partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |

@@ -43,6 +43,12 @@ type CassetteEntry =
         TimedOut: bool
         /// The terminating signal number on POSIX, or `null` if the process was not signalled.
         Signal: Nullable<int>
+        /// Whether the captured output was truncated by an output-buffer policy (so a bounded-policy
+        /// recording replays as truncated). Absent in a pre-1.x cassette — defaults to `false`.
+        Truncated: bool
+        /// The recorded wall-clock duration in milliseconds, so `ProcessResult.Duration` survives replay.
+        /// Absent in a pre-1.x cassette — defaults to `0`.
+        DurationMs: double
     }
 
 /// The on-disk cassette envelope: a format `version` (so an incompatible future format is rejected
@@ -79,9 +85,10 @@ type private Mode =
 /// **Replay** mode loads the cassette and serves results with **no subprocess**: a match is keyed on
 /// program + args + cwd + stdin-source digest; duplicates replay in capture order then repeat the
 /// last; an unmatched call is `ProcessError.CassetteMiss` (never a surprise subprocess). Covers
-/// `CaptureStringAsync` (and `CaptureBytesAsync` via a UTF-8 round-trip of the recorded stdout); `SpawnAsync` is
-/// unsupported. A one-shot stdin source (`FromStream` / `FromLines` / `FromAsyncLines`) cannot be
-/// keyed and errors.
+/// `CaptureStringAsync` (and the checking verbs over it); `CaptureBytesAsync` and `SpawnAsync` are
+/// unsupported — a cassette stores text, so it can't reproduce the exact bytes a `byte[]` capture
+/// promises. A one-shot stdin source (`FromStream` / `FromLines` / `FromAsyncLines`) cannot be keyed
+/// and errors.
 [<Sealed>]
 type RecordReplayRunner private (mode: Mode, path: string) =
 
@@ -107,12 +114,22 @@ type RecordReplayRunner private (mode: Mode, path: string) =
         | value -> value
 
     static let normalizeEntry (entry: CassetteEntry) : CassetteEntry =
+        // Clamp a crafted/corrupted `DurationMs` into `TimeSpan`'s range (and a NaN/∞ to 0), so replay's
+        // `TimeSpan.FromMilliseconds` can't overflow-throw on a hand-edited cassette — same "a partial /
+        // crafted entry can't trip replay" guarantee the null-coalescing below gives the string fields.
+        let durationMs =
+            if Double.IsFinite entry.DurationMs then
+                Math.Clamp(entry.DurationMs, 0.0, TimeSpan.MaxValue.TotalMilliseconds)
+            else
+                0.0
+
         { entry with
             Program = stringOrEmpty entry.Program
             Args = arrayOrEmpty entry.Args
             EnvNames = arrayOrEmpty entry.EnvNames
             Stdout = stringOrEmpty entry.Stdout
-            Stderr = stringOrEmpty entry.Stderr }
+            Stderr = stringOrEmpty entry.Stderr
+            DurationMs = durationMs }
 
     // Write the cassette atomically and owner-only: serialize into a sibling temp file created `0600`
     // from the start (so the secret-bearing bytes are never even briefly group/world-readable), then
@@ -215,7 +232,9 @@ type RecordReplayRunner private (mode: Mode, path: string) =
              | Some c -> Nullable c
              | None -> Nullable())
           TimedOut = result.IsTimedOut
-          Signal = signal }
+          Signal = signal
+          Truncated = result.Truncated
+          DurationMs = result.Duration.TotalMilliseconds }
 
     let outcomeOf (entry: CassetteEntry) : Outcome =
         if entry.TimedOut then
@@ -233,8 +252,8 @@ type RecordReplayRunner private (mode: Mode, path: string) =
             entry.Stdout,
             entry.Stderr,
             outcomeOf entry,
-            TimeSpan.Zero,
-            false,
+            TimeSpan.FromMilliseconds entry.DurationMs,
+            entry.Truncated,
             command.Config.OkCodes
         )
 
@@ -345,25 +364,17 @@ type RecordReplayRunner private (mode: Mode, path: string) =
         member this.CaptureStringAsync(command, cancellationToken) =
             this.Capture(command, cancellationToken)
 
-        member this.CaptureBytesAsync(command, cancellationToken) =
-            task {
-                match! this.Capture(command, cancellationToken) with
-                | Error error -> return Error error
-                | Ok result ->
-                    // Cassettes are text; the bytes verb round-trips the recorded stdout through UTF-8.
-                    return
-                        Ok(
-                            ProcessResult<byte[]>(
-                                result.Program,
-                                Encoding.UTF8.GetBytes result.Stdout,
-                                result.Stderr,
-                                result.Outcome,
-                                result.Duration,
-                                false,
-                                command.Config.OkCodes
-                            )
-                        )
-            }
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            // A cassette stores stdout as TEXT, so it cannot reproduce the exact bytes a `byte[]` capture
+            // promises — a UTF-8 round-trip corrupts binary / non-UTF-8 output. Reject the bytes verb in
+            // both record and replay modes rather than hand back lossy bytes that silently differ from a
+            // real run (matching the honest-results contract: never a silent downgrade).
+            Task.FromResult(
+                Error(
+                    ProcessError.Unsupported
+                        "RecordReplayRunner does not support the bytes capture verb (a cassette stores text, not exact bytes)"
+                )
+            )
 
         member _.SpawnAsync(_command, _cancellationToken) =
             Task.FromResult(

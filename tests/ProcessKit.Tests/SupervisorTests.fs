@@ -69,6 +69,10 @@ type SupervisorTests() =
     let failWith (code: int) : Result<ProcessResult<string>, ProcessError> =
         Ok(ProcessResult<string>("fake", "", "boom", Outcome.Exited code, TimeSpan.Zero, false, [ 0 ]))
 
+    // A crash that ran for `duration` (its recorded uptime) — for the healthy-run backoff-reset test.
+    let crashAfter (duration: TimeSpan) (code: int) : Result<ProcessResult<string>, ProcessError> =
+        Ok(ProcessResult<string>("fake", "", "boom", Outcome.Exited code, duration, false, [ 0 ]))
+
     let timedOut () : Result<ProcessResult<string>, ProcessError> =
         Ok(ProcessResult<string>("fake", "", "", Outcome.TimedOut, TimeSpan.FromSeconds 1.0, false, [ 0 ]))
 
@@ -326,6 +330,63 @@ type SupervisorTests() =
             | Ok outcome ->
                 Assert.That(outcome.Restarts, Is.EqualTo 2)
                 Assert.That(totalMs clock, Is.EqualTo(500.0).Within 1.0) // 200 + 400->300
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``backoff escalation resets after a healthy (long-lived) incarnation``() : Task =
+        task {
+            let clock = FakeClock()
+
+            // crash(short) -> crash(short) -> crash that ran LONG (>= MaxBackoff, healthy) -> crash(short)
+            // -> ok. The long incarnation resets the escalation, so the restart AFTER it is back at the
+            // base delay (200), not the escalated ceiling (300).
+            let sup =
+                Supervisor(Command.create "fake")
+                    .WithRunner(
+                        runner
+                            [ failWith 1 // -> backoff 200 (exp 0)
+                              failWith 1 // -> backoff 400 capped to 300 (exp 1)
+                              crashAfter (TimeSpan.FromSeconds 1.0) 1 // healthy: reset -> backoff 200 (exp 0)
+                              failWith 1 // -> backoff 400 capped to 300 (exp 1)
+                              ok () ]
+                    )
+                    .Backoff(TimeSpan.FromMilliseconds 200.0, 2.0)
+                    .MaxBackoff(TimeSpan.FromMilliseconds 300.0)
+                    .Jitter(false)
+                |> withClock clock
+
+            match! sup.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 4)
+                // 200 + 300 + 200(reset) + 300 = 1000. Without the reset it would be 200+300+300+300=1100.
+                Assert.That(totalMs clock, Is.EqualTo(1000.0).Within 1.0)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a timeout loop keeps escalating the backoff (a hang is not a healthy incarnation)``() : Task =
+        task {
+            let clock = FakeClock()
+
+            // Each incarnation hangs and is killed by its timeout (Duration 1s >= MaxBackoff 300ms), but a
+            // timeout is NOT a healthy run, so the escalation must keep climbing rather than reset each time.
+            let sup =
+                Supervisor(Command.create "fake")
+                    .WithRunner(runner [ timedOut (); timedOut (); ok () ])
+                    .Backoff(TimeSpan.FromMilliseconds 200.0, 2.0)
+                    .MaxBackoff(TimeSpan.FromMilliseconds 300.0)
+                    .Jitter(false)
+                |> withClock clock
+
+            match! sup.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 2)
+                // 200 + 300 (escalated, NOT reset) = 500. If a timeout wrongly counted as healthy and reset
+                // the escalation, it would be 200 + 200 = 400.
+                Assert.That(totalMs clock, Is.EqualTo(500.0).Within 1.0)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task

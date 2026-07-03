@@ -933,14 +933,28 @@ module internal Native =
     [<DllImport("libc", SetLastError = true)>]
     extern int private kill(int pid, int signalNumber)
 
-    let private cgroupRoot = "/sys/fs/cgroup"
+    // The **usable** cgroup v2 root (one whose `cgroup.controllers` lists at least one controller). On a
+    // pure-v2 host it is /sys/fs/cgroup; on a systemd **hybrid** host the v2 hierarchy is at
+    // /sys/fs/cgroup/unified, so probe both. Crucially, require a NON-EMPTY `cgroup.controllers`: a
+    // hybrid host's v2 mount exists but its controllers file is empty (memory/cpu/pids stay on v1), so
+    // limits can't be enforced there — treat that as "no usable v2 root" and fall back to the clear
+    // fail-fast `ResourceLimit` error rather than a later low-level `subtree_control` write failure.
+    // A plain function (not a cached value), so the probe runs only when the limits backend is used (not
+    // at module load on Windows/macOS) AND re-checks each call, so it self-heals if v2 is mounted later.
+    let private cgroupRoot () : string option =
+        [ "/sys/fs/cgroup"; "/sys/fs/cgroup/unified" ]
+        |> List.tryFind (fun root ->
+            try
+                let controllers = Path.Combine(root, "cgroup.controllers")
+                File.Exists controllers && (File.ReadAllText controllers).Trim() <> ""
+            with _ ->
+                // An unreadable candidate (denied permission, a torn-down mount) simply isn't a usable
+                // v2 root — treat it as absent and try the next candidate.
+                false)
 
-    /// True when cgroup v2's unified hierarchy is mounted (its root exposes `cgroup.controllers`).
-    let cgroupV2Available () =
-        try
-            File.Exists(Path.Combine(cgroupRoot, "cgroup.controllers"))
-        with _ ->
-            false
+    /// True when a **usable** cgroup v2 hierarchy is mounted (its root's `cgroup.controllers` is
+    /// non-empty) — including the systemd hybrid mount at /sys/fs/cgroup/unified when it has controllers.
+    let cgroupV2Available () = (cgroupRoot ()).IsSome
 
     // This process's own cgroup path (the `0::<path>` line of /proc/self/cgroup), defaulting to "/".
     let private selfCgroupRelative () =
@@ -1007,28 +1021,32 @@ module internal Native =
     /// Create a fresh limit cgroup under this process's own cgroup and apply `limits`. Returns the
     /// new cgroup's absolute path, or an error message (the dir is removed on a limit failure).
     let createCgroup (limits: ResourceLimits) : Result<string, string> =
-        try
-            let rel = (selfCgroupRelative ()).TrimStart('/')
-            let parent = Path.Combine(cgroupRoot, rel)
-            let id = System.Threading.Interlocked.Increment(&nextCgroupId)
-            let path = Path.Combine(parent, $"processkit-{Environment.ProcessId}-{id}")
-            Directory.CreateDirectory path |> ignore
+        match cgroupRoot () with
+        | None -> Error "cgroup v2 is not mounted"
+        | Some root ->
 
-            if limits.Any then
-                try
-                    applyCgroupLimits parent path limits
+            try
+                let rel = (selfCgroupRelative ()).TrimStart('/')
+                let parent = Path.Combine(root, rel)
+                let id = System.Threading.Interlocked.Increment(&nextCgroupId)
+                let path = Path.Combine(parent, $"processkit-{Environment.ProcessId}-{id}")
+                Directory.CreateDirectory path |> ignore
+
+                if limits.Any then
+                    try
+                        applyCgroupLimits parent path limits
+                        Ok path
+                    with ex ->
+                        (try
+                            Directory.Delete path
+                         with _ ->
+                             ())
+
+                        Error ex.Message
+                else
                     Ok path
-                with ex ->
-                    (try
-                        Directory.Delete path
-                     with _ ->
-                         ())
-
-                    Error ex.Message
-            else
-                Ok path
-        with ex ->
-            Error ex.Message
+            with ex ->
+                Error ex.Message
 
     /// Migrate a process into the cgroup (a single write to `cgroup.procs`). Best-effort: a failure
     /// leaves the child in the parent cgroup (unbounded), which the run's outcome reflects.

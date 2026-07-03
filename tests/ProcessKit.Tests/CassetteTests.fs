@@ -81,6 +81,29 @@ type CassetteTests() =
             })
 
     [<Test>]
+    member _.``a crafted oversized DurationMs is clamped, not an overflow on replay``() : Task =
+        withCassette (fun path ->
+            task {
+                // A hand-edited cassette with a DurationMs far beyond TimeSpan's range: normalization must
+                // clamp it so replay's TimeSpan.FromMilliseconds can't throw OverflowException.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 1, "Entries": [ { "Program": "tool", "Args": ["x"], "HasStdin": false, "EnvNames": [], "Stdout": "out", "Stderr": "", "DurationMs": 1e18 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    let command = Command.create "tool" |> Command.arg "x"
+
+                    match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                    | Ok result ->
+                        Assert.That(result.Stdout, Is.EqualTo "out")
+                        Assert.That(result.Duration, Is.LessThanOrEqualTo TimeSpan.MaxValue)
+                    | Error error -> Assert.Fail $"replay must not fault on an oversized duration: {error}"
+            })
+
+    [<Test>]
     member _.``a cassette with an unsupported format version is rejected``() : Task =
         withCassette (fun path ->
             task {
@@ -203,7 +226,7 @@ type CassetteTests() =
             })
 
     [<Test>]
-    member _.``Dispose flushes the cassette and OutputBytes round-trips``() : Task =
+    member _.``Dispose flushes the cassette; the bytes verb is rejected``() : Task =
         withCassette (fun path ->
             task {
                 let command = Command.create "tool" |> Command.arg "z"
@@ -219,7 +242,68 @@ type CassetteTests() =
                 match RecordReplayRunner.Replay path with
                 | Error error -> Assert.Fail $"{error}"
                 | Ok replayer ->
+                    // The dispose-time flush persisted the recording: the string verb replays it.
+                    match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "byte-output")
+                    | Error error -> Assert.Fail $"string replay: {error}"
+
+                    // A cassette stores text, not exact bytes, so the bytes verb is rejected rather than
+                    // returning a lossy UTF-8 round-trip.
                     match! (runner replayer).OutputBytesAsync(command, CancellationToken.None) with
-                    | Ok result -> Assert.That(Encoding.UTF8.GetString result.Stdout, Is.EqualTo "byte-output")
+                    | Error(ProcessError.Unsupported _) -> ()
+                    | other -> Assert.Fail $"expected the bytes verb to be Unsupported, got {other}"
+            })
+
+    [<Test>]
+    member _.``replay preserves the recorded Truncated flag and Duration``() : Task =
+        withCassette (fun path ->
+            task {
+                let command = Command.create "tool" |> Command.arg "z"
+                let recordedDuration = TimeSpan.FromMilliseconds 250.0
+
+                // An inner runner whose captured result was truncated and took a measurable duration —
+                // both must survive record + replay (previously replay reported false / 0).
+                let inner =
+                    { new IProcessRunner with
+                        member _.CaptureStringAsync(cmd, _ct) =
+                            Task.FromResult(
+                                Ok(
+                                    ProcessResult<string>(
+                                        cmd.Program,
+                                        "clipped",
+                                        "",
+                                        Outcome.Exited 0,
+                                        recordedDuration,
+                                        true,
+                                        [ 0 ]
+                                    )
+                                )
+                            )
+
+                        member _.CaptureBytesAsync(_cmd, _ct) =
+                            Task.FromResult(Error(ProcessError.Unsupported "n/a"))
+
+                        member _.SpawnAsync(_cmd, _ct) =
+                            Task.FromResult(Error(ProcessError.Unsupported "n/a")) }
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, inner)
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+                        ()
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok replayer ->
+                    match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                    | Ok result ->
+                        Assert.That(result.Truncated, Is.True, "recorded Truncated must survive replay")
+
+                        Assert.That(
+                            result.Duration,
+                            Is.EqualTo recordedDuration,
+                            "recorded Duration must survive replay"
+                        )
                     | Error error -> Assert.Fail $"{error}"
             })

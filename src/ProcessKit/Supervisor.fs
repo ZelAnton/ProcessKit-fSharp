@@ -298,6 +298,11 @@ type Supervisor internal (config: SupervisorConfig) =
 
         task {
             let mutable restarts = 0
+            // The backoff *escalation* exponent — distinct from the lifetime `restarts` (which drives the
+            // `MaxRestarts` budget and the reported count). It climbs per restart but RESETS after a
+            // healthy incarnation, so a long-lived service that crashes occasionally isn't pinned at the
+            // `MaxBackoff` ceiling forever.
+            let mutable escalation = 0
             let mutable stormScore = 0.0
             let mutable lastFailureAt: float option = None
             let mutable stormPauses = 0
@@ -336,11 +341,16 @@ type Supervisor internal (config: SupervisorConfig) =
                 }
                 :> Task
 
-            let sleepBackoff (n: int) : Task =
+            // `exponent` is the resettable backoff escalation; `restartNumber` is the 1-based *lifetime*
+            // restart count for the log, so the logged number tracks `SupervisionOutcome.Restarts` (it
+            // must NOT be the escalation, which resets after a healthy run).
+            let sleepBackoff (exponent: int) (restartNumber: int) : Task =
                 task {
-                    let delay = Supervision.backoffDelay config.BackoffBase factor n config.MaxBackoff
+                    let delay =
+                        Supervision.backoffDelay config.BackoffBase factor exponent config.MaxBackoff
+
                     let delay = Supervision.applyJitter delay config.Jitter
-                    Log.supervisorRestart config.Command.Config.Logger program (n + 1) delay
+                    Log.supervisorRestart config.Command.Config.Logger program restartNumber delay
 
                     if delay > TimeSpan.Zero then
                         do! config.Sleep delay cancellationToken
@@ -402,7 +412,16 @@ type Supervisor internal (config: SupervisorConfig) =
                                 if crashed then
                                     do! stormGate ()
 
-                                do! sleepBackoff restarts
+                                // A healthy incarnation — one that stayed up at least as long as the backoff
+                                // ceiling AND wasn't a hang killed by its own timeout — resets the escalation,
+                                // so the next restart starts at the base delay again. A tight crash loop, or a
+                                // hang that times out on every incarnation, does NOT clear the bar, so it keeps
+                                // climbing and self-throttles.
+                                if result.Duration >= config.MaxBackoff && not result.IsTimedOut then
+                                    escalation <- 0
+
+                                do! sleepBackoff escalation (restarts + 1)
+                                escalation <- escalation + 1
                                 restarts <- restarts + 1
                     | Error error ->
                         match error with
@@ -425,8 +444,12 @@ type Supervisor internal (config: SupervisorConfig) =
                             if not wantsRestart || budgetExhausted () then
                                 final <- Some(Error error)
                             else
+                                // A transient error produced no healthy incarnation, so the escalation only
+                                // climbs here (no reset); it uses the shared exponent so a run that
+                                // alternates transient errors and crashes backs off consistently.
                                 do! stormGate ()
-                                do! sleepBackoff restarts
+                                do! sleepBackoff escalation (restarts + 1)
+                                escalation <- escalation + 1
                                 restarts <- restarts + 1
 
             return final.Value
