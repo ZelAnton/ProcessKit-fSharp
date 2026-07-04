@@ -22,9 +22,12 @@
 	-->
 	<ItemGroup>
 		<PackageVersion Include="FSharp.Core" Version="10.1.300" />
+		<PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.9" />
 		<PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.9" />
 		<PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
 		<PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.9" />
+		<PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.9" />
+		<PackageVersion Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.9" />
 		<PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.7.0" />
 		<PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.300" />
 		<PackageVersion Include="NUnit" Version="4.6.1" />

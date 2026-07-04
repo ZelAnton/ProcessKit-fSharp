@@ -1,3 +1,13 @@
+class ProcessKit.Extensions.DependencyInjection.ProcessKitOptions
+  new()
+  property DefaultTimeout : System.Nullable<System.TimeSpan> { get; set }
+  property DefaultWorkingDirectory : System.String { get; set }
+
 class ProcessKit.Extensions.DependencyInjection.ServiceCollectionExtensions
   static member AddProcessKit(Microsoft.Extensions.DependencyInjection.IServiceCollection) : Microsoft.Extensions.DependencyInjection.IServiceCollection
+  static member AddProcessKit(Microsoft.Extensions.DependencyInjection.IServiceCollection, Microsoft.Extensions.Configuration.IConfiguration) : Microsoft.Extensions.DependencyInjection.IServiceCollection
+  static member AddProcessKit(Microsoft.Extensions.DependencyInjection.IServiceCollection, System.Action<ProcessKit.Extensions.DependencyInjection.ProcessKitOptions>) : Microsoft.Extensions.DependencyInjection.IServiceCollection
+  static member AddProcessKitClient(Microsoft.Extensions.DependencyInjection.IServiceCollection, System.String, System.String) : Microsoft.Extensions.DependencyInjection.IServiceCollection
+  static member AddProcessKitClient(Microsoft.Extensions.DependencyInjection.IServiceCollection, System.String, System.String, System.Func<ProcessKit.CliClient, ProcessKit.CliClient>) : Microsoft.Extensions.DependencyInjection.IServiceCollection
+  static member AddProcessKitGroup(Microsoft.Extensions.DependencyInjection.IServiceCollection) : Microsoft.Extensions.DependencyInjection.IServiceCollection
 

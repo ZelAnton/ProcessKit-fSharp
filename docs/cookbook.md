@@ -757,6 +757,10 @@ public class Deployer(IProcessRunner runner)
 ```
 
 `AddProcessKit` uses `TryAdd`, so a pre-existing `IProcessRunner` registration is left intact.
+`AddProcessKit(configure)` / `AddProcessKit(configuration)` set a default timeout / working directory;
+`AddProcessKitClient(name, program)` registers keyed per-tool `CliClient`s (the place for retry / encoding
+defaults); and `AddProcessKitGroup()` backs the runner with a shared, container-managed `ProcessGroup`
+(disposing the provider reaps the whole tree). See the [Dependency injection guide](dependency-injection.md).
 
 ## Testing without subprocesses
 
