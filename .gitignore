@@ -156,3 +156,6 @@ $RECYCLE.BIN/
 /CLAUDE.md
 /CLAUDE.local.md
 .claude/
+
+# Local agent working directory (task queue, active task, review journal, status) — never shipped.
+/.work/
