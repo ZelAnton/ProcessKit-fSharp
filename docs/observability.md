@@ -29,18 +29,19 @@ delegate, so when the level is disabled there is **no formatting or boxing** on 
 
 ### Event taxonomy
 
-Every event has a stable `EventId` (name + number) so you can filter or route by id, and every
-**run-scoped** event carries a per-run **`RunId`** (plus the `Pid` on spawn) so a run's lines tie
-together even across a concurrent fleet — and even in a sink that does not capture logging scopes.
+Every event has a stable `EventId` (name + number) so you can filter or route by id — the ids are exposed
+as `ProcessKitDiagnostics.Events.*` so you never hard-code a number — and every **run-scoped** event
+carries a per-run **`RunId`** (plus the `Pid` on spawn) so a run's lines tie together even across a
+concurrent fleet, and even in a sink that does not capture logging scopes.
 
-| Event | `EventId` | Level | Fields |
-|---|---|---|---|
-| Process spawned | `1` `ProcessSpawned` | Debug | program, pid, run id |
-| Process exited | `2` `ProcessExited` | Debug | program, outcome, duration, run id |
-| Process timed out | `3` `ProcessTimedOut` | Warning | program, timeout, run id |
-| Run retry | `4` `ProcessRetry` | Debug | program, attempt, delay, run id |
-| Supervisor restart | `5` `SupervisorRestart` | Debug | program, restart #, delay |
-| Supervisor storm pause | `6` `SupervisorStormPause` | Warning | program, pause |
+| Event | `EventId` | `ProcessKitDiagnostics.Events` | Level | Fields |
+|---|---|---|---|---|
+| Process spawned | `1` `ProcessSpawned` | `.ProcessSpawned` | Debug | program, pid, run id |
+| Process exited | `2` `ProcessExited` | `.ProcessExited` | Debug | program, outcome, duration, run id |
+| Process timed out | `3` `ProcessTimedOut` | `.ProcessTimedOut` | Warning | program, timeout, run id |
+| Run retry | `4` `ProcessRetry` | `.ProcessRetry` | Debug | program, attempt, delay, run id |
+| Supervisor restart | `5` `SupervisorRestart` | `.SupervisorRestart` | Debug | program, restart #, delay |
+| Supervisor storm pause | `6` `SupervisorStormPause` | `.SupervisorStormPause` | Warning | program, pause |
 
 The `RunId` is stamped once per logical run at the verb layer, so **a run and all its retries share one
 id**; a directly-spawned streaming run (`StartAsync`) gets a fresh per-incarnation id. It is a compact,
@@ -71,15 +72,18 @@ ProcessKit publishes a `Meter` named **`ProcessKitDiagnostics.MeterName`** (`"Pr
 compatible. Tag cardinality is deliberately bounded — instruments are tagged by **program name** and a
 small closed set of **outcome** labels, never by argv.
 
+Units follow the OpenTelemetry/UCUM convention — dimensionless counts use a `{…}` annotation, and the
+duration histogram is in **seconds** (the OTel norm for `*.duration`).
+
 | Instrument | Kind | Unit | Tags |
 |---|---|---|---|
-| `processkit.runs.started` | Counter | run | program |
-| `processkit.runs.completed` | Counter | run | program, outcome |
-| `processkit.runs.active` | UpDownCounter | run | program |
-| `processkit.run.duration` | Histogram | ms | program, outcome |
-| `processkit.retries` | Counter | retry | program |
-| `processkit.supervisor.restarts` | Counter | restart | program |
-| `processkit.supervisor.storm_pauses` | Counter | pause | program |
+| `processkit.runs.started` | Counter | `{run}` | program |
+| `processkit.runs.completed` | Counter | `{run}` | program, outcome |
+| `processkit.runs.active` | UpDownCounter | `{run}` | program |
+| `processkit.run.duration` | Histogram | `s` | program, outcome |
+| `processkit.retries` | Counter | `{retry}` | program |
+| `processkit.supervisor.restarts` | Counter | `{restart}` | program |
+| `processkit.supervisor.storm_pauses` | Counter | `{pause}` | program |
 
 ```csharp
 services.AddOpenTelemetry().WithMetrics(m => m.AddMeter(ProcessKitDiagnostics.MeterName));

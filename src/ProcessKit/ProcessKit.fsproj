@@ -22,6 +22,7 @@
 		<Compile Include="ProcessException.fs" />
 		<Compile Include="ResultExtensions.fs" />
 		<Compile Include="Outcome.fs" />
+		<Compile Include="Diagnostics.fs" />
 		<Compile Include="Log.fs" />
 		<Compile Include="Diag.fs" />
 		<Compile Include="Mechanism.fs" />

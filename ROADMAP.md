@@ -20,8 +20,11 @@ Shipped changes are in [`CHANGELOG.md`](CHANGELOG.md).
   `Shutdown`), whole-tree **resource limits**, and **stats** sampling.
 - The **`IProcessRunner`** seam with subprocess-free doubles (`ScriptedRunner`,
   `RecordReplayRunner`), the **`CliClient`** wrapper, and the top-level **`Exec`** helpers.
-- Optional **`Microsoft.Extensions.Logging`** lifecycle events (`Command.Logger`) and the
-  **`ProcessKit.Extensions.DependencyInjection`** package (`AddProcessKit`).
+- Optional observability: **`Microsoft.Extensions.Logging`** lifecycle events (`Command.Logger`, with
+  stable `EventId`s and per-run correlation), a **`System.Diagnostics` trace span** per run and
+  **metrics** on the `ProcessKit` `ActivitySource` / `Meter` (`ProcessKitDiagnostics`), and the
+  **`ProcessKit.Extensions.DependencyInjection`** package (`AddProcessKit`). Secret-safe — argv and env
+  values never reach a log, span, or metric.
 
 The [documentation guide set](docs/README.md) covers all of it in depth.
 

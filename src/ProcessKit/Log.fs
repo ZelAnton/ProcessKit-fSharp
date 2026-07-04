@@ -17,42 +17,36 @@ open Microsoft.Extensions.Logging
 /// non-secret lifecycle facts (pid, outcome, durations, retry/restart counts, run id) are emitted.
 module internal Log =
 
-    /// Stable `EventId`s — numeric + name — so a consumer filters/routes by id. Keep the numbers stable.
-    [<RequireQualifiedAccess>]
-    module Events =
-        let Spawn = EventId(1, "ProcessSpawned")
-        let Exit = EventId(2, "ProcessExited")
-        let Timeout = EventId(3, "ProcessTimedOut")
-        let Retry = EventId(4, "ProcessRetry")
-        let SupervisorRestart = EventId(5, "SupervisorRestart")
-        let StormPause = EventId(6, "SupervisorStormPause")
+    // The stable EventIds are the public `ProcessKitDiagnostics.Events`, so a consumer filters/routes by
+    // the same ids the library tags with.
+    module Events = ProcessKitDiagnostics.Events
 
     // Cached message delegates (allocation-free; skip formatting/boxing when the level is disabled).
     let private spawnMessage =
         LoggerMessage.Define<string, string, string>(
             LogLevel.Debug,
-            Events.Spawn,
+            Events.ProcessSpawned,
             "processkit: spawned {Program} (pid {Pid}, run {RunId})"
         )
 
     let private exitMessage =
         LoggerMessage.Define<string, string, double, string>(
             LogLevel.Debug,
-            Events.Exit,
+            Events.ProcessExited,
             "processkit: {Program} finished ({Outcome}) in {DurationMs}ms (run {RunId})"
         )
 
     let private timeoutMessage =
         LoggerMessage.Define<string, double, string>(
             LogLevel.Warning,
-            Events.Timeout,
+            Events.ProcessTimedOut,
             "processkit: {Program} timed out after {TimeoutMs}ms (run {RunId})"
         )
 
     let private retryMessage =
         LoggerMessage.Define<string, int, double, string>(
             LogLevel.Debug,
-            Events.Retry,
+            Events.ProcessRetry,
             "processkit: retrying {Program} (attempt {Attempt}) after {DelayMs}ms (run {RunId})"
         )
 
@@ -66,7 +60,7 @@ module internal Log =
     let private stormPauseMessage =
         LoggerMessage.Define<string, double>(
             LogLevel.Warning,
-            Events.StormPause,
+            Events.SupervisorStormPause,
             "processkit: supervisor failure storm for {Program} — pausing restarts for {PauseMs}ms"
         )
 

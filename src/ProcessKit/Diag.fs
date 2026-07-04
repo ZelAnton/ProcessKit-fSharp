@@ -5,24 +5,6 @@ open System.Diagnostics
 open System.Diagnostics.Metrics
 open System.Threading
 
-/// The well-known names of ProcessKit's `System.Diagnostics` observability sources, so a consumer
-/// wiring OpenTelemetry (or a raw `ActivityListener` / `MeterListener`) references them without a magic
-/// string — e.g. `builder.AddSource(ProcessKitDiagnostics.ActivitySourceName)` /
-/// `builder.AddMeter(ProcessKitDiagnostics.MeterName)`.
-///
-/// **Security:** neither the trace span nor any metric ever carries argv or environment **values** —
-/// only the program *name* and non-secret facts (outcome, duration, exit code / signal, pid, run id).
-[<RequireQualifiedAccess>]
-module ProcessKitDiagnostics =
-
-    /// The name of the `ActivitySource` ProcessKit emits one span per completed run on (`"ProcessKit"`).
-    [<Literal>]
-    let ActivitySourceName = "ProcessKit"
-
-    /// The name of the `Meter` ProcessKit publishes its run/retry/supervisor instruments on (`"ProcessKit"`).
-    [<Literal>]
-    let MeterName = "ProcessKit"
-
 /// Internal `System.Diagnostics` instrumentation — a shared `ActivitySource` (distributed tracing) and
 /// `Meter` (metrics), both free when nothing is listening. Emitted alongside the `Log` events at the same
 /// lifecycle points. **argv and environment values are never recorded** — only the program name and
@@ -34,26 +16,29 @@ module internal Diag =
 
     let private meter = new Meter(ProcessKitDiagnostics.MeterName)
 
+    // Units follow the OpenTelemetry/UCUM convention: dimensionless counts use a `{...}` annotation
+    // (bare words would be emitted as literal unit suffixes by exporters), and the duration histogram is
+    // in **seconds** (the OTel norm for `*.duration`), so dashboards calibrated to it aren't off by 1000×.
     let private runsStarted =
-        meter.CreateCounter<int64>("processkit.runs.started", "run", "Process runs started.")
+        meter.CreateCounter<int64>("processkit.runs.started", "{run}", "Process runs started.")
 
     let private runsCompleted =
-        meter.CreateCounter<int64>("processkit.runs.completed", "run", "Process runs that reached a terminal verb.")
+        meter.CreateCounter<int64>("processkit.runs.completed", "{run}", "Process runs that reached a terminal verb.")
 
     let private runsActive =
-        meter.CreateUpDownCounter<int64>("processkit.runs.active", "run", "Process runs currently in flight.")
+        meter.CreateUpDownCounter<int64>("processkit.runs.active", "{run}", "Process runs currently in flight.")
 
     let private runDuration =
-        meter.CreateHistogram<double>("processkit.run.duration", "ms", "Wall-clock duration of a completed run.")
+        meter.CreateHistogram<double>("processkit.run.duration", "s", "Wall-clock duration of a completed run.")
 
     let private retriesCounter =
-        meter.CreateCounter<int64>("processkit.retries", "retry", "Run retries attempted.")
+        meter.CreateCounter<int64>("processkit.retries", "{retry}", "Run retries attempted.")
 
     let private restartsCounter =
-        meter.CreateCounter<int64>("processkit.supervisor.restarts", "restart", "Supervisor restarts.")
+        meter.CreateCounter<int64>("processkit.supervisor.restarts", "{restart}", "Supervisor restarts.")
 
     let private stormPausesCounter =
-        meter.CreateCounter<int64>("processkit.supervisor.storm_pauses", "pause", "Supervisor failure-storm pauses.")
+        meter.CreateCounter<int64>("processkit.supervisor.storm_pauses", "{pause}", "Supervisor failure-storm pauses.")
 
     // A monotonic, per-process run correlation id. Compact hex so it reads cleanly in a log line and
     // ties one run's events (spawn/exit/timeout/retry) together across a concurrent fleet. Per-process
@@ -149,7 +134,7 @@ module internal Diag =
         let mutable completedTags = outcomeTags program label
         let mutable activeTags = programTag program
         runsCompleted.Add(1L, &completedTags)
-        runDuration.Record(duration.TotalMilliseconds, &completedTags)
+        runDuration.Record(duration.TotalSeconds, &completedTags)
         runsActive.Add(-1L, &activeTags)
         emitSpan program runId outcome pid startTime parentContext
 

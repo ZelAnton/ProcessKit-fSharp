@@ -213,7 +213,7 @@ kill-on-dispose tree guarantee is unconditional.
 | Resource caps — memory / process count / CPU | `ProcessGroupOptions` → `ProcessGroup.Create` |
 | Stats & profiling — `Stats` / `SampleStatsAsync` / `ProfileAsync` | `ProcessGroup`, `RunningProcess` |
 | Record / replay cassettes | `ProcessKit.Testing.RecordReplayRunner` |
-| Lifecycle logging (`Microsoft.Extensions.Logging`) | `Command.Logger` |
+| Observability — logging, tracing & metrics ([guide](docs/observability.md)) | `Command.Logger`, `ProcessKitDiagnostics` (`ActivitySource` / `Meter`) |
 | Dependency-injection wiring | `ProcessKit.Extensions.DependencyInjection` (separate package) |
 
 ## Capping a group's resources
@@ -848,12 +848,15 @@ file is written `0600`.
 ## Observability and dependency injection
 
 Opt into structured lifecycle events (spawn, exit, timeout, retry, supervisor restart) with
-`Command.Logger` — **argv and the environment are never logged**, only the program name and
-non-secret facts. The separate `ProcessKit.Extensions.DependencyInjection` package registers an
-`IProcessRunner` for `Microsoft.Extensions.DependencyInjection` consumers with `AddProcessKit()`
-(logger-aware when the container has an `ILoggerFactory`).
+`Command.Logger` — each with a stable `EventId` and a per-run `RunId` for correlation. ProcessKit also
+emits a `System.Diagnostics` **trace span** per run (`ActivitySource` `ProcessKitDiagnostics.ActivitySourceName`)
+and OpenTelemetry-ready **metrics** (`Meter` `ProcessKitDiagnostics.MeterName`). **argv and the
+environment are never logged, traced, or tagged** — only the program name and non-secret facts. The
+separate `ProcessKit.Extensions.DependencyInjection` package registers an `IProcessRunner` for
+`Microsoft.Extensions.DependencyInjection` consumers with `AddProcessKit()` (logger-aware when the
+container has an `ILoggerFactory`).
 
-*Deeper: [Testing your code → the runner seam](docs/testing.md).*
+*Deeper: [Observability](docs/observability.md).*
 
 ## Contributing
 

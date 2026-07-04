@@ -149,13 +149,13 @@ type LoggingTests() =
 
             match! command.RunAsync() with
             | Ok _ ->
-                // Stable EventIds (name + number), asserted through what a consumer actually filters on.
-                let spawn = logger.MessageFor Log.Events.Spawn
-                let exit = logger.MessageFor Log.Events.Exit
+                // Stable EventIds (name + number), asserted through the public ids a consumer filters on.
+                let spawn = logger.MessageFor ProcessKitDiagnostics.Events.ProcessSpawned
+                let exit = logger.MessageFor ProcessKitDiagnostics.Events.ProcessExited
                 Assert.That(spawn.IsSome, "a ProcessSpawned event")
                 Assert.That(exit.IsSome, "a ProcessExited event")
-                Assert.That(Log.Events.Spawn.Id, Is.EqualTo 1)
-                Assert.That(Log.Events.Exit.Id, Is.EqualTo 2)
+                Assert.That(ProcessKitDiagnostics.Events.ProcessSpawned.Id, Is.EqualTo 1)
+                Assert.That(ProcessKitDiagnostics.Events.ProcessExited.Id, Is.EqualTo 2)
 
                 // Correlation: spawn and exit of one run share the run id; the pid rides on spawn.
                 let runIdOf (m: string) =
