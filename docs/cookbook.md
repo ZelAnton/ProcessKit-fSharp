@@ -817,3 +817,8 @@ if (loaded.IsOk)
 else
     Console.Error.WriteLine(loaded.ErrorValue.Message);
 ```
+
+Cassettes also cover the `byte[]` capture and streaming (`SpawnAsync`) verbs,
+`RecordReplayRunner.Auto` grows a cassette by recording on a miss, and
+`RecordReplayOptions` adds arg-normalizer / redaction / file-content-stdin matching —
+see [testing.md → Record and replay](testing.md#record-and-replay).

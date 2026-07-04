@@ -341,8 +341,7 @@ Wrap a `ScriptedRunner` with it and drive a retrying verb to prove the retry
 fires — because retry lives in the verb layer over the `CaptureStringAsync` primitive,
 `failOnce`'s single transient error is retried away. If a double is bulk-only and you
 want spawning to be a hard error, return
-`Error(ProcessError.Unsupported "no streaming in this double")` from `SpawnAsync` —
-exactly what `RecordReplayRunner` does.
+`Error(ProcessError.Unsupported "no streaming in this double")` from `SpawnAsync`.
 
 ## What the doubles don't cover
 
