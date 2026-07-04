@@ -26,7 +26,7 @@ methods.
 - [Supervision](#supervision)
 - [CliClient](#cliclient)
 - [Top-level Exec helpers](#top-level-exec-helpers)
-- [Logging](#logging)
+- [Logging, tracing & metrics](#logging-tracing--metrics)
 - [Dependency injection](#dependency-injection)
 - [Testing without subprocesses](#testing-without-subprocesses)
 
@@ -704,10 +704,11 @@ var commands = files.Select(f => new Command("gzip").Arg(f));
 var results = await Exec.outputAll(4, runner, commands, CancellationToken.None); // at most 4 live at once
 ```
 
-## Logging
+## Logging, tracing & metrics
 
-Opt in to structured lifecycle events (spawn, exit, timeout, retry, supervisor restart).
-**argv and the environment are never logged** — only the program name and non-secret facts.
+Opt in to structured lifecycle events (spawn, exit, timeout, retry, supervisor restart) — each with a
+stable `EventId` and a per-run `RunId` that ties a run's lines together. **argv and the environment are
+never logged** — only the program name and non-secret facts.
 
 **F#**
 
@@ -721,7 +722,10 @@ let cmd = Command.create "deploy" |> Command.logger logger   // any Microsoft.Ex
 var cmd = new Command("deploy").Logger(logger);   // any Microsoft.Extensions.Logging ILogger
 ```
 
-No-op and free when no logger is set.
+No-op and free when no logger is set. ProcessKit also emits a `System.Diagnostics` **trace span** per run
+(`ActivitySource` `ProcessKitDiagnostics.ActivitySourceName`) and **metrics** (`Meter`
+`ProcessKitDiagnostics.MeterName`) — wire them into OpenTelemetry with `AddSource(...)` / `AddMeter(...)`.
+See the [Observability guide](observability.md) for the full event/instrument taxonomy.
 
 ## Dependency injection
 

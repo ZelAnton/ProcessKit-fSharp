@@ -45,6 +45,7 @@ one place.
 | [Timeouts, retries & cancellation](timeouts-and-cancellation.md) | How a deadline is *captured* vs when it errors, retry policies and their classifier, and cancellation: per-command tokens and client-level defaults via `CliClient.WithDefaults` |
 | [Supervision](supervision.md) | Keeping a child alive: restart policies, backoff & jitter math, the failure-storm guard, stop conditions, outcomes, supervising inside a shared group |
 | [Testing your code](testing.md) | The `IProcessRunner` seam — bulk **and** streaming: `ScriptedRunner` (incl. scripted `StartAsync()` with canned lines), record/replay cassettes, and building hermetically-testable CLI wrappers with `CliClient` |
+| [Observability](observability.md) | Logging, tracing & metrics: the `ILogger` lifecycle events (EventIds + per-run correlation), the `ProcessKit` `ActivitySource` span, and the `ProcessKit` `Meter` instruments — all secret-safe and OpenTelemetry-ready |
 | [Platform support](platform-support.md) | The containment mechanisms, every per-capability support matrix in one place, and the platform caveats worth knowing before you ship |
 
 ## The 60-second tour

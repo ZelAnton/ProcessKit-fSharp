@@ -144,10 +144,17 @@ module Runner =
     let private withRetry
         (command: Command)
         (cancellationToken: CancellationToken)
-        (action: unit -> Task<Result<'T, ProcessError>>)
+        (action: Command -> Task<Result<'T, ProcessError>>)
         : Task<Result<'T, ProcessError>> =
+        // Stamp one run-level correlation id here, before the retry loop, so every attempt (and each
+        // attempt's spawned incarnation) shares it — a run's spawn/exit/timeout/retry lines correlate.
+        let command =
+            match command.Config.RunId with
+            | Some _ -> command
+            | None -> command.WithRunId(Diag.newRunId ())
+
         match command.Config.Retry with
-        | None -> action ()
+        | None -> action command
         | Some(maxAttempts, delay, shouldRetry) ->
             task {
                 // `maxAttempts` is the TOTAL number of runs (the initial run plus retries), so the
@@ -159,7 +166,7 @@ module Runner =
                 let mutable final = None
 
                 while final.IsNone do
-                    match! action () with
+                    match! action command with
                     | Ok value -> final <- Some(Ok value)
                     | Error error ->
                         // A cancelled run is always terminal: never retry a `Cancelled` error (even if a
@@ -178,7 +185,9 @@ module Runner =
                             && not isCancelled
                         then
                             attempt <- attempt + 1
-                            Log.retry command.Config.Logger command.Program attempt delay
+                            let runId = command.Config.RunId |> Option.defaultValue ""
+                            Log.retry command.Config.Logger command.Program attempt delay runId
+                            Diag.retried command.Program
 
                             try
                                 // Clamp the backoff into the armable timer range so a misconfigured delay
@@ -205,11 +214,11 @@ module Runner =
 
     /// Run to completion, capturing stdout as decoded text. A non-zero exit is data, not an error.
     let outputString (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
-        withRetry command cancellationToken (fun () -> runner.CaptureStringAsync(command, cancellationToken))
+        withRetry command cancellationToken (fun command -> runner.CaptureStringAsync(command, cancellationToken))
 
     /// Run to completion, capturing stdout as raw bytes.
     let outputBytes (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
-        withRetry command cancellationToken (fun () -> runner.CaptureBytesAsync(command, cancellationToken))
+        withRetry command cancellationToken (fun command -> runner.CaptureBytesAsync(command, cancellationToken))
 
     /// Require a zero exit and return stdout with trailing whitespace trimmed.
     let run
@@ -217,7 +226,7 @@ module Runner =
         (cancellationToken: CancellationToken)
         (command: Command)
         : Task<Result<string, ProcessError>> =
-        withRetry command cancellationToken (fun () ->
+        withRetry command cancellationToken (fun command ->
             CaptureVerbs.run (captureString runner cancellationToken command))
 
     /// Like `run`, but discard the captured output.
@@ -226,7 +235,7 @@ module Runner =
         (cancellationToken: CancellationToken)
         (command: Command)
         : Task<Result<unit, ProcessError>> =
-        withRetry command cancellationToken (fun () ->
+        withRetry command cancellationToken (fun command ->
             CaptureVerbs.runUnit (captureString runner cancellationToken command))
 
     /// The exit code. A signal kill or timeout errors instead of inventing a sentinel code.
@@ -235,7 +244,7 @@ module Runner =
         (cancellationToken: CancellationToken)
         (command: Command)
         : Task<Result<int, ProcessError>> =
-        withRetry command cancellationToken (fun () ->
+        withRetry command cancellationToken (fun command ->
             CaptureVerbs.exitCode (captureString runner cancellationToken command))
 
     /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
@@ -244,7 +253,7 @@ module Runner =
         (cancellationToken: CancellationToken)
         (command: Command)
         : Task<Result<bool, ProcessError>> =
-        withRetry command cancellationToken (fun () ->
+        withRetry command cancellationToken (fun command ->
             CaptureVerbs.probe (captureString runner cancellationToken command))
 
     /// Start the command and return a live `RunningProcess` for streaming and interactive I/O.

@@ -40,6 +40,7 @@ module internal Timeouts =
     let raceTimeout
         (logger: ILogger option)
         (program: string)
+        (runId: string)
         (timeout: TimeSpan option)
         (onTimeout: unit -> Task)
         (wait: Task<Outcome>)
@@ -57,7 +58,7 @@ module internal Timeouts =
                 else
                     do! onTimeout ()
                     let! _ = wait
-                    Log.timeout logger program t
+                    Log.timeout logger program t runId
                     return Outcome.TimedOut
             }
         | _ -> wait
@@ -88,7 +89,10 @@ type internal CommandConfig =
       UncheckedInPipe: bool
       OkCodes: int list
       CreateNoWindow: bool
-      Logger: ILogger option }
+      Logger: ILogger option
+      // A per-run correlation id, stamped once at the verb layer so a run's log/trace events (and its
+      // retries) share it. `None` until stamped; a direct spawn gets a per-incarnation id instead.
+      RunId: string option }
 
 module internal CommandConfig =
 
@@ -116,7 +120,8 @@ module internal CommandConfig =
           UncheckedInPipe = false
           OkCodes = [ 0 ]
           CreateNoWindow = false
-          Logger = None }
+          Logger = None
+          RunId = None }
 
 /// An immutable description of a process to run.
 ///
@@ -343,6 +348,11 @@ type Command internal (config: CommandConfig) =
     member _.Logger(logger: ILogger) =
         ArgumentNullException.ThrowIfNull logger
         Command({ config with Logger = Some logger })
+
+    /// Stamp a per-run correlation id, shared by the run's log/trace events and its retries. Internal:
+    /// the verb layer sets it once per logical run; a direct spawn falls back to a per-incarnation id.
+    member internal _.WithRunId(runId: string) =
+        Command({ config with RunId = Some runId })
 
 /// Pipe-friendly functions over `Command`, mirroring the instance **builder** methods. The run
 /// verbs (`RunAsync`/`OutputStringAsync`/`ParseAsync`/…) are instance methods only — end a pipeline with method

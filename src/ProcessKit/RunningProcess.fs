@@ -123,6 +123,30 @@ type RunningProcess internal (host: RunningHost) =
     let elapsed () =
         Stopwatch.GetElapsedTime host.StartedTimestamp
 
+    // The per-run correlation id: the verb layer stamps one (shared across a run's retries); a direct
+    // spawn with none gets a fresh per-incarnation id. Carried on every run-scoped log/trace event.
+    let runId =
+        match config.RunId with
+        | Some id -> id
+        | None -> Diag.newRunId ()
+
+    // Count the run as started + in-flight, and capture the ambient `Activity` now (at spawn) so the
+    // backdated completion span nests under it. Runs once, at construction (like the spawn log). Defined
+    // before the timeout arming below, which carries `runId` into the timeout log.
+    let spawnParentContext = Diag.runStarted config.Program
+
+    // The single exit hook: log + metrics + (backdated) trace span, at each terminal verb's exit point.
+    // Single-consumption already means one terminal verb runs, but the once-guard makes it bulletproof —
+    // conclude fires at most once per run, so metrics can't double-count and a run never yields two spans.
+    // An abandoned run (spawned, never driven to a terminal verb) simply isn't counted as completed.
+    let concludedFlag = ref 0
+
+    let conclude (outcome: Outcome) =
+        if Interlocked.Exchange(&concludedFlag.contents, 1) = 0 then
+            let duration = elapsed ()
+            Log.exit config.Logger config.Program outcome duration runId
+            Diag.runCompleted config.Program runId outcome host.Pid host.StartTime duration spawnParentContext
+
     // Per-process CPU / peak-memory via the BCL `Process` (reads /proc on Linux, the OS APIs
     // elsewhere) — no metrics once the child has exited or where the platform does not report them.
     let processMetrics (pid: int) : TimeSpan option * int64 option =
@@ -228,7 +252,7 @@ type RunningProcess internal (host: RunningHost) =
             }
             :> Task
 
-        Timeouts.raceTimeout config.Logger config.Program config.Timeout onTimeout (host.Wait())
+        Timeouts.raceTimeout config.Logger config.Program runId config.Timeout onTimeout (host.Wait())
 
     // An async-disposable that reaps the tree on scope exit — normal OR exceptional. Every terminal
     // verb opens one with `use` so the container is always torn down, even when a pump faults (e.g.
@@ -253,7 +277,7 @@ type RunningProcess internal (host: RunningHost) =
         |> ignore
 
     // Log the spawn once, at construction.
-    do Log.spawn config.Logger config.Program host.Pid
+    do Log.spawn config.Logger config.Program host.Pid runId
 
     /// The pid, when known.
     member _.Pid = host.Pid
@@ -314,7 +338,7 @@ type RunningProcess internal (host: RunningHost) =
                 do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
                 let! outBuf = stdoutTask
                 let! errBuf = stderrTask
-                Log.exit config.Logger config.Program outcome (elapsed ())
+                conclude outcome
 
                 if outBuf.TooLarge || errBuf.TooLarge then
                     return
@@ -360,7 +384,7 @@ type RunningProcess internal (host: RunningHost) =
                 do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
                 let! stdoutBytes = stdoutTask
                 let! errBuf = stderrTask
-                Log.exit config.Logger config.Program outcome (elapsed ())
+                conclude outcome
 
                 if errBuf.TooLarge then
                     return Error(tooLargeError errBuf.TotalLines errBuf.TotalBytes)
@@ -395,7 +419,7 @@ type RunningProcess internal (host: RunningHost) =
             let! outcome = waitWithTimeout ()
             // Observe both drains together so an I/O fault on one can't orphan the other.
             do! Task.WhenAll([| stdoutTask; stderrTask |])
-            Log.exit config.Logger config.Program outcome (elapsed ())
+            conclude outcome
             return outcome
         }
 
@@ -477,7 +501,9 @@ type RunningProcess internal (host: RunningHost) =
 
             match error with
             | Some ex -> return! Task.FromException<RunProfile> ex
-            | None -> return RunProfile(outcome, elapsed (), lastCpu, peakMemory, samples)
+            | None ->
+                conclude outcome
+                return RunProfile(outcome, elapsed (), lastCpu, peakMemory, samples)
         }
 
     /// `ProfileAsync` sampling every 100 ms.
@@ -552,7 +578,7 @@ type RunningProcess internal (host: RunningHost) =
             task {
                 use _reap = reapGuard ()
                 let! outcome = streamOutcome
-                Log.exit config.Logger config.Program outcome (elapsed ())
+                conclude outcome
 
                 if stderrStreamBuffer.TooLarge then
                     return Error(tooLargeError stderrStreamBuffer.TotalLines stderrStreamBuffer.TotalBytes)
@@ -638,7 +664,9 @@ type RunningProcess internal (host: RunningHost) =
                     // case never leaves an unobserved task exception.
                     match error with
                     | Some ex -> return! Task.FromException<Outcome> ex
-                    | None -> return outcome
+                    | None ->
+                        conclude outcome
+                        return outcome
                 }
 
             // Observe any fault on this otherwise fire-and-forget task (the OutputEvents-only case, where
@@ -813,6 +841,11 @@ type RunningProcess internal (host: RunningHost) =
 
                         let! outcome = waitWithTimeout ()
                         do! Task.WhenAll([| stdoutDrain; stderrDrain |])
+                        // Racing this handle to exit *is* its completion (conclude does not reap, so the
+                        // no-reap contract holds), so a `WaitAny`/`WaitAll`-only run still records its
+                        // exit/metrics/span and clears the in-flight mark. Once-guarded, so a terminal verb
+                        // afterwards (already refused by the buffered claim above) can't double-count.
+                        conclude outcome
                         return outcome
                     }
 

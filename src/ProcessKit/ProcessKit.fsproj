@@ -23,6 +23,7 @@
 		<Compile Include="ResultExtensions.fs" />
 		<Compile Include="Outcome.fs" />
 		<Compile Include="Log.fs" />
+		<Compile Include="Diag.fs" />
 		<Compile Include="Mechanism.fs" />
 		<Compile Include="Signal.fs" />
 		<Compile Include="Limits.fs" />

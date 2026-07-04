@@ -537,6 +537,10 @@ class ProcessKit.ProcessGroupStats
   property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property TotalCpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
 
+module ProcessKit.ProcessKitDiagnostics
+  field literal ActivitySourceName : System.String
+  field literal MeterName : System.String
+
 module ProcessKit.ProcessResult
   static member Create<T>(T, System.String, ProcessKit.Outcome, System.TimeSpan) : ProcessKit.ProcessResult<T>
   static member Failure<T>(T, System.String, System.Int32) : ProcessKit.ProcessResult<T>
