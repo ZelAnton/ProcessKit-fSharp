@@ -164,3 +164,21 @@ type ServiceCollectionExtensions =
             DiInternals.buildRunner provider (provider.GetRequiredService<ProcessGroup>() :> IProcessRunner))
 
         services
+
+    /// A shared container-managed group (see `AddProcessKitGroup`) that also configures the
+    /// `ProcessKitOptions` defaults (timeout / working directory) applied to every run through it.
+    [<Extension>]
+    static member AddProcessKitGroup
+        (services: IServiceCollection, configure: Action<ProcessKitOptions>)
+        : IServiceCollection =
+        ArgumentNullException.ThrowIfNull configure
+        services.Configure configure |> ignore
+        ServiceCollectionExtensions.AddProcessKitGroup services
+
+    /// A shared container-managed group (see `AddProcessKitGroup`) that also binds the `ProcessKitOptions`
+    /// defaults from a configuration section.
+    [<Extension>]
+    static member AddProcessKitGroup(services: IServiceCollection, configuration: IConfiguration) : IServiceCollection =
+        ArgumentNullException.ThrowIfNull configuration
+        services.Configure<ProcessKitOptions> configuration |> ignore
+        ServiceCollectionExtensions.AddProcessKitGroup services

@@ -1,9 +1,10 @@
 # Dependency injection
 
 The `ProcessKit.Extensions.DependencyInjection` package wires ProcessKit into
-`Microsoft.Extensions.DependencyInjection`. It stays **Abstractions-light** (DI, Logging, Options, and
-Configuration abstractions only — no hosting dependency) and every registration uses `TryAdd`, so a
-pre-existing registration of yours always wins.
+`Microsoft.Extensions.DependencyInjection`. It stays **dependency-light** — only the DI, Logging,
+Options, and Configuration extension packages that a DI-integration package inevitably needs, and **no
+hosting dependency** — and every registration uses `TryAdd`, so a pre-existing registration of yours
+always wins.
 
 ## The runner
 
@@ -80,6 +81,12 @@ services.AddProcessKitGroup();
 // IProcessRunner now runs every command into the shared group;
 // await using the provider (or host shutdown) reaps all children.
 ```
+
+Both `AddProcessKitGroup()` and `AddProcessKit()` register `IProcessRunner` with `TryAdd`, so call **one
+or the other** — whichever runs first wins. If `AddProcessKit()` runs first, `IProcessRunner` stays the
+per-run `JobRunner`, and a later `AddProcessKitGroup()` still registers the `ProcessGroup` but **no runs
+go into it** — an easy-to-miss mis-wire. `AddProcessKitGroup(configure)` / `AddProcessKitGroup(configuration)`
+apply the same `ProcessKitOptions` defaults as the `AddProcessKit` overloads.
 
 ## Hosting a supervised child
 

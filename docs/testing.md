@@ -592,7 +592,8 @@ The separate `ProcessKit.Extensions.DependencyInjection` package wires the seam
 into `Microsoft.Extensions.DependencyInjection`. `AddProcessKit()` registers an
 `IProcessRunner` in the container — logger-aware when the container already has
 an `ILoggerFactory`, so runs emit ProcessKit's lifecycle events with no extra
-wiring:
+wiring. (See the [Dependency injection guide](dependency-injection.md) for
+configured defaults, keyed per-tool clients, and a shared container-managed group.)
 
 **F#**
 
