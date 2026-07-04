@@ -76,11 +76,10 @@ gives every runner the full verb vocabulary, each verb taking
 
 Everything in the first eight rows reaches a child only through `CaptureStringAsync`
 (or `CaptureBytesAsync`), so it runs hermetically against the subprocess-free doubles
-below — with one exception: `RecordReplayRunner` rejects the **bytes** verb
-(`outputBytes` / `CaptureBytesAsync`) with `ProcessError.Unsupported`, since a cassette
-stores text and can't reproduce exact bytes. The last two — `firstLine` and `start` —
-need a live handle and go through `SpawnAsync`; see
-[what the doubles don't cover](#what-the-doubles-dont-cover).
+below. The last two — `firstLine` and `start` — need a live handle and go through
+`SpawnAsync`; both `ScriptedRunner` and `RecordReplayRunner` serve it (a `RecordReplayRunner`
+reconstructs a live handle from the recording), so streaming and readiness code replays too —
+see [what the doubles don't cover](#what-the-doubles-dont-cover).
 
 Production code, generic over the runner:
 
@@ -348,16 +347,17 @@ exactly what `RecordReplayRunner` does.
 ## What the doubles don't cover
 
 The subprocess-free doubles center on the **bulk** primitives. `ScriptedRunner` and
-[`RecordReplayRunner`](#record-and-replay) both implement `CaptureStringAsync`.
-`ScriptedRunner` also serves `CaptureBytesAsync` and a [`FakeProcess`](#scripting-replies)
-from `SpawnAsync` (so the parts of the live surface a fake can replay — `StdoutLinesAsync`,
-the readiness probes — *are* testable through it); `RecordReplayRunner` returns
-`Error(ProcessError.Unsupported …)` from both `CaptureBytesAsync` (a cassette stores text,
-not exact bytes) and `SpawnAsync`. The full live
+[`RecordReplayRunner`](#record-and-replay) both implement `CaptureStringAsync` and
+`CaptureBytesAsync`, and both serve a [`FakeProcess`](#scripting-replies) from `SpawnAsync`
+(so the parts of the live surface a fake can replay — `StdoutLinesAsync`, the readiness probes —
+*are* testable through them). The one gap is **recording** a live stream: a
+`RecordReplayRunner` in record mode returns `Error(ProcessError.Unsupported …)` from
+`SpawnAsync`, because a live stream can't be captured without racing the consumer — record a
+streaming call through a capture verb, then replay it as a stream. The full live
 [`RunningProcess`](streaming.md) surface (`WaitForPortAsync`, `TakeStdin`, `ProfileAsync`, …)
 and a [`Pipeline`](pipelines.md) are best tested against a real (possibly trivial) child
-process; keep the scripted/cassette doubles for everything that flows through
-`CaptureStringAsync`.
+process; keep the scripted/cassette doubles for everything that flows through the capture
+primitives.
 
 ## Record and replay
 
@@ -414,16 +414,16 @@ Semantics worth knowing before you commit a cassette:
 
 | Aspect | Behaviour |
 |---|---|
-| Match key | program + args + cwd + a stdin **source digest** (plus whether stdin was present). In-memory bytes hash their content; a `Stdin.FromFile` source hashes its path |
+| Match key | program + args + cwd + a stdin **source digest** (plus whether stdin was present). In-memory bytes hash their content; a `Stdin.FromFile` source hashes its path (opt into hashing its **contents** with `RecordReplayOptions.WithFileStdinContentHashing`) |
 | Environment | override **values never reach the file** — only the variable names are stored, so env secrets can't leak, and env is not part of the match key |
 | Miss | an unmatched call is `ProcessError.CassetteMiss` (distinct from a missing program) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded before/after sequence replays faithfully, while retry/probe loops keep getting a stable final answer |
-| Bytes | `CaptureBytesAsync` is **rejected** with `ProcessError.Unsupported` — a cassette stores text, so it can't reproduce the exact bytes a `byte[]` capture promises (record and replay both) |
-| `SpawnAsync` | unsupported — replay serves the bulk capture primitives only (see [above](#what-the-doubles-dont-cover)) |
-| Fidelity | a recording's **truncation** flag and wall-clock **duration** survive replay, so `ProcessResult.Truncated` / `Duration` read true on replay (not a synthetic `false` / `0`) |
+| Bytes | `CaptureBytesAsync` / `outputBytes` is supported: a **bytes recording** stores the exact stdout bytes (base64) and replays them byte-for-byte, including non-UTF-8 output. A **text** recording (or a pre-v2 cassette) replayed through the bytes verb is honestly `ProcessError.Unsupported` — it never hands back a lossy re-encode — so re-record that call through the bytes verb |
+| `SpawnAsync` | **replay** reconstructs a live handle ([`FakeProcess`](#scripting-replies)) from the recording, so `StdoutLinesAsync` / readiness probes / exit replay too. **Record** mode can't capture a live stream (it would race the consumer) and returns `Unsupported` — record the call through a capture verb, then replay it as a stream |
+| Fidelity | for the **capture** verbs, a recording's **truncation** flag and wall-clock **duration** survive replay, so `ProcessResult.Truncated` / `Duration` read true on replay (not a synthetic `false` / `0`). Streaming replay (`SpawnAsync`) reconstructs the recorded lines and outcome; its duration is measured live and truncation is not replayed |
 | Err results | not recorded — only completed runs (a non-zero exit and a captured timeout *are* results and are recorded) |
 | One-shot stdin | `Stdin.FromStream` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
-| Format | a versioned JSON envelope — `{ "Version", "Entries" }`; a cassette whose format version this build doesn't understand is rejected on load, and a partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
+| Format | a versioned JSON envelope — `{ "Version", "Entries" }` (current version **2**); a cassette **newer** than this build understands is rejected on load, while an older compatible one (a v1 cassette) still loads (missing fields default). A partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
 
 Only env *values* are redacted. `program`, `args`, `stdout`, and `stderr` are
 stored **verbatim** and can carry secrets (a `--password=…` flag, a token echoed
@@ -436,6 +436,42 @@ directories.
 A neat trick: in tests, record against a `ScriptedRunner` instead of
 `JobRunner()` — the whole record → save → replay round trip is then itself
 hermetic.
+
+**Grow a cassette on miss (VCR "new episodes").** `RecordReplayRunner.Auto(path, inner)`
+replays what the cassette already holds and, on a **miss**, delegates to `inner`, records the
+result, and grows the file on `Save()`/dispose — so you build a cassette up incrementally
+instead of curating every entry by hand. Existing entries still replay hermetically; only a
+first-seen call reaches the real tool. A missing (or empty) file starts a fresh cassette. Use
+strict `Replay(path)` in CI, where a miss should fail loudly. (Like record mode, `Auto` can't
+capture a *streaming* miss — record such a call through a capture verb first.)
+
+**Matching customization & redaction (`RecordReplayOptions`).** Pass an immutable, fluent
+`RecordReplayOptions` to `Record` / `Replay` / `Auto` (use the **same** options on both sides,
+since they change how invocations are keyed):
+
+- `WithFileStdinContentHashing()` — key a `Stdin.FromFile` source by its **contents** (a SHA-256
+  of the bytes) instead of its path, so a cassette matches on what was actually fed to the child
+  (and matches a `Stdin.FromBytes` of the same bytes). Opt-in: the file must exist at record and
+  replay time, and an unreadable file surfaces `ProcessError.Stdin`.
+- `WithArgNormalizer(args -> args)` — normalize the argument list before matching, so a volatile
+  argument (a temp directory, a nonce) no longer defeats the match — drop it, or rewrite it to a
+  stable placeholder. The **raw** arguments are still stored verbatim for inspection.
+- `WithRedaction(text -> text)` — scrub captured **text** before it is written, so a secret
+  echoed to stdout/stderr never reaches disk. Applied at record time to a string capture's
+  stdout/stderr and a bytes capture's stderr; a `byte[]` stdout capture is stored opaquely
+  (base64) and is not passed through the redactor.
+
+```csharp
+var options = new RecordReplayOptions()
+    .WithArgNormalizer(args => args.Where(a => !a.StartsWith("/tmp/")).ToArray())
+    .WithRedaction(text => text.Replace(token, "[REDACTED]"));
+
+// Auto (like Replay) returns a Result — it can fail to load an existing cassette.
+if (RecordReplayRunner.Auto("fixtures/git.json", new JobRunner(), options) is { IsOk: true, ResultValue: var recorder })
+{
+    // recorder replays a hit, records a miss, and grows the cassette on Save()...
+}
+```
 
 ## CliClient
 

@@ -834,7 +834,7 @@ class ProcessKit.Testing.CassetteEntry
   member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
   member ToString() : System.String
   new()
-  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double)
+  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double)
   property Args : System.String[] { get; set }
   property Code : System.Nullable<System.Int32> { get; set }
   property Cwd : System.String { get; set }
@@ -846,6 +846,7 @@ class ProcessKit.Testing.CassetteEntry
   property Stderr : System.String { get; set }
   property StdinDigest : System.String { get; set }
   property Stdout : System.String { get; set }
+  property StdoutBase64 : System.String { get; set }
   property TimedOut : System.Boolean { get; set }
   property Truncated : System.Boolean { get; set }
 
@@ -875,12 +876,22 @@ class ProcessKit.Testing.FakeProcess
   static member Create() : ProcessKit.Testing.FakeProcess
   static member Create(System.String) : ProcessKit.Testing.FakeProcess
 
+class ProcessKit.Testing.RecordReplayOptions
+  member WithArgNormalizer(System.Func<System.String[], System.String[]>) : ProcessKit.Testing.RecordReplayOptions
+  member WithFileStdinContentHashing() : ProcessKit.Testing.RecordReplayOptions
+  member WithRedaction(System.Func<System.String, System.String>) : ProcessKit.Testing.RecordReplayOptions
+  new()
+
 class ProcessKit.Testing.RecordReplayRunner
   :> ProcessKit.IProcessRunner
   :> System.IDisposable
   member Save() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  static member Auto(System.String, ProcessKit.IProcessRunner) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
+  static member Auto(System.String, ProcessKit.IProcessRunner, ProcessKit.Testing.RecordReplayOptions) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
   static member Record(System.String, ProcessKit.IProcessRunner) : ProcessKit.Testing.RecordReplayRunner
+  static member Record(System.String, ProcessKit.IProcessRunner, ProcessKit.Testing.RecordReplayOptions) : ProcessKit.Testing.RecordReplayRunner
   static member Replay(System.String) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
+  static member Replay(System.String, ProcessKit.Testing.RecordReplayOptions) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
 
 class ProcessKit.Testing.Reply
   member WithStderr(System.String) : ProcessKit.Testing.Reply
