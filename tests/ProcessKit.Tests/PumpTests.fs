@@ -35,6 +35,18 @@ type PumpTests() =
 
         List.ofSeq lines
 
+    // Feed a payload to a RawBuffer in a fixed chunk size so the ring/head logic is exercised across
+    // chunk seams (a single 8192-byte read never straddles the accumulator's chunk boundaries otherwise).
+    let feedRaw (buf: Pump.RawBuffer) (bytes: byte[]) (chunk: int) =
+        let mutable i = 0
+
+        while i < bytes.Length do
+            let n = min chunk (bytes.Length - i)
+            buf.Append(bytes, i, n)
+            i <- i + n
+
+    let bytesOf (s: string) = Encoding.UTF8.GetBytes s
+
     [<Test>]
     member _.``readLines strips a leading UTF-8 BOM``() =
         let bytes =
@@ -124,6 +136,110 @@ type PumpTests() =
             .Wait()
 
         Assert.That(buf.TooLarge, Is.True)
+
+    // --- RawBuffer: the byte-cap accumulator for the raw stdout capture (OutputBytesAsync / pipeline) ---
+
+    [<Test>]
+    member _.``RawBuffer DropOldest keeps the last cap bytes as a tail``() =
+        let buf = Pump.RawBuffer(3, OverflowMode.DropOldest)
+        feedRaw buf (bytesOf "abcdefg") 2
+        Assert.That(Encoding.UTF8.GetString(buf.ToArray()), Is.EqualTo "efg")
+        Assert.That(buf.Truncated, Is.True)
+        Assert.That(buf.TooLarge, Is.False)
+        Assert.That(buf.TotalBytes, Is.EqualTo 7)
+
+    [<Test>]
+    member _.``RawBuffer DropNewest keeps the first cap bytes as a head``() =
+        let buf = Pump.RawBuffer(3, OverflowMode.DropNewest)
+        feedRaw buf (bytesOf "abcdefg") 2
+        Assert.That(Encoding.UTF8.GetString(buf.ToArray()), Is.EqualTo "abc")
+        Assert.That(buf.Truncated, Is.True)
+        Assert.That(buf.TooLarge, Is.False)
+
+    [<Test>]
+    member _.``RawBuffer Error trips the fail-loud ceiling once the cap is exceeded``() =
+        let buf = Pump.RawBuffer(3, OverflowMode.Error)
+        feedRaw buf (bytesOf "abcd") 1
+        Assert.That(buf.TooLarge, Is.True)
+        Assert.That(buf.Truncated, Is.False)
+        Assert.That(buf.TotalBytes, Is.EqualTo 4)
+
+    [<Test>]
+    member _.``RawBuffer exactly at the cap neither truncates nor errors``() =
+        // Total == cap is the boundary: nothing is dropped and the fail-loud ceiling is not crossed.
+        for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest; OverflowMode.Error ] do
+            let buf = Pump.RawBuffer(4, overflow)
+            feedRaw buf (bytesOf "abcd") 3
+            Assert.That(Encoding.UTF8.GetString(buf.ToArray()), Is.EqualTo "abcd", $"{overflow} content")
+            Assert.That(buf.Truncated, Is.False, $"{overflow} truncated")
+            Assert.That(buf.TooLarge, Is.False, $"{overflow} tooLarge")
+
+    [<Test>]
+    member _.``RawBuffer with a zero cap retains nothing but flags any output``() =
+        let dropOldest = Pump.RawBuffer(0, OverflowMode.DropOldest)
+        feedRaw dropOldest (bytesOf "abc") 1
+        Assert.That(dropOldest.ToArray(), Is.Empty)
+        Assert.That(dropOldest.Truncated, Is.True)
+
+        let error = Pump.RawBuffer(0, OverflowMode.Error)
+        feedRaw error (bytesOf "abc") 1
+        Assert.That(error.ToArray(), Is.Empty)
+        Assert.That(error.TooLarge, Is.True)
+
+    [<Test>]
+    member _.``RawBuffer on empty input retains nothing and flags nothing``() =
+        for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest; OverflowMode.Error ] do
+            let buf = Pump.RawBuffer(4, overflow)
+            Assert.That(buf.ToArray(), Is.Empty, $"{overflow} content")
+            Assert.That(buf.Truncated, Is.False, $"{overflow} truncated")
+            Assert.That(buf.TooLarge, Is.False, $"{overflow} tooLarge")
+            Assert.That(buf.TotalBytes, Is.EqualTo 0, $"{overflow} total")
+
+    [<Test>]
+    member _.``RawBuffer DropOldest tail survives many small evicting chunks``() =
+        // Feed one byte at a time so eviction runs on nearly every Append — the ring must still hold
+        // exactly the last cap bytes regardless of chunking.
+        let buf = Pump.RawBuffer(5, OverflowMode.DropOldest)
+        feedRaw buf (bytesOf "0123456789") 1
+        Assert.That(Encoding.UTF8.GetString(buf.ToArray()), Is.EqualTo "56789")
+        Assert.That(buf.TotalBytes, Is.EqualTo 10)
+
+    [<Test>]
+    member _.``captureRawOrEmpty with no byte cap is unbounded and never truncates``() =
+        // MaxBytes = None keeps the raw capture unbounded (unchanged behaviour): all bytes, no flags.
+        use stream = new MemoryStream(bytesOf "unbounded payload")
+
+        let capture =
+            (Pump.captureRawOrEmpty (Some(stream :> Stream)) None OutputBufferPolicy.Unbounded CancellationToken.None)
+                .Result
+
+        Assert.That(Encoding.UTF8.GetString capture.Bytes, Is.EqualTo "unbounded payload")
+        Assert.That(capture.Truncated, Is.False)
+        Assert.That(capture.TooLarge, Is.False)
+
+    [<Test>]
+    member _.``captureRawOrEmpty applies the byte cap and tees the full stream``() =
+        // The tee mirrors the full child output; retention obeys the DropOldest cap independently.
+        use stream = new MemoryStream(bytesOf "abcdefgh")
+        use tee = new MemoryStream()
+        let policy = OutputBufferPolicy.Unbounded.WithMaxBytes 3
+
+        let capture =
+            (Pump.captureRawOrEmpty (Some(stream :> Stream)) (Some(tee :> Stream)) policy CancellationToken.None).Result
+
+        Assert.That(Encoding.UTF8.GetString capture.Bytes, Is.EqualTo "fgh") // last 3 bytes (DropOldest)
+        Assert.That(capture.Truncated, Is.True)
+        Assert.That(Encoding.UTF8.GetString(tee.ToArray()), Is.EqualTo "abcdefgh") // tee is byte-exact
+
+    [<Test>]
+    member _.``captureRawOrEmpty over a missing stream yields an empty capture``() =
+        let capture =
+            (Pump.captureRawOrEmpty None None (OutputBufferPolicy.Unbounded.WithMaxBytes 4) CancellationToken.None)
+                .Result
+
+        Assert.That(capture.Bytes, Is.Empty)
+        Assert.That(capture.Truncated, Is.False)
+        Assert.That(capture.TooLarge, Is.False)
 
     [<Test>]
     member _.``OutputBufferPolicy rejects a negative cap but accepts zero``() =

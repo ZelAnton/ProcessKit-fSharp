@@ -14,12 +14,16 @@ type internal PipelineStage =
       Stderr: string
       OkCodes: int list }
 
-/// The captured result of running a whole pipeline: the last stage's stdout, every stage's
+/// The captured result of running a whole pipeline: the last stage's stdout (with its byte-cap
+/// truncation / fail-loud / total signals from the last stage's `OutputBuffer`), every stage's
 /// terminal state (left-to-right), the wall-clock duration, whether the pipeline timed out, and a
 /// genuine stage-0 stdin source-acquisition failure observed by the feeder (surfaced by `Pipeline`
 /// as `ProcessError.Stdin` on an otherwise-successful run, like a single command).
 type internal PipelineCapture =
     { LastStdout: byte[]
+      LastStdoutTruncated: bool
+      LastStdoutTooLarge: bool
+      LastStdoutTotalBytes: int
       Stages: PipelineStage list
       Duration: TimeSpan
       TimedOut: bool
@@ -160,15 +164,23 @@ module internal PipelineRunner =
                     | None ->
                         let lastSpawned = spawned[spawned.Count - 1]
 
+                        // The last stage's stdout is the pipeline's captured output, so its `OutputBuffer`
+                        // byte cap + overflow apply to that capture — matching a single command's byte
+                        // verb. (`MaxLines` never applies to a raw byte capture; intermediate stages'
+                        // policies are not applied — see the `Pipeline` type doc.)
                         let captureTask =
-                            Pump.drainRawOrEmpty lastSpawned.Stdout lastTee CancellationToken.None
+                            Pump.captureRawOrEmpty
+                                lastSpawned.Stdout
+                                lastTee
+                                stages[stages.Length - 1].Config.OutputBuffer
+                                CancellationToken.None
 
                         let waitTasks =
                             spawned |> Seq.map (fun sp -> group.WaitHandle sp.Handle) |> Seq.toArray
 
                         let! outcomes = Task.WhenAll waitTasks
                         do! Task.WhenAll(copyTasks.ToArray())
-                        let! lastStdout = captureTask
+                        let! lastCapture = captureTask
                         let! stderrBytes = Task.WhenAll(stderrTasks.ToArray())
 
                         for sp in spawned do
@@ -197,7 +209,10 @@ module internal PipelineRunner =
 
                             return
                                 Ok
-                                    { LastStdout = lastStdout
+                                    { LastStdout = lastCapture.Bytes
+                                      LastStdoutTruncated = lastCapture.Truncated
+                                      LastStdoutTooLarge = lastCapture.TooLarge
+                                      LastStdoutTotalBytes = lastCapture.TotalBytes
                                       Stages = stageResults
                                       Duration = duration
                                       TimedOut = timeoutCts.IsCancellationRequested

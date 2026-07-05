@@ -45,13 +45,19 @@ type OverflowMode =
 type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, overflow: OverflowMode) =
 
     /// Maximum retained lines: `None` is unbounded, `Some 0` retains nothing, `Some n` keeps at most `n`.
+    /// Applies to the line-capturing paths (the text verbs' stdout/stderr, and a byte verb's line-pumped
+    /// stderr). It does **not** apply to a raw byte capture — `OutputBytesAsync`'s stdout and a
+    /// pipeline's captured last-stage stdout have no line structure, so only `MaxBytes` bounds those.
     member _.MaxLines = maxLines
 
     /// Maximum retained bytes (sum of the retained lines' UTF-8 lengths): `None` is unbounded. Also
     /// bounds the in-flight (not-yet-newline-terminated) line for the buffered verbs: an unterminated
     /// line is force-flushed once it reaches this many characters, so a child emitting a newline-free
     /// flood can't grow the assembly buffer past the cap (the flushed segments are dropped/errored per
-    /// `Overflow`, like any other over-cap output).
+    /// `Overflow`, like any other over-cap output). This cap is also the ceiling on a **raw byte**
+    /// capture (`OutputBytesAsync`'s stdout and a pipeline's captured last-stage stdout): `Some cap`
+    /// enforces it per `Overflow` (`Error` -> `OutputTooLarge`, `DropOldest` -> last `cap` bytes,
+    /// `DropNewest` -> first `cap` bytes), while `None` leaves the raw capture unbounded.
     member _.MaxBytes = maxBytes
 
     /// Which line to drop, or whether to error, when a cap is reached.

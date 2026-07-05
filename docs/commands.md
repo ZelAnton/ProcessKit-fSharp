@@ -352,6 +352,40 @@ cap — even while a streaming consumer is draining lines as they arrive. It bou
 memory, not wall-time, so pair it with a [`Timeout`](#timeouts-and-retries)
 against a flooding child.
 
+#### Raw byte captures obey the byte cap too
+
+`OutputBytesAsync` captures stdout as raw bytes with no line structure, so only the
+**byte** side of the policy applies to it — `MaxLines` is meaningless there and is
+ignored. `MaxBytes = Some cap` enforces the cap per `Overflow`: `Error` returns
+`ProcessError.OutputTooLarge` once the cumulative stdout exceeds `cap` (the pipe is
+still drained, so the child never blocks), `DropOldest` keeps the **last** `cap`
+bytes, and `DropNewest` keeps the **first** `cap` bytes — the dropping modes set
+`ProcessResult.Truncated`. `MaxBytes = None` (the default) leaves the raw stdout
+capture **unbounded**, exactly as before. `ProcessResult.Truncated` on a byte
+capture reflects truncation of stdout *or* stderr, and `OutputTooLarge` fires if
+either stream trips its fail-loud ceiling.
+
+```fsharp
+// Keep the last 1 MiB of a binary stream; anything earlier is dropped, Truncated is set:
+let tail =
+    Command.create "produce-archive"
+    |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes(1024 * 1024))
+
+// …or refuse to buffer more than 1 MiB at all:
+let strict =
+    Command.create "produce-archive"
+    |> Command.outputBuffer ((OutputBufferPolicy.Unbounded.WithMaxBytes(1024 * 1024)).WithOverflow OverflowMode.Error)
+```
+
+A [pipeline](pipelines.md) captures its last stage's stdout as raw bytes, so the same
+byte cap + overflow of that **last** stage's `OutputBuffer` bound the pipeline's
+captured output (its `MaxLines`, and every intermediate stage's policy, do not apply).
+
+> This is a deliberate divergence from the Rust `ProcessKit-rs` reference, whose
+> `output_bytes` bounds raw bytes only by `Timeout`, not by the buffer policy. The
+> port applies the byte cap honestly so that a caller who set `MaxBytes`/`FailLoud`
+> to bound memory is not handed an unbounded stdout buffer.
+
 ### Line handlers and tees
 
 `OnStdoutLine` / `OnStderrLine` run a callback on each decoded line *in addition

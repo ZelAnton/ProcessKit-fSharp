@@ -21,11 +21,13 @@ open System.Threading.Tasks
 /// `Command.UncheckedInPipe`.
 ///
 /// Per-stage I/O config that applies inside a pipeline: each stage's `OkCodes` (pipefail), the last
-/// stage's `StdoutEncoding` and `StdoutTee` (the captured stdout), and the chain-level `Timeout` /
-/// `CancelOn`. Per-stage *stdout/stderr observation* hooks are **not** applied — intermediate stages'
-/// `StdoutTee`, and every stage's `StderrTee`, `OnStdoutLine`/`OnStderrLine`, and `OutputBuffer`
-/// policy — because the chain wires stdout into the next stage's stdin and captures only the final
-/// stage's output. Observe an individual command by running it on its own, not as a pipeline stage.
+/// stage's `StdoutEncoding`, `StdoutTee`, and `OutputBuffer` **byte** cap (`MaxBytes` + `Overflow`,
+/// applied to the captured stdout — its `MaxLines` never applies to a raw byte capture), and the
+/// chain-level `Timeout` / `CancelOn`. Per-stage *stdout/stderr observation* hooks are **not**
+/// applied — intermediate stages' `StdoutTee` and `OutputBuffer`, and every stage's `StderrTee`,
+/// `OnStdoutLine`/`OnStderrLine` — because the chain wires stdout into the next stage's stdin and
+/// captures only the final stage's output. Observe an individual command by running it on its own,
+/// not as a pipeline stage.
 [<Sealed>]
 type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancelOn: CancellationToken option) =
 
@@ -75,6 +77,16 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         else
             None
 
+    // The pipeline's captured stdout tripped the last stage's fail-loud (`OverflowMode.Error`) byte
+    // ceiling — surface it as `ProcessError.OutputTooLarge`, consistent with a single command's byte
+    // verb. The overflow is on the raw byte capture, so it carries no lines (`TotalLines = 0`); the
+    // limits are the last stage's configured caps. The program is the last stage's, whose output
+    // overflowed. Checked before the pipefail/stdin classification, mirroring the single-command order.
+    static let outputTooLargeError (commands: Command list) (capture: PipelineCapture) : ProcessError =
+        let last = List.last commands
+        let policy = last.Config.OutputBuffer
+        ProcessError.OutputTooLarge(last.Program, policy.MaxLines, policy.MaxBytes, 0, capture.LastStdoutTotalBytes)
+
     /// Append another stage; its stdin is fed from the current last stage's stdout.
     member _.Pipe(command: Command) =
         ArgumentNullException.ThrowIfNull command
@@ -93,10 +105,10 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     // Run the chain, honouring the pipeline-level `cancelOn` on top of the verb's token.
     member private _.Execute(cancellationToken: CancellationToken) : Task<Result<PipelineCapture, ProcessError>> =
         task {
-            // A pipeline captures only the *last* stage's stdout, so the last command's `StdoutTee` is
-            // applied to that captured stream — matching a single command's `StdoutTee`. (Per-stage line
-            // handlers / stderr tees / output-buffer caps are not applied within a pipeline; see the
-            // type doc.)
+            // A pipeline captures only the *last* stage's stdout, so the last command's `StdoutTee` and
+            // `OutputBuffer` byte cap are applied to that captured stream — matching a single command's
+            // byte capture. (Per-stage line handlers / stderr tees, and intermediate stages' output
+            // buffers, are not applied within a pipeline; see the type doc.)
             let lastTee = (List.last commands).Config.StdoutTee
 
             match cancelOn with
@@ -117,23 +129,26 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             match! this.Execute cancellationToken with
             | Error error -> return Error error
             | Ok capture ->
-                let stage = representative capture
+                if capture.LastStdoutTooLarge then
+                    return Error(outputTooLargeError commands capture)
+                else
+                    let stage = representative capture
 
-                match stdinErrorOnSuccess (List.head commands).Program capture stage with
-                | Some err -> return Error err
-                | None ->
-                    return
-                        Ok(
-                            ProcessResult<byte[]>(
-                                stage.Program,
-                                capture.LastStdout,
-                                stage.Stderr,
-                                stage.Outcome,
-                                capture.Duration,
-                                false,
-                                stage.OkCodes
+                    match stdinErrorOnSuccess (List.head commands).Program capture stage with
+                    | Some err -> return Error err
+                    | None ->
+                        return
+                            Ok(
+                                ProcessResult<byte[]>(
+                                    stage.Program,
+                                    capture.LastStdout,
+                                    stage.Stderr,
+                                    stage.Outcome,
+                                    capture.Duration,
+                                    capture.LastStdoutTruncated,
+                                    stage.OkCodes
+                                )
                             )
-                        )
         }
 
     /// Run the pipeline to completion, capturing the last stage's stdout as decoded text (using the
@@ -145,26 +160,29 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             match! this.Execute cancellationToken with
             | Error error -> return Error error
             | Ok capture ->
-                let stage = representative capture
+                if capture.LastStdoutTooLarge then
+                    return Error(outputTooLargeError commands capture)
+                else
+                    let stage = representative capture
 
-                match stdinErrorOnSuccess (List.head commands).Program capture stage with
-                | Some err -> return Error err
-                | None ->
-                    let encoding = (List.last commands).Config.StdoutEncoding
-                    let text = encoding.GetString capture.LastStdout
+                    match stdinErrorOnSuccess (List.head commands).Program capture stage with
+                    | Some err -> return Error err
+                    | None ->
+                        let encoding = (List.last commands).Config.StdoutEncoding
+                        let text = encoding.GetString capture.LastStdout
 
-                    return
-                        Ok(
-                            ProcessResult<string>(
-                                stage.Program,
-                                text,
-                                stage.Stderr,
-                                stage.Outcome,
-                                capture.Duration,
-                                false,
-                                stage.OkCodes
+                        return
+                            Ok(
+                                ProcessResult<string>(
+                                    stage.Program,
+                                    text,
+                                    stage.Stderr,
+                                    stage.Outcome,
+                                    capture.Duration,
+                                    capture.LastStdoutTruncated,
+                                    stage.OkCodes
+                                )
                             )
-                        )
         }
 
     // The capture-derived verbs share one implementation with the `Runner` module (`CaptureVerbs`),

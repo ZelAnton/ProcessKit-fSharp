@@ -6,6 +6,7 @@ open System.Text
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
+open NUnit.Framework.Legacy
 open ProcessKit
 
 [<TestFixture>]
@@ -36,6 +37,17 @@ type PipelineTests() =
         |> Array.map (fun s -> s.Trim())
         |> Array.filter (fun s -> s.Length > 0)
         |> Array.toList
+
+    // Run a two-stage `emit | sort` pipeline, optionally capping the LAST stage's OutputBuffer, and
+    // capture its stdout as raw bytes. The sorted output is deterministic across runs, so an uncapped
+    // run is a stable oracle for the capped tail/head. Used by the last-stage byte-cap tests (T-011).
+    let pipelineBytes (lastPolicy: OutputBufferPolicy option) =
+        let last =
+            match lastPolicy with
+            | Some policy -> sortStage |> Command.outputBuffer policy
+            | None -> sortStage
+
+        ((emit [ "banana"; "apple" ]).Pipe last).OutputBytesAsync()
 
     [<Test>]
     member _.``two-stage pipeline wires stdout into the next stage's stdin``() : Task =
@@ -69,7 +81,75 @@ type PipelineTests() =
             | Ok result ->
                 let text = Encoding.UTF8.GetString result.Stdout
                 Assert.That(lines text, Is.EqualTo(box [ "apple"; "banana" ]))
+                Assert.That(result.Truncated, Is.False) // no cap on the last stage -> nothing truncated
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // --- The last stage's OutputBuffer byte cap bounds the captured pipeline stdout (T-011) ---
+
+    [<Test>]
+    member _.``pipeline last-stage DropOldest keeps the tail and flags truncation``() : Task =
+        task {
+            let cap = 4
+            let! full = pipelineBytes None
+            let! result = pipelineBytes (Some(OutputBufferPolicy.Unbounded.WithMaxBytes cap))
+
+            match full, result with
+            | Ok full, Ok result ->
+                Assert.That(full.Stdout.Length, Is.GreaterThan cap, "the sorted output must exceed the cap")
+                Assert.That(result.Truncated, Is.True)
+                Assert.That(result.Stdout.Length, Is.EqualTo cap)
+                CollectionAssert.AreEqual(full.Stdout[full.Stdout.Length - cap ..], result.Stdout) // the tail
+            | other -> Assert.Fail $"expected both captures to succeed, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``pipeline last-stage DropNewest keeps the head and flags truncation``() : Task =
+        task {
+            let cap = 4
+            let! full = pipelineBytes None
+
+            let! result =
+                pipelineBytes (
+                    Some((OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow OverflowMode.DropNewest)
+                )
+
+            match full, result with
+            | Ok full, Ok result ->
+                Assert.That(full.Stdout.Length, Is.GreaterThan cap, "the sorted output must exceed the cap")
+                Assert.That(result.Truncated, Is.True)
+                Assert.That(result.Stdout.Length, Is.EqualTo cap)
+                CollectionAssert.AreEqual(full.Stdout[.. cap - 1], result.Stdout) // the head
+            | other -> Assert.Fail $"expected both captures to succeed, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``pipeline last-stage Error trips OutputTooLarge once the byte cap is exceeded``() : Task =
+        task {
+            match!
+                pipelineBytes (Some((OutputBufferPolicy.Unbounded.WithMaxBytes 3).WithOverflow OverflowMode.Error))
+            with
+            | Error(ProcessError.OutputTooLarge(_, _, byteLimit, _, totalBytes)) ->
+                Assert.That(byteLimit, Is.EqualTo(Some 3))
+                Assert.That(totalBytes, Is.GreaterThan 3)
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``pipeline OutputString also errors OutputTooLarge under the last-stage byte cap``() : Task =
+        task {
+            // The string verb decodes the raw byte capture, so the same byte cap Error trips it too.
+            let last =
+                sortStage
+                |> Command.outputBuffer ((OutputBufferPolicy.Unbounded.WithMaxBytes 3).WithOverflow OverflowMode.Error)
+
+            match! ((emit [ "banana"; "apple" ]).Pipe last).OutputStringAsync() with
+            | Error(ProcessError.OutputTooLarge _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
         }
         :> Task
 

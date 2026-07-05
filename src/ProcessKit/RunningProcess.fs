@@ -514,6 +514,20 @@ type RunningProcess internal (host: RunningHost) =
             }
 
     /// Run to completion, capturing stdout as raw bytes (no line splitting) and stderr as text.
+    ///
+    /// The configured `OutputBuffer` policy's **byte** controls apply to this raw stdout capture:
+    /// `MaxBytes = Some cap` enforces the cap per `Overflow` — `Error` returns
+    /// `ProcessError.OutputTooLarge` once the cumulative stdout exceeds the cap (the pipe is still
+    /// drained), `DropOldest` keeps the last `cap` bytes, `DropNewest` keeps the first `cap` bytes, both
+    /// setting `ProcessResult.Truncated` when anything was dropped. `MaxBytes = None` (the default)
+    /// keeps the raw capture **unbounded** — there is no byte ceiling to enforce. `MaxLines` never
+    /// applies to a raw byte stream (it has no line structure) and is ignored on stdout here; it still
+    /// governs the line-pumped **stderr** capture. `Truncated` reflects truncation of stdout OR stderr,
+    /// and `OutputTooLarge` fires if either stream trips its fail-loud ceiling.
+    ///
+    /// This is a deliberate, documented divergence from the Rust `ProcessKit-rs` reference, whose
+    /// `output_bytes` bounds raw bytes only by `Timeout`, not by the buffer policy: a caller who set
+    /// `MaxBytes`/`FailLoud` to bound memory would still get an unbounded stdout buffer otherwise.
     member _.OutputBytesAsync() : Task<Result<ProcessResult<byte[]>, ProcessError>> =
         if not (claimBuffered ()) then
             Task.FromResult(Error(alreadyConsumedError ()))
@@ -522,20 +536,25 @@ type RunningProcess internal (host: RunningHost) =
             task {
                 use _reap = reapGuard ()
 
+                // The raw stdout capture now honours the byte cap + overflow of `config.OutputBuffer`
+                // (unbounded when `MaxBytes = None`, exactly as before); `MaxLines` does not apply to a
+                // byte stream, so it is ignored here — it still governs the line-pumped stderr below.
                 let stdoutTask =
-                    Pump.drainRawOrEmpty host.Stdout config.StdoutTee CancellationToken.None
+                    Pump.captureRawOrEmpty host.Stdout config.StdoutTee config.OutputBuffer CancellationToken.None
 
                 let stderrTask = pumpStderrBuffer ()
                 let! outcome = startBufferedWait ()
                 // Observe both pumps before reading either, so a throwing stderr handler (or a raw-drain
                 // I/O fault) can't orphan the other as an unobserved task.
                 do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
-                let! stdoutBytes = stdoutTask
+                let! stdoutCapture = stdoutTask
                 let! errBuf = stderrTask
                 conclude outcome
 
-                if errBuf.TooLarge then
-                    return Error(tooLargeError errBuf.TotalLines errBuf.TotalBytes)
+                if stdoutCapture.TooLarge || errBuf.TooLarge then
+                    // The raw stdout byte cap contributes no lines (a byte stream has none); stderr is
+                    // line-pumped, so its totals carry the lines and both streams' bytes are summed.
+                    return Error(tooLargeError errBuf.TotalLines (stdoutCapture.TotalBytes + errBuf.TotalBytes))
                 else
                     match stdinErrorOnSuccess outcome with
                     | Some err -> return Error err
@@ -544,11 +563,11 @@ type RunningProcess internal (host: RunningHost) =
                             Ok(
                                 ProcessResult<byte[]>(
                                     config.Program,
-                                    stdoutBytes,
+                                    stdoutCapture.Bytes,
                                     errBuf.Text,
                                     outcome,
                                     elapsed (),
-                                    errBuf.Truncated,
+                                    stdoutCapture.Truncated || errBuf.Truncated,
                                     config.OkCodes
                                 )
                             )

@@ -31,6 +31,15 @@ type StreamingTests() =
         else
             shell "echo line1; echo line2; echo line3"
 
+    // Start `command` and collect its stdout as raw bytes through the byte verb (the verb reaps the
+    // tree). Used by the OutputBuffer byte-cap tests below.
+    let runBytes (command: Command) : Task<Result<ProcessResult<byte[]>, ProcessError>> =
+        task {
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> return Error error
+            | Ok running -> return! running.OutputBytesAsync()
+        }
+
     let collect (lines: IAsyncEnumerable<'T>) =
         task {
             let acc = ResizeArray<'T>()
@@ -599,6 +608,99 @@ type StreamingTests() =
                 match! running.OutputStringAsync() with
                 | Error(ProcessError.OutputTooLarge _) -> Assert.Pass()
                 | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    // --- OutputBytesAsync honours the OutputBuffer byte cap + overflow (T-011) ---
+
+    [<Test>]
+    member _.``OutputBytes with no byte cap captures the full stdout untruncated``() : Task =
+        task {
+            match! runBytes threeLines with
+            | Ok result ->
+                Assert.That(result.Stdout.Length, Is.GreaterThan 0)
+                Assert.That(result.Truncated, Is.False)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputBytes with a byte cap above the output does not truncate``() : Task =
+        task {
+            // MaxBytes set but never exceeded behaves exactly like no cap: full bytes, Truncated = false.
+            let command =
+                threeLines
+                |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes 1_000_000)
+
+            let! full = runBytes threeLines
+            let! capped = runBytes command
+
+            match full, capped with
+            | Ok full, Ok capped ->
+                Assert.That(capped.Truncated, Is.False)
+                CollectionAssert.AreEqual(full.Stdout, capped.Stdout)
+            | other -> Assert.Fail $"expected both captures to succeed, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputBytes DropOldest keeps the last cap bytes and flags truncation``() : Task =
+        task {
+            let cap = 5
+
+            let capped =
+                threeLines
+                |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes cap)
+
+            let! full = runBytes threeLines
+            let! result = runBytes capped
+
+            match full, result with
+            | Ok full, Ok result ->
+                Assert.That(full.Stdout.Length, Is.GreaterThan cap, "the payload must exceed the cap to truncate")
+                Assert.That(result.Truncated, Is.True)
+                Assert.That(result.Stdout.Length, Is.EqualTo cap)
+                CollectionAssert.AreEqual(full.Stdout[full.Stdout.Length - cap ..], result.Stdout) // the tail
+            | other -> Assert.Fail $"expected both captures to succeed, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputBytes DropNewest keeps the first cap bytes and flags truncation``() : Task =
+        task {
+            let cap = 5
+
+            let capped =
+                threeLines
+                |> Command.outputBuffer (
+                    (OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow OverflowMode.DropNewest
+                )
+
+            let! full = runBytes threeLines
+            let! result = runBytes capped
+
+            match full, result with
+            | Ok full, Ok result ->
+                Assert.That(full.Stdout.Length, Is.GreaterThan cap, "the payload must exceed the cap to truncate")
+                Assert.That(result.Truncated, Is.True)
+                Assert.That(result.Stdout.Length, Is.EqualTo cap)
+                CollectionAssert.AreEqual(full.Stdout[.. cap - 1], result.Stdout) // the head
+            | other -> Assert.Fail $"expected both captures to succeed, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputBytes Error trips OutputTooLarge once the byte cap is exceeded``() : Task =
+        task {
+            let command =
+                threeLines
+                |> Command.outputBuffer ((OutputBufferPolicy.Unbounded.WithMaxBytes 5).WithOverflow OverflowMode.Error)
+
+            match! runBytes command with
+            | Error(ProcessError.OutputTooLarge(_, _, byteLimit, _, totalBytes)) ->
+                Assert.That(byteLimit, Is.EqualTo(Some 5))
+                Assert.That(totalBytes, Is.GreaterThan 5)
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
         }
         :> Task
 

@@ -219,6 +219,10 @@ The two ends of the chain behave like a single `Command`:
   chain connected.
 - Each inner stage's **stderr** is captured per-stage for pipefail diagnostics; only the
   last stage's stdout reaches you.
+- The **last** stage's [`OutputBuffer`](commands.md#raw-byte-captures-obey-the-byte-cap-too) byte
+  cap (`MaxBytes` + `Overflow`) bounds the captured stdout — the same way a single command's
+  `OutputBytesAsync` does (`Error` -> `OutputTooLarge`, `DropOldest`/`DropNewest` -> a tail/head with
+  `Truncated` set). Its `MaxLines`, and every intermediate stage's buffer policy, do not apply.
 
 **F#**
 

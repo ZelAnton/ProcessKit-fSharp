@@ -79,6 +79,103 @@ module internal Pump =
                 retained.AddLast line |> ignore
                 retainedBytes <- retainedBytes + bytes
 
+    /// The retained bytes of a bounded raw-byte capture, plus whether the byte cap truncated them
+    /// (`DropOldest`/`DropNewest`) or tripped the fail-loud ceiling (`Error`), and the cumulative byte
+    /// total seen (`TotalBytes`, saturating at `Int32.MaxValue` — carried into the `OutputTooLarge`
+    /// diagnostics). A raw byte stream has no line structure, so `TotalLines` is meaningless and is not
+    /// tracked here.
+    type RawCapture =
+        { Bytes: byte[]
+          Truncated: bool
+          TooLarge: bool
+          TotalBytes: int }
+
+    /// Accumulates retained raw stdout bytes under an `OutputBufferPolicy`'s byte cap + `OverflowMode` —
+    /// the byte-stream analogue of `LineBuffer` (which retains decoded lines). Only `MaxBytes` and
+    /// `Overflow` govern a raw byte stream; `MaxLines` has no meaning without line structure, so it is
+    /// ignored by construction. The unbounded (`MaxBytes = None`) case never constructs this — it uses
+    /// `drainRaw` — so `cap` is always the configured non-negative `MaxBytes`. `DropOldest` keeps the
+    /// LAST `cap` bytes (a byte ring built from retained chunks, evicting the front); `DropNewest` and
+    /// `Error` keep the FIRST `cap` bytes, `Error` additionally tripping its fail-loud ceiling once the
+    /// cap is exceeded. Memory is bounded to `cap` (plus one in-flight read chunk while evicting), so a
+    /// small cap never buffers a large flood. Not thread-safe; one per stream.
+    type RawBuffer(cap: int, overflow: OverflowMode) =
+        // DropOldest retains from the tail (evicting the front); Error/DropNewest retain from the head.
+        let isTail = overflow = OverflowMode.DropOldest
+        // Retained bytes as their arrived chunks. `frontOffset` skips already-evicted bytes at the front
+        // of the first chunk, so a tail eviction can trim at sub-chunk granularity without recopying the
+        // survivors. `retained` is the live retained-byte count (Σ chunk lengths − frontOffset).
+        let chunks = LinkedList<byte[]>()
+        let mutable frontOffset = 0
+        let mutable retained = 0
+        let mutable total = 0L
+
+        /// Record a chunk of raw bytes, applying the byte cap. `source[offset .. offset+count-1]` is
+        /// copied out (the caller reuses `source` across reads), so the buffer owns its retained bytes.
+        member _.Append(source: byte[], offset: int, count: int) =
+            if count > 0 then
+                total <- total + int64 count
+
+                if isTail then
+                    // Retain the new bytes, then evict from the front until we fit `cap` (only the LAST
+                    // `cap` bytes of the whole stream can survive).
+                    chunks.AddLast(Array.sub source offset count) |> ignore
+                    retained <- retained + count
+
+                    while retained > cap && chunks.Count > 0 do
+                        match chunks.First with
+                        | null ->
+                            // Unreachable while Count > 0 (a non-empty LinkedList has a First node); the
+                            // arm exists only to satisfy the nullable match and never loops.
+                            ()
+                        | node ->
+                            let available = node.Value.Length - frontOffset
+                            let over = retained - cap
+
+                            if available <= over then
+                                // The whole front chunk is now stale — drop it.
+                                chunks.RemoveFirst()
+                                frontOffset <- 0
+                                retained <- retained - available
+                            else
+                                // Part of the front chunk survives — skip its stale prefix in place.
+                                frontOffset <- frontOffset + over
+                                retained <- retained - over
+                elif retained < cap then
+                    // Head: retain only up to `cap`; the excess is dropped (DropNewest) or trips the
+                    // fail-loud ceiling (Error) — `Truncated`/`TooLarge` below read that off `total`.
+                    let take = min count (cap - retained)
+                    chunks.AddLast(Array.sub source offset take) |> ignore
+                    retained <- retained + take
+
+        /// True once anything was dropped (a `DropOldest`/`DropNewest` truncation); always false for
+        /// `Error`, whose over-cap signal is `TooLarge`.
+        member _.Truncated = overflow <> OverflowMode.Error && total > int64 cap
+
+        /// True once an `Error` (fail-loud) cap is exceeded; always false for the dropping modes.
+        member _.TooLarge = overflow = OverflowMode.Error && total > int64 cap
+
+        /// Cumulative stdout bytes seen, saturating at `Int32.MaxValue` (a raw flood can exceed it).
+        member _.TotalBytes = int (min total (int64 Int32.MaxValue))
+
+        /// The retained bytes, in stream order.
+        member _.ToArray() : byte[] =
+            let result = Array.zeroCreate<byte> retained
+            let mutable pos = 0
+            // Skip the evicted prefix on the first chunk only (`frontOffset`); later chunks are whole.
+            let mutable skip = frontOffset
+
+            for chunk in chunks do
+                let len = chunk.Length - skip
+
+                if len > 0 then
+                    Array.blit chunk skip result pos len
+                    pos <- pos + len
+
+                skip <- 0
+
+            result
+
     /// Read `stream` to EOF: tee the raw bytes (if a sink is set), decode with `encoding`, split
     /// into lines (stripping `\n` / `\r\n`), and pass each complete line — including a final
     /// unterminated one — to `onLine`. When `maxLineLength` is set, an unterminated line that reaches
@@ -255,6 +352,75 @@ module internal Pump =
         match stream with
         | Some s -> drainRaw s tee cancellationToken
         | None -> Task.FromResult Array.empty<byte>
+
+    /// Read `stream` to EOF as raw bytes under an `OutputBufferPolicy`'s byte `cap` + `overflow` mode,
+    /// teeing the FULL byte stream if a sink is set — the tee mirrors exactly what the child produced,
+    /// so it is independent of the in-memory retention policy (just as `readLines` tees before its line
+    /// buffer applies). Returns the retained bytes plus the truncation / fail-loud / total signals. The
+    /// child never blocks: the pipe is always drained to EOF even after the cap is reached.
+    let drainRawBounded
+        (stream: Stream)
+        (tee: Stream option)
+        (cap: int)
+        (overflow: OverflowMode)
+        (cancellationToken: CancellationToken)
+        : Task<RawCapture> =
+        task {
+            let buffer = RawBuffer(cap, overflow)
+            let chunk = Array.zeroCreate<byte> 8192
+            let mutable reading = true
+
+            while reading do
+                let! read = stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)
+
+                if read = 0 then
+                    reading <- false
+                else
+                    match tee with
+                    | Some sink -> do! sink.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
+                    | None -> ()
+
+                    buffer.Append(chunk, 0, read)
+
+            return
+                { Bytes = buffer.ToArray()
+                  Truncated = buffer.Truncated
+                  TooLarge = buffer.TooLarge
+                  TotalBytes = buffer.TotalBytes }
+        }
+
+    /// Capture an optional raw stdout stream to EOF under `policy`. `policy.MaxBytes = None` keeps the
+    /// capture UNBOUNDED (via `drainRaw`, unchanged) — there is no byte ceiling to enforce, so its
+    /// `Truncated`/`TooLarge` are always false; `Some cap` applies the byte cap + `Overflow` mode
+    /// (`MaxLines` never applies to a raw byte stream — it has no line structure). The single entry
+    /// point the byte verb (`RunningProcess.OutputBytesAsync`) and the pipeline's last-stage capture
+    /// share, so their raw-capture semantics can't drift.
+    let captureRawOrEmpty
+        (stream: Stream option)
+        (tee: Stream option)
+        (policy: OutputBufferPolicy)
+        (cancellationToken: CancellationToken)
+        : Task<RawCapture> =
+        match policy.MaxBytes with
+        | None ->
+            task {
+                let! bytes = drainRawOrEmpty stream tee cancellationToken
+
+                return
+                    { Bytes = bytes
+                      Truncated = false
+                      TooLarge = false
+                      TotalBytes = bytes.Length }
+            }
+        | Some cap ->
+            match stream with
+            | Some s -> drainRawBounded s tee cap policy.Overflow cancellationToken
+            | None ->
+                Task.FromResult
+                    { Bytes = Array.empty<byte>
+                      Truncated = false
+                      TooLarge = false
+                      TotalBytes = 0 }
 
     /// Dispose a stream, swallowing the exceptions a teardown race raises — a double-close, or a
     /// broken pipe surfaced while flushing on dispose because the peer is already gone. The one
