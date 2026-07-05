@@ -84,11 +84,16 @@ module internal Pump =
     /// unterminated one — to `onLine`. When `maxLineLength` is set, an unterminated line that reaches
     /// that many characters is force-flushed to `onLine` as a segment, so a newline-free flood can't
     /// grow the in-flight buffer without bound (the segment then goes through the caller's buffer policy).
+    ///
+    /// `onLine` returns a `ValueTask` (not `unit`) so a streaming consumer's sink can genuinely await —
+    /// e.g. a bounded channel's backpressured `WriteAsync`, which must stop this very read loop from
+    /// draining more of the pipe until the consumer catches up. A buffered sink (a `LineBuffer`) is
+    /// synchronous work wrapped in `ValueTask.CompletedTask`, so it costs nothing extra on that path.
     let readLines
         (stream: Stream)
         (encoding: Encoding)
         (tee: Stream option)
-        (onLine: string -> unit)
+        (onLine: string -> ValueTask)
         (maxLineLength: int option)
         (cancellationToken: CancellationToken)
         : Task =
@@ -128,7 +133,7 @@ module internal Pump =
                                 if line.Length > 0 && line[line.Length - 1] = '\r' then
                                     line.Length <- line.Length - 1
 
-                                onLine (line.ToString())
+                                do! onLine (line.ToString())
                                 line.Clear() |> ignore
                             else
                                 match maxLineLength with
@@ -136,7 +141,7 @@ module internal Pump =
                                     // Force-flush an over-long unterminated line so a newline-free flood
                                     // can't grow the in-flight buffer past the cap; the flushed segment
                                     // then goes through the caller's buffer policy (dropped / errored).
-                                    onLine (line.ToString())
+                                    do! onLine (line.ToString())
                                     line.Clear() |> ignore
                                 | _ -> ()
 
@@ -148,7 +153,7 @@ module internal Pump =
                 if line[line.Length - 1] = '\r' then
                     line.Length <- line.Length - 1
 
-                onLine (line.ToString())
+                do! onLine (line.ToString())
         }
         :> Task
 
@@ -159,7 +164,7 @@ module internal Pump =
         (stream: Stream)
         (encoding: Encoding)
         (tee: Stream option)
-        (onLine: string -> unit)
+        (onLine: string -> ValueTask)
         (maxLineLength: int option)
         (cancellationToken: CancellationToken)
         : Task =

@@ -18,6 +18,7 @@ streams are `await foreach`.
 - [Lifecycle](#lifecycle)
 - [Streaming stdout line by line](#streaming-stdout-line-by-line)
 - [Interleaving stdout and stderr](#interleaving-stdout-and-stderr)
+- [Bounding the streaming backlog](#bounding-the-streaming-backlog)
 - [Finishing a streamed run](#finishing-a-streamed-run)
 - [Interactive stdin](#interactive-stdin)
 - [Readiness probes](#readiness-probes)
@@ -180,6 +181,93 @@ await foreach (var ev in proc.OutputEventsAsync())
 From C#, `await foreach (var ev in proc.OutputEventsAsync()) { ... }`. Choose `OutputEventsAsync()`
 *or* `StdoutLinesAsync()` for a given run — both consume stdout, so they are alternatives,
 not companions.
+
+## Bounding the streaming backlog
+
+By default, the channel that feeds `StdoutLinesAsync()` / `OutputEventsAsync()` / `WaitForLineAsync()`
+is **unbounded**: a producer far outrunning your consumer (a chatty child, a slow line handler) just
+grows the in-flight backlog — exactly the behavior ProcessKit has always had. `Command.StreamBuffer`
+opts in to a bounded channel instead, capping that backlog with one of four `StreamFullMode`s:
+
+- **`Backpressure`** (the default for `StreamBufferPolicy.Bounded(capacity)`) — the pump stops
+  draining the OS pipe once the channel is full, so the child itself observably blocks writing to a
+  full stdout/stderr pipe until your consumer catches up. Bounds memory losslessly, at the cost of the
+  child's timing — pick this for a *trusted* producer you genuinely want to pace against your consumer
+  (tailing a log, a pipeline stage).
+- **`DropOldest`** — "tail" semantics: once full, the oldest queued line is discarded to make room for
+  the newest. Lossy but bounded.
+- **`DropNewest`** — "head" semantics: once full, the incoming line is discarded and what's already
+  queued is kept.
+- **`Error`** — fail loud: once the cap is reached, the streaming enumerator throws (carrying
+  `ProcessError.OutputTooLarge`) instead of silently dropping anything.
+
+Both `DropOldest` and `DropNewest` bump `RunningProcess.DroppedStreamLineCount` — a live counter (like
+`StdoutLineCount`/`StderrLineCount`) so a lossy policy's drops are always visible, never silent:
+
+**F#**
+
+```fsharp
+task {
+    let command =
+        (Command.create "chatty-tool")
+            .StreamBuffer(StreamBufferPolicy.Bounded(1000, StreamFullMode.DropOldest))
+
+    match! command.StartAsync() with
+    | Error err -> eprintfn $"{err.Message}"
+    | Ok proc ->
+        use _ = proc
+        let e = proc.StdoutLinesAsync().GetAsyncEnumerator()
+
+        try
+            let mutable go = true
+
+            while go do
+                match! e.MoveNextAsync() with
+                | true -> printfn $"{e.Current}"
+                | false -> go <- false
+        finally
+            e.DisposeAsync().AsTask().Wait()
+
+        if proc.DroppedStreamLineCount > 0 then
+            printfn $"dropped {proc.DroppedStreamLineCount} lines to stay within the bound"
+}
+```
+
+**C#**
+
+```csharp
+var command = new Command("chatty-tool")
+    .StreamBuffer(StreamBufferPolicy.Bounded(1000, StreamFullMode.DropOldest));
+
+await using var proc = (await command.StartAsync()).GetValueOrThrow();
+
+await foreach (var line in proc.StdoutLinesAsync())
+    Console.WriteLine(line);
+
+if (proc.DroppedStreamLineCount > 0)
+    Console.WriteLine($"dropped {proc.DroppedStreamLineCount} lines to stay within the bound");
+```
+
+**The backpressure deadlock footgun.** `StreamFullMode.Backpressure` slows the *child*, not your code
+— but if your consumption loop itself never resumes (it's stuck waiting on something that, in turn,
+waits for the child to finish), the child can never finish either: it's blocked writing to a pipe
+nobody is reading, forever. This is the same full-duplex hazard as the
+[interactive-stdin deadlock](#interactive-stdin) above, just on the read side instead of the write
+side. Two things to know before opting in:
+
+- A `Command.Timeout` kills the *child* at the deadline, but that alone does **not** free a writer your
+  own pump is parked on if you also never read again — the child dying doesn't hand the pump anything
+  new to write, but a pump already blocked *inside* a `WriteAsync` call only unblocks when either the
+  channel gets read from again or the `RunningProcess` itself is disposed. In other words: pairing
+  `Backpressure` with `Command.Timeout` bounds the *child's* lifetime, not necessarily your consumer's.
+- Give your **own** consumption loop a deadline (a `CancellationToken` passed to
+  `GetAsyncEnumerator(token)`, or a read-side timeout around each `MoveNextAsync()`), and make sure you
+  `Dispose`/`DisposeAsync` the `RunningProcess` promptly if you give up on it — disposal always
+  unblocks a writer parked on backpressure, so the pump can wind down instead of leaking forever as an
+  abandoned background task.
+
+If you can't reason about your consumer always resuming, prefer `DropOldest`/`DropNewest` (never
+blocks the child) or `Error` (fails loud instead of stalling) over `Backpressure`.
 
 ## Finishing a streamed run
 

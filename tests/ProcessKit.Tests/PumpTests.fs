@@ -4,6 +4,7 @@ open System
 open System.IO
 open System.Text
 open System.Threading
+open System.Threading.Tasks
 open NUnit.Framework
 open NUnit.Framework.Legacy
 open ProcessKit
@@ -20,7 +21,18 @@ type PumpTests() =
     let collect (bytes: byte[]) (encoding: Encoding) : string list =
         use stream = new MemoryStream(bytes)
         let lines = ResizeArray<string>()
-        (Pump.readLines stream encoding None (fun l -> lines.Add l) None CancellationToken.None).Wait()
+
+        (Pump.readLines
+            stream
+            encoding
+            None
+            (fun l ->
+                lines.Add l
+                ValueTask.CompletedTask)
+            None
+            CancellationToken.None)
+            .Wait()
+
         List.ofSeq lines
 
     [<Test>]
@@ -78,7 +90,16 @@ type PumpTests() =
         use stream = new MemoryStream(Encoding.UTF8.GetBytes "aaabbbc")
         let segments = ResizeArray<string>()
 
-        (Pump.readLines stream Encoding.UTF8 None (fun l -> segments.Add l) (Some 3) CancellationToken.None).Wait()
+        (Pump.readLines
+            stream
+            Encoding.UTF8
+            None
+            (fun l ->
+                segments.Add l
+                ValueTask.CompletedTask)
+            (Some 3)
+            CancellationToken.None)
+            .Wait()
 
         CollectionAssert.AreEqual([ "aaa"; "bbb"; "c" ], segments)
 
@@ -90,5 +111,16 @@ type PumpTests() =
             Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes(3).WithOverflow OverflowMode.Error)
 
         use stream = new MemoryStream(Encoding.UTF8.GetBytes "aaaaaaaaaa")
-        (Pump.readLines stream Encoding.UTF8 None buf.Add (Some 3) CancellationToken.None).Wait()
+
+        (Pump.readLines
+            stream
+            Encoding.UTF8
+            None
+            (fun l ->
+                buf.Add l
+                ValueTask.CompletedTask)
+            (Some 3)
+            CancellationToken.None)
+            .Wait()
+
         Assert.That(buf.TooLarge, Is.True)

@@ -42,6 +42,7 @@ class ProcessKit.Command
   member Stdout(ProcessKit.StdioMode) : ProcessKit.Command
   member StdoutEncoding(System.Text.Encoding) : ProcessKit.Command
   member StdoutTee(System.IO.Stream) : ProcessKit.Command
+  member StreamBuffer(ProcessKit.StreamBufferPolicy) : ProcessKit.Command
   member Timeout(System.TimeSpan) : ProcessKit.Command
   member TimeoutGrace(System.TimeSpan) : ProcessKit.Command
   member UncheckedInPipe() : ProcessKit.Command
@@ -76,6 +77,7 @@ module ProcessKit.CommandModule
   static member stdout(ProcessKit.StdioMode, ProcessKit.Command) : ProcessKit.Command
   static member stdoutEncoding(System.Text.Encoding, ProcessKit.Command) : ProcessKit.Command
   static member stdoutTee(System.IO.Stream, ProcessKit.Command) : ProcessKit.Command
+  static member streamBuffer(ProcessKit.StreamBufferPolicy, ProcessKit.Command) : ProcessKit.Command
   static member timeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member timeoutGrace(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member uncheckedInPipe(ProcessKit.Command) : ProcessKit.Command
@@ -673,6 +675,7 @@ class ProcessKit.RunningProcess
   member WaitForLineAsync(System.Func<System.String, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
   member WaitForPortAsync(System.Net.IPEndPoint, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
+  property DroppedStreamLineCount : System.Int32 { get }
   property Elapsed : System.TimeSpan { get }
   property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property Pid : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
@@ -810,6 +813,48 @@ module ProcessKit.StopReason+Tags
   field literal PolicySatisfied : System.Int32
   field literal Predicate : System.Int32
   field literal RestartsExhausted : System.Int32
+
+class ProcessKit.StreamBufferPolicy
+  member WithFullMode(ProcessKit.StreamFullMode) : ProcessKit.StreamBufferPolicy
+  property Capacity : System.Int32 { get }
+  property FullMode : ProcessKit.StreamFullMode { get }
+  static member Bounded(System.Int32) : ProcessKit.StreamBufferPolicy
+  static member Bounded(System.Int32, ProcessKit.StreamFullMode) : ProcessKit.StreamBufferPolicy
+
+class ProcessKit.StreamFullMode
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.StreamFullMode>
+  member Equals(ProcessKit.StreamFullMode) : System.Boolean
+  member Equals(ProcessKit.StreamFullMode, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsBackpressure() : System.Boolean
+  member get_IsDropNewest() : System.Boolean
+  member get_IsDropOldest() : System.Boolean
+  member get_IsError() : System.Boolean
+  member get_Tag() : System.Int32
+  property Backpressure : ProcessKit.StreamFullMode { get }
+  property DropNewest : ProcessKit.StreamFullMode { get }
+  property DropOldest : ProcessKit.StreamFullMode { get }
+  property Error : ProcessKit.StreamFullMode { get }
+  property IsBackpressure : System.Boolean { get }
+  property IsDropNewest : System.Boolean { get }
+  property IsDropOldest : System.Boolean { get }
+  property IsError : System.Boolean { get }
+  property Tag : System.Int32 { get }
+  static member get_Backpressure() : ProcessKit.StreamFullMode
+  static member get_DropNewest() : ProcessKit.StreamFullMode
+  static member get_DropOldest() : ProcessKit.StreamFullMode
+  static member get_Error() : ProcessKit.StreamFullMode
+
+module ProcessKit.StreamFullMode+Tags
+  field literal Backpressure : System.Int32
+  field literal DropNewest : System.Int32
+  field literal DropOldest : System.Int32
+  field literal Error : System.Int32
 
 class ProcessKit.SupervisionOutcome
   property FinalResult : ProcessKit.ProcessResult<System.String> { get }

@@ -1,5 +1,7 @@
 namespace ProcessKit
 
+open System
+
 /// How a child's stdout or stderr stream is connected. Set per-stream on `Command` via
 /// `Stdout`/`Stderr`; the default is `Piped`.
 [<RequireQualifiedAccess; NoComparison>]
@@ -80,3 +82,60 @@ type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, ov
 
     /// The default policy: retain everything.
     static member Default = OutputBufferPolicy.Unbounded
+
+/// How a bounded *streaming* channel behaves once its capacity is reached — the streaming analogue of
+/// `OverflowMode`, but with a genuine backpressure option that only makes sense against a live
+/// consumer (a buffered one-shot verb has no such consumer to pace, which is why `OutputBufferPolicy`
+/// has no equivalent case).
+[<RequireQualifiedAccess; NoComparison>]
+type StreamFullMode =
+
+    /// Slow the producer down instead of dropping anything: the pump stops draining the OS pipe until
+    /// the consumer catches up, so the child itself observably blocks writing to a full stdout/stderr
+    /// pipe. Bounds memory losslessly, at the cost of the child's timing — opt in only when you intend
+    /// to pace a trusted producer against your consumer (see the deadlock note in
+    /// [Streaming](../../docs/streaming.md) before using it: a `Command.Timeout` kills the *child* but
+    /// does not by itself free a writer parked here if you abandon reading — dispose the
+    /// `RunningProcess` to release it).
+    | Backpressure
+
+    /// Ring-buffer / "tail" semantics: drop the oldest queued item to make room for the newest.
+    /// Lossy but bounded; sets `RunningProcess.DroppedStreamLineCount`.
+    | DropOldest
+
+    /// "Head" semantics: keep what is already queued and drop the newest incoming item.
+    /// Lossy but bounded; sets `RunningProcess.DroppedStreamLineCount`.
+    | DropNewest
+
+    /// Fail-loud ceiling: once the cap is reached, fault the stream with `ProcessError.OutputTooLarge`
+    /// (observed by the consumer as the streaming enumerator throwing, the same fault path a throwing
+    /// per-line handler already uses).
+    | Error
+
+/// An opt-in bounded/backpressure policy for the streaming verbs (`StdoutLinesAsync` /
+/// `OutputEventsAsync` / `WaitForLineAsync`), set via `Command.StreamBuffer`. Unlike
+/// `OutputBufferPolicy` — which bounds an in-memory *buffer* a one-shot verb assembles — this bounds
+/// the *channel* between the background pump and your live consumer. Leaving it unset keeps today's
+/// unbounded channel: an unbounded, uncapped in-flight backlog, exactly as before this policy existed.
+[<Sealed>]
+type StreamBufferPolicy internal (capacity: int, fullMode: StreamFullMode) =
+
+    /// The bounded channel capacity, in lines/events not yet read by the consumer.
+    member _.Capacity = capacity
+
+    /// What happens once the channel reaches `Capacity`.
+    member _.FullMode = fullMode
+
+    /// A channel bounded to `capacity` items that backpressures the producer once full — the safest
+    /// default for an opt-in cap: lossless, at the cost of the child's observable timing.
+    static member Bounded(capacity: int) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1)
+        StreamBufferPolicy(capacity, StreamFullMode.Backpressure)
+
+    /// A channel bounded to `capacity` items with an explicit `fullMode`.
+    static member Bounded(capacity: int, fullMode: StreamFullMode) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1)
+        StreamBufferPolicy(capacity, fullMode)
+
+    /// A copy with the full-mode changed, composable with any policy.
+    member _.WithFullMode(fullMode: StreamFullMode) = StreamBufferPolicy(capacity, fullMode)

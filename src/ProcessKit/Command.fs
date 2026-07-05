@@ -82,6 +82,10 @@ type internal CommandConfig =
       StdoutTee: Stream option
       StderrTee: Stream option
       OutputBuffer: OutputBufferPolicy
+      // Opt-in bounded/backpressure policy for the streaming verbs (`StdoutLinesAsync`/
+      // `OutputEventsAsync`/`WaitForLineAsync`). `None` (the default) keeps the unbounded streaming
+      // channels ProcessKit has always used.
+      StreamBuffer: StreamBufferPolicy option
       Timeout: TimeSpan option
       TimeoutGrace: TimeSpan option
       CancelOn: CancellationToken option
@@ -113,6 +117,7 @@ module internal CommandConfig =
           StdoutTee = None
           StderrTee = None
           OutputBuffer = OutputBufferPolicy.Default
+          StreamBuffer = None
           Timeout = None
           TimeoutGrace = None
           CancelOn = None
@@ -281,6 +286,18 @@ type Command internal (config: CommandConfig) =
         ArgumentNullException.ThrowIfNull policy
         Command({ config with OutputBuffer = policy })
 
+    /// Opt in to a bounded/backpressure channel for the streaming verbs (`StdoutLinesAsync`/
+    /// `OutputEventsAsync`/`WaitForLineAsync`). Unset (the default) keeps the unbounded streaming
+    /// channel ProcessKit has always used. See [Streaming](../../docs/streaming.md) for the
+    /// backpressure deadlock footgun before opting in to `StreamFullMode.Backpressure`.
+    member _.StreamBuffer(policy: StreamBufferPolicy) =
+        ArgumentNullException.ThrowIfNull policy
+
+        Command(
+            { config with
+                StreamBuffer = Some policy }
+        )
+
     /// The configured run timeout, if any.
     member _.ConfiguredTimeout = config.Timeout
 
@@ -418,6 +435,9 @@ module Command =
 
     /// Bound the in-memory backlog of captured lines.
     let outputBuffer (policy: OutputBufferPolicy) (command: Command) = command.OutputBuffer policy
+
+    /// Opt in to a bounded/backpressure channel for the streaming verbs (default stays unbounded).
+    let streamBuffer (policy: StreamBufferPolicy) (command: Command) = command.StreamBuffer policy
 
     /// Kill the run after `duration`.
     let timeout (duration: TimeSpan) (command: Command) = command.Timeout duration

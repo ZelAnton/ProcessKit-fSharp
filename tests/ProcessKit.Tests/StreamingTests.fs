@@ -7,8 +7,10 @@ open System.IO
 open System.Runtime.InteropServices
 open System.Text
 open System.Threading
+open System.Threading.Channels
 open System.Threading.Tasks
 open NUnit.Framework
+open NUnit.Framework.Legacy
 open ProcessKit
 
 [<TestFixture>]
@@ -70,6 +72,52 @@ type StreamingTests() =
                 return None
             with :? InvalidOperationException as ex ->
                 return Some ex.Message
+        }
+
+    // A synthetic `RunningProcess` over an in-memory stdout payload — no real subprocess, no OS pipe.
+    // The `StreamBuffer` tests below need to control *exactly* when the consumer starts reading
+    // relative to the producer, so they can assert on the bounded channel deterministically; racing a
+    // real child process's OS pipe buffering would make the same assertions flaky across the CI matrix.
+    // `Wait` resolves immediately — nothing here exercises the process's own exit path.
+    let syntheticStdoutProcess (config: CommandConfig) (payload: string) : RunningProcess =
+        let stdout = new MemoryStream(Encoding.UTF8.GetBytes payload) :> Stream
+
+        let host: RunningHost =
+            { Config = config
+              Pid = None
+              Stdout = Some stdout
+              Stderr = None
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = Stopwatch.GetTimestamp()
+              Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+              StdinError = fun () -> None
+              StartKill = ignore
+              GracefulKill = fun _ -> Task.CompletedTask
+              Teardown = fun () -> ValueTask() }
+
+        new RunningProcess(host)
+
+    // `total` newline-terminated lines "line-1" .. "line-<total>".
+    let linesPayload (total: int) =
+        String.Join("\n", [ 1..total ] |> List.map (sprintf "line-%d")) + "\n"
+
+    // Unwrap the `ProcessException` a faulted streaming enumerator surfaces. `IAsyncEnumerable`
+    // consumption (`ReadAllAsync`, what `StdoutLinesAsync`/`OutputEventsAsync` return) surfaces the
+    // original exception directly; the single-item `Reader.ReadAsync` (what `WaitForLineAsync` /
+    // `Runner.firstLine` use instead) wraps it in a `ChannelClosedException`. Handle both so this
+    // helper doesn't depend on which of the two a given verb happens to use internally.
+    let processError (drain: Task) =
+        task {
+            try
+                do! drain
+                return None
+            with
+            | :? ProcessException as pe -> return Some pe.Error
+            | :? ChannelClosedException as ex ->
+                match ex.InnerException with
+                | :? ProcessException as pe -> return Some pe.Error
+                | _ -> return None
         }
 
     [<Test>]
@@ -522,5 +570,220 @@ type StreamingTests() =
                 match! running.OutputStringAsync() with
                 | Error(ProcessError.OutputTooLarge _) -> Assert.Pass()
                 | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    // --- Command.StreamBuffer (opt-in bounded/backpressure streaming) ---
+
+    [<Test>]
+    member _.``without StreamBuffer, streaming stays unbounded and drops nothing``() : Task =
+        task {
+            match! runner.StartAsync(threeLines, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let! lines = collect (running.StdoutLinesAsync())
+                let! finished = running.FinishAsync()
+
+                Assert.That(lines.Count, Is.GreaterThanOrEqualTo 3)
+                Assert.That(running.DroppedStreamLineCount, Is.EqualTo 0)
+
+                match finished with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StreamBuffer Backpressure stalls the producer at capacity until the consumer reads``() : Task =
+        task {
+            let total = 30
+            let capacity = 4
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded capacity))
+                    .Config
+
+            use running = syntheticStdoutProcess config (linesPayload total)
+            let enumerable = running.StdoutLinesAsync()
+
+            // Nobody reads during this window, so a genuine backpressure producer can only get to
+            // `capacity` retained items plus the one it's currently blocked writing — nowhere near
+            // `total`. This is deterministic (no OS pipe / scheduler timing involved): the synthetic
+            // stdout is already fully in memory, so the pump would race straight to EOF if it weren't
+            // being throttled by the bounded channel.
+            do! Task.Delay 200
+
+            Assert.That(
+                running.StdoutLineCount,
+                Is.LessThanOrEqualTo(capacity + 2),
+                "a Backpressure producer must stall once the bounded channel fills, not race ahead unread"
+            )
+
+            let! lines = collect enumerable
+            Assert.That(lines.Count, Is.EqualTo total)
+            Assert.That(lines[0], Is.EqualTo "line-1")
+            Assert.That(lines[total - 1], Is.EqualTo(sprintf "line-%d" total))
+            Assert.That(running.StdoutLineCount, Is.EqualTo total)
+            Assert.That(running.DroppedStreamLineCount, Is.EqualTo 0)
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StreamBuffer DropNewest keeps the earliest lines and flags the rest as dropped``() : Task =
+        task {
+            let total = 20
+            let capacity = 5
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.DropNewest)))
+                    .Config
+
+            use running = syntheticStdoutProcess config (linesPayload total)
+            let enumerable = running.StdoutLinesAsync()
+
+            // Let the (fully synchronous, in-memory) producer run to completion, unread, before we
+            // start consuming — otherwise a concurrent read could free capacity and change how many
+            // lines end up dropped, making the exact counts below flaky.
+            do! Task.Delay 200
+
+            let! lines = collect enumerable
+
+            Assert.That(lines.Count, Is.EqualTo capacity)
+            CollectionAssert.AreEqual([ for i in 1..capacity -> sprintf "line-%d" i ], lines)
+            Assert.That(running.DroppedStreamLineCount, Is.EqualTo(total - capacity))
+            Assert.That(running.StdoutLineCount, Is.EqualTo total)
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StreamBuffer DropOldest keeps the most recent lines and flags the rest as dropped``() : Task =
+        task {
+            let total = 20
+            let capacity = 5
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.DropOldest)))
+                    .Config
+
+            use running = syntheticStdoutProcess config (linesPayload total)
+            let enumerable = running.StdoutLinesAsync()
+            do! Task.Delay 200
+
+            let! lines = collect enumerable
+
+            Assert.That(lines.Count, Is.EqualTo capacity)
+
+            CollectionAssert.AreEqual([ for i in (total - capacity + 1) .. total -> sprintf "line-%d" i ], lines)
+
+            Assert.That(running.DroppedStreamLineCount, Is.EqualTo(total - capacity))
+            Assert.That(running.StdoutLineCount, Is.EqualTo total)
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StreamBuffer DropOldest on OutputEvents does not livelock when a sibling pump faults``() : Task =
+        task {
+            // Regression: the event channel has two writers (stdout + stderr). If DropOldest's
+            // eviction retry loop only exits on a successful `TryWrite`, a sibling pump completing the
+            // shared channel via its own fault path (a throwing handler) leaves the other pump spinning
+            // forever — `TryRead`/`TryWrite` both permanently `false` — livelocking a CPU core and
+            // hanging `eventOutcome`/anything awaiting this handle's exit.
+            let total = 20
+            let capacity = 3
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.DropOldest))
+                 |> Command.onStderrLine (fun _ -> raise (InvalidOperationException "boom")))
+                    .Config
+
+            let stdout = new MemoryStream(Encoding.UTF8.GetBytes(linesPayload total)) :> Stream
+            let stderr = new MemoryStream(Encoding.UTF8.GetBytes "err1\n") :> Stream
+
+            let host: RunningHost =
+                { Config = config
+                  Pid = None
+                  Stdout = Some stdout
+                  Stderr = Some stderr
+                  Stdin = None
+                  StartTime = DateTime.UtcNow
+                  StartedTimestamp = Stopwatch.GetTimestamp()
+                  Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+                  StdinError = fun () -> None
+                  StartKill = ignore
+                  GracefulKill = fun _ -> Task.CompletedTask
+                  Teardown = fun () -> ValueTask() }
+
+            use running = new RunningProcess(host)
+            // Must complete within the deadline — a regression here hangs forever, not merely slowly.
+            // Whatever it settles as (a clean partial drain or some flavor of fault) is fine; the point
+            // of this test is that it settles at all, instead of spinning forever on DropOldest.
+            let! drain = drainWithDeadline (running.OutputEventsAsync()) 5000
+
+            try
+                do! drain
+            with _ ->
+                ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StreamBuffer Error faults the streaming enumerator with OutputTooLarge at the cap``() : Task =
+        task {
+            let total = 20
+            let capacity = 3
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.Error)))
+                    .Config
+
+            use running = syntheticStdoutProcess config (linesPayload total)
+            let! drain = drainWithDeadline (running.StdoutLinesAsync()) 5000
+            let! error = processError drain
+
+            match error with
+            | Some(ProcessError.OutputTooLarge _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForLine works over a bounded StreamBuffer``() : Task =
+        task {
+            let total = 10
+            let capacity = 3
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.DropOldest)))
+                    .Config
+
+            use running = syntheticStdoutProcess config (linesPayload total)
+            running.StdoutLinesAsync() |> ignore
+            // Let the producer race to EOF (and drop everything but the newest `capacity` lines)
+            // before we start looking for a match, exactly like the DropOldest test above.
+            do! Task.Delay 200
+
+            let target = sprintf "line-%d" total
+
+            match! running.WaitForLineAsync((fun line -> line = target), TimeSpan.FromSeconds 5.0) with
+            | Ok line -> Assert.That(line, Is.EqualTo target)
+            | Error error -> Assert.Fail $"{error}"
         }
         :> Task
