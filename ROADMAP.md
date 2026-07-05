@@ -33,15 +33,22 @@ The [documentation guide set](docs/README.md) covers all of it in depth.
 
 Deliberate, documented constraints — not correctness bugs — kept here for future hardening:
 
-- **Blocking pipe reads (and the POSIX exit wait).** The Windows exit wait now uses a thread-pool
-  registered wait (no dedicated thread per child), but the parent-side **pipe reads** are still
-  sync-over-async on both platforms — they park a thread-pool thread per piped stream — and the
-  **POSIX exit wait** still blocks a thread per child. Under heavy concurrency (a large `WaitAll`, a
-  `Supervisor`, `Exec.outputAll`) this pressures the thread pool. The public API would not change
-  when the remaining reads/waits move to overlapped (Windows) / `pidfd`-or-reaper (POSIX) I/O.
-- **Streaming backlog.** A streamed (`StdoutLines` / `OutputEvents`) consumer that stops draining
-  while the child floods grows the channel unbounded; the `OutputBufferPolicy` ceiling applies to
-  the *buffered* verbs, and streaming is consumer-paced (pair it with a `Timeout`).
+- **Blocking POSIX pipe reads.** Exit waits no longer block a dedicated thread on either platform —
+  Windows uses a thread-pool registered wait, and POSIX uses an event-driven `SIGCHLD` registration
+  (see [`CHANGELOG.md`](CHANGELOG.md)) — and Windows pipe reads are now genuinely overlapped
+  (`PipeOptions.Asynchronous`, completed via IOCP). The parent-side **pipe reads on POSIX** are still
+  sync-over-async, though — a plain `FileStream` without `FileOptions.Asynchronous` — so they park a
+  thread-pool thread per piped stream on Linux/macOS. Under heavy concurrency (a large `WaitAll`, a
+  `Supervisor`, `Exec.outputAll`) with many piped POSIX children this still pressures the thread pool.
+  The public API would not change when the remaining POSIX reads move to genuinely async I/O.
+- **Streaming backlog.** By default a streamed (`StdoutLines` / `OutputEvents`) consumer that stops
+  draining while the child floods still grows the channel unbounded. Opt in to
+  `Command.StreamBuffer`/`StreamBufferPolicy` to cap it instead — `Backpressure` (the child itself
+  slows down), `DropOldest`/`DropNewest` (lossy but bounded, surfaced on
+  `RunningProcess.DroppedStreamLineCount`), or `Error` (`ProcessError.OutputTooLarge`); see
+  [Streaming](docs/streaming.md#bounding-the-streaming-backlog). The `OutputBufferPolicy` ceiling still
+  applies only to the *buffered* verbs, and an unbounded stream is still consumer-paced (pair it with
+  a `Timeout`).
 - **In-flight line without a byte cap.** With `OutputBufferPolicy.MaxBytes` set, the in-flight
   (not-yet-terminated) line is bounded too — it is force-flushed at the cap, so a newline-free flood
   can't outgrow the buffer. Without a byte cap, or for the consumer-paced *streaming* verbs, a single
@@ -54,10 +61,17 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
 
 ## Future directions
 
-- **Async-I/O hardening.** The Windows exit wait is now a registered wait; the remaining work is
-  overlapped (named-pipe) reads on Windows and an async exit wait on POSIX (`pidfd` on Linux ≥5.3, a
-  single reaper thread otherwise) so heavy concurrency no longer parks a thread per piped stream /
-  per POSIX child. An internal change, no public-API impact; best driven by a concurrency benchmark.
+- **POSIX async pipe reads.** Exit waits on both platforms, and Windows pipe reads, are already
+  event-driven/overlapped (see [`CHANGELOG.md`](CHANGELOG.md)). The remaining piece is the parent-side
+  pipe reads on POSIX, still a plain `FileStream` without `FileOptions.Asynchronous`, so a piped
+  Linux/macOS child still parks a thread-pool thread for the life of its stream. An internal change,
+  no public-API impact; best driven by a concurrency benchmark.
+- **Fully pidfd-driven POSIX exit wait.** The current POSIX exit wait is event-driven via a shared
+  `SIGCHLD` registration (not a thread per child); on Linux it also opens a `pidfd_open` handle per
+  child, today only for bookkeeping (closed alongside the reap). A future revision could make the
+  pidfd itself drive the wait (e.g. `epoll`) for O(1) per-child dispatch instead of a `SIGCHLD`-
+  triggered rescan of every outstanding wait, closer to how tokio waits on Linux — a scalability
+  refinement, not a correctness one; the current design already meets the "no thread per child" goal.
 
 ## Not currently supported
 

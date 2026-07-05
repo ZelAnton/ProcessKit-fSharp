@@ -202,10 +202,13 @@ requested) closes it, since membership is kernel-enforced.
 **In-flight line without a byte cap, and streaming backlog.** `OutputBufferPolicy.MaxBytes` bounds the
 in-flight (not-yet-terminated) line too for the buffered verbs — it is force-flushed at the cap, so a
 newline-free flood can't outgrow the buffer. Without a byte cap, a single not-yet-terminated line still
-grows until end of stream. Likewise, a streamed consumer (`StdoutLinesAsync` / `OutputEventsAsync`) that
-stops draining while the child keeps writing grows the backing channel, since streaming is
-consumer-paced. Set `MaxBytes`, or pair an untrusted or chatty child with a `Command.Timeout`, which
-bounds the run and ends the stream at the deadline.
+grows until end of stream (`MaxBytes` does not apply to the streaming verbs, which are consumer-paced
+instead). By default, a streamed consumer (`StdoutLinesAsync` / `OutputEventsAsync`) that stops draining
+while the child keeps writing grows the backing channel unbounded. Opt in to
+`Command.StreamBuffer`/`StreamBufferPolicy` to cap that channel instead — `Backpressure`,
+`DropOldest`/`DropNewest`, or `Error`; see [Streaming](streaming.md#bounding-the-streaming-backlog) — or
+pair an untrusted or chatty child with a `Command.Timeout`, which bounds the run and ends the stream at
+the deadline either way.
 
 **One consumption per `RunningProcess`.** The streaming verbs compose in one session
 (`WaitForLineAsync` → `StdoutLinesAsync` → `FinishAsync`); `OutputStringAsync` / `OutputBytesAsync` / `WaitAsync` / `ProfileAsync` are
@@ -214,11 +217,15 @@ pipes, a second, conflicting one is refused rather than racing two readers on th
 `Result`-returning verbs return `ProcessError.Unsupported`, while `WaitAsync` / `ProfileAsync` / `StdoutLinesAsync`
 / `OutputEventsAsync` throw `InvalidOperationException`. Pick one consumption model per handle.
 
-**Blocking waits under heavy concurrency.** Internally, waiting on a running child blocks a
-thread-pool thread per process. A very large `WaitAllAsync`, a busy `Supervisor`, or a wide
-`Exec.outputAll` fan-out therefore pressures the thread pool. This is an internal characteristic
-only — the `Task`-based public API does not change when the waits move to overlapped/registered
-I/O — but bound your concurrency accordingly (`Exec.outputAll` already takes a concurrency cap).
+**Blocking I/O under heavy concurrency.** Waiting on a running child no longer blocks a dedicated
+thread on either platform — Windows uses a thread-pool registered wait, and POSIX uses an
+event-driven `SIGCHLD` registration (see [`CHANGELOG.md`](CHANGELOG.md)) — and Windows pipe reads are
+genuinely overlapped (`PipeOptions.Asynchronous`, completed via IOCP). The parent-side pipe reads on
+POSIX are still sync-over-async, though, so a very large `WaitAllAsync`, a busy `Supervisor`, or a wide
+`Exec.outputAll` fan-out of many *piped* Linux/macOS children still pressures the thread pool (one
+parked thread per piped POSIX stream). This is an internal characteristic only — the `Task`-based
+public API does not change when the remaining POSIX reads move to genuinely async I/O — but bound
+your concurrency accordingly (`Exec.outputAll` already takes a concurrency cap).
 
 ---
 
