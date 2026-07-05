@@ -211,14 +211,19 @@ Console.WriteLine(await pipeline.RunAsync() switch
 The two ends of the chain behave like a single `Command`:
 
 - The **first** stage's configured [`Stdin`](commands.md) source is honored — feed the
-  whole pipeline from a string, bytes, a file, or a stream.
-- **Inner** stages always read from the pipe: any `Stdin` source or `KeepStdinOpen`
-  configured on a non-first stage is overridden.
+  whole pipeline from a string, bytes, a file, or a stream. A `Stdin` source on any **later**
+  stage is a configuration error — that stage's stdin is always rewired to the previous stage's
+  stdout — so `.Pipe` rejects it with an `ArgumentException` naming the offending stage.
+- A `KeepStdinOpen` on a stage has no effect inside a chain: a pipeline exposes no live stdin
+  handle to write into, and the relay wires each later stage's stdin itself.
 - Every stage's **stdout** is wired into a pipe — feeding the next stage's stdin, or captured
   at the end — so a `Stdout` mode of `Null` / `Inherit` set on a stage is overridden to keep the
   chain connected.
 - Each inner stage's **stderr** is captured per-stage for pipefail diagnostics; only the
   last stage's stdout reaches you.
+- A per-stage `Timeout` or `Retry` is rejected when the stage is piped (see
+  [Timeouts and cancellation](#timeouts-and-cancellation)); a per-stage `Logger` or `StreamBuffer`
+  has no effect inside a chain — observe or bound an individual command by running it on its own.
 - The **last** stage's [`OutputBuffer`](commands.md#raw-byte-captures-obey-the-byte-cap-too) byte
   cap (`MaxBytes` + `Overflow`) bounds the captured stdout — the same way a single command's
   `OutputBytesAsync` does (`Error` -> `OutputTooLarge`, `DropOldest`/`DropNewest` -> a tail/head with
@@ -294,10 +299,9 @@ Console.WriteLine(await first.RunAsync() switch
 
 The rules:
 
-- An unchecked stage's unclean exit — a non-zero code, a broken-pipe death from a
+- An unchecked stage's unclean exit — a non-zero code, or a broken-pipe death from a
   consumer that closed early (a failed write on Windows; `SIGPIPE` on POSIX where the OS
-  delivers it), or its own per-stage `Command.Timeout` kill — is **skipped** when the
-  chain decides what to report.
+  delivers it) — is **skipped** when the chain decides what to report.
 - A **checked** failure always trumps an unchecked one, regardless of position:
   `uncheckedInPipe` never shields another stage's real failure.
 - A chain whose only failures are unchecked reports **success** — the last stage's stdout
@@ -309,16 +313,16 @@ The rules:
 
 ## Timeouts and cancellation
 
-There are two distinct timeout scopes:
+A pipeline is bounded as a **whole chain** — there is no per-stage timeout:
 
 **F#**
 
 ```fsharp
 task {
     let pipeline =
-        (Command.create "producer" |> Command.timeout (TimeSpan.FromSeconds 10.0)) // per-STAGE: kills just producer
+        (Command.create "producer")
             .Pipe(Command.create "consumer")
-            .Timeout(TimeSpan.FromSeconds 30.0)                                     // whole-CHAIN
+            .Timeout(TimeSpan.FromSeconds 30.0) // whole-CHAIN deadline
 
     match! pipeline.OutputStringAsync() with
     | Ok result -> printfn $"timedOut={result.IsTimedOut}"
@@ -329,9 +333,9 @@ task {
 **C#**
 
 ```csharp
-var pipeline = new Command("producer").Timeout(TimeSpan.FromSeconds(10)) // per-STAGE: kills just producer
+var pipeline = new Command("producer")
     .Pipe(new Command("consumer"))
-    .Timeout(TimeSpan.FromSeconds(30));                                  // whole-CHAIN
+    .Timeout(TimeSpan.FromSeconds(30)); // whole-CHAIN deadline
 
 Console.WriteLine(await pipeline.OutputStringAsync() switch
 {
@@ -344,10 +348,12 @@ Console.WriteLine(await pipeline.OutputStringAsync() switch
   at the deadline the shared group is torn down and the run reports the timeout — on
   `OutputStringAsync` as `IsTimedOut`, on `RunAsync` as an `Error`. Unlike a single command's
   *captured* timeout, there is no salvaged partial stdout to read back.
-- A per-stage **`Command.Timeout`** kills just that stage. The same pipefail rule then
-  applies: a stage that hit its own deadline — inner or last — surfaces on `RunAsync` as that
-  stage's `ProcessError.Timeout`, reporting **that stage's own deadline** (not the
-  chain's).
+- A per-stage **`Command.Timeout`** cannot bound one stage of a chain — a pipeline spawns its
+  stages directly, so a stage's own deadline never fires. Setting one is a configuration error, so
+  `.Pipe` rejects it with an `ArgumentException`. Bound the whole chain with `Pipeline.Timeout`, or
+  run the stage as a standalone `Command` when it needs its own deadline.
+- A per-stage **`Command.Retry`** is rejected the same way — retry is a verb-layer mechanism and
+  pipeline stages are spawned directly, bypassing it. Retry the pipeline as a whole instead.
 
 Cancellation has two forms:
 

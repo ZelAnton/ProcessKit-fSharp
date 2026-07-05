@@ -301,3 +301,59 @@ type PipelineTests() =
             | other -> Assert.Fail $"expected a Parse error, got {other}"
         }
         :> Task
+
+    // --- Fail-fast: per-stage config a pipeline cannot honour is rejected when the stage is piped
+    //     (T-012). A pipeline spawns stages directly and rewires stdin, so these settings never took
+    //     effect; rejecting at build time replaces the previous silent drop. ---
+
+    [<Test>]
+    member _.``a Stdin source on a stage after the first is rejected when piped``() =
+        let withStdin () =
+            sortStage |> Command.stdin (Stdin.FromString "y\n")
+
+        // The two-argument Pipe: the appended (second) stage — index 1 — carries a source.
+        Assert.Throws<ArgumentException>(Action(fun () -> (emit [ "x" ]).Pipe(withStdin ()) |> ignore))
+        |> ignore
+
+        // A later stage appended through Pipeline.Pipe — index 2 — is caught the same way.
+        Assert.Throws<ArgumentException>(Action(fun () -> (emit [ "x" ]).Pipe(sortStage).Pipe(withStdin ()) |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``a per-stage Timeout is rejected on any stage when piped``() =
+        let withTimeout cmd =
+            cmd |> Command.timeout (TimeSpan.FromSeconds 5.0)
+
+        // On the first stage (index 0)...
+        Assert.Throws<ArgumentException>(Action(fun () -> (withTimeout (emit [ "x" ])).Pipe sortStage |> ignore))
+        |> ignore
+
+        // ...and on a later stage (index 1).
+        Assert.Throws<ArgumentException>(Action(fun () -> (emit [ "x" ]).Pipe(withTimeout sortStage) |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``a per-stage Retry is rejected when piped``() =
+        let withRetry cmd =
+            cmd |> Command.retry 3 (TimeSpan.FromMilliseconds 10.0) (fun _ -> true)
+
+        // On the first stage...
+        Assert.Throws<ArgumentException>(Action(fun () -> (withRetry (emit [ "x" ])).Pipe sortStage |> ignore))
+        |> ignore
+
+        // ...and on a later stage.
+        Assert.Throws<ArgumentException>(Action(fun () -> (emit [ "x" ]).Pipe(withRetry sortStage) |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``a Stdin source on stage 0 stays allowed and feeds the whole chain``() : Task =
+        task {
+            // Regression: only stages AFTER the first reject a source; stage 0 feeds the chain.
+            let pipeline =
+                (sortStage |> Command.stdin (Stdin.FromString "banana\napple\n")).Pipe sortStage
+
+            match! pipeline.RunAsync() with
+            | Ok output -> Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana" ]))
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
