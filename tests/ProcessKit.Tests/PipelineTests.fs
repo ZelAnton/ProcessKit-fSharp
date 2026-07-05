@@ -1,13 +1,34 @@
 namespace ProcessKit.Tests
 
 open System
+open System.Collections.Concurrent
+open System.Diagnostics.Metrics
 open System.Runtime.InteropServices
 open System.Text
+open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
+open Microsoft.Extensions.Logging
 open NUnit.Framework
 open NUnit.Framework.Legacy
 open ProcessKit
+
+/// A capturing `ILogger`, scoped to this file's pipeline observability tests (mirrors
+/// `LoggingTests.CapturingLogger` — a `private` type there is not reachable from this file, and
+/// `PipelineTests.fs` compiles before `LoggingTests.fs` regardless).
+type private PipelineCapturingLogger() =
+    let records = ConcurrentQueue<string>()
+    member _.Text = String.Join("\n", records)
+
+    interface ILogger with
+        member _.Log(_logLevel, _eventId, state, error, formatter) =
+            records.Enqueue(formatter.Invoke(state, error))
+
+        member _.IsEnabled(_logLevel) = true
+
+        member _.BeginScope(_state) =
+            { new IDisposable with
+                member _.Dispose() = () }
 
 [<TestFixture>]
 type PipelineTests() =
@@ -48,6 +69,32 @@ type PipelineTests() =
             | None -> sortStage
 
         ((emit [ "banana"; "apple" ]).Pipe last).OutputBytesAsync()
+
+    // Listen to every `int64` measurement on ProcessKit's meter for the pipeline observability
+    // tests below — mirrors `LoggingTests.listenToRunMetrics` (not reachable from this file).
+    let listenToRunMetrics () =
+        let activeDeltas = ConcurrentQueue<int64>()
+        let mutable startedCount = 0L
+        let mutable completedCount = 0L
+
+        let listener = new MeterListener()
+
+        listener.InstrumentPublished <-
+            (fun instrument l ->
+                if instrument.Meter.Name = ProcessKitDiagnostics.MeterName then
+                    l.EnableMeasurementEvents instrument)
+
+        listener.SetMeasurementEventCallback<int64>(
+            MeasurementCallback<int64>(fun instrument value _tags _state ->
+                match instrument.Name with
+                | "processkit.runs.active" -> activeDeltas.Enqueue value
+                | "processkit.runs.started" -> Interlocked.Add(&startedCount, value) |> ignore
+                | "processkit.runs.completed" -> Interlocked.Add(&completedCount, value) |> ignore
+                | _ -> ())
+        )
+
+        listener.Start()
+        listener, activeDeltas, (fun () -> startedCount), (fun () -> completedCount)
 
     [<Test>]
     member _.``two-stage pipeline wires stdout into the next stage's stdin``() : Task =
@@ -389,5 +436,170 @@ type PipelineTests() =
             match! pipeline.RunAsync() with
             | Ok output -> Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana" ]))
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // --- Observability: a pipeline run is whole-chain, not per-stage (T-013) ---
+
+    [<Test>]
+    member _.``a successful pipeline run logs spawn and exit under one shared run id``() : Task =
+        task {
+            let logger = PipelineCapturingLogger()
+
+            let pipeline =
+                ((emit [ "banana"; "apple" ]) |> Command.logger logger).Pipe sortStage
+
+            match! pipeline.RunAsync() with
+            | Ok _ ->
+                Assert.That(logger.Text, Does.Contain "spawned")
+                Assert.That(logger.Text, Does.Contain "finished")
+
+                let runIdOf (m: string) =
+                    Regex.Match(m, @"run ([0-9a-f]+)").Groups[1].Value
+
+                let spawnLine =
+                    logger.Text.Split('\n') |> Array.find (fun l -> l.Contains "spawned")
+
+                let exitLine =
+                    logger.Text.Split('\n') |> Array.find (fun l -> l.Contains "finished")
+
+                let spawnRunId = runIdOf spawnLine
+                Assert.That(spawnRunId, Is.Not.Empty, "spawn carries a run id")
+                Assert.That(runIdOf exitLine, Is.EqualTo spawnRunId, "spawn and exit share the run id")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a successful pipeline run's program label composes every stage's name``() : Task =
+        task {
+            let logger = PipelineCapturingLogger()
+            let stage0 = (emit [ "banana"; "apple" ]) |> Command.logger logger
+            let pipeline = stage0.Pipe sortStage
+
+            match! pipeline.RunAsync() with
+            | Ok _ -> Assert.That(logger.Text, Does.Contain(stage0.Program + " | " + sortStage.Program))
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a pipeline timeout is logged and reports TimedOut``() : Task =
+        task {
+            let logger = PipelineCapturingLogger()
+
+            let sleeper =
+                if isWindows then
+                    shell "ping -n 6 127.0.0.1 >nul"
+                else
+                    shell "sleep 5"
+
+            let pipeline =
+                ((emit [ "hi" ]) |> Command.logger logger).Pipe(sleeper).Timeout(TimeSpan.FromMilliseconds 300.0)
+
+            match! pipeline.RunAsync() with
+            | Error(ProcessError.Timeout _) -> Assert.That(logger.Text, Does.Contain "timed out")
+            | other -> Assert.Fail $"expected Timeout, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``argv is never logged for a pipeline run``() : Task =
+        task {
+            let logger = PipelineCapturingLogger()
+
+            let secretStage =
+                Command.create (if isWindows then "cmd.exe" else "/bin/sh")
+                |> Command.args [ (if isWindows then "/c" else "-c"); "echo ok"; "--token=SUPERSECRET" ]
+                |> Command.logger logger
+
+            let pipeline = secretStage.Pipe sortStage
+
+            let! _ = pipeline.RunAsync()
+            Assert.That(logger.Text, Does.Not.Contain "SUPERSECRET")
+            Assert.That(logger.Text, Does.Contain "spawned")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a successful pipeline run emits one runs.started/completed pair and settles active at zero``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            let pipeline = (emit [ "banana"; "apple" ]).Pipe sortStage
+
+            match! pipeline.RunAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok _ ->
+                Assert.That(started (), Is.EqualTo 1L, "expected exactly one runs.started for the whole chain")
+                Assert.That(completed (), Is.EqualTo 1L, "expected exactly one runs.completed for the whole chain")
+                Assert.That(activeDeltas |> Seq.sum, Is.EqualTo 0L, "runs.active must return to zero")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a timed-out pipeline still settles runs.active at zero without counting extra completions``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            let sleeper =
+                if isWindows then
+                    shell "ping -n 6 127.0.0.1 >nul"
+                else
+                    shell "sleep 5"
+
+            let pipeline =
+                (emit [ "hi" ]).Pipe(sleeper).Timeout(TimeSpan.FromMilliseconds 300.0)
+
+            match! pipeline.RunAsync() with
+            | Error(ProcessError.Timeout _) ->
+                Assert.That(started (), Is.EqualTo 1L)
+                Assert.That(completed (), Is.EqualTo 1L, "a timed-out run still reaches a terminal state")
+                Assert.That(activeDeltas |> Seq.sum, Is.EqualTo 0L, "runs.active must return to zero on timeout")
+            | other -> Assert.Fail $"expected Timeout, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a partial spawn failure past stage 0 clears runs.active without counting as completed``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            // Stage 0 spawns fine; the second stage's program does not exist, so the chain fails to
+            // spawn fully. `runs.started`/`runs.active` were already armed by stage 0 — they must be
+            // closed, but this must never count as `runs.completed` (a spawn failure, not a run that
+            // reached a terminal verb).
+            let pipeline =
+                (shell "echo hello").Pipe(Command.create "pk-definitely-not-a-program-xyz")
+
+            match! pipeline.RunAsync() with
+            | Error _ ->
+                Assert.That(started (), Is.EqualTo 1L, "stage 0 did spawn, so the chain counts as started")
+                Assert.That(completed (), Is.EqualTo 0L, "a spawn failure must not count as completed")
+                Assert.That(activeDeltas |> Seq.sum, Is.EqualTo 0L, "runs.active must not leak on a partial spawn")
+            | Ok _ -> Assert.Fail "expected an error from the missing pipeline stage"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a stage-0 spawn failure emits no run metrics at all``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            // Stage 0 itself never spawns, so — mirroring a single command's own spawn failure never
+            // counting as a run — no `runs.started`/`runs.active` mark is ever armed for this pipeline.
+            let pipeline =
+                (Command.create "pk-definitely-not-a-program-xyz").Pipe(shell "echo hello")
+
+            match! pipeline.RunAsync() with
+            | Error _ ->
+                Assert.That(started (), Is.EqualTo 0L, "stage 0 never spawned, so the run never started")
+                Assert.That(completed (), Is.EqualTo 0L)
+                Assert.That(activeDeltas |> Seq.isEmpty, Is.True, "no runs.active mark was ever armed")
+            | Ok _ -> Assert.Fail "expected an error from the missing stage-0 program"
         }
         :> Task

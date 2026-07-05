@@ -96,12 +96,19 @@ module internal PipelineStageGuard =
 /// `Pipeline.CancelOn` cancels a pipeline). Set the deadline on the pipeline, cancel the whole chain
 /// with `Pipeline.CancelOn`, feed stage 0, or run the command on its own.
 ///
-/// Per-stage config that is simply **inapplicable** inside a pipeline and has no effect: `Logger`
-/// (a pipeline emits no per-stage lifecycle events — observe an individual command by running it on
-/// its own), `StreamBuffer` (a policy for the streaming verbs, which a pipeline does not offer), and
-/// `KeepStdinOpen` / `RunningProcess.TakeStdin` (a pipeline exposes no live handle to write stdin
-/// into — it wires each stage after the first from the previous stage's stdout itself, and a
-/// `KeepStdinOpen` there is an internal wiring detail, not user-reachable).
+/// Observability is whole-pipeline, not per-stage: running the chain emits one `Log.spawn`/`Log.exit`
+/// pair (plus `Log.timeout` on a timeout) and one `Diag.runStarted`/`runCompleted`/`runEnded` triple,
+/// all sharing a single run id — never one set per stage. Stage 0's `Logger` becomes the pipeline's
+/// logger (a per-stage `Logger` on any *other* stage has no effect — set it on stage 0, or observe an
+/// individual command by running it on its own); the `program` tag/label is a composite of every
+/// stage's name, joined `"a | b | c"` (built only from `Command.Program`, never argv/env, so the
+/// argv/env-never-logged invariant holds for a multi-stage run too).
+///
+/// Per-stage config that is simply **inapplicable** inside a pipeline and has no effect: `StreamBuffer`
+/// (a policy for the streaming verbs, which a pipeline does not offer), and `KeepStdinOpen` /
+/// `RunningProcess.TakeStdin` (a pipeline exposes no live handle to write stdin into — it wires each
+/// stage after the first from the previous stage's stdout itself, and a `KeepStdinOpen` there is an
+/// internal wiring detail, not user-reachable).
 [<Sealed>]
 type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancelOn: CancellationToken option) =
 

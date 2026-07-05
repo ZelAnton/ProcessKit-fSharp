@@ -51,6 +51,16 @@ module internal PipelineRunner =
             elif cancellationToken.IsCancellationRequested then
                 return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
             else
+                // The pipeline's observability identity, chosen once no matter how the run ends:
+                // stage 0's `Logger` becomes the pipeline's logger (a pipeline emits one whole-run
+                // event pair, not per-stage events — see the `Pipeline` type doc), one `runId` ties
+                // every event of this run together, and the `program` label is a composite of stage
+                // *names* only (`a | b | c`) — never argv/env, keeping the security invariant that
+                // holds for a single command.
+                let logger = stages[0].Config.Logger
+                let programLabel = stages |> Array.map (fun c -> c.Program) |> String.concat " | "
+                let runId = Diag.newRunId ()
+
                 match ProcessGroup.Create() with
                 | Error error -> return Error error
                 | Ok group ->
@@ -82,6 +92,16 @@ module internal PipelineRunner =
                     let mutable stage0Feed: Task<exn option> option = None
                     let mutable index = 0
 
+                    // Set exactly once, the moment stage 0 actually spawns — mirroring the
+                    // single-command rule that a spawn failure is never counted as a run
+                    // (`RunningProcess` — and its `Diag.runStarted` — only exists after a successful
+                    // native spawn). Guards the `spawnError` branch below: a stage-0 spawn failure
+                    // never armed `runs.active`, so there is nothing to close there; a later stage's
+                    // spawn failure does, and must be closed with `runEnded`.
+                    let mutable runStarted = false
+                    let mutable spawnParentContext = Unchecked.defaultof<ActivityContext>
+                    let mutable startTimeUtc = DateTime.UtcNow
+
                     while index < stages.Length && spawnError.IsNone do
                         // The pipeline owns stdout wiring: every stage's stdout must be a pipe —
                         // intermediate stages feed the next stage's stdin and the last stage's stdout is
@@ -100,6 +120,16 @@ module internal PipelineRunner =
                             spawned.Add sp
 
                             if index = 0 then
+                                // The chain has actually launched: count + mark the whole run in
+                                // flight and log the spawn now — matching `RunningProcess`, which does
+                                // the same at construction, right after its own successful native
+                                // spawn. No single pid represents a multi-process chain, so `None`
+                                // rides here (a pipeline never claims one process's pid as its own).
+                                runStarted <- true
+                                startTimeUtc <- DateTime.UtcNow
+                                spawnParentContext <- Diag.runStarted programLabel
+                                Log.spawn logger programLabel None runId
+
                                 // Only the first stage may carry its own stdin source; feed it and keep the
                                 // feed task so a genuine source-acquisition failure (a missing `FromFile`
                                 // path, say) can surface as `ProcessError.Stdin` on an otherwise-successful
@@ -160,6 +190,16 @@ module internal PipelineRunner =
                         for sp in spawned do
                             Pump.closeSpawned sp
 
+                        // A spawn failure is not a completed run — no duration/outcome to report,
+                        // mirroring a single command's own spawn failure, which never reaches
+                        // `RunningProcess`/`conclude` at all (no `runCompleted`, ever, on this path).
+                        // But if stage 0 already spawned before a LATER stage failed, `runStarted`
+                        // above already marked this run in flight — that mark must be cleared here so
+                        // `runs.active` returns to zero instead of leaking. A stage-0 spawn failure
+                        // never set `runStarted`, so this is then a no-op.
+                        if runStarted then
+                            Diag.runEnded programLabel
+
                         return Error error
                     | None ->
                         let lastSpawned = spawned[spawned.Count - 1]
@@ -187,6 +227,40 @@ module internal PipelineRunner =
                             Pump.closeSpawned sp
 
                         let duration = Stopwatch.GetElapsedTime startedAt
+                        let timedOut = timeoutCts.IsCancellationRequested
+
+                        // The whole chain reaped, its stdout captured: the run reached a terminal
+                        // state. Report it exactly once here — before the cancellation check below can
+                        // override the *returned* Result to `Cancelled` — mirroring `Runner.runToCompletion`,
+                        // which likewise lets a verb's own completion (and its `conclude`) fire before
+                        // the outer cancel-map can replace its result. A timed-out chain additionally
+                        // gets `Log.timeout` (the explicit deadline-kill event), exactly like a single
+                        // command's own `Timeouts.raceTimeout`; the outcome fed to `Log.exit`/`Diag.runCompleted`
+                        // is `Outcome.TimedOut` for that case, else the last stage's raw outcome — the
+                        // same stage whose stdout/duration the pipeline reports as its own.
+                        let overallOutcome =
+                            if timedOut then
+                                Outcome.TimedOut
+                            else
+                                outcomes[outcomes.Length - 1]
+
+                        if timedOut then
+                            match timeout with
+                            | Some deadline -> Log.timeout logger programLabel deadline runId
+                            | None -> ()
+
+                        Log.exit logger programLabel overallOutcome duration runId
+
+                        Diag.runCompleted
+                            programLabel
+                            runId
+                            overallOutcome
+                            None
+                            startTimeUtc
+                            duration
+                            spawnParentContext
+
+                        Diag.runEnded programLabel
 
                         if cancellationToken.IsCancellationRequested then
                             return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
