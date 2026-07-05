@@ -67,11 +67,11 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
   Linux/macOS child still parks a thread-pool thread for the life of its stream. An internal change,
   no public-API impact; best driven by a concurrency benchmark.
 - **Fully pidfd-driven POSIX exit wait.** The current POSIX exit wait is event-driven via a shared
-  `SIGCHLD` registration (not a thread per child); on Linux it also opens a `pidfd_open` handle per
-  child, today only for bookkeeping (closed alongside the reap). A future revision could make the
-  pidfd itself drive the wait (e.g. `epoll`) for O(1) per-child dispatch instead of a `SIGCHLD`-
-  triggered rescan of every outstanding wait, closer to how tokio waits on Linux — a scalability
-  refinement, not a correctness one; the current design already meets the "no thread per child" goal.
+  `SIGCHLD` registration (not a thread per child). A future revision could open a `pidfd_open`
+  handle (Linux >= 5.3) per child and drive the wait off it directly (e.g. `waitid(P_PIDFD)` /
+  `epoll`) for O(1) per-child dispatch and pid-reuse-safe reaping, instead of a `SIGCHLD`-triggered
+  rescan of every outstanding wait, closer to how tokio waits on Linux — a scalability refinement,
+  not a correctness one; the current design already meets the "no thread per child" goal.
 
 ## Not currently supported
 

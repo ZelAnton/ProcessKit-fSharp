@@ -9,10 +9,9 @@ open NUnit.Framework
 open ProcessKit
 
 /// POSIX-only: the event-driven replacement for `Native.waitPosix`'s old `Task.Run` + blocking
-/// `waitpid` (a shared SIGCHLD registration + pid -> `TaskCompletionSource` registry, plus an
-/// auxiliary `pidfd_open` on Linux — see `Native.fs`). Verifies the observable contract holds under
-/// this native change: no fd/pidfd leak under load, and the thread-pool no longer parking one thread
-/// per live POSIX child.
+/// `waitpid` (a shared SIGCHLD registration + pid -> `TaskCompletionSource` registry — see
+/// `Native.fs`). Verifies the observable contract holds under this native change: no fd leak under
+/// load, and the thread-pool no longer parking one thread per live POSIX child.
 [<TestFixture>]
 type PosixEventDrivenWaitTests() =
 
@@ -51,7 +50,7 @@ type PosixEventDrivenWaitTests() =
         }
 
     [<Test>]
-    member _.``waitPosix is idempotent for a repeated pid and does not leak a pidfd``() : Task =
+    member _.``waitPosix is idempotent for a repeated pid and does not leak a descriptor``() : Task =
         task {
             if isWindows then
                 Assert.Ignore "POSIX-only: exercises Native.waitPosix directly"
@@ -67,9 +66,9 @@ type PosixEventDrivenWaitTests() =
 
             if isLinux then
                 // Warm up (JIT, the lazy shared SIGCHLD registration) before the baseline, then repeat
-                // the double-registration scenario under load: an unconditional `pendingWaits`
-                // overwrite would leak the first call's pidfd every time, showing up as fd growth
-                // proportional to the iteration count.
+                // the double-registration scenario under load: any per-spawn fd left open (stdio
+                // pipes, or anything the losing side of the registration race failed to release)
+                // would show up as fd growth proportional to the iteration count.
                 for _ in 1..5 do
                     match! spawnAndDoubleWait () with
                     | Ok _ -> ()
@@ -91,7 +90,7 @@ type PosixEventDrivenWaitTests() =
                     after,
                     Is.LessThan(baseline + 20),
                     $"open fd count grew from {baseline} to {after} after 50 duplicate-registration \
-                      spawns — looks like a pidfd leak"
+                      spawns — looks like an fd leak"
                 )
         }
         :> Task
@@ -100,7 +99,7 @@ type PosixEventDrivenWaitTests() =
     member _.``no fd leak after many piped spawns``() : Task =
         task {
             if isWindows then
-                Assert.Ignore "POSIX-only: exercises the event-driven waitPosix/pidfd replacement"
+                Assert.Ignore "POSIX-only: exercises the event-driven waitPosix replacement"
 
             if not isLinux then
                 Assert.Ignore "open fd count is observable portably via /proc on Linux only"
@@ -126,7 +125,7 @@ type PosixEventDrivenWaitTests() =
 
             let after = fdCount ()
 
-            // A per-spawn leak of even one fd/pidfd would show up as growth proportional to the 200
+            // A per-spawn leak of even one fd would show up as growth proportional to the 200
             // runs; a generous absolute slack (`+20`) absorbs incidental steady-state noise without
             // masking a real leak.
             Assert.That(
@@ -141,7 +140,7 @@ type PosixEventDrivenWaitTests() =
     member _.``reaping a POSIX child does not park a thread-pool thread per concurrent child``() : Task =
         task {
             if isWindows then
-                Assert.Ignore "POSIX-only: exercises the event-driven waitPosix/pidfd replacement"
+                Assert.Ignore "POSIX-only: exercises the event-driven waitPosix replacement"
 
             let concurrency = 100
             let baselineThreadPoolCount = ThreadPool.ThreadCount
@@ -179,7 +178,7 @@ type PosixEventDrivenWaitTests() =
     member _.``exit code, clean exit, and signal all decode correctly through the event-driven wait``() : Task =
         task {
             if isWindows then
-                Assert.Ignore "POSIX-only: exercises the event-driven waitPosix/pidfd replacement"
+                Assert.Ignore "POSIX-only: exercises the event-driven waitPosix replacement"
 
             match! (shell "exit 0").RunAsync() with
             | Ok _ -> ()
