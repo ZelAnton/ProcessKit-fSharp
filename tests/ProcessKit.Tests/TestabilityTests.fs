@@ -218,3 +218,46 @@ type TestabilityTests() =
         match ProcessResult.ensureSuccess result with
         | Error(ProcessError.Timeout _) -> ()
         | other -> Assert.Fail $"expected a Timeout error, got {other}"
+
+    [<Test>]
+    member _.``an Unobserved outcome never counts as success and maps to ProcessError.Unobserved``() =
+        let result =
+            ProcessResult.Create "" "" (Outcome.Unobserved "native failure") System.TimeSpan.Zero
+
+        Assert.That(result.Code, Is.EqualTo None, "an unobserved outcome carries no exit code")
+        Assert.That(result.Signal, Is.EqualTo None, "an unobserved outcome carries no signal")
+        Assert.That(result.IsSuccess, Is.False, "an unobserved outcome must never count as success")
+
+        match ProcessResult.ensureSuccess result with
+        | Error(ProcessError.Unobserved(_, detail)) -> Assert.That(detail, Is.EqualTo "native failure")
+        | other -> Assert.Fail $"expected an Unobserved error, got {other}"
+
+    [<Test>]
+    member _.``exitCode and probe error on an Unobserved outcome instead of inventing a code``() =
+        let result =
+            ProcessResult.Create "" "" (Outcome.Unobserved "native failure") System.TimeSpan.Zero
+
+        match ProcessResult.exitCode result with
+        | Error(ProcessError.Unobserved _) -> ()
+        | other -> Assert.Fail $"expected an Unobserved error from exitCode, got {other}"
+
+        match ProcessResult.probe result with
+        | Error(ProcessError.Unobserved _) -> ()
+        | other -> Assert.Fail $"expected an Unobserved error from probe, got {other}"
+
+    [<Test>]
+    member _.``ScriptedRunner can script an unobserved outcome``() : Task =
+        task {
+            let runner: IProcessRunner =
+                ScriptedRunner().On([ "x" ], Reply.Unobserved "native failure")
+
+            match! runner.OutputStringAsync(Command.create "x", CancellationToken.None) with
+            | Ok result ->
+                Assert.That(result.Outcome, Is.EqualTo(Outcome.Unobserved "native failure"))
+                Assert.That(result.IsSuccess, Is.False, "an unobserved outcome must never count as success")
+
+                match ProcessResult.ensureSuccess result with
+                | Error(ProcessError.Unobserved(_, detail)) -> Assert.That(detail, Is.EqualTo "native failure")
+                | other -> Assert.Fail $"expected an Unobserved error, got {other}"
+            | Error error -> Assert.Fail $"expected a completed (non-success) result, got {error.Message}"
+        }

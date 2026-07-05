@@ -25,6 +25,11 @@ type ProcessError =
     /// The run exceeded its configured timeout.
     | Timeout of Program: string * Timeout: TimeSpan * Stdout: string * Stderr: string
 
+    /// The process concluded but its actual exit status could not be observed (see
+    /// `Outcome.Unobserved`) — a native API failure or an unresolved POSIX reap race. `Detail` carries
+    /// the reason. Always a failure; never fabricated as a clean exit.
+    | Unobserved of Program: string * Detail: string
+
     /// The run was cancelled through its `CancellationToken`. A cancellation is always an error.
     | Cancelled of Program: string
 
@@ -79,6 +84,7 @@ type ProcessError =
             | Some s -> $"'{program}' was terminated by signal {s}"
             | None -> $"'{program}' was killed"
         | ProcessError.Timeout(program, timeout, _, _) -> $"'{program}' timed out after {timeout.TotalSeconds}s"
+        | ProcessError.Unobserved(program, detail) -> $"'{program}' concluded, but its exit status is unknown: {detail}"
         | ProcessError.Cancelled program -> $"'{program}' was cancelled"
         | ProcessError.NotReady(program, timeout) -> $"'{program}' was not ready within {timeout.TotalSeconds}s"
         | ProcessError.Parse(program, detail) -> $"failed to parse output of '{program}': {detail}"
@@ -114,6 +120,7 @@ type ProcessError =
         | ProcessError.Exit(program, _, _, _)
         | ProcessError.Signalled(program, _, _, _)
         | ProcessError.Timeout(program, _, _, _)
+        | ProcessError.Unobserved(program, _)
         | ProcessError.Cancelled program
         | ProcessError.NotReady(program, _)
         | ProcessError.Parse(program, _)

@@ -409,6 +409,12 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           Truncated = result.Truncated
           DurationMs = result.Duration.TotalMilliseconds }
 
+    // The cassette schema records exactly the three "normal" outcomes (`TimedOut`/`Signal`/`Code`) a
+    // live run can be recorded as via `entryOfText`/`entryOfBytes` — `Outcome.Unobserved` is not one of
+    // them, so it is not round-tripped: recording one (an astronomically rare native-race edge case, not
+    // something a deterministic test fixture would ever intentionally set up) degrades to this final
+    // fallback on replay. That is an accepted, documented simplification of the cassette format, not a
+    // live fabrication of a clean exit — nothing here reports a *real* run's unobserved status as `Exited 0`.
     let outcomeOf (entry: CassetteEntry) : Outcome =
         if entry.TimedOut then
             Outcome.TimedOut

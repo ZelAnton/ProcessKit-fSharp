@@ -165,16 +165,19 @@ class ProcessKit.Outcome
   member get_IsExited() : System.Boolean
   member get_IsSignalled() : System.Boolean
   member get_IsTimedOut() : System.Boolean
+  member get_IsUnobserved() : System.Boolean
   member get_Tag() : System.Int32
   property Code : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property IsExited : System.Boolean { get }
   property IsSignalled : System.Boolean { get }
   property IsTimedOut : System.Boolean { get }
+  property IsUnobserved : System.Boolean { get }
   property Signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property Tag : System.Int32 { get }
   property TimedOut : ProcessKit.Outcome { get }
   static member NewExited(System.Int32) : ProcessKit.Outcome
   static member NewSignalled(Microsoft.FSharp.Core.FSharpOption<System.Int32>) : ProcessKit.Outcome
+  static member NewUnobserved(System.String) : ProcessKit.Outcome
   static member get_TimedOut() : ProcessKit.Outcome
 
 class ProcessKit.Outcome+Exited : ProcessKit.Outcome
@@ -193,6 +196,13 @@ module ProcessKit.Outcome+Tags
   field literal Exited : System.Int32
   field literal Signalled : System.Int32
   field literal TimedOut : System.Int32
+  field literal Unobserved : System.Int32
+
+class ProcessKit.Outcome+Unobserved : ProcessKit.Outcome
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.Outcome>
+  member get_Reason() : System.String
+  property Reason : System.String { get }
 
 class ProcessKit.OutputBufferPolicy
   member WithMaxBytes(System.Int32) : ProcessKit.OutputBufferPolicy
@@ -321,6 +331,7 @@ class ProcessKit.ProcessError
   member get_IsSpawn() : System.Boolean
   member get_IsStdin() : System.Boolean
   member get_IsTimeout() : System.Boolean
+  member get_IsUnobserved() : System.Boolean
   member get_IsUnsupported() : System.Boolean
   member get_Tag() : System.Int32
   property Code : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
@@ -339,6 +350,7 @@ class ProcessKit.ProcessError
   property IsStdin : System.Boolean { get }
   property IsTimeout : System.Boolean { get }
   property IsTransient : System.Boolean { get }
+  property IsUnobserved : System.Boolean { get }
   property IsUnsupported : System.Boolean { get }
   property Message : System.String { get }
   property Program : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
@@ -359,6 +371,7 @@ class ProcessKit.ProcessError
   static member NewSpawn(System.String, System.String) : ProcessKit.ProcessError
   static member NewStdin(System.String, System.String) : ProcessKit.ProcessError
   static member NewTimeout(System.String, System.TimeSpan, System.String, System.String) : ProcessKit.ProcessError
+  static member NewUnobserved(System.String, System.String) : ProcessKit.ProcessError
   static member NewUnsupported(System.String) : ProcessKit.ProcessError
 
 class ProcessKit.ProcessError+Cancelled : ProcessKit.ProcessError
@@ -477,6 +490,7 @@ module ProcessKit.ProcessError+Tags
   field literal Spawn : System.Int32
   field literal Stdin : System.Int32
   field literal Timeout : System.Int32
+  field literal Unobserved : System.Int32
   field literal Unsupported : System.Int32
 
 class ProcessKit.ProcessError+Timeout : ProcessKit.ProcessError
@@ -490,6 +504,14 @@ class ProcessKit.ProcessError+Timeout : ProcessKit.ProcessError
   property Stderr : System.String { get }
   property Stdout : System.String { get }
   property Timeout : System.TimeSpan { get }
+
+class ProcessKit.ProcessError+Unobserved : ProcessKit.ProcessError
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_Detail() : System.String
+  member get_Program() : System.String
+  property Detail : System.String { get }
+  property Program : System.String { get }
 
 class ProcessKit.ProcessError+Unsupported : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
@@ -960,6 +982,7 @@ class ProcessKit.Testing.Reply
   static member Ok(System.String) : ProcessKit.Testing.Reply
   static member Signalled() : ProcessKit.Testing.Reply
   static member Signalled(System.Int32) : ProcessKit.Testing.Reply
+  static member Unobserved(System.String) : ProcessKit.Testing.Reply
 
 class ProcessKit.Testing.ScriptedRunner
   :> ProcessKit.IProcessRunner

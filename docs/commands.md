@@ -692,8 +692,12 @@ keeps the previously configured codes (it never clears them).
 
 ### The `Outcome` enum
 
-When the three-way distinction matters, match on `Outcome` instead of decoding the
-`Code` / `IsTimedOut` pair:
+When the distinction matters, match on `Outcome` instead of decoding the
+`Code` / `IsTimedOut` pair. There are four cases — the fourth, `Unobserved`, is
+the rare honest fallback for a process that concluded but whose actual exit
+status could not be observed (a native API failure, or an unresolved POSIX
+reap race); it is never a stand-in for a clean exit, and (like `Signalled` /
+`TimedOut`) never counts as success:
 
 **F#**
 
@@ -703,6 +707,7 @@ match result.Outcome with
 | Outcome.Exited code -> printfn $"failed with {code}"
 | Outcome.Signalled signal -> printfn $"killed by signal {signal}"
 | Outcome.TimedOut -> printfn "hit its deadline"
+| Outcome.Unobserved reason -> printfn $"exit status unknown: {reason}"
 ```
 
 **C#**
@@ -714,7 +719,8 @@ Console.WriteLine(result.Outcome switch
     { IsExited: true, Code.Value: var code }        => $"failed with {code}",
     { IsSignalled: true, Signal.Value: var signal } => $"killed by signal {signal}",
     { IsSignalled: true }                           => "killed by an unknown signal",
-    _                                               => "hit its deadline", // TimedOut
+    { IsUnobserved: true }                          => "exit status unknown",
+    _                                                => "hit its deadline", // TimedOut
 });
 ```
 

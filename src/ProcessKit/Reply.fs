@@ -38,6 +38,10 @@ type Reply private (outcome: Outcome, stdout: string, stderr: string, error: Pro
     /// Killed by its timeout (`Outcome.TimedOut`).
     static member TimedOut = Reply(Outcome.TimedOut, "", "", None)
 
+    /// Concluded, but its exit status could not be observed (`Outcome.Unobserved`).
+    static member Unobserved(reason: string) =
+        Reply(Outcome.Unobserved reason, "", "", None)
+
     /// A runner-level failure: the verb returns this `ProcessError` (e.g. a spawn/IO failure or a
     /// missing program) instead of a completed result — so the error branch can be tested.
     static member Error(error: ProcessError) =

@@ -194,3 +194,37 @@ type PosixEventDrivenWaitTests() =
             | other -> Assert.Fail $"expected a Signalled outcome, got {other}"
         }
         :> Task
+
+    [<Test>]
+    member _.``waitPosix resolves to the real outcome when reapLeader wins the reap race``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: exercises the reformulated ECHILD race in tryReapPending/reapLeader"
+
+            match Native.spawnPosix (shell "exit 0") with
+            | Error e -> Assert.Fail $"spawn failed: {e.Message}"
+            | Ok spawned ->
+                let pid = int spawned.Handle
+                let waitTask = Native.waitPosix spawned.Handle
+
+                // Race a direct `reapLeader` call — the exact "some concurrent caller already reaped
+                // this pid" scenario `tryReapPending`'s ECHILD branch exists for (in real use, this is
+                // a group's own teardown racing a run's own wait) — against `waitPosix`'s own
+                // SIGCHLD-driven reap. Whichever side actually wins the `waitpid` race, the wait must
+                // still resolve to the REAL decoded status promptly: never a fabricated clean exit
+                // (the old behaviour), and never a hang (the removed blocking spin's replacement must
+                // not silently swallow a result either).
+                let reapTask = Task.Run(fun () -> Native.reapLeader pid)
+
+                let! outcome = withDeadline 5000 waitTask
+                do! reapTask
+
+                spawned.Stdout |> Option.iter (fun s -> s.Dispose())
+                spawned.Stderr |> Option.iter (fun s -> s.Dispose())
+                spawned.Stdin |> Option.iter (fun s -> s.Dispose())
+
+                match outcome with
+                | Outcome.Exited 0 -> ()
+                | other -> Assert.Fail $"expected a clean exit despite the concurrent reap race, got {other}"
+        }
+        :> Task

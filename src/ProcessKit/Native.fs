@@ -385,8 +385,10 @@ module internal Native =
         let mutable duplicate = IntPtr.Zero
 
         if not (DuplicateHandle(current, hProcess, current, &duplicate, 0u, false, DUPLICATE_SAME_ACCESS)) then
-            // The source handle is already gone — the process is unobservable; report a clean exit.
-            tcs.SetResult(Outcome.Exited 0)
+            // The source handle is already gone/unusable — the process's real exit status is not
+            // observable through it. Honest failure, not a fabricated clean exit.
+            let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+            tcs.SetResult(Outcome.Unobserved $"DuplicateHandle failed: {message}")
         else
             let waitHandle =
                 new OwnedProcessWait(new SafeWaitHandle(duplicate, ownsHandle = true))
@@ -394,10 +396,15 @@ module internal Native =
             let callback =
                 WaitOrTimerCallback(fun _ _ ->
                     let mutable code = 0u
-                    // We own `duplicate` for the wait's lifetime, so this reads the real exit code;
-                    // tolerate any residual hiccup by reporting `Exited 0` rather than faulting a verb.
-                    GetExitCodeProcess(duplicate, &code) |> ignore
-                    tcs.TrySetResult(Outcome.Exited(int code)) |> ignore)
+                    // We own `duplicate` for the wait's lifetime, so this call should always succeed;
+                    // an honest `Unobserved` outcome on the rare hiccup instead of fabricating a clean exit.
+                    if GetExitCodeProcess(duplicate, &code) then
+                        tcs.TrySetResult(Outcome.Exited(int code)) |> ignore
+                    else
+                        let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+
+                        tcs.TrySetResult(Outcome.Unobserved $"GetExitCodeProcess failed: {message}")
+                        |> ignore)
 
             // -1 = infinite, executeOnlyOnce = true. The registration is published before the
             // continuation that uses it is attached, so unregistering there is race-free even if the
@@ -986,13 +993,17 @@ module internal Native =
         Marshal.FreeHGlobal array
 
     /// Decode a `waitpid` status word into an `Outcome` (the encoding is shared by Linux and macOS).
+    /// The final branch (`WIFSTOPPED`) should be unreachable: every `waitpid` call in this file passes
+    /// only `WNOHANG` — never `WUNTRACED`/`WCONTINUED` — so a stopped/continued child never surfaces a
+    /// status here. Decoded honestly rather than assumed impossible, in case some future call site (or
+    /// an unexpected kernel/runtime interaction) ever reaches it.
     let private decodeWaitStatus (status: int) : Outcome =
         if status &&& 0x7f = 0 then
             Outcome.Exited((status >>> 8) &&& 0xff)
         elif status &&& 0x7f <> 0x7f then
             Outcome.Signalled(Some(status &&& 0x7f))
         else
-            Outcome.Exited 0
+            Outcome.Unobserved $"unexpected wait status 0x{status:x} (neither exited nor signalled)"
 
     /// Kill an entire POSIX process group (teardown / cancellation).
     let killProcessGroup (pgid: int) = killpg (pgid, SIGKILL) |> ignore
@@ -1306,9 +1317,10 @@ module internal Native =
             pending.Tcs.TrySetResult outcome |> ignore
         | false, _ -> ()
 
-    // Best-effort, non-blocking reap of one pending pid. Returns `true` once there is nothing further
-    // to do for it (reaped — by us or, via `ECHILD`, by a concurrent `reapLeader` — or nothing was
-    // ever pending); `false` if it is still alive (left pending for the next trigger).
+    // Best-effort, non-blocking reap of one pending pid. Returns `true` once nothing further needs to
+    // be done SYNCHRONOUSLY for it (reaped by us; nothing was ever pending; or an `ECHILD` race whose
+    // resolution has been handed off to an async grace-then-fallback on the thread pool — see below);
+    // `false` if it is still alive (left pending for the next trigger). Never blocks.
     let private tryReapPending (pid: int) : bool =
         if not (pendingWaits.ContainsKey pid) then
             true
@@ -1334,22 +1346,34 @@ module internal Native =
                 true
             else
                 // `ECHILD`: some concurrent caller (most plausibly `reapLeader` tearing down an
-                // abandoned run) won the actual `waitpid` race for this pid and has the REAL status;
-                // we have nothing to report ourselves. `completePending` is a `TryRemove`, so whichever
-                // side calls it *first* decides the outcome — not whichever side won the `waitpid`
-                // race — so briefly give the genuine winner a chance to land its real result before
-                // this side settles for a fallback. Bounded and non-blocking-in-spirit (a few 1ms
-                // sleeps): if the entry is somehow still there afterwards (the "winner" errored out
-                // before calling `completePending`, or some other/impossible edge case), report a
-                // clean exit as an honest "nothing more to learn" rather than leaving the wait hanging
-                // forever — the `Outcome` type has no dedicated "unknown" case.
-                let mutable spins = 0
+                // abandoned run, or another `tryReapPending` invocation that already won this exact
+                // race) has already reaped this pid and holds the REAL status; we have nothing to
+                // report ourselves. `completePending` is a `TryRemove`, so whichever side calls it
+                // *first* decides the outcome — not whichever side won the `waitpid` race — so give the
+                // genuine winner a brief grace period to land its real result before falling back.
+                //
+                // This grace-then-fallback runs on the thread pool (fire-and-forget), NOT spun in-line:
+                // this function is called from the shared SIGCHLD callback, so blocking it here would
+                // stall the runtime's whole signal-dispatch path and delay reaping every other pending
+                // child. Nothing inside the task can throw (`ContainsKey`/`completePending` don't), so
+                // it needs no fault observer.
+                task {
+                    let mutable spins = 0
 
-                while pendingWaits.ContainsKey pid && spins < 20 do
-                    Thread.Sleep 1
-                    spins <- spins + 1
+                    while pendingWaits.ContainsKey pid && spins < 20 do
+                        do! Task.Delay 1
+                        spins <- spins + 1
 
-                completePending pid (Outcome.Exited 0)
+                    // Still pending after the grace period: nobody ever reported this pid's real status
+                    // (the genuine winner errored out before calling `completePending`, or something
+                    // outside ProcessKit's own reap machinery reaped it). Resolve honestly instead of
+                    // leaving the wait hanging forever or inventing a clean exit.
+                    completePending
+                        pid
+                        (Outcome.Unobserved "the process's exit status could not be observed (ECHILD race)")
+                }
+                |> ignore
+
                 true
 
     // Re-scan every still-pending pid — triggered by SIGCHLD (some child changed state; POSIX signals

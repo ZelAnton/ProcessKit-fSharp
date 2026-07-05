@@ -61,6 +61,7 @@ module internal Diag =
         | Outcome.Exited _ -> "exited"
         | Outcome.Signalled _ -> "signalled"
         | Outcome.TimedOut -> "timedout"
+        | Outcome.Unobserved _ -> "unobserved"
 
     let private outcomeTags (program: string) (label: string) : TagList =
         let mutable tags = TagList()

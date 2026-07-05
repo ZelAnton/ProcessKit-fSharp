@@ -98,6 +98,7 @@ type ProcessResult<'T>
         | Outcome.Exited code -> ProcessError.Exit(program, code, this.StdoutText, stderr)
         | Outcome.Signalled signal -> ProcessError.Signalled(program, signal, this.StdoutText, stderr)
         | Outcome.TimedOut -> ProcessError.Timeout(program, duration, this.StdoutText, stderr)
+        | Outcome.Unobserved reason -> ProcessError.Unobserved(program, reason)
 
     /// Demand a successful run (an **accepted** exit code — one in `Command.OkCodes`, `{0}` by default):
     /// returns the result unchanged on success, otherwise the corresponding `ProcessError`
