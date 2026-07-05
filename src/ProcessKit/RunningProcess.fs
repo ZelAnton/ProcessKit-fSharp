@@ -75,6 +75,19 @@ type RunningProcess internal (host: RunningHost) =
     let bumpDroppedStreamLine () =
         Interlocked.Increment(&droppedStreamLineCount) |> ignore
 
+    // `stdoutLineCount`/`stderrLineCount` are written by a background pump task and read from the
+    // consumer's thread via `StdoutLineCount`/`StderrLineCount` and the `countSoFar` callbacks below —
+    // `Interlocked.Increment` to publish each write, `Volatile.Read` (see the two members) to read a
+    // fresh value, the same atomic approach `droppedStreamLineCount` already uses.
+    let bumpStdoutLine () =
+        Interlocked.Increment(&stdoutLineCount) |> ignore
+
+    let bumpStderrLine () =
+        Interlocked.Increment(&stderrLineCount) |> ignore
+
+    let readStdoutLineCount () = Volatile.Read(&stdoutLineCount)
+    let readStderrLineCount () = Volatile.Read(&stderrLineCount)
+
     // Cancels a writer parked on a bounded stream's `StreamFullMode.Backpressure` (`WriteAsync`) once
     // this handle is torn down, so an abandoned bounded stream can't leave its pump running forever: a
     // `Command.Timeout` kills the CHILD but does not by itself free a writer waiting here if nothing
@@ -303,16 +316,12 @@ type RunningProcess internal (host: RunningHost) =
 
     let pumpStdoutBuffer () =
         match host.Stdout with
-        | Some s ->
-            pumpToBuffer s config.StdoutEncoding config.StdoutTee config.OnStdoutLine (fun () ->
-                stdoutLineCount <- stdoutLineCount + 1)
+        | Some s -> pumpToBuffer s config.StdoutEncoding config.StdoutTee config.OnStdoutLine bumpStdoutLine
         | None -> Task.FromResult(Pump.LineBuffer config.OutputBuffer)
 
     let pumpStderrBuffer () =
         match host.Stderr with
-        | Some s ->
-            pumpToBuffer s config.StderrEncoding config.StderrTee config.OnStderrLine (fun () ->
-                stderrLineCount <- stderrLineCount + 1)
+        | Some s -> pumpToBuffer s config.StderrEncoding config.StderrTee config.OnStderrLine bumpStderrLine
         | None -> Task.FromResult(Pump.LineBuffer config.OutputBuffer)
 
     // Pump one stream's lines through `onLine` until the stream ends — the streaming-verb analogue
@@ -423,15 +432,15 @@ type RunningProcess internal (host: RunningHost) =
         | None -> None
 
     /// Total stdout lines pumped so far (counts dropped lines too).
-    member _.StdoutLineCount = stdoutLineCount
+    member _.StdoutLineCount = readStdoutLineCount ()
 
     /// Total stderr lines pumped so far.
-    member _.StderrLineCount = stderrLineCount
+    member _.StderrLineCount = readStderrLineCount ()
 
     /// Lines dropped so far by a bounded streaming policy's `StreamFullMode.DropOldest`/`DropNewest`
     /// (always `0` unless `Command.StreamBuffer` is configured with one of those modes) — the
     /// streaming analogue of a buffered verb's `ProcessResult.Truncated`.
-    member _.DroppedStreamLineCount = droppedStreamLineCount
+    member _.DroppedStreamLineCount = Volatile.Read(&droppedStreamLineCount)
 
     /// Take the interactive stdin handle — `Some` only when the command kept stdin open without a
     /// source attached, and only once.
@@ -652,12 +661,12 @@ type RunningProcess internal (host: RunningHost) =
                         do!
                             pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
                                 invokeLine config.OnStdoutLine line
-                                stdoutLineCount <- stdoutLineCount + 1
+                                bumpStdoutLine ()
 
                                 writeStreamItem
                                     stdoutChannel.Writer
                                     stdoutChannel.Reader
-                                    (fun () -> stdoutLineCount)
+                                    readStdoutLineCount
                                     bumpDroppedStreamLine
                                     line)
 
@@ -675,7 +684,7 @@ type RunningProcess internal (host: RunningHost) =
             let stderrPump =
                 pumpLines host.Stderr config.StderrEncoding config.StderrTee (fun line ->
                     invokeLine config.OnStderrLine line
-                    stderrLineCount <- stderrLineCount + 1
+                    bumpStderrLine ()
                     stderrBuffer.Add line
                     ValueTask.CompletedTask)
 
@@ -767,8 +776,8 @@ type RunningProcess internal (host: RunningHost) =
                     config.StdoutEncoding
                     config.StdoutTee
                     config.OnStdoutLine
-                    (fun () -> stdoutLineCount <- stdoutLineCount + 1)
-                    (fun () -> stdoutLineCount)
+                    bumpStdoutLine
+                    readStdoutLineCount
                     OutputEvent.Stdout
 
             let stderrPump =
@@ -777,8 +786,8 @@ type RunningProcess internal (host: RunningHost) =
                     config.StderrEncoding
                     config.StderrTee
                     config.OnStderrLine
-                    (fun () -> stderrLineCount <- stderrLineCount + 1)
-                    (fun () -> stderrLineCount)
+                    bumpStderrLine
+                    readStderrLineCount
                     OutputEvent.Stderr
 
             eventOutcome <-
