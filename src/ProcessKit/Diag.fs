@@ -69,7 +69,9 @@ module internal Diag =
         tags
 
     /// A run was spawned: count it and mark it in flight. Returns the `Activity` context current *now*
-    /// (at spawn) so the backdated span emitted at completion still nests under it.
+    /// (at spawn) so the backdated span emitted at completion still nests under it. Paired with exactly
+    /// one `runEnded` call per run — see that function's doc for how the two ends of the run's lifetime
+    /// are tracked separately from whether it ever reached a terminal verb.
     let runStarted (program: string) : ActivityContext =
         let mutable startedTags = programTag program
         let mutable activeTags = programTag program
@@ -119,8 +121,10 @@ module internal Diag =
                 // so leave the span status unset rather than forcing Error — the outcome tag carries the fact.
                 activity.Dispose() // ends the span at "now" → duration = now - startTime
 
-    /// A run reached a terminal verb: record the completion counter, its duration, clear the in-flight
-    /// mark, and emit the (backdated) trace span.
+    /// A run reached a terminal verb: record the completion counter, its duration, and emit the
+    /// (backdated) trace span. Does NOT itself clear the in-flight `runs.active` mark — call `runEnded`
+    /// once as well (the caller pairs the two, since a run that reaches a terminal verb is exactly one
+    /// case of the run ending; see `runEnded`'s doc for the other).
     let runCompleted
         (program: string)
         (runId: string)
@@ -132,11 +136,21 @@ module internal Diag =
         =
         let label = outcomeLabel outcome
         let mutable completedTags = outcomeTags program label
-        let mutable activeTags = programTag program
         runsCompleted.Add(1L, &completedTags)
         runDuration.Record(duration.TotalSeconds, &completedTags)
-        runsActive.Add(-1L, &activeTags)
         emitSpan program runId outcome pid startTime parentContext
+
+    /// A run left "in flight" — clears the `runs.active` mark `runStarted` set. Deliberately separate
+    /// from `runCompleted`: a run reaching a terminal verb (`runCompleted` + `runEnded`, both called) is
+    /// only ONE way a run ends. A streaming/event-driven handle that is disposed (or abandoned to GC)
+    /// without ever reaching one also ends the run — active must still go to zero for it, but it must
+    /// NOT be counted as `runs.completed` (no duration, no span: "an abandoned run simply isn't counted
+    /// as completed"). The caller (`RunningProcess`) is responsible for calling this exactly once per
+    /// run — whichever of "reached a terminal verb" / "handle disposed" happens first — since `Diag` has
+    /// no per-run identity of its own to de-duplicate on.
+    let runEnded (program: string) =
+        let mutable tags = programTag program
+        runsActive.Add(-1L, &tags)
 
     let retried (program: string) =
         let mutable tags = programTag program

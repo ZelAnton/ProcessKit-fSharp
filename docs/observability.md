@@ -89,8 +89,12 @@ duration histogram is in **seconds** (the OTel norm for `*.duration`).
 services.AddOpenTelemetry().WithMetrics(m => m.AddMeter(ProcessKitDiagnostics.MeterName));
 ```
 
-`runs.active` is incremented at spawn and decremented at completion. A run that never reaches a terminal
-outcome — a streaming handle dropped without `FinishAsync`, or a verb that faults before the child exits
-(for example a throwing `OnStdoutLine` handler) — is not counted as completed, so its `runs.active`
-contribution and the started/completed balance skew slightly upward. A normal run through any capture/wait
-verb (`Run`/`Output*`/`Wait*`/`Profile`) that runs the child to exit is counted exactly.
+`runs.active` is incremented at spawn and decremented when the run's handle stops being "in flight" —
+either of two events, whichever happens first: it reaches a terminal verb (`Run`/`Output*`/`Wait*`/
+`Profile`/`Finish`, or racing it via `WaitAnyAsync`/`WaitAllAsync`), or its `RunningProcess` handle is
+disposed without ever reaching one (a streaming handle dropped without `FinishAsync`). Either way
+`runs.active` returns to zero for that run — it never leaks upward just because a caller only streamed
+and disposed. Only the first of those two events counts toward `runs.completed`/`run.duration`/the trace
+span: a handle disposed without a terminal verb is still not counted as completed ("an abandoned run
+simply isn't counted as completed"), so `runs.started`/`runs.completed` can legitimately diverge even
+though `runs.active` is exact.

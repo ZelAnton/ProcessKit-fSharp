@@ -257,6 +257,12 @@ type RunningProcess internal (host: RunningHost) =
     // Single-consumption already means one terminal verb runs, but the once-guard makes it bulletproof —
     // conclude fires at most once per run, so metrics can't double-count and a run never yields two spans.
     // An abandoned run (spawned, never driven to a terminal verb) simply isn't counted as completed.
+    //
+    // `concludedFlag` doubles as the "has this run's `runs.active` mark already been cleared" guard,
+    // shared with `markAbandoned` below (the `IAsyncDisposable.DisposeAsync` path): whichever of the two
+    // wins the exchange decides whether the run's end is counted as `runs.completed` (here) or not
+    // (`markAbandoned`), but either way `Diag.runEnded` fires exactly once per run, so `runs.active`
+    // always returns to zero and never goes negative.
     let concludedFlag = ref 0
 
     let conclude (outcome: Outcome) =
@@ -264,6 +270,14 @@ type RunningProcess internal (host: RunningHost) =
             let duration = elapsed ()
             Log.exit config.Logger config.Program outcome duration runId
             Diag.runCompleted config.Program runId outcome host.Pid host.StartTime duration spawnParentContext
+            Diag.runEnded config.Program
+
+    // Clear the `runs.active` mark for a run whose handle is being disposed without ever having reached
+    // a terminal verb (a streaming/event-driven handle the caller only consumed and dropped). Shares
+    // `concludedFlag` with `conclude` — a no-op once a terminal verb has already run.
+    let markAbandoned () =
+        if Interlocked.Exchange(&concludedFlag.contents, 1) = 0 then
+            Diag.runEnded config.Program
 
     // Per-process CPU / peak-memory via the BCL `Process` (reads /proc on Linux, the OS APIs
     // elsewhere) — no metrics once the child has exited or where the platform does not report them.
@@ -1039,4 +1053,8 @@ type RunningProcess internal (host: RunningHost) =
     interface IAsyncDisposable with
         member _.DisposeAsync() =
             disposalCts.Cancel()
+            // Clear `runs.active` for a handle disposed without ever reaching a terminal verb — a no-op
+            // (guarded by `concludedFlag`) when `conclude` already ran, so a normal verb-then-dispose
+            // sequence, or a repeated dispose, cannot double-decrement.
+            markAbandoned ()
             host.Teardown()

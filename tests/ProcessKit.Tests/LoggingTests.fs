@@ -64,12 +64,49 @@ type private AlwaysCrash() =
 type LoggingTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    let runner: IProcessRunner = JobRunner()
 
     let shell (script: string) =
         if isWindows then
             Command.create "cmd.exe" |> Command.args [ "/c"; script ]
         else
             Command.create "/bin/sh" |> Command.args [ "-c"; script ]
+
+    // Stays alive a few seconds without exiting on its own — so a handle can be dropped while the
+    // child is still running, without racing its natural exit.
+    let lingering () =
+        if isWindows then
+            shell "ping 127.0.0.1 -n 5 >NUL"
+        else
+            shell "sleep 4"
+
+    // Listen to every `int64` measurement on ProcessKit's meter, tallying `runs.started`/`runs.completed`
+    // (net counts) and every `runs.active` delta (the individual +1/-1 measurements, not summed here —
+    // callers sum them to check the net balance). Tests run sequentially (no `[Parallelizable]` in this
+    // suite), so a listener started immediately before the run(s) under test sees only its own measurements.
+    let listenToRunMetrics () =
+        let activeDeltas = ConcurrentQueue<int64>()
+        let mutable startedCount = 0L
+        let mutable completedCount = 0L
+
+        let listener = new MeterListener()
+
+        listener.InstrumentPublished <-
+            (fun instrument l ->
+                if instrument.Meter.Name = ProcessKitDiagnostics.MeterName then
+                    l.EnableMeasurementEvents instrument)
+
+        listener.SetMeasurementEventCallback<int64>(
+            MeasurementCallback<int64>(fun instrument value _tags _state ->
+                match instrument.Name with
+                | "processkit.runs.active" -> activeDeltas.Enqueue value
+                | "processkit.runs.started" -> Interlocked.Add(&startedCount, value) |> ignore
+                | "processkit.runs.completed" -> Interlocked.Add(&completedCount, value) |> ignore
+                | _ -> ())
+        )
+
+        listener.Start()
+        listener, activeDeltas, (fun () -> startedCount), (fun () -> completedCount)
 
     [<Test>]
     member _.``a run logs spawn and exit``() : Task =
@@ -263,5 +300,50 @@ type LoggingTests() =
                     "argv must never reach a metric tag"
                 )
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an abandoned streaming handle clears runs.active without counting as completed``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            match! runner.StartAsync(lingering (), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                // Never touch a terminal verb (OutputString/Wait/Profile/Finish/…) — just drop the handle
+                // while the child is still alive, the exact "StartAsync -> DisposeAsync, no verb" scenario
+                // that used to leave `runs.active` permanently inflated.
+                do! (running :> IAsyncDisposable).DisposeAsync()
+
+            Assert.That(started (), Is.EqualTo 1L, "expected exactly one runs.started measurement")
+            Assert.That(completed (), Is.EqualTo 0L, "an abandoned run must not count as completed")
+
+            Assert.That(activeDeltas |> Seq.sum, Is.EqualTo 0L, "runs.active must return to zero for the abandoned run")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a terminal verb followed by disposing the handle does not double-decrement runs.active``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            match! runner.StartAsync(shell "echo hi", CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match! running.OutputStringAsync() with
+                | Error error -> Assert.Fail $"{error.Message}"
+                | Ok _ -> ()
+
+                // Redundant with the terminal verb's own teardown, but a caller may still do this (e.g. a
+                // `use` binding around the handle) — `conclude` already cleared `runs.active`, so this must
+                // be a no-op rather than decrementing a second time.
+                do! (running :> IAsyncDisposable).DisposeAsync()
+
+            Assert.That(started (), Is.EqualTo 1L)
+            Assert.That(completed (), Is.EqualTo 1L, "a run through a terminal verb must count as completed")
+            Assert.That(activeDeltas |> Seq.sum, Is.EqualTo 0L, "active must settle at zero, not go negative")
         }
         :> Task
