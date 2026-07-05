@@ -5,6 +5,7 @@ open System.ComponentModel
 open System.IO
 open System.IO.Pipes
 open System.Runtime.InteropServices
+open System.Security.Principal
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -650,6 +651,72 @@ module internal Native =
     // → drop the inheritable copies); reads happen afterwards, off the lock.
     let private windowsSpawnLock = obj ()
 
+    // The named pipe's OS-level buffer, on each side. The 5-arg `NamedPipeServerStream` constructor
+    // defaults this to 0, which lets the OS pick a minimal buffer — too small to hold even a couple of
+    // short lines. An anonymous pipe (what this replaces) gets a much more generous OS default, so a
+    // child that outpaces its (perhaps already-faulted, no-longer-draining) reader could still finish
+    // writing its output and exit; reproduced by a throwing `OnStdoutLine` handler that abandons the
+    // stdout pump after line 1 — the child then blocked forever writing line 2 into a too-small pipe,
+    // hanging `FinishAsync` (and, unnoticed by that specific test, leaking the child until the group's
+    // kill-on-drop reaped it). 64 KiB comfortably covers ordinary line-buffered output.
+    [<Literal>]
+    let private asyncPipeBufferSize = 65536
+
+    // A connected named-pipe pair for one piped stdio stream: the parent's async-capable server end
+    // (`PipeOptions.Asynchronous` — real overlapped `ReadAsync`/`WriteAsync`, completed via IOCP, no
+    // thread-pool-parking sync fallback) and an inheritable client end the child inherits as its std
+    // handle. `AnonymousPipeServerStream` (what this replaces) has no `PipeOptions` overload at all —
+    // it is unconditionally synchronous — so an async-capable pipe on Windows has to be a *named* one.
+    // `serverDirection` is from the PARENT's perspective (`In` for stdout/stderr, `Out` for stdin); the
+    // client uses the opposite direction. A unique per-call pipe name (a GUID) keeps concurrent spawns
+    // from colliding; the actual cross-inherit hazard (ANY inheritable handle open at `CreateProcessW`
+    // time) is still guarded by `windowsSpawnLock` below, exactly as for the anonymous pipes this
+    // replaces — switching pipe kinds does not touch that invariant.
+    let private createAsyncPipePair (serverDirection: PipeDirection) : NamedPipeServerStream * NamedPipeClientStream =
+        let pipeName = "ProcessKit-" + Guid.NewGuid().ToString("N")
+
+        let clientDirection =
+            if serverDirection = PipeDirection.In then
+                PipeDirection.Out
+            else
+                PipeDirection.In
+
+        let server =
+            new NamedPipeServerStream(
+                pipeName,
+                serverDirection,
+                1,
+                PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous,
+                asyncPipeBufferSize,
+                asyncPipeBufferSize
+            )
+
+        try
+            let client =
+                new NamedPipeClientStream(
+                    ".",
+                    pipeName,
+                    clientDirection,
+                    PipeOptions.None,
+                    TokenImpersonationLevel.None,
+                    HandleInheritability.Inheritable
+                )
+
+            try
+                // Purely local + same-process: the server instance already exists (constructed just
+                // above), so this connects and completes near-instantly. Bounded rather than infinite
+                // so a pathological OS/security-software failure can't hang a spawn forever.
+                client.Connect 5000
+                server.WaitForConnection()
+                server, client
+            with _ ->
+                client.Dispose()
+                reraise ()
+        with _ ->
+            server.Dispose()
+            reraise ()
+
     /// Spawn `command` suspended, assign it to `job` while still suspended (so no
     /// grandchild can escape the container), then resume it. Returns the process handle and
     /// managed read streams for stdout/stderr.
@@ -657,121 +724,143 @@ module internal Native =
         let config = command.Config
         let stdinWanted = config.StdinSource.IsSome || config.KeepStdinOpen
 
-        // stdin is always a pipe so we control EOF; the write end is kept (interactive) or closed.
-        let inPipe =
-            new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.Inheritable)
+        // Every pipe end created so far, torn down (best-effort, reverse order) if pipe setup fails
+        // partway through — before `CreateProcessW` is even reached, so nothing has been handed to a
+        // child yet. `AnonymousPipeServerStream` construction essentially never threw in practice; a
+        // named pipe's `Connect` genuinely can (e.g. under resource exhaustion), which is a new failure
+        // mode this replacement introduces, so it gets a real unwind-and-report instead of leaking
+        // handles or letting a BCL exception escape this `Result`-returning function.
+        let createdPipes = ResizeArray<IDisposable>()
 
-        // For an output stream: the inheritable child-side handle, the parent read stream
-        // (`Some` only when piped), and a cleanup that closes the child-side handle after spawn.
-        let setupOut (mode: StdioMode) (stdHandleId: int) : nativeint * Stream option * (unit -> unit) =
-            match mode with
-            | StdioMode.Piped ->
-                let pipe =
-                    new AnonymousPipeServerStream(PipeDirection.In, HandleInheritability.Inheritable)
+        let disposeCreatedPipes () =
+            for i in createdPipes.Count - 1 .. -1 .. 0 do
+                try
+                    createdPipes[i].Dispose()
+                with _ ->
+                    // Best-effort unwind after an earlier failure; that original failure is what we
+                    // report, not a secondary problem tearing down an already-broken pipe.
+                    ()
 
-                pipe.ClientSafePipeHandle.DangerousGetHandle(),
-                Some(pipe :> Stream),
-                (fun () -> pipe.DisposeLocalCopyOfClientHandle())
-            | StdioMode.Null ->
-                let handle = inheritableNul GENERIC_WRITE
-                handle, None, (fun () -> CloseHandle handle |> ignore)
-            | StdioMode.Inherit ->
-                let handle = inheritableStdHandle stdHandleId
+        try
+            // stdin is always a pipe so we control EOF; the write end is kept (interactive) or closed.
+            let inServer, inClient = createAsyncPipePair PipeDirection.Out
+            createdPipes.Add inServer
+            createdPipes.Add inClient
 
-                handle,
-                None,
-                (fun () ->
-                    if handle <> IntPtr.Zero then
-                        CloseHandle handle |> ignore)
+            // For an output stream: the inheritable child-side handle, the parent read stream
+            // (`Some` only when piped), and a cleanup that drops the parent's copy of the child handle
+            // after spawn (the child has its own inherited copy by then).
+            let setupOut (mode: StdioMode) (stdHandleId: int) : nativeint * Stream option * (unit -> unit) =
+                match mode with
+                | StdioMode.Piped ->
+                    let server, client = createAsyncPipePair PipeDirection.In
+                    createdPipes.Add server
+                    createdPipes.Add client
+                    client.SafePipeHandle.DangerousGetHandle(), Some(server :> Stream), (fun () -> client.Dispose())
+                | StdioMode.Null ->
+                    let handle = inheritableNul GENERIC_WRITE
+                    handle, None, (fun () -> CloseHandle handle |> ignore)
+                | StdioMode.Inherit ->
+                    let handle = inheritableStdHandle stdHandleId
 
-        let outChild, outStream, outCleanup = setupOut config.StdoutMode STD_OUTPUT_HANDLE
-        let errChild, errStream, errCleanup = setupOut config.StderrMode STD_ERROR_HANDLE
+                    handle,
+                    None,
+                    (fun () ->
+                        if handle <> IntPtr.Zero then
+                            CloseHandle handle |> ignore)
 
-        let mutable startup = STARTUPINFO()
-        startup.cb <- Marshal.SizeOf<STARTUPINFO>()
-        startup.dwFlags <- STARTF_USESTDHANDLES
-        startup.hStdInput <- inPipe.ClientSafePipeHandle.DangerousGetHandle()
-        startup.hStdOutput <- outChild
-        startup.hStdError <- errChild
+            let outChild, outStream, outCleanup = setupOut config.StdoutMode STD_OUTPUT_HANDLE
+            let errChild, errStream, errCleanup = setupOut config.StderrMode STD_ERROR_HANDLE
 
-        let mutable info = PROCESS_INFORMATION()
-        let commandLine = buildWindowsCommandLine command
+            let mutable startup = STARTUPINFO()
+            startup.cb <- Marshal.SizeOf<STARTUPINFO>()
+            startup.dwFlags <- STARTF_USESTDHANDLES
+            startup.hStdInput <- inClient.SafePipeHandle.DangerousGetHandle()
+            startup.hStdOutput <- outChild
+            startup.hStdError <- errChild
 
-        let workingDirectory =
-            config.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
+            let mutable info = PROCESS_INFORMATION()
+            let commandLine = buildWindowsCommandLine command
 
-        let environment = buildWindowsEnvironment command
+            let workingDirectory =
+                config.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
 
-        let flags =
-            CREATE_SUSPENDED
-            ||| (if environment = IntPtr.Zero then
-                     0u
-                 else
-                     CREATE_UNICODE_ENVIRONMENT)
-            ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
+            let environment = buildWindowsEnvironment command
 
-        let created =
-            CreateProcessW(
-                IntPtr.Zero,
-                commandLine,
-                IntPtr.Zero,
-                IntPtr.Zero,
-                true,
-                flags,
-                environment,
-                workingDirectory,
-                &startup,
-                &info
-            )
+            let flags =
+                CREATE_SUSPENDED
+                ||| (if environment = IntPtr.Zero then
+                         0u
+                     else
+                         CREATE_UNICODE_ENVIRONMENT)
+                ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
 
-        let lastError = Marshal.GetLastWin32Error()
+            let created =
+                CreateProcessW(
+                    IntPtr.Zero,
+                    commandLine,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    true,
+                    flags,
+                    environment,
+                    workingDirectory,
+                    &startup,
+                    &info
+                )
 
-        if environment <> IntPtr.Zero then
-            Marshal.FreeHGlobal environment
+            let lastError = Marshal.GetLastWin32Error()
 
-        let releaseStdio () =
-            outCleanup ()
-            errCleanup ()
-            outStream |> Option.iter (fun s -> s.Dispose())
-            errStream |> Option.iter (fun s -> s.Dispose())
-            inPipe.Dispose()
+            if environment <> IntPtr.Zero then
+                Marshal.FreeHGlobal environment
 
-        if not created then
-            releaseStdio ()
+            let releaseStdio () =
+                outCleanup ()
+                errCleanup ()
+                outStream |> Option.iter (fun s -> s.Dispose())
+                errStream |> Option.iter (fun s -> s.Dispose())
+                inClient.Dispose()
+                inServer.Dispose()
 
-            if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
-                Error(ProcessError.NotFound(command.Program, None))
-            else
-                Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
-        elif not (AssignProcessToJobObject(job, info.hProcess)) then
-            // Suspended but uncontained — kill it rather than let it run free.
-            let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-            TerminateProcess(info.hProcess, 1u) |> ignore
-            CloseHandle info.hThread |> ignore
-            CloseHandle info.hProcess |> ignore
-            releaseStdio ()
-            Error(ProcessError.Spawn(command.Program, $"could not assign process to job object: {message}"))
-        else
-            ResumeThread info.hThread |> ignore
-            CloseHandle info.hThread |> ignore
-            // Drop the parent's copies of the child-side handles now that the child has inherited
-            // them, so reads see EOF when the child exits.
-            inPipe.DisposeLocalCopyOfClientHandle()
-            outCleanup ()
-            errCleanup ()
+            if not created then
+                releaseStdio ()
 
-            let stdinStream =
-                if stdinWanted then
-                    Some(inPipe :> Stream)
+                if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
+                    Error(ProcessError.NotFound(command.Program, None))
                 else
-                    inPipe.Dispose() // close stdin write end -> child sees EOF
-                    None
+                    Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
+            elif not (AssignProcessToJobObject(job, info.hProcess)) then
+                // Suspended but uncontained — kill it rather than let it run free.
+                let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                TerminateProcess(info.hProcess, 1u) |> ignore
+                CloseHandle info.hThread |> ignore
+                CloseHandle info.hProcess |> ignore
+                releaseStdio ()
+                Error(ProcessError.Spawn(command.Program, $"could not assign process to job object: {message}"))
+            else
+                ResumeThread info.hThread |> ignore
+                CloseHandle info.hThread |> ignore
+                // Drop the parent's copies of the child-side handles now that the child has inherited
+                // them, so reads see EOF when the child exits.
+                inClient.Dispose()
+                outCleanup ()
+                errCleanup ()
 
-            Ok
-                { Handle = info.hProcess
-                  Stdout = outStream
-                  Stderr = errStream
-                  Stdin = stdinStream }
+                let stdinStream =
+                    if stdinWanted then
+                        Some(inServer :> Stream)
+                    else
+                        inServer.Dispose() // close stdin write end -> child sees EOF
+                        None
+
+                Ok
+                    { Handle = info.hProcess
+                      Stdout = outStream
+                      Stderr = errStream
+                      Stdin = stdinStream }
+        with ex ->
+            disposeCreatedPipes ()
+            Error(ProcessError.Spawn(command.Program, ex.Message))
 
     let spawnWindows (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
         lock windowsSpawnLock (fun () -> spawnWindowsCore job command)
