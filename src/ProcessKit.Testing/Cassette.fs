@@ -354,15 +354,15 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 )
 
     let keyOf (command: Command) (digest: string option) : Key =
-        let args = applyNormalizer options.ArgNormalizer (List.toArray command.Config.Args)
+        let args = applyNormalizer options.ArgNormalizer (Seq.toArray command.Config.Args)
         command.Program, args, command.WorkingDirectory, command.Config.StdinSource.IsSome, digest
 
     let envNamesOf (command: Command) : string[] =
         command.Config.EnvOverrides
-        |> List.map fst
-        |> List.distinct
-        |> List.sort
-        |> List.toArray
+        |> Seq.map fst
+        |> Seq.distinct
+        |> Seq.sort
+        |> Seq.toArray
 
     let signalOf (outcome: Outcome) : Nullable<int> =
         match outcome with
@@ -377,7 +377,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // Record a text capture: stdout/stderr are the decoded strings (redacted); no base64.
     let entryOfText (command: Command) (result: ProcessResult<string>) (digest: string option) : CassetteEntry =
         { Program = command.Program
-          Args = List.toArray command.Config.Args
+          Args = Seq.toArray command.Config.Args
           Cwd = Option.toObj command.WorkingDirectory
           StdinDigest = Option.toObj digest
           HasStdin = command.Config.StdinSource.IsSome
@@ -395,7 +395,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // replay decodes the base64); stderr is text (redacted). The opaque bytes are not redacted.
     let entryOfBytes (command: Command) (result: ProcessResult<byte[]>) (digest: string option) : CassetteEntry =
         { Program = command.Program
-          Args = List.toArray command.Config.Args
+          Args = Seq.toArray command.Config.Args
           Cwd = Option.toObj command.WorkingDirectory
           StdinDigest = Option.toObj digest
           HasStdin = command.Config.StdinSource.IsSome

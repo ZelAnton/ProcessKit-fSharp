@@ -57,7 +57,7 @@ module internal Windows =
             sb.Append('"').ToString()
 
     let private buildWindowsCommandLine (command: Command) =
-        let parts = command.Program :: command.Config.Args
+        let parts = command.Program :: List.ofSeq command.Config.Args
         parts |> List.map quoteWindowsArg |> String.concat " "
 
     // ----------------------------------------------------------------------------------
@@ -595,7 +595,7 @@ module internal Windows =
             Marshal.FreeHGlobal buffer
 
     let private buildWindowsEnvironment (command: Command) : nativeint =
-        if not command.Config.ClearEnv && List.isEmpty command.Config.EnvOverrides then
+        if not command.Config.ClearEnv && command.Config.EnvOverrides.IsEmpty then
             IntPtr.Zero
         else
             let env = effectiveEnvironment command

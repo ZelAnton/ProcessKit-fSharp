@@ -72,6 +72,21 @@ type PumpTests() =
         CollectionAssert.AreEqual([ "a"; "b"; "c" ], collect (Encoding.UTF8.GetBytes "a\r\nb\nc") Encoding.UTF8)
 
     [<Test>]
+    member _.``readLines strips a trailing CR that lands exactly at the 8192-byte read boundary``() =
+        // The '\r' is the very last byte of the first 8192-byte read; the '\n' that completes the CRLF
+        // arrives as the first byte of the next read. The carry (an unterminated line ending in '\r')
+        // must survive across reads so the pair still collapses to a single line break.
+        let prefix = String('a', 8191)
+        let bytes = Encoding.UTF8.GetBytes(prefix + "\r\nworld")
+        CollectionAssert.AreEqual([ prefix; "world" ], collect bytes Encoding.UTF8)
+
+    [<Test>]
+    member _.``readLines strips a lone trailing CR at EOF``() =
+        // No following '\n' ever arrives — the final unterminated line still drops its trailing '\r',
+        // same as the mid-stream CRLF case.
+        CollectionAssert.AreEqual([ "hello" ], collect (Encoding.UTF8.GetBytes "hello\r") Encoding.UTF8)
+
+    [<Test>]
     member _.``LineBuffer DropOldest keeps the most recent lines``() =
         let buf = Pump.LineBuffer(OutputBufferPolicy.Bounded 2)
         [ "a"; "b"; "c" ] |> List.iter buf.Add
@@ -114,6 +129,34 @@ type PumpTests() =
             .Wait()
 
         CollectionAssert.AreEqual([ "aaa"; "bbb"; "c" ], segments)
+
+    [<Test>]
+    member _.``readLines force-flush segments stay aligned when the cap boundary coincides with the 8192-char read boundary``
+        ()
+        =
+        // 8200 newline-free 'x' chars with a cap of 4: 8192 / 4 is exact, so the force-flush right at
+        // the read boundary lands exactly on a cap boundary too — the in-flight segment must carry over
+        // to the next read (unflushed) rather than emitting a short/misaligned segment at the seam.
+        let payload = String('x', 8200)
+        use stream = new MemoryStream(Encoding.UTF8.GetBytes payload)
+        let segments = ResizeArray<string>()
+
+        (Pump.readLines
+            stream
+            Encoding.UTF8
+            None
+            (fun l ->
+                segments.Add l
+                ValueTask.CompletedTask)
+            (Some 4)
+            CancellationToken.None)
+            .Wait()
+
+        Assert.That(segments.Count, Is.EqualTo 2050)
+        Assert.That(String.concat "" segments, Is.EqualTo payload)
+
+        for segment in segments do
+            Assert.That(segment, Is.EqualTo "xxxx")
 
     [<Test>]
     member _.``a newline-free flood still trips the byte-cap fail-loud ceiling via the in-flight cap``() =

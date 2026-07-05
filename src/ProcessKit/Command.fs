@@ -2,6 +2,7 @@ namespace ProcessKit
 
 open System
 open System.Collections.Generic
+open System.Collections.Immutable
 open System.IO
 open System.Text
 open System.Threading
@@ -10,11 +11,17 @@ open Microsoft.Extensions.Logging
 
 /// The immutable configuration behind a `Command`. Internal — consumers build it through the
 /// `Command` builder; the runner/native layer reads it to spawn.
+///
+/// `Args`/`EnvOverrides` are `ImmutableList<'T>` (an AVL-tree-backed persistent list), not `'T list`
+/// — a long `.Arg(x)`/`.Env(k, v)` chain calls `Add`/`AddRange` in O(log n) per call (O(n log n)
+/// total), instead of the O(n) `@`/list-append that a plain F# list would need for each appended
+/// element (O(n²) total on a long chain). Readers still see the same forward (append) order; they
+/// enumerate/convert via `Seq.*`/`ImmutableList.ToArray()` instead of `List.*`/`::`.
 type internal CommandConfig =
     { Program: string
-      Args: string list
+      Args: ImmutableList<string>
       WorkingDirectory: string option
-      EnvOverrides: (string * string option) list
+      EnvOverrides: ImmutableList<string * string option>
       ClearEnv: bool
       StdinSource: Stdin option
       KeepStdinOpen: bool
@@ -47,9 +54,9 @@ module internal CommandConfig =
 
     let create (program: string) =
         { Program = program
-          Args = []
+          Args = ImmutableList<string>.Empty
           WorkingDirectory = None
-          EnvOverrides = []
+          EnvOverrides = ImmutableList<string * string option>.Empty
           ClearEnv = false
           StdinSource = None
           KeepStdinOpen = false
@@ -102,7 +109,7 @@ type Command internal (config: CommandConfig) =
     member _.Program = config.Program
 
     /// The arguments, in order.
-    member _.Arguments: IReadOnlyList<string> = List.toArray config.Args
+    member _.Arguments: IReadOnlyList<string> = config.Args :> IReadOnlyList<string>
 
     /// The working directory, when overridden.
     member _.WorkingDirectory = config.WorkingDirectory
@@ -113,7 +120,7 @@ type Command internal (config: CommandConfig) =
 
         Command(
             { config with
-                Args = config.Args @ [ value ] }
+                Args = config.Args.Add value }
         )
 
     /// Append several arguments, in order.
@@ -122,7 +129,7 @@ type Command internal (config: CommandConfig) =
 
         Command(
             { config with
-                Args = config.Args @ List.ofSeq values }
+                Args = config.Args.AddRange values }
         )
 
     /// Set the working directory for the run.
@@ -143,7 +150,7 @@ type Command internal (config: CommandConfig) =
 
         Command(
             { config with
-                EnvOverrides = config.EnvOverrides @ [ key, Some value ] }
+                EnvOverrides = config.EnvOverrides.Add(key, Some value) }
         )
 
     /// Remove an inherited environment variable from the child. `key` must be non-empty and must not
@@ -154,7 +161,7 @@ type Command internal (config: CommandConfig) =
 
         Command(
             { config with
-                EnvOverrides = config.EnvOverrides @ [ key, None ] }
+                EnvOverrides = config.EnvOverrides.Add(key, None) }
         )
 
     /// Start the child's environment empty instead of inheriting the parent's.

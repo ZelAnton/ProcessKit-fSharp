@@ -13,14 +13,15 @@ module internal Pump =
     /// Accumulates retained output lines under an `OutputBufferPolicy`, tracking cumulative
     /// totals and whether the fail-loud ceiling tripped. Not thread-safe; one per stream.
     type LineBuffer(policy: OutputBufferPolicy) =
-        let retained = LinkedList<string>()
+        // Each retained line carries its own UTF-8 byte length alongside it (computed once, on Add),
+        // so a `DropOldest` eviction can subtract the stored length instead of re-scanning the evicted
+        // string through `Encoding.UTF8.GetByteCount` a second time.
+        let retained = LinkedList<struct (string * int)>()
         let mutable retainedBytes = 0
         let mutable totalLines = 0
         let mutable totalBytes = 0
         let mutable truncated = false
         let mutable tooLarge = false
-
-        let byteLen (line: string) = Encoding.UTF8.GetByteCount line
 
         // The retained/total byte counts only matter when a byte cap is set or the fail-loud ceiling
         // is in play; under the default (line-only / unbounded) policy, skip the per-line UTF-8 scan.
@@ -41,11 +42,12 @@ module internal Pump =
         member _.TotalBytes = totalBytes
         member _.Truncated = truncated
         member _.TooLarge = tooLarge
-        member _.Text = String.Join('\n', retained)
+
+        member _.Text = String.Join('\n', retained |> Seq.map (fun struct (s, _) -> s))
 
         /// Record a complete line, applying the policy.
         member _.Add(line: string) =
-            let bytes = if needBytes then byteLen line else 0
+            let bytes = if needBytes then Encoding.UTF8.GetByteCount line else 0
             totalLines <- totalLines + 1
             totalBytes <- totalBytes + bytes
             let unbounded = policy.MaxLines.IsNone && policy.MaxBytes.IsNone
@@ -58,7 +60,7 @@ module internal Pump =
             | OverflowMode.DropNewest when full -> truncated <- true
             | OverflowMode.DropOldest when full ->
                 truncated <- true
-                retained.AddLast line |> ignore
+                retained.AddLast(struct (line, bytes)) |> ignore
                 retainedBytes <- retainedBytes + bytes
 
                 let fits () =
@@ -73,10 +75,11 @@ module internal Pump =
                     match retained.First with
                     | null -> ()
                     | node ->
+                        let struct (_, evictedBytes) = node.Value
                         retained.RemoveFirst()
-                        retainedBytes <- retainedBytes - (if needBytes then byteLen node.Value else 0)
+                        retainedBytes <- retainedBytes - evictedBytes
             | _ ->
-                retained.AddLast line |> ignore
+                retained.AddLast(struct (line, bytes)) |> ignore
                 retainedBytes <- retainedBytes + bytes
 
     /// The retained bytes of a bounded raw-byte capture, plus whether the byte cap truncated them
@@ -216,35 +219,58 @@ module internal Pump =
                     | None -> ()
 
                     let chars = decoder.GetChars(byteBuffer, 0, read, charBuffer, 0)
-                    let mutable i = 0
+                    let mutable pos = 0
 
-                    while i < chars do
-                        let c = charBuffer[i]
+                    // The leading BOM only ever occupies index 0 of the very first non-empty decode —
+                    // check and consume it (at most once, across the whole stream) before scanning.
+                    if atStreamStart && chars > 0 then
+                        if charBuffer[0] = char 0xFEFF then
+                            pos <- 1
 
-                        if atStreamStart && c = char 0xFEFF then
-                            atStreamStart <- false
-                        else
-                            atStreamStart <- false
+                        atStreamStart <- false
 
-                            if c = '\n' then
-                                if line.Length > 0 && line[line.Length - 1] = '\r' then
-                                    line.Length <- line.Length - 1
+                    // Scan the decoded chunk for '\n' via `IndexOf` instead of a per-character loop —
+                    // each run of non-newline characters between two `\n` (or to the end of the chunk)
+                    // is appended to `line` in one batched `StringBuilder.Append(char[], int, int)` call.
+                    while pos < chars do
+                        let newlineIndex = Array.IndexOf(charBuffer, '\n', pos, chars - pos)
+                        let runEnd = if newlineIndex >= 0 then newlineIndex else chars
 
-                                do! onLine (line.ToString())
-                                line.Clear() |> ignore
-                            else
-                                match maxLineLength with
-                                | Some cap when line.Length >= cap ->
-                                    // Force-flush an over-long unterminated line so a newline-free flood
-                                    // can't grow the in-flight buffer past the cap; the flushed segment
-                                    // then goes through the caller's buffer policy (dropped / errored).
+                        match maxLineLength with
+                        | None ->
+                            if runEnd > pos then
+                                line.Append(charBuffer, pos, runEnd - pos) |> ignore
+
+                            pos <- runEnd
+                        | Some cap ->
+                            // Replicate the per-character force-flush at the cap, but batched: append up
+                            // to `cap - line.Length` characters at once, then — if the run isn't fully
+                            // consumed yet — flush the now-full line, append exactly the one character
+                            // that tripped the cap (matching the original's unconditional post-check
+                            // append), and repeat for the remainder of the run.
+                            let mutable p = pos
+
+                            while p < runEnd do
+                                if line.Length >= cap then
                                     do! onLine (line.ToString())
                                     line.Clear() |> ignore
-                                | _ -> ()
+                                    line.Append charBuffer[p] |> ignore
+                                    p <- p + 1
+                                else
+                                    let budget = cap - line.Length
+                                    let take = min budget (runEnd - p)
+                                    line.Append(charBuffer, p, take) |> ignore
+                                    p <- p + take
 
-                                line.Append c |> ignore
+                            pos <- p
 
-                        i <- i + 1
+                        if newlineIndex >= 0 then
+                            if line.Length > 0 && line[line.Length - 1] = '\r' then
+                                line.Length <- line.Length - 1
+
+                            do! onLine (line.ToString())
+                            line.Clear() |> ignore
+                            pos <- newlineIndex + 1
 
             if line.Length > 0 then
                 if line[line.Length - 1] = '\r' then

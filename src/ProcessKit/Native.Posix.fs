@@ -474,7 +474,7 @@ module internal Posix =
             // holds either platform's representation (glibc structs or macOS pointers).
             let fileActions = Marshal.AllocHGlobal 1024
             let attributes = Marshal.AllocHGlobal 1024
-            let argv = command.Program :: command.Config.Args
+            let argv = command.Program :: List.ofSeq command.Config.Args
 
             let envp =
                 effectiveEnvironment command
