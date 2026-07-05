@@ -9,8 +9,14 @@
 		<Version>2.0.0</Version>
 		<Description>F# async child-process management: whole-tree kill-on-drop (no orphans), streaming, pipelines, timeouts, and supervision.</Description>
 		<PackageTags>fsharp;dotnet;process;subprocess;child-process;process-management;process-tree;kill-on-drop;async;pipeline;supervision;job-object;cgroups</PackageTags>
-		<!-- Release notes are read from release-notes.md by the release workflow (main package only). -->
-		<PackageReleaseNotes Condition="Exists('$(RepoRoot)release-notes.md')">$([System.IO.File]::ReadAllText('$(RepoRoot)release-notes.md'))</PackageReleaseNotes>
+		<!-- A short pointer, not the full text: NuGet.org caps PackageReleaseNotes at 35000
+		     characters, and this project's per-release notes can exceed that (the 2.0.0
+		     notes alone run to ~39000). The full notes already ship in CHANGELOG.md (packed
+		     into the nupkg below) and in the GitHub Release body, neither of which has this
+		     limit. Gated on release-notes.md existing so a plain local `dotnet pack` (no
+		     release in progress) sets no release notes at all, rather than a pointer to a
+		     tag/version that may not exist yet. -->
+		<PackageReleaseNotes Condition="Exists('$(RepoRoot)release-notes.md')">See $(RepositoryUrl)/releases/tag/v$(Version) for the full release notes.</PackageReleaseNotes>
 	</PropertyGroup>
 
 	<!-- F# COMPILE ORDER IS SIGNIFICANT. Files are compiled top-to-bottom; a type or
