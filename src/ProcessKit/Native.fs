@@ -1,6 +1,7 @@
 namespace ProcessKit
 
 open System
+open System.Collections.Concurrent
 open System.ComponentModel
 open System.IO
 open System.IO.Pipes
@@ -916,6 +917,19 @@ module internal Native =
     [<DllImport("libc", SetLastError = true)>]
     extern int private killpg(int pgrp, int signalNumber)
 
+    // `pidfd_open` (Linux >= 5.3) has no dedicated libc wrapper before glibc 2.36, so call it through
+    // the raw `syscall()` — a fixed-arity P/Invoke over a variadic C function is fine as long as the
+    // call always passes the same, small number of arguments (the syscall number, then the real
+    // args), which is exactly what a specific syscall like this one does. Syscall number 434 is the
+    // same on x86_64 and arm64: post-2018 syscalls were assigned matching numbers on the "generic"
+    // table arm64 (and most other 64-bit architectures) uses and the x86_64 table, specifically to
+    // avoid per-architecture number tables for anything added going forward.
+    [<DllImport("libc", EntryPoint = "syscall", SetLastError = true)>]
+    extern int64 private syscall_pidfd_open(int64 number, int pid, uint flags)
+
+    [<Literal>]
+    let private SYS_pidfd_open = 434L
+
     [<DllImport("libc", SetLastError = true)>]
     extern int private posix_spawn_file_actions_init(nativeint fileActions)
 
@@ -1266,19 +1280,136 @@ module internal Native =
     // blocking. Same value on Linux and macOS.
     let private WNOHANG = 1
 
-    /// Reap a POSIX child and report how it concluded.
-    let waitPosix (pid: nativeint) : Task<Outcome> =
-        Task.Run(fun () ->
+    // An event-driven `waitPosix` wait in flight for one pid: the completion source the eventual
+    // `waitpid` result feeds, and the pidfd (if one was opened — Linux >= 5.3 only) to close once
+    // decided. Keyed by pid in `pendingWaits` below.
+    [<NoComparison; NoEquality>]
+    type private PendingWait =
+        { Tcs: TaskCompletionSource<Outcome>
+          Pidfd: int option }
+
+    // Every event-driven POSIX wait currently in flight, process-wide. `waitPosix` adds an entry;
+    // whichever of `reapAllPending` (SIGCHLD-triggered) or `reapLeader` (teardown) actually reaps a
+    // given child removes it and completes its `Tcs` — only one of them ever can, since a child's
+    // exit status is consumed exactly once by whichever `waitpid` call gets there first.
+    let private pendingWaits = ConcurrentDictionary<int, PendingWait>()
+
+    // Complete a pending event-driven wait for `pid` (if `waitPosix` registered one) with `outcome`,
+    // closing its pidfd. Shared by the SIGCHLD-triggered reap path below and by `reapLeader`'s
+    // teardown reap, so whichever of the two actually reaps a given child still delivers the real
+    // decoded status to anything awaiting it, instead of leaving the wait to notice only `ECHILD`.
+    // A no-op if nothing is pending for `pid` (no `waitPosix` call is in flight for it).
+    let private completePending (pid: int) (outcome: Outcome) =
+        match pendingWaits.TryRemove pid with
+        | true, pending ->
+            pending.Pidfd |> Option.iter (fun fd -> close fd |> ignore)
+            pending.Tcs.TrySetResult outcome |> ignore
+        | false, _ -> ()
+
+    // Best-effort, non-blocking reap of one pending pid. Returns `true` once there is nothing further
+    // to do for it (reaped — by us or, via `ECHILD`, by a concurrent `reapLeader` — or nothing was
+    // ever pending); `false` if it is still alive (left pending for the next trigger).
+    let private tryReapPending (pid: int) : bool =
+        if not (pendingWaits.ContainsKey pid) then
+            true
+        else
             let mutable status = 0
-            // `waitpid` can return -1/EINTR when a signal interrupts the blocking wait — notably the
-            // .NET runtime's own thread-suspension signal on Linux. Retry so we don't misread the
-            // untouched status as `Exited 0` (and leak the child as a zombie).
-            let mutable result = waitpid (int pid, &status, 0)
+            let mutable result = waitpid (pid, &status, WNOHANG)
 
+            // `WNOHANG` returns near-instantly (it never blocks), so retrying `EINTR` immediately here
+            // costs nothing — unlike the blocking `waitpid` this replaces, an "unbounded" retry loop
+            // can't wedge a thread. Retrying immediately (rather than deferring to the next SIGCHLD,
+            // which may never come) matters because this call can be the *only* look a pid ever gets:
+            // the one immediate probe right after `waitPosix` registers it, for a child that had
+            // already exited before that — no *new* SIGCHLD is generated for an event that already
+            // happened.
             while result < 0 && Marshal.GetLastWin32Error() = EINTR do
-                result <- waitpid (int pid, &status, 0)
+                result <- waitpid (pid, &status, WNOHANG)
 
-            decodeWaitStatus status)
+            if result = 0 then
+                false // still alive
+            elif result = pid then
+                // We won the reap race — this is the real, decoded status.
+                completePending pid (decodeWaitStatus status)
+                true
+            else
+                // `ECHILD`: some concurrent caller (most plausibly `reapLeader` tearing down an
+                // abandoned run) won the actual `waitpid` race for this pid and has the REAL status;
+                // we have nothing to report ourselves. `completePending` is a `TryRemove`, so whichever
+                // side calls it *first* decides the outcome — not whichever side won the `waitpid`
+                // race — so briefly give the genuine winner a chance to land its real result before
+                // this side settles for a fallback. Bounded and non-blocking-in-spirit (a few 1ms
+                // sleeps): if the entry is somehow still there afterwards (the "winner" errored out
+                // before calling `completePending`, or some other/impossible edge case), report a
+                // clean exit as an honest "nothing more to learn" rather than leaving the wait hanging
+                // forever — the `Outcome` type has no dedicated "unknown" case.
+                let mutable spins = 0
+
+                while pendingWaits.ContainsKey pid && spins < 20 do
+                    Thread.Sleep 1
+                    spins <- spins + 1
+
+                completePending pid (Outcome.Exited 0)
+                true
+
+    // Re-scan every still-pending pid — triggered by SIGCHLD (some child changed state; POSIX signals
+    // are not queued, so a burst of near-simultaneous exits can coalesce into one delivery, and we
+    // cannot assume it was any *specific* one of ours — re-probing all of them handles that
+    // uniformly) and once eagerly right after registering a new wait, in case that child had already
+    // exited before we started listening for it.
+    let private reapAllPending () =
+        for pid in pendingWaits.Keys |> Seq.toArray do
+            tryReapPending pid |> ignore
+
+    let mutable private sigchldRegistration: PosixSignalRegistration option = None
+    let private sigchldInitLock = obj ()
+
+    // Lazily install ONE process-wide SIGCHLD handler (not one thread, and not one per child) the
+    // first time a POSIX wait is needed. `PosixSignalRegistration` dispatches through the runtime's
+    // own signal-handling machinery — no dedicated blocking thread of our own, and it coexists safely
+    // alongside any other SIGCHLD registration in the process (unlike installing a raw `sigaction`
+    // handler, which would clobber one).
+    let private ensureSigchldRegistration () =
+        if sigchldRegistration.IsNone then
+            lock sigchldInitLock (fun () ->
+                if sigchldRegistration.IsNone then
+                    sigchldRegistration <-
+                        Some(PosixSignalRegistration.Create(PosixSignal.SIGCHLD, (fun _ -> reapAllPending ()))))
+
+    // `pidfd_open` a Linux child (kernel >= 5.3), closed by whichever side (`completePending`)
+    // eventually reaps it. `None` on macOS (no such syscall) or on ANY failure (`ENOSYS` on an older
+    // kernel, `EMFILE`, a sandboxed `EPERM`, …): the wait mechanism below is driven entirely by SIGCHLD
+    // + `waitpid`, not by the pidfd's own readiness, so a missing pidfd never blocks or degrades the
+    // wait itself. NOTE: this pidfd is currently a bookkeeping-only placeholder for the pid-reuse-safe,
+    // fully pidfd-driven wait a future revision could build on it (matching tokio's Linux design more
+    // closely) — nothing here yet actually reads it or checks it against the pid before reaping, so it
+    // does not itself protect against a pid being reused between "child exited" and "we call
+    // `waitpid`" (a vanishingly small window in practice: SIGCHLD/the immediate probe fire promptly,
+    // and a just-exited zombie's pid is not recycled by the kernel until it is reaped).
+    let private tryOpenPidfd (pid: int) : int option =
+        if isMacOs then
+            None
+        else
+            let result = syscall_pidfd_open (SYS_pidfd_open, pid, 0u)
+            if result >= 0L then Some(int result) else None
+
+    /// Reap a POSIX child and report how it concluded — event-driven: a shared, process-wide SIGCHLD
+    /// registration (not a thread parked per child) re-checks every outstanding wait when any child
+    /// changes state, so a piped POSIX child no longer holds a dedicated thread-pool thread blocked in
+    /// `waitpid` for its whole lifetime.
+    let waitPosix (pid: nativeint) : Task<Outcome> =
+        ensureSigchldRegistration ()
+        let intPid = int pid
+
+        let tcs =
+            TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let pidfd = tryOpenPidfd intPid
+        pendingWaits[intPid] <- { Tcs = tcs; Pidfd = pidfd }
+        // The child may already have exited — even before this call started — so probe once
+        // immediately rather than waiting on a SIGCHLD that may already have been delivered.
+        tryReapPending intPid |> ignore
+        tcs.Task
 
     /// Best-effort synchronous reap of a POSIX child we own (a group leader, whose pid == its pgid)
     /// during teardown — it was just SIGKILLed, so it becomes a zombie within a moment. Uses a
@@ -1306,6 +1437,13 @@ module internal Native =
                 () // interrupted before we learned anything; loop and retry
             else
                 finished <- true // reaped (result = pid), or ECHILD / other error — nothing more to do
+
+                // If an event-driven `waitPosix` wait is still pending for this pid (an abandoned run
+                // being torn down concurrently with, or just ahead of, its own exit), hand it the real
+                // decoded status now that we have it, rather than leaving it to notice only `ECHILD`
+                // whenever it next gets a chance to look.
+                if result = pid then
+                    completePending pid (decodeWaitStatus status)
 
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
     /// child's pid) and capture its stdout/stderr. The whole group can later be reaped with
