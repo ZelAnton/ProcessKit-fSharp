@@ -705,7 +705,7 @@ class ProcessKit.RunningProcess
   property StderrLineCount : System.Int32 { get }
   property StdoutLineCount : System.Int32 { get }
   static member WaitAllAsync(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<ProcessKit.Outcome[]>
-  static member WaitAnyAsync(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.WaitAnyResult, ProcessKit.ProcessError>>
+  static member WaitAnyAsync(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<ProcessKit.WaitAnyResult>
 
 class ProcessKit.Signal
   :> System.Collections.IStructuralEquatable

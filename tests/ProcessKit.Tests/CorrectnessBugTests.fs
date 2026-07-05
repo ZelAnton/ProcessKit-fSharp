@@ -214,9 +214,7 @@ type CorrectnessBugTests() =
             | Error e -> Assert.Fail $"OutputStringAsync failed: {e.Message}"
             | Ok result -> Assert.That(result.Stdout, Is.EqualTo payload)
 
-            match waitAnyResult with
-            | Ok r -> Assert.That(r.Outcome, Is.EqualTo(Outcome.Exited 0))
-            | Error e -> Assert.Fail $"WaitAnyAsync failed: {e.Message}"
+            Assert.That(waitAnyResult.Outcome, Is.EqualTo(Outcome.Exited 0))
         }
         :> Task
 
@@ -228,15 +226,72 @@ type CorrectnessBugTests() =
             | Ok running ->
                 use running = running
 
-                match! RunningProcess.WaitAnyAsync [| running |] with
-                | Error e -> Assert.Fail $"WaitAnyAsync failed: {e.Message}"
-                | Ok _ ->
-                    // The reverse order still refuses a terminal verb, unchanged: a `Fresh` ExitTask
-                    // claims the buffered slot itself, so a verb called afterwards races nothing.
-                    match! running.OutputStringAsync() with
-                    | Error(ProcessError.Unsupported _) -> ()
-                    | Error other -> Assert.Fail $"expected Unsupported, got {other.Message}"
-                    | Ok _ -> Assert.Fail "expected OutputStringAsync to be refused after WaitAnyAsync"
+                let! _ = RunningProcess.WaitAnyAsync [| running |]
+
+                // The reverse order still refuses a terminal verb, unchanged: a `Fresh` ExitTask
+                // claims the buffered slot itself, so a verb called afterwards races nothing.
+                match! running.OutputStringAsync() with
+                | Error(ProcessError.Unsupported _) -> ()
+                | Error other -> Assert.Fail $"expected Unsupported, got {other.Message}"
+                | Ok _ -> Assert.Fail "expected OutputStringAsync to be refused after WaitAnyAsync"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitAnyAsync rejects a null array``() =
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> RunningProcess.WaitAnyAsync(Unchecked.defaultof<RunningProcess[]>) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``WaitAnyAsync rejects an empty array``() =
+        Assert.Throws<ArgumentException>(Action(fun () -> RunningProcess.WaitAnyAsync [||] |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``WaitAnyAsync rejects an array with a null element``() : Task =
+        task {
+            match! runner.StartAsync(shell "echo hi", CancellationToken.None) with
+            | Error e -> failwith $"Start failed: {e}"
+            | Ok running ->
+                use running = running
+
+                Assert.Throws<ArgumentException>(
+                    Action(fun () ->
+                        RunningProcess.WaitAnyAsync [| running; Unchecked.defaultof<RunningProcess> |]
+                        |> ignore)
+                )
+                |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitAllAsync rejects a null array``() =
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> RunningProcess.WaitAllAsync(Unchecked.defaultof<RunningProcess[]>) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``WaitAllAsync rejects an empty array``() =
+        Assert.Throws<ArgumentException>(Action(fun () -> RunningProcess.WaitAllAsync [||] |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``WaitAllAsync rejects an array with a null element``() : Task =
+        task {
+            match! runner.StartAsync(shell "echo hi", CancellationToken.None) with
+            | Error e -> failwith $"Start failed: {e}"
+            | Ok running ->
+                use running = running
+
+                Assert.Throws<ArgumentException>(
+                    Action(fun () ->
+                        RunningProcess.WaitAllAsync [| running; Unchecked.defaultof<RunningProcess> |]
+                        |> ignore)
+                )
+                |> ignore
         }
         :> Task
 

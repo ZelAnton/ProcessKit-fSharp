@@ -538,8 +538,11 @@ async health check fits — re-evaluated until it returns `true` or the deadline
 
 `RunningProcess.WaitAny` races several started handles and reports whichever exits
 first — the natural primitive for "first answer wins" or "restart whatever died". It
-returns `Result<WaitAnyResult, ProcessError>`, where `WaitAnyResult` carries the winner's
-`Index` in the array you passed and its `Outcome`:
+returns `WaitAnyResult` directly (no `Result` wrapper), carrying the winner's `Index`
+in the array you passed and its `Outcome`. The array itself must be non-null,
+non-empty, and free of null elements — a violation throws (`ArgumentNullException`/
+`ArgumentException`) rather than reporting through a `Result`, the same contract
+`WaitAllAsync` below uses:
 
 **F#**
 
@@ -559,9 +562,8 @@ task {
         | Ok b ->
             use _ = b
 
-            match! RunningProcess.WaitAnyAsync [| a; b |] with
-            | Ok result -> printfn $"contender #{result.Index} exited first with {result.Outcome}"
-            | Error err -> eprintfn $"{err.Message}"
+            let! result = RunningProcess.WaitAnyAsync [| a; b |]
+            printfn $"contender #{result.Index} exited first with {result.Outcome}"
 }
 ```
 
@@ -575,16 +577,13 @@ Command withDeadline(string name) =>
 await using var a = (await withDeadline("replica-a").StartAsync()).GetValueOrThrow();
 await using var b = (await withDeadline("replica-b").StartAsync()).GetValueOrThrow();
 
-Console.WriteLine(await RunningProcess.WaitAnyAsync([a, b]) switch
-{
-    { IsOk: true, ResultValue: var first } => $"contender #{first.Index} exited first with {first.Outcome}",
-    { IsOk: false, ErrorValue: var err }  => err.Message,
-});
+var first = await RunningProcess.WaitAnyAsync([a, b]);
+Console.WriteLine($"contender #{first.Index} exited first with {first.Outcome}");
 ```
 
 To join a fixed set instead of racing it, `RunningProcess.WaitAll` waits for *all* of
 them and returns every `Outcome` in input order (an `Outcome[]` directly — no `Result`
-wrapper):
+wrapper), under the same non-null/non-empty/no-null-element contract:
 
 **F#**
 

@@ -1053,20 +1053,47 @@ type RunningProcess internal (host: RunningHost) =
     /// of them — dispose them yourself. Safe to call on a handle a buffered verb (`OutputStringAsync`/
     /// `OutputBytesAsync`/`WaitAsync`/`ProfileAsync`) already started: it reuses that verb's own wait
     /// (see `ExitTask`) rather than racing a second reader on the same pipes.
-    static member WaitAnyAsync(processes: RunningProcess[]) : Task<Result<WaitAnyResult, ProcessError>> =
+    ///
+    /// `processes` must be non-null, non-empty, and free of null elements — each is a programmer
+    /// error, not a process outcome, so it throws (`ArgumentNullException` for a null array,
+    /// `ArgumentException` for an empty array or a null element) rather than reporting through a
+    /// `Result`. Symmetric with `WaitAllAsync` on all three axes: error channel, empty input, and
+    /// null handling. If a pump backing one of the raced `ExitTask`s faults, that exception propagates
+    /// unchanged from the awaited task — also not wrapped in a `Result`.
+    static member WaitAnyAsync(processes: RunningProcess[]) : Task<WaitAnyResult> =
+        ArgumentNullException.ThrowIfNull processes
+
+        if processes.Length = 0 then
+            raise (ArgumentException("expected at least one process", nameof processes))
+
+        if processes |> Array.exists (fun p -> obj.ReferenceEquals(p, null)) then
+            raise (ArgumentException("processes must not contain a null element", nameof processes))
+
         task {
-            if processes.Length = 0 then
-                return Error(ProcessError.Unsupported "WaitAnyAsync requires at least one process")
-            else
-                let tasks = processes |> Array.map (fun p -> p.ExitTask)
-                let! completed = Task.WhenAny tasks
-                let index = tasks |> Array.findIndex (fun t -> obj.ReferenceEquals(t, completed))
-                let! outcome = completed
-                return Ok(WaitAnyResult(index, outcome))
+            let tasks = processes |> Array.map (fun p -> p.ExitTask)
+            let! completed = Task.WhenAny tasks
+            let index = tasks |> Array.findIndex (fun t -> obj.ReferenceEquals(t, completed))
+            let! outcome = completed
+            return WaitAnyResult(index, outcome)
         }
 
     /// Wait for all of `processes` to exit; returns their outcomes in order. Does not reap them.
+    ///
+    /// `processes` must be non-null, non-empty, and free of null elements — each is a programmer
+    /// error, not a process outcome, so it throws (`ArgumentNullException` for a null array,
+    /// `ArgumentException` for an empty array or a null element) rather than reporting through a
+    /// `Result`. Symmetric with `WaitAnyAsync` on all three axes: error channel, empty input, and null
+    /// handling. If a pump backing one of the `ExitTask`s faults, that exception propagates unchanged
+    /// from `Task.WhenAll` — also not wrapped in a `Result`.
     static member WaitAllAsync(processes: RunningProcess[]) : Task<Outcome[]> =
+        ArgumentNullException.ThrowIfNull processes
+
+        if processes.Length = 0 then
+            raise (ArgumentException("expected at least one process", nameof processes))
+
+        if processes |> Array.exists (fun p -> obj.ReferenceEquals(p, null)) then
+            raise (ArgumentException("processes must not contain a null element", nameof processes))
+
         processes |> Array.map (fun p -> p.ExitTask) |> Task.WhenAll
 
     interface IAsyncDisposable with

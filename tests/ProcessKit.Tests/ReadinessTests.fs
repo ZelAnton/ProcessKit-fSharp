@@ -116,9 +116,8 @@ type ReadinessTests() =
                     use fast = fast
                     use slow = slow
 
-                    match! RunningProcess.WaitAnyAsync [| fast; slow |] with
-                    | Ok result -> Assert.That(result.Index, Is.EqualTo 0)
-                    | Error error -> Assert.Fail $"{error}"
+                    let! result = RunningProcess.WaitAnyAsync [| fast; slow |]
+                    Assert.That(result.Index, Is.EqualTo 0)
         }
         :> Task
 

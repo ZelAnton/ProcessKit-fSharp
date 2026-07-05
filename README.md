@@ -329,9 +329,8 @@ task {
             | Ok pids -> printfn $"live pids: {pids}"
             | Error _ -> ()
 
-            match! RunningProcess.WaitAnyAsync [| a; b |] with
-            | Ok result -> printfn $"contender #{result.Index} exited first with {result.Outcome}"
-            | Error err -> eprintfn $"{err.Message}"
+            let! result = RunningProcess.WaitAnyAsync [| a; b |]
+            printfn $"contender #{result.Index} exited first with {result.Outcome}"
         | _ -> ()
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -347,11 +346,8 @@ var b = (await group.StartAsync(new Command("server-b"))).GetValueOrThrow();
 if (group.Members() is { IsOk: true, ResultValue: var pids })
     Console.WriteLine($"live pids: {string.Join(", ", pids)}");
 
-Console.WriteLine(await RunningProcess.WaitAnyAsync([a, b]) switch
-{
-    { IsOk: true, ResultValue: var first } => $"contender #{first.Index} exited first with {first.Outcome}",
-    { IsOk: false, ErrorValue: var err }  => err.Message,
-});
+var first = await RunningProcess.WaitAnyAsync([a, b]);
+Console.WriteLine($"contender #{first.Index} exited first with {first.Outcome}");
 ```
 
 `Members()` lists the whole tree on Windows (Job Object) and Linux (cgroup); the POSIX
