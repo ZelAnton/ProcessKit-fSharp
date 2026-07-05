@@ -1397,19 +1397,36 @@ module internal Native =
     /// registration (not a thread parked per child) re-checks every outstanding wait when any child
     /// changes state, so a piped POSIX child no longer holds a dedicated thread-pool thread blocked in
     /// `waitpid` for its whole lifetime.
-    let waitPosix (pid: nativeint) : Task<Outcome> =
+    ///
+    /// Idempotent per pid: a second call while a wait for the same pid is already in flight reuses the
+    /// existing registration's task instead of overwriting it in `pendingWaits` — an unconditional
+    /// overwrite would strand the earlier `TaskCompletionSource` forever (nothing would ever complete
+    /// it, since `completePending`'s `TryRemove` only ever observes the newer entry) and leak the
+    /// earlier pidfd. Both callers observe the same eventual outcome.
+    let rec waitPosix (pid: nativeint) : Task<Outcome> =
         ensureSigchldRegistration ()
         let intPid = int pid
 
-        let tcs =
-            TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+        match pendingWaits.TryGetValue intPid with
+        | true, existing -> existing.Tcs.Task
+        | false, _ ->
+            let tcs =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-        let pidfd = tryOpenPidfd intPid
-        pendingWaits[intPid] <- { Tcs = tcs; Pidfd = pidfd }
-        // The child may already have exited — even before this call started — so probe once
-        // immediately rather than waiting on a SIGCHLD that may already have been delivered.
-        tryReapPending intPid |> ignore
-        tcs.Task
+            let pidfd = tryOpenPidfd intPid
+            let pending = { Tcs = tcs; Pidfd = pidfd }
+
+            if pendingWaits.TryAdd(intPid, pending) then
+                // The child may already have exited — even before this call started — so probe once
+                // immediately rather than waiting on a SIGCHLD that may already have been delivered.
+                tryReapPending intPid |> ignore
+                tcs.Task
+            else
+                // Lost the race to register first — a concurrent `waitPosix` call for the same pid won
+                // in between our `TryGetValue` miss and this `TryAdd`. Close the pidfd we opened
+                // (nobody else will) and reuse the winner's entry instead.
+                pidfd |> Option.iter (fun fd -> close fd |> ignore)
+                waitPosix pid
 
     /// Best-effort synchronous reap of a POSIX child we own (a group leader, whose pid == its pgid)
     /// during teardown — it was just SIGKILLed, so it becomes a zombie within a moment. Uses a

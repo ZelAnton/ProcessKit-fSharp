@@ -22,6 +22,80 @@ type PosixEventDrivenWaitTests() =
     let shell (script: string) =
         Command.create "/bin/sh" |> Command.args [ "-c"; script ]
 
+    // Race `work` against a deadline so a regression that strands a `TaskCompletionSource` fails this
+    // test in `deadlineMs` instead of hanging the whole run.
+    let withDeadline (deadlineMs: int) (work: Task<'T>) =
+        task {
+            let! winner = Task.WhenAny((work :> Task), Task.Delay deadlineMs)
+            Assert.That(obj.ReferenceEquals(winner, work), Is.True, "timed out waiting for the task to complete")
+            return! work
+        }
+
+    // Spawn a short-lived child directly through `Native.spawnPosix` (bypassing the containment/verb
+    // layer entirely) and call `Native.waitPosix` on its pid TWICE — the exact double-registration
+    // scenario a caller could hit before this handle's own single wait has settled. Returns both
+    // outcomes so a caller can assert they agree.
+    let spawnAndDoubleWait () =
+        task {
+            match Native.spawnPosix (shell "true") with
+            | Error e -> return Error e
+            | Ok spawned ->
+                let first = Native.waitPosix spawned.Handle
+                let second = Native.waitPosix spawned.Handle
+                let! firstOutcome = withDeadline 5000 first
+                let! secondOutcome = withDeadline 5000 second
+                spawned.Stdout |> Option.iter (fun s -> s.Dispose())
+                spawned.Stderr |> Option.iter (fun s -> s.Dispose())
+                spawned.Stdin |> Option.iter (fun s -> s.Dispose())
+                return Ok(firstOutcome, secondOutcome)
+        }
+
+    [<Test>]
+    member _.``waitPosix is idempotent for a repeated pid and does not leak a pidfd``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: exercises Native.waitPosix directly"
+
+            match! spawnAndDoubleWait () with
+            | Error e -> Assert.Fail $"spawn failed: {e.Message}"
+            | Ok(firstOutcome, secondOutcome) ->
+                Assert.That(secondOutcome, Is.EqualTo firstOutcome, "the two waitPosix calls disagreed on the outcome")
+
+                match firstOutcome with
+                | Outcome.Exited 0 -> ()
+                | other -> Assert.Fail $"expected a clean exit, got {other}"
+
+            if isLinux then
+                // Warm up (JIT, the lazy shared SIGCHLD registration) before the baseline, then repeat
+                // the double-registration scenario under load: an unconditional `pendingWaits`
+                // overwrite would leak the first call's pidfd every time, showing up as fd growth
+                // proportional to the iteration count.
+                for _ in 1..5 do
+                    match! spawnAndDoubleWait () with
+                    | Ok _ -> ()
+                    | Error e -> Assert.Fail $"{e.Message}"
+
+                let fdCount () =
+                    Directory.GetFileSystemEntries("/proc/self/fd").Length
+
+                let baseline = fdCount ()
+
+                for _ in 1..50 do
+                    match! spawnAndDoubleWait () with
+                    | Ok _ -> ()
+                    | Error e -> Assert.Fail $"{e.Message}"
+
+                let after = fdCount ()
+
+                Assert.That(
+                    after,
+                    Is.LessThan(baseline + 20),
+                    $"open fd count grew from {baseline} to {after} after 50 duplicate-registration \
+                      spawns — looks like a pidfd leak"
+                )
+        }
+        :> Task
+
     [<Test>]
     member _.``no fd leak after many piped spawns``() : Task =
         task {
