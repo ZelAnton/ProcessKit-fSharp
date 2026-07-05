@@ -187,6 +187,12 @@ type RunningProcess internal (host: RunningHost) =
     // racing set of drains on the same streams.
     let mutable eventOutcome = Unchecked.defaultof<Task<Outcome>>
 
+    // A buffered verb's single exit wait (`OutputStringAsync`/`OutputBytesAsync`/`WaitAsync`/
+    // `ProfileAsync`, via `startBufferedWait`). ExitTask reuses it for an already-`Buffered` handle —
+    // the "verb, then WaitAny/WaitAll" order — so it does not start a second `host.Wait()` racing the
+    // verb's own, mirroring `streamOutcome`/`eventOutcome` above for the streaming sessions.
+    let mutable bufferedOutcome = Unchecked.defaultof<Task<Outcome>>
+
     // Single-consumption guard: the output pipes are pumped exactly once. A buffered one-shot verb
     // (OutputString/OutputBytes/Wait/Profile) consumes them whole; the streaming verbs form one
     // session (`StdoutStreaming`: StdoutLines/WaitForLine/Finish share the stdout channel;
@@ -354,6 +360,16 @@ type RunningProcess internal (host: RunningHost) =
 
         Timeouts.raceTimeout config.Logger config.Program runId config.Timeout onTimeout (host.Wait())
 
+    // Start (and memoize) a buffered verb's single exit wait. Every buffered verb calls this instead
+    // of `waitWithTimeout()` directly, storing the resulting task in `bufferedOutcome` synchronously —
+    // before the caller's `let!` can suspend — so a concurrent `ExitTask` access on the same handle
+    // (the "verb, then WaitAny/WaitAll" order) always observes a fully-assigned `bufferedOutcome` and
+    // can reuse it instead of racing a second reader on the same pipes and a second `host.Wait()`.
+    let startBufferedWait () : Task<Outcome> =
+        let wait = waitWithTimeout ()
+        bufferedOutcome <- wait
+        wait
+
     // An async-disposable that reaps the tree on scope exit — normal OR exceptional. Every terminal
     // verb opens one with `use` so the container is always torn down, even when a pump faults (e.g.
     // a throwing line handler) before the verb would otherwise reach its teardown. `Teardown` is
@@ -441,7 +457,7 @@ type RunningProcess internal (host: RunningHost) =
                 use _reap = reapGuard ()
                 let stdoutTask = pumpStdoutBuffer ()
                 let stderrTask = pumpStderrBuffer ()
-                let! outcome = waitWithTimeout ()
+                let! outcome = startBufferedWait ()
                 // Observe BOTH buffer pumps before reading either, so a throwing line handler in one
                 // never orphans the other as an unobserved task (mirrors the streaming path's WhenAll).
                 do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
@@ -487,7 +503,7 @@ type RunningProcess internal (host: RunningHost) =
                     Pump.drainRawOrEmpty host.Stdout config.StdoutTee CancellationToken.None
 
                 let stderrTask = pumpStderrBuffer ()
-                let! outcome = waitWithTimeout ()
+                let! outcome = startBufferedWait ()
                 // Observe both pumps before reading either, so a throwing stderr handler (or a raw-drain
                 // I/O fault) can't orphan the other as an unobserved task.
                 do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
@@ -525,7 +541,7 @@ type RunningProcess internal (host: RunningHost) =
             // Drain both pipes (so the child never blocks on a full buffer) without retaining.
             let stdoutTask = Pump.drainDiscardOrEmpty host.Stdout CancellationToken.None
             let stderrTask = Pump.drainDiscardOrEmpty host.Stderr CancellationToken.None
-            let! outcome = waitWithTimeout ()
+            let! outcome = startBufferedWait ()
             // Observe both drains together so an I/O fault on one can't orphan the other.
             do! Task.WhenAll([| stdoutTask; stderrTask |])
             conclude outcome
@@ -592,7 +608,7 @@ type RunningProcess internal (host: RunningHost) =
             let mutable outcome = Unchecked.defaultof<Outcome>
 
             try
-                let! settled = waitWithTimeout ()
+                let! settled = startBufferedWait ()
                 do! Task.WhenAll([| stdoutTask; stderrTask |])
                 outcome <- settled
             with ex ->
@@ -938,7 +954,16 @@ type RunningProcess internal (host: RunningHost) =
         }
 
     /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
-    /// the racing primitive behind `WaitAnyAsync`/`WaitAllAsync`.
+    /// the racing primitive behind `WaitAnyAsync`/`WaitAllAsync`. Reuses whichever consumption already
+    /// owns the pipes instead of ever starting a second reader on them:
+    /// - `StdoutStreaming`/`EventStreaming`: the session's own combined outcome.
+    /// - `Buffered` (a capture verb already started — the "verb, then WaitAny/WaitAll" order): the
+    ///   verb's own in-flight `bufferedOutcome`, set synchronously by `startBufferedWait` before the
+    ///   verb's `let!` can suspend, so it is always assigned by the time a sequential caller reaches
+    ///   this property.
+    /// - `Fresh` (WaitAny/WaitAll arrives first): claims the buffered slot itself and runs its own
+    ///   drains, so a terminal verb called afterwards on the same handle is refused
+    ///   (`alreadyConsumedError`) rather than racing a second reader.
     member internal _.ExitTask: Task<Outcome> =
         if not exitStarted then
             exitStarted <- true
@@ -950,9 +975,15 @@ type RunningProcess internal (host: RunningHost) =
                     // The event pumps already drain both pipes; reuse their shared outcome rather than
                     // starting our own drains here, which would race a second reader on the same streams.
                     eventOutcome
+                elif consumption = Consumption.Buffered then
+                    // A buffered verb already claimed the pipes and is already awaiting its own single
+                    // wait; reuse it rather than starting a second pair of readers on the same pipes and
+                    // a second `host.Wait()`.
+                    bufferedOutcome
                 else
-                    // Claim the buffered slot so a terminal verb called after WaitAny/WaitAll on the
-                    // same handle is refused rather than racing a second reader on these pipes.
+                    // Fresh: no verb has run yet. Claim the buffered slot so a terminal verb called
+                    // after WaitAny/WaitAll on the same handle is refused rather than racing a second
+                    // reader on these pipes.
                     claimBuffered () |> ignore
 
                     task {
@@ -977,7 +1008,9 @@ type RunningProcess internal (host: RunningHost) =
         exitTaskValue
 
     /// Wait for the first of `processes` to exit; returns its index and outcome. Does not reap any
-    /// of them — dispose them yourself.
+    /// of them — dispose them yourself. Safe to call on a handle a buffered verb (`OutputStringAsync`/
+    /// `OutputBytesAsync`/`WaitAsync`/`ProfileAsync`) already started: it reuses that verb's own wait
+    /// (see `ExitTask`) rather than racing a second reader on the same pipes.
     static member WaitAnyAsync(processes: RunningProcess[]) : Task<Result<WaitAnyResult, ProcessError>> =
         task {
             if processes.Length = 0 then

@@ -1,11 +1,72 @@
 namespace ProcessKit.Tests
 
 open System
+open System.Diagnostics
+open System.IO
 open System.Runtime.InteropServices
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+
+/// A `Stream` whose `ReadAsync` parks until the test releases it, and records whether two
+/// `ReadAsync` calls on the same instance were ever in flight at once — direct, deterministic
+/// evidence of "two readers pumping the same pipe", which a regression in `RunningProcess.ExitTask`
+/// (the "buffered verb, then WaitAnyAsync" order) would produce.
+type private GatedStream(payload: byte[]) =
+    inherit Stream()
+
+    let inner = new MemoryStream(payload)
+    let mutable inFlight = 0
+    let mutable everConcurrent = false
+
+    let entered =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let proceed =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    /// Completes once some `ReadAsync` call has been entered (and is parked, waiting on `Release`).
+    member _.Entered: Task = entered.Task :> Task
+
+    /// Whether two `ReadAsync` calls were ever in flight on this stream at the same time.
+    member _.EverConcurrent = everConcurrent
+
+    /// Lets every parked (and future) `ReadAsync` call proceed to the real, underlying read.
+    member _.Release() = proceed.TrySetResult() |> ignore
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = inner.Length
+
+    override _.Position
+        with get () = inner.Position
+        and set value = inner.Position <- value
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = raise (NotSupportedException())
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Read(buffer, offset, count) = inner.Read(buffer, offset, count)
+
+    override _.ReadAsync(buffer: Memory<byte>, cancellationToken: CancellationToken) : ValueTask<int> =
+        let run =
+            task {
+                if Interlocked.Increment(&inFlight) > 1 then
+                    everConcurrent <- true
+
+                entered.TrySetResult() |> ignore
+
+                try
+                    do! proceed.Task
+                    return! inner.ReadAsync(buffer, cancellationToken).AsTask()
+                finally
+                    Interlocked.Decrement(&inFlight) |> ignore
+            }
+
+        ValueTask<int>(run)
 
 /// Regression tests for the correctness & robustness fixes: timeout validation/clamping, the
 /// single-consumption guard on `RunningProcess`, pipeline per-stage `OkCodes`, and pipeline wiring
@@ -80,6 +141,79 @@ type CorrectnessBugTests() =
 
                 do! (running :> IAsyncDisposable).DisposeAsync()
         }
+
+    [<Test>]
+    member _.``WaitAnyAsync after a buffered verb reuses its wait, not a second pipe reader``() : Task =
+        task {
+            let payload = "hello"
+            let stdout = new GatedStream(Encoding.UTF8.GetBytes payload)
+
+            let host: RunningHost =
+                { Config = (Command.create "test").Config
+                  Pid = None
+                  Stdout = Some(stdout :> Stream)
+                  Stderr = None
+                  Stdin = None
+                  StartTime = DateTime.UtcNow
+                  StartedTimestamp = Stopwatch.GetTimestamp()
+                  Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+                  StdinError = fun () -> None
+                  StartKill = ignore
+                  GracefulKill = fun _ -> Task.CompletedTask
+                  Teardown = fun () -> ValueTask() }
+
+            use running = new RunningProcess(host)
+
+            // Start the buffered verb; its stdout pump parks mid-`ReadAsync` (the gate is not released
+            // yet) — proving it is genuinely in flight, not already finished, once WaitAnyAsync is
+            // called next on the very same handle.
+            let outputTask = running.OutputStringAsync()
+            let! winner = Task.WhenAny(stdout.Entered, Task.Delay 5000)
+
+            Assert.That(obj.ReferenceEquals(winner, stdout.Entered), Is.True, "the stdout pump never started reading")
+
+            // The regression this guards against: WaitAnyAsync on the same handle, called while the
+            // buffered verb's own pump is still parked mid-read, used to start a second, independent
+            // drain of the very same stdout stream — two concurrent readers on one pipe. It must
+            // instead reuse the buffered verb's own in-flight wait.
+            let waitAnyTask = RunningProcess.WaitAnyAsync [| running |]
+
+            stdout.Release()
+
+            let! outputResult = outputTask
+            let! waitAnyResult = waitAnyTask
+
+            Assert.That(stdout.EverConcurrent, Is.False, "two readers were pumping the same stdout pipe at once")
+
+            match outputResult with
+            | Error e -> Assert.Fail $"OutputStringAsync failed: {e.Message}"
+            | Ok result -> Assert.That(result.Stdout, Is.EqualTo payload)
+
+            match waitAnyResult with
+            | Ok r -> Assert.That(r.Outcome, Is.EqualTo(Outcome.Exited 0))
+            | Error e -> Assert.Fail $"WaitAnyAsync failed: {e.Message}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitAnyAsync claiming a fresh handle still refuses a later terminal verb``() : Task =
+        task {
+            match! runner.StartAsync(shell "echo hi", CancellationToken.None) with
+            | Error e -> failwith $"Start failed: {e}"
+            | Ok running ->
+                use running = running
+
+                match! RunningProcess.WaitAnyAsync [| running |] with
+                | Error e -> Assert.Fail $"WaitAnyAsync failed: {e.Message}"
+                | Ok _ ->
+                    // The reverse order still refuses a terminal verb, unchanged: a `Fresh` ExitTask
+                    // claims the buffered slot itself, so a verb called afterwards races nothing.
+                    match! running.OutputStringAsync() with
+                    | Error(ProcessError.Unsupported _) -> ()
+                    | Error other -> Assert.Fail $"expected Unsupported, got {other.Message}"
+                    | Ok _ -> Assert.Fail "expected OutputStringAsync to be refused after WaitAnyAsync"
+        }
+        :> Task
 
     [<Test>]
     member _.``a pipeline honours the last stage's accepted exit codes``() : Task =
