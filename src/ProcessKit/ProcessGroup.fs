@@ -45,6 +45,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// a Windows Job Object or a Linux cgroup v2 at the real cgroup root; otherwise creation fails
     /// fast with `ProcessError.ResourceLimit` rather than leaving the tree unbounded. Without limits
     /// the group uses the platform's default mechanism (Job Object / POSIX process group).
+    ///
+    /// On the Linux cgroup v2 mechanism, a spawned child is migrated into the cgroup right after it
+    /// starts, and the limits then apply to it and every descendant it forks *afterwards*. A grandchild
+    /// forked in the brief spawn→migrate window is created in the parent cgroup and stays there — still
+    /// reaped by kill-on-drop teardown, but outside the resource limits. If the child cannot be migrated
+    /// at all (e.g. the cgroup was torn down underneath the spawn), it is killed and reaped and the
+    /// spawn fails with `ProcessError.ResourceLimit` — never left running unconstrained.
     static member Create(options: ProcessGroupOptions) : Result<ProcessGroup, ProcessError> =
         let limits = options.Limits
 
@@ -100,17 +107,24 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             match backend.Spawn command with
             | Error error -> Error error
             | Ok spawned ->
-                backend.Track spawned
-                // Re-check after tracking: if the group was released concurrently between the guard
-                // above and `Track`, `HardRelease`'s kill/reap snapshot may have missed this child (it
-                // would then run uncontained on the POSIX/cgroup backends). The release flag is set
-                // before that snapshot runs, so observing it set here means the child may have escaped —
-                // reap it ourselves rather than leak it, preserving the kill-on-drop guarantee.
-                if releasedFlag <> 0 then
-                    backend.ReapEscapee spawned
-                    Error(ProcessError.Unsupported "the process group has been released")
-                else
-                    Ok spawned
+                match backend.Track spawned with
+                | Error trackError ->
+                    // The backend could not actually contain the child (e.g. the cgroup backend failed
+                    // to migrate it into the cgroup). It has already killed and reaped the child on this
+                    // path, so there is no live child to clean up here — just surface the honest error
+                    // rather than let an uncontained child run.
+                    Error trackError
+                | Ok() ->
+                    // Re-check after tracking: if the group was released concurrently between the guard
+                    // above and `Track`, `HardRelease`'s kill/reap snapshot may have missed this child (it
+                    // would then run uncontained on the POSIX/cgroup backends). The release flag is set
+                    // before that snapshot runs, so observing it set here means the child may have escaped —
+                    // reap it ourselves rather than leak it, preserving the kill-on-drop guarantee.
+                    if releasedFlag <> 0 then
+                        backend.ReapEscapee spawned
+                        Error(ProcessError.Unsupported "the process group has been released")
+                    else
+                        Ok spawned
 
     /// Spawn `command` into the group and build a `RunningHost`. `ownsGroup` decides what disposing
     /// the resulting `RunningProcess` does: when **true** (a private per-run group) it reaps this

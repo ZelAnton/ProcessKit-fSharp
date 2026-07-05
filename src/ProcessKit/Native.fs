@@ -1196,13 +1196,17 @@ module internal Native =
             with ex ->
                 Error ex.Message
 
-    /// Migrate a process into the cgroup (a single write to `cgroup.procs`). Best-effort: a failure
-    /// leaves the child in the parent cgroup (unbounded), which the run's outcome reflects.
-    let migrateToCgroup (cgroupPath: string) (pid: int) =
+    /// Migrate a process into the cgroup (a single write to `cgroup.procs`). Returns the write's
+    /// failure detail on `Error` instead of swallowing it: a failure would otherwise leave the child
+    /// running in the parent cgroup, entirely outside the requested limits. The caller
+    /// (`CgroupBackend.Track`) turns that `Error` into an honest spawn failure — killing and reaping
+    /// the child — rather than silently downgrading to an unconstrained run.
+    let migrateToCgroup (cgroupPath: string) (pid: int) : Result<unit, string> =
         try
             File.WriteAllText(Path.Combine(cgroupPath, "cgroup.procs"), string pid)
-        with _ ->
-            ()
+            Ok()
+        with ex ->
+            Error ex.Message
 
     /// The live member pids of a cgroup (`cgroup.procs`).
     let cgroupMembers (cgroupPath: string) : int list =

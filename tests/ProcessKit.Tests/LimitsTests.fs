@@ -1,6 +1,7 @@
 namespace ProcessKit.Tests
 
 open System
+open System.IO
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
@@ -126,6 +127,61 @@ type LimitsTests() =
                     | Error error -> Assert.Fail $"{error}"
                 | Error(ProcessError.ResourceLimit _) when not expectCgroup -> Assert.Pass()
                 | Error other -> Assert.Fail $"expected CgroupV2 (PROCESSKIT_EXPECT_CGROUP set), got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a failed cgroup migration kills the child and returns an honest error``() : Task =
+        task {
+            if isWindows || isMacOs then
+                Assert.Ignore "cgroup v2 migration is Linux-only"
+            else
+                // A cgroup directory that does not exist, so the migration write to
+                // <path>/cgroup.procs throws (the parent directory is absent) and migration must fail.
+                // This exercises CgroupBackend.Track's failure path directly (a real ProcessGroup only
+                // ever holds a valid cgroup path, so the failure has to be injected at the backend).
+                let missingCgroup =
+                    Path.Combine(Path.GetTempPath(), $"processkit-missing-cgroup-{Guid.NewGuid():N}")
+
+                let backend: IContainmentBackend = CgroupBackend missingCgroup
+
+                // A long-lived child with no piped stdio (nothing for the parent to drain/close), so the
+                // only thing under test is whether Track leaves it running after the migration fails.
+                let child =
+                    Command.create "sleep"
+                    |> Command.args [ "30" ]
+                    |> Command.stdout StdioMode.Null
+                    |> Command.stderr StdioMode.Null
+
+                match backend.Spawn child with
+                | Error error -> Assert.Fail $"spawn failed: {error}"
+                | Ok spawned ->
+                    let pid =
+                        match backend.PidOf spawned with
+                        | Some p -> p
+                        | None -> failwith "expected a spawned pid"
+
+                    match backend.Track spawned with
+                    | Ok() -> Assert.Fail "Track should fail when the child cannot be migrated into the cgroup"
+                    | Error(ProcessError.ResourceLimit detail) ->
+                        // (a) an honest error of the expected variant, carrying a real detail.
+                        Assert.That(detail, Is.Not.Empty)
+
+                        // (b) no live, unconstrained child left behind: Track killed and reaped it, so the
+                        // pid no longer exists (a fully-reaped leader, not a zombie). Poll briefly to
+                        // absorb any tiny scheduling lag in the SIGKILL taking effect.
+                        let mutable gone = false
+                        let mutable attempts = 0
+
+                        while not gone && attempts < 100 do
+                            match Native.signalPid pid 0 with
+                            | Native.SignalDelivery.TargetGone -> gone <- true
+                            | _ ->
+                                do! Task.Delay 10
+                                attempts <- attempts + 1
+
+                        Assert.That(gone, Is.True, "the child was left alive after a failed migration")
+                    | Error other -> Assert.Fail $"expected ProcessError.ResourceLimit, got {other}"
         }
         :> Task
 

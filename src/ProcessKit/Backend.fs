@@ -69,8 +69,12 @@ type internal IContainmentBackend =
     /// Spawn a child of this group (not yet tracked).
     abstract Spawn: Command -> Result<Native.Spawned, ProcessError>
 
-    /// Start tracking a freshly-spawned child (place it in the container).
-    abstract Track: Native.Spawned -> unit
+    /// Start tracking a freshly-spawned child (place it in the container). Returns `Error` when the
+    /// child could not actually be contained — e.g. the cgroup backend fails to migrate it into the
+    /// cgroup — in which case the child has already been killed and reaped, so no live, uncontained,
+    /// untracked child is left behind for the caller to clean up. The Windows Job and POSIX
+    /// process-group backends always succeed (the child is contained by spawn itself).
+    abstract Track: Native.Spawned -> Result<unit, ProcessError>
 
     /// Stop tracking a reaped child (close its handle / drop it from the container's view).
     abstract Release: Native.Spawned -> unit
@@ -124,7 +128,11 @@ type internal JobObjectBackend(jobHandle: nativeint) =
         member _.Mechanism = Mechanism.JobObject
         member _.Spawn(command) = Native.spawnWindows jobHandle command
 
-        member _.Track(spawned) = children.Add spawned.Handle
+        member _.Track(spawned) =
+            // The child was assigned to the Job while still suspended at spawn, so it is already
+            // contained — tracking its handle is only for waiting. Always succeeds.
+            children.Add spawned.Handle
+            Ok()
 
         member _.Release(spawned) =
             // Remove the handle before closing so the teardown drain can't double-close a reused
@@ -191,11 +199,32 @@ type internal CgroupBackend(cgroupPath: string) =
         member _.Spawn(command) = Native.spawnPosix command
 
         member _.Track(spawned) =
-            // Track the pid so teardown can reap it (cgroup.kill SIGKILLs but does not waitpid our own
-            // children) and clean it up as a fallback if it failed to migrate into the cgroup and so
-            // escapes cgroup.kill.
-            children.Add(int spawned.Handle)
-            Native.migrateToCgroup cgroupPath (int spawned.Handle)
+            let pid = int spawned.Handle
+            // Track the pid first so teardown can always reap it (cgroup.kill SIGKILLs but does not
+            // waitpid our own children), and so a concurrent HardRelease can see it even if migration
+            // then fails.
+            children.Add pid
+
+            // Migrate the child into the cgroup by writing its pid to cgroup.procs. The child and every
+            // descendant it forks AFTER this write are subject to the cgroup's resource limits. There is
+            // an unavoidable spawn->migrate window: the child is already running (posix_spawn starts it
+            // immediately — there is no portable "start stopped" for posix_spawn), so any descendant it
+            // forks BEFORE this write completes is created in the PARENT cgroup and stays there —
+            // covered by kill-on-drop (the child is its own pgid leader, so teardown's killpg reaps that
+            // subtree) but NOT by the resource limits. On a migration FAILURE the child would run wholly
+            // outside the cgroup, so instead of the old silent downgrade we kill and reap it here (drop
+            // it from tracking, then killpg its group + reap the leader — the same kill+reap ReapEscapee
+            // does) and report an honest error, leaving no live, uncontained child behind.
+            match Native.migrateToCgroup cgroupPath pid with
+            | Ok() -> Ok()
+            | Error detail ->
+                children.Remove pid |> ignore
+                PosixReap.leader pid
+
+                Error(
+                    ProcessError.ResourceLimit
+                        $"the child could not be migrated into the cgroup (write to cgroup.procs failed): {detail}"
+                )
 
         member _.Release(spawned) =
             // A run verb has reaped this child; stop tracking so teardown does not waitpid it again.
@@ -274,7 +303,11 @@ type internal ProcessGroupBackend() =
         member _.Mechanism = Mechanism.ProcessGroup
         member _.Spawn(command) = Native.spawnPosix command
 
-        member _.Track(spawned) = children.Add(int spawned.Handle)
+        member _.Track(spawned) =
+            // Each posix_spawn already formed its own process group (pgid = child pid), so the child is
+            // contained by spawn itself; tracking the pgid is all that is needed. Always succeeds.
+            children.Add(int spawned.Handle)
+            Ok()
 
         member _.Release(spawned) =
             // A pgid is a whole group; the reaped leader may have left backgrounded members behind,
