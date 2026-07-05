@@ -226,10 +226,17 @@ type internal CgroupBackend(cgroupPath: string) =
 
         member _.Signal(signal) =
             match signal with
-            | Signal.Kill -> Native.killCgroup cgroupPath // atomic whole-subtree SIGKILL
-            | _ -> Native.signalCgroup cgroupPath (Native.signalNumber signal)
+            | Signal.Kill ->
+                Native.killCgroup cgroupPath // atomic whole-subtree SIGKILL
+                Ok()
+            | _ ->
+                let signalNum = Native.signalNumber signal
 
-            Ok()
+                match Native.signalCgroup cgroupPath signalNum with
+                | Native.SignalDelivery.Delivered
+                | Native.SignalDelivery.TargetGone -> Ok()
+                | Native.SignalDelivery.DeliveryFailed(errno, message) ->
+                    Error(ProcessError.Io $"failed to deliver signal {signalNum} to cgroup: {message} (errno {errno})")
 
         member _.Suspend() =
             Native.freezeCgroup cgroupPath true
@@ -313,11 +320,25 @@ type internal ProcessGroupBackend() =
 
         member _.Signal(signal) =
             let signalNum = Native.signalNumber signal
+            let mutable firstFailure: (int * string) option = None
 
+            // Broadcast to every tracked pgid regardless of an earlier failure — a member that has
+            // already exited (ESRCH) must not abort delivery to the rest — but only the first genuine
+            // delivery failure (e.g. EINVAL for an invalid signal number) is reported.
             for pgid in children.Snapshot() do
-                Native.signalProcessGroup pgid signalNum |> ignore
+                match Native.signalProcessGroup pgid signalNum with
+                | Native.SignalDelivery.Delivered
+                | Native.SignalDelivery.TargetGone -> ()
+                | Native.SignalDelivery.DeliveryFailed(errno, message) ->
+                    if firstFailure.IsNone then
+                        firstFailure <- Some(errno, message)
 
-            Ok()
+            match firstFailure with
+            | None -> Ok()
+            | Some(errno, message) ->
+                Error(
+                    ProcessError.Io $"failed to deliver signal {signalNum} to process group: {message} (errno {errno})"
+                )
 
         member _.Suspend() =
             for pgid in children.Snapshot() do

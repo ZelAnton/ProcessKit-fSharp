@@ -89,6 +89,46 @@ type ProcessControlTests() =
         :> Task
 
     [<Test>]
+    member _.``Signal with an invalid raw number returns Error on POSIX``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "Signal.Other's errno-aware failure path is POSIX-only."
+            else
+                use group = create ()
+
+                match! group.StartAsync sleeper with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    // Signal numbers are conventionally 1..31/64; a wildly out-of-range value is
+                    // rejected by the kernel (EINVAL), which must now surface honestly instead of a
+                    // silently-swallowed `Ok()`.
+                    match group.Signal(Signal.Other 999) with
+                    | Error(ProcessError.Io _) -> ()
+                    | other -> Assert.Fail $"expected Error(ProcessError.Io), got {other}"
+
+                    running.Kill()
+                    let! _ = running.WaitAsync()
+                    ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Signal on an empty/concluded group still returns Ok``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "This exercises the POSIX best-effort ESRCH path specifically."
+            else
+                use group = create ()
+
+                // No child was ever started: the group's member set is empty, so delivery has
+                // nothing to fail on — a vacuous broadcast is a success, not an error.
+                match group.Signal Signal.Term with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"expected Ok for an empty group, got {error}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``Suspend then Resume leaves the process able to complete``() : Task =
         task {
             use group = create ()

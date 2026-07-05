@@ -1031,8 +1031,42 @@ module internal Native =
         | Signal.Usr2 -> if isMacOs then 31 else 12
         | Signal.Other n -> n
 
-    /// Broadcast a raw signal to a POSIX process group; `true` if the send was accepted.
-    let signalProcessGroup (pgid: int) (signalNum: int) : bool = killpg (pgid, signalNum) = 0
+    // errno for "no such process" — Linux and macOS agree on the value. `killpg`/`kill` return this
+    // when the target (process, process group, or single pid) no longer exists: a race with the
+    // target's own exit, not a caller error, so it is classified as a best-effort success below.
+    [<Literal>]
+    let private ESRCH = 3
+
+    /// The result of one `killpg`/`kill` signal-delivery attempt, distinguishing "the target already
+    /// exited" (best-effort success — a race with process exit, not a caller error) from a genuine
+    /// delivery failure (any other non-zero errno, e.g. EINVAL for an invalid signal number).
+    [<RequireQualifiedAccess; NoComparison; NoEquality>]
+    type SignalDelivery =
+        /// The kernel accepted the signal.
+        | Delivered
+        /// errno ESRCH: the target no longer exists.
+        | TargetGone
+        /// Any other non-zero errno — the call itself failed.
+        | DeliveryFailed of Errno: int * Message: string
+
+    /// Classify the return of a `killpg`/`kill` call. `Marshal.GetLastWin32Error()` must be read here,
+    /// immediately after the native call that produced `returnCode` — before any other P/Invoke — since
+    /// it is a per-thread value the runtime only guarantees valid until the next `SetLastError`d call.
+    let private classifySignalDelivery (returnCode: int) : SignalDelivery =
+        if returnCode = 0 then
+            SignalDelivery.Delivered
+        else
+            let errno = Marshal.GetLastWin32Error()
+
+            if errno = ESRCH then
+                SignalDelivery.TargetGone
+            else
+                SignalDelivery.DeliveryFailed(errno, Win32Exception(errno).Message)
+
+    /// Broadcast a raw signal to a POSIX process group via `killpg`, classifying the outcome (see
+    /// `SignalDelivery`) instead of collapsing every non-zero errno into "not delivered".
+    let signalProcessGroup (pgid: int) (signalNum: int) : SignalDelivery =
+        classifySignalDelivery (killpg (pgid, signalNum))
 
     /// Freeze a POSIX process group (SIGSTOP).
     let suspendProcessGroup (pgid: int) = killpg (pgid, sigStop) |> ignore
@@ -1224,10 +1258,28 @@ module internal Native =
         for pid in cgroupMembers cgroupPath do
             kill (pid, SIGTERM) |> ignore
 
-    /// Broadcast a raw signal to every member of a cgroup.
-    let signalCgroup (cgroupPath: string) (signalNum: int) =
+    /// Send a raw signal to a single POSIX pid via `kill`, classified the same way as
+    /// `signalProcessGroup` (see `SignalDelivery`).
+    let signalPid (pid: int) (signalNum: int) : SignalDelivery =
+        classifySignalDelivery (kill (pid, signalNum))
+
+    /// Broadcast a raw signal to every member of a cgroup, aggregating the per-pid outcomes: a member
+    /// that already exited (ESRCH) does not abort the broadcast — every member still gets the signal —
+    /// but the first genuine delivery failure is what the aggregated result reports.
+    let signalCgroup (cgroupPath: string) (signalNum: int) : SignalDelivery =
+        let mutable firstFailure: SignalDelivery option = None
+
         for pid in cgroupMembers cgroupPath do
-            kill (pid, signalNum) |> ignore
+            match signalPid pid signalNum with
+            | SignalDelivery.Delivered
+            | SignalDelivery.TargetGone -> ()
+            | SignalDelivery.DeliveryFailed _ as failure ->
+                if firstFailure.IsNone then
+                    firstFailure <- Some failure
+
+        match firstFailure with
+        | Some failure -> failure
+        | None -> SignalDelivery.Delivered
 
     /// Freeze (`true`) or thaw (`false`) a cgroup (`cgroup.freeze`).
     let freezeCgroup (cgroupPath: string) (frozen: bool) =

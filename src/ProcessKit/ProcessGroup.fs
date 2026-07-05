@@ -233,9 +233,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         this.WhenLive(fun () -> backend.Members())
         |> Result.map (fun pids -> List.toArray pids :> IReadOnlyList<int>)
 
-    /// Broadcast `signal` to every process in the group. Best-effort: an exited member is skipped
-    /// and an empty group succeeds trivially. On **Windows** only `Signal.Kill` is deliverable (it
-    /// maps to the Job terminate); any other signal returns `ProcessError.Unsupported`.
+    /// Broadcast `signal` to every process in the group. A member that has already exited (or an
+    /// already-empty group) is a best-effort success — that races the target's own exit, not a
+    /// caller error. An invalid delivery — most notably `Signal.Other` with a signal number the
+    /// platform rejects — is a genuine failure and returns `ProcessError.Io` with the errno detail;
+    /// when the group has several members, the first genuine failure is reported but every member
+    /// still receives the signal. On **Windows** only `Signal.Kill` is deliverable (it maps to the
+    /// Job terminate); any other signal returns `ProcessError.Unsupported`.
     member this.Signal(signal: Signal) : Result<unit, ProcessError> =
         this.WhenLive(fun () -> backend.Signal signal)
 
