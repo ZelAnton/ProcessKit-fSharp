@@ -1,5 +1,6 @@
 namespace ProcessKit
 
+open System
 open System.IO
 open System.Runtime.InteropServices
 open System.Text
@@ -20,12 +21,15 @@ open System.Threading.Tasks
 [<Sealed>]
 type ProcessStdin internal (stream: Stream) =
 
-    /// Write raw bytes to the child's stdin.
+    /// Write raw bytes to the child's stdin. `bytes` must not be null (`ArgumentNullException` —
+    /// a C# caller that forgets a null check would otherwise see a raw `NullReferenceException`).
     member _.WriteAsync(bytes: byte[], [<Optional>] cancellationToken: CancellationToken) : Task =
+        ArgumentNullException.ThrowIfNull bytes
         stream.WriteAsync(bytes, 0, bytes.Length, cancellationToken)
 
-    /// Write a line of UTF-8 text followed by `\n`.
+    /// Write a line of UTF-8 text followed by `\n`. `text` must not be null (`ArgumentNullException`).
     member _.WriteLineAsync(text: string, [<Optional>] cancellationToken: CancellationToken) : Task =
+        ArgumentNullException.ThrowIfNull text
         let bytes = Encoding.UTF8.GetBytes(text + "\n")
         stream.WriteAsync(bytes, 0, bytes.Length, cancellationToken)
 

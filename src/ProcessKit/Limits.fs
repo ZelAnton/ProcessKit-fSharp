@@ -27,16 +27,34 @@ type ResourceLimits internal (memoryMax: int64 option, maxProcesses: int option,
     /// leaves CPU unbounded. On Windows this is approximate (converted against the host core count).
     member _.CpuQuota = cpuQuota
 
-    /// A copy with the memory cap set.
+    /// A copy with the memory cap set. `bytes` must be positive — zero or negative is rejected
+    /// (`ArgumentOutOfRangeException`): a non-positive cap could never let anything run, so it is a
+    /// misconfiguration rather than a meaningful limit, and previously degraded silently (e.g. a
+    /// negative value converting to a huge `unativeint` on Windows — effectively "unlimited").
     member _.WithMemoryMax(bytes: int64) =
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(bytes, 0L)
         ResourceLimits(Some bytes, maxProcesses, cpuQuota)
 
-    /// A copy with the live-process cap set.
+    /// A copy with the live-process cap set. `count` must be positive — zero or negative is rejected
+    /// (`ArgumentOutOfRangeException`): the tree always has at least its own leader process, so a
+    /// non-positive cap could never be satisfied.
     member _.WithMaxProcesses(count: int) =
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(count, 0)
         ResourceLimits(memoryMax, Some count, cpuQuota)
 
-    /// A copy with the CPU quota (in cores) set.
+    /// A copy with the CPU quota (in cores) set. `cores` must be a positive, non-NaN number —
+    /// zero, negative, or NaN is rejected (`ArgumentOutOfRangeException`): a non-positive quota could
+    /// never let anything run.
     member _.WithCpuQuota(cores: float) =
+        if Double.IsNaN cores || cores <= 0.0 then
+            raise (
+                ArgumentOutOfRangeException(
+                    nameof cores,
+                    cores,
+                    "CPU quota must be a positive, non-NaN number of cores"
+                )
+            )
+
         ResourceLimits(memoryMax, maxProcesses, Some cores)
 
     /// Whether any limit is set (so the group needs a limit-capable mechanism).
@@ -56,8 +74,11 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, limits: ResourceLi
     /// The whole-tree resource caps applied at creation.
     member _.Limits = limits
 
-    /// A copy with the shutdown grace window set.
-    member _.WithShutdownTimeout(timeout: TimeSpan) = ProcessGroupOptions(timeout, limits)
+    /// A copy with the shutdown grace window set. A negative `timeout` is rejected
+    /// (`ArgumentOutOfRangeException`); `TimeSpan.Zero` is valid (no grace — escalate immediately).
+    member _.WithShutdownTimeout(timeout: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero)
+        ProcessGroupOptions(timeout, limits)
 
     /// A copy capping the tree's total memory at `bytes`.
     member _.WithMemoryMax(bytes: int64) =

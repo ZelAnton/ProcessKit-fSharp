@@ -217,8 +217,11 @@ type Supervisor internal (config: SupervisorConfig) =
     member _.Restart(policy: RestartPolicy) =
         Supervisor({ config with Policy = policy })
 
-    /// Restart at most `count` times — `count + 1` total runs (default: unlimited).
+    /// Restart at most `count` times — `count + 1` total runs (default: unlimited). `count` must be
+    /// non-negative (`0` means no restarts at all — a single run; a negative value is rejected with
+    /// `ArgumentOutOfRangeException`).
     member _.MaxRestarts(count: int) =
+        ArgumentOutOfRangeException.ThrowIfNegative count
         Supervisor({ config with MaxRestarts = Some count })
 
     /// Exponential backoff before each restart: the delay is `base × factor^n`, capped by `MaxBackoff`,

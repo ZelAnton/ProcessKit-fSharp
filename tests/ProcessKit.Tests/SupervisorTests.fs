@@ -117,6 +117,15 @@ type SupervisorTests() =
         :> Task
 
     [<Test>]
+    member _.``MaxRestarts rejects a negative budget but accepts zero``() =
+        Supervisor(Command.create "x").MaxRestarts(0) |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> Supervisor(Command.create "x").MaxRestarts(-1) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
     member _.``zero MaxRestarts means a single run``() : Task =
         task {
             match! supervise([ failWith 1; ok () ]).MaxRestarts(0).RunAsync() with

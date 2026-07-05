@@ -150,6 +150,24 @@ type DependencyInjectionTests() =
         :> Task
 
     [<Test>]
+    member _.``ProcessKitOptions.DefaultTimeout rejects a negative value at assignment``() =
+        // Validated at the options boundary (the setter), so a misconfiguration surfaces at
+        // setup/binding time rather than as an exception escaping a Result-returning verb later
+        // (inside DefaultsRunner.applyDefaults).
+        let options = ProcessKitOptions()
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> options.DefaultTimeout <- Nullable(TimeSpan.FromSeconds -1.0))
+        )
+        |> ignore
+
+        // A non-negative value (and clearing it back to null) still works.
+        options.DefaultTimeout <- Nullable(TimeSpan.FromSeconds 1.0)
+        Assert.That(options.DefaultTimeout, Is.EqualTo(Nullable(TimeSpan.FromSeconds 1.0)))
+        options.DefaultTimeout <- Nullable()
+        Assert.That(options.DefaultTimeout.HasValue, Is.False)
+
+    [<Test>]
     member _.``AddProcessKit(configure) applies the default timeout to a resolved run``() : Task =
         task {
             let services = ServiceCollection()

@@ -128,6 +128,15 @@ module internal CommandConfig =
           Logger = None
           RunId = None }
 
+    /// Validate an environment-variable key for `Command.Env`/`Command.EnvRemove`: must be non-empty
+    /// and must not contain `=` (an env var name can never contain one; a key that did would corrupt
+    /// the child's environment block, since `KEY=VALUE` is the wire format on every platform).
+    let validateEnvKey (key: string) =
+        if key.Length = 0 then
+            raise (ArgumentException("an environment variable key must not be empty", nameof key))
+        elif key.Contains '=' then
+            raise (ArgumentException("an environment variable key must not contain '='", nameof key))
+
 /// An immutable description of a process to run.
 ///
 /// Build it fluently — each method returns a new `Command`. The value is the *cold* description
@@ -180,19 +189,23 @@ type Command internal (config: CommandConfig) =
                 WorkingDirectory = Some directory }
         )
 
-    /// Set an environment variable for the child.
+    /// Set an environment variable for the child. `key` must be non-empty and must not contain `=`
+    /// (rejected with `ArgumentException` — either would corrupt the child's environment block).
     member _.Env(key: string, value: string) =
         ArgumentNullException.ThrowIfNull key
         ArgumentNullException.ThrowIfNull value
+        CommandConfig.validateEnvKey key
 
         Command(
             { config with
                 EnvOverrides = config.EnvOverrides @ [ key, Some value ] }
         )
 
-    /// Remove an inherited environment variable from the child.
+    /// Remove an inherited environment variable from the child. `key` must be non-empty and must not
+    /// contain `=` (same rule as `Env`).
     member _.EnvRemove(key: string) =
         ArgumentNullException.ThrowIfNull key
+        CommandConfig.validateEnvKey key
 
         Command(
             { config with
@@ -308,8 +321,11 @@ type Command internal (config: CommandConfig) =
         Command({ config with Timeout = Some duration })
 
     /// On timeout, terminate gracefully (SIGTERM) and force-kill only if still alive after
-    /// `grace`. On Windows this degrades to the atomic Job kill.
+    /// `grace`. On Windows this degrades to the atomic Job kill. A negative `grace` is rejected
+    /// (`ArgumentOutOfRangeException`), matching `Timeout`.
     member _.TimeoutGrace(grace: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(grace, TimeSpan.Zero)
+
         Command(
             { config with
                 TimeoutGrace = Some grace }

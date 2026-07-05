@@ -108,6 +108,31 @@ type CorrectnessBugTests() =
         |> ignore
 
     [<Test>]
+    member _.``a negative TimeoutGrace is rejected at configuration time``() =
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () ->
+                Command.create "whatever"
+                |> Command.timeoutGrace (TimeSpan.FromSeconds -1.0)
+                |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``Command.Env rejects an empty key or a key containing '='``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> Command.create "whatever" |> Command.env "" "value" |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> Command.create "whatever" |> Command.env "KEY=X" "value" |> ignore)
+        )
+        |> ignore
+
+        // A valid key still works.
+        Command.create "whatever" |> Command.env "KEY" "value" |> ignore
+
+    [<Test>]
     member _.``a timeout larger than the timer range is treated as no timeout, not a throw``() : Task =
         task {
             // TimeSpan.MaxValue would overflow Task.Delay and throw synchronously, faulting the run and

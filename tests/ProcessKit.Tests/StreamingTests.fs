@@ -272,6 +272,35 @@ type StreamingTests() =
         :> Task
 
     [<Test>]
+    member _.``ProcessStdin write verbs reject a null argument with ArgumentNullException``() : Task =
+        task {
+            // A C# caller that forgets its own null check must see ArgumentNullException, not a raw
+            // NullReferenceException out of the underlying stream write.
+            let command = shell "sort" |> Command.keepStdinOpen
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match running.TakeStdin() with
+                | None -> Assert.Fail "expected an interactive stdin handle"
+                | Some stdin ->
+                    Assert.Throws<ArgumentNullException>(
+                        Action(fun () -> stdin.WriteAsync(Unchecked.defaultof<byte[]>) |> ignore)
+                    )
+                    |> ignore
+
+                    Assert.Throws<ArgumentNullException>(
+                        Action(fun () -> stdin.WriteLineAsync(Unchecked.defaultof<string>) |> ignore)
+                    )
+                    |> ignore
+
+                    do! stdin.FinishAsync()
+                    let! _ = running.OutputStringAsync()
+                    ()
+        }
+        :> Task
+
+    [<Test>]
     member _.``concurrent stdin runs do not cross-inherit pipes and deadlock``() : Task =
         task {
             let runOne (i: int) =

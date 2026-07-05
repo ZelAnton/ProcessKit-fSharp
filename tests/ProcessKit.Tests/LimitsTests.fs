@@ -36,6 +36,40 @@ type LimitsTests() =
         Assert.That(ResourceLimits.None.Any, Is.False)
 
     [<Test>]
+    member _.``ResourceLimits builders reject non-positive values``() =
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> ResourceLimits.None.WithMemoryMax 0L |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> ResourceLimits.None.WithMemoryMax -1L |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> ResourceLimits.None.WithMaxProcesses 0 |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> ResourceLimits.None.WithMaxProcesses -1 |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> ResourceLimits.None.WithCpuQuota 0.0 |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> ResourceLimits.None.WithCpuQuota -1.0 |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithCpuQuota Double.NaN |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``ProcessGroupOptions.WithShutdownTimeout rejects a negative window but accepts zero``() =
+        ProcessGroupOptions().WithShutdownTimeout TimeSpan.Zero |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ProcessGroupOptions().WithShutdownTimeout(TimeSpan.FromSeconds -1.0) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
     member _.``a group with no limits behaves as the default mechanism``() : Task =
         task {
             match ProcessGroup.Create(ProcessGroupOptions()) with

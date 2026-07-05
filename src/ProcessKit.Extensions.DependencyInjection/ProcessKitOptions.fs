@@ -13,9 +13,19 @@ open System
 /// `AddProcessKitClient` — its template carries them into the command before a verb runs.
 [<Sealed>]
 type ProcessKitOptions() =
+    let mutable defaultTimeout: Nullable<TimeSpan> = Nullable()
 
     /// A default run timeout applied when a command sets none. `null` (the default) means no timeout.
-    member val DefaultTimeout: Nullable<TimeSpan> = Nullable() with get, set
+    /// A negative value is rejected at assignment (`ArgumentOutOfRangeException`) — validated here,
+    /// at the options boundary, so a misconfiguration surfaces at setup/binding time rather than as an
+    /// exception escaping a `Result`-returning verb when the default is later applied to a command.
+    member _.DefaultTimeout
+        with get () = defaultTimeout
+        and set (value: Nullable<TimeSpan>) =
+            if value.HasValue then
+                ArgumentOutOfRangeException.ThrowIfLessThan(value.Value, TimeSpan.Zero)
+
+            defaultTimeout <- value
 
     /// A default working directory applied when a command sets none. `null` (the default) means the
     /// process inherits the current directory.

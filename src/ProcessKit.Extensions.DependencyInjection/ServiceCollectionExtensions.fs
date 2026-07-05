@@ -44,6 +44,10 @@ type internal DefaultsRunner(inner: IProcessRunner, options: ProcessKitOptions) 
     let applyDefaults (command: Command) : Command =
         let mutable c = command
 
+        // `ProcessKitOptions.DefaultTimeout`'s own setter already rejects a negative value at
+        // assignment/binding time, so `Command.Timeout` (which also guards against negative) can never
+        // throw here — a misconfigured default surfaces at options setup, not from inside this
+        // Result-returning verb.
         if command.Config.Timeout.IsNone && options.DefaultTimeout.HasValue then
             c <- c.Timeout options.DefaultTimeout.Value
 

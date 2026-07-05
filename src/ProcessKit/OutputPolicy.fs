@@ -60,20 +60,28 @@ type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, ov
     /// Retain everything (the default).
     static member Unbounded = OutputBufferPolicy(None, None, OverflowMode.DropOldest)
 
-    /// Retain at most `maxLines`, dropping the oldest when full.
+    /// Retain at most `maxLines`, dropping the oldest when full. `maxLines` must be non-negative
+    /// (`0` retains nothing; a negative value is rejected with `ArgumentOutOfRangeException`).
     static member Bounded(maxLines: int) =
+        ArgumentOutOfRangeException.ThrowIfNegative maxLines
         OutputBufferPolicy(Some maxLines, None, OverflowMode.DropOldest)
 
-    /// Retain at most `maxLines` and error when the cap is reached — a fail-loud ceiling.
+    /// Retain at most `maxLines` and error when the cap is reached — a fail-loud ceiling. `maxLines`
+    /// must be non-negative (`0` retains nothing but still tracks totals; negative is rejected).
     static member FailLoud(maxLines: int) =
+        ArgumentOutOfRangeException.ThrowIfNegative maxLines
         OutputBufferPolicy(Some maxLines, None, OverflowMode.Error)
 
-    /// A copy with the retained-line ceiling set, composable with any policy.
+    /// A copy with the retained-line ceiling set, composable with any policy. `maxLines` must be
+    /// non-negative (negative is rejected with `ArgumentOutOfRangeException`).
     member _.WithMaxLines(maxLines: int) =
+        ArgumentOutOfRangeException.ThrowIfNegative maxLines
         OutputBufferPolicy(Some maxLines, maxBytes, overflow)
 
-    /// A copy with the retained-byte ceiling set, composable with any policy.
+    /// A copy with the retained-byte ceiling set, composable with any policy. `maxBytes` must be
+    /// non-negative (negative is rejected with `ArgumentOutOfRangeException`).
     member _.WithMaxBytes(maxBytes: int) =
+        ArgumentOutOfRangeException.ThrowIfNegative maxBytes
         OutputBufferPolicy(maxLines, Some maxBytes, overflow)
 
     /// A copy with the overflow behaviour set.

@@ -124,3 +124,28 @@ type PumpTests() =
             .Wait()
 
         Assert.That(buf.TooLarge, Is.True)
+
+    [<Test>]
+    member _.``OutputBufferPolicy rejects a negative cap but accepts zero``() =
+        // `Some 0` retains nothing but is still valid (documented on `MaxLines`) — only negative caps
+        // are rejected as meaningless.
+        OutputBufferPolicy.Bounded 0 |> ignore
+        OutputBufferPolicy.FailLoud 0 |> ignore
+        OutputBufferPolicy.Unbounded.WithMaxLines 0 |> ignore
+        OutputBufferPolicy.Unbounded.WithMaxBytes 0 |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> OutputBufferPolicy.Bounded -1 |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> OutputBufferPolicy.FailLoud -1 |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> OutputBufferPolicy.Unbounded.WithMaxLines -1 |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> OutputBufferPolicy.Unbounded.WithMaxBytes -1 |> ignore)
+        )
+        |> ignore
