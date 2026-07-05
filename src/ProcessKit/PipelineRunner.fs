@@ -84,7 +84,7 @@ module internal PipelineRunner =
                     // a broken pipe surfaced while flushing on dispose because the peer is gone).
                     let closeQuietly = Pump.disposeQuietly
 
-                    let spawned = ResizeArray<Native.Spawned>()
+                    let spawned = ResizeArray<Native.Common.Spawned>()
                     let copyTasks = ResizeArray<Task>()
                     let stderrTasks = ResizeArray<Task<byte[]>>()
                     let mutable prevStdout: Stream option = None

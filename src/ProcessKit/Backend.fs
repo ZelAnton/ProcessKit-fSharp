@@ -30,8 +30,8 @@ module private GracefulTeardown =
 module private PosixReap =
 
     let leader (id: int) =
-        Native.killProcessGroup id
-        Native.reapLeader id
+        Native.Posix.killProcessGroup id
+        Native.Posix.reapLeader id
 
 /// The set of children a backend tracks, behind a single lock — the concurrency invariant every
 /// backend needs: a spawn racing a `Dispose`/teardown must serialize on add / remove / snapshot so a
@@ -67,32 +67,32 @@ type internal IContainmentBackend =
     abstract Mechanism: Mechanism
 
     /// Spawn a child of this group (not yet tracked).
-    abstract Spawn: Command -> Result<Native.Spawned, ProcessError>
+    abstract Spawn: Command -> Result<Native.Common.Spawned, ProcessError>
 
     /// Start tracking a freshly-spawned child (place it in the container). Returns `Error` when the
     /// child could not actually be contained — e.g. the cgroup backend fails to migrate it into the
     /// cgroup — in which case the child has already been killed and reaped, so no live, uncontained,
     /// untracked child is left behind for the caller to clean up. The Windows Job and POSIX
     /// process-group backends always succeed (the child is contained by spawn itself).
-    abstract Track: Native.Spawned -> Result<unit, ProcessError>
+    abstract Track: Native.Common.Spawned -> Result<unit, ProcessError>
 
     /// Stop tracking a reaped child (close its handle / drop it from the container's view).
-    abstract Release: Native.Spawned -> unit
+    abstract Release: Native.Common.Spawned -> unit
 
     /// Wait for one contained child to conclude.
     abstract Wait: nativeint -> Task<Outcome>
 
     /// The pid behind a spawned child, when known.
-    abstract PidOf: Native.Spawned -> int option
+    abstract PidOf: Native.Common.Spawned -> int option
 
     /// Hard-kill a single contained child (not the whole tree).
-    abstract KillChild: Native.Spawned -> unit
+    abstract KillChild: Native.Common.Spawned -> unit
 
     /// Kill and reap a child that escaped the teardown snapshot — one tracked in the race window after
     /// `HardRelease` began — so a spawn racing `Dispose` can never leave it running uncontained or as a
     /// zombie. Backend-specific: the Windows Job already kills it on close, the POSIX backends must
     /// killpg the subtree and reap the leader.
-    abstract ReapEscapee: Native.Spawned -> unit
+    abstract ReapEscapee: Native.Common.Spawned -> unit
 
     /// Hard-kill the whole contained tree now (no grace) without releasing the container.
     abstract KillTree: unit -> unit
@@ -126,7 +126,9 @@ type internal JobObjectBackend(jobHandle: nativeint) =
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.JobObject
-        member _.Spawn(command) = Native.spawnWindows jobHandle command
+
+        member _.Spawn(command) =
+            Native.Windows.spawnWindows jobHandle command
 
         member _.Track(spawned) =
             // The child was assigned to the Job while still suspended at spawn, so it is already
@@ -138,56 +140,58 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             // Remove the handle before closing so the teardown drain can't double-close a reused
             // handle value; the Job still contains the tree.
             if children.Remove spawned.Handle then
-                Native.closeWindowsHandle spawned.Handle
+                Native.Windows.closeWindowsHandle spawned.Handle
 
-        member _.Wait(handle) = Native.waitWindows handle
+        member _.Wait(handle) = Native.Windows.waitWindows handle
 
         member _.PidOf(spawned) =
-            Some(Native.processIdWindows spawned.Handle)
+            Some(Native.Windows.processIdWindows spawned.Handle)
 
         member _.KillChild(spawned) =
-            Native.terminateWindowsProcess spawned.Handle
+            Native.Windows.terminateWindowsProcess spawned.Handle
 
         member _.ReapEscapee(spawned) =
             // The child was assigned to the Job at spawn, so KILL_ON_JOB_CLOSE kills it when HardRelease
             // closes the job handle — no TerminateProcess here (a concurrent HardRelease may already have
             // closed this handle value). Just drop our wait-handle if still tracked, so it is not leaked.
             if children.Remove spawned.Handle then
-                Native.closeWindowsHandle spawned.Handle
+                Native.Windows.closeWindowsHandle spawned.Handle
 
-        member _.KillTree() = Native.terminateWindowsJob jobHandle
+        member _.KillTree() =
+            Native.Windows.terminateWindowsJob jobHandle
 
         member _.GracefulKillTree(_grace) =
             // No per-job graceful signal on Windows; this is the atomic Job kill.
-            task { Native.terminateWindowsJob jobHandle } :> Task
+            task { Native.Windows.terminateWindowsJob jobHandle } :> Task
 
-        member _.Members() = Ok(Native.membersWindows jobHandle)
+        member _.Members() =
+            Ok(Native.Windows.membersWindows jobHandle)
 
         member _.Signal(signal) =
             match signal with
             | Signal.Kill ->
-                Native.terminateWindowsJob jobHandle
+                Native.Windows.terminateWindowsJob jobHandle
                 Ok()
             | _ -> Error(ProcessError.Unsupported $"signal {signal} on Windows (only Signal.Kill is deliverable)")
 
         member _.Suspend() =
-            Native.suspendWindows jobHandle
+            Native.Windows.suspendWindows jobHandle
             Ok()
 
         member _.Resume() =
-            Native.resumeWindows jobHandle
+            Native.Windows.resumeWindows jobHandle
             Ok()
 
         member _.Stats() =
-            match Native.jobStatsWindows jobHandle with
+            match Native.Windows.jobStatsWindows jobHandle with
             | Some(active, cpu, peak) -> Ok(ProcessGroupStats(active, Some cpu, Some peak))
             | None -> Error(ProcessError.Io "failed to query Job Object accounting")
 
         member _.HardRelease() =
             for handle in children.Drain() do
-                Native.closeWindowsHandle handle
+                Native.Windows.closeWindowsHandle handle
 
-            Native.closeWindowsHandle jobHandle
+            Native.Windows.closeWindowsHandle jobHandle
 
 /// Linux cgroup v2 backend (the `limits` mechanism). Membership lives in `cgroup.procs`; the tree is
 /// reaped with `cgroup.kill` and the directory removed.
@@ -196,7 +200,7 @@ type internal CgroupBackend(cgroupPath: string) =
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.CgroupV2
-        member _.Spawn(command) = Native.spawnPosix command
+        member _.Spawn(command) = Native.Posix.spawnPosix command
 
         member _.Track(spawned) =
             let pid = int spawned.Handle
@@ -215,7 +219,7 @@ type internal CgroupBackend(cgroupPath: string) =
             // outside the cgroup, so instead of the old silent downgrade we kill and reap it here (drop
             // it from tracking, then killpg its group + reap the leader — the same kill+reap ReapEscapee
             // does) and report an honest error, leaving no live, uncontained child behind.
-            match Native.migrateToCgroup cgroupPath pid with
+            match Native.Cgroup.migrateToCgroup cgroupPath pid with
             | Ok() -> Ok()
             | Error detail ->
                 children.Remove pid |> ignore
@@ -231,9 +235,11 @@ type internal CgroupBackend(cgroupPath: string) =
             // (The kernel already removed it from cgroup.procs.)
             children.Remove(int spawned.Handle) |> ignore
 
-        member _.Wait(handle) = Native.waitPosix handle
+        member _.Wait(handle) = Native.Posix.waitPosix handle
         member _.PidOf(spawned) = Some(int spawned.Handle)
-        member _.KillChild(spawned) = Native.killProcess (int spawned.Handle)
+
+        member _.KillChild(spawned) =
+            Native.Posix.killProcess (int spawned.Handle)
 
         member _.ReapEscapee(spawned) =
             let pid = int spawned.Handle
@@ -242,46 +248,47 @@ type internal CgroupBackend(cgroupPath: string) =
             // any subtree it spawned (whether or not it migrated into the cgroup), then reap the leader.
             PosixReap.leader pid
 
-        member _.KillTree() = Native.killCgroup cgroupPath
+        member _.KillTree() = Native.Cgroup.killCgroup cgroupPath
 
         member _.GracefulKillTree(grace) =
             GracefulTeardown.poll
-                (fun () -> Native.terminateCgroup cgroupPath)
-                (fun () -> Native.cgroupAlive cgroupPath)
-                (fun () -> Native.killCgroup cgroupPath)
+                (fun () -> Native.Cgroup.terminateCgroup cgroupPath)
+                (fun () -> Native.Cgroup.cgroupAlive cgroupPath)
+                (fun () -> Native.Cgroup.killCgroup cgroupPath)
                 grace
 
-        member _.Members() = Ok(Native.cgroupMembers cgroupPath)
+        member _.Members() =
+            Ok(Native.Cgroup.cgroupMembers cgroupPath)
 
         member _.Signal(signal) =
             match signal with
             | Signal.Kill ->
-                Native.killCgroup cgroupPath // atomic whole-subtree SIGKILL
+                Native.Cgroup.killCgroup cgroupPath // atomic whole-subtree SIGKILL
                 Ok()
             | _ ->
-                let signalNum = Native.signalNumber signal
+                let signalNum = Native.Posix.signalNumber signal
 
-                match Native.signalCgroup cgroupPath signalNum with
-                | Native.SignalDelivery.Delivered
-                | Native.SignalDelivery.TargetGone -> Ok()
-                | Native.SignalDelivery.DeliveryFailed(errno, message) ->
+                match Native.Cgroup.signalCgroup cgroupPath signalNum with
+                | Native.Common.SignalDelivery.Delivered
+                | Native.Common.SignalDelivery.TargetGone -> Ok()
+                | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
                     Error(ProcessError.Io $"failed to deliver signal {signalNum} to cgroup: {message} (errno {errno})")
 
         member _.Suspend() =
-            Native.freezeCgroup cgroupPath true
+            Native.Cgroup.freezeCgroup cgroupPath true
             Ok()
 
         member _.Resume() =
-            Native.freezeCgroup cgroupPath false
+            Native.Cgroup.freezeCgroup cgroupPath false
             Ok()
 
         member _.Stats() =
-            let active = List.length (Native.cgroupMembers cgroupPath)
-            let cpu, peak = Native.cgroupStats cgroupPath
+            let active = List.length (Native.Cgroup.cgroupMembers cgroupPath)
+            let cpu, peak = Native.Cgroup.cgroupStats cgroupPath
             Ok(ProcessGroupStats(active, cpu, peak))
 
         member _.HardRelease() =
-            Native.killCgroup cgroupPath
+            Native.Cgroup.killCgroup cgroupPath
 
             // cgroup.kill SIGKILLs everything in the cgroup but does not reap our own children, and a
             // child that failed to migrate runs outside the cgroup entirely. Every child is also its own
@@ -289,7 +296,7 @@ type internal CgroupBackend(cgroupPath: string) =
             for pid in children.Snapshot() do
                 PosixReap.leader pid
 
-            Native.removeCgroup cgroupPath
+            Native.Cgroup.removeCgroup cgroupPath
 
 /// POSIX process-group backend (macOS/BSD, or Linux without cgroup delegation). Every `posix_spawn`
 /// forms its own pgid, so a multi-child group holds several; `killpg` is the teardown.
@@ -297,11 +304,11 @@ type internal ProcessGroupBackend() =
     let children = TrackedChildren<int>()
 
     let anyChildAlive () =
-        children.Snapshot() |> List.exists Native.processGroupAlive
+        children.Snapshot() |> List.exists Native.Posix.processGroupAlive
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.ProcessGroup
-        member _.Spawn(command) = Native.spawnPosix command
+        member _.Spawn(command) = Native.Posix.spawnPosix command
 
         member _.Track(spawned) =
             // Each posix_spawn already formed its own process group (pgid = child pid), so the child is
@@ -314,14 +321,14 @@ type internal ProcessGroupBackend() =
             // so only stop tracking once the group is actually empty.
             let pgid = int spawned.Handle
 
-            if not (Native.processGroupAlive pgid) then
+            if not (Native.Posix.processGroupAlive pgid) then
                 children.Remove pgid |> ignore
 
-        member _.Wait(handle) = Native.waitPosix handle
+        member _.Wait(handle) = Native.Posix.waitPosix handle
         member _.PidOf(spawned) = Some(int spawned.Handle)
 
         member _.KillChild(spawned) =
-            Native.killProcessGroup (int spawned.Handle)
+            Native.Posix.killProcessGroup (int spawned.Handle)
 
         member _.ReapEscapee(spawned) =
             let pgid = int spawned.Handle
@@ -332,7 +339,7 @@ type internal ProcessGroupBackend() =
 
         member _.KillTree() =
             for pgid in children.Snapshot() do
-                Native.killProcessGroup pgid
+                Native.Posix.killProcessGroup pgid
 
         member _.GracefulKillTree(grace) =
             // Snapshot the pgids once so terminate and the final force-kill act on the same set.
@@ -341,28 +348,28 @@ type internal ProcessGroupBackend() =
             GracefulTeardown.poll
                 (fun () ->
                     for pgid in pgids do
-                        Native.terminateProcessGroup pgid)
+                        Native.Posix.terminateProcessGroup pgid)
                 anyChildAlive
                 (fun () ->
                     for pgid in pgids do
-                        if Native.processGroupAlive pgid then
-                            Native.killProcessGroup pgid)
+                        if Native.Posix.processGroupAlive pgid then
+                            Native.Posix.killProcessGroup pgid)
                 grace
 
         member _.Members() = Ok(children.Snapshot())
 
         member _.Signal(signal) =
-            let signalNum = Native.signalNumber signal
+            let signalNum = Native.Posix.signalNumber signal
             let mutable firstFailure: (int * string) option = None
 
             // Broadcast to every tracked pgid regardless of an earlier failure — a member that has
             // already exited (ESRCH) must not abort delivery to the rest — but only the first genuine
             // delivery failure (e.g. EINVAL for an invalid signal number) is reported.
             for pgid in children.Snapshot() do
-                match Native.signalProcessGroup pgid signalNum with
-                | Native.SignalDelivery.Delivered
-                | Native.SignalDelivery.TargetGone -> ()
-                | Native.SignalDelivery.DeliveryFailed(errno, message) ->
+                match Native.Posix.signalProcessGroup pgid signalNum with
+                | Native.Common.SignalDelivery.Delivered
+                | Native.Common.SignalDelivery.TargetGone -> ()
+                | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
                     if firstFailure.IsNone then
                         firstFailure <- Some(errno, message)
 
@@ -375,19 +382,19 @@ type internal ProcessGroupBackend() =
 
         member _.Suspend() =
             for pgid in children.Snapshot() do
-                Native.suspendProcessGroup pgid
+                Native.Posix.suspendProcessGroup pgid
 
             Ok()
 
         member _.Resume() =
             for pgid in children.Snapshot() do
-                Native.resumeProcessGroup pgid
+                Native.Posix.resumeProcessGroup pgid
 
             Ok()
 
         member _.Stats() =
             let active =
-                children.Snapshot() |> List.filter Native.processGroupAlive |> List.length
+                children.Snapshot() |> List.filter Native.Posix.processGroupAlive |> List.length
 
             Ok(ProcessGroupStats(active, None, None))
 

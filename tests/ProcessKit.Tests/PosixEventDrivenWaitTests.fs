@@ -8,9 +8,9 @@ open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
 
-/// POSIX-only: the event-driven replacement for `Native.waitPosix`'s old `Task.Run` + blocking
+/// POSIX-only: the event-driven replacement for `Native.Posix.waitPosix`'s old `Task.Run` + blocking
 /// `waitpid` (a shared SIGCHLD registration + pid -> `TaskCompletionSource` registry — see
-/// `Native.fs`). Verifies the observable contract holds under this native change: no fd leak under
+/// `Native.Posix.fs`). Verifies the observable contract holds under this native change: no fd leak under
 /// load, and the thread-pool no longer parking one thread per live POSIX child.
 [<TestFixture>]
 type PosixEventDrivenWaitTests() =
@@ -30,17 +30,17 @@ type PosixEventDrivenWaitTests() =
             return! work
         }
 
-    // Spawn a short-lived child directly through `Native.spawnPosix` (bypassing the containment/verb
-    // layer entirely) and call `Native.waitPosix` on its pid TWICE — the exact double-registration
+    // Spawn a short-lived child directly through `Native.Posix.spawnPosix` (bypassing the containment/verb
+    // layer entirely) and call `Native.Posix.waitPosix` on its pid TWICE — the exact double-registration
     // scenario a caller could hit before this handle's own single wait has settled. Returns both
     // outcomes so a caller can assert they agree.
     let spawnAndDoubleWait () =
         task {
-            match Native.spawnPosix (shell "true") with
+            match Native.Posix.spawnPosix (shell "true") with
             | Error e -> return Error e
             | Ok spawned ->
-                let first = Native.waitPosix spawned.Handle
-                let second = Native.waitPosix spawned.Handle
+                let first = Native.Posix.waitPosix spawned.Handle
+                let second = Native.Posix.waitPosix spawned.Handle
                 let! firstOutcome = withDeadline 5000 first
                 let! secondOutcome = withDeadline 5000 second
                 spawned.Stdout |> Option.iter (fun s -> s.Dispose())
@@ -53,7 +53,7 @@ type PosixEventDrivenWaitTests() =
     member _.``waitPosix is idempotent for a repeated pid and does not leak a descriptor``() : Task =
         task {
             if isWindows then
-                Assert.Ignore "POSIX-only: exercises Native.waitPosix directly"
+                Assert.Ignore "POSIX-only: exercises Native.Posix.waitPosix directly"
 
             match! spawnAndDoubleWait () with
             | Error e -> Assert.Fail $"spawn failed: {e.Message}"
@@ -200,11 +200,11 @@ type PosixEventDrivenWaitTests() =
             if isWindows then
                 Assert.Ignore "POSIX-only: exercises the reformulated ECHILD race in tryReapPending/reapLeader"
 
-            match Native.spawnPosix (shell "exit 0") with
+            match Native.Posix.spawnPosix (shell "exit 0") with
             | Error e -> Assert.Fail $"spawn failed: {e.Message}"
             | Ok spawned ->
                 let pid = int spawned.Handle
-                let waitTask = Native.waitPosix spawned.Handle
+                let waitTask = Native.Posix.waitPosix spawned.Handle
 
                 // Race a direct `reapLeader` call — the exact "some concurrent caller already reaped
                 // this pid" scenario `tryReapPending`'s ECHILD branch exists for (in real use, this is
@@ -213,7 +213,7 @@ type PosixEventDrivenWaitTests() =
                 // still resolve to the REAL decoded status promptly: never a fabricated clean exit
                 // (the old behaviour), and never a hang (the removed blocking spin's replacement must
                 // not silently swallow a result either).
-                let reapTask = Task.Run(fun () -> Native.reapLeader pid)
+                let reapTask = Task.Run(fun () -> Native.Posix.reapLeader pid)
 
                 let! outcome = withDeadline 5000 waitTask
                 do! reapTask

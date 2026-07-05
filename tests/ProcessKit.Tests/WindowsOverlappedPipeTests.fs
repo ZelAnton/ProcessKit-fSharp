@@ -11,7 +11,7 @@ open NUnit.Framework.Legacy
 open ProcessKit
 
 /// Windows-only: the async-capable named-pipe replacement for the piped-stdio anonymous pipes
-/// (`Native.createAsyncPipePair` / `spawnWindowsCore`). Verifies the observable contract stays intact
+/// (`Native.Windows.createAsyncPipePair` / `spawnWindowsCore`). Verifies the observable contract stays intact
 /// under this native change — byte-exact captured output, no handle leak under load — and that reads
 /// no longer park a dedicated thread-pool thread per piped stream.
 [<TestFixture>]

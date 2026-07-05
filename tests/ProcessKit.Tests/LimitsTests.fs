@@ -174,8 +174,8 @@ type LimitsTests() =
                         let mutable attempts = 0
 
                         while not gone && attempts < 100 do
-                            match Native.signalPid pid 0 with
-                            | Native.SignalDelivery.TargetGone -> gone <- true
+                            match Native.Posix.signalPid pid 0 with
+                            | Native.Common.SignalDelivery.TargetGone -> gone <- true
                             | _ ->
                                 do! Task.Delay 10
                                 attempts <- attempts + 1

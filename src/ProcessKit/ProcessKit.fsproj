@@ -35,8 +35,12 @@
 		<Compile Include="Finished.fs" />
 		<Compile Include="Stats.fs" />
 		<Compile Include="Stdin.fs" />
+		<Compile Include="Timeouts.fs" />
 		<Compile Include="Command.fs" />
-		<Compile Include="Native.fs" />
+		<Compile Include="Native.Common.fs" />
+		<Compile Include="Native.Windows.fs" />
+		<Compile Include="Native.Posix.fs" />
+		<Compile Include="Native.Cgroup.fs" />
 		<Compile Include="Backend.fs" />
 		<Compile Include="Pump.fs" />
 		<Compile Include="ProcessStdin.fs" />

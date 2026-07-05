@@ -58,20 +58,20 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         let withBackend (backend: IContainmentBackend) = Ok(new ProcessGroup(backend, options))
 
         if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
-            match Native.createWindowsJob () with
+            match Native.Windows.createWindowsJob () with
             | Error error -> Error error
             | Ok job ->
                 if limits.Any then
-                    match Native.applyWindowsJobLimits job limits with
+                    match Native.Windows.applyWindowsJobLimits job limits with
                     | Ok() -> withBackend (JobObjectBackend job)
                     | Error message ->
-                        Native.closeWindowsHandle job
+                        Native.Windows.closeWindowsHandle job
                         Error(ProcessError.ResourceLimit message)
                 else
                     withBackend (JobObjectBackend job)
         elif RuntimeInformation.IsOSPlatform OSPlatform.Linux && limits.Any then
-            if Native.cgroupV2Available () then
-                match Native.createCgroup limits with
+            if Native.Cgroup.cgroupV2Available () then
+                match Native.Cgroup.createCgroup limits with
                 | Ok path -> withBackend (CgroupBackend path)
                 | Error message -> Error(ProcessError.ResourceLimit message)
             else
@@ -97,7 +97,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     member internal _.KillTree() = backend.KillTree()
 
     /// Spawn `command` into the group, tracking the child for signalling / teardown. Internal.
-    member internal _.SpawnInto(command: Command) : Result<Native.Spawned, ProcessError> =
+    member internal _.SpawnInto(command: Command) : Result<Native.Common.Spawned, ProcessError> =
         // Refuse to spawn into a released group: on Windows the child is created before it is assigned
         // to the (now-closed) Job, so spawning after teardown would leak an UNCONTAINED child. Fail
         // fast with a non-transient error instead. (Same released-flag guard as the control verbs.)
