@@ -221,7 +221,7 @@ The two ends of the chain behave like a single `Command`:
   chain connected.
 - Each inner stage's **stderr** is captured per-stage for pipefail diagnostics; only the
   last stage's stdout reaches you.
-- A per-stage `Timeout` or `Retry` is rejected when the stage is piped (see
+- A per-stage `Timeout`, `Retry`, or `CancelOn` is rejected when the stage is piped (see
   [Timeouts and cancellation](#timeouts-and-cancellation)); a per-stage `Logger` or `StreamBuffer`
   has no effect inside a chain — observe or bound an individual command by running it on its own.
 - The **last** stage's [`OutputBuffer`](commands.md#raw-byte-captures-obey-the-byte-cap-too) byte

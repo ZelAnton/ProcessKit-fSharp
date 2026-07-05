@@ -423,8 +423,10 @@ Console.WriteLine(await pipeline.OutputStringAsync() switch
 `Pipeline.Timeout` tears the shared group down at the deadline and reports the
 timeout (`IsTimedOut` on `OutputStringAsync`, `Error` on `RunAsync`) — but, unlike a single
 command's *captured* timeout, there is no salvaged partial stdout to read back. A
-per-stage `Command.Timeout` instead kills just that stage and folds into pipefail.
-See [pipelines.md](pipelines.md) for the full chain model.
+per-stage `Command.Timeout` cannot bound one stage of a chain — a pipeline spawns its
+stages directly, so a stage's own deadline never fires — so `.Pipe` rejects it with an
+`ArgumentException` instead of silently ignoring it. See [pipelines.md](pipelines.md)
+for the full chain model.
 
 A **`CliClient`** usually builds and consumes its `Command`s internally, so set
 the deadline and token **once on the client** and every command it builds carries
