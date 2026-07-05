@@ -346,6 +346,40 @@ type PipelineTests() =
         |> ignore
 
     [<Test>]
+    member _.``a per-stage CancelOn is rejected on any stage when piped``() =
+        use cts = new CancellationTokenSource()
+
+        let withCancelOn cmd = cmd |> Command.cancelOn cts.Token
+
+        // On the first stage (index 0)...
+        Assert.Throws<ArgumentException>(Action(fun () -> (withCancelOn (emit [ "x" ])).Pipe sortStage |> ignore))
+        |> ignore
+
+        // ...and on a later stage (index 1).
+        Assert.Throws<ArgumentException>(Action(fun () -> (emit [ "x" ]).Pipe(withCancelOn sortStage) |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``chain-level Pipeline.CancelOn cancels the whole pipeline``() : Task =
+        // The chain-level builder is a distinct, un-guarded method (unlike a per-stage Command.CancelOn),
+        // so it must keep cancelling the whole chain exactly as before.
+        task {
+            let sleeper =
+                if isWindows then
+                    shell "ping -n 6 127.0.0.1 >nul"
+                else
+                    shell "sleep 5"
+
+            use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 300.0)
+            let pipeline = ((emit [ "hi" ]).Pipe sleeper).CancelOn cts.Token
+
+            match! pipeline.RunAsync() with
+            | Error(ProcessError.Cancelled _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``a Stdin source on stage 0 stays allowed and feeds the whole chain``() : Task =
         task {
             // Regression: only stages AFTER the first reject a source; stage 0 feeds the chain.

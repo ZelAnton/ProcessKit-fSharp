@@ -363,10 +363,12 @@ Cancellation has two forms:
 - Each verb's optional **`CancellationToken`** (`pipeline.RunAsync(token)`) ties a single call
   to a token without baking it into the pipeline.
 
-A `Command.CancelOn` token set on an individual stage also cancels that stage and errors
-the pipeline, but the pipeline-level builder is the clearer authority. For the full model
-— captured vs. raised deadlines, and how cancellation differs from a timeout — see
-[timeouts-and-cancellation.md](timeouts-and-cancellation.md).
+A per-stage **`Command.CancelOn`** cannot cancel one stage of a chain — a pipeline spawns its
+stages directly, so a stage's own token is a verb-layer mechanism the spawn bypasses and never
+fires. Setting one is a configuration error, so `.Pipe` rejects it with an `ArgumentException`.
+Cancel the whole chain with the chain-level `Pipeline.CancelOn` (or pass a token to the verb)
+instead. For the full model — captured vs. raised deadlines, and how cancellation differs from a
+timeout — see [timeouts-and-cancellation.md](timeouts-and-cancellation.md).
 
 ## Re-running a pipeline
 
