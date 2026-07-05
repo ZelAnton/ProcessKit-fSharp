@@ -483,21 +483,23 @@ module internal Pump =
                         let bytes = Encoding.UTF8.GetBytes(entry + "\n")
                         do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                 | StdinSource.AsyncLines lines ->
-                    let enumerator = lines.GetAsyncEnumerator cancellationToken
+                    // `use` on an `IAsyncEnumerator<'T>` (an `IAsyncDisposable`) inside this `task { }`
+                    // makes the F# task-CE binder call `DisposeAsync` genuinely asynchronously and
+                    // exactly once — on normal completion, on an exception from `MoveNextAsync`/
+                    // `WriteAsync`, and on cancellation — instead of blocking a thread-pool thread on
+                    // `.DisposeAsync().AsTask().GetAwaiter().GetResult()`. Any exception raised here
+                    // still propagates to the outer `with ex ->` below unchanged.
+                    use enumerator = lines.GetAsyncEnumerator cancellationToken
+                    let mutable more = true
 
-                    try
-                        let mutable more = true
+                    while more do
+                        let! has = enumerator.MoveNextAsync()
 
-                        while more do
-                            let! has = enumerator.MoveNextAsync()
-
-                            if has then
-                                let bytes = Encoding.UTF8.GetBytes(enumerator.Current + "\n")
-                                do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
-                            else
-                                more <- false
-                    finally
-                        enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult()
+                        if has then
+                            let bytes = Encoding.UTF8.GetBytes(enumerator.Current + "\n")
+                            do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
+                        else
+                            more <- false
 
                 do! stdinStream.FlushAsync cancellationToken
             with ex ->
