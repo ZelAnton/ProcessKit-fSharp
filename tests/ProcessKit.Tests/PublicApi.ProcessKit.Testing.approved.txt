@@ -1,0 +1,89 @@
+class ProcessKit.Testing.CassetteEntry
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.Testing.CassetteEntry>
+  member Equals(ProcessKit.Testing.CassetteEntry) : System.Boolean
+  member Equals(ProcessKit.Testing.CassetteEntry, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  new()
+  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double)
+  property Args : System.String[] { get; set }
+  property Code : System.Nullable<System.Int32> { get; set }
+  property Cwd : System.String { get; set }
+  property DurationMs : System.Double { get; set }
+  property EnvNames : System.String[] { get; set }
+  property HasStdin : System.Boolean { get; set }
+  property Program : System.String { get; set }
+  property Signal : System.Nullable<System.Int32> { get; set }
+  property Stderr : System.String { get; set }
+  property StdinDigest : System.String { get; set }
+  property Stdout : System.String { get; set }
+  property StdoutBase64 : System.String { get; set }
+  property TimedOut : System.Boolean { get; set }
+  property Truncated : System.Boolean { get; set }
+
+class ProcessKit.Testing.CassetteFile
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.Testing.CassetteFile>
+  member Equals(ProcessKit.Testing.CassetteFile) : System.Boolean
+  member Equals(ProcessKit.Testing.CassetteFile, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  new()
+  new(System.Int32, ProcessKit.Testing.CassetteEntry[])
+  property Entries : ProcessKit.Testing.CassetteEntry[] { get; set }
+  property Version : System.Int32 { get; set }
+
+class ProcessKit.Testing.FakeProcess
+  member Build() : ProcessKit.RunningProcess
+  member WithExit(System.Int32) : ProcessKit.Testing.FakeProcess
+  member WithOutcome(ProcessKit.Outcome) : ProcessKit.Testing.FakeProcess
+  member WithPid(System.Int32) : ProcessKit.Testing.FakeProcess
+  member WithStderr(System.String) : ProcessKit.Testing.FakeProcess
+  member WithStdout(System.String) : ProcessKit.Testing.FakeProcess
+  member WithStdoutLines(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Testing.FakeProcess
+  static member Create() : ProcessKit.Testing.FakeProcess
+  static member Create(System.String) : ProcessKit.Testing.FakeProcess
+
+class ProcessKit.Testing.RecordReplayOptions
+  member WithArgNormalizer(System.Func<System.String[], System.String[]>) : ProcessKit.Testing.RecordReplayOptions
+  member WithFileStdinContentHashing() : ProcessKit.Testing.RecordReplayOptions
+  member WithRedaction(System.Func<System.String, System.String>) : ProcessKit.Testing.RecordReplayOptions
+  new()
+
+class ProcessKit.Testing.RecordReplayRunner
+  :> ProcessKit.IProcessRunner
+  :> System.IDisposable
+  member Save() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  static member Auto(System.String, ProcessKit.IProcessRunner) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
+  static member Auto(System.String, ProcessKit.IProcessRunner, ProcessKit.Testing.RecordReplayOptions) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
+  static member Record(System.String, ProcessKit.IProcessRunner) : ProcessKit.Testing.RecordReplayRunner
+  static member Record(System.String, ProcessKit.IProcessRunner, ProcessKit.Testing.RecordReplayOptions) : ProcessKit.Testing.RecordReplayRunner
+  static member Replay(System.String) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
+  static member Replay(System.String, ProcessKit.Testing.RecordReplayOptions) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
+
+class ProcessKit.Testing.Reply
+  member WithStderr(System.String) : ProcessKit.Testing.Reply
+  member WithStdout(System.String) : ProcessKit.Testing.Reply
+  property TimedOut : ProcessKit.Testing.Reply { get }
+  static member Error(ProcessKit.ProcessError) : ProcessKit.Testing.Reply
+  static member Exit(System.Int32) : ProcessKit.Testing.Reply
+  static member Fail(System.Int32, System.String) : ProcessKit.Testing.Reply
+  static member Ok(System.String) : ProcessKit.Testing.Reply
+  static member Signalled() : ProcessKit.Testing.Reply
+  static member Signalled(System.Int32) : ProcessKit.Testing.Reply
+  static member Unobserved(System.String) : ProcessKit.Testing.Reply
+
+class ProcessKit.Testing.ScriptedRunner
+  :> ProcessKit.IProcessRunner
+  member Fallback(ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
+  member On(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
+  member When(System.Func<ProcessKit.Command, System.Boolean>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
+  new()
+

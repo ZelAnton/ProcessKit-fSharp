@@ -250,3 +250,7 @@ type ApiSurfaceTests() =
         verify
             typeof<ProcessKit.Extensions.DependencyInjection.ServiceCollectionExtensions>.Assembly
             "PublicApi.ProcessKit.Extensions.DependencyInjection.approved.txt"
+
+    [<Test>]
+    member _.``Testing package public API matches the approved baseline``() =
+        verify typeof<ProcessKit.Testing.ScriptedRunner>.Assembly "PublicApi.ProcessKit.Testing.approved.txt"

@@ -49,10 +49,6 @@
 		<Compile Include="Runner.fs" />
 		<Compile Include="ProcessRunnerExtensions.fs" />
 		<Compile Include="DelegatingProcessRunner.fs" />
-		<Compile Include="FakeProcess.fs" />
-		<Compile Include="Reply.fs" />
-		<Compile Include="ScriptedRunner.fs" />
-		<Compile Include="Cassette.fs" />
 		<Compile Include="ProcessGroup.fs" />
 		<Compile Include="JobRunner.fs" />
 		<Compile Include="CommandVerbs.fs" />
@@ -68,6 +64,9 @@
 		<InternalsVisibleTo Include="ProcessKit.Tests" />
 		<!-- The DI extensions read Command.Config.Logger to avoid clobbering an explicit per-command logger. -->
 		<InternalsVisibleTo Include="ProcessKit.Extensions.DependencyInjection" />
+		<!-- The testing doubles build a RunningProcess over ProcessKit's internal RunningHost and
+		     construct ProcessResult<'T> directly (both internal constructors). -->
+		<InternalsVisibleTo Include="ProcessKit.Testing" />
 	</ItemGroup>
 
 	<ItemGroup>

@@ -10,6 +10,11 @@ subprocess-free double). The default real implementation is `JobRunner` — each
 run lands in a fresh kill-on-dispose group; everything in this guide swaps it for
 a double so your tests never touch the operating system.
 
+> The subprocess-free doubles ship in a **separate `ProcessKit.Testing` NuGet package**, kept out
+> of the runtime `ProcessKit` package so its on-disk/JSON record-replay surface never enters your
+> production dependency graph. Add a `ProcessKit.Testing` package reference to your test project;
+> the types stay in the `ProcessKit.Testing` namespace.
+
 **F#**
 
 ```fsharp

@@ -5,7 +5,7 @@
 		<IsPackable>false</IsPackable>
 		<!-- Test project ships no package, so it needs no XML doc file. -->
 		<GenerateDocumentationFile>false</GenerateDocumentationFile>
-		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.DependencyInjection\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Testing\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.DependencyInjection\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
 	</PropertyGroup>
 
 	<!-- F# compile order is significant — list test files in dependency order. -->
@@ -41,6 +41,7 @@
 		<!-- Public-API baselines for ApiSurfaceTests; copied next to the test assembly so the test
 		     reads them from its output directory. -->
 		<None Include="PublicApi.ProcessKit.approved.txt" CopyToOutputDirectory="PreserveNewest" />
+		<None Include="PublicApi.ProcessKit.Testing.approved.txt" CopyToOutputDirectory="PreserveNewest" />
 		<None Include="PublicApi.ProcessKit.Extensions.DependencyInjection.approved.txt" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
@@ -58,6 +59,7 @@
 
 	<ItemGroup>
 		<Reference Include="ProcessKit" />
+		<Reference Include="ProcessKit.Testing" />
 		<Reference Include="ProcessKit.Extensions.DependencyInjection" />
 	</ItemGroup>
 

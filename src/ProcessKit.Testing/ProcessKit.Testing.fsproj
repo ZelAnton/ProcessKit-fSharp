@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<!-- TargetFrameworks are set centrally in Directory.Build.props (net8.0;net10.0). -->
+		<AssemblyName>ProcessKit.Testing</AssemblyName>
+
+		<!-- Package identity only; shared metadata is hoisted to Directory.Build.props. -->
+		<PackageId>ProcessKit.Testing</PackageId>
+		<Version>2.0.0</Version>
+		<Description>Test doubles for ProcessKit — a subprocess-free ScriptedRunner (with Reply), an in-memory FakeProcess handle, and a record/replay IProcessRunner (RecordReplayRunner + cassettes). Shipped as a separate package so the disk/JSON record-replay surface stays out of a consumer's production dependency; reference it only from test projects.</Description>
+		<PackageTags>fsharp;dotnet;process;subprocess;testing;test-double;fake;mock;scripted-runner;record-replay;cassette;iprocessrunner;processkit</PackageTags>
+
+		<!-- The referenced ProcessKit.dll resolves from the main project's build output. -->
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+	</PropertyGroup>
+
+	<!-- F# COMPILE ORDER IS SIGNIFICANT. Files are compiled top-to-bottom; a type or
+	     function must be declared before its first use. Reply must precede ScriptedRunner
+	     (which scripts Reply values); Cassette is last (it reuses FakeProcess). FakeProcess
+	     is independent of the other three. -->
+	<ItemGroup>
+		<Compile Include="FakeProcess.fs" />
+		<Compile Include="Reply.fs" />
+		<Compile Include="ScriptedRunner.fs" />
+		<Compile Include="Cassette.fs" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- The test project drives FakeProcess.OfCommand (internal) directly. -->
+		<InternalsVisibleTo Include="ProcessKit.Tests" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- Explicit FSharp.Core reference (version from Directory.Packages.props); required under
+		     Central Package Management or the runtime cannot load FSharp.Core. See CLAUDE.md.
+		     Logging.Abstractions is a transitive need: the doubles reconstruct a RunningProcess from
+		     ProcessKit's internal CommandConfig, whose Logger field is an ILogger option. -->
+		<PackageReference Include="FSharp.Core" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- Cross-project reference is the built ProcessKit assembly (build order via the .slnx
+		     BuildDependency), never a ProjectReference — see CLAUDE.md. -->
+		<Reference Include="ProcessKit" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Include="$(RepoRoot)README.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+
+</Project>

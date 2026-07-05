@@ -201,18 +201,23 @@ read [Running commands](docs/commands.md) end to end:
 
 Where the project is headed: the **[roadmap](ROADMAP.md)**.
 
-## One package, full surface
+## One runtime package, plus opt-in side packages
 
-There are no compile-time feature flags to choose: a single `ProcessKit` package ships the whole
-surface, and the optional capabilities are just modules you use when you need them. The
-kill-on-dispose tree guarantee is unconditional.
+There are no compile-time feature flags to choose: the `ProcessKit` runtime package ships the whole
+production surface, and its optional capabilities are just modules you use when you need them. The
+kill-on-dispose tree guarantee is unconditional. Two concerns live in **separate, opt-in packages**
+so they never reach a consumer's production dependency graph: the **test doubles**
+(`ProcessKit.Testing` — a subprocess-free `ScriptedRunner`/`FakeProcess` and the disk/JSON
+record-replay `RecordReplayRunner`, referenced only from test projects) and the
+**dependency-injection wiring** (`ProcessKit.Extensions.DependencyInjection`).
 
 | Capability | Where |
 |---|---|
 | Tree control — `Signal` / `Suspend` / `Resume` / `Members` | `ProcessGroup` |
 | Resource caps — memory / process count / CPU | `ProcessGroupOptions` → `ProcessGroup.Create` |
 | Stats & profiling — `Stats` / `SampleStatsAsync` / `ProfileAsync` | `ProcessGroup`, `RunningProcess` |
-| Record / replay cassettes | `ProcessKit.Testing.RecordReplayRunner` |
+| Test doubles — `ScriptedRunner` / `FakeProcess` | `ProcessKit.Testing` (separate package) |
+| Record / replay cassettes | `ProcessKit.Testing.RecordReplayRunner` (separate package) |
 | Observability — logging, tracing & metrics ([guide](docs/observability.md)) | `Command.Logger`, `ProcessKitDiagnostics` (`ActivitySource` / `Meter`) |
 | Dependency-injection wiring | `ProcessKit.Extensions.DependencyInjection` (separate package) |
 
