@@ -225,3 +225,68 @@ type VerbTests() =
                         Assert.That(int fields[16], Is.EqualTo 10)
         }
         :> Task
+
+    // ---- Umask (observable, platform-guarded) -------------------------------------------------
+
+    [<Test>]
+    member _.``Umask restricts the permissions of files the child creates (observed on Unix)``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore
+                    "umask is a Unix file-mode creation mask; the Windows behaviour is the Unsupported gate below."
+            else
+                // umask 0o077 masks off every group/other bit, so a file `touch` creates at the default
+                // 0o666 lands at 0o600. CI's ambient umask is the usual 0o022 (which would leave 0o644,
+                // i.e. group/other read), so an observed 0o600 proves the requested mask actually applied.
+                let path =
+                    Path.Combine(Path.GetTempPath(), "processkit-umask-" + System.Guid.NewGuid().ToString("N"))
+
+                try
+                    let command = shell $"touch '{path}'" |> Command.umask 0o077
+
+                    match! runner.RunUnitAsync command with
+                    | Error error -> Assert.Fail $"{error}"
+                    | Ok() ->
+                        Assert.That(File.Exists path, Is.True, "the child should have created the file")
+                        let mode = File.GetUnixFileMode path
+
+                        let groupOther =
+                            UnixFileMode.GroupRead
+                            ||| UnixFileMode.GroupWrite
+                            ||| UnixFileMode.GroupExecute
+                            ||| UnixFileMode.OtherRead
+                            ||| UnixFileMode.OtherWrite
+                            ||| UnixFileMode.OtherExecute
+
+                        Assert.That(
+                            mode &&& groupOther,
+                            Is.EqualTo UnixFileMode.None,
+                            "umask 0o077 must clear all group/other bits"
+                        )
+
+                        Assert.That(
+                            mode.HasFlag UnixFileMode.UserRead && mode.HasFlag UnixFileMode.UserWrite,
+                            Is.True,
+                            "the owner should still keep read/write"
+                        )
+                finally
+                    if File.Exists path then
+                        File.Delete path
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Umask is honestly Unsupported on Windows (no silent drop)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The umask Unsupported gate is Windows-only; Unix applies the mask (observed above)."
+            else
+                // Windows has no umask equivalent, so a requested mask fails the spawn honestly rather
+                // than being silently ignored — gated before any spawn work.
+                let command = shell "echo hi" |> Command.umask 0o022
+
+                match! runner.RunAsync command with
+                | Error(ProcessError.Unsupported _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected Unsupported for umask on Windows, got {other}"
+        }
+        :> Task

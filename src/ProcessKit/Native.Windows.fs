@@ -843,4 +843,10 @@ module internal Windows =
             Error(ProcessError.Spawn(command.Program, ex.Message))
 
     let spawnWindows (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
-        lock windowsSpawnLock (fun () -> spawnWindowsCore job command)
+        // `Command.Umask` is a Unix `umask(2)` file-mode creation mask with no Windows equivalent. Honour
+        // the request honestly as `ProcessError.Unsupported` BEFORE any spawn work, rather than silently
+        // ignoring the requested mask — symmetric to the port's other Unix-only gates (e.g. every
+        // non-`Kill` `Signal` on Windows → `Unsupported` in `Backend.fs`).
+        match command.Config.Umask with
+        | Some _ -> Error(ProcessError.Unsupported "umask")
+        | None -> lock windowsSpawnLock (fun () -> spawnWindowsCore job command)

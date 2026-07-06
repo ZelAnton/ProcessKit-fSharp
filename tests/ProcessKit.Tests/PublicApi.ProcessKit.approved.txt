@@ -50,6 +50,7 @@ class ProcessKit.Command
   member StreamBuffer(ProcessKit.StreamBufferPolicy) : ProcessKit.Command
   member Timeout(System.TimeSpan) : ProcessKit.Command
   member TimeoutGrace(System.TimeSpan) : ProcessKit.Command
+  member Umask(System.Int32) : ProcessKit.Command
   member UncheckedInPipe() : ProcessKit.Command
   new(System.String)
   property Arguments : System.Collections.Generic.IReadOnlyList<System.String> { get }
@@ -90,6 +91,7 @@ module ProcessKit.CommandModule
   static member streamBuffer(ProcessKit.StreamBufferPolicy, ProcessKit.Command) : ProcessKit.Command
   static member timeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member timeoutGrace(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
+  static member umask(System.Int32, ProcessKit.Command) : ProcessKit.Command
   static member uncheckedInPipe(ProcessKit.Command) : ProcessKit.Command
 
 class ProcessKit.CommandVerbs

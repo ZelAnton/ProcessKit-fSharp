@@ -121,6 +121,24 @@ module internal Posix =
     [<DllImport("libc", SetLastError = true)>]
     extern int private setpriority(int which, int who, int prio)
 
+    // umask(2) sets the calling PROCESS's file-mode creation mask and returns the previous one. It is a
+    // whole-process attribute (not per-thread, not per-spawn), and `posix_spawn` has no umask attribute
+    // of its own (unlike its file-action / flag attributes), so `Command.Umask` is applied by setting
+    // the process umask right before `posix_spawnp` and restoring it right after, under `umaskSpawnLock`
+    // (see `spawnPosix`). Only the low permission bits are meaningful; the return of any garbage high
+    // bits on platforms with a narrow `mode_t` is harmless — umask ignores non-permission bits.
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private umask(int mask)
+
+    // Serializes the umask set/spawn/restore critical section against EVERY concurrent `posix_spawnp` in
+    // this process — including one that requested no mask, which would otherwise be able to inherit
+    // another spawn's temporarily-set umask during that window. This is the port's deliberate, typed
+    // divergence from ProcessKit-rs: there `umask(2)` is applied in a `pre_exec` hook that runs in the
+    // already-forked child, so it races neither the parent nor any sibling spawn; `posix_spawn` exposes
+    // no such user hook, so the mask must be set in the PARENT and the whole window serialized. Mirrors
+    // the existing `windowsSpawnLock` (Native.Windows) and `sigchldInitLock` module-level `lock`s.
+    let private umaskSpawnLock = obj ()
+
     /// Marshal a list of strings into a NULL-terminated `char* []`. Returns the array pointer
     /// and the individual string allocations to free afterwards.
     let private marshalCStringArray (items: string list) : nativeint * nativeint list =
@@ -537,10 +555,33 @@ module internal Posix =
                 posix_spawnattr_setflags (attributes, spawnFlags) |> ignore
                 posix_spawnattr_setpgroup (attributes, 0) |> ignore
 
-                let mutable pid = 0
+                // Do the actual `posix_spawnp` (returning its rc and the pid it wrote) under
+                // `umaskSpawnLock`. `localPid` is declared INSIDE the closure so `&localPid` is a plain
+                // addressable local, not a captured mutable (which F# forbids taking the address of).
+                let spawnUnderLock () =
+                    let mutable localPid = 0
 
-                let rc =
-                    posix_spawnp (&pid, command.Program, fileActions, attributes, argvPointer, envpPointer)
+                    let rc =
+                        posix_spawnp (&localPid, command.Program, fileActions, attributes, argvPointer, envpPointer)
+
+                    rc, localPid
+
+                // umask(2) is a whole-process attribute with no `posix_spawn` attribute, so a requested
+                // mask is set on the parent right before the spawn and restored right after — and EVERY
+                // spawn (mask or not) takes `umaskSpawnLock`, so a concurrent no-mask spawn can never
+                // observe another spawn's temporarily-set umask. See `umaskSpawnLock` for why this
+                // parent-side set/spawn/restore replaces the Rust source's child-side `pre_exec` hook.
+                let rc, pid =
+                    lock umaskSpawnLock (fun () ->
+                        match config.Umask with
+                        | None -> spawnUnderLock ()
+                        | Some mask ->
+                            let previous = umask mask
+
+                            try
+                                spawnUnderLock ()
+                            finally
+                                umask previous |> ignore)
 
                 // The parent never needs the child-side fds.
                 for fd in childSideFds do

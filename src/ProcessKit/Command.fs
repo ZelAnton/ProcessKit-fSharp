@@ -59,6 +59,11 @@ type internal CommandConfig =
       // The child's CPU-scheduling priority, applied at spawn (Windows priority class / Unix nice).
       // `None` (the default) leaves the OS default untouched.
       Priority: Priority option
+      // The child's Unix file-mode creation mask (`umask(2)`), applied at spawn on the POSIX path.
+      // `None` (the default) leaves the inherited umask untouched. Unix-only: a set value fails a
+      // Windows spawn with `ProcessError.Unsupported` (there is no Windows equivalent), never a silent
+      // drop. Only the low permission bits are meaningful, as with `umask(2)` itself.
+      Umask: int option
       Logger: ILogger option
       // A per-run correlation id, stamped once at the verb layer so a run's log/trace events (and its
       // retries) share it. `None` until stamped; a direct spawn gets a per-incarnation id instead.
@@ -95,6 +100,7 @@ module internal CommandConfig =
           OkCodes = [ 0 ]
           CreateNoWindow = false
           Priority = None
+          Umask = None
           Logger = None
           RunId = None }
 
@@ -393,6 +399,14 @@ type Command internal (config: CommandConfig) =
     member _.Priority(priority: Priority) =
         Command({ config with Priority = Some priority })
 
+    /// Set the child's Unix file-mode creation mask (`umask(2)`), controlling the default permissions
+    /// of files it creates — pass the value you would give the `umask` shell builtin (e.g. `0o022`).
+    /// Only the low permission bits are meaningful, as with the syscall itself. **Unix-only:** on
+    /// Windows (which has no equivalent) a set mask fails the spawn with `ProcessError.Unsupported`
+    /// rather than being silently ignored. The default (unset) leaves the inherited umask untouched.
+    member _.Umask(mask: int) =
+        Command({ config with Umask = Some mask })
+
     /// Emit structured lifecycle events (spawn / exit / timeout / retry) to `logger`. The program
     /// name and non-secret facts only — **argv and environment are never logged**.
     member _.Logger(logger: ILogger) =
@@ -512,6 +526,10 @@ module Command =
     /// Launch the child (and its spawned tree) at a lower/higher CPU-scheduling priority (Windows
     /// priority class / Unix nice). Supported on both platforms; the default leaves the OS default.
     let priority (level: Priority) (command: Command) = command.Priority level
+
+    /// Set the child's Unix file-mode creation mask (`umask(2)`). Unix-only: a set mask fails a Windows
+    /// spawn with `ProcessError.Unsupported`. The default leaves the inherited umask untouched.
+    let umask (mask: int) (command: Command) = command.Umask mask
 
     /// Emit structured lifecycle events to `logger` (argv/env never logged).
     let logger (logger: ILogger) (command: Command) = command.Logger logger

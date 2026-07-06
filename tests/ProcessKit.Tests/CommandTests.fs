@@ -154,6 +154,26 @@ type CommandTests() =
         Assert.That(PriorityMapping.windowsCreationFlag Priority.AboveNormal, Is.EqualTo 0x00008000u)
         Assert.That(PriorityMapping.windowsCreationFlag Priority.High, Is.EqualTo 0x00000080u)
 
+    // ---- Umask --------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``Umask is unset by default``() =
+        Assert.That(Command.create("git").Config.Umask, Is.EqualTo(None: int option))
+
+    [<Test>]
+    member _.``Umask records the mask and the instance method matches the module function``() =
+        let viaModule = Command.create "git" |> Command.umask 0o022
+        let viaInstance = Command("git").Umask 0o022
+        Assert.That(viaModule.Config.Umask, Is.EqualTo(Some 0o022))
+        Assert.That(viaInstance.Config.Umask, Is.EqualTo(Some 0o022))
+
+    [<Test>]
+    member _.``Umask is immutable - setting it returns a new command``() =
+        let baseCommand = Command.create "git"
+        let withUmask = baseCommand |> Command.umask 0o077
+        Assert.That(baseCommand.Config.Umask, Is.EqualTo(None: int option))
+        Assert.That(withUmask.Config.Umask, Is.EqualTo(Some 0o077))
+
     // ---- LineTerminator -----------------------------------------------------------------------
 
     [<Test>]
