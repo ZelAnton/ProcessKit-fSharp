@@ -40,6 +40,12 @@ class ProcessKit.Testing.CassetteFile
   property Entries : ProcessKit.Testing.CassetteEntry[] { get; set }
   property Version : System.Int32 { get; set }
 
+class ProcessKit.Testing.DryRunRunner
+  :> ProcessKit.IProcessRunner
+  new()
+  property History : System.Collections.Generic.IReadOnlyList<System.String> { get }
+  static member Render(ProcessKit.Command) : System.String
+
 class ProcessKit.Testing.FakeProcess
   member Build() : ProcessKit.RunningProcess
   member WithExit(System.Int32) : ProcessKit.Testing.FakeProcess

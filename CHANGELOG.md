@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `ProcessKit.Testing.DryRunRunner` — a subprocess-free `IProcessRunner` for a `--dry-run` seam: every verb renders the command deterministically (program, arguments, working directory) instead of spawning it, and `History` exposes every command "run" so far for inspection.
 
 ### Changed
 -
