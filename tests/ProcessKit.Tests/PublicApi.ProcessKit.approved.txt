@@ -816,10 +816,13 @@ class ProcessKit.StopReason
   member GetHashCode() : System.Int32
   member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
   member ToString() : System.String
+  member get_IsGaveUp() : System.Boolean
   member get_IsPolicySatisfied() : System.Boolean
   member get_IsPredicate() : System.Boolean
   member get_IsRestartsExhausted() : System.Boolean
   member get_Tag() : System.Int32
+  property GaveUp : ProcessKit.StopReason { get }
+  property IsGaveUp : System.Boolean { get }
   property IsPolicySatisfied : System.Boolean { get }
   property IsPredicate : System.Boolean { get }
   property IsRestartsExhausted : System.Boolean { get }
@@ -827,11 +830,13 @@ class ProcessKit.StopReason
   property Predicate : ProcessKit.StopReason { get }
   property RestartsExhausted : ProcessKit.StopReason { get }
   property Tag : System.Int32 { get }
+  static member get_GaveUp() : ProcessKit.StopReason
   static member get_PolicySatisfied() : ProcessKit.StopReason
   static member get_Predicate() : ProcessKit.StopReason
   static member get_RestartsExhausted() : ProcessKit.StopReason
 
 module ProcessKit.StopReason+Tags
+  field literal GaveUp : System.Int32
   field literal PolicySatisfied : System.Int32
   field literal Predicate : System.Int32
   field literal RestartsExhausted : System.Int32
@@ -889,6 +894,7 @@ class ProcessKit.Supervisor
   member Capture(ProcessKit.OutputBufferPolicy) : ProcessKit.Supervisor
   member FailureDecay(System.TimeSpan) : ProcessKit.Supervisor
   member FailureThreshold(System.Double) : ProcessKit.Supervisor
+  member GiveUpWhen(System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Supervisor
   member Jitter(System.Boolean) : ProcessKit.Supervisor
   member MaxBackoff(System.TimeSpan) : ProcessKit.Supervisor
   member MaxRestarts(System.Int32) : ProcessKit.Supervisor

@@ -299,6 +299,118 @@ type SupervisorTests() =
         }
         :> Task
 
+    // ----- give-up classifier -----
+
+    [<Test>]
+    member _.``GiveUpWhen stops a permanently crashing run``() : Task =
+        task {
+            // Exit code 127 ("command not found", the classic shell convention for a missing binary)
+            // recurs on every incarnation; without the classifier this would restart forever. The
+            // second reply is never consumed (SequenceRunner fails loudly if it is).
+            let sup =
+                supervise([ failWith 127; ok () ])
+                    .GiveUpWhen(fun error ->
+                        match error with
+                        | ProcessError.Exit(_, 127, _, _) -> true
+                        | _ -> false)
+
+            match! sup.RunAsync() with
+            | Ok outcome ->
+                Assert.That(
+                    outcome.Restarts,
+                    Is.EqualTo 0,
+                    "must not restart a run the classifier recognized as permanent"
+                )
+
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.GaveUp)
+                Assert.That(outcome.FinalResult.Code, Is.EqualTo(Some 127))
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``GiveUpWhen does not affect an unrecognized crash``() : Task =
+        task {
+            let sup =
+                supervise([ failWith 1; ok () ])
+                    .GiveUpWhen(fun error ->
+                        match error with
+                        | ProcessError.Exit(_, 127, _, _) -> true
+                        | _ -> false)
+
+            match! sup.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 1, "an unrecognized crash still restarts")
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``GiveUpWhen takes precedence over an exhausted budget``() : Task =
+        task {
+            let sup =
+                supervise([ failWith 127 ])
+                    .MaxRestarts(0)
+                    .GiveUpWhen(fun error ->
+                        match error with
+                        | ProcessError.Exit(_, 127, _, _) -> true
+                        | _ -> false)
+
+            match! sup.RunAsync() with
+            | Ok outcome ->
+                Assert.That(
+                    outcome.Stopped,
+                    Is.EqualTo StopReason.GaveUp,
+                    "a permanent-failure verdict wins over an exhausted budget"
+                )
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``GiveUpWhen is not consulted when the policy already stops``() : Task =
+        task {
+            let sup =
+                supervise([ failWith 127 ])
+                    .Restart(RestartPolicy.Never)
+                    .GiveUpWhen(fun _ -> failwith "classifier must not run once the policy already stopped")
+
+            match! sup.RunAsync() with
+            | Ok outcome -> Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``GiveUpWhen stops a permanent failure that never produced a result``() : Task =
+        task {
+            // Without a classifier this restarts like a crash (spawn races are transient) — the second
+            // reply is never consumed (SequenceRunner fails loudly if it is).
+            let sup =
+                supervise([ spawnErr (); ok () ])
+                    .GiveUpWhen(fun error ->
+                        match error with
+                        | ProcessError.Spawn _ -> true
+                        | _ -> false)
+
+            match! sup.RunAsync() with
+            | Error(ProcessError.Spawn _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected Spawn, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``GiveUpWhen does not change default behaviour when unset``() : Task =
+        task {
+            match! supervise([ failWith 127; failWith 127; ok () ]).RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 2)
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
     // ----- backoff timing (virtual clock) -----
 
     [<Test>]

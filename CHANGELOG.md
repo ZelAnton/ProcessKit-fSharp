@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `Supervisor.GiveUpWhen(classifier)` and `StopReason.GaveUp`: classify a crash's or a runner failure's `ProcessError` as *permanent*, so the supervisor gives up instead of restarting it forever.
 
 ### Changed
 -

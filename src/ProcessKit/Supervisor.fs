@@ -36,6 +36,14 @@ type StopReason =
     /// The `Supervisor.MaxRestarts` budget ran out while the policy still wanted another restart.
     | RestartsExhausted
 
+    /// The `Supervisor.GiveUpWhen` classifier recognized a crash as *permanent* — the supervisor
+    /// stopped instead of restarting it forever. Only reported for a crashed run that produced a
+    /// `ProcessResult` (the classifier still receives that crash's `ProcessError` projection, via
+    /// `ProcessResult.FailureError`); a permanent failure that never produced a result (a spawn/IO
+    /// failure the classifier also recognizes) has no result to report and instead surfaces
+    /// directly as `RunAsync`'s `Error`, same as an exhausted budget on that path.
+    | GaveUp
+
 /// What a finished supervision reports — the last run plus the keeper's telemetry.
 ///
 /// Sealed with an internal constructor so it can gain fields without breaking the frozen API.
@@ -140,6 +148,7 @@ type internal SupervisorConfig =
       FailureThreshold: float
       StormPause: TimeSpan option
       StopWhen: (ProcessResult<string> -> bool) option
+      GiveUpWhen: (ProcessError -> bool) option
       Capture: OutputBufferPolicy
       // The clock seam: `Now` is a monotonic reading in seconds (only differences matter); `Sleep`
       // waits out a delay. Real implementations by default; tests inject a virtual clock that
@@ -176,6 +185,7 @@ module internal SupervisorConfig =
           FailureThreshold = 5.0
           StormPause = None
           StopWhen = None
+          GiveUpWhen = None
           Capture = Supervision.defaultCapture command
           Now = realNow
           Sleep = realSleep }
@@ -279,6 +289,33 @@ type Supervisor internal (config: SupervisorConfig) =
                 StopWhen = Some(fun result -> predicate.Invoke result) }
         )
 
+    /// Classify a crash — or a spawn/IO failure that never produced a result — as *permanent*, so
+    /// the supervisor gives up instead of restarting it forever. `classifier` receives the
+    /// `ProcessError` of the failed incarnation: for a crashed run (one that produced a
+    /// `ProcessResult` but is not a success) that is the crash's own `ProcessResult.FailureError`
+    /// projection; for a run that never produced a result at all, it is the runner's own error.
+    /// This is a different seam than `StopWhen`, which classifies by *outcome*
+    /// (`ProcessResult`) — `GiveUpWhen` classifies by *error kind*, independent of whether the
+    /// incarnation ever ran.
+    ///
+    /// Not checked for a clean exit, nor for a run `StopWhen` already ended, nor for a crash the
+    /// `RestartPolicy` itself would not have restarted (e.g. under `Never`) — those already stop
+    /// supervision with a more specific reason. When checked, it runs *before* `MaxRestarts`: a
+    /// permanent-failure verdict wins over "budget not yet exhausted". A crashed match reports
+    /// `StopReason.GaveUp`; a match on a run that never produced a result has no result to report
+    /// and surfaces the classified error directly as `RunAsync`'s `Error`, same as an exhausted
+    /// budget on that path.
+    ///
+    /// Default: unset — a permanent failure restarts forever (throttled only by
+    /// backoff/`MaxRestarts`/the storm guard), matching the prior behavior.
+    member _.GiveUpWhen(classifier: Func<ProcessError, bool>) =
+        ArgumentNullException.ThrowIfNull classifier
+
+        Supervisor(
+            { config with
+                GiveUpWhen = Some(fun error -> classifier.Invoke error) }
+        )
+
     /// Internal test seam: inject a virtual clock (advance-on-sleep) for deterministic timing tests.
     member internal _.WithClock(now: unit -> float, sleep: TimeSpan -> CancellationToken -> Task) =
         Supervisor({ config with Now = now; Sleep = sleep })
@@ -369,6 +406,15 @@ type Supervisor internal (config: SupervisorConfig) =
             let budgetExhausted () =
                 config.MaxRestarts |> Option.exists (fun limit -> restarts >= limit)
 
+            // True when `GiveUpWhen` is set and its classifier recognizes `error` as permanent.
+            // Callers only consult this once a restart would otherwise be attempted (a policy that
+            // already stops, or a `StopWhen`/terminal-error match, wins with its own more specific
+            // reason and never reaches this check) — matching `StopWhen`'s own "checked before the
+            // policy" placement but one step later, since a permanent verdict should win over an
+            // exhausted budget, not just over the plain policy decision.
+            let giveUpMatches (error: ProcessError) =
+                config.GiveUpWhen |> Option.exists (fun classify -> classify error)
+
             while final.IsNone do
                 if cancellationToken.IsCancellationRequested then
                     final <- Some(Error(ProcessError.Cancelled program))
@@ -405,6 +451,8 @@ type Supervisor internal (config: SupervisorConfig) =
                                             )
                                         )
                                     )
+                            elif crashed && giveUpMatches result.FailureError then
+                                final <- Some(Ok(SupervisionOutcome(result, restarts, StopReason.GaveUp, stormPauses)))
                             elif budgetExhausted () then
                                 final <-
                                     Some(
@@ -450,7 +498,13 @@ type Supervisor internal (config: SupervisorConfig) =
                                 | RestartPolicy.Never -> false
                                 | _ -> ProcessError.isTransient error
 
-                            if not wantsRestart || budgetExhausted () then
+                            // A permanent-failure verdict on a run that never produced a result has no
+                            // `ProcessResult` to report through `SupervisionOutcome`, so it surfaces the
+                            // classified error directly — same as an exhausted budget or an already-terminal
+                            // error on this path. Only consulted once a restart would otherwise be attempted
+                            // (`wantsRestart`), so a classifier is never invoked for a policy/error class
+                            // that already stops for its own, more specific reason.
+                            if not wantsRestart || giveUpMatches error || budgetExhausted () then
                                 final <- Some(Error error)
                             else
                                 // A transient error produced no healthy incarnation, so the escalation only
