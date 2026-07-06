@@ -43,6 +43,7 @@
 		<Compile Include="Stdin.fs" />
 		<Compile Include="Timeouts.fs" />
 		<Compile Include="Priority.fs" />
+		<Compile Include="LineTerminator.fs" />
 		<Compile Include="Command.fs" />
 		<Compile Include="Native.Common.fs" />
 		<Compile Include="Native.Windows.fs" />

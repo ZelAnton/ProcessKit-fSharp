@@ -918,3 +918,70 @@ type StreamingTests() =
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
+
+    // --- Command.LineTerminator (carriage-return framing across the line-pumped path) ---
+
+    [<Test>]
+    member _.``LineTerminator Cr streams carriage-return progress as per-frame lines``() : Task =
+        task {
+            // A `\r`-redrawn progress stream (no `\n`) must arrive as separate frames on the streaming
+            // path under `Cr`, not pile up into one line as it would under the default `Lf`.
+            let config =
+                (Command.create "test" |> Command.stdoutLineTerminator LineTerminator.Cr).Config
+
+            use running = syntheticStdoutProcess config "10%\r55%\r100%"
+            let! lines = collect (running.StdoutLinesAsync())
+            CollectionAssert.AreEqual([ "10%"; "55%"; "100%" ], lines)
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``LineTerminator Cr splits carriage-return progress in the buffered OutputString capture``() : Task =
+        task {
+            // The buffered verb frames lines by the same rule, joining them with '\n'.
+            let config =
+                (Command.create "test" |> Command.stdoutLineTerminator LineTerminator.Cr).Config
+
+            use running = syntheticStdoutProcess config "10%\r55%\r100%"
+
+            match! running.OutputStringAsync() with
+            | Ok result -> Assert.That(result.Stdout, Is.EqualTo "10%\n55%\n100%")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``LineTerminator leaves OutputBytes and the tee byte-exact``() : Task =
+        task {
+            // The raw byte path and the tee are independent of the line terminator: both must reproduce
+            // the child's stdout exactly, embedded '\r' and all, even under `Cr` framing.
+            use tee = new MemoryStream()
+
+            let config =
+                (Command.create "test"
+                 |> Command.stdoutLineTerminator LineTerminator.Cr
+                 |> Command.stdoutTee tee)
+                    .Config
+
+            use running = syntheticStdoutProcess config "A\rB\rC"
+
+            match! running.OutputBytesAsync() with
+            | Ok result ->
+                Assert.That(
+                    Encoding.UTF8.GetString result.Stdout,
+                    Is.EqualTo "A\rB\rC",
+                    "raw bytes must stay byte-exact"
+                )
+
+                Assert.That(
+                    Encoding.UTF8.GetString(tee.ToArray()),
+                    Is.EqualTo "A\rB\rC",
+                    "the tee must stay byte-exact"
+                )
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task

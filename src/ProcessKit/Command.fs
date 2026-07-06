@@ -29,6 +29,11 @@ type internal CommandConfig =
       StderrMode: StdioMode
       StdoutEncoding: Encoding
       StderrEncoding: Encoding
+      // How the line-pumped path frames a captured/streamed line, per stream. The default
+      // (`LineTerminator.Lf`) reproduces ProcessKit's original `\n`-splitting behaviour; the raw
+      // byte path (`OutputBytesAsync`) and the tees are unaffected.
+      StdoutLineTerminator: LineTerminator
+      StderrLineTerminator: LineTerminator
       OnStdoutLine: Action<string> option
       OnStderrLine: Action<string> option
       StdoutTee: Stream option
@@ -67,6 +72,8 @@ module internal CommandConfig =
           StderrMode = StdioMode.Piped
           StdoutEncoding = Encoding.UTF8
           StderrEncoding = Encoding.UTF8
+          StdoutLineTerminator = LineTerminator.Lf
+          StderrLineTerminator = LineTerminator.Lf
           OnStdoutLine = None
           OnStderrLine = None
           StdoutTee = None
@@ -220,6 +227,33 @@ type Command internal (config: CommandConfig) =
             { config with
                 StdoutEncoding = encoding
                 StderrEncoding = encoding }
+        )
+
+    /// Frame captured/streamed **stdout** lines with `terminator` (default `LineTerminator.Lf` — split
+    /// on `\n`). Pass `LineTerminator.Cr`/`Any` to split carriage-return progress output on a bare
+    /// `\r`. Affects only the line-pumped path (streaming, per-line handlers, `OutputStringAsync`); the
+    /// raw `OutputBytesAsync` bytes and the tees stay byte-exact.
+    member _.StdoutLineTerminator(terminator: LineTerminator) =
+        Command(
+            { config with
+                StdoutLineTerminator = terminator }
+        )
+
+    /// Frame captured/streamed **stderr** lines with `terminator` (default `LineTerminator.Lf`). See
+    /// `StdoutLineTerminator`; the stdout framing is left untouched.
+    member _.StderrLineTerminator(terminator: LineTerminator) =
+        Command(
+            { config with
+                StderrLineTerminator = terminator }
+        )
+
+    /// Frame **both** captured/streamed streams' lines with `terminator`. See `StdoutLineTerminator`
+    /// for what the line framing governs (and what it leaves byte-exact).
+    member _.LineTerminator(terminator: LineTerminator) =
+        Command(
+            { config with
+                StdoutLineTerminator = terminator
+                StderrLineTerminator = terminator }
         )
 
     /// Invoke `handler` for each captured stdout line, as it is pumped.
@@ -399,6 +433,15 @@ module Command =
 
     /// Decode both captured streams with `encoding`.
     let encoding (enc: Encoding) (command: Command) = command.Encoding enc
+
+    /// Frame captured/streamed stdout lines with `terminator` (default `LineTerminator.Lf`).
+    let stdoutLineTerminator (terminator: LineTerminator) (command: Command) = command.StdoutLineTerminator terminator
+
+    /// Frame captured/streamed stderr lines with `terminator` (default `LineTerminator.Lf`).
+    let stderrLineTerminator (terminator: LineTerminator) (command: Command) = command.StderrLineTerminator terminator
+
+    /// Frame both captured/streamed streams' lines with `terminator` (default `LineTerminator.Lf`).
+    let lineTerminator (terminator: LineTerminator) (command: Command) = command.LineTerminator terminator
 
     /// Invoke `handler` for each captured stdout line.
     let onStdoutLine (handler: string -> unit) (command: Command) =

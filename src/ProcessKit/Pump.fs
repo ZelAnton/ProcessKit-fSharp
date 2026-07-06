@@ -179,11 +179,15 @@ module internal Pump =
 
             result
 
-    /// Read `stream` to EOF: tee the raw bytes (if a sink is set), decode with `encoding`, split
-    /// into lines (stripping `\n` / `\r\n`), and pass each complete line — including a final
-    /// unterminated one — to `onLine`. When `maxLineLength` is set, an unterminated line that reaches
-    /// that many characters is force-flushed to `onLine` as a segment, so a newline-free flood can't
-    /// grow the in-flight buffer without bound (the segment then goes through the caller's buffer policy).
+    /// Read `stream` to EOF: tee the raw bytes (if a sink is set), decode with `encoding`, split into
+    /// lines under `terminator`, and pass each complete line — including a final unterminated one — to
+    /// `onLine`. `terminator` decides where a line ends: `Lf` (the default) splits on `\n` only,
+    /// stripping a preceding `\r`; `Cr`/`CrLf`/`Any` also (or instead) split on a bare `\r`, so
+    /// carriage-return progress output streams as per-frame lines (see `LineTerminator`). A `\r\n` pair
+    /// is a single terminator in every mode. When `maxLineLength` is set, an unterminated line that
+    /// reaches that many characters is force-flushed to `onLine` as a segment, so a newline-free flood
+    /// can't grow the in-flight buffer without bound (the segment then goes through the caller's buffer
+    /// policy).
     ///
     /// `onLine` returns a `ValueTask` (not `unit`) so a streaming consumer's sink can genuinely await —
     /// e.g. a bounded channel's backpressured `WriteAsync`, which must stop this very read loop from
@@ -192,6 +196,7 @@ module internal Pump =
     let readLines
         (stream: Stream)
         (encoding: Encoding)
+        (terminator: LineTerminator)
         (tee: Stream option)
         (onLine: string -> ValueTask)
         (maxLineLength: int option)
@@ -208,49 +213,122 @@ module internal Pump =
             // byte-exact — only decoded text drops the BOM.
             let mutable atStreamStart = true
 
-            while reading do
-                let! read = stream.ReadAsync(byteBuffer.AsMemory(0, byteBuffer.Length), cancellationToken)
-
-                if read = 0 then
-                    reading <- false
+            // Consume the leading BOM (at most once, across the whole stream) at index 0 of the first
+            // non-empty decode, returning the scan start position for the freshly decoded `chars`.
+            let consumeBom (chars: int) : int =
+                if atStreamStart && chars > 0 then
+                    atStreamStart <- false
+                    if charBuffer[0] = char 0xFEFF then 1 else 0
                 else
-                    match tee with
-                    | Some sink -> do! sink.WriteAsync(byteBuffer.AsMemory(0, read), cancellationToken)
-                    | None -> ()
+                    0
 
-                    let chars = decoder.GetChars(byteBuffer, 0, read, charBuffer, 0)
-                    let mutable pos = 0
+            match terminator with
+            | LineTerminator.Lf ->
+                // The default, hot path: split on '\n' only, stripping a preceding '\r'. Left exactly
+                // as ProcessKit has always pumped lines — a bare '\r' is content (accumulated whole).
+                while reading do
+                    let! read = stream.ReadAsync(byteBuffer.AsMemory(0, byteBuffer.Length), cancellationToken)
 
-                    // The leading BOM only ever occupies index 0 of the very first non-empty decode —
-                    // check and consume it (at most once, across the whole stream) before scanning.
-                    if atStreamStart && chars > 0 then
-                        if charBuffer[0] = char 0xFEFF then
-                            pos <- 1
+                    if read = 0 then
+                        reading <- false
+                    else
+                        match tee with
+                        | Some sink -> do! sink.WriteAsync(byteBuffer.AsMemory(0, read), cancellationToken)
+                        | None -> ()
 
-                        atStreamStart <- false
+                        let chars = decoder.GetChars(byteBuffer, 0, read, charBuffer, 0)
+                        let mutable pos = consumeBom chars
 
-                    // Scan the decoded chunk for '\n' via `IndexOf` instead of a per-character loop —
-                    // each run of non-newline characters between two `\n` (or to the end of the chunk)
-                    // is appended to `line` in one batched `StringBuilder.Append(char[], int, int)` call.
-                    while pos < chars do
-                        let newlineIndex = Array.IndexOf(charBuffer, '\n', pos, chars - pos)
-                        let runEnd = if newlineIndex >= 0 then newlineIndex else chars
+                        // Scan the decoded chunk for '\n' via `IndexOf` instead of a per-character loop —
+                        // each run of non-newline characters between two `\n` (or to the end of the chunk)
+                        // is appended to `line` in one batched `StringBuilder.Append(char[], int, int)` call.
+                        while pos < chars do
+                            let newlineIndex = Array.IndexOf(charBuffer, '\n', pos, chars - pos)
+                            let runEnd = if newlineIndex >= 0 then newlineIndex else chars
 
+                            match maxLineLength with
+                            | None ->
+                                if runEnd > pos then
+                                    line.Append(charBuffer, pos, runEnd - pos) |> ignore
+
+                                pos <- runEnd
+                            | Some cap ->
+                                // Replicate the per-character force-flush at the cap, but batched: append up
+                                // to `cap - line.Length` characters at once, then — if the run isn't fully
+                                // consumed yet — flush the now-full line, append exactly the one character
+                                // that tripped the cap (matching the original's unconditional post-check
+                                // append), and repeat for the remainder of the run.
+                                let mutable p = pos
+
+                                while p < runEnd do
+                                    if line.Length >= cap then
+                                        do! onLine (line.ToString())
+                                        line.Clear() |> ignore
+                                        line.Append charBuffer[p] |> ignore
+                                        p <- p + 1
+                                    else
+                                        let budget = cap - line.Length
+                                        let take = min budget (runEnd - p)
+                                        line.Append(charBuffer, p, take) |> ignore
+                                        p <- p + take
+
+                                pos <- p
+
+                            if newlineIndex >= 0 then
+                                if line.Length > 0 && line[line.Length - 1] = '\r' then
+                                    line.Length <- line.Length - 1
+
+                                do! onLine (line.ToString())
+                                line.Clear() |> ignore
+                                pos <- newlineIndex + 1
+
+                if line.Length > 0 then
+                    if line[line.Length - 1] = '\r' then
+                        line.Length <- line.Length - 1
+
+                    do! onLine (line.ToString())
+            | _ ->
+                // '\r'-aware framing (`Cr`/`CrLf`/`Any`). A '\r' is deferred (held in `pendingCr`) until
+                // the next character resolves it — a following '\n' makes it a single `\r\n` terminator;
+                // otherwise it is a lone '\r', which ends a line under `Cr`/`Any` or is content under
+                // `CrLf`. `pendingCr` carries across read boundaries, so a `\r\n` split between two reads
+                // still collapses to one terminator.
+                let lfSplits = LineTerminatorRules.splitsOnLf terminator
+                let crSplits = LineTerminatorRules.splitsOnCr terminator
+                let mutable pendingCr = false
+
+                // Emit `line` (a terminator was reached) and reset it for the next line.
+                let emitLine () =
+                    task {
+                        do! onLine (line.ToString())
+                        line.Clear() |> ignore
+                    }
+
+                // Append one content character, honouring the `maxLineLength` force-flush.
+                let appendChar (c: char) =
+                    task {
+                        match maxLineLength with
+                        | None -> line.Append c |> ignore
+                        | Some cap ->
+                            if line.Length >= cap then
+                                do! onLine (line.ToString())
+                                line.Clear() |> ignore
+
+                            line.Append c |> ignore
+                    }
+
+                // Append the content run `charBuffer[start .. stop-1]`, honouring the force-flush (the
+                // same batched logic as the `Lf` path above).
+                let appendRun (start: int) (stop: int) =
+                    task {
                         match maxLineLength with
                         | None ->
-                            if runEnd > pos then
-                                line.Append(charBuffer, pos, runEnd - pos) |> ignore
-
-                            pos <- runEnd
+                            if stop > start then
+                                line.Append(charBuffer, start, stop - start) |> ignore
                         | Some cap ->
-                            // Replicate the per-character force-flush at the cap, but batched: append up
-                            // to `cap - line.Length` characters at once, then — if the run isn't fully
-                            // consumed yet — flush the now-full line, append exactly the one character
-                            // that tripped the cap (matching the original's unconditional post-check
-                            // append), and repeat for the remainder of the run.
-                            let mutable p = pos
+                            let mutable p = start
 
-                            while p < runEnd do
+                            while p < stop do
                                 if line.Length >= cap then
                                     do! onLine (line.ToString())
                                     line.Clear() |> ignore
@@ -258,25 +336,81 @@ module internal Pump =
                                     p <- p + 1
                                 else
                                     let budget = cap - line.Length
-                                    let take = min budget (runEnd - p)
+                                    let take = min budget (stop - p)
                                     line.Append(charBuffer, p, take) |> ignore
                                     p <- p + take
+                    }
 
-                            pos <- p
+                while reading do
+                    let! read = stream.ReadAsync(byteBuffer.AsMemory(0, byteBuffer.Length), cancellationToken)
 
-                        if newlineIndex >= 0 then
-                            if line.Length > 0 && line[line.Length - 1] = '\r' then
-                                line.Length <- line.Length - 1
+                    if read = 0 then
+                        reading <- false
+                    else
+                        match tee with
+                        | Some sink -> do! sink.WriteAsync(byteBuffer.AsMemory(0, read), cancellationToken)
+                        | None -> ()
 
-                            do! onLine (line.ToString())
-                            line.Clear() |> ignore
-                            pos <- newlineIndex + 1
+                        let chars = decoder.GetChars(byteBuffer, 0, read, charBuffer, 0)
+                        let mutable pos = consumeBom chars
 
-            if line.Length > 0 then
-                if line[line.Length - 1] = '\r' then
-                    line.Length <- line.Length - 1
+                        while pos < chars do
+                            if pendingCr then
+                                // Resolve the deferred '\r' against the next character.
+                                if charBuffer[pos] = '\n' then
+                                    // '\r\n' — a single terminator; emit the content before the '\r' and
+                                    // consume the '\n'.
+                                    do! emitLine ()
+                                    pos <- pos + 1
+                                elif crSplits then
+                                    // Lone '\r' that ends a line — emit; the current char starts the next
+                                    // line, so it is left for the scan below (pos not advanced).
+                                    do! emitLine ()
+                                else
+                                    // Lone '\r' that is content under `CrLf` — keep it, then re-scan the
+                                    // current char (pos not advanced).
+                                    do! appendChar '\r'
 
-                do! onLine (line.ToString())
+                                pendingCr <- false
+                            else
+                                // Batch the run of content up to the next '\r' or '\n'.
+                                let crIndex = Array.IndexOf(charBuffer, '\r', pos, chars - pos)
+                                let lfIndex = Array.IndexOf(charBuffer, '\n', pos, chars - pos)
+
+                                let sigIndex =
+                                    match crIndex, lfIndex with
+                                    | -1, -1 -> -1
+                                    | -1, n -> n
+                                    | r, -1 -> r
+                                    | r, n -> min r n
+
+                                let runEnd = if sigIndex >= 0 then sigIndex else chars
+                                do! appendRun pos runEnd
+
+                                if sigIndex < 0 then
+                                    pos <- chars
+                                elif charBuffer[sigIndex] = '\n' then
+                                    // A lone '\n' (no pending '\r'): a terminator under `Lf`/`Any`,
+                                    // content under `Cr`/`CrLf`.
+                                    if lfSplits then do! emitLine () else do! appendChar '\n'
+                                    pos <- sigIndex + 1
+                                else
+                                    // A '\r' — defer the decision until the next character (or EOF).
+                                    pendingCr <- true
+                                    pos <- sigIndex + 1
+
+                // EOF: resolve any deferred trailing '\r', then flush a final unterminated line.
+                if pendingCr then
+                    if crSplits then
+                        // Trailing bare '\r' ended the last frame — emit its content (even if empty,
+                        // mirroring how a trailing '\n' emits under `Lf`).
+                        do! emitLine ()
+                    else
+                        // Content under `CrLf` — keep the trailing '\r' on the final line.
+                        do! appendChar '\r'
+
+                if line.Length > 0 then
+                    do! onLine (line.ToString())
         }
         :> Task
 
@@ -286,6 +420,7 @@ module internal Pump =
     let readLinesUntilDone
         (stream: Stream)
         (encoding: Encoding)
+        (terminator: LineTerminator)
         (tee: Stream option)
         (onLine: string -> ValueTask)
         (maxLineLength: int option)
@@ -293,7 +428,7 @@ module internal Pump =
         : Task =
         task {
             try
-                do! readLines stream encoding tee onLine maxLineLength cancellationToken
+                do! readLines stream encoding terminator tee onLine maxLineLength cancellationToken
             with
             | :? ObjectDisposedException ->
                 // The stream was torn down (early dispose) while reading. Stop quietly.

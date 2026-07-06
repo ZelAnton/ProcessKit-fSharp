@@ -18,13 +18,14 @@ type PumpTests() =
     // U+FEFF, constructed (not a source literal) so the test file itself carries no BOM.
     static let bom = string (char 0xFEFF)
 
-    let collect (bytes: byte[]) (encoding: Encoding) : string list =
+    let collectWith (terminator: LineTerminator) (bytes: byte[]) (encoding: Encoding) : string list =
         use stream = new MemoryStream(bytes)
         let lines = ResizeArray<string>()
 
         (Pump.readLines
             stream
             encoding
+            terminator
             None
             (fun l ->
                 lines.Add l
@@ -34,6 +35,11 @@ type PumpTests() =
             .Wait()
 
         List.ofSeq lines
+
+    // The default (`Lf`) framing — split on `\n`, stripping a preceding `\r` — used by the existing
+    // decoding/BOM tests below (which predate the configurable terminator).
+    let collect (bytes: byte[]) (encoding: Encoding) : string list =
+        collectWith LineTerminator.Lf bytes encoding
 
     // Feed a payload to a RawBuffer in a fixed chunk size so the ring/head logic is exercised across
     // chunk seams (a single 8192-byte read never straddles the accumulator's chunk boundaries otherwise).
@@ -86,6 +92,85 @@ type PumpTests() =
         // same as the mid-stream CRLF case.
         CollectionAssert.AreEqual([ "hello" ], collect (Encoding.UTF8.GetBytes "hello\r") Encoding.UTF8)
 
+    // --- LineTerminator: '\r'-aware framing (Cr / CrLf / Any) ---
+
+    [<Test>]
+    member _.``Lf mode keeps a bare CR as content (carriage-return progress accumulates)``() =
+        // The default: a '\r' not before '\n' is content, so a redraw-in-place progress line stays one
+        // ever-growing line until the final '\n'.
+        let bytes = Encoding.UTF8.GetBytes "50%\r100%\n"
+        CollectionAssert.AreEqual([ "50%\r100%" ], collectWith LineTerminator.Lf bytes Encoding.UTF8)
+
+    [<Test>]
+    member _.``Cr mode splits carriage-return progress into per-frame lines``() =
+        // Each '\r' frame becomes its own line; the last, unterminated frame is the final line.
+        let bytes = Encoding.UTF8.GetBytes "10%\r55%\r100%"
+        CollectionAssert.AreEqual([ "10%"; "55%"; "100%" ], collectWith LineTerminator.Cr bytes Encoding.UTF8)
+
+    [<Test>]
+    member _.``Cr mode treats a lone LF as content and CRLF as one terminator``() =
+        // '\n' alone is content under Cr; a '\r\n' pair is a single terminator (no spurious empty line).
+        let bytes = Encoding.UTF8.GetBytes "a\nb\r\nc"
+        CollectionAssert.AreEqual([ "a\nb"; "c" ], collectWith LineTerminator.Cr bytes Encoding.UTF8)
+
+    [<Test>]
+    member _.``Cr mode emits the frame before a trailing bare CR``() =
+        let bytes = Encoding.UTF8.GetBytes "done\r"
+        CollectionAssert.AreEqual([ "done" ], collectWith LineTerminator.Cr bytes Encoding.UTF8)
+
+    [<Test>]
+    member _.``Any mode splits on LF, CR, and CRLF alike``() =
+        // A lone '\n', a lone '\r', and a '\r\n' pair are each a single terminator.
+        let bytes = Encoding.UTF8.GetBytes "a\rb\nc\r\nd"
+        CollectionAssert.AreEqual([ "a"; "b"; "c"; "d" ], collectWith LineTerminator.Any bytes Encoding.UTF8)
+
+    [<Test>]
+    member _.``CrLf mode splits only on CRLF, keeping lone CR and lone LF as content``() =
+        let bytes = Encoding.UTF8.GetBytes "a\rb\nc\r\nd"
+        CollectionAssert.AreEqual([ "a\rb\nc"; "d" ], collectWith LineTerminator.CrLf bytes Encoding.UTF8)
+
+    [<Test>]
+    member _.``Any mode collapses a CRLF split across the 8192-byte read boundary``() =
+        // The '\r' is the last byte of the first read; the '\n' is the first byte of the next. The
+        // deferred-CR carry must survive across reads so the pair stays a single terminator (no empty
+        // line between the two frames), exactly as the default Lf path handles it.
+        let prefix = String('a', 8191)
+        let bytes = Encoding.UTF8.GetBytes(prefix + "\r\nworld")
+        CollectionAssert.AreEqual([ prefix; "world" ], collectWith LineTerminator.Any bytes Encoding.UTF8)
+
+    [<Test>]
+    member _.``Cr mode force-flushes an over-long frame at the byte cap``() =
+        // The '\r'-aware path honours `maxLineLength` too: a newline-free (here, CR-free) frame is
+        // flushed in <=cap segments, so a runaway frame can't outgrow the in-flight buffer.
+        use stream = new MemoryStream(Encoding.UTF8.GetBytes "aaabbbc\rtail")
+        let segments = ResizeArray<string>()
+
+        (Pump.readLines
+            stream
+            Encoding.UTF8
+            LineTerminator.Cr
+            None
+            (fun l ->
+                segments.Add l
+                ValueTask.CompletedTask)
+            (Some 3)
+            CancellationToken.None)
+            .Wait()
+
+        CollectionAssert.AreEqual([ "aaa"; "bbb"; "c"; "tai"; "l" ], segments)
+
+    [<Test>]
+    member _.``LineTerminatorRules map each mode to its lone-LF / lone-CR split rules``() =
+        // Lf splits lone '\n'; Cr splits lone '\r'; Any splits both; CrLf splits neither ('\r\n' only).
+        Assert.That(LineTerminatorRules.splitsOnLf LineTerminator.Lf, Is.True)
+        Assert.That(LineTerminatorRules.splitsOnCr LineTerminator.Lf, Is.False)
+        Assert.That(LineTerminatorRules.splitsOnLf LineTerminator.Cr, Is.False)
+        Assert.That(LineTerminatorRules.splitsOnCr LineTerminator.Cr, Is.True)
+        Assert.That(LineTerminatorRules.splitsOnLf LineTerminator.CrLf, Is.False)
+        Assert.That(LineTerminatorRules.splitsOnCr LineTerminator.CrLf, Is.False)
+        Assert.That(LineTerminatorRules.splitsOnLf LineTerminator.Any, Is.True)
+        Assert.That(LineTerminatorRules.splitsOnCr LineTerminator.Any, Is.True)
+
     [<Test>]
     member _.``LineBuffer DropOldest keeps the most recent lines``() =
         let buf = Pump.LineBuffer(OutputBufferPolicy.Bounded 2)
@@ -120,6 +205,7 @@ type PumpTests() =
         (Pump.readLines
             stream
             Encoding.UTF8
+            LineTerminator.Lf
             None
             (fun l ->
                 segments.Add l
@@ -144,6 +230,7 @@ type PumpTests() =
         (Pump.readLines
             stream
             Encoding.UTF8
+            LineTerminator.Lf
             None
             (fun l ->
                 segments.Add l
@@ -170,6 +257,7 @@ type PumpTests() =
         (Pump.readLines
             stream
             Encoding.UTF8
+            LineTerminator.Lf
             None
             (fun l ->
                 buf.Add l

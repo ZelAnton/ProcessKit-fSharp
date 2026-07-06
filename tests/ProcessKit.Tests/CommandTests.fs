@@ -153,3 +153,59 @@ type CommandTests() =
         Assert.That(PriorityMapping.windowsCreationFlag Priority.Normal, Is.EqualTo 0x00000020u)
         Assert.That(PriorityMapping.windowsCreationFlag Priority.AboveNormal, Is.EqualTo 0x00008000u)
         Assert.That(PriorityMapping.windowsCreationFlag Priority.High, Is.EqualTo 0x00000080u)
+
+    // ---- LineTerminator -----------------------------------------------------------------------
+
+    [<Test>]
+    member _.``LineTerminator defaults to Lf on both streams``() =
+        let config = Command.create("git").Config
+        Assert.That(config.StdoutLineTerminator, Is.EqualTo LineTerminator.Lf)
+        Assert.That(config.StderrLineTerminator, Is.EqualTo LineTerminator.Lf)
+
+    [<Test>]
+    member _.``LineTerminator sets both streams and the instance method matches the module function``() =
+        let viaModule = Command.create "git" |> Command.lineTerminator LineTerminator.Any
+        let viaInstance = Command("git").LineTerminator(LineTerminator.Any)
+
+        for c in [ viaModule; viaInstance ] do
+            Assert.That(c.Config.StdoutLineTerminator, Is.EqualTo LineTerminator.Any)
+            Assert.That(c.Config.StderrLineTerminator, Is.EqualTo LineTerminator.Any)
+
+    [<Test>]
+    member _.``StdoutLineTerminator targets stdout only, leaving stderr at the default``() =
+        let viaModule =
+            Command.create "git" |> Command.stdoutLineTerminator LineTerminator.Cr
+
+        let viaInstance = Command("git").StdoutLineTerminator(LineTerminator.Cr)
+
+        for c in [ viaModule; viaInstance ] do
+            Assert.That(c.Config.StdoutLineTerminator, Is.EqualTo LineTerminator.Cr)
+
+            Assert.That(
+                c.Config.StderrLineTerminator,
+                Is.EqualTo LineTerminator.Lf,
+                "stdout setter must not touch stderr"
+            )
+
+    [<Test>]
+    member _.``StderrLineTerminator targets stderr only, leaving stdout at the default``() =
+        let viaModule =
+            Command.create "git" |> Command.stderrLineTerminator LineTerminator.CrLf
+
+        let viaInstance = Command("git").StderrLineTerminator(LineTerminator.CrLf)
+
+        for c in [ viaModule; viaInstance ] do
+            Assert.That(c.Config.StderrLineTerminator, Is.EqualTo LineTerminator.CrLf)
+
+            Assert.That(
+                c.Config.StdoutLineTerminator,
+                Is.EqualTo LineTerminator.Lf,
+                "stderr setter must not touch stdout"
+            )
+
+    [<Test>]
+    member _.``LineTerminator is immutable - setting it returns a new command``() =
+        let baseCommand = Command.create "git"
+        let withTerminator = baseCommand |> Command.lineTerminator LineTerminator.Cr
+        Assert.That(baseCommand.Config.StdoutLineTerminator, Is.EqualTo LineTerminator.Lf)
+        Assert.That(withTerminator.Config.StdoutLineTerminator, Is.EqualTo LineTerminator.Cr)

@@ -312,7 +312,7 @@ type RunningProcess internal (host: RunningHost) =
         | Some cb -> cb.Invoke line
         | None -> ()
 
-    let pumpToBuffer (stream: Stream) encoding tee (callback: Action<string> option) counter =
+    let pumpToBuffer (stream: Stream) encoding terminator tee (callback: Action<string> option) counter =
         task {
             let buffer = Pump.LineBuffer(config.OutputBuffer)
 
@@ -324,29 +324,43 @@ type RunningProcess internal (host: RunningHost) =
 
             // Pass the buffer's byte cap as the in-flight line ceiling too, so a newline-free flood
             // can't grow the assembly buffer past it (the forced segments go through `buffer`'s policy).
-            do! Pump.readLines stream encoding tee onLine config.OutputBuffer.MaxBytes CancellationToken.None
+            do! Pump.readLines stream encoding terminator tee onLine config.OutputBuffer.MaxBytes CancellationToken.None
             return buffer
         }
 
     let pumpStdoutBuffer () =
         match host.Stdout with
-        | Some s -> pumpToBuffer s config.StdoutEncoding config.StdoutTee config.OnStdoutLine bumpStdoutLine
+        | Some s ->
+            pumpToBuffer
+                s
+                config.StdoutEncoding
+                config.StdoutLineTerminator
+                config.StdoutTee
+                config.OnStdoutLine
+                bumpStdoutLine
         | None -> Task.FromResult(Pump.LineBuffer config.OutputBuffer)
 
     let pumpStderrBuffer () =
         match host.Stderr with
-        | Some s -> pumpToBuffer s config.StderrEncoding config.StderrTee config.OnStderrLine bumpStderrLine
+        | Some s ->
+            pumpToBuffer
+                s
+                config.StderrEncoding
+                config.StderrLineTerminator
+                config.StderrTee
+                config.OnStderrLine
+                bumpStderrLine
         | None -> Task.FromResult(Pump.LineBuffer config.OutputBuffer)
 
     // Pump one stream's lines through `onLine` until the stream ends — the streaming-verb analogue
     // of `pumpToBuffer` (which captures to a `LineBuffer` instead). No-op when the stream isn't
     // piped. The caller owns the sink (a channel writer, a buffer) and any completion signal.
-    let pumpLines (stream: Stream option) encoding tee (onLine: string -> ValueTask) =
+    let pumpLines (stream: Stream option) encoding terminator tee (onLine: string -> ValueTask) =
         task {
             match stream with
             // No in-flight line cap for streaming: it is consumer-paced and applies no buffer policy, so
             // a consumer receives whole lines (the in-flight cap is a buffered-verb concern).
-            | Some s -> do! Pump.readLinesUntilDone s encoding tee onLine None CancellationToken.None
+            | Some s -> do! Pump.readLinesUntilDone s encoding terminator tee onLine None CancellationToken.None
             | None -> ()
         }
 
@@ -692,16 +706,21 @@ type RunningProcess internal (host: RunningHost) =
                 task {
                     try
                         do!
-                            pumpLines host.Stdout config.StdoutEncoding config.StdoutTee (fun line ->
-                                invokeLine config.OnStdoutLine line
-                                bumpStdoutLine ()
+                            pumpLines
+                                host.Stdout
+                                config.StdoutEncoding
+                                config.StdoutLineTerminator
+                                config.StdoutTee
+                                (fun line ->
+                                    invokeLine config.OnStdoutLine line
+                                    bumpStdoutLine ()
 
-                                writeStreamItem
-                                    stdoutChannel.Writer
-                                    stdoutChannel.Reader
-                                    readStdoutLineCount
-                                    bumpDroppedStreamLine
-                                    line)
+                                    writeStreamItem
+                                        stdoutChannel.Writer
+                                        stdoutChannel.Reader
+                                        readStdoutLineCount
+                                        bumpDroppedStreamLine
+                                        line)
 
                         stdoutChannel.Writer.Complete()
                     with ex ->
@@ -715,7 +734,7 @@ type RunningProcess internal (host: RunningHost) =
                 }
 
             let stderrPump =
-                pumpLines host.Stderr config.StderrEncoding config.StderrTee (fun line ->
+                pumpLines host.Stderr config.StderrEncoding config.StderrLineTerminator config.StderrTee (fun line ->
                     invokeLine config.OnStderrLine line
                     bumpStderrLine ()
                     stderrBuffer.Add line
@@ -779,6 +798,7 @@ type RunningProcess internal (host: RunningHost) =
             let eventPump
                 (stream: Stream option)
                 encoding
+                terminator
                 tee
                 (onLine: Action<string> option)
                 (bump: unit -> unit)
@@ -788,7 +808,7 @@ type RunningProcess internal (host: RunningHost) =
                 task {
                     try
                         do!
-                            pumpLines stream encoding tee (fun line ->
+                            pumpLines stream encoding terminator tee (fun line ->
                                 invokeLine onLine line
                                 bump ()
 
@@ -807,6 +827,7 @@ type RunningProcess internal (host: RunningHost) =
                 eventPump
                     host.Stdout
                     config.StdoutEncoding
+                    config.StdoutLineTerminator
                     config.StdoutTee
                     config.OnStdoutLine
                     bumpStdoutLine
@@ -817,6 +838,7 @@ type RunningProcess internal (host: RunningHost) =
                 eventPump
                     host.Stderr
                     config.StderrEncoding
+                    config.StderrLineTerminator
                     config.StderrTee
                     config.OnStderrLine
                     bumpStderrLine
