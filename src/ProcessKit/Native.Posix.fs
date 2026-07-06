@@ -112,6 +112,15 @@ module internal Posix =
     [<DllImport("libc", SetLastError = true)>]
     extern int kill(int pid, int signalNumber)
 
+    // setpriority(PRIO_PROCESS, pid, nice) sets a process's absolute nice value (its CPU-scheduling
+    // priority). `posix_spawn` has no attribute for nice, so `Command.Priority` applies it to the
+    // spawned leader from the parent right after the spawn returns (see `spawnPosix`).
+    [<Literal>]
+    let private PRIO_PROCESS = 0
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private setpriority(int which, int who, int prio)
+
     /// Marshal a list of strings into a NULL-terminated `char* []`. Returns the array pointer
     /// and the individual string allocations to free afterwards.
     let private marshalCStringArray (items: string list) : nativeint * nativeint list =
@@ -545,17 +554,51 @@ module internal Posix =
                     else
                         Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
                 else
-                    let readStream fd =
-                        new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Read) :> Stream
+                    // Apply the requested CPU priority to the freshly spawned leader (pgid = its pid).
+                    // `posix_spawn` has no nice attribute, so this is a post-spawn `setpriority` from the
+                    // parent; the nice inherits across `fork`, so every descendant the leader spawns runs
+                    // at it (whole-tree, modulo the sub-millisecond window before this call lands — see
+                    // `Priority`). Lowering nice (raising priority) can be refused for lack of privilege:
+                    // rather than silently running the child at a lower-than-requested priority, kill and
+                    // reap it and fail the spawn honestly — matching the contract that priority is never
+                    // downgraded silently.
+                    let priorityApplied =
+                        match config.Priority with
+                        | None -> Ok()
+                        | Some priority ->
+                            if setpriority (PRIO_PROCESS, pid, PriorityMapping.niceValue priority) = 0 then
+                                Ok()
+                            else
+                                let errno = Marshal.GetLastWin32Error()
 
-                    let writeStream fd =
-                        new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Write) :> Stream
+                                Error(
+                                    ProcessError.Spawn(
+                                        command.Program,
+                                        $"could not set process priority via setpriority (errno {errno}); raising priority may require privilege (CAP_SYS_NICE)"
+                                    )
+                                )
 
-                    Ok
-                        { Handle = nativeint pid
-                          Stdout = stdoutParentRead |> Option.map readStream
-                          Stderr = stderrParentRead |> Option.map readStream
-                          Stdin = stdinParentWrite |> Option.map writeStream }
+                    match priorityApplied with
+                    | Error error ->
+                        // The child is already running but must not run at an unintended priority: killpg
+                        // its group (it is its own leader) and reap the leader, then drop the parent pipe
+                        // ends before reporting the failure — the same kill+reap+cleanup a failed spawn does.
+                        killProcessGroup pid
+                        reapLeader pid
+                        closeParentEnds ()
+                        Error error
+                    | Ok() ->
+                        let readStream fd =
+                            new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Read) :> Stream
+
+                        let writeStream fd =
+                            new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Write) :> Stream
+
+                        Ok
+                            { Handle = nativeint pid
+                              Stdout = stdoutParentRead |> Option.map readStream
+                              Stderr = stderrParentRead |> Option.map readStream
+                              Stdin = stdinParentWrite |> Option.map writeStream }
             finally
                 posix_spawn_file_actions_destroy fileActions |> ignore
                 posix_spawnattr_destroy attributes |> ignore

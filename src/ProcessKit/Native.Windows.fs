@@ -763,6 +763,17 @@ module internal Windows =
                      else
                          CREATE_UNICODE_ENVIRONMENT)
                 ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
+                // The requested CPU priority becomes a priority-class creation flag on the direct child,
+                // set atomically at creation (unlike the POSIX post-spawn nudge), so no window. It is
+                // honored on the immediate child for every level, but Windows only *inherits* a class to
+                // grandchildren when it is lowered: Idle/BelowNormal (and Normal) reach the whole tree,
+                // while a grandchild spawned with no flag defaults to NORMAL unless its creator is
+                // idle/below-normal — so grandchildren of an AboveNormal/High child run at Normal. This is
+                // the honest divergence documented on `Priority`; a job-wide class is not used here because
+                // the Job Object is a per-group container shared across commands, not per-command.
+                ||| (match config.Priority with
+                     | Some priority -> PriorityMapping.windowsCreationFlag priority
+                     | None -> 0u)
 
             let created =
                 CreateProcessW(

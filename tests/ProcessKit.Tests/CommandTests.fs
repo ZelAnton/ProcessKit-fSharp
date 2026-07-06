@@ -115,3 +115,41 @@ type CommandTests() =
         )
 
         Assert.That(seen, Is.EqualTo "err:cancelled")
+
+    // ---- Priority -----------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``Priority is unset by default``() =
+        Assert.That(Command.create("git").Config.Priority, Is.EqualTo(None: Priority option))
+
+    [<Test>]
+    member _.``Priority records the level and the instance method matches the module function``() =
+        let viaModule = Command.create "git" |> Command.priority Priority.BelowNormal
+        let viaInstance = Command("git").Priority(Priority.BelowNormal)
+        Assert.That(viaModule.Config.Priority, Is.EqualTo(Some Priority.BelowNormal))
+        Assert.That(viaInstance.Config.Priority, Is.EqualTo(Some Priority.BelowNormal))
+
+    [<Test>]
+    member _.``Priority is immutable - setting it returns a new command``() =
+        let baseCommand = Command.create "git"
+        let withPriority = baseCommand |> Command.priority Priority.Idle
+        Assert.That(baseCommand.Config.Priority, Is.EqualTo(None: Priority option))
+        Assert.That(withPriority.Config.Priority, Is.EqualTo(Some Priority.Idle))
+
+    [<Test>]
+    member _.``Priority maps every variant to its Unix nice value``() =
+        // Lower nice is higher priority; setpriority sets the absolute nice. Mirrors the Rust table.
+        Assert.That(PriorityMapping.niceValue Priority.Idle, Is.EqualTo 19)
+        Assert.That(PriorityMapping.niceValue Priority.BelowNormal, Is.EqualTo 10)
+        Assert.That(PriorityMapping.niceValue Priority.Normal, Is.EqualTo 0)
+        Assert.That(PriorityMapping.niceValue Priority.AboveNormal, Is.EqualTo -5)
+        Assert.That(PriorityMapping.niceValue Priority.High, Is.EqualTo -10)
+
+    [<Test>]
+    member _.``Priority maps every variant to its Windows priority-class creation flag``() =
+        // winbase.h values, OR'd into the CreateProcess creation flags.
+        Assert.That(PriorityMapping.windowsCreationFlag Priority.Idle, Is.EqualTo 0x00000040u)
+        Assert.That(PriorityMapping.windowsCreationFlag Priority.BelowNormal, Is.EqualTo 0x00004000u)
+        Assert.That(PriorityMapping.windowsCreationFlag Priority.Normal, Is.EqualTo 0x00000020u)
+        Assert.That(PriorityMapping.windowsCreationFlag Priority.AboveNormal, Is.EqualTo 0x00008000u)
+        Assert.That(PriorityMapping.windowsCreationFlag Priority.High, Is.EqualTo 0x00000080u)

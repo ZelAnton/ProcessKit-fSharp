@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `Supervisor.GiveUpWhen(classifier)` and `StopReason.GaveUp`: classify a crash's or a runner failure's `ProcessError` as *permanent*, so the supervisor gives up instead of restarting it forever.
+- `ProcessKit.Testing.DryRunRunner` — a subprocess-free `IProcessRunner` for a `--dry-run` seam: every verb renders the command deterministically (program, arguments, working directory) instead of spawning it, and `History` exposes every command "run" so far for inspection.
+- `Command.Priority` / `Command.priority` and the portable `Priority` type (`Idle`/`BelowNormal`/`Normal`/`AboveNormal`/`High`) to launch a child at a lower or higher CPU-scheduling priority: a Windows priority class set at process creation, or a Unix `nice`/`setpriority` value. The child's whole spawned tree runs at it on Unix (inherited across `fork`) and on Windows for the lowered classes (`Idle`/`BelowNormal`); on Windows `AboveNormal`/`High` apply to the immediate child but are not inherited by the grandchildren it later spawns, which default to `Normal`. Supported on both platform families (never `Unsupported`); the default is unchanged (normal priority). Raising priority above the inherited level on Unix (`AboveNormal`/`High`) needs privilege (e.g. `CAP_SYS_NICE`) — without it the spawn fails with `ProcessError.Spawn` rather than silently running lower.
 
 ### Changed
 -
