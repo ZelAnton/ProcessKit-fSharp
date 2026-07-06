@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [2.1.0] - 2026-07-06
+
+### Added
 - `Command.LineTerminator` / `StdoutLineTerminator` / `StderrLineTerminator` (and their `Command` module pipe-equivalents) plus the `LineTerminator` type (`Lf`/`Cr`/`CrLf`/`Any`) to choose how the line-pumped path frames a line. The default `Lf` is unchanged (split on `\n`, stripping a preceding `\r`); `Cr`/`Any` also split on a bare `\r`, so carriage-return progress output (`curl`/`pip`/`apt` redrawing a line in place) streams as per-frame lines instead of piling up as one growing line. The choice applies uniformly to the buffered verbs, the streaming verbs (`StdoutLinesAsync`/`OutputEventsAsync`/`WaitForLineAsync`), and the `OnStdoutLine`/`OnStderrLine` callbacks; the raw `OutputBytesAsync` bytes and the tees stay byte-exact and unaffected.
 - `Supervisor.GiveUpWhen(classifier)` and `StopReason.GaveUp`: classify a crash's or a runner failure's `ProcessError` as *permanent*, so the supervisor gives up instead of restarting it forever.
 - `ProcessKit.Testing.DryRunRunner` — a subprocess-free `IProcessRunner` for a `--dry-run` seam: every verb renders the command deterministically (program, arguments, working directory) instead of spawning it, and `History` exposes every command "run" so far for inspection.
@@ -127,5 +138,6 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - POSIX: the SIGCHLD dispatch callback no longer blocks on a `Thread.Sleep` spin while resolving a reap race against a concurrent `reapLeader` (group teardown) — the same bounded grace period now runs on the thread pool instead of the shared signal-dispatch thread, so it can no longer delay reaping every other pending child. A race that genuinely can't be resolved within the grace period now reports `Outcome.Unobserved` rather than a fabricated clean exit; the far more common case — the concurrent reap actually landing the real status — is unaffected.
 - Linux cgroup v2: a child that cannot be migrated into the cgroup (the write to `cgroup.procs` fails) is now killed and reaped, and the spawn fails with `ProcessError.ResourceLimit`, instead of being silently left to run in the parent cgroup entirely outside the requested resource limits. The `Mechanism.CgroupV2` / `ProcessGroup.Create` docs now also state the spawn→migrate window honestly: the limits apply to the child and every descendant it forks *after* migration, while a grandchild forked in the brief window before the migration write completes stays in the parent cgroup — still reaped by kill-on-drop teardown, but outside the resource limits.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v0.0.0...v2.0.0
