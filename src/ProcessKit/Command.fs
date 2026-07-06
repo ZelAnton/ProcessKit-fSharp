@@ -45,6 +45,9 @@ type internal CommandConfig =
       UncheckedInPipe: bool
       OkCodes: int list
       CreateNoWindow: bool
+      // The child's CPU-scheduling priority, applied at spawn (Windows priority class / Unix nice).
+      // `None` (the default) leaves the OS default untouched.
+      Priority: Priority option
       Logger: ILogger option
       // A per-run correlation id, stamped once at the verb layer so a run's log/trace events (and its
       // retries) share it. `None` until stamped; a direct spawn gets a per-incarnation id instead.
@@ -77,6 +80,7 @@ module internal CommandConfig =
           UncheckedInPipe = false
           OkCodes = [ 0 ]
           CreateNoWindow = false
+          Priority = None
           Logger = None
           RunId = None }
 
@@ -328,6 +332,15 @@ type Command internal (config: CommandConfig) =
     member _.CreateNoWindow() =
         Command({ config with CreateNoWindow = true })
 
+    /// Launch the child — and the process tree it spawns — at a lower (or higher) CPU-scheduling
+    /// `priority`: a Windows priority class set at process creation, or a Unix `nice` value applied via
+    /// `setpriority`. Supported on both platforms (never `ProcessError.Unsupported`); the default
+    /// (unset) leaves the OS default. Raising priority above the inherited level on Unix
+    /// (`Priority.High`/`Priority.AboveNormal`) needs privilege — without it the spawn fails with
+    /// `ProcessError.Spawn` rather than silently running lower. See `Priority`.
+    member _.Priority(priority: Priority) =
+        Command({ config with Priority = Some priority })
+
     /// Emit structured lifecycle events (spawn / exit / timeout / retry) to `logger`. The program
     /// name and non-secret facts only — **argv and environment are never logged**.
     member _.Logger(logger: ILogger) =
@@ -430,6 +443,10 @@ module Command =
 
     /// Windows: run the child with `CREATE_NO_WINDOW` (no effect on Unix).
     let createNoWindow (command: Command) = command.CreateNoWindow()
+
+    /// Launch the child (and its spawned tree) at a lower/higher CPU-scheduling priority (Windows
+    /// priority class / Unix nice). Supported on both platforms; the default leaves the OS default.
+    let priority (level: Priority) (command: Command) = command.Priority level
 
     /// Emit structured lifecycle events to `logger` (argv/env never logged).
     let logger (logger: ILogger) (command: Command) = command.Logger logger

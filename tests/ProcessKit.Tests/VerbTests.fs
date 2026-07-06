@@ -157,3 +157,71 @@ type VerbTests() =
             | Error error -> Assert.Fail $"firstLine(ct): {error}"
         }
         :> Task
+
+    // ---- Priority (observable, platform-guarded) ----------------------------------------------
+
+    [<Test>]
+    member _.``Priority sets the child's Windows priority class (observed on the live process)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The Windows priority class is observable only on Windows."
+            else
+                // BelowNormal (a lower priority) needs no privilege; the creation-flag path sets it on the
+                // spawned leader, which the tree inherits. Observed directly on the live leader process.
+                let sleeper =
+                    shell "ping -n 4 127.0.0.1 >nul" |> Command.priority Priority.BelowNormal
+
+                match! runner.StartAsync(sleeper, CancellationToken.None) with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    match running.Pid with
+                    | None ->
+                        running.Kill()
+                        let! _ = running.WaitAsync()
+                        Assert.Fail "expected a pid"
+                    | Some pid ->
+                        use proc = System.Diagnostics.Process.GetProcessById pid
+                        let observed = proc.PriorityClass
+                        running.Kill()
+                        let! _ = running.WaitAsync()
+
+                        Assert.That(observed, Is.EqualTo System.Diagnostics.ProcessPriorityClass.BelowNormal)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Priority sets the child's Unix nice value (observed via proc)``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "The Unix nice value is observed via /proc, below."
+            elif not (RuntimeInformation.IsOSPlatform OSPlatform.Linux) then
+                Assert.Ignore "nice introspection via /proc is Linux-only (macOS has no /proc)."
+            else
+                // BelowNormal maps to nice 10 — raising the nice never needs privilege — applied to the
+                // spawned leader via setpriority. Read the leader's own nice from /proc so there is no
+                // fork window in play (the leader's nice is set synchronously before StartAsync returns).
+                let sleeper = shell "sleep 3" |> Command.priority Priority.BelowNormal
+
+                match! runner.StartAsync(sleeper, CancellationToken.None) with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    match running.Pid with
+                    | None ->
+                        running.Kill()
+                        let! _ = running.WaitAsync()
+                        Assert.Fail "expected a pid"
+                    | Some pid ->
+                        let stat = File.ReadAllText $"/proc/{pid}/stat"
+                        running.Kill()
+                        let! _ = running.WaitAsync()
+
+                        // Fields after the final ')': state ppid ... priority nice ...; nice is the 17th
+                        // (splitting after the last ')' side-steps a comm that itself contains parens/spaces).
+                        let afterComm = stat.Substring(stat.LastIndexOf(')') + 1)
+
+                        let fields =
+                            afterComm.Split([| ' '; '\t'; '\n' |], System.StringSplitOptions.RemoveEmptyEntries)
+
+                        Assert.That(int fields[16], Is.EqualTo 10)
+        }
+        :> Task

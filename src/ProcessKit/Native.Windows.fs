@@ -763,6 +763,12 @@ module internal Windows =
                      else
                          CREATE_UNICODE_ENVIRONMENT)
                 ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
+                // The requested CPU priority becomes a priority-class creation flag on the direct child;
+                // Windows children inherit their creator's priority class, so the whole spawned tree runs
+                // at it. Set atomically at creation (unlike the POSIX post-spawn nudge), so no window.
+                ||| (match config.Priority with
+                     | Some priority -> PriorityMapping.windowsCreationFlag priority
+                     | None -> 0u)
 
             let created =
                 CreateProcessW(
