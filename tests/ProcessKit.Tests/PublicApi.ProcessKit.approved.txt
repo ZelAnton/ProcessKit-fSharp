@@ -34,6 +34,7 @@ class ProcessKit.Command
   member OnStderrLine(System.Action<System.String>) : ProcessKit.Command
   member OnStdoutLine(System.Action<System.String>) : ProcessKit.Command
   member OutputBuffer(ProcessKit.OutputBufferPolicy) : ProcessKit.Command
+  member Priority(ProcessKit.Priority) : ProcessKit.Command
   member Retry(System.Int32, System.TimeSpan, System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Command
   member Stderr(ProcessKit.StdioMode) : ProcessKit.Command
   member StderrEncoding(System.Text.Encoding) : ProcessKit.Command
@@ -69,6 +70,7 @@ module ProcessKit.CommandModule
   static member onStderrLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command
   static member onStdoutLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command
   static member outputBuffer(ProcessKit.OutputBufferPolicy, ProcessKit.Command) : ProcessKit.Command
+  static member priority(ProcessKit.Priority, ProcessKit.Command) : ProcessKit.Command
   static member retry(System.Int32, System.TimeSpan, Microsoft.FSharp.Core.FSharpFunc<ProcessKit.ProcessError, System.Boolean>, ProcessKit.Command) : ProcessKit.Command
   static member stderr(ProcessKit.StdioMode, ProcessKit.Command) : ProcessKit.Command
   static member stderrEncoding(System.Text.Encoding, ProcessKit.Command) : ProcessKit.Command
@@ -307,6 +309,46 @@ module ProcessKit.PipelineModule
   static member create(ProcessKit.Command, ProcessKit.Command) : ProcessKit.Pipeline
   static member pipe(ProcessKit.Command, ProcessKit.Pipeline) : ProcessKit.Pipeline
   static member timeout(System.TimeSpan, ProcessKit.Pipeline) : ProcessKit.Pipeline
+
+class ProcessKit.Priority
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.Priority>
+  member Equals(ProcessKit.Priority) : System.Boolean
+  member Equals(ProcessKit.Priority, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsAboveNormal() : System.Boolean
+  member get_IsBelowNormal() : System.Boolean
+  member get_IsHigh() : System.Boolean
+  member get_IsIdle() : System.Boolean
+  member get_IsNormal() : System.Boolean
+  member get_Tag() : System.Int32
+  property AboveNormal : ProcessKit.Priority { get }
+  property BelowNormal : ProcessKit.Priority { get }
+  property High : ProcessKit.Priority { get }
+  property Idle : ProcessKit.Priority { get }
+  property IsAboveNormal : System.Boolean { get }
+  property IsBelowNormal : System.Boolean { get }
+  property IsHigh : System.Boolean { get }
+  property IsIdle : System.Boolean { get }
+  property IsNormal : System.Boolean { get }
+  property Normal : ProcessKit.Priority { get }
+  property Tag : System.Int32 { get }
+  static member get_AboveNormal() : ProcessKit.Priority
+  static member get_BelowNormal() : ProcessKit.Priority
+  static member get_High() : ProcessKit.Priority
+  static member get_Idle() : ProcessKit.Priority
+  static member get_Normal() : ProcessKit.Priority
+
+module ProcessKit.Priority+Tags
+  field literal AboveNormal : System.Int32
+  field literal BelowNormal : System.Int32
+  field literal High : System.Int32
+  field literal Idle : System.Int32
+  field literal Normal : System.Int32
 
 class ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
@@ -816,10 +858,13 @@ class ProcessKit.StopReason
   member GetHashCode() : System.Int32
   member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
   member ToString() : System.String
+  member get_IsGaveUp() : System.Boolean
   member get_IsPolicySatisfied() : System.Boolean
   member get_IsPredicate() : System.Boolean
   member get_IsRestartsExhausted() : System.Boolean
   member get_Tag() : System.Int32
+  property GaveUp : ProcessKit.StopReason { get }
+  property IsGaveUp : System.Boolean { get }
   property IsPolicySatisfied : System.Boolean { get }
   property IsPredicate : System.Boolean { get }
   property IsRestartsExhausted : System.Boolean { get }
@@ -827,11 +872,13 @@ class ProcessKit.StopReason
   property Predicate : ProcessKit.StopReason { get }
   property RestartsExhausted : ProcessKit.StopReason { get }
   property Tag : System.Int32 { get }
+  static member get_GaveUp() : ProcessKit.StopReason
   static member get_PolicySatisfied() : ProcessKit.StopReason
   static member get_Predicate() : ProcessKit.StopReason
   static member get_RestartsExhausted() : ProcessKit.StopReason
 
 module ProcessKit.StopReason+Tags
+  field literal GaveUp : System.Int32
   field literal PolicySatisfied : System.Int32
   field literal Predicate : System.Int32
   field literal RestartsExhausted : System.Int32
@@ -889,6 +936,7 @@ class ProcessKit.Supervisor
   member Capture(ProcessKit.OutputBufferPolicy) : ProcessKit.Supervisor
   member FailureDecay(System.TimeSpan) : ProcessKit.Supervisor
   member FailureThreshold(System.Double) : ProcessKit.Supervisor
+  member GiveUpWhen(System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Supervisor
   member Jitter(System.Boolean) : ProcessKit.Supervisor
   member MaxBackoff(System.TimeSpan) : ProcessKit.Supervisor
   member MaxRestarts(System.Int32) : ProcessKit.Supervisor

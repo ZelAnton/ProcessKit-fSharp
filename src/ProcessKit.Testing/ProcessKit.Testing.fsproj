@@ -16,12 +16,14 @@
 
 	<!-- F# COMPILE ORDER IS SIGNIFICANT. Files are compiled top-to-bottom; a type or
 	     function must be declared before its first use. Reply must precede ScriptedRunner
-	     (which scripts Reply values); Cassette is last (it reuses FakeProcess). FakeProcess
-	     is independent of the other three. -->
+	     (which scripts Reply values); DryRunRunner only needs FakeProcess, so it can sit
+	     alongside ScriptedRunner; Cassette is last (it reuses FakeProcess). FakeProcess is
+	     independent of the other three. -->
 	<ItemGroup>
 		<Compile Include="FakeProcess.fs" />
 		<Compile Include="Reply.fs" />
 		<Compile Include="ScriptedRunner.fs" />
+		<Compile Include="DryRunRunner.fs" />
 		<Compile Include="Cassette.fs" />
 	</ItemGroup>
 
