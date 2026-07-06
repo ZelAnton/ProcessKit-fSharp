@@ -70,6 +70,30 @@ type PipelineTests() =
 
         ((emit [ "banana"; "apple" ]).Pipe last).OutputBytesAsync()
 
+    // A silent producer that never writes (and would run a long time) — the stage whose empty,
+    // still-open stdout blocks the relay's read, so proactive teardown, not a broken pipe, is what
+    // must end it once a downstream stage fails.
+    let slowSilentStage =
+        if isWindows then
+            shell "ping -n 30 127.0.0.1 >nul"
+        else
+            shell "sleep 30"
+
+    // Race a pipeline run against a generous deadline: assert it finished by teardown (won the race)
+    // rather than by outliving the slow stage (which would let the delay win). 15s is far below the
+    // 30s slow stage, so a hang is unmistakable, yet far above the sub-second proactive teardown.
+    let assertFinishesPromptly (run: Task<'T>) : Task =
+        task {
+            let! finished = Task.WhenAny(run, Task.Delay(TimeSpan.FromSeconds 15.0))
+
+            Assert.That(
+                finished,
+                Is.SameAs run,
+                "the pipeline must tear the chain down proactively, not wait for the slow/silent stage"
+            )
+        }
+        :> Task
+
     // Listen to every `int64` measurement on ProcessKit's meter for the pipeline observability
     // tests below — mirrors `LoggingTests.listenToRunMetrics` (not reachable from this file).
     let listenToRunMetrics () =
@@ -263,6 +287,44 @@ type PipelineTests() =
                 match! pipeline.RunAsync() with
                 | Ok output -> Assert.That(output.Trim(), Is.EqualTo "y")
                 | Error error -> Assert.Fail $"expected the pipeline to complete, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a failed downstream stage tears down a silent upstream instead of waiting for pipe EOF``() : Task =
+        task {
+            // Stage 0 never writes and would run ~30s; the relay copying its (empty) stdout blocks
+            // indefinitely, and a producer that never writes never dies of a broken pipe. Stage 1 fails
+            // fast (checked). Before proactive teardown the chain hung on stage 0's natural exit; now the
+            // checked failure kills the whole chain at once — the pipefail representative stays stage 1.
+            let pipeline = slowSilentStage.Pipe(shell "exit 7")
+            let run = pipeline.OutputStringAsync()
+            do! assertFinishesPromptly run
+
+            match! run with
+            | Ok result -> Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 7))
+            | Error error -> Assert.Fail $"expected the failing checked stage as data, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an upstream checked failure tears down a slow downstream but still blames the upstream``() : Task =
+        task {
+            // Stage 0 fails fast (checked exit 3). Stage 1 ignores its stdin and would run ~30s, so a
+            // teardown victim's signal-kill lands to the RIGHT of the real failure. The pipefail result
+            // must still be the upstream's exit 3, proving the torn-down downstream never steals blame.
+            let pipeline = (shell "exit 3").Pipe slowSilentStage
+            let run = pipeline.OutputStringAsync()
+            do! assertFinishesPromptly run
+
+            match! run with
+            | Ok result ->
+                Assert.That(
+                    result.Outcome,
+                    Is.EqualTo(Outcome.Exited 3),
+                    "pipefail blames the upstream's real failure, not the torn-down downstream victim"
+                )
+            | Error error -> Assert.Fail $"expected exit 3 as data, got {error}"
         }
         :> Task
 

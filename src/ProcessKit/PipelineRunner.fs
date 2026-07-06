@@ -8,11 +8,18 @@ open System.Threading.Tasks
 
 /// One stage's terminal state inside a pipeline run.
 type internal PipelineStage =
-    { Program: string
-      Outcome: Outcome
-      Unchecked: bool
-      Stderr: string
-      OkCodes: int list }
+    {
+        Program: string
+        Outcome: Outcome
+        Unchecked: bool
+        Stderr: string
+        OkCodes: int list
+        /// The stage was ended by the chain's *proactive teardown* — the shared group was hard-killed
+        /// after some *other* (checked) stage failed — rather than by a failure of its own. Such a
+        /// victim is de-prioritized in the pipefail fold (`Pipeline.representative`) so the stage that
+        /// actually triggered the teardown keeps the blame, never a sibling the kill happened to catch.
+        TornDown: bool
+    }
 
 /// The captured result of running a whole pipeline: the last stage's stdout (with its byte-cap
 /// truncation / fail-loud / total signals from the last stage's `OutputBuffer`), every stage's
@@ -215,8 +222,47 @@ module internal PipelineRunner =
                                 stages[stages.Length - 1].Config.OutputBuffer
                                 CancellationToken.None
 
-                        let waitTasks =
-                            spawned |> Seq.map (fun sp -> group.WaitHandle sp.Handle) |> Seq.toArray
+                        // Proactive teardown (ProcessKit-rs 2.1 robustness): the first *checked* stage to
+                        // finish with a non-accepted outcome hard-kills the whole shared tree at once,
+                        // instead of leaving the chain to wait for a pipe EOF that a quiet, still-running
+                        // sibling may never deliver — classically an upstream producer that never writes
+                        // and so never dies of a broken pipe, holding the relay's read (and thus the whole
+                        // run) open indefinitely. The stages this kill catches are recorded `TornDown` and
+                        // de-prioritized by the pipefail fold (`Pipeline.representative`), so the stage that
+                        // actually failed keeps the blame and the reported result is unchanged. Only a
+                        // genuine stage failure fires it: an `UncheckedInPipe` stage's unclean exit is
+                        // forgiven (never a pipefail culprit, so never a teardown trigger), and a tree
+                        // already being torn down by the whole-chain timeout or cancellation (`linkedCts`)
+                        // suppresses it — that path is killing the tree itself.
+                        use teardownCts = new CancellationTokenSource()
+                        let tornDown = Array.zeroCreate<bool> spawned.Count
+
+                        let observeStage (index: int) : Task<Outcome> =
+                            task {
+                                let! outcome = group.WaitHandle spawned[index].Handle
+
+                                // Snapshot before possibly firing: a teardown already in flight when this
+                                // stage ends marks it a victim (`TornDown`); the first genuine checked
+                                // failure sees no teardown yet, fires it, and stays the (non-torn) culprit.
+                                let victim = teardownCts.IsCancellationRequested
+                                tornDown[index] <- victim
+
+                                let checkedFailure =
+                                    not stages[index].Config.UncheckedInPipe
+                                    && not (outcome.IsAcceptedBy stages[index].Config.OkCodes)
+
+                                if not victim && not linkedCts.IsCancellationRequested && checkedFailure then
+                                    // `Cancel` marks the teardown fired (so later-finishing siblings read
+                                    // themselves as victims); `KillTree` reaps the still-running rest of the
+                                    // chain. Both are idempotent, so a benign race between two near-
+                                    // simultaneous genuine failures (each a legitimate culprit) is harmless.
+                                    teardownCts.Cancel()
+                                    group.KillTree()
+
+                                return outcome
+                            }
+
+                        let waitTasks = [| for index in 0 .. spawned.Count - 1 -> observeStage index |]
 
                         let! outcomes = Task.WhenAll waitTasks
                         do! Task.WhenAll(copyTasks.ToArray())
@@ -271,7 +317,8 @@ module internal PipelineRunner =
                                         Outcome = outcomes[i]
                                         Unchecked = stages[i].Config.UncheckedInPipe
                                         Stderr = stages[i].Config.StderrEncoding.GetString stderrBytes[i]
-                                        OkCodes = stages[i].Config.OkCodes } ]
+                                        OkCodes = stages[i].Config.OkCodes
+                                        TornDown = tornDown[i] } ]
 
                             // Observe the stage-0 stdin fault without blocking: only a feed that has
                             // finished (a missing `FromFile` faults synchronously at spawn) yields its

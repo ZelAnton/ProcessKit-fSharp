@@ -130,8 +130,22 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                 // default `{0}`); a signal/timeout is always a failure.
                 not (stage.Outcome.IsAcceptedBy stage.OkCodes)
 
-            match checkedStages |> List.filter failed |> List.tryLast with
-            | Some stage -> stage // rightmost checked failure -> the pipeline failed here
+            let checkedFailures = checkedStages |> List.filter failed
+
+            // The rightmost checked failure is where the pipeline failed — but a stage the chain's own
+            // proactive teardown hard-killed (`TornDown`, killed after a *sibling* failed) is a victim,
+            // not the culprit, so it must never steal the blame: prefer the rightmost NON-torn-down
+            // checked failure, falling back to the rightmost failure only when every checked failure is a
+            // teardown victim. With no proactive teardown in play (every `TornDown` is false) this is
+            // exactly the previous "rightmost checked failure" rule, so the pipefail result is unchanged.
+            let culprit =
+                checkedFailures
+                |> List.filter (fun stage -> not stage.TornDown)
+                |> List.tryLast
+                |> Option.orElseWith (fun () -> List.tryLast checkedFailures)
+
+            match culprit with
+            | Some stage -> stage // the checked failure the pipeline failed at
             | None ->
                 // No checked stage failed: the pipeline succeeded. Report the last checked stage
                 // (its accepted exit).
