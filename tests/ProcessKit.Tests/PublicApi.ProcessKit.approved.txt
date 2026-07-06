@@ -37,6 +37,7 @@ class ProcessKit.Command
   member OutputBuffer(ProcessKit.OutputBufferPolicy) : ProcessKit.Command
   member Priority(ProcessKit.Priority) : ProcessKit.Command
   member Retry(System.Int32, System.TimeSpan, System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Command
+  member RetryNever() : ProcessKit.Command
   member Stderr(ProcessKit.StdioMode) : ProcessKit.Command
   member StderrEncoding(System.Text.Encoding) : ProcessKit.Command
   member StderrLineTerminator(ProcessKit.LineTerminator) : ProcessKit.Command
@@ -76,6 +77,7 @@ module ProcessKit.CommandModule
   static member outputBuffer(ProcessKit.OutputBufferPolicy, ProcessKit.Command) : ProcessKit.Command
   static member priority(ProcessKit.Priority, ProcessKit.Command) : ProcessKit.Command
   static member retry(System.Int32, System.TimeSpan, Microsoft.FSharp.Core.FSharpFunc<ProcessKit.ProcessError, System.Boolean>, ProcessKit.Command) : ProcessKit.Command
+  static member retryNever(ProcessKit.Command) : ProcessKit.Command
   static member stderr(ProcessKit.StdioMode, ProcessKit.Command) : ProcessKit.Command
   static member stderrEncoding(System.Text.Encoding, ProcessKit.Command) : ProcessKit.Command
   static member stderrLineTerminator(ProcessKit.LineTerminator, ProcessKit.Command) : ProcessKit.Command

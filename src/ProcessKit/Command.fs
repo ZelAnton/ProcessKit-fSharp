@@ -47,6 +47,12 @@ type internal CommandConfig =
       TimeoutGrace: TimeSpan option
       CancelOn: CancellationToken option
       Retry: (int * TimeSpan * Func<ProcessError, bool>) option
+      // Explicit one-shot opt-out of retrying, distinct from `Retry = None` ("no policy set"). Set by
+      // `RetryNever` and read by the verb layer's `withRetry`, which runs the command exactly once
+      // whenever this is `true` — even if `Retry` itself carries a policy inherited from a
+      // `CliClient.WithDefaults` template. `Retry` (the builder method) resets this back to `false`,
+      // so the last of `.Retry(...)`/`.RetryNever()` in a chain wins, like every other builder knob.
+      RetryDisabled: bool
       UncheckedInPipe: bool
       OkCodes: int list
       CreateNoWindow: bool
@@ -84,6 +90,7 @@ module internal CommandConfig =
           TimeoutGrace = None
           CancelOn = None
           Retry = None
+          RetryDisabled = false
           UncheckedInPipe = false
           OkCodes = [ 0 ]
           CreateNoWindow = false
@@ -339,8 +346,19 @@ type Command internal (config: CommandConfig) =
 
         Command(
             { config with
-                Retry = Some(maxAttempts, delay, shouldRetry) }
+                Retry = Some(maxAttempts, delay, shouldRetry)
+                // A fresh `Retry` call re-opts-in, undoing an earlier `RetryNever` in the same chain —
+                // the last of the two builder calls wins, as with every other knob.
+                RetryDisabled = false }
         )
+
+    /// Explicitly disable retrying for this command, overriding any `Retry` policy already on it —
+    /// including one inherited from a `CliClient.WithDefaults` template. Distinct from never having
+    /// called `Retry` at all: an unset `Retry` still accepts a client's default, `RetryNever` refuses
+    /// it. The command always runs exactly once. A later `Retry(...)` call in the same chain re-opts
+    /// back in (the last call wins).
+    member _.RetryNever() =
+        Command({ config with RetryDisabled = true })
 
     /// Inside a pipeline, do not let this stage's non-zero exit fail the pipeline (it is still
     /// reported in the stage outcomes). Outside a pipeline this flag has no effect.
@@ -476,6 +494,10 @@ module Command =
     /// between attempts (`0`/`1` both mean a single run).
     let retry (maxAttempts: int) (delay: TimeSpan) (shouldRetry: ProcessError -> bool) (command: Command) =
         command.Retry(maxAttempts, delay, Func<ProcessError, bool> shouldRetry)
+
+    /// Explicitly disable retrying for this command, overriding any inherited `Retry` policy (e.g.
+    /// from a `CliClient.WithDefaults` template). The command always runs exactly once.
+    let retryNever (command: Command) = command.RetryNever()
 
     /// Inside a pipeline, allow this stage to exit non-zero without failing the pipeline.
     let uncheckedInPipe (command: Command) = command.UncheckedInPipe()

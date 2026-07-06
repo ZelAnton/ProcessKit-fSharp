@@ -153,9 +153,13 @@ module Runner =
             | Some _ -> command
             | None -> command.WithRunId(Diag.newRunId ())
 
-        match command.Config.Retry with
-        | None -> action command
-        | Some(maxAttempts, delay, shouldRetry) ->
+        // `RetryNever` is a one-shot opt-out distinct from an unset `Retry`: it wins outright, even
+        // over a policy inherited from a `CliClient.WithDefaults` template, so check it first and skip
+        // `Config.Retry` entirely.
+        match command.Config.RetryDisabled, command.Config.Retry with
+        | true, _
+        | _, None -> action command
+        | false, Some(maxAttempts, delay, shouldRetry) ->
             task {
                 // `maxAttempts` is the TOTAL number of runs (the initial run plus retries), so the
                 // command always runs at least once: `0`/`1` (and any non-positive value) mean a single

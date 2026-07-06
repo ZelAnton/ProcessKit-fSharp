@@ -503,6 +503,13 @@ Console.WriteLine(await cmd.RunAsync() switch
   while your classifier returns `true` for the error (`ProcessError.isTransient`
   covers spawn races and I/O blips). The classifier sees the typed `ProcessError`; a
   cancelled token stops the loop.
+- **`RetryNever`** explicitly disables retrying for this command — it always runs
+  exactly once. This differs from simply never calling `Retry`: a `CliClient` built
+  with `WithDefaults(fun c -> c.Retry(...))` applies that default `Retry` to every
+  command built from its template, and `RetryNever` is the one way to opt a specific
+  command out of an inherited default. Calling `Retry` again after `RetryNever` in
+  the same chain re-enables retrying — the last of the two wins, like any other
+  builder call.
 
 To tie a run to a `CancellationToken`, use `CancelOn` (or pass a token to any verb's
 optional token parameter, `cmd.RunAsync(ct)`). A cancelled run is **always** an error

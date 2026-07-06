@@ -148,6 +148,124 @@ type RunnerTests() =
         :> Task
 
     [<Test>]
+    member _.``RetryNever overrides a default Retry inherited from CliClient.WithDefaults``() : Task =
+        task {
+            let mutable calls = 0
+
+            // Every attempt fails with a non-zero exit, and `shouldRetry` unconditionally accepts it —
+            // if `RetryNever` did not win, the loop would burn all 3 configured attempts.
+            let alwaysFailing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Ok(ProcessResult.Failure "" "boom" 1))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Failure [||] "boom" 1))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let client =
+                CliClient
+                    .create("svc")
+                    .WithRunner(alwaysFailing)
+                    .WithDefaults(fun c -> c.Retry(3, TimeSpan.Zero, fun _ -> true))
+
+            // Build a command through the client (inheriting the template's default Retry), then
+            // explicitly opt out on top of it.
+            let command = client.Command([]).RetryNever()
+
+            let! result = command |> Runner.run alwaysFailing CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Exit(_, 1, _, _)) -> ()
+            | other -> Assert.Fail $"expected an Exit error, got {other}"
+
+            Assert.That(calls, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``RetryNever and an unset Retry both run once, but are distinct configuration states``() : Task =
+        task {
+            let unset = Command.create "svc"
+            let retryNever = Command.create "svc" |> Command.retryNever
+
+            // Different observable configuration: `Retry` stays `None` either way, but `RetryDisabled`
+            // distinguishes "no policy" from "explicitly disabled" — the whole point of the new signal.
+            Assert.That(unset.Config.Retry, Is.EqualTo None)
+            Assert.That(unset.Config.RetryDisabled, Is.False)
+            Assert.That(retryNever.Config.Retry, Is.EqualTo None)
+            Assert.That(retryNever.Config.RetryDisabled, Is.True)
+
+            // Same observable single-run behaviour for both, against a runner that would happily be
+            // retried (no `Retry` policy is configured on either command, so nothing schedules a retry).
+            let counting () =
+                let mutable calls = 0
+
+                let runner =
+                    { new IProcessRunner with
+                        member _.CaptureStringAsync(_, _) =
+                            calls <- calls + 1
+                            Task.FromResult(Ok(ProcessResult.Failure "" "boom" 1))
+
+                        member _.CaptureBytesAsync(_, _) =
+                            Task.FromResult(Ok(ProcessResult.Failure [||] "boom" 1))
+
+                        member _.SpawnAsync(command, _) =
+                            Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+                runner, (fun () -> calls)
+
+            let unsetRunner, unsetCalls = counting ()
+            let retryNeverRunner, retryNeverCalls = counting ()
+
+            let! _ = unset |> Runner.run unsetRunner CancellationToken.None
+            let! _ = retryNever |> Runner.run retryNeverRunner CancellationToken.None
+
+            Assert.That(unsetCalls (), Is.EqualTo 1)
+            Assert.That(retryNeverCalls (), Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Retry after RetryNever in the same chain re-enables retrying (last call wins)``() : Task =
+        task {
+            let mutable calls = 0
+
+            let alwaysFailing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Ok(ProcessResult.Failure "" "boom" 1))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Failure [||] "boom" 1))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            // Order matters: `.RetryNever().Retry(...)` re-opts back in, the mirror image of
+            // `.Retry(...).RetryNever()` (which suppresses it).
+            let command =
+                Command.create "svc"
+                |> Command.retryNever
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            Assert.That(command.Config.RetryDisabled, Is.False)
+
+            let! result = command |> Runner.run alwaysFailing CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Exit(_, 1, _, _)) -> ()
+            | other -> Assert.Fail $"expected an Exit error, got {other}"
+
+            Assert.That(calls, Is.EqualTo 3)
+        }
+        :> Task
+
+    [<Test>]
     member _.``a pre-cancelled token makes the scripted runner report Cancelled``() : Task =
         task {
             use cts = new CancellationTokenSource()
