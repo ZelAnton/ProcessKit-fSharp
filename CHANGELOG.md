@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `Command.Priority` / `Command.priority` and the portable `Priority` type (`Idle`/`BelowNormal`/`Normal`/`AboveNormal`/`High`) to launch a child — and the process tree it spawns — at a lower or higher CPU-scheduling priority: a Windows priority class set at process creation, or a Unix `nice`/`setpriority` value. Supported on both platform families (never `Unsupported`); the default is unchanged (normal priority). Raising priority above the inherited level on Unix (`AboveNormal`/`High`) needs privilege (e.g. `CAP_SYS_NICE`) — without it the spawn fails with `ProcessError.Spawn` rather than silently running lower.
+- `Command.Priority` / `Command.priority` and the portable `Priority` type (`Idle`/`BelowNormal`/`Normal`/`AboveNormal`/`High`) to launch a child at a lower or higher CPU-scheduling priority: a Windows priority class set at process creation, or a Unix `nice`/`setpriority` value. The child's whole spawned tree runs at it on Unix (inherited across `fork`) and on Windows for the lowered classes (`Idle`/`BelowNormal`); on Windows `AboveNormal`/`High` apply to the immediate child but are not inherited by the grandchildren it later spawns, which default to `Normal`. Supported on both platform families (never `Unsupported`); the default is unchanged (normal priority). Raising priority above the inherited level on Unix (`AboveNormal`/`High`) needs privilege (e.g. `CAP_SYS_NICE`) — without it the spawn fails with `ProcessError.Spawn` rather than silently running lower.
 
 ### Changed
 -
