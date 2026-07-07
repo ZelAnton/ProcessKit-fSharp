@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - A pipeline whose checked stage fails now tears the whole chain down at once instead of waiting for a pipe EOF: a quiet, still-running sibling — classically an upstream producer that never writes, so never dies of a broken pipe — can no longer hold an already-failed chain open indefinitely. The pipefail result is unchanged (the stage that actually failed keeps the blame; the siblings the teardown kills are de-prioritized as victims).
+- `OutputStringAsync`, `OutputBytesAsync`, and `WaitAsync` now await their in-flight output pumps before letting a fault from the exit wait propagate (aligned with `ProfileAsync`'s existing guard), instead of risking an orphaned pump racing the stream `Dispose` that follows on the fault path.
 
 ## [2.0.0] - 2026-07-06
 
