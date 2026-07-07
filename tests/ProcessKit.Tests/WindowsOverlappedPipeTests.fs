@@ -190,7 +190,7 @@ type WindowsOverlappedPipeTests() =
         :> Task
 
     [<Test>]
-    member _.``a failed stderr std-handle setup does not leak the stdout pipe already created``() : Task =
+    member _.``a failed stderr std-handle setup does not leak the stdout Inherit handle already created``() : Task =
         task {
             if not isWindows then
                 Assert.Ignore "Windows-only: exercises GetStdHandle/SetStdHandle fault injection"
@@ -207,15 +207,19 @@ type WindowsOverlappedPipeTests() =
                 )
                 |> ignore
 
-                // Stdout is `Piped` — the FIRST `setupOut` call, which creates a real named-pipe pair —
-                // and stderr is `Inherit`, whose std handle is forced invalid above, so the SECOND
-                // `setupOut` call always fails. Before the fix, the stdout pipe pair from the first call
-                // was never registered in the unwind list, so every one of these failed attempts leaked
-                // it.
+                // Stdout is `Inherit` — the FIRST `setupOut` call succeeds and duplicates the parent's
+                // (untouched) STD_OUTPUT_HANDLE, registering that duplicate in the unwind list via the
+                // `createdPipes.Add(disposableHandle handle)` line this task adds to the `Inherit` branch.
+                // Stderr is also `Inherit`, but its std handle is forced invalid above, so the SECOND
+                // `setupOut` call always throws. Before the fix, that new `Add` call did not exist, so
+                // the duplicated stdout handle from the first call was never registered in the unwind list
+                // and leaked on every one of these failed attempts. `Piped` mode is deliberately NOT used
+                // here: its pipe handles were already registered in `createdPipes` before this task, so it
+                // would not exercise the `Null`/`Inherit` fix at all.
                 let command =
                     Command.create "cmd.exe"
                     |> Command.args [ "/c"; "echo hi" ]
-                    |> Command.stdout StdioMode.Piped
+                    |> Command.stdout StdioMode.Inherit
                     |> Command.stderr StdioMode.Inherit
 
                 // Warm up once so the baseline reflects steady state, not first-call one-offs.
@@ -234,15 +238,15 @@ type WindowsOverlappedPipeTests() =
                 proc.Refresh()
                 let after = proc.HandleCount
 
-                // A per-attempt leak of the stdout pipe pair would show up as growth roughly
-                // proportional to the 50 failed attempts; a generous absolute slack absorbs incidental
-                // steady-state noise without masking a real leak.
+                // A per-attempt leak of the duplicated stdout Inherit handle would show up as growth
+                // roughly proportional to the 50 failed attempts; a generous absolute slack absorbs
+                // incidental steady-state noise without masking a real leak.
                 Assert.That(
                     after,
                     Is.LessThan(baseline + 20),
                     $"handle count grew from {baseline} to {after} after 50 spawn attempts that fail \
-                      during stdio setup — looks like the stdout pipe from the first setupOut call is \
-                      leaking"
+                      during stdio setup — looks like the stdout Inherit handle from the first setupOut \
+                      call is leaking"
                 )
             finally
                 WindowsStdHandleFaultInjection.SetStdHandle(WindowsStdHandleFaultInjection.STD_ERROR_HANDLE, original)
