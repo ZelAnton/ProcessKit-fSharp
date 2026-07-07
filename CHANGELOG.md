@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - A pipeline whose checked stage fails now tears the whole chain down at once instead of waiting for a pipe EOF: a quiet, still-running sibling — classically an upstream producer that never writes, so never dies of a broken pipe — can no longer hold an already-failed chain open indefinitely. The pipefail result is unchanged (the stage that actually failed keeps the blame; the siblings the teardown kills are de-prioritized as victims).
+- The `CgroupBackend` and `ProcessGroupBackend` teardown (`HardRelease`) now atomically drains its tracked children instead of only snapshotting them, matching the Windows Job Object backend: tracking is fully cleared after teardown, and a concurrent racing-spawn cleanup (`ReapEscapee`) now only re-kills/reaps a pid it actually still owns. This closes a window where both could `killpg`/`waitpid` the same pid — after the first reap the OS can reuse that pid, so a second, unguarded `killpg` could land on an unrelated process group.
 
 ## [2.0.0] - 2026-07-06
 

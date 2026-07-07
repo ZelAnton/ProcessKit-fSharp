@@ -243,10 +243,15 @@ type internal CgroupBackend(cgroupPath: string) =
 
         member _.ReapEscapee(spawned) =
             let pid = int spawned.Handle
-            children.Remove pid |> ignore
-            // Mirror HardRelease's per-child cleanup: the child is its own pgid leader, so killpg covers
-            // any subtree it spawned (whether or not it migrated into the cgroup), then reap the leader.
-            PosixReap.leader pid
+            // Only reap if this call is the one that actually takes the pid out of tracking: a
+            // concurrent HardRelease's Drain may have already taken (and reaped) it, in which case
+            // Remove returns false here and reaping again would killpg/waitpid a pid the OS may have
+            // already reused for an unrelated process group (wrong-target kill).
+            if children.Remove pid then
+                // Mirror HardRelease's per-child cleanup: the child is its own pgid leader, so killpg
+                // covers any subtree it spawned (whether or not it migrated into the cgroup), then reap
+                // the leader.
+                PosixReap.leader pid
 
         member _.KillTree() = Native.Cgroup.killCgroup cgroupPath
 
@@ -293,7 +298,11 @@ type internal CgroupBackend(cgroupPath: string) =
             // cgroup.kill SIGKILLs everything in the cgroup but does not reap our own children, and a
             // child that failed to migrate runs outside the cgroup entirely. Every child is also its own
             // process-group leader, so killpg cleans up an escapee's subtree; then reap the leader.
-            for pid in children.Snapshot() do
+            // Drain (atomic take-and-clear), not Snapshot: a Snapshot would leave the tracking list
+            // populated after teardown, and a concurrent ReapEscapee could still see (and re-reap) the
+            // same pid — after the first killpg/waitpid the OS may reuse that pid, so a second killpg
+            // would land on an unrelated process group (wrong-target kill).
+            for pid in children.Drain() do
                 PosixReap.leader pid
 
             Native.Cgroup.removeCgroup cgroupPath
@@ -332,10 +341,14 @@ type internal ProcessGroupBackend() =
 
         member _.ReapEscapee(spawned) =
             let pgid = int spawned.Handle
-            children.Remove pgid |> ignore
-            // killpg the leader's group, then reap the leader we posix_spawned (killpg does not waitpid
-            // our own child), matching HardRelease's per-pgid cleanup.
-            PosixReap.leader pgid
+            // Only reap if this call is the one that actually takes the pgid out of tracking: a
+            // concurrent HardRelease's Drain may have already taken (and reaped) it, in which case
+            // Remove returns false here and reaping again would killpg/waitpid a pid the OS may have
+            // already reused for an unrelated process group (wrong-target kill).
+            if children.Remove pgid then
+                // killpg the leader's group, then reap the leader we posix_spawned (killpg does not
+                // waitpid our own child), matching HardRelease's per-pgid cleanup.
+                PosixReap.leader pgid
 
         member _.KillTree() =
             for pgid in children.Snapshot() do
@@ -402,5 +415,9 @@ type internal ProcessGroupBackend() =
             // Each pgid's leader is a child we posix_spawned, so we must waitpid it ourselves — `killpg`
             // SIGKILLs the group but does not reap our own children. Reap the leaders we still track (a
             // run verb Releases the ones it already reaped); other group members reparent to init.
-            for pgid in children.Snapshot() do
+            // Drain (atomic take-and-clear), not Snapshot: a Snapshot would leave the tracking list
+            // populated after teardown, and a concurrent ReapEscapee could still see (and re-reap) the
+            // same pgid — after the first killpg/waitpid the OS may reuse that pid, so a second killpg
+            // would land on an unrelated process group (wrong-target kill).
+            for pgid in children.Drain() do
                 PosixReap.leader pgid

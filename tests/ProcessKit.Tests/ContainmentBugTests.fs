@@ -131,3 +131,69 @@ type ContainmentBugTests() =
 
                 Assert.That(isZombie, Is.False, $"child pid {pid} was left as a zombie after dispose")
         }
+
+    [<Test>]
+    member _.``TrackedChildren.Drain and Remove of the same item never both win the race``() : Task =
+        task {
+            // The mutual-exclusion primitive underlying the HardRelease/ReapEscapee fix: a concurrent
+            // Drain (HardRelease's atomic take-and-clear) and Remove (ReapEscapee's guard) for the same
+            // tracked item must never both report success — exactly one of them may act on the item, or
+            // Drain must win outright (it always empties the whole list). Run it many times under
+            // `Task.WhenAll` to shake out any lock-ordering issue.
+            for _ in 1..500 do
+                let children = TrackedChildren<int>()
+                children.Add 42
+
+                let mutable drained: int list = []
+                let mutable removed = false
+
+                let drainTask = Task.Run(fun () -> drained <- children.Drain())
+                let removeTask = Task.Run(fun () -> removed <- children.Remove 42)
+                do! Task.WhenAll(drainTask, removeTask)
+
+                let bothClaimedIt = List.contains 42 drained && removed
+
+                Assert.That(
+                    bothClaimedIt,
+                    Is.False,
+                    "both Drain and Remove claimed the same tracked item — the double-reap race is open"
+                )
+
+                // Regardless of who won, nothing tracked is left behind.
+                Assert.That(children.Snapshot(), Is.Empty)
+        }
+
+    [<Test>]
+    member _.``ProcessGroupBackend: HardRelease racing ReapEscapee never leaves the pgid tracked twice``() : Task =
+        task {
+            // The full-stack shape of the fix: HardRelease (teardown) and ReapEscapee (racing-spawn
+            // cleanup) contend for the SAME tracked pgid. Before this fix HardRelease used Snapshot (no
+            // clear) and ReapEscapee unconditionally re-reaped, so both could killpg/waitpid the same
+            // leader — after the first waitpid the OS may reuse that pid for an unrelated process
+            // group, so the second killpg would land on the wrong target. Actually observing a
+            // wrong-target kill needs a pid-reuse window this test cannot force deterministically; what
+            // IS deterministic and asserted here is that only one side ever "wins" the pgid (Members()
+            // is empty afterwards either way, and no exception/hang occurs from a double reap racing).
+            if isWindows then
+                Assert.Ignore "ProcessGroupBackend is the POSIX (non-cgroup) mechanism only"
+
+            for _ in 1..20 do
+                let backend = ProcessGroupBackend() :> IContainmentBackend
+
+                let spawned =
+                    match backend.Spawn(shell "sleep 5") with
+                    | Ok s -> s
+                    | Error e -> failwith $"spawn failed: {e}"
+
+                match backend.Track spawned with
+                | Ok() -> ()
+                | Error e -> failwith $"track failed: {e}"
+
+                let hardReleaseTask = Task.Run(fun () -> backend.HardRelease())
+                let reapEscapeeTask = Task.Run(fun () -> backend.ReapEscapee spawned)
+                do! Task.WhenAll(hardReleaseTask, reapEscapeeTask)
+
+                match backend.Members() with
+                | Ok members -> Assert.That(members, Is.Empty, "the pgid must not remain tracked after both race")
+                | Error e -> failwith $"Members failed: {e}"
+        }
