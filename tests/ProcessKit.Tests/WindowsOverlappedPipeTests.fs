@@ -10,6 +10,22 @@ open NUnit.Framework
 open NUnit.Framework.Legacy
 open ProcessKit
 
+/// Deterministic Windows-only fault injection for `Native.Windows`'s `StdioMode.Inherit` path
+/// (`inheritableStdHandle` → `GetStdHandle`): `SetStdHandle` lets a test force `GetStdHandle` to
+/// return an invalid handle for the current process, the same condition a detached/no-console
+/// process would see for real — without touching production code or relying on a genuinely
+/// console-less host (which CI runners are not, reliably).
+module private WindowsStdHandleFaultInjection =
+
+    [<Literal>]
+    let STD_ERROR_HANDLE = -12
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern nativeint GetStdHandle(int nStdHandle)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool SetStdHandle(int nStdHandle, nativeint hHandle)
+
 /// Windows-only: the async-capable named-pipe replacement for the piped-stdio anonymous pipes
 /// (`Native.Windows.createAsyncPipePair` / `spawnWindowsCore`). Verifies the observable contract stays intact
 /// under this native change — byte-exact captured output, no handle leak under load — and that reads
@@ -132,5 +148,108 @@ type WindowsOverlappedPipeTests() =
                   with {concurrency} concurrent piped children in flight — looks like one thread parked \
                   per pipe read"
             )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``spawn honestly fails instead of handing the child a broken Inherit std handle``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: exercises GetStdHandle/SetStdHandle fault injection"
+
+            let original =
+                WindowsStdHandleFaultInjection.GetStdHandle WindowsStdHandleFaultInjection.STD_ERROR_HANDLE
+
+            try
+                // Force `GetStdHandle(STD_ERROR_HANDLE)` to return NULL for the duration of the spawn —
+                // the same condition `inheritableStdHandle` sees for a detached/no-console process whose
+                // stderr is not otherwise redirected. Before the fix, `spawnWindowsCore` put this
+                // unchecked (NULL) value straight into `STARTUPINFO.hStdError`, handing the child a
+                // broken std handle instead of failing the spawn.
+                WindowsStdHandleFaultInjection.SetStdHandle(
+                    WindowsStdHandleFaultInjection.STD_ERROR_HANDLE,
+                    IntPtr.Zero
+                )
+                |> ignore
+
+                let command =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/c"; "echo hi" ]
+                    |> Command.stderr StdioMode.Inherit
+
+                match! command.OutputStringAsync() with
+                | Ok result ->
+                    Assert.Fail
+                        $"expected an honest spawn failure with an invalid stderr std handle, got a \
+                          successful run instead (stdout: {result.Stdout})"
+                | Error error -> StringAssert.Contains("spawn", error.Message.ToLowerInvariant())
+            finally
+                WindowsStdHandleFaultInjection.SetStdHandle(WindowsStdHandleFaultInjection.STD_ERROR_HANDLE, original)
+                |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a failed stderr std-handle setup does not leak the stdout Inherit handle already created``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: exercises GetStdHandle/SetStdHandle fault injection"
+
+            use proc = Process.GetCurrentProcess()
+
+            let original =
+                WindowsStdHandleFaultInjection.GetStdHandle WindowsStdHandleFaultInjection.STD_ERROR_HANDLE
+
+            try
+                WindowsStdHandleFaultInjection.SetStdHandle(
+                    WindowsStdHandleFaultInjection.STD_ERROR_HANDLE,
+                    IntPtr.Zero
+                )
+                |> ignore
+
+                // Stdout is `Inherit` — the FIRST `setupOut` call succeeds and duplicates the parent's
+                // (untouched) STD_OUTPUT_HANDLE, registering that duplicate in the unwind list via the
+                // `createdPipes.Add(disposableHandle handle)` line this task adds to the `Inherit` branch.
+                // Stderr is also `Inherit`, but its std handle is forced invalid above, so the SECOND
+                // `setupOut` call always throws. Before the fix, that new `Add` call did not exist, so
+                // the duplicated stdout handle from the first call was never registered in the unwind list
+                // and leaked on every one of these failed attempts. `Piped` mode is deliberately NOT used
+                // here: its pipe handles were already registered in `createdPipes` before this task, so it
+                // would not exercise the `Null`/`Inherit` fix at all.
+                let command =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/c"; "echo hi" ]
+                    |> Command.stdout StdioMode.Inherit
+                    |> Command.stderr StdioMode.Inherit
+
+                // Warm up once so the baseline reflects steady state, not first-call one-offs.
+                match! command.OutputStringAsync() with
+                | Ok _ -> Assert.Fail "expected the forced invalid stderr std handle to fail the spawn"
+                | Error _ -> ()
+
+                proc.Refresh()
+                let baseline = proc.HandleCount
+
+                for _ in 1..50 do
+                    match! command.OutputStringAsync() with
+                    | Ok _ -> Assert.Fail "expected the forced invalid stderr std handle to fail the spawn"
+                    | Error _ -> ()
+
+                proc.Refresh()
+                let after = proc.HandleCount
+
+                // A per-attempt leak of the duplicated stdout Inherit handle would show up as growth
+                // roughly proportional to the 50 failed attempts; a generous absolute slack absorbs
+                // incidental steady-state noise without masking a real leak.
+                Assert.That(
+                    after,
+                    Is.LessThan(baseline + 20),
+                    $"handle count grew from {baseline} to {after} after 50 spawn attempts that fail \
+                      during stdio setup — looks like the stdout Inherit handle from the first setupOut \
+                      call is leaking"
+                )
+            finally
+                WindowsStdHandleFaultInjection.SetStdHandle(WindowsStdHandleFaultInjection.STD_ERROR_HANDLE, original)
+                |> ignore
         }
         :> Task

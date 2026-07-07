@@ -407,6 +407,40 @@ type RunningProcess internal (host: RunningHost) =
         bufferedOutcome <- wait
         wait
 
+    // Await a buffered verb's exit wait (`waitTask`, from `startBufferedWait`) together with its
+    // already-running `pumps`, guaranteeing the pumps are drained before a fault from `waitTask`
+    // propagates — the same guard `ProfileAsync` applies around its own `startBufferedWait`. Although
+    // `backend.Wait` (the innermost primitive) is designed never to fault, `waitWithTimeout` layers a
+    // timeout race on top of it whose `onTimeout` hook calls into `host.GracefulKill`/`host.StartKill`
+    // (native kill syscalls), so the composed wait CAN throw. `reapGuard`'s teardown disposes the
+    // streams the pumps read, so a pump still in-flight when such a fault escaped this scope would race
+    // that dispose; awaiting the pumps best-effort before re-raising closes that gap. A pump's own
+    // fault (thrown from `Task.WhenAll pumps` on the success path) is not swallowed — it propagates
+    // exactly as before, unaffected by this guard.
+    let awaitBufferedOutcome (waitTask: Task<Outcome>) (pumps: Task[]) : Task<Outcome> =
+        task {
+            let mutable error: exn option = None
+            let mutable outcome = Unchecked.defaultof<Outcome>
+
+            try
+                let! settled = waitTask
+                do! Task.WhenAll pumps
+                outcome <- settled
+            with ex ->
+                error <- Some ex
+                // A fault from `waitTask` before the pumps were awaited must not orphan them — observe
+                // them best-effort. Their own fault, if any, is secondary to the error we surface.
+                try
+                    do! Task.WhenAll pumps
+                with _ ->
+                    // best-effort drain; the original fault above is what we report.
+                    ()
+
+            match error with
+            | Some ex -> return! Task.FromException<Outcome> ex
+            | None -> return outcome
+        }
+
     // An async-disposable that reaps the tree on scope exit — normal OR exceptional. Every terminal
     // verb opens one with `use` so the container is always torn down, even when a pump faults (e.g.
     // a throwing line handler) before the verb would otherwise reach its teardown. `Teardown` is
@@ -494,10 +528,12 @@ type RunningProcess internal (host: RunningHost) =
                 use _reap = reapGuard ()
                 let stdoutTask = pumpStdoutBuffer ()
                 let stderrTask = pumpStderrBuffer ()
-                let! outcome = startBufferedWait ()
                 // Observe BOTH buffer pumps before reading either, so a throwing line handler in one
-                // never orphans the other as an unobserved task (mirrors the streaming path's WhenAll).
-                do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
+                // never orphans the other as an unobserved task (mirrors the streaming path's WhenAll);
+                // `awaitBufferedOutcome` additionally guarantees this even if the exit wait itself faults.
+                let! outcome =
+                    awaitBufferedOutcome (startBufferedWait ()) [| (stdoutTask :> Task); (stderrTask :> Task) |]
+
                 let! outBuf = stdoutTask
                 let! errBuf = stderrTask
                 conclude outcome
@@ -557,10 +593,12 @@ type RunningProcess internal (host: RunningHost) =
                     Pump.captureRawOrEmpty host.Stdout config.StdoutTee config.OutputBuffer CancellationToken.None
 
                 let stderrTask = pumpStderrBuffer ()
-                let! outcome = startBufferedWait ()
                 // Observe both pumps before reading either, so a throwing stderr handler (or a raw-drain
-                // I/O fault) can't orphan the other as an unobserved task.
-                do! Task.WhenAll([| (stdoutTask :> Task); (stderrTask :> Task) |])
+                // I/O fault) can't orphan the other as an unobserved task; `awaitBufferedOutcome`
+                // additionally guarantees this even if the exit wait itself faults.
+                let! outcome =
+                    awaitBufferedOutcome (startBufferedWait ()) [| (stdoutTask :> Task); (stderrTask :> Task) |]
+
                 let! stdoutCapture = stdoutTask
                 let! errBuf = stderrTask
                 conclude outcome
@@ -597,9 +635,9 @@ type RunningProcess internal (host: RunningHost) =
             // Drain both pipes (so the child never blocks on a full buffer) without retaining.
             let stdoutTask = Pump.drainDiscardOrEmpty host.Stdout CancellationToken.None
             let stderrTask = Pump.drainDiscardOrEmpty host.Stderr CancellationToken.None
-            let! outcome = startBufferedWait ()
-            // Observe both drains together so an I/O fault on one can't orphan the other.
-            do! Task.WhenAll([| stdoutTask; stderrTask |])
+            // Observe both drains together so an I/O fault on one can't orphan the other;
+            // `awaitBufferedOutcome` additionally guarantees this even if the exit wait itself faults.
+            let! outcome = awaitBufferedOutcome (startBufferedWait ()) [| stdoutTask; stderrTask |]
             conclude outcome
             return outcome
         }

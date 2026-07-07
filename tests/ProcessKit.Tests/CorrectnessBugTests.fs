@@ -219,6 +219,68 @@ type CorrectnessBugTests() =
         :> Task
 
     [<Test>]
+    member _.``a fault in the exit wait does not orphan a buffered verb's still-in-flight pump``() : Task =
+        task {
+            // `backend.Wait` is designed never to fault, but the composed exit wait (`waitWithTimeout`)
+            // also runs `onTimeout`'s native kill calls, so it CAN throw. If `WaitAsync` read the exit
+            // wait's result before its pumps were drained (the bug this guards against), the pump would
+            // be left unobserved/in-flight while `reapGuard`'s teardown races disposing its stream.
+            let stdout = new GatedStream(Encoding.UTF8.GetBytes "hello")
+
+            let waitTcs =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let host: RunningHost =
+                { Config = (Command.create "test").Config
+                  Pid = None
+                  Stdout = Some(stdout :> Stream)
+                  Stderr = None
+                  Stdin = None
+                  StartTime = DateTime.UtcNow
+                  StartedTimestamp = Stopwatch.GetTimestamp()
+                  Wait = fun () -> waitTcs.Task
+                  StdinError = fun () -> None
+                  StartKill = ignore
+                  GracefulKill = fun _ -> Task.CompletedTask
+                  Teardown = fun () -> ValueTask() }
+
+            use running = new RunningProcess(host)
+
+            let waitAsyncTask = running.WaitAsync()
+
+            // Let the stdout drain genuinely start reading (park mid-`ReadAsync`) before faulting the
+            // exit wait, so the pump is provably still in flight when the fault happens.
+            let! enteredWinner = Task.WhenAny(stdout.Entered, Task.Delay 5000)
+
+            Assert.That(
+                obj.ReferenceEquals(enteredWinner, stdout.Entered),
+                Is.True,
+                "the stdout drain never started reading"
+            )
+
+            waitTcs.SetException(InvalidOperationException "exit wait faulted")
+
+            // The verb must not surface the fault until its still-parked pump is drained — proving the
+            // pump is awaited, not left orphaned, before the exception propagates.
+            let! settledEarly = Task.WhenAny(waitAsyncTask :> Task, Task.Delay 200)
+
+            Assert.That(
+                obj.ReferenceEquals(settledEarly, waitAsyncTask),
+                Is.False,
+                "WaitAsync surfaced the exit-wait fault before draining its still-in-flight pump"
+            )
+
+            stdout.Release()
+
+            try
+                let! _ = waitAsyncTask
+                Assert.Fail "expected WaitAsync to propagate the exit-wait fault"
+            with :? InvalidOperationException as ex ->
+                Assert.That(ex.Message, Is.EqualTo "exit wait faulted")
+        }
+        :> Task
+
+    [<Test>]
     member _.``WaitAnyAsync claiming a fresh handle still refuses a later terminal verb``() : Task =
         task {
             match! runner.StartAsync(shell "echo hi", CancellationToken.None) with
