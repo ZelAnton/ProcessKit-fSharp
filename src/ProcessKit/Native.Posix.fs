@@ -411,14 +411,6 @@ module internal Posix =
         // Child-side fds the parent closes after spawn (the child gets its own via dup2).
         let childSideFds = System.Collections.Generic.List<int>()
 
-        let openNul (flags: int) =
-            let fd = openDevNull flags
-
-            if fd >= 0 then
-                childSideFds.Add fd
-
-            fd
-
         // Per stream: the fd the child should see at the target slot (-1 = inherit, no dup2), and
         // the fd the parent keeps as a stream (read for stdout/stderr, write for stdin).
         let mutable stdinChildFd = -1
@@ -428,6 +420,22 @@ module internal Posix =
         let mutable stderrChildFd = -1
         let mutable stderrParentRead: int option = None
         let mutable failure: string option = None
+
+        // A failed open("/dev/null") (fd < 0, e.g. EMFILE/ENFILE) must fail the spawn honestly,
+        // exactly like a failed pipe() below (`makePipe`) already does — NOT leave the slot's
+        // *ChildFd at -1, which `posix_spawn_file_actions_adddup2` below reads as "no dup2 —
+        // inherit the parent's stream", the silent downgrade this guards against (for stdin,
+        // handing the child the parent's real stdin/terminal instead of an immediate EOF).
+        let openNul (label: string) (flags: int) =
+            let fd = openDevNull flags
+
+            if fd >= 0 then
+                childSideFds.Add fd
+            else
+                let errno = Marshal.GetLastWin32Error()
+                failure <- Some $"open(/dev/null) failed for {label} (errno {errno})"
+
+            fd
 
         let makePipe (label: string) =
             let fds = Array.zeroCreate<int> 2
@@ -447,7 +455,7 @@ module internal Posix =
                 stdinParentWrite <- Some writeFd
             | None -> ()
         else
-            stdinChildFd <- openNul O_RDONLY
+            stdinChildFd <- openNul "stdin" O_RDONLY
 
         // stdout
         if failure.IsNone then
@@ -459,7 +467,7 @@ module internal Posix =
                     stdoutChildFd <- writeFd
                     childSideFds.Add writeFd
                 | None -> ()
-            | StdioMode.Null -> stdoutChildFd <- openNul O_WRONLY
+            | StdioMode.Null -> stdoutChildFd <- openNul "stdout" O_WRONLY
             | StdioMode.Inherit ->
                 // Inherit the parent's stdout. On macOS, POSIX_SPAWN_CLOEXEC_DEFAULT closes every fd
                 // not named by a file action at exec, so register a self-dup2 (1 -> 1) to keep fd 1
@@ -476,7 +484,7 @@ module internal Posix =
                     stderrChildFd <- writeFd
                     childSideFds.Add writeFd
                 | None -> ()
-            | StdioMode.Null -> stderrChildFd <- openNul O_WRONLY
+            | StdioMode.Null -> stderrChildFd <- openNul "stderr" O_WRONLY
             | StdioMode.Inherit ->
                 // See the stdout note: a self-dup2 (2 -> 2) keeps fd 2 alive under macOS
                 // POSIX_SPAWN_CLOEXEC_DEFAULT; Linux inherits it without a file action.

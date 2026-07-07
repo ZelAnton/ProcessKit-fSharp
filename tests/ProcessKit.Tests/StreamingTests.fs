@@ -13,10 +13,36 @@ open NUnit.Framework
 open NUnit.Framework.Legacy
 open ProcessKit
 
+/// Raw `getrlimit`/`setrlimit` access to `RLIMIT_NOFILE`, used ONLY by the T-028 regression test
+/// below (``spawnPosix fails instead of silently inheriting when open(/dev/null) fails``) to pin
+/// the test process's file-descriptor ceiling at an exact, deterministic point so a specific
+/// `open("/dev/null")` call inside `Native.Posix.spawnPosix` can be made to fail with EMFILE
+/// without guessing at an ambient fd count.
+module private DevNullExhaustion =
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type RLimit =
+        struct
+            val mutable Current: int64
+            val mutable Max: int64
+        end
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int getrlimit(int resource, RLimit& limit)
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int setrlimit(int resource, RLimit& limit)
+
+    // Linux value for RLIMIT_NOFILE. The regression test that uses this is Linux-only (see its
+    // comment for why macOS is skipped), so no macOS constant is needed here.
+    [<Literal>]
+    let RLIMIT_NOFILE = 7
+
 [<TestFixture>]
 type StreamingTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
     let runner: IProcessRunner = JobRunner()
 
     let shell (script: string) =
@@ -594,6 +620,64 @@ type StreamingTests() =
                 match! running.OutputStringAsync() with
                 | Ok result -> Assert.That(result.Stdout, Is.Empty)
                 | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // T-028: a failed open("/dev/null") inside `spawnPosix` (POSIX-only; `Native.Posix.openNul`)
+    // must fail the spawn honestly (`ProcessError.Spawn`), never silently downgrade to inheriting
+    // the parent's stream. Linux-only: pinning the exact fd ceiling below needs /proc/self/fd to
+    // read back the process's current fd high-water mark; macOS has no equally cheap, portable way
+    // to do that, so there is no way to pin the limit at "one more fd, no further" there without
+    // guessing at an ambient fd count (risking starving the whole test process of descriptors).
+    [<Test>]
+    member _.``spawnPosix fails instead of silently inheriting when open(/dev/null) fails``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: exercises Native.Posix.spawnPosix's open(/dev/null) failure path"
+
+            if not isLinux then
+                Assert.Ignore "macOS: no /proc/self/fd to pin the exact rlimit deterministically"
+
+            let mutable original = DevNullExhaustion.RLimit()
+
+            Assert.That(
+                DevNullExhaustion.getrlimit (DevNullExhaustion.RLIMIT_NOFILE, &original),
+                Is.EqualTo 0,
+                "getrlimit failed"
+            )
+
+            let maxOpenFd =
+                Directory.GetFileSystemEntries "/proc/self/fd"
+                |> Array.map (fun path -> int (Path.GetFileName path))
+                |> Array.max
+
+            // Allow exactly one more fd beyond the process's current high-water mark: enough for
+            // the default stdin's own open("/dev/null") — the first fd-creating call spawnPosix
+            // makes, since this command sets no stdin source — to succeed, so the very NEXT open,
+            // the explicit StdioMode.Null stdout below, is the one that fails with EMFILE.
+            let mutable exhausted =
+                DevNullExhaustion.RLimit(Current = int64 (maxOpenFd + 2), Max = original.Max)
+
+            try
+                Assert.That(
+                    DevNullExhaustion.setrlimit (DevNullExhaustion.RLIMIT_NOFILE, &exhausted),
+                    Is.EqualTo 0,
+                    "setrlimit failed"
+                )
+
+                let command = shell "true" |> Command.stdout StdioMode.Null
+
+                match Native.Posix.spawnPosix command with
+                | Error(ProcessError.Spawn(_, message)) ->
+                    Assert.That(
+                        message,
+                        Does.Contain "/dev/null",
+                        "expected the Spawn error to name the failing open(/dev/null)"
+                    )
+                | other -> Assert.Fail $"expected a Spawn error from the exhausted open(/dev/null), got {other}"
+            finally
+                DevNullExhaustion.setrlimit (DevNullExhaustion.RLIMIT_NOFILE, &original)
+                |> ignore
         }
         :> Task
 

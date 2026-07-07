@@ -3,6 +3,7 @@ namespace ProcessKit
 open System
 open System.Collections.Generic
 open System.IO
+open System.Runtime.ExceptionServices
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -619,9 +620,60 @@ module internal Pump =
         | :? UnauthorizedAccessException -> Some ex
         | _ -> None
 
+    /// Marks an exception raised while reading/iterating the user-supplied stdin *source* — a
+    /// `FromFile`/`FromStream` stream, or a `FromLines`/`FromAsyncLines` generator — as distinct from
+    /// one raised while *writing* to the child's stdin pipe (where a broken pipe is routine: the
+    /// child may close stdin early, and that is not the caller's error). `feedStdin` tells the two
+    /// apart by *where* they were thrown, not by exception type: `readSource` below wraps every
+    /// non-cancellation exception from the read/iterate step in this, so the outer handler can
+    /// surface it unconditionally as `ProcessError.Stdin`, while a write-side exception still goes
+    /// through `genuineStdinFault`'s conservative allow-list.
+    exception private StdinSourceFault of inner: exn
+
+    /// Await one read/iteration step against the user-supplied stdin source (`Stream.ReadAsync`,
+    /// `IEnumerator.MoveNext`, `IAsyncEnumerator.MoveNextAsync`), wrapping any exception it raises as
+    /// a `StdinSourceFault` — except a cancellation, which is rethrown as itself (preserving its
+    /// original stack via `ExceptionDispatchInfo`; `reraise` is unavailable inside a task CE) so it
+    /// still falls through to `genuineStdinFault`'s ordinary "a cancelled write is not the caller's
+    /// error" handling instead of being misclassified as a genuine source fault.
+    let inline private readSource (read: unit -> Task<'T>) : Task<'T> =
+        task {
+            try
+                let! result = read ()
+                return result
+            with
+            | :? OperationCanceledException as ex ->
+                ExceptionDispatchInfo.Throw ex
+                return Unchecked.defaultof<'T>
+            | ex -> return raise (StdinSourceFault ex)
+        }
+
+    /// Copy `source` to `destination` chunk-by-chunk, reading via `readSource` so a read-side fault
+    /// against a `FromFile`/`FromStream` source is distinguishable, by where it was thrown, from a
+    /// write-side broken pipe. Used instead of `Stream.CopyToAsync`, which performs both sides in one
+    /// call and would erase that distinction.
+    let private pumpStream (source: Stream) (destination: Stream) (cancellationToken: CancellationToken) : Task =
+        task {
+            let buffer = Array.zeroCreate<byte> 8192
+            let mutable reading = true
+
+            while reading do
+                let! read =
+                    readSource (fun () ->
+                        source.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).AsTask())
+
+                if read = 0 then
+                    reading <- false
+                else
+                    do! destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken)
+        }
+        :> Task
+
     /// Write a stdin source to the child's stdin stream; close it (EOF) afterwards unless the
     /// caller is keeping it open for interactive writing. Never faults: returns a genuine
-    /// source-acquisition failure (per `genuineStdinFault`) for the caller to surface, or `None`.
+    /// source failure — a source-acquisition failure (per `genuineStdinFault`) on the write side, or
+    /// (per `StdinSourceFault`, unconditionally) any fault reading/iterating the source itself — for
+    /// the caller to surface, or `None`.
     let feedStdin
         (source: StdinSource)
         (stdinStream: Stream)
@@ -637,12 +689,20 @@ module internal Pump =
                 | StdinSource.Bytes bytes -> do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                 | StdinSource.File path ->
                     use file = File.OpenRead path
-                    do! file.CopyToAsync(stdinStream, cancellationToken)
-                | StdinSource.Reader reader -> do! reader.CopyToAsync(stdinStream, cancellationToken)
+                    do! pumpStream file stdinStream cancellationToken
+                | StdinSource.Reader reader -> do! pumpStream reader stdinStream cancellationToken
                 | StdinSource.Lines lines ->
-                    for entry in lines do
-                        let bytes = Encoding.UTF8.GetBytes(entry + "\n")
-                        do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
+                    use enumerator = lines.GetEnumerator()
+                    let mutable more = true
+
+                    while more do
+                        let! hasNext = readSource (fun () -> Task.FromResult(enumerator.MoveNext()))
+
+                        if hasNext then
+                            let bytes = Encoding.UTF8.GetBytes(enumerator.Current + "\n")
+                            do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
+                        else
+                            more <- false
                 | StdinSource.AsyncLines lines ->
                     // `use` on an `IAsyncEnumerator<'T>` (an `IAsyncDisposable`) inside this `task { }`
                     // makes the F# task-CE binder call `DisposeAsync` genuinely asynchronously and
@@ -654,7 +714,7 @@ module internal Pump =
                     let mutable more = true
 
                     while more do
-                        let! has = enumerator.MoveNextAsync()
+                        let! has = readSource (fun () -> enumerator.MoveNextAsync().AsTask())
 
                         if has then
                             let bytes = Encoding.UTF8.GetBytes(enumerator.Current + "\n")
@@ -665,10 +725,15 @@ module internal Pump =
                 do! stdinStream.FlushAsync cancellationToken
             with ex ->
                 // The stdin writer runs detached, so swallow to keep it from faulting unobserved; but
-                // stash a genuine source failure so an otherwise-successful run can surface it as
-                // `ProcessError.Stdin` instead of silently feeding the child empty input. A broken
-                // pipe / torn-down stream / cancelled write classifies as `None` — see `genuineStdinFault`.
-                fault <- genuineStdinFault ex
+                // stash a genuine fault so an otherwise-successful run can surface it as
+                // `ProcessError.Stdin` instead of silently feeding the child truncated/empty input. A
+                // read-side fault against the source (`StdinSourceFault`) always surfaces; a write-side
+                // exception — broken pipe / torn-down stream / cancelled write — classifies via the
+                // conservative `genuineStdinFault` allow-list, so a routine broken pipe stays `None`.
+                fault <-
+                    match ex with
+                    | StdinSourceFault inner -> Some inner
+                    | _ -> genuineStdinFault ex
 
             if closeWhenDone then
                 disposeQuietly stdinStream
