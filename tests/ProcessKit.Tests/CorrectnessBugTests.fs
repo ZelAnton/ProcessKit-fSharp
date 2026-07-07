@@ -388,6 +388,28 @@ type CorrectnessBugTests() =
         }
 
     [<Test>]
+    member _.``a FromLines source that throws mid-iteration surfaces as ProcessError.Stdin``() : Task =
+        task {
+            // The generator raises an arbitrary exception (not one of the old FileNotFoundException /
+            // DirectoryNotFoundException / UnauthorizedAccessException allow-list) partway through
+            // iteration. `sort` keeps reading until EOF, so the first line is genuinely written before
+            // the generator faults — this must surface as `ProcessError.Stdin`, not truncate the
+            // child's input and pass through as a silent success.
+            let source =
+                seq {
+                    yield "first line"
+                    failwith "boom mid-iteration"
+                }
+
+            let cmd = (shell "sort") |> Command.stdin (Stdin.FromLines source)
+
+            match! cmd.OutputStringAsync() with
+            | Error(ProcessError.Stdin _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Stdin, got {other.Message}"
+            | Ok _ -> Assert.Fail "expected a mid-iteration source fault to surface as ProcessError.Stdin"
+        }
+
+    [<Test>]
     member _.``a pipeline surfaces a missing first-stage stdin source as ProcessError.Stdin``() : Task =
         task {
             // The first stage's stdin source can't be read; the pipeline otherwise succeeds (both stages
