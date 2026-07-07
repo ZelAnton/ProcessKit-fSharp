@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - A pipeline whose checked stage fails now tears the whole chain down at once instead of waiting for a pipe EOF: a quiet, still-running sibling — classically an upstream producer that never writes, so never dies of a broken pipe — can no longer hold an already-failed chain open indefinitely. The pipefail result is unchanged (the stage that actually failed keeps the blame; the siblings the teardown kills are de-prioritized as victims).
+- On Unix, a spawn whose `open("/dev/null")` fails (e.g. the process's file-descriptor table is full) for stdin's default null source or an explicit `StdioMode.Null` stdout/stderr now fails honestly with `ProcessError.Spawn`, instead of silently downgrading to inherit the parent's stream — for stdin, that previously meant the child could read the parent's real stdin/terminal instead of getting an immediate EOF.
 
 ## [2.0.0] - 2026-07-06
 
