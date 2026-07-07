@@ -33,10 +33,20 @@ module private DevNullExhaustion =
     [<DllImport("libc", SetLastError = true)>]
     extern int setrlimit(int resource, RLimit& limit)
 
+    [<DllImport("libc", SetLastError = true, EntryPoint = "open")>]
+    extern int openDevNull(string path, int flags)
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int close(int fd)
+
     // Linux value for RLIMIT_NOFILE. The regression test that uses this is Linux-only (see its
     // comment for why macOS is skipped), so no macOS constant is needed here.
     [<Literal>]
     let RLIMIT_NOFILE = 7
+
+    // O_RDONLY = 0 (standard POSIX value)
+    [<Literal>]
+    let O_RDONLY = 0
 
 [<TestFixture>]
 type StreamingTests() =
@@ -646,11 +656,28 @@ type StreamingTests() =
                 "getrlimit failed"
             )
 
-            let maxOpenFd =
-                Directory.GetFileSystemEntries "/proc/self/fd"
-                |> Array.map (fun path -> int (Path.GetFileName path))
-                |> Array.max
+            let openFds = Directory.GetFileSystemEntries "/proc/self/fd"
+            let usedCount = openFds.Length
 
+            let maxOpenFd =
+                openFds |> Array.map (fun path -> int (Path.GetFileName path)) |> Array.max
+
+            // Fill any gaps in the fd table below maxOpenFd so it becomes contiguous.
+            // RLIMIT_NOFILE bounds the fd *number*, not the open fd *count*, so pre-existing gaps below
+            // the high-water mark can be reused by open() for "free" without consuming the budget.
+            // By filling them first, we ensure the "budget of 1 new fd" assumption is exact.
+            let gapCount = (maxOpenFd + 1) - usedCount
+            let fillerFds = ResizeArray<int>(gapCount)
+
+            for _ in 1..gapCount do
+                let fd = DevNullExhaustion.openDevNull ("/dev/null", DevNullExhaustion.O_RDONLY)
+
+                if fd >= 0 then
+                    fillerFds.Add fd
+                else
+                    Assert.Fail $"failed to fill fd gap (errno {Marshal.GetLastWin32Error()})"
+
+            // Now the fd table 0..maxOpenFd is fully occupied, so the next open will request fd `maxOpenFd + 1`.
             // Allow exactly one more fd beyond the process's current high-water mark: enough for
             // the default stdin's own open("/dev/null") — the first fd-creating call spawnPosix
             // makes, since this command sets no stdin source — to succeed, so the very NEXT open,
@@ -676,6 +703,10 @@ type StreamingTests() =
                     )
                 | other -> Assert.Fail $"expected a Spawn error from the exhausted open(/dev/null), got {other}"
             finally
+                // Close all filler fds before restoring the original limit.
+                for fd in fillerFds do
+                    DevNullExhaustion.close fd |> ignore
+
                 DevNullExhaustion.setrlimit (DevNullExhaustion.RLIMIT_NOFILE, &original)
                 |> ignore
         }
