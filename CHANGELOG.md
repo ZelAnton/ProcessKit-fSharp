@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - A pipeline whose checked stage fails now tears the whole chain down at once instead of waiting for a pipe EOF: a quiet, still-running sibling — classically an upstream producer that never writes, so never dies of a broken pipe — can no longer hold an already-failed chain open indefinitely. The pipefail result is unchanged (the stage that actually failed keeps the blame; the siblings the teardown kills are de-prioritized as victims).
+- Windows spawn: an unavailable `StdioMode.Null`/`Inherit` std handle (e.g. no console and the stream not otherwise redirected) now honestly fails the spawn with `ProcessError.Spawn` instead of silently handing the child a broken std handle; the handle-close cleanup no longer risks calling `CloseHandle` on an invalid handle; and a handle already created for one stdio stream is no longer leaked if setting up the other one throws afterwards.
 
 ## [2.0.0] - 2026-07-06
 
