@@ -268,12 +268,24 @@ module internal Windows =
         nativeint hTemplateFile
     )
 
+    /// `true` for a real, usable Win32 handle — `false` for the two "nothing here" sentinels
+    /// (`IntPtr.Zero`/`INVALID_HANDLE_VALUE`) that `GetStdHandle`/`CreateFileW`/`DuplicateHandle`
+    /// return on failure or "no such handle". Shared by the handle validation at the
+    /// `STARTUPINFO` boundary and by every place that closes one of these handles, so a cleanup
+    /// path can never call `CloseHandle` on a sentinel.
+    let private isValidHandle (handle: nativeint) : bool =
+        handle <> IntPtr.Zero && handle <> nativeint INVALID_HANDLE_VALUE
+
+    let private closeHandleIfValid (handle: nativeint) =
+        if isValidHandle handle then
+            CloseHandle handle |> ignore
+
     /// An inheritable handle to the null device, for `StdioMode.Null`.
     let private inheritableNul (access: uint32) : nativeint =
         let handle =
             CreateFileW("NUL", access, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, 0u, IntPtr.Zero)
 
-        if handle <> IntPtr.Zero && handle <> nativeint INVALID_HANDLE_VALUE then
+        if isValidHandle handle then
             SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) |> ignore
 
         handle
@@ -641,6 +653,14 @@ module internal Windows =
     // from colliding; the actual cross-inherit hazard (ANY inheritable handle open at `CreateProcessW`
     // time) is still guarded by `windowsSpawnLock` below, exactly as for the anonymous pipes this
     // replaces — switching pipe kinds does not touch that invariant.
+    /// Wraps a raw Win32 handle for the pipe-setup unwind list (`createdPipes` in `spawnWindowsCore`):
+    /// `Dispose` closes it, guarded by `closeHandleIfValid` — the list is a rescue mechanism run from
+    /// an exception handler, so it must never call `CloseHandle` on a sentinel that was never really
+    /// opened.
+    let private disposableHandle (handle: nativeint) : IDisposable =
+        { new IDisposable with
+            member _.Dispose() = closeHandleIfValid handle }
+
     let private createAsyncPipePair (serverDirection: PipeDirection) : NamedPipeServerStream * NamedPipeClientStream =
         let pipeName = "ProcessKit-" + Guid.NewGuid().ToString("N")
 
@@ -728,15 +748,32 @@ module internal Windows =
                     client.SafePipeHandle.DangerousGetHandle(), Some(server :> Stream), (fun () -> client.Dispose())
                 | StdioMode.Null ->
                     let handle = inheritableNul GENERIC_WRITE
-                    handle, None, (fun () -> CloseHandle handle |> ignore)
+
+                    if not (isValidHandle handle) then
+                        // Validated at the source, before this ever reaches `STARTUPINFO.hStdOutput`/
+                        // `hStdError` — a NUL-device handle is not the sort of thing that should be
+                        // handed to the child silently broken. Caught by the outer `with` below, which
+                        // turns it into an honest `ProcessError.Spawn` instead of a fabricated success.
+                        let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                        failwith $"could not open an inheritable handle to the NUL device: {message}"
+
+                    // Registered in the unwind list immediately: if the NEXT step in this same spawn
+                    // (the `setupOut` call for stderr, when this was stdout's) throws afterwards, this
+                    // handle has not been handed to a child yet and must not leak.
+                    createdPipes.Add(disposableHandle handle)
+                    handle, None, (fun () -> closeHandleIfValid handle)
                 | StdioMode.Inherit ->
                     let handle = inheritableStdHandle stdHandleId
 
-                    handle,
-                    None,
-                    (fun () ->
-                        if handle <> IntPtr.Zero then
-                            CloseHandle handle |> ignore)
+                    if not (isValidHandle handle) then
+                        // Same rationale as the `Null` branch above: `GetStdHandle`/`DuplicateHandle`
+                        // failing (e.g. no console and this stream not redirected) must fail the spawn,
+                        // not silently hand the child a broken std handle.
+                        let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                        failwith $"could not duplicate an inheritable copy of the parent's std handle: {message}"
+
+                    createdPipes.Add(disposableHandle handle)
+                    handle, None, (fun () -> closeHandleIfValid handle)
 
             let outChild, outStream, outCleanup = setupOut config.StdoutMode STD_OUTPUT_HANDLE
             let errChild, errStream, errCleanup = setupOut config.StderrMode STD_ERROR_HANDLE
