@@ -19,6 +19,7 @@ pipe-friendly `Command.*` mirror (`Command.timeout`, `Command.retry`,
 
 - [Timeouts](#timeouts)
 - [Graceful timeout](#graceful-timeout)
+- [Idle timeout](#idle-timeout)
 - [Captured vs raised: the decision table](#captured-vs-raised-the-decision-table)
 - [Retries](#retries)
 - [Cancellation](#cancellation)
@@ -146,6 +147,71 @@ await cmd.OutputStringAsync();
 `SIGKILL`ed after the grace — the deadline is what fired. **On Windows there is no
 signal tier:** `TimeoutGrace` is accepted but the deadline kills the Job Object
 atomically, so the grace window has no effect there.
+
+## Idle timeout
+
+`Command.Timeout` bounds the **total** run length. The other common failure is a run
+that is still alive but *stuck* — it has stopped producing output. `Command.IdleTimeout(duration)`
+(mirror: `Command.idleTimeout`) catches exactly that: it kills the tree when **neither
+stdout nor stderr** produces output for `duration`. Every chunk of output **resets** the
+deadline, so a run that keeps streaming stays alive; one that goes quiet is killed.
+
+**F#**
+
+```fsharp
+task {
+    // Kill the build if it stops printing for 30s, however long it runs overall.
+    let cmd =
+        Command.create "long-build"
+        |> Command.idleTimeout (TimeSpan.FromSeconds 30.0)
+
+    match! cmd.OutputStringAsync() with
+    | Ok result when result.IsTimedOut -> eprintfn "stalled — no output for 30s"
+    | Ok result -> printfn $"exited {result.Code}"
+    | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+**C#**
+
+```csharp
+// Kill the build if it stops printing for 30s, however long it runs overall.
+var cmd = new Command("long-build")
+    .IdleTimeout(TimeSpan.FromSeconds(30));
+
+Console.WriteLine(await cmd.OutputStringAsync() switch
+{
+    { IsOk: true, ResultValue: { IsTimedOut: true } } => "stalled — no output for 30s",
+    { IsOk: true, ResultValue: var result }           => $"exited {result.Code}",
+    { IsOk: false, ErrorValue: var err }              => err.Message,
+});
+```
+
+Key facts:
+
+- **Same honest result as `Timeout`.** An idle kill surfaces as `Outcome.TimedOut` — so
+  `IsTimedOut` on the capture verbs and `ProcessError.Timeout` on the success-checking
+  verbs, exactly like the total timeout. At the API level the two are *not* distinguished
+  (both mean "killed on a deadline"); logs tell them apart (the message names an idle kill
+  and reports the idle window, under the same `ProcessTimedOut` event id).
+- **Byte granularity, every verb.** Activity is any output read from the child, measured in
+  bytes — so a single long line without a newline still counts as active, and it works
+  uniformly for the buffered capture verbs, the streaming verbs, the raw `OutputBytesAsync`,
+  and even the output-discarding `WaitAsync`/`ProfileAsync`. It is independent of
+  `StdoutLineCount`/`StderrLineCount`, which stay pure line counters.
+- **The idle clock starts when consumption begins** (the verb's exit wait), not at some
+  earlier construction, so a handle you drive later is not killed for a gap before you
+  started reading.
+- **Independent of `Timeout`.** Set both — each fires on its own condition, whichever comes
+  first, with a single kill and a single reported outcome (no double kill). `IdleTimeout`
+  honours `TimeoutGrace` (SIGTERM → grace → SIGKILL) exactly as `Timeout` does.
+- A negative `duration` is rejected (`ArgumentOutOfRangeException`); one larger than ~24.8
+  days is treated as no idle deadline (as with `Timeout`).
+
+Like `Command.Timeout`, a per-stage `Command.IdleTimeout` cannot bound one stage of a
+pipeline — a pipeline captures only the last stage's output and does not monitor per-stage
+activity — so `.Pipe` rejects it with an `ArgumentException` rather than silently ignoring
+it (see [Pipelines and clients](#pipelines-and-clients)).
 
 ## Captured vs raised: the decision table
 
@@ -425,8 +491,9 @@ timeout (`IsTimedOut` on `OutputStringAsync`, `Error` on `RunAsync`) — but, un
 command's *captured* timeout, there is no salvaged partial stdout to read back. A
 per-stage `Command.Timeout` cannot bound one stage of a chain — a pipeline spawns its
 stages directly, so a stage's own deadline never fires — so `.Pipe` rejects it with an
-`ArgumentException` instead of silently ignoring it. See [pipelines.md](pipelines.md)
-for the full chain model.
+`ArgumentException` instead of silently ignoring it. A per-stage `Command.IdleTimeout` is
+rejected the same way (a pipeline captures only the last stage's output and does not monitor
+per-stage activity). See [pipelines.md](pipelines.md) for the full chain model.
 
 A **`CliClient`** usually builds and consumes its `Command`s internally, so set
 the deadline and token **once on the client** and every command it builds carries
@@ -470,6 +537,7 @@ returned an `IsTimedOut` result.
 | You want | Reach for |
 |---|---|
 | "This run may not take longer than X" | `Command.Timeout` |
+| "Kill it if it stops producing output" | `Command.IdleTimeout` |
 | "Let it clean up before the kill" | `Command.Timeout` + `Command.TimeoutGrace` |
 | "This operation is flaky, try a few times" | `Command.Retry` |
 | "Stop everything when the app shuts down" | `Command.CancelOn` / a verb token + one shared token |

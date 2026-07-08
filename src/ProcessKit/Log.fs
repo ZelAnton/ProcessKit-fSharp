@@ -43,6 +43,16 @@ module internal Log =
             "processkit: {Program} timed out after {TimeoutMs}ms (run {RunId})"
         )
 
+    // Idle-timeout shares the `ProcessTimedOut` EventId (a consumer routing by id catches both kinds of
+    // deadline kill), but the human-readable message names it "idle" and reports the idle window rather
+    // than the total timeout, so a log reader can tell a no-output hang from a total-length overrun.
+    let private idleTimeoutMessage =
+        LoggerMessage.Define<string, double, string>(
+            LogLevel.Warning,
+            Events.ProcessTimedOut,
+            "processkit: {Program} idle-timed out after {IdleMs}ms with no output (run {RunId})"
+        )
+
     let private retryMessage =
         LoggerMessage.Define<string, int, double, string>(
             LogLevel.Debug,
@@ -86,6 +96,12 @@ module internal Log =
     let timeout (logger: ILogger option) (program: string) (deadline: TimeSpan) (runId: string) =
         match logger with
         | Some log -> timeoutMessage.Invoke(log, program, deadline.TotalMilliseconds, runId, null)
+        | None -> ()
+
+    /// A run was killed for producing no output for its idle deadline.
+    let idleTimeout (logger: ILogger option) (program: string) (idle: TimeSpan) (runId: string) =
+        match logger with
+        | Some log -> idleTimeoutMessage.Invoke(log, program, idle.TotalMilliseconds, runId, null)
         | None -> ()
 
     /// A failed run is being retried.

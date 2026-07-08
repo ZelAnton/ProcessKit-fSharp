@@ -45,6 +45,10 @@ type internal CommandConfig =
       StreamBuffer: StreamBufferPolicy option
       Timeout: TimeSpan option
       TimeoutGrace: TimeSpan option
+      // Opt-in idle deadline: kill the run when neither stdout nor stderr produces output for this long
+      // (each chunk of output resets it), independent of the total `Timeout`. `None` (the default) is no
+      // idle deadline. A pipeline stage cannot honour it (rejected by `PipelineStageGuard`).
+      IdleTimeout: TimeSpan option
       CancelOn: CancellationToken option
       Retry: (int * TimeSpan * Func<ProcessError, bool>) option
       // Explicit one-shot opt-out of retrying, distinct from `Retry = None` ("no policy set"). Set by
@@ -98,6 +102,7 @@ module internal CommandConfig =
           StreamBuffer = None
           Timeout = None
           TimeoutGrace = None
+          IdleTimeout = None
           CancelOn = None
           Retry = None
           RetryDisabled = false
@@ -340,6 +345,24 @@ type Command internal (config: CommandConfig) =
                 TimeoutGrace = Some grace }
         )
 
+    /// Kill the run when it produces **no output** — on neither stdout nor stderr — for `duration`,
+    /// reporting the result as `Outcome.TimedOut`. Every chunk of output resets the deadline, so a run
+    /// that keeps streaming stays alive; one that hangs after going quiet is killed. This is distinct
+    /// from `Timeout`, which bounds the *total* run length regardless of output: the two are
+    /// independent and may both be set, each firing on its own condition. Idle activity is measured at
+    /// byte granularity across every verb (buffered capture, streaming, raw bytes, and the drained
+    /// `WaitAsync`/`ProfileAsync`), so even a run whose output is discarded — or a single long
+    /// newline-free blob — counts as active. A negative `duration` is rejected
+    /// (`ArgumentOutOfRangeException`, matching `Timeout`); one larger than ~24.8 days is treated as no
+    /// idle deadline. Honours `TimeoutGrace` (a graceful stop, then a hard kill) exactly as `Timeout`.
+    member _.IdleTimeout(duration: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero)
+
+        Command(
+            { config with
+                IdleTimeout = Some duration }
+        )
+
     /// Also cancel the run when `cancellationToken` fires (in addition to any verb token). This binds the
     /// token to the **completion** verbs — `RunAsync`/`Output*`/`ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/`FirstLineAsync`:
     /// they drive the child to completion, so they watch the token for the whole run and turn a fired token
@@ -537,6 +560,10 @@ module Command =
 
     /// Terminate gracefully on timeout, force-killing only after `grace`.
     let timeoutGrace (grace: TimeSpan) (command: Command) = command.TimeoutGrace grace
+
+    /// Kill the run when it produces no output (stdout or stderr) for `duration` — reset by each chunk
+    /// of output — independent of the total `Command.Timeout`.
+    let idleTimeout (duration: TimeSpan) (command: Command) = command.IdleTimeout duration
 
     /// Also cancel the run when `cancellationToken` fires.
     let cancelOn (cancellationToken: CancellationToken) (command: Command) = command.CancelOn cancellationToken
