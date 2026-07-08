@@ -1,8 +1,6 @@
 namespace ProcessKit.Testing
 
 open System
-open System.Threading
-open System.Threading.Tasks
 open ProcessKit
 
 /// A subprocess-free `IProcessRunner` for tests: match commands to scripted `Reply`s.
@@ -12,6 +10,38 @@ open ProcessKit
 /// stub fails the test loudly rather than silently returning a default.
 [<Sealed>]
 type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: Reply option) =
+
+    // Resolve the matched reply, and either surface its error override or build the in-memory
+    // `FakeProcess` that every seam path shares — so all three verbs agree byte-for-byte with a real
+    // run (line-ending normalization, the command's encoding, `OkCodes`, output-buffer truncation)
+    // and differ only in the final projection `Seam.runner` applies. Cancellation and that projection
+    // are shared with `DryRunRunner` via `Seam`, not duplicated here.
+    let resolve (command: Command) : Result<RunningProcess, ProcessError> =
+        let matched =
+            rules
+            |> List.tryPick (fun (predicate, reply) -> if predicate command then Some reply else None)
+
+        let reply =
+            match matched with
+            | Some reply -> reply
+            | None ->
+                match fallback with
+                | Some reply -> reply
+                | None -> invalidOp $"ScriptedRunner: no scripted reply matched command '{command.Program}'."
+
+        match reply.ErrorOverride with
+        | Some error -> Error error
+        | None ->
+            Ok(
+                FakeProcess
+                    .OfCommand(command)
+                    .WithStdout(reply.StdoutText)
+                    .WithStderr(reply.StderrText)
+                    .WithOutcome(reply.Outcome)
+                    .Build()
+            )
+
+    let seam = Seam.runner resolve
 
     /// An empty runner. Add rules with `On`/`When`, and a catch-all with `Fallback`.
     new() = ScriptedRunner([], None)
@@ -33,52 +63,12 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
     /// Reply to any command not matched by a rule.
     member _.Fallback(reply: Reply) = ScriptedRunner(rules, Some reply)
 
-    member private _.Resolve(command: Command) : Reply =
-        match
-            rules
-            |> List.tryPick (fun (predicate, reply) -> if predicate command then Some reply else None)
-        with
-        | Some reply -> reply
-        | None ->
-            match fallback with
-            | Some reply -> reply
-            | None -> invalidOp $"ScriptedRunner: no scripted reply matched command '{command.Program}'."
-
-    // Guard cancellation, resolve the matched reply, and either surface its error override or build the
-    // in-memory `FakeProcess` that every seam path shares — so all three verbs agree byte-for-byte with
-    // a real run (line-ending normalization, the command's encoding, `OkCodes`, output-buffer
-    // truncation) and differ only in the final projection below. A cancelled run is always an error,
-    // matching `JobRunner` / `ProcessGroup`, so the cancelled path is testable through the scripted seam.
-    member private this.Serve
-        (command: Command, cancellationToken: CancellationToken)
-        : Result<RunningProcess, ProcessError> =
-        if cancellationToken.IsCancellationRequested then
-            Error(ProcessError.Cancelled command.Program)
-        else
-            let reply = this.Resolve command
-
-            match reply.ErrorOverride with
-            | Some error -> Error error
-            | None ->
-                Ok(
-                    FakeProcess
-                        .OfCommand(command)
-                        .WithStdout(reply.StdoutText)
-                        .WithStderr(reply.StderrText)
-                        .WithOutcome(reply.Outcome)
-                        .Build()
-                )
-
     interface IProcessRunner with
-        member this.CaptureStringAsync(command, cancellationToken) =
-            match this.Serve(command, cancellationToken) with
-            | Ok running -> running.OutputStringAsync()
-            | Error error -> Task.FromResult(Error error)
+        member _.CaptureStringAsync(command, cancellationToken) =
+            seam.CaptureStringAsync(command, cancellationToken)
 
-        member this.SpawnAsync(command, cancellationToken) =
-            Task.FromResult(this.Serve(command, cancellationToken))
+        member _.SpawnAsync(command, cancellationToken) =
+            seam.SpawnAsync(command, cancellationToken)
 
-        member this.CaptureBytesAsync(command, cancellationToken) =
-            match this.Serve(command, cancellationToken) with
-            | Ok running -> running.OutputBytesAsync()
-            | Error error -> Task.FromResult(Error error)
+        member _.CaptureBytesAsync(command, cancellationToken) =
+            seam.CaptureBytesAsync(command, cancellationToken)
