@@ -185,7 +185,8 @@ await group.ShutdownAsync(TimeSpan.FromSeconds(5)); // graceful: SIGTERM → wai
 This README is the quick tour. The **[`docs/` guide set](docs/README.md)** goes deeper on every
 capability, with more examples and the platform fine print collected in one place. New here? Skim
 the [Cookbook](docs/cookbook.md) first — it maps "I want to …" tasks to working snippets — then
-read [Running commands](docs/commands.md) end to end:
+read [Running commands](docs/commands.md) end to end. For a member-by-member lookup instead of a
+narrative guide, browse the generated **[API reference](https://zelanton.github.io/ProcessKit-fSharp/)**.
 
 | Guide | Covers |
 |---|---|

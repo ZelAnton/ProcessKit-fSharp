@@ -12,8 +12,8 @@ Shipped changes are in [`CHANGELOG.md`](CHANGELOG.md).
   `OutputBytes` / `ExitCode` / `Probe` / `Parse` / `TryParse` / `FirstLine` / `Start`), with honest
   results (a non-zero exit is data until you ask for success) and a typed `ProcessError`.
 - A live **`RunningProcess`**: line streaming (`StdoutLines` / `OutputEvents`), interactive stdin,
-  readiness probes (`WaitForLine` / `WaitForPort` / `WaitFor`), racing (`WaitAny` / `WaitAll`), and
-  per-run profiling.
+  readiness probes (`WaitForLine` / `WaitForPort` / `WaitFor`), racing (`WaitAny` / `WaitAll`),
+  per-run profiling, and stopping — `Kill` (immediate) or `StopAsync` (graceful SIGTERM → grace → SIGKILL).
 - Shell-free **`Pipeline`s** with pipefail semantics.
 - **`Supervisor`** — restart policies, exponential backoff + jitter, and a failure-storm guard.
 - Tree control on **`ProcessGroup`** (`Signal` / `Suspend` / `Resume` / `Members` / `KillAll` /

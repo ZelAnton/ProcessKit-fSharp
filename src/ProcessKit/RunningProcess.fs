@@ -125,6 +125,12 @@ type RunningProcess internal (host: RunningHost) =
     let mutable exitStarted = false
     let mutable exitTaskValue = Unchecked.defaultof<Task<Outcome>>
 
+    // 0 = no `StopAsync` has fired the soft-kill yet; `Interlocked.Exchange` flips it to 1 for the
+    // first one. A repeat `StopAsync` (or one racing a `Dispose` that already reaped the container)
+    // then skips re-entering the native graceful kill on an already-released container and only awaits
+    // the same exit outcome — the once-guard that makes `StopAsync` idempotent.
+    let mutable stopStarted = 0
+
     // The event-streaming session's single combined outcome (waiting for exit + draining both pipes via
     // the two pumps). ExitTask reuses it for an `EventStreaming` handle so it does not start a second,
     // racing set of drains on the same streams.
@@ -421,6 +427,65 @@ type RunningProcess internal (host: RunningHost) =
     /// Signal the process tree to die without waiting (fire-and-forget, like `Process.Kill()`); the
     /// tree is fully reaped when the handle is disposed. For a blocking kill, dispose the handle.
     member _.Kill() = host.StartKill()
+
+    // The grace window the parameterless `StopAsync()` uses — 2 seconds, matching
+    // `ProcessGroupOptions.ShutdownTimeout`'s default so a live handle and its owning group agree on
+    // how long a soft stop waits before escalating. Private: it is a documented default, not new
+    // public surface.
+    static member private DefaultStopGrace = TimeSpan.FromSeconds 2.0
+
+    /// Gracefully stop the process tree, then reap it: send the child a soft signal (SIGTERM), wait
+    /// up to `gracePeriod` for it to exit on its own, then hard-kill whatever is still alive — the
+    /// same graceful-kill machinery `Command.TimeoutGrace` and `ProcessGroup.ShutdownAsync` drive.
+    /// Returns the honest `Outcome` of how the child *actually* concluded (a clean `Exited` if it
+    /// obeyed the signal, otherwise a `Signalled`/`Exited` from the escalated kill); a non-zero or
+    /// killed exit is data, never a raised error. Unlike the fire-and-forget `Kill()`, this awaits the
+    /// stop and tears the tree down before returning, so it is a terminal verb like `WaitAsync`.
+    ///
+    /// This drains the child's stdout/stderr while it shuts down (a child blocked writing to a full
+    /// pipe would otherwise ignore the soft signal until it could flush). If a streaming or capturing
+    /// verb already owns the pipes, `StopAsync` reuses that session's wait rather than starting a
+    /// second reader on them, so it is safe to call after `StdoutLinesAsync`/`OutputEventsAsync` or
+    /// concurrently with an in-flight `FinishAsync`/`WaitAsync`. Idempotent and race-safe with `Kill`,
+    /// `Dispose`, and a repeat `StopAsync`: the tree is reaped exactly once.
+    ///
+    /// **Platform / shared-group degradation (no new silent downgrade).** A soft signal needs a
+    /// mechanism that has one. On **Windows** there is no per-tree graceful signal, so `gracePeriod`
+    /// is skipped and this is the atomic Job kill — exactly as `Command.TimeoutGrace` and
+    /// `ProcessGroup.ShutdownAsync` already degrade there (a console child can still get a best-effort
+    /// CTRL+BREAK via `Command.WindowsCtrlSignals()` + `ProcessGroup.Signal`). On a **shared** group
+    /// (a handle from `ProcessGroup.StartAsync`, where the group — not the handle — owns the tree)
+    /// there is no per-child graceful signal either, so this immediately hard-kills just this child
+    /// (like `Kill()`), matching the documented `TimeoutGrace` fallback for a shared group. A handle
+    /// from the default runner (`Command.StartAsync()` / `IProcessRunner.SpawnAsync`) owns a private
+    /// group and gets the full SIGTERM → grace → SIGKILL on Unix.
+    member this.StopAsync(gracePeriod: TimeSpan) : Task<Outcome> =
+        task {
+            use _reap = reapGuard ()
+            // Begin (or reuse) the exit wait BEFORE signalling, so the pipes are drained while the
+            // child shuts down. `ExitTask` reuses whichever consumption already owns the pipes (a
+            // streaming session, or an in-flight buffered verb) rather than racing a second reader,
+            // and claims a fresh buffered drain only when no verb has run yet. It never reaps.
+            let exitTask = this.ExitTask
+            // Ask the tree to stop: soft signal, wait up to `gracePeriod`, then hard-kill the remainder
+            // — reusing `host.GracefulKill`, the timeout machinery's own escalation. Degrades to the
+            // documented immediate child/tree kill on Windows or a shared group (see the doc above).
+            // Fired at most once (a repeat `StopAsync` only awaits the outcome), so it never re-enters
+            // the native kill on a container a prior stop/`Dispose` already released.
+            if Interlocked.Exchange(&stopStarted, 1) = 0 then
+                do! host.GracefulKill gracePeriod
+
+            let! outcome = exitTask
+            // Record the run as completed (once-guarded: a no-op if a concurrent terminal verb sharing
+            // the same wait already concluded it). Return the honest outcome; a killed/non-zero exit is
+            // data, so this never raises for the stop itself.
+            conclude outcome
+            return outcome
+        }
+
+    /// `StopAsync` using the default 2-second grace window (matching `ProcessGroupOptions.ShutdownTimeout`).
+    member this.StopAsync() : Task<Outcome> =
+        this.StopAsync RunningProcess.DefaultStopGrace
 
     /// Run to completion, capturing stdout as decoded text. A non-zero exit is data; the tree is
     /// reaped when the call returns.

@@ -8,6 +8,13 @@
 				"fantomas"
 			],
 			"rollForward": true
+		},
+		"fsdocs-tool": {
+			"version": "22.1.0",
+			"commands": [
+				"fsdocs"
+			],
+			"rollForward": false
 		}
 	}
 }

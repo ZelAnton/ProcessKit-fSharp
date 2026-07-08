@@ -52,6 +52,10 @@
 
 	<ItemGroup>
 		<!-- See the library .fsproj: explicit FSharp.Core is required under CPM. -->
+		<PackageReference Include="coverlet.collector">
+			<PrivateAssets>all</PrivateAssets>
+			<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+		</PackageReference>
 		<PackageReference Include="FSharp.Core" />
 		<PackageReference Include="FsCheck" />
 		<PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />

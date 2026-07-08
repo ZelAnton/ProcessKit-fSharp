@@ -83,6 +83,21 @@ there is nothing to stream. The live gauges `Pid`, `Elapsed`, `StartTime`,
 mid-stream. There is also `Kill()` — "stop it now, I'll `WaitAsync()` for the
 `Outcome` myself" — which begins teardown without blocking.
 
+To stop a long-running child *cleanly* — let it flush logs, release locks, and run its
+shutdown hooks — use `StopAsync(gracePeriod)` (or `StopAsync()` for a 2-second default,
+matching `ProcessGroupOptions.ShutdownTimeout`). It sends the tree a soft signal (SIGTERM),
+waits up to the grace window for it to exit on its own, then hard-kills whatever is still
+alive, reaps the tree, and returns the honest `Outcome` — the same SIGTERM → grace → SIGKILL
+escalation as [`Command.TimeoutGrace`](timeouts-and-cancellation.md) and
+[`ProcessGroup.ShutdownAsync`](process-groups.md). It drains the child's output while it
+shuts down and reuses an in-flight streaming/capturing session's wait, so it is safe to call
+after `StdoutLinesAsync()`/`OutputEventsAsync()` or alongside `FinishAsync`/`WaitAsync`, and
+is idempotent with `Kill`/`Dispose`. A soft signal needs a mechanism that has one: on
+**Windows** (no per-tree graceful signal) and on a **shared** group from
+`group.StartAsync(cmd)` (no per-child graceful signal) the grace is skipped and the child is
+hard-killed at once — exactly as `TimeoutGrace` already degrades there. A handle from
+`StartAsync()` (its own private group) gets the full graceful stop on Unix.
+
 A command's [`Timeout`](timeouts-and-cancellation.md) and `CancelOn` token **bound
 the stream**: at the deadline (or on cancellation) the tree is killed, the pipes
 close, and the stream ends — a streamed run can't hang past its deadline. After a

@@ -1,0 +1,128 @@
+name: Docs
+
+# Publish the browsable API reference to GitHub Pages.
+#
+# TRIGGER CHOICE: on a published GitHub Release, not on every push to main. The
+# reference is generated from the XML doc comments of the two SHIPPING packages
+# (ProcessKit, ProcessKit.Extensions.DependencyInjection), so it is meant to track
+# what a consumer actually installed from NuGet — a release-triggered site never
+# shows an API surface that has not shipped yet, and it does not rebuild/redeploy
+# on every ordinary commit to main (docs-only edits, internal refactors, work in
+# progress between releases). workflow_dispatch is kept for a manual rebuild (e.g.
+# after editing this workflow, or apidocs/index.md, without cutting a release).
+#
+# GENERATOR CHOICE: fsdocs (FSharp.Formatting), not docfx. This repository's public
+# surface is F#-authored (curried module functions, discriminated unions, `'T`
+# generics) and fsdocs renders those natively and readably (e.g.
+# `Command.arg value command`, `Result<int, ProcessError>`); docfx's metadata-based
+# renderer is built around C# conventions and reads F#-specific shapes awkwardly. A
+# C# reader still gets a correct, idiomatic call from the guides in `docs/`
+# (linked from `apidocs/index.md`) for the handful of members (the `CommandVerbs`
+# extension methods) where the F#-native rendering looks like a static call instead
+# of C#'s dot-syntax — documented on the generated front page.
+#
+# This workflow does not modify ci.yml/release.yml — it only adds a new,
+# independent publishing pipeline scoped to the doc site.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Only one Pages deployment may be in flight at a time; never cancel one that is
+# already uploading/activating (unlike CI, a half-applied Pages deploy is not a
+# safe thing to abandon mid-flight).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to a full commit SHA (supply-chain hardening); the
+      # trailing comment records the human-readable version. Dependabot bumps the
+      # SHA and updates the comment on its weekly run.
+      #
+      # No explicit `ref:` — the default checkout ref is already correct for both
+      # triggers: a `release: published` event's ref is the release's tag, and
+      # workflow_dispatch defaults to whatever ref is chosen in the UI (main).
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          # Only the SDK band matters here (pinned by global.json) — this workflow
+          # builds Release assemblies for fsdocs to read, it does not run tests, so
+          # the net8.0 runtime is not needed the way it is in ci.yml's test job.
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Directory.Packages.props', 'nuget.config', 'global.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      # Restores fsdocs-tool alongside Fantomas (.config/dotnet-tools.json).
+      - name: Restore local tools
+        run: dotnet tool restore
+
+      - name: Restore
+        run: dotnet restore
+
+      # fsdocs reads each project's built DLL + XML doc file. ProcessKit.Extensions.DependencyInjection
+      # resolves ProcessKit via Reference + AssemblySearchPaths (not ProjectReference,
+      # per this repo's convention), so ProcessKit must already be built at the same
+      # Configuration for that path to exist — building the whole solution up front
+      # (build order comes from ProcessKit.slnx's BuildDependency entries) guarantees it.
+      - name: Build
+        run: dotnet build ProcessKit.slnx --no-restore --configuration Release
+
+      # Resolves the real Pages base URL (e.g. https://zelanton.github.io/ProcessKit-fSharp/)
+      # so generated absolute links/assets are correct without hardcoding it here —
+      # also works unchanged if a custom domain is ever configured for Pages.
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      # --projects scopes the reference to the two shipping packages named in the
+      # task (ProcessKit, ProcessKit.Extensions.DependencyInjection) — ProcessKit.Testing
+      # (test doubles, not part of the runtime surface a consumer builds against) and
+      # the benchmarks project are intentionally excluded.
+      #
+      # --sourcerepo / fsdocs-license-link / fsdocs-release-notes-link override
+      # fsdocs' own defaults, which point at a `master` branch and a RELEASE_NOTES.md
+      # file this repo does not have (it uses `main` and CHANGELOG.md instead).
+      - name: Build API reference (fsdocs)
+        run: >-
+          dotnet fsdocs build
+          --input apidocs
+          --output apidocs/output
+          --projects src/ProcessKit/ProcessKit.fsproj src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj
+          --properties Configuration=Release
+          --sourcerepo https://github.com/${{ github.repository }}/tree/main
+          --parameters
+          root "${{ steps.pages.outputs.base_url }}/"
+          fsdocs-collection-name "ProcessKit API Reference"
+          fsdocs-license-link "https://github.com/${{ github.repository }}/blob/main/LICENSE"
+          fsdocs-release-notes-link "https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md"
+          --clean
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: apidocs/output
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
