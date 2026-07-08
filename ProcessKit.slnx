@@ -5,6 +5,11 @@
 			<BuildDependency Project="src/ProcessKit.Testing/ProcessKit.Testing.fsproj" />
 			<BuildDependency Project="src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj" />
 		</Project>
+		<Project Path="tests/ProcessKit.CSharp.Tests/ProcessKit.CSharp.Tests.csproj">
+			<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
+			<BuildDependency Project="src/ProcessKit.Testing/ProcessKit.Testing.fsproj" />
+			<BuildDependency Project="src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj" />
+		</Project>
 	</Folder>
 	<Project Path="src/ProcessKit/ProcessKit.fsproj" />
 	<Project Path="src/ProcessKit.Testing/ProcessKit.Testing.fsproj">
