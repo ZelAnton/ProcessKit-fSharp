@@ -208,6 +208,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// Start `command` into this shared group and return a live `RunningProcess`. The **group** owns
     /// the child's lifetime: disposing the returned process detaches its I/O but does not kill it —
     /// reap the tree with `ShutdownAsync`/`Dispose`, or this one run with its `Kill`.
+    ///
+    /// `cancellationToken` is checked once, before the spawn (an already-cancelled token reports
+    /// `ProcessError.Cancelled` and starts nothing); once the child is running the token is not tracked —
+    /// this live handle is caller-driven, so kill or reap it yourself. (The capture/completion verbs on a
+    /// `ProcessGroup` do watch the token — and the command's `CancelOn` — for the whole run.)
     member this.StartAsync
         (command: Command, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<RunningProcess, ProcessError>> =

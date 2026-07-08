@@ -66,6 +66,10 @@ type ProcessRunnerExtensions =
         Runner.probe runner cancellationToken command
 
     /// Start the command and return a live `RunningProcess`. Forwards to the runner's `SpawnAsync` seam.
+    /// `cancellationToken` is checked once, before the spawn (an already-cancelled token reports
+    /// `ProcessError.Cancelled` and starts nothing); after the child is running neither it nor the
+    /// command's `CancelOn` token is tracked — drive and cancel the live handle yourself (dispose it or
+    /// call its `Kill`). The completion verbs, by contrast, watch the token for the whole run.
     [<Extension>]
     static member StartAsync
         (runner: IProcessRunner, command: Command, [<Optional>] cancellationToken: CancellationToken)

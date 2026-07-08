@@ -375,7 +375,7 @@ The contract, path by path:
 | Situation | Behavior |
 |---|---|
 | Cancel during `RunAsync` / `OutputStringAsync` / `OutputBytesAsync` / `ExitCodeAsync` / `ProbeAsync` / `ParseAsync` | tree killed → `Error (ProcessError.Cancelled program)` |
-| Cancel during streaming (`StdoutLinesAsync`) | the stream **ends**; the following `FinishAsync()` reports `ProcessError.Cancelled` |
+| Cancel on a live handle (`StdoutLinesAsync`/`FinishAsync` after `StartAsync`) | **not tracked** — the token is checked only before the spawn, and a live handle is caller-driven. `Kill`/dispose the handle yourself (or register the token to call `Kill`); ProcessKit does not kill the child or surface `Cancelled` for you here |
 | Token already cancelled **before** the run | short-circuits before spawning — no process is ever created |
 | `FirstLineAsync` mid-run | surfaces `ProcessError.Cancelled` once the token fires (not `Ok None`) |
 | Under `Retry` | terminal — the built-in classifiers reject `Cancelled` and the loop stops re-trying |

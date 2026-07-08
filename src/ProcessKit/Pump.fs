@@ -180,6 +180,40 @@ module internal Pump =
 
             result
 
+    /// Append the run `buffer[start .. stop-1]` to `line`, force-flushing it to `onLine` whenever it
+    /// reaches `cap` characters. Batched: append up to the remaining budget (`cap - line.Length`) in
+    /// one `StringBuilder.Append(char[], int, int)` call; if the run isn't fully consumed yet, flush
+    /// the now-full line, append exactly the one character that tripped the cap (an unconditional
+    /// post-check append, so even a cap of 0 still makes progress), and repeat for the remainder of
+    /// the run. The one definition of the force-flush-at-cap algorithm, shared by `readLines`'s `Lf`
+    /// hot path and its CR-aware path's `appendRun` (a multi-character run) and `appendChar` (a
+    /// single character passed as a one-element range, so a deferred '\r'/'\n' that no longer lives
+    /// at its original `charBuffer` position still goes through the same logic).
+    let private appendCapped
+        (line: StringBuilder)
+        (buffer: char[])
+        (start: int)
+        (stop: int)
+        (cap: int)
+        (onLine: string -> ValueTask)
+        : Task =
+        task {
+            let mutable p = start
+
+            while p < stop do
+                if line.Length >= cap then
+                    do! onLine (line.ToString())
+                    line.Clear() |> ignore
+                    line.Append buffer[p] |> ignore
+                    p <- p + 1
+                else
+                    let budget = cap - line.Length
+                    let take = min budget (stop - p)
+                    line.Append(buffer, p, take) |> ignore
+                    p <- p + take
+        }
+        :> Task
+
     /// Read `stream` to EOF: tee the raw bytes (if a sink is set), decode with `encoding`, split into
     /// lines under `terminator`, and pass each complete line — including a final unterminated one — to
     /// `onLine`. `terminator` decides where a line ends: `Lf` (the default) splits on `\n` only,
@@ -254,26 +288,11 @@ module internal Pump =
 
                                 pos <- runEnd
                             | Some cap ->
-                                // Replicate the per-character force-flush at the cap, but batched: append up
-                                // to `cap - line.Length` characters at once, then — if the run isn't fully
-                                // consumed yet — flush the now-full line, append exactly the one character
-                                // that tripped the cap (matching the original's unconditional post-check
-                                // append), and repeat for the remainder of the run.
-                                let mutable p = pos
-
-                                while p < runEnd do
-                                    if line.Length >= cap then
-                                        do! onLine (line.ToString())
-                                        line.Clear() |> ignore
-                                        line.Append charBuffer[p] |> ignore
-                                        p <- p + 1
-                                    else
-                                        let budget = cap - line.Length
-                                        let take = min budget (runEnd - p)
-                                        line.Append(charBuffer, p, take) |> ignore
-                                        p <- p + take
-
-                                pos <- p
+                                // `appendCapped` batches the per-character force-flush at the cap (see its
+                                // doc comment); it always advances through the whole run, so `pos` lands on
+                                // `runEnd` exactly as the inline version's `p` used to.
+                                do! appendCapped line charBuffer pos runEnd cap onLine
+                                pos <- runEnd
 
                             if newlineIndex >= 0 then
                                 if line.Length > 0 && line[line.Length - 1] = '\r' then
@@ -305,17 +324,21 @@ module internal Pump =
                         line.Clear() |> ignore
                     }
 
+                // A single deferred content character (a lone '\r' or '\n') never lives at a stable
+                // `charBuffer` position of its own — `pendingCr` can carry it across a read boundary,
+                // past whatever the next `decoder.GetChars` overwrites `charBuffer` with — so
+                // `appendChar` stages it here as a one-element range and routes it through the same
+                // `appendCapped` helper the runs below use.
+                let oneChar = Array.zeroCreate<char> 1
+
                 // Append one content character, honouring the `maxLineLength` force-flush.
                 let appendChar (c: char) =
                     task {
                         match maxLineLength with
                         | None -> line.Append c |> ignore
                         | Some cap ->
-                            if line.Length >= cap then
-                                do! onLine (line.ToString())
-                                line.Clear() |> ignore
-
-                            line.Append c |> ignore
+                            oneChar[0] <- c
+                            do! appendCapped line oneChar 0 1 cap onLine
                     }
 
                 // Append the content run `charBuffer[start .. stop-1]`, honouring the force-flush (the
@@ -326,20 +349,7 @@ module internal Pump =
                         | None ->
                             if stop > start then
                                 line.Append(charBuffer, start, stop - start) |> ignore
-                        | Some cap ->
-                            let mutable p = start
-
-                            while p < stop do
-                                if line.Length >= cap then
-                                    do! onLine (line.ToString())
-                                    line.Clear() |> ignore
-                                    line.Append charBuffer[p] |> ignore
-                                    p <- p + 1
-                                else
-                                    let budget = cap - line.Length
-                                    let take = min budget (stop - p)
-                                    line.Append(charBuffer, p, take) |> ignore
-                                    p <- p + take
+                        | Some cap -> do! appendCapped line charBuffer start stop cap onLine
                     }
 
                 while reading do

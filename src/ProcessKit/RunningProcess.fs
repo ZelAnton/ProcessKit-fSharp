@@ -5,7 +5,6 @@ open System.Collections.Generic
 open System.Diagnostics
 open System.IO
 open System.Net
-open System.Net.Sockets
 open System.Runtime.ExceptionServices
 open System.Runtime.InteropServices
 open System.Threading
@@ -95,43 +94,17 @@ type RunningProcess internal (host: RunningHost) =
     // it, so it owns no timer — there is nothing to release, and skipping `Dispose` is safe.
     let disposalCts = new CancellationTokenSource()
 
-    // A bounded channel for an opt-in `StreamBufferPolicy`. `SingleReader = false` regardless of
-    // `FullMode` (not just for `DropOldest`, which needs the writer to evict via `Reader.TryRead`) —
-    // one uniform construction path is simpler than a mode-dependent one, and the cost only applies to
-    // an opt-in bounded stream, never to the default. Every full mode is otherwise implemented over
-    // `BoundedChannelFullMode.Wait`'s precise, non-blocking "is it full?" signal (`TryWrite`'s bool) —
-    // the channel's own built-in Drop full-modes always report `TryWrite` success, which would hide
-    // whether a drop actually happened.
-    let boundedOptions (capacity: int) (singleWriter: bool) =
-        BoundedChannelOptions(
-            capacity,
-            SingleReader = false,
-            SingleWriter = singleWriter,
-            FullMode = BoundedChannelFullMode.Wait
-        )
-
-    // Single-reader/single-writer *unbounded* channels remain the unconditional default: each is
-    // consumed by exactly one reader, and the stdout channel is written by exactly one pump (the event
-    // channel by two), selecting the faster single-consumer channel implementation. Opting in to
-    // `Command.StreamBuffer` switches both to the bounded construction above instead.
-    let stdoutChannel: Channel<string> =
-        match config.StreamBuffer with
-        | Some policy -> Channel.CreateBounded<string>(boundedOptions policy.Capacity true)
-        | None -> Channel.CreateUnbounded<string>(UnboundedChannelOptions(SingleReader = true, SingleWriter = true))
+    // The streaming channels and their policy-aware writer live in `StreamChannel`: the stdout channel
+    // is written by exactly one pump, the event channel by two (stdout + stderr), and either is bounded
+    // when `config.StreamBuffer` opts in (else unbounded, as before).
+    let stdoutChannel: Channel<string> = StreamChannel.create config.StreamBuffer true
 
     let eventChannel: Channel<OutputEvent> =
-        match config.StreamBuffer with
-        | Some policy -> Channel.CreateBounded<OutputEvent>(boundedOptions policy.Capacity false)
-        | None ->
-            Channel.CreateUnbounded<OutputEvent>(UnboundedChannelOptions(SingleReader = true, SingleWriter = false))
+        StreamChannel.create config.StreamBuffer false
 
-    // Write one item to a (possibly bounded) channel per `config.StreamBuffer` (`None` = today's
-    // unbounded `TryWrite`, unchanged). `Backpressure` awaits room via `WriteAsync`, bounded to
+    // Write one item to a streaming channel per `config.StreamBuffer` (see `StreamChannel.writeItem`):
+    // unbounded `TryWrite` when unset, else backpressure / drop / fail-loud. Bound `Backpressure` to
     // `disposalCts.Token` so an abandoned bounded stream's writer can't outlive this handle.
-    // `DropNewest`/`DropOldest` keep the channel's item count bounded losslessly but the CONTENT is
-    // lossy, bumping `onDrop`. `Error` faults the pump with `ProcessError.OutputTooLarge` once full —
-    // reusing the exact fault path a throwing per-line handler already goes through (the caller's
-    // `try`/`with` completes the channel and re-raises).
     let writeStreamItem
         (writer: ChannelWriter<'T>)
         (reader: ChannelReader<'T>)
@@ -139,58 +112,15 @@ type RunningProcess internal (host: RunningHost) =
         (onDrop: unit -> unit)
         (item: 'T)
         : ValueTask =
-        match config.StreamBuffer with
-        | None ->
-            writer.TryWrite item |> ignore
-            ValueTask.CompletedTask
-        | Some policy ->
-            match policy.FullMode with
-            | StreamFullMode.Backpressure -> writer.WriteAsync(item, disposalCts.Token)
-            | StreamFullMode.DropNewest ->
-                if not (writer.TryWrite item) then
-                    onDrop ()
-
-                ValueTask.CompletedTask
-            | StreamFullMode.DropOldest ->
-                // Full: evict the oldest queued item ourselves — safe because bounded channels are
-                // always created with SingleReader = false — then retry, looping rather than retrying
-                // once: the event channel has two concurrent writers (stdout + stderr), so a sibling
-                // pump can refill the freed slot before our retry lands. Looping keeps `onDrop` exactly
-                // in step with actual evictions instead of under-counting on that race (a single-writer
-                // stdout-only stream always succeeds on the first iteration).
-                //
-                // Bounded to genuine progress: if a sibling pump has completed the channel (its own
-                // fault path — a throwing handler, a decode/IO error — calls `Writer.TryComplete ex`),
-                // both `TryRead` and `TryWrite` permanently return `false`; without this check the loop
-                // would spin forever (a livelock pinning a CPU core, and `eventOutcome`/`FinishAsync`
-                // would never complete). Capacity is always >= 1 (`StreamBufferPolicy.Bounded` rejects
-                // less), so a non-completed channel reporting `TryWrite` full always has something to
-                // evict — `TryRead` failing here is therefore only possible once the channel is done.
-                let mutable written = writer.TryWrite item
-                let mutable canRetry = true
-
-                while not written && canRetry do
-                    let evicted, _ = reader.TryRead()
-
-                    if evicted then
-                        onDrop ()
-                        written <- writer.TryWrite item
-                    else
-                        // Nothing left to evict and nowhere to write: the channel is done. This item
-                        // can't be delivered either way — count it dropped and stop instead of spinning.
-                        onDrop ()
-                        canRetry <- false
-
-                ValueTask.CompletedTask
-            | StreamFullMode.Error ->
-                if writer.TryWrite item then
-                    ValueTask.CompletedTask
-                else
-                    raise (
-                        ProcessException(
-                            ProcessError.OutputTooLarge(config.Program, Some policy.Capacity, None, countSoFar (), 0)
-                        )
-                    )
+        StreamChannel.writeItem
+            config.StreamBuffer
+            config.Program
+            disposalCts.Token
+            writer
+            reader
+            countSoFar
+            onDrop
+            item
 
     let mutable exitStarted = false
     let mutable exitTaskValue = Unchecked.defaultof<Task<Outcome>>
@@ -351,18 +281,6 @@ type RunningProcess internal (host: RunningHost) =
                 config.OnStderrLine
                 bumpStderrLine
         | None -> Task.FromResult(Pump.LineBuffer config.OutputBuffer)
-
-    // Pump one stream's lines through `onLine` until the stream ends — the streaming-verb analogue
-    // of `pumpToBuffer` (which captures to a `LineBuffer` instead). No-op when the stream isn't
-    // piped. The caller owns the sink (a channel writer, a buffer) and any completion signal.
-    let pumpLines (stream: Stream option) encoding terminator tee (onLine: string -> ValueTask) =
-        task {
-            match stream with
-            // No in-flight line cap for streaming: it is consumer-paced and applies no buffer policy, so
-            // a consumer receives whole lines (the in-flight cap is a buffered-verb concern).
-            | Some s -> do! Pump.readLinesUntilDone s encoding terminator tee onLine None CancellationToken.None
-            | None -> ()
-        }
 
     let tooLargeError (totalLines: int) (totalBytes: int) =
         ProcessError.OutputTooLarge(
@@ -744,7 +662,7 @@ type RunningProcess internal (host: RunningHost) =
                 task {
                     try
                         do!
-                            pumpLines
+                            StreamChannel.pumpLines
                                 host.Stdout
                                 config.StdoutEncoding
                                 config.StdoutLineTerminator
@@ -772,11 +690,16 @@ type RunningProcess internal (host: RunningHost) =
                 }
 
             let stderrPump =
-                pumpLines host.Stderr config.StderrEncoding config.StderrLineTerminator config.StderrTee (fun line ->
-                    invokeLine config.OnStderrLine line
-                    bumpStderrLine ()
-                    stderrBuffer.Add line
-                    ValueTask.CompletedTask)
+                StreamChannel.pumpLines
+                    host.Stderr
+                    config.StderrEncoding
+                    config.StderrLineTerminator
+                    config.StderrTee
+                    (fun line ->
+                        invokeLine config.OnStderrLine line
+                        bumpStderrLine ()
+                        stderrBuffer.Add line
+                        ValueTask.CompletedTask)
 
             streamOutcome <-
                 task {
@@ -846,7 +769,7 @@ type RunningProcess internal (host: RunningHost) =
                 task {
                     try
                         do!
-                            pumpLines stream encoding terminator tee (fun line ->
+                            StreamChannel.pumpLines stream encoding terminator tee (fun line ->
                                 invokeLine onLine line
                                 bump ()
 
@@ -986,39 +909,7 @@ type RunningProcess internal (host: RunningHost) =
         (endpoint: IPEndPoint, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull endpoint
-
-        task {
-            let deadline = Stopwatch.StartNew()
-            let mutable connected = false
-
-            while not connected
-                  && not cancellationToken.IsCancellationRequested
-                  && deadline.Elapsed < timeout do
-                use attempt = CancellationTokenSource.CreateLinkedTokenSource cancellationToken
-                attempt.CancelAfter(TimeSpan.FromSeconds 1.0)
-
-                try
-                    use client = new TcpClient()
-                    do! client.ConnectAsync(endpoint.Address, endpoint.Port, attempt.Token)
-                    connected <- true
-                with _ ->
-                    // Any connection failure (refused / timed out / unreachable) just means the
-                    // server is not up yet — back off and retry until the deadline or cancellation.
-                    try
-                        do! Task.Delay(50, attempt.Token)
-                    with :? OperationCanceledException ->
-                        // The per-attempt 1s window or the caller's token cancelled the backoff; the
-                        // loop guard re-checks the deadline/token next iteration and reports
-                        // NotReady/Cancelled, so swallowing here is correct.
-                        ()
-
-            if connected then
-                return Ok()
-            elif cancellationToken.IsCancellationRequested then
-                return Error(ProcessError.Cancelled config.Program)
-            else
-                return Error(ProcessError.NotReady(config.Program, timeout))
-        }
+        ReadinessProbe.waitForPort config.Program endpoint timeout cancellationToken
 
     /// Poll `probe` until it returns true, or fail with `NotReady` after `timeout` (or `Cancelled`
     /// if `cancellationToken` fires first). Like `WaitForPortAsync`, this does not drain the child's
@@ -1028,32 +919,7 @@ type RunningProcess internal (host: RunningHost) =
         (probe: Func<Task<bool>>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull probe
-
-        task {
-            let deadline = Stopwatch.StartNew()
-            let mutable ready = false
-
-            while not ready
-                  && not cancellationToken.IsCancellationRequested
-                  && deadline.Elapsed < timeout do
-                let! result = probe.Invoke()
-
-                if result then
-                    ready <- true
-                else
-                    try
-                        do! Task.Delay(50, cancellationToken)
-                    with :? OperationCanceledException ->
-                        // Cancelled mid-backoff; the loop guard exits and reports Cancelled below.
-                        ()
-
-            if ready then
-                return Ok()
-            elif cancellationToken.IsCancellationRequested then
-                return Error(ProcessError.Cancelled config.Program)
-            else
-                return Error(ProcessError.NotReady(config.Program, timeout))
-        }
+        ReadinessProbe.waitFor config.Program probe timeout cancellationToken
 
     /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
     /// the racing primitive behind `WaitAnyAsync`/`WaitAllAsync`. Reuses whichever consumption already
