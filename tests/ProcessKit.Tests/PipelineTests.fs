@@ -70,6 +70,29 @@ type PipelineTests() =
 
         ((emit [ "banana"; "apple" ]).Pipe last).OutputBytesAsync()
 
+    // A stage that writes `lineCount` lines to stderr (never stdout), then exits non-zero — used to
+    // prove a chatty stage's stderr is bounded by that stage's own `OutputBuffer` byte cap (T-034).
+    // Optionally capped via `cap`; `None` keeps the previous unbounded behaviour.
+    let noisyFailingStage (lineCount: int) (cap: int option) =
+        let line = String.replicate 32 "x"
+        let echoErr = sprintf "echo %s 1>&2" line
+        // A space-padded separator on Windows keeps cmd.exe from misparsing the trailing `1>&2`
+        // redirection against an immediately-following `&` command separator.
+        let separator = if isWindows then " & " else "; "
+
+        let script =
+            (List.replicate lineCount echoErr |> String.concat separator)
+            + separator
+            + "exit 3"
+
+        let stage = shell script
+
+        match cap with
+        | Some maxBytes ->
+            stage
+            |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes maxBytes)
+        | None -> stage
+
     // A silent producer that never writes (and would run a long time) — the stage whose empty,
     // still-open stdout blocks the relay's read, so proactive teardown, not a broken pipe, is what
     // must end it once a downstream stage fails.
@@ -221,6 +244,49 @@ type PipelineTests() =
             match! ((emit [ "banana"; "apple" ]).Pipe last).OutputStringAsync() with
             | Error(ProcessError.OutputTooLarge _) -> Assert.Pass()
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    // --- Every stage's stderr is bounded by that stage's own OutputBuffer byte cap (T-034) ---
+
+    [<Test>]
+    member _.``a chatty stage's stderr is bounded by its own OutputBuffer byte cap``() : Task =
+        task {
+            let cap = 64
+            let noisy = noisyFailingStage 50 (Some cap)
+            let pipeline = noisy.Pipe sortStage
+
+            match! pipeline.OutputBytesAsync() with
+            | Ok result ->
+                Assert.That(
+                    result.Outcome,
+                    Is.EqualTo(Outcome.Exited 3),
+                    "the noisy failing stage must be the pipefail representative carrying the capped stderr"
+                )
+
+                let retainedBytes = Encoding.UTF8.GetByteCount result.Stderr
+                Assert.That(retainedBytes, Is.LessThanOrEqualTo cap, "retained stderr must never exceed its byte cap")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a stage without an OutputBuffer cap keeps its stderr unbounded, as before``() : Task =
+        task {
+            let noisy = noisyFailingStage 50 None
+            let pipeline = noisy.Pipe sortStage
+
+            match! pipeline.OutputBytesAsync() with
+            | Ok result ->
+                Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 3))
+
+                let retainedLines =
+                    result.Stderr.Split('\n')
+                    |> Array.filter (fun l -> l.Trim().Length > 0)
+                    |> Array.length
+
+                Assert.That(retainedLines, Is.EqualTo 50, "an uncapped stage's stderr must retain every line")
+            | Error error -> Assert.Fail $"{error}"
         }
         :> Task
 
