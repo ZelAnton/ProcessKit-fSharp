@@ -15,11 +15,13 @@
 	</PropertyGroup>
 
 	<!-- F# COMPILE ORDER IS SIGNIFICANT. Files are compiled top-to-bottom; a type or
-	     function must be declared before its first use. Reply must precede ScriptedRunner
-	     (which scripts Reply values); DryRunRunner only needs FakeProcess, so it can sit
-	     alongside ScriptedRunner; Cassette is last (it reuses FakeProcess). FakeProcess is
-	     independent of the other three. -->
+	     function must be declared before its first use. Seam (the shared Serve→verbs
+	     projection) depends only on ProcessKit, so it precedes everything else that uses
+	     it; FakeProcess is independent of the other three; Reply must precede ScriptedRunner
+	     (which scripts Reply values); DryRunRunner only needs FakeProcess and Seam, so it can
+	     sit alongside ScriptedRunner; Cassette is last (it reuses FakeProcess). -->
 	<ItemGroup>
+		<Compile Include="Seam.fs" />
 		<Compile Include="FakeProcess.fs" />
 		<Compile Include="Reply.fs" />
 		<Compile Include="ScriptedRunner.fs" />
