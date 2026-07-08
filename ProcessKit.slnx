@@ -13,4 +13,7 @@
 	<Project Path="src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj">
 		<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
 	</Project>
+	<Project Path="benchmarks/ProcessKit.Benchmarks/ProcessKit.Benchmarks.fsproj">
+		<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
+	</Project>
 </Solution>
