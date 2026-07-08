@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Changed
--
+- Clarified the cancellation contract for the live `StartAsync`/`SpawnAsync` handle (docstrings on `Command.CancelOn`, `IProcessRunner.SpawnAsync`, `ProcessRunnerExtensions.StartAsync`, and `ProcessGroup.StartAsync`): the token is checked exactly once, before the spawn (an already-cancelled token reports `ProcessError.Cancelled` and starts nothing), and once the child is running neither the verb token nor the command's `CancelOn` is tracked — a live handle is caller-driven, so cancel or reap it yourself (dispose it, call its `Kill`, or register the token to call `Kill`). The completion verbs (`RunAsync`/`Output*`/`ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/`FirstLineAsync`) are unaffected and continue to watch the token for the whole run. No runtime behaviour changed; this only replaces a previously ambiguous wording that could be read as "the `StartAsync` token is observed after spawn".
 
 ### Fixed
 - The `CgroupBackend` and `ProcessGroupBackend` teardown (`HardRelease`) now atomically drains its tracked children instead of only snapshotting them, matching the Windows Job Object backend: tracking is fully cleared after teardown, and a concurrent racing-spawn cleanup (`ReapEscapee`) now only re-kills/reaps a pid it actually still owns. This closes a window where both could `killpg`/`waitpid` the same pid — after the first reap the OS can reuse that pid, so a second, unguarded `killpg` could land on an unrelated process group.
