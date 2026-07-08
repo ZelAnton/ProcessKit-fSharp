@@ -13,6 +13,7 @@ open ProcessKit
 /// carries one), so DI-resolved runs emit ProcessKit's lifecycle events. argv/env are never logged
 /// — see `Command.Logger`.
 type internal LoggingRunner(inner: IProcessRunner, logger: ILogger) =
+    inherit DelegatingProcessRunner(inner)
 
     let withLogger (command: Command) =
         if command.Config.Logger.IsNone then
@@ -20,15 +21,14 @@ type internal LoggingRunner(inner: IProcessRunner, logger: ILogger) =
         else
             command
 
-    interface IProcessRunner with
-        member _.CaptureStringAsync(command, cancellationToken) =
-            inner.CaptureStringAsync(withLogger command, cancellationToken)
+    override this.CaptureStringAsync(command, cancellationToken) =
+        this.Inner.CaptureStringAsync(withLogger command, cancellationToken)
 
-        member _.CaptureBytesAsync(command, cancellationToken) =
-            inner.CaptureBytesAsync(withLogger command, cancellationToken)
+    override this.CaptureBytesAsync(command, cancellationToken) =
+        this.Inner.CaptureBytesAsync(withLogger command, cancellationToken)
 
-        member _.SpawnAsync(command, cancellationToken) =
-            inner.SpawnAsync(withLogger command, cancellationToken)
+    override this.SpawnAsync(command, cancellationToken) =
+        this.Inner.SpawnAsync(withLogger command, cancellationToken)
 
 /// An `IProcessRunner` that fills in the configured `ProcessKitOptions` defaults on every command —
 /// **only where the command has not set that field itself**, so a per-command value always wins. A
@@ -40,6 +40,7 @@ type internal LoggingRunner(inner: IProcessRunner, logger: ILogger) =
 /// reads the command before this decorator sees it, so a retry stamped here would never fire — retry
 /// defaults belong on a `CliClient` template (`AddProcessKitClient`), where they precede the verb.
 type internal DefaultsRunner(inner: IProcessRunner, options: ProcessKitOptions) =
+    inherit DelegatingProcessRunner(inner)
 
     let applyDefaults (command: Command) : Command =
         let mutable c = command
@@ -58,15 +59,14 @@ type internal DefaultsRunner(inner: IProcessRunner, options: ProcessKitOptions) 
 
         c
 
-    interface IProcessRunner with
-        member _.CaptureStringAsync(command, cancellationToken) =
-            inner.CaptureStringAsync(applyDefaults command, cancellationToken)
+    override this.CaptureStringAsync(command, cancellationToken) =
+        this.Inner.CaptureStringAsync(applyDefaults command, cancellationToken)
 
-        member _.CaptureBytesAsync(command, cancellationToken) =
-            inner.CaptureBytesAsync(applyDefaults command, cancellationToken)
+    override this.CaptureBytesAsync(command, cancellationToken) =
+        this.Inner.CaptureBytesAsync(applyDefaults command, cancellationToken)
 
-        member _.SpawnAsync(command, cancellationToken) =
-            inner.SpawnAsync(applyDefaults command, cancellationToken)
+    override this.SpawnAsync(command, cancellationToken) =
+        this.Inner.SpawnAsync(applyDefaults command, cancellationToken)
 
 module internal DiInternals =
 
