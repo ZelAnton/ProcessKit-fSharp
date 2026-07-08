@@ -436,7 +436,12 @@ type Command internal (config: CommandConfig) =
     /// Only the low permission bits are meaningful, as with the syscall itself. **Unix-only:** on
     /// Windows (which has no equivalent) a set mask fails the spawn with `ProcessError.Unsupported`
     /// rather than being silently ignored. The default (unset) leaves the inherited umask untouched.
+    /// `mask` must be within `0..0o7777` (the meaningful permission-bit range); outside it an
+    /// `ArgumentOutOfRangeException` is thrown at the builder boundary rather than being handed to
+    /// `umask(2)` as-is.
     member _.Umask(mask: int) =
+        ArgumentOutOfRangeException.ThrowIfNegative mask
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(mask, 0o7777)
         Command({ config with Umask = Some mask })
 
     /// Emit structured lifecycle events (spawn / exit / timeout / retry) to `logger`. The program
