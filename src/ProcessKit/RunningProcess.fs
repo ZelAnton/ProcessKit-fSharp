@@ -180,34 +180,21 @@ type RunningProcess internal (host: RunningHost) =
 
     // Count the run as started + in-flight, and capture the ambient `Activity` now (at spawn) so the
     // backdated completion span nests under it. Runs once, at construction (like the spawn log). Defined
-    // before the timeout arming below, which carries `runId` into the timeout log.
-    let spawnParentContext = Diag.runStarted config.Program
-
-    // The single exit hook: log + metrics + (backdated) trace span, at each terminal verb's exit point.
-    // Single-consumption already means one terminal verb runs, but the once-guard makes it bulletproof —
-    // conclude fires at most once per run, so metrics can't double-count and a run never yields two spans.
-    // An abandoned run (spawned, never driven to a terminal verb) simply isn't counted as completed.
-    //
-    // `concludedFlag` doubles as the "has this run's `runs.active` mark already been cleared" guard,
-    // shared with `markAbandoned` below (the `IAsyncDisposable.DisposeAsync` path): whichever of the two
-    // wins the exchange decides whether the run's end is counted as `runs.completed` (here) or not
-    // (`markAbandoned`), but either way `Diag.runEnded` fires exactly once per run, so `runs.active`
-    // always returns to zero and never goes negative.
-    let concludedFlag = ref 0
+    // before the timeout arming below, which carries `runId` into the timeout log. The once-guarded
+    // conclude/abandon paths (formerly `conclude`/`markAbandoned` with a hand-rolled `concludedFlag`)
+    // now live in the shared `RunTelemetryScope` (T-041) — single-consumption already means one terminal
+    // verb runs, but its once-guard makes that bulletproof, so metrics can't double-count and a run
+    // never yields two spans. An abandoned run (spawned, never driven to a terminal verb) simply isn't
+    // counted as completed.
+    let telemetry = RunTelemetryScope.Start(config.Program, runId, host.StartTime)
 
     let conclude (outcome: Outcome) =
-        if Interlocked.Exchange(&concludedFlag.contents, 1) = 0 then
-            let duration = elapsed ()
-            Log.exit config.Logger config.Program outcome duration runId
-            Diag.runCompleted config.Program runId outcome host.Pid host.StartTime duration spawnParentContext
-            Diag.runEnded config.Program
+        telemetry.Conclude(config.Logger, outcome, host.Pid, elapsed ())
 
     // Clear the `runs.active` mark for a run whose handle is being disposed without ever having reached
-    // a terminal verb (a streaming/event-driven handle the caller only consumed and dropped). Shares
-    // `concludedFlag` with `conclude` — a no-op once a terminal verb has already run.
-    let markAbandoned () =
-        if Interlocked.Exchange(&concludedFlag.contents, 1) = 0 then
-            Diag.runEnded config.Program
+    // a terminal verb (a streaming/event-driven handle the caller only consumed and dropped) — a no-op
+    // once a terminal verb has already run (`telemetry`'s own once-guard).
+    let markAbandoned () = telemetry.Abandon()
 
     // Per-process CPU / peak-memory via the BCL `Process` (reads /proc on Linux, the OS APIs
     // elsewhere) — no metrics once the child has exited or where the platform does not report them.

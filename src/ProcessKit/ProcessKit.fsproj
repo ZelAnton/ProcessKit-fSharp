@@ -31,6 +31,7 @@
 		<Compile Include="Diagnostics.fs" />
 		<Compile Include="Log.fs" />
 		<Compile Include="Diag.fs" />
+		<Compile Include="RunTelemetryScope.fs" />
 		<Compile Include="Mechanism.fs" />
 		<Compile Include="Signal.fs" />
 		<Compile Include="Limits.fs" />
