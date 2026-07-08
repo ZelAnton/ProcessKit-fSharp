@@ -93,7 +93,7 @@ module internal PipelineRunner =
 
                     let spawned = ResizeArray<Native.Common.Spawned>()
                     let copyTasks = ResizeArray<Task>()
-                    let stderrTasks = ResizeArray<Task<byte[]>>()
+                    let stderrTasks = ResizeArray<Task<Pump.RawCapture>>()
                     let mutable prevStdout: Stream option = None
                     let mutable spawnError = None
                     let mutable stage0Feed: Task<exn option> option = None
@@ -168,8 +168,19 @@ module internal PipelineRunner =
                                     )
                                 | _ -> ()
 
-                            // Drain every stage's stderr so a full stderr pipe never blocks a stage.
-                            stderrTasks.Add(Pump.drainRawOrEmpty sp.Stderr None CancellationToken.None)
+                            // Drain every stage's stderr so a full stderr pipe never blocks a stage,
+                            // bounding retained memory by that stage's own `OutputBuffer` byte cap +
+                            // `Overflow` mode — the same path (`Pump.captureRawOrEmpty`) the last
+                            // stage's stdout capture uses below. A stage without `MaxBytes` set keeps
+                            // its previous unbounded behaviour (`captureRawOrEmpty` falls back to
+                            // `drainRawOrEmpty` in that case).
+                            stderrTasks.Add(
+                                Pump.captureRawOrEmpty
+                                    sp.Stderr
+                                    None
+                                    stages[index].Config.OutputBuffer
+                                    CancellationToken.None
+                            )
 
                             prevStdout <- sp.Stdout
 
@@ -267,7 +278,7 @@ module internal PipelineRunner =
                         let! outcomes = Task.WhenAll waitTasks
                         do! Task.WhenAll(copyTasks.ToArray())
                         let! lastCapture = captureTask
-                        let! stderrBytes = Task.WhenAll(stderrTasks.ToArray())
+                        let! stderrCaptures = Task.WhenAll(stderrTasks.ToArray())
 
                         for sp in spawned do
                             Pump.closeSpawned sp
@@ -316,7 +327,7 @@ module internal PipelineRunner =
                                       { Program = stages[i].Program
                                         Outcome = outcomes[i]
                                         Unchecked = stages[i].Config.UncheckedInPipe
-                                        Stderr = stages[i].Config.StderrEncoding.GetString stderrBytes[i]
+                                        Stderr = stages[i].Config.StderrEncoding.GetString stderrCaptures[i].Bytes
                                         OkCodes = stages[i].Config.OkCodes
                                         TornDown = tornDown[i] } ]
 
