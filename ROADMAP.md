@@ -33,14 +33,14 @@ The [documentation guide set](docs/README.md) covers all of it in depth.
 
 Deliberate, documented constraints — not correctness bugs — kept here for future hardening:
 
-- **Blocking POSIX pipe reads.** Exit waits no longer block a dedicated thread on either platform —
-  Windows uses a thread-pool registered wait, and POSIX uses an event-driven `SIGCHLD` registration
-  (see [`CHANGELOG.md`](CHANGELOG.md)) — and Windows pipe reads are now genuinely overlapped
-  (`PipeOptions.Asynchronous`, completed via IOCP). The parent-side **pipe reads on POSIX** are still
-  sync-over-async, though — a plain `FileStream` without `FileOptions.Asynchronous` — so they park a
-  thread-pool thread per piped stream on Linux/macOS. Under heavy concurrency (a large `WaitAll`, a
-  `Supervisor`, `Exec.outputAll`) with many piped POSIX children this still pressures the thread pool.
-  The public API would not change when the remaining POSIX reads move to genuinely async I/O.
+- **POSIX child stdio is a Unix-domain socket.** So the parent side can be driven by genuinely
+  async, epoll/kqueue-backed I/O — no thread-pool thread parked per piped stream, closing the former
+  "blocking POSIX pipe reads" limitation (exit waits are event-driven and Windows pipe reads are
+  overlapped/IOCP; see [`CHANGELOG.md`](CHANGELOG.md)) — a child's piped stdin/stdout/stderr on
+  Linux/macOS is one end of an `AF_UNIX` `SOCK_STREAM` socketpair rather than a pipe. The observable
+  contract is unchanged (a byte-exact stream, EOF on the peer's close), but a child that inspects the
+  *kind* of its stdio (`fstat` reporting `S_IFSOCK` instead of `S_IFIFO`) sees a socket; `isatty` is
+  false either way, exactly as with a pipe.
 - **Streaming backlog.** By default a streamed (`StdoutLines` / `OutputEvents`) consumer that stops
   draining while the child floods still grows the channel unbounded. Opt in to
   `Command.StreamBuffer`/`StreamBufferPolicy` to cap it instead — `Backpressure` (the child itself
@@ -61,11 +61,6 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
 
 ## Future directions
 
-- **POSIX async pipe reads.** Exit waits on both platforms, and Windows pipe reads, are already
-  event-driven/overlapped (see [`CHANGELOG.md`](CHANGELOG.md)). The remaining piece is the parent-side
-  pipe reads on POSIX, still a plain `FileStream` without `FileOptions.Asynchronous`, so a piped
-  Linux/macOS child still parks a thread-pool thread for the life of its stream. An internal change,
-  no public-API impact; best driven by a concurrency benchmark.
 - **Fully pidfd-driven POSIX exit wait.** The current POSIX exit wait is event-driven via a shared
   `SIGCHLD` registration (not a thread per child). A future revision could open a `pidfd_open`
   handle (Linux >= 5.3) per child and drive the wait off it directly (e.g. `waitid(P_PIDFD)` /

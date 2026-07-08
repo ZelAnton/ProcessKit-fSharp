@@ -5,9 +5,9 @@ open System
 open System.Collections.Concurrent
 open System.IO
 open System.Runtime.InteropServices
+open System.Net.Sockets
 open System.Threading
 open System.Threading.Tasks
-open Microsoft.Win32.SafeHandles
 open ProcessKit.Native.Common
 
 /// POSIX process-group containment: `posix_spawn` into a fresh process group, event-driven
@@ -31,13 +31,28 @@ module internal Posix =
     let private O_WRONLY = 1
 
     // Non-variadic close-on-exec, used instead of fcntl (which a fixed-signature P/Invoke cannot
-    // call under the AArch64 variadic ABI): Linux gets O_CLOEXEC via pipe2/open; macOS gets
-    // POSIX_SPAWN_CLOEXEC_DEFAULT, which closes every non-dup2 fd in the child at exec.
+    // call under the AArch64 variadic ABI): Linux gets O_CLOEXEC on open (and the sibling SOCK_CLOEXEC
+    // on the stdio socketpairs); macOS gets POSIX_SPAWN_CLOEXEC_DEFAULT, which closes every non-dup2 fd
+    // in the child at exec.
     [<Literal>]
     let private O_CLOEXEC = 0x80000
 
     [<Literal>]
     let private POSIX_SPAWN_CLOEXEC_DEFAULT = 0x4000s
+
+    // The stdio channels are AF_UNIX SOCK_STREAM socket pairs (see `createSocketPair`), not bare
+    // pipes: a socket end can be wrapped in a .NET `Socket`/`NetworkStream` for genuine async I/O.
+    // AF_UNIX and SOCK_STREAM are both 1 on Linux and macOS. SOCK_CLOEXEC (Linux only) shares
+    // O_CLOEXEC's numeric value; OR'd into the socket type it makes socketpair(2) set close-on-exec
+    // atomically on both ends.
+    [<Literal>]
+    let private AF_UNIX = 1
+
+    [<Literal>]
+    let private SOCK_STREAM = 1
+
+    [<Literal>]
+    let private SOCK_CLOEXEC = 0x80000
 
     // SIGKILL / SIGTERM are shared with the cgroup layer (`Native.Cgroup` sweeps members with these
     // raw numbers), so they are module-internal rather than private.
@@ -53,10 +68,7 @@ module internal Posix =
     let private isMacOs = RuntimeInformation.IsOSPlatform OSPlatform.OSX
 
     [<DllImport("libc", SetLastError = true)>]
-    extern int private pipe(int[] fds)
-
-    [<DllImport("libc", SetLastError = true)>]
-    extern int private pipe2(int[] fds, int flags)
+    extern int private socketpair(int domain, int socketType, int protocol, int[] fds)
 
     [<DllImport("libc", SetLastError = true)>]
     extern int private close(int fd)
@@ -215,11 +227,22 @@ module internal Posix =
     /// Hard-kill a single POSIX process by pid (SIGKILL).
     let killProcess (pid: int) = kill (pid, SIGKILL) |> ignore
 
-    // Create a pipe whose ends are close-on-exec so a *different* concurrent spawn does not
-    // inherit this run's pipe ends (which outlive the spawn). Linux sets it atomically with
-    // pipe2(O_CLOEXEC); macOS lacks pipe2, and relies on POSIX_SPAWN_CLOEXEC_DEFAULT instead.
-    let private createPipe (fds: int[]) : int =
-        if isMacOs then pipe fds else pipe2 (fds, O_CLOEXEC)
+    // A connected AF_UNIX SOCK_STREAM socket pair for one piped stdio channel, used instead of a bare
+    // pipe: its parent-kept end can be wrapped in a .NET `Socket`/`NetworkStream`, whose async reads and
+    // writes complete through the runtime's epoll/kqueue `SocketAsyncEngine` rather than parking a
+    // thread-pool thread in a blocking `FileStream` call for the stream's whole lifetime — the entire
+    // point of this path. SOCK_STREAM (never SOCK_DGRAM) keeps it a byte-exact, boundary-free stream, so
+    // the parent captures the same bytes a pipe delivered. Close-on-exec so a *different* concurrent
+    // spawn never inherits this run's parent-kept end: Linux sets it atomically with SOCK_CLOEXEC; macOS
+    // lacks it and relies on POSIX_SPAWN_CLOEXEC_DEFAULT, exactly as the pipe path did.
+    let private createSocketPair (fds: int[]) : int =
+        let socketType =
+            if isMacOs then
+                SOCK_STREAM
+            else
+                SOCK_STREAM ||| SOCK_CLOEXEC
+
+        socketpair (AF_UNIX, socketType, 0, fds)
 
     let private openDevNull (flags: int) : int =
         let flags = if isMacOs then flags else flags ||| O_CLOEXEC
@@ -422,7 +445,7 @@ module internal Posix =
         let mutable failure: string option = None
 
         // A failed open("/dev/null") (fd < 0, e.g. EMFILE/ENFILE) must fail the spawn honestly,
-        // exactly like a failed pipe() below (`makePipe`) already does — NOT leave the slot's
+        // exactly like a failed socketpair() below (`makeStdioChannel`) already does — NOT leave the slot's
         // *ChildFd at -1, which `posix_spawn_file_actions_adddup2` below reads as "no dup2 —
         // inherit the parent's stream", the silent downgrade this guards against (for stdin,
         // handing the child the parent's real stdin/terminal instead of an immediate EOF).
@@ -437,18 +460,21 @@ module internal Posix =
 
             fd
 
-        let makePipe (label: string) =
+        // Both socketpair ends are bidirectional and interchangeable; the tuple keeps the pipe-era
+        // (readFd, writeFd) = (fds[0], fds[1]) shape purely so the per-stream role assignment below
+        // (child-read/parent-write for stdin, parent-read/child-write for stdout+stderr) reads the same.
+        let makeStdioChannel (label: string) =
             let fds = Array.zeroCreate<int> 2
 
-            if createPipe fds <> 0 then
-                failure <- Some $"pipe() failed for {label}"
+            if createSocketPair fds <> 0 then
+                failure <- Some $"socketpair() failed for {label}"
                 None
             else
                 Some(fds[0], fds[1])
 
         // stdin
         if stdinWanted then
-            match makePipe "stdin" with
+            match makeStdioChannel "stdin" with
             | Some(readFd, writeFd) ->
                 stdinChildFd <- readFd
                 childSideFds.Add readFd
@@ -461,7 +487,7 @@ module internal Posix =
         if failure.IsNone then
             match config.StdoutMode with
             | StdioMode.Piped ->
-                match makePipe "stdout" with
+                match makeStdioChannel "stdout" with
                 | Some(readFd, writeFd) ->
                     stdoutParentRead <- Some readFd
                     stdoutChildFd <- writeFd
@@ -478,7 +504,7 @@ module internal Posix =
         if failure.IsNone then
             match config.StderrMode with
             | StdioMode.Piped ->
-                match makePipe "stderr" with
+                match makeStdioChannel "stderr" with
                 | Some(readFd, writeFd) ->
                     stderrParentRead <- Some readFd
                     stderrChildFd <- writeFd
@@ -747,19 +773,28 @@ module internal Posix =
                                 closeParentEnds ()
                                 Error error
                             | Ok() ->
-                                let readStream fd =
-                                    new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Read) :> Stream
+                                // Wrap a retained parent-side socketpair end in a `Socket` +
+                                // `NetworkStream`: its ReadAsync/WriteAsync complete through the runtime's
+                                // epoll/kqueue `SocketAsyncEngine`, so a piped POSIX child no longer parks a
+                                // thread-pool thread in a blocking `FileStream` read/write for the stream's
+                                // whole lifetime (the linear thread-pool pressure this closes). `ownsHandle`/
+                                // `ownsSocket` give the stream sole ownership, so disposing it closes the fd
+                                // exactly once, with the SafeSocketHandle finalizer as the GC-time safety net
+                                // — the same single-owner contract the FileStream + SafeFileHandle had. A
+                                // socketpair end is bidirectional, but each stream is only ever read
+                                // (stdout/stderr) xor written (stdin) by its one consumer.
+                                let pipeStream fd =
+                                    let socket = new Socket(new SafeSocketHandle(nativeint fd, ownsHandle = true))
 
-                                let writeStream fd =
-                                    new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Write) :> Stream
+                                    new NetworkStream(socket, ownsSocket = true) :> Stream
 
                                 // Wrap each retained parent end into an owning stream, clearing its fd
                                 // tracker as ownership transfers so that if a later step (or the outer
-                                // handler) runs, it never double-closes an fd a FileStream now owns.
+                                // handler) runs, it never double-closes an fd the stream now owns.
                                 let stdoutStream =
                                     match stdoutParentRead with
                                     | Some fd ->
-                                        let stream = readStream fd
+                                        let stream = pipeStream fd
                                         stdoutParentRead <- None
                                         Some stream
                                     | None -> None
@@ -767,7 +802,7 @@ module internal Posix =
                                 let stderrStream =
                                     match stderrParentRead with
                                     | Some fd ->
-                                        let stream = readStream fd
+                                        let stream = pipeStream fd
                                         stderrParentRead <- None
                                         Some stream
                                     | None -> None
@@ -775,7 +810,7 @@ module internal Posix =
                                 let stdinStream =
                                     match stdinParentWrite with
                                     | Some fd ->
-                                        let stream = writeStream fd
+                                        let stream = pipeStream fd
                                         stdinParentWrite <- None
                                         Some stream
                                     | None -> None

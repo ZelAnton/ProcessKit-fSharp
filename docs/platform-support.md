@@ -217,15 +217,15 @@ pipes, a second, conflicting one is refused rather than racing two readers on th
 `Result`-returning verbs return `ProcessError.Unsupported`, while `WaitAsync` / `ProfileAsync` / `StdoutLinesAsync`
 / `OutputEventsAsync` throw `InvalidOperationException`. Pick one consumption model per handle.
 
-**Blocking I/O under heavy concurrency.** Waiting on a running child no longer blocks a dedicated
-thread on either platform — Windows uses a thread-pool registered wait, and POSIX uses an
-event-driven `SIGCHLD` registration (see [`CHANGELOG.md`](CHANGELOG.md)) — and Windows pipe reads are
-genuinely overlapped (`PipeOptions.Asynchronous`, completed via IOCP). The parent-side pipe reads on
-POSIX are still sync-over-async, though, so a very large `WaitAllAsync`, a busy `Supervisor`, or a wide
-`Exec.outputAll` fan-out of many *piped* Linux/macOS children still pressures the thread pool (one
-parked thread per piped POSIX stream). This is an internal characteristic only — the `Task`-based
-public API does not change when the remaining POSIX reads move to genuinely async I/O — but bound
-your concurrency accordingly (`Exec.outputAll` already takes a concurrency cap).
+**Concurrency-friendly I/O.** Waiting on a running child no longer blocks a dedicated thread on either
+platform — Windows uses a thread-pool registered wait, and POSIX uses an event-driven `SIGCHLD`
+registration (see [`CHANGELOG.md`](CHANGELOG.md)) — and the parent side of a child's pipes is now
+genuinely asynchronous on both: Windows uses overlapped named pipes over IOCP, and Linux/macOS wrap
+each stdio channel's parent end (an `AF_UNIX` socketpair) in a `Socket`/`NetworkStream` whose reads
+and writes complete through the runtime's epoll/kqueue event loop — no thread-pool thread parked per
+piped stream. So a very large `WaitAllAsync`, a busy `Supervisor`, or a wide `Exec.outputAll` fan-out
+of many *piped* children no longer grows thread-pool occupancy in step with the fleet size. This is
+an internal characteristic only — the `Task`-based public API is unchanged.
 
 ---
 

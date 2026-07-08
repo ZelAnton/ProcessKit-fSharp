@@ -15,6 +15,7 @@
 		<Compile Include="JobRunnerTests.fs" />
 		<Compile Include="WindowsOverlappedPipeTests.fs" />
 		<Compile Include="PosixEventDrivenWaitTests.fs" />
+		<Compile Include="PosixAsyncPipeTests.fs" />
 		<Compile Include="ShutdownTests.fs" />
 		<Compile Include="StreamingTests.fs" />
 		<Compile Include="ReadinessTests.fs" />
