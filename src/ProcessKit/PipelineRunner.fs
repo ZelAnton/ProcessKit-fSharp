@@ -103,10 +103,9 @@ module internal PipelineRunner =
                     // single-command rule that a spawn failure is never counted as a run
                     // (`RunningProcess` — and its `Diag.runStarted` — only exists after a successful
                     // native spawn). Guards the `spawnError` branch below: a stage-0 spawn failure
-                    // never armed `runs.active`, so there is nothing to close there; a later stage's
-                    // spawn failure does, and must be closed with `runEnded`.
-                    let mutable runStarted = false
-                    let mutable spawnParentContext = Unchecked.defaultof<ActivityContext>
+                    // never starts a `RunTelemetryScope` (so there is nothing to close there); a later
+                    // stage's spawn failure does, and must be closed via `Abandon()`.
+                    let mutable telemetry: RunTelemetryScope option = None
                     let mutable startTimeUtc = DateTime.UtcNow
 
                     while index < stages.Length && spawnError.IsNone do
@@ -132,9 +131,8 @@ module internal PipelineRunner =
                                 // the same at construction, right after its own successful native
                                 // spawn. No single pid represents a multi-process chain, so `None`
                                 // rides here (a pipeline never claims one process's pid as its own).
-                                runStarted <- true
                                 startTimeUtc <- DateTime.UtcNow
-                                spawnParentContext <- Diag.runStarted programLabel
+                                telemetry <- Some(RunTelemetryScope.Start(programLabel, runId, startTimeUtc))
                                 Log.spawn logger programLabel None runId
 
                                 // Only the first stage may carry its own stdin source; feed it and keep the
@@ -211,12 +209,12 @@ module internal PipelineRunner =
                         // A spawn failure is not a completed run — no duration/outcome to report,
                         // mirroring a single command's own spawn failure, which never reaches
                         // `RunningProcess`/`conclude` at all (no `runCompleted`, ever, on this path).
-                        // But if stage 0 already spawned before a LATER stage failed, `runStarted`
+                        // But if stage 0 already spawned before a LATER stage failed, `telemetry`
                         // above already marked this run in flight — that mark must be cleared here so
-                        // `runs.active` returns to zero instead of leaking. A stage-0 spawn failure
-                        // never set `runStarted`, so this is then a no-op.
-                        if runStarted then
-                            Diag.runEnded programLabel
+                        // `runs.active` returns to zero instead of leaking (`Abandon`, not `Conclude`:
+                        // this is not a completed run). A stage-0 spawn failure never started a
+                        // `telemetry` scope, so this is then a no-op.
+                        telemetry |> Option.iter (fun t -> t.Abandon())
 
                         return Error error
                     | None ->
@@ -289,7 +287,7 @@ module internal PipelineRunner =
                         // The whole chain reaped, its stdout captured: the run reached a terminal
                         // state. Report it exactly once here — before the cancellation check below can
                         // override the *returned* Result to `Cancelled` — mirroring `Runner.runToCompletion`,
-                        // which likewise lets a verb's own completion (and its `conclude`) fire before
+                        // which likewise lets a verb's own completion (and its `Conclude`) fire before
                         // the outer cancel-map can replace its result. A timed-out chain additionally
                         // gets `Log.timeout` (the explicit deadline-kill event), exactly like a single
                         // command's own `Timeouts.raceTimeout`; the outcome fed to `Log.exit`/`Diag.runCompleted`
@@ -301,23 +299,13 @@ module internal PipelineRunner =
                             else
                                 outcomes[outcomes.Length - 1]
 
-                        if timedOut then
-                            match timeout with
-                            | Some deadline -> Log.timeout logger programLabel deadline runId
-                            | None -> ()
+                        // `telemetry` is always `Some` here: reaching this branch means every stage
+                        // spawned, including stage 0, which is the only place it is set.
+                        let timeoutForLog = if timedOut then timeout else None
 
-                        Log.exit logger programLabel overallOutcome duration runId
-
-                        Diag.runCompleted
-                            programLabel
-                            runId
-                            overallOutcome
-                            None
-                            startTimeUtc
-                            duration
-                            spawnParentContext
-
-                        Diag.runEnded programLabel
+                        telemetry
+                        |> Option.iter (fun t ->
+                            t.Conclude(logger, overallOutcome, None, duration, ?timeout = timeoutForLog))
 
                         if cancellationToken.IsCancellationRequested then
                             return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
