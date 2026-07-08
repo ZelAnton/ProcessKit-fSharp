@@ -4,8 +4,11 @@ open System
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
+open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Hosting
 open NUnit.Framework
 open ProcessKit
+open ProcessKit.Extensions.Hosting
 open ProcessKit.Testing
 
 /// Tests for the API completeness & parity additions: CliClient verbs routed through the configured
@@ -265,3 +268,11 @@ type ApiParityTests() =
 
                 do! (running :> IAsyncDisposable).DisposeAsync()
         }
+
+    [<Test>]
+    member _.``AddProcessKitHostedProcess registers an IHostedService``() =
+        let services = Microsoft.Extensions.DependencyInjection.ServiceCollection()
+        services.AddProcessKitHostedProcess("svc", shell "echo hosted") |> ignore
+        use provider = services.BuildServiceProvider()
+        let hosted = provider.GetServices<IHostedService>() |> Seq.toArray
+        Assert.That(hosted, Has.Length.EqualTo 1)

@@ -90,7 +90,26 @@ apply the same `ProcessKitOptions` defaults as the `AddProcessKit` overloads.
 
 ## Hosting a supervised child
 
-A hosted-service wrapper that keeps a [`Supervisor`](supervision.md) command alive for the app's lifetime
-is a natural companion, but it needs `Microsoft.Extensions.Hosting.Abstractions`. To keep this package
-hosting-free it is **not** included here; today, run a `Supervisor` from your own `IHostedService`
-(inject the DI-registered `IProcessRunner` via `Supervisor.WithRunner`).
+Use the `ProcessKit.Extensions.Hosting` package when a supervised child should live for the host's
+lifetime. It depends only on `Microsoft.Extensions.Hosting.Abstractions`, discovers an existing
+DI-registered `IProcessRunner` when one is present, starts `Supervisor.RunAsync` in the background, and
+calls `RunningProcess.StopAsync` during host shutdown.
+
+```csharp
+services.AddProcessKitGroup();
+
+services.AddProcessKitHostedProcess(
+    "worker",
+    new Command("worker").Arg("--serve"),
+    supervisor => supervisor
+        .Restart(RestartPolicy.OnCrash)
+        .OnRestart(e => metrics.Restarts.Add(1)));
+
+services.ConfigureProcessKitHostedProcess("worker", o =>
+{
+    o.ShutdownGracePeriod = TimeSpan.FromSeconds(10);
+});
+```
+
+Resolve `HostedProcessService` by the same key when you need the last `SupervisionOutcome` or stop
+outcome for health reporting.

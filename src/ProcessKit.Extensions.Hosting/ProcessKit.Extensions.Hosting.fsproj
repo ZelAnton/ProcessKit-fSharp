@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<!-- TargetFrameworks are set centrally in Directory.Build.props (net8.0;net10.0). -->
+		<AssemblyName>ProcessKit.Extensions.Hosting</AssemblyName>
+
+		<!-- Package identity only; shared metadata is hoisted to Directory.Build.props. -->
+		<PackageId>ProcessKit.Extensions.Hosting</PackageId>
+		<Version>2.1.0</Version>
+		<Description>Microsoft.Extensions.Hosting integration for ProcessKit: register supervised child processes as lifecycle-managed hosted services.</Description>
+		<PackageTags>fsharp;dotnet;process;subprocess;hosting;hosted-service;supervision;processkit</PackageTags>
+
+		<!-- The referenced ProcessKit.dll resolves from the main project's build output. -->
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Compile Include="HostedProcessService.fs" />
+		<Compile Include="HostedServiceCollectionExtensions.fs" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="FSharp.Core" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+		<PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+		<PackageReference Include="Microsoft.Extensions.Options" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- Cross-project reference is the built ProcessKit assembly (build order via the .slnx
+		     BuildDependency), never a ProjectReference — see CLAUDE.md. -->
+		<Reference Include="ProcessKit" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Include="$(RepoRoot)README.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+
+</Project>

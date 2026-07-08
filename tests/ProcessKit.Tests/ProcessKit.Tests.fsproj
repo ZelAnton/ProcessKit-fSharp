@@ -5,7 +5,7 @@
 		<IsPackable>false</IsPackable>
 		<!-- Test project ships no package, so it needs no XML doc file. -->
 		<GenerateDocumentationFile>false</GenerateDocumentationFile>
-		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Testing\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.DependencyInjection\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Testing\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.DependencyInjection\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.Hosting\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
 	</PropertyGroup>
 
 	<!-- F# compile order is significant — list test files in dependency order. -->
@@ -40,6 +40,7 @@
 		<Compile Include="PumpPropertyTests.fs" />
 		<Compile Include="ApiSurfaceTests.fs" />
 		<Compile Include="StressTests.fs" />
+		<Compile Include="HostedProcessTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>
@@ -48,6 +49,7 @@
 		<None Include="PublicApi.ProcessKit.approved.txt" CopyToOutputDirectory="PreserveNewest" />
 		<None Include="PublicApi.ProcessKit.Testing.approved.txt" CopyToOutputDirectory="PreserveNewest" />
 		<None Include="PublicApi.ProcessKit.Extensions.DependencyInjection.approved.txt" CopyToOutputDirectory="PreserveNewest" />
+		<None Include="PublicApi.ProcessKit.Extensions.Hosting.approved.txt" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 	<ItemGroup>
@@ -60,6 +62,7 @@
 		<PackageReference Include="FsCheck" />
 		<PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+		<PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Options" />
 		<PackageReference Include="Microsoft.NET.Test.Sdk" />
@@ -71,6 +74,7 @@
 		<Reference Include="ProcessKit" />
 		<Reference Include="ProcessKit.Testing" />
 		<Reference Include="ProcessKit.Extensions.DependencyInjection" />
+		<Reference Include="ProcessKit.Extensions.Hosting" />
 	</ItemGroup>
 
 </Project>
