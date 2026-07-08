@@ -179,10 +179,21 @@ type ShutdownTests() =
             Assert.Ignore "A soft SIGTERM has no Windows equivalent; StopAsync is the atomic Job kill there."
 
         task {
-            // Trap SIGTERM and exit 42. The `sleep & wait` loop makes the shell act on the trap promptly
-            // (a bare foreground `sleep` would defer the handler until the sleep returned).
-            let trapping = shell "trap 'exit 42' TERM; while :; do sleep 0.2 & wait $!; done"
+            // Trap SIGTERM and exit 42, announcing "ready" only AFTER the trap is installed. The
+            // `sleep & wait` loop makes the shell act on the trap promptly (a bare foreground `sleep`
+            // would defer the handler until the sleep returned).
+            let trapping =
+                shell "trap 'exit 42' TERM; echo ready; while :; do sleep 0.2 & wait $!; done"
+
             let! proc = startProc trapping
+
+            // Gate on that readiness line before signalling. `posix_spawn` returns the instant the child
+            // has exec'd — BEFORE the shell has run `trap` — so a SIGTERM sent immediately would race the
+            // handler's installation and land on the default disposition (a bare Signalled 15), never the
+            // trap. Waiting for "ready" makes the soft signal deterministically hit an installed trap.
+            match! proc.WaitForLineAsync((fun line -> line = "ready"), TimeSpan.FromSeconds 10.0) with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"child never signalled readiness before StopAsync: {error}"
 
             let! outcome = proc.StopAsync(TimeSpan.FromSeconds 5.0)
 
