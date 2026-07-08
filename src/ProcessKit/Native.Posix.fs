@@ -505,153 +505,314 @@ module internal Posix =
             closeParentEnds ()
             Error(ProcessError.Spawn(command.Program, message))
         | None ->
-            // posix_spawn_file_actions_t / posix_spawnattr_t are opaque; a generous zeroed buffer
-            // holds either platform's representation (glibc structs or macOS pointers).
-            let fileActions = Marshal.AllocHGlobal 1024
-            let attributes = Marshal.AllocHGlobal 1024
-            let argv = command.Program :: List.ofSeq command.Config.Args
+            // Native scratch for the opaque posix_spawn_file_actions_t / posix_spawnattr_t (a generous
+            // zeroed buffer holds either platform's representation — glibc structs or macOS pointers)
+            // plus the marshalled argv/envp. Held in mutables seeded with a null/empty sentinel so the
+            // `finally` and the exception handler below release exactly what was actually allocated: an
+            // OOM in `AllocHGlobal`/`marshalCStringArray`, or any unexpected native fault, must free the
+            // earlier allocations and close any fds already opened, never escape this Result-returning
+            // function (symmetric to `spawnWindowsCore`'s unwind list in Native.Windows).
+            let mutable fileActions = IntPtr.Zero
+            let mutable attributes = IntPtr.Zero
+            let mutable fileActionsReady = false
+            let mutable attributesReady = false
+            let mutable argvPointer = IntPtr.Zero
+            let mutable argvAllocations: nativeint list = []
+            let mutable envpPointer = IntPtr.Zero
+            let mutable envpAllocations: nativeint list = []
 
-            let envp =
-                effectiveEnvironment command
-                |> Seq.map (fun entry -> $"{entry.Key}={entry.Value}")
-                |> List.ofSeq
+            // The parent closes the child-side fds right after the spawn attempt. This flag lets the
+            // error/exception paths close them if an exception fired before that point, without
+            // double-closing them once the normal flow already has (an fd number can be reused after
+            // close, so a stray second `close` could hit an unrelated fd).
+            let mutable childFdsOpen = true
 
-            let argvPointer, argvAllocations = marshalCStringArray argv
-            let envpPointer, envpAllocations = marshalCStringArray envp
+            let closeChildSideFds () =
+                if childFdsOpen then
+                    for fd in childSideFds do
+                        closeFd fd
+
+                    childFdsOpen <- false
 
             try
-                posix_spawn_file_actions_init fileActions |> ignore
-                posix_spawnattr_init attributes |> ignore
+                try
+                    fileActions <- Marshal.AllocHGlobal 1024
+                    attributes <- Marshal.AllocHGlobal 1024
+                    let argv = command.Program :: List.ofSeq command.Config.Args
 
-                if stdinChildFd >= 0 then
-                    posix_spawn_file_actions_adddup2 (fileActions, stdinChildFd, 0) |> ignore
+                    let envp =
+                        effectiveEnvironment command
+                        |> Seq.map (fun entry -> $"{entry.Key}={entry.Value}")
+                        |> List.ofSeq
 
-                if stdoutChildFd >= 0 then
-                    posix_spawn_file_actions_adddup2 (fileActions, stdoutChildFd, 1) |> ignore
+                    let argvArray, argvStrings = marshalCStringArray argv
+                    argvPointer <- argvArray
+                    argvAllocations <- argvStrings
+                    let envpArray, envpStrings = marshalCStringArray envp
+                    envpPointer <- envpArray
+                    envpAllocations <- envpStrings
 
-                if stderrChildFd >= 0 then
-                    posix_spawn_file_actions_adddup2 (fileActions, stderrChildFd, 2) |> ignore
+                    // Every posix_spawn_file_actions_* / posix_spawnattr_* helper returns an errno-style
+                    // rc; a non-zero one is an honest spawn failure (a mis-wired stdio dup2/close, or a
+                    // failed attr set that would silently drop SETPGROUP/CLOEXEC), NOT something to
+                    // `|> ignore`. Record the FIRST failure and stop invoking further helpers — never
+                    // operate a helper on a half-initialized struct.
+                    let mutable err: ProcessError option = None
 
-                // After dup2, close the original child-side fds so only 0/1/2 remain in the child.
-                for fd in childSideFds do
-                    posix_spawn_file_actions_addclose (fileActions, fd) |> ignore
+                    let register (helper: string) (call: unit -> int) =
+                        if err.IsNone then
+                            let rc = call ()
 
-                // Also close the parent-kept ends in the child. This is what guarantees EOF: a
-                // child must never inherit a writer to its own stdin. We do it explicitly rather
-                // than rely on FD_CLOEXEC, whose `fcntl` is variadic and is mis-passed by a
-                // fixed-signature P/Invoke on the AArch64 variadic ABI (Apple Silicon), so CLOEXEC
-                // never takes effect there and the child would block forever waiting for stdin.
-                stdinParentWrite
-                |> Option.iter (fun fd -> posix_spawn_file_actions_addclose (fileActions, fd) |> ignore)
+                            if rc <> 0 then
+                                err <- Some(ProcessError.Spawn(command.Program, $"{helper} failed (rc {rc})"))
 
-                stdoutParentRead
-                |> Option.iter (fun fd -> posix_spawn_file_actions_addclose (fileActions, fd) |> ignore)
+                    register "posix_spawn_file_actions_init" (fun () -> posix_spawn_file_actions_init fileActions)
 
-                stderrParentRead
-                |> Option.iter (fun fd -> posix_spawn_file_actions_addclose (fileActions, fd) |> ignore)
+                    // Only a successfully initialized struct may be destroyed (POSIX leaves a failed
+                    // init's struct undefined) — the `finally` keys its destroy calls off these flags.
+                    if err.IsNone then
+                        fileActionsReady <- true
 
-                match config.WorkingDirectory with
-                | Some directory -> posix_spawn_file_actions_addchdir_np (fileActions, directory) |> ignore
-                | None -> ()
+                    register "posix_spawnattr_init" (fun () -> posix_spawnattr_init attributes)
 
-                let spawnFlags =
-                    if isMacOs then
-                        POSIX_SPAWN_SETPGROUP ||| POSIX_SPAWN_CLOEXEC_DEFAULT
-                    else
-                        POSIX_SPAWN_SETPGROUP
+                    if err.IsNone then
+                        attributesReady <- true
 
-                posix_spawnattr_setflags (attributes, spawnFlags) |> ignore
-                posix_spawnattr_setpgroup (attributes, 0) |> ignore
+                    if stdinChildFd >= 0 then
+                        register "posix_spawn_file_actions_adddup2 (stdin)" (fun () ->
+                            posix_spawn_file_actions_adddup2 (fileActions, stdinChildFd, 0))
 
-                // Do the actual `posix_spawnp` (returning its rc and the pid it wrote) under
-                // `umaskSpawnLock`. `localPid` is declared INSIDE the closure so `&localPid` is a plain
-                // addressable local, not a captured mutable (which F# forbids taking the address of).
-                let spawnUnderLock () =
-                    let mutable localPid = 0
+                    if stdoutChildFd >= 0 then
+                        register "posix_spawn_file_actions_adddup2 (stdout)" (fun () ->
+                            posix_spawn_file_actions_adddup2 (fileActions, stdoutChildFd, 1))
 
-                    let rc =
-                        posix_spawnp (&localPid, command.Program, fileActions, attributes, argvPointer, envpPointer)
+                    if stderrChildFd >= 0 then
+                        register "posix_spawn_file_actions_adddup2 (stderr)" (fun () ->
+                            posix_spawn_file_actions_adddup2 (fileActions, stderrChildFd, 2))
 
-                    rc, localPid
+                    // After dup2, close the original child-side fds so only 0/1/2 remain in the child.
+                    for fd in childSideFds do
+                        register "posix_spawn_file_actions_addclose (child-side fd)" (fun () ->
+                            posix_spawn_file_actions_addclose (fileActions, fd))
 
-                // umask(2) is a whole-process attribute with no `posix_spawn` attribute, so a requested
-                // mask is set on the parent right before the spawn and restored right after — and EVERY
-                // spawn (mask or not) takes `umaskSpawnLock`, so a concurrent no-mask spawn can never
-                // observe another spawn's temporarily-set umask. See `umaskSpawnLock` for why this
-                // parent-side set/spawn/restore replaces the Rust source's child-side `pre_exec` hook.
-                let rc, pid =
-                    lock umaskSpawnLock (fun () ->
-                        match config.Umask with
-                        | None -> spawnUnderLock ()
-                        | Some mask ->
-                            let previous = umask mask
+                    // Also close the parent-kept ends in the child. This is what guarantees EOF: a
+                    // child must never inherit a writer to its own stdin. We do it explicitly rather
+                    // than rely on FD_CLOEXEC, whose `fcntl` is variadic and is mis-passed by a
+                    // fixed-signature P/Invoke on the AArch64 variadic ABI (Apple Silicon), so CLOEXEC
+                    // never takes effect there and the child would block forever waiting for stdin.
+                    stdinParentWrite
+                    |> Option.iter (fun fd ->
+                        register "posix_spawn_file_actions_addclose (stdin parent end)" (fun () ->
+                            posix_spawn_file_actions_addclose (fileActions, fd)))
 
-                            try
-                                spawnUnderLock ()
-                            finally
-                                umask previous |> ignore)
+                    stdoutParentRead
+                    |> Option.iter (fun fd ->
+                        register "posix_spawn_file_actions_addclose (stdout parent end)" (fun () ->
+                            posix_spawn_file_actions_addclose (fileActions, fd)))
 
-                // The parent never needs the child-side fds.
-                for fd in childSideFds do
-                    closeFd fd
+                    stderrParentRead
+                    |> Option.iter (fun fd ->
+                        register "posix_spawn_file_actions_addclose (stderr parent end)" (fun () ->
+                            posix_spawn_file_actions_addclose (fileActions, fd)))
 
-                if rc <> 0 then
-                    closeParentEnds ()
+                    // CurrentDir → a child-side chdir. A non-zero rc from addchdir_np is an honest spawn
+                    // error; its ABSENCE (EntryPointNotFoundException — the entry point arrived in glibc
+                    // 2.29 / macOS 10.15) means this platform cannot honor CurrentDir at all. We report
+                    // that as a typed `Unsupported` rather than silently running the child in the PARENT's
+                    // working directory (a silent CurrentDir downgrade — the exact bug this fixes). Chosen
+                    // over folding it into `Spawn` because it is a fixed platform capability gap, not a
+                    // per-invocation failure — mirroring the port's other Unix-only gates (e.g. Windows
+                    // `umask` → `Unsupported`), so a caller can branch on it with `err.IsUnsupported`.
+                    match config.WorkingDirectory with
+                    | Some directory when err.IsNone ->
+                        try
+                            let rc = posix_spawn_file_actions_addchdir_np (fileActions, directory)
 
-                    if rc = ENOENT then
-                        Error(ProcessError.NotFound(command.Program, None))
-                    else
-                        Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
-                else
-                    // Apply the requested CPU priority to the freshly spawned leader (pgid = its pid).
-                    // `posix_spawn` has no nice attribute, so this is a post-spawn `setpriority` from the
-                    // parent; the nice inherits across `fork`, so every descendant the leader spawns runs
-                    // at it (whole-tree, modulo the sub-millisecond window before this call lands — see
-                    // `Priority`). Lowering nice (raising priority) can be refused for lack of privilege:
-                    // rather than silently running the child at a lower-than-requested priority, kill and
-                    // reap it and fail the spawn honestly — matching the contract that priority is never
-                    // downgraded silently.
-                    let priorityApplied =
-                        match config.Priority with
-                        | None -> Ok()
-                        | Some priority ->
-                            if setpriority (PRIO_PROCESS, pid, PriorityMapping.niceValue priority) = 0 then
-                                Ok()
-                            else
-                                let errno = Marshal.GetLastWin32Error()
-
-                                Error(
-                                    ProcessError.Spawn(
-                                        command.Program,
-                                        $"could not set process priority via setpriority (errno {errno}); raising priority may require privilege (CAP_SYS_NICE)"
+                            if rc <> 0 then
+                                err <-
+                                    Some(
+                                        ProcessError.Spawn(
+                                            command.Program,
+                                            $"posix_spawn_file_actions_addchdir_np failed for CurrentDir (rc {rc})"
+                                        )
                                     )
+                        with :? EntryPointNotFoundException ->
+                            // libc predates posix_spawn_file_actions_addchdir_np; CurrentDir genuinely
+                            // cannot be applied here. Honest typed failure, never a silent parent-cwd run.
+                            err <-
+                                Some(
+                                    ProcessError.Unsupported
+                                        "CurrentDir on this platform (needs posix_spawn_file_actions_addchdir_np: glibc >= 2.29 or macOS >= 10.15)"
                                 )
+                    | _ -> ()
 
-                    match priorityApplied with
-                    | Error error ->
-                        // The child is already running but must not run at an unintended priority: killpg
-                        // its group (it is its own leader) and reap the leader, then drop the parent pipe
-                        // ends before reporting the failure — the same kill+reap+cleanup a failed spawn does.
-                        killProcessGroup pid
-                        reapLeader pid
+                    let spawnFlags =
+                        if isMacOs then
+                            POSIX_SPAWN_SETPGROUP ||| POSIX_SPAWN_CLOEXEC_DEFAULT
+                        else
+                            POSIX_SPAWN_SETPGROUP
+
+                    register "posix_spawnattr_setflags" (fun () -> posix_spawnattr_setflags (attributes, spawnFlags))
+
+                    register "posix_spawnattr_setpgroup" (fun () -> posix_spawnattr_setpgroup (attributes, 0))
+
+                    match err with
+                    | Some error ->
+                        // A helper failed (or CurrentDir is unsupported here): nothing has been spawned.
+                        // Close the child-side fds and the parent-kept ends before reporting — the
+                        // `finally` still frees the native buffers/marshalling on this same path.
+                        closeChildSideFds ()
                         closeParentEnds ()
                         Error error
-                    | Ok() ->
-                        let readStream fd =
-                            new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Read) :> Stream
+                    | None ->
+                        // Do the actual `posix_spawnp` (returning its rc and the pid it wrote) under
+                        // `umaskSpawnLock`. `localPid` is declared INSIDE the closure so `&localPid` is a
+                        // plain addressable local, not a captured mutable (which F# forbids taking the
+                        // address of).
+                        let spawnUnderLock () =
+                            let mutable localPid = 0
 
-                        let writeStream fd =
-                            new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Write) :> Stream
+                            let rc =
+                                posix_spawnp (
+                                    &localPid,
+                                    command.Program,
+                                    fileActions,
+                                    attributes,
+                                    argvPointer,
+                                    envpPointer
+                                )
 
-                        Ok
-                            { Handle = nativeint pid
-                              Stdout = stdoutParentRead |> Option.map readStream
-                              Stderr = stderrParentRead |> Option.map readStream
-                              Stdin = stdinParentWrite |> Option.map writeStream }
-            finally
-                posix_spawn_file_actions_destroy fileActions |> ignore
-                posix_spawnattr_destroy attributes |> ignore
-                Marshal.FreeHGlobal fileActions
-                Marshal.FreeHGlobal attributes
-                freeCStringArray argvPointer argvAllocations
-                freeCStringArray envpPointer envpAllocations
+                            rc, localPid
+
+                        // umask(2) is a whole-process attribute with no `posix_spawn` attribute, so a
+                        // requested mask is set on the parent right before the spawn and restored right
+                        // after — and EVERY spawn (mask or not) takes `umaskSpawnLock`, so a concurrent
+                        // no-mask spawn can never observe another spawn's temporarily-set umask. See
+                        // `umaskSpawnLock` for why this parent-side set/spawn/restore replaces the Rust
+                        // source's child-side `pre_exec` hook.
+                        let rc, pid =
+                            lock umaskSpawnLock (fun () ->
+                                match config.Umask with
+                                | None -> spawnUnderLock ()
+                                | Some mask ->
+                                    let previous = umask mask
+
+                                    try
+                                        spawnUnderLock ()
+                                    finally
+                                        umask previous |> ignore)
+
+                        // The parent never needs the child-side fds.
+                        closeChildSideFds ()
+
+                        if rc <> 0 then
+                            closeParentEnds ()
+
+                            if rc = ENOENT then
+                                Error(ProcessError.NotFound(command.Program, None))
+                            else
+                                Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
+                        else
+                            // Apply the requested CPU priority to the freshly spawned leader (pgid = its pid).
+                            // `posix_spawn` has no nice attribute, so this is a post-spawn `setpriority` from the
+                            // parent; the nice inherits across `fork`, so every descendant the leader spawns runs
+                            // at it (whole-tree, modulo the sub-millisecond window before this call lands — see
+                            // `Priority`). Lowering nice (raising priority) can be refused for lack of privilege:
+                            // rather than silently running the child at a lower-than-requested priority, kill and
+                            // reap it and fail the spawn honestly — matching the contract that priority is never
+                            // downgraded silently.
+                            let priorityApplied =
+                                match config.Priority with
+                                | None -> Ok()
+                                | Some priority ->
+                                    if setpriority (PRIO_PROCESS, pid, PriorityMapping.niceValue priority) = 0 then
+                                        Ok()
+                                    else
+                                        let errno = Marshal.GetLastWin32Error()
+
+                                        Error(
+                                            ProcessError.Spawn(
+                                                command.Program,
+                                                $"could not set process priority via setpriority (errno {errno}); raising priority may require privilege (CAP_SYS_NICE)"
+                                            )
+                                        )
+
+                            match priorityApplied with
+                            | Error error ->
+                                // The child is already running but must not run at an unintended priority: killpg
+                                // its group (it is its own leader) and reap the leader, then drop the parent pipe
+                                // ends before reporting the failure — the same kill+reap+cleanup a failed spawn does.
+                                killProcessGroup pid
+                                reapLeader pid
+                                closeParentEnds ()
+                                Error error
+                            | Ok() ->
+                                let readStream fd =
+                                    new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Read) :> Stream
+
+                                let writeStream fd =
+                                    new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.Write) :> Stream
+
+                                // Wrap each retained parent end into an owning stream, clearing its fd
+                                // tracker as ownership transfers so that if a later step (or the outer
+                                // handler) runs, it never double-closes an fd a FileStream now owns.
+                                let stdoutStream =
+                                    match stdoutParentRead with
+                                    | Some fd ->
+                                        let stream = readStream fd
+                                        stdoutParentRead <- None
+                                        Some stream
+                                    | None -> None
+
+                                let stderrStream =
+                                    match stderrParentRead with
+                                    | Some fd ->
+                                        let stream = readStream fd
+                                        stderrParentRead <- None
+                                        Some stream
+                                    | None -> None
+
+                                let stdinStream =
+                                    match stdinParentWrite with
+                                    | Some fd ->
+                                        let stream = writeStream fd
+                                        stdinParentWrite <- None
+                                        Some stream
+                                    | None -> None
+
+                                Ok
+                                    { Handle = nativeint pid
+                                      Stdout = stdoutStream
+                                      Stderr = stderrStream
+                                      Stdin = stdinStream
+                                      // POSIX signals the child's process group directly (killpg); the
+                                      // Windows console-ctrl-group flag has no bearing here.
+                                      WindowsCtrlGroup = false }
+                finally
+                    // Release the native scratch on every path (success, honest helper failure, or an
+                    // exception unwinding through here) — destroying only the structs that initialized
+                    // cleanly and freeing only what was actually allocated (a null/empty sentinel is a
+                    // documented no-op for FreeHGlobal / FreeCoTaskMem, so partial allocation is safe).
+                    if fileActionsReady then
+                        posix_spawn_file_actions_destroy fileActions |> ignore
+
+                    if attributesReady then
+                        posix_spawnattr_destroy attributes |> ignore
+
+                    if fileActions <> IntPtr.Zero then
+                        Marshal.FreeHGlobal fileActions
+
+                    if attributes <> IntPtr.Zero then
+                        Marshal.FreeHGlobal attributes
+
+                    freeCStringArray argvPointer argvAllocations
+                    freeCStringArray envpPointer envpAllocations
+            with ex ->
+                // An OOM in AllocHGlobal/marshalCStringArray, or an EntryPointNotFoundException from any
+                // other posix_spawn* import, must not escape this Result-returning function: close
+                // whatever fds are still open and report an honest Spawn error (symmetric to
+                // `spawnWindowsCore`'s `with ex -> ...`). The `finally` above has already released the
+                // native scratch on this same unwind.
+                closeChildSideFds ()
+                closeParentEnds ()
+                Error(ProcessError.Spawn(command.Program, ex.Message))

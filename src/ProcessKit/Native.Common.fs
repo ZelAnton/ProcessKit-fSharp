@@ -28,6 +28,11 @@ module internal Common =
             Stderr: Stream option
             /// Parent write stream for the child's stdin — `Some` only when a stdin pipe was created.
             Stdin: Stream option
+            /// Windows only: `true` when the child was spawned as its own console process group
+            /// (`CREATE_NEW_PROCESS_GROUP`), so `ProcessGroup.Signal(Signal.Int/Term)` can deliver a
+            /// best-effort `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to it. Always `false` on
+            /// POSIX, which delivers signals through `killpg` regardless of this flag.
+            WindowsCtrlGroup: bool
         }
 
     /// The effective environment for the child: the inherited set (unless cleared) with the

@@ -52,6 +52,7 @@ class ProcessKit.Command
   member TimeoutGrace(System.TimeSpan) : ProcessKit.Command
   member Umask(System.Int32) : ProcessKit.Command
   member UncheckedInPipe() : ProcessKit.Command
+  member WindowsCtrlSignals() : ProcessKit.Command
   new(System.String)
   property Arguments : System.Collections.Generic.IReadOnlyList<System.String> { get }
   property ConfiguredTimeout : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
@@ -93,6 +94,7 @@ module ProcessKit.CommandModule
   static member timeoutGrace(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member umask(System.Int32, ProcessKit.Command) : ProcessKit.Command
   static member uncheckedInPipe(ProcessKit.Command) : ProcessKit.Command
+  static member windowsCtrlSignals(ProcessKit.Command) : ProcessKit.Command
 
 class ProcessKit.CommandVerbs
   static member ExitCodeAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>

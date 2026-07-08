@@ -106,6 +106,38 @@ type JobRunnerTests() =
         :> Task
 
     [<Test>]
+    member _.``a token that fires after StartAsync does not terminate the caller-driven live handle``() : Task =
+        // Locks in the documented `StartAsync`/`SpawnAsync` contract: the token is checked exactly once,
+        // before the spawn, and is NOT tracked once the child is running. A live handle is caller-driven
+        // (unlike the completion verbs, which watch the token for the whole run — see `cancelling
+        // terminates the contained process promptly` below). If this behaviour ever regresses into a
+        // post-spawn watchdog, the cancelled token would kill the sleeper and the exit wait would complete
+        // well within the window below.
+        task {
+            use cts = new CancellationTokenSource()
+
+            match! runner.StartAsync(sleeper, cts.Token) with
+            | Error error -> Assert.Fail $"expected a live handle, got {error}"
+            | Ok running ->
+                // Fire the token after the spawn; the caller-driven handle must ignore it.
+                cts.Cancel()
+                let exitWait = RunningProcess.WaitAnyAsync [| running |]
+                let! _ = Task.WhenAny(exitWait :> Task, Task.Delay(TimeSpan.FromMilliseconds 400.0))
+
+                Assert.That(
+                    exitWait.IsCompleted,
+                    Is.False,
+                    "a token that fires after StartAsync must not terminate the live handle"
+                )
+
+                // The caller — not the token — reaps it.
+                running.Kill()
+                let! _ = exitWait
+                do! (running :> IAsyncDisposable).DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
     member _.``cancelling terminates the contained process promptly``() : Task =
         task {
             use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 300.0)
