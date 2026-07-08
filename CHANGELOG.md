@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- A browsable API reference, generated from the XML doc comments of `ProcessKit` and
+  `ProcessKit.Extensions.DependencyInjection` with [fsdocs](https://fsprojects.github.io/FSharp.Formatting/)
+  and published to GitHub Pages on every release: <https://zelanton.github.io/ProcessKit-fSharp/>.
 - `Supervisor.OnRestart` / `OnStormPause`: observe restarts and failure-storm pauses live, as supervision runs, instead of only in the final `SupervisionOutcome` — useful for a health check or crash-loop alerting on a long-lived supervised service. Both callbacks are invoked synchronously from the supervision loop, right before the corresponding delay is slept out, and are purely additive (`SupervisionOutcome.Restarts`/`StormPauses`/`Stopped` are unchanged).
 - `Command.WindowsCtrlSignals` / `Command.windowsCtrlSignals`: spawn a Windows child in its own console process group (`CREATE_NEW_PROCESS_GROUP`) so `ProcessGroup.Signal(Signal.Int)` / `Signal.Term` can deliver it a best-effort console **CTRL+BREAK** — the closest Windows analogue to a graceful `SIGINT`/`SIGTERM` — instead of the hard atomic Job kill, giving a console child a chance to clean up. Best-effort and console-only: the event reaches only a console child that shares the caller's console (a child given its own/hidden console via `CreateNoWindow`, or a parent with no console, cannot receive it), and even a successful send is not guaranteed to be handled. No effect on Unix (which signals the child's process group regardless). The default is unchanged.
 
