@@ -780,6 +780,8 @@ class ProcessKit.RunningProcess
   member ProfileAsync() : System.Threading.Tasks.Task<ProcessKit.RunProfile>
   member ProfileAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.RunProfile>
   member StdoutLinesAsync() : System.Collections.Generic.IAsyncEnumerable<System.String>
+  member StopAsync() : System.Threading.Tasks.Task<ProcessKit.Outcome>
+  member StopAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.Outcome>
   member TakeStdin() : Microsoft.FSharp.Core.FSharpOption<ProcessKit.ProcessStdin>
   member WaitAsync() : System.Threading.Tasks.Task<ProcessKit.Outcome>
   member WaitForAsync(System.Func<System.Threading.Tasks.Task<System.Boolean>>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
