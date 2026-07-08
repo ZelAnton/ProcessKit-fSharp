@@ -6,6 +6,10 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # Weekly, off the ordinary PR/push path — feeds only the `stress` job below (see its own
+  # `if:` guard); the other jobs skip a scheduled run so this doesn't re-run the whole matrix.
+  schedule:
+    - cron: '0 6 * * 1'
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -16,6 +20,7 @@ permissions:
 
 jobs:
   yaml-lint:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -34,6 +39,7 @@ jobs:
         run: yamllint .
 
   format:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       # Actions are pinned to a full commit SHA (supply-chain hardening); the
@@ -54,6 +60,7 @@ jobs:
         run: dotnet fantomas --check src tests
 
   test:
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -85,8 +92,13 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration Release
 
+      # The Stress category is a flaky-sensitive soak/leak suite (hundreds of concurrent spawns,
+      # thread-pool/handle/memory baselines) that would slow down and add noise to every ordinary
+      # PR/push run; it has its own scheduled/workflow_dispatch stage below instead (`stress`).
       - name: Test
-        run: dotnet test --no-build --configuration Release --logger "trx;LogFileName=test-results.trx" --results-directory ./TestResults
+        run: >-
+          dotnet test --no-build --configuration Release --filter "Category!=Stress"
+          --logger "trx;LogFileName=test-results.trx" --results-directory ./TestResults
 
       # Test results are uploaded even when the Test step fails, so a red CI run
       # can be diagnosed from the .trx without re-running locally.
@@ -104,6 +116,7 @@ jobs:
   # namespace and moves the test process to the real root, so cgroup enforcement is actually
   # exercised (PROCESSKIT_EXPECT_CGROUP makes the tests require the cgroup path, not the fallback).
   test-cgroup-limits:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -127,3 +140,47 @@ jobs:
                 --framework net10.0 \
                 --filter "FullyQualifiedName~LimitsTests"
             '
+
+  # Stress/soak suite (`[<Category("Stress")>]` in tests/ProcessKit.Tests/StressTests.fs): hundreds
+  # of concurrent runs against thread-pool/managed-memory/handle baselines. Deliberately kept off the
+  # ordinary PR/push `test` job (flaky-sensitive, adds real wall-clock time) and run instead on a
+  # weekly schedule or on demand via workflow_dispatch. ubuntu-latest is enough to cover the
+  # cross-platform teardown/reap path (ProcessGroup + POSIX zombie reaping) that most past fixes in
+  # CHANGELOG.md have landed in; add more OSes here if a platform-specific stress regression shows up.
+  stress:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Directory.Packages.props', 'nuget.config', 'global.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Stress test
+        run: >-
+          dotnet test --no-build --configuration Release --filter "Category=Stress"
+          --logger "trx;LogFileName=stress-results.trx" --results-directory ./TestResults
+
+      - name: Upload stress test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-test-results
+          path: ./TestResults/*.trx
+          if-no-files-found: ignore
