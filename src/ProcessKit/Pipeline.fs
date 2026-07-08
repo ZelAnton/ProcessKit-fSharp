@@ -80,10 +80,13 @@ module internal PipelineStageGuard =
 /// `UncheckedInPipe`, the last stage's `StdoutEncoding`, `StdoutTee`, and `OutputBuffer` **byte** cap
 /// (`MaxBytes` + `Overflow`, applied to the captured stdout — its `MaxLines` never applies to a raw
 /// byte capture), stage 0's `Stdin` source (feeding the whole chain), and the chain-level `Timeout` /
-/// `CancelOn`. Per-stage *stdout/stderr observation* hooks are **not** applied — intermediate stages'
-/// `StdoutTee` and `OutputBuffer`, and every stage's `StderrTee`, `OnStdoutLine`/`OnStderrLine` —
-/// because the chain wires stdout into the next stage's stdin and captures only the final stage's
-/// output. Observe an individual command by running it on its own, not as a pipeline stage.
+/// `CancelOn`. Every stage's stderr is likewise drained under its OWN `OutputBuffer`'s **byte** cap
+/// (`MaxBytes` + `Overflow`; a stage without `MaxBytes` set keeps its stderr unbounded, as before), so
+/// a chatty stage can never exhaust memory regardless of its position in the chain. Per-stage *stdout/
+/// stderr observation* hooks are still **not** applied — intermediate stages' `StdoutTee`, every
+/// stage's `StderrTee`, and `OnStdoutLine`/`OnStderrLine` — because the chain wires stdout into the
+/// next stage's stdin and captures only the final stage's output. Observe an individual command by
+/// running it on its own, not as a pipeline stage.
 ///
 /// Per-stage config a pipeline cannot honour is **rejected when the stage is piped** (an
 /// `ArgumentException` from `Pipe`, naming the field and stage index), rather than silently dropped:

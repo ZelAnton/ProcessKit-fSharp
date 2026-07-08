@@ -51,7 +51,9 @@
 		<Compile Include="Native.Cgroup.fs" />
 		<Compile Include="Backend.fs" />
 		<Compile Include="Pump.fs" />
+		<Compile Include="StreamChannel.fs" />
 		<Compile Include="ProcessStdin.fs" />
+		<Compile Include="ReadinessProbe.fs" />
 		<Compile Include="RunningProcess.fs" />
 		<Compile Include="IProcessRunner.fs" />
 		<Compile Include="Runner.fs" />
