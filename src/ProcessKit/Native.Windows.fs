@@ -73,6 +73,12 @@ module internal Windows =
     [<Literal>]
     let private CREATE_NO_WINDOW = 0x08000000u
 
+    // Spawn the child as the root of a NEW console process group (its group id = its pid), so a
+    // `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` can be targeted at just that group. It also
+    // disables the child's default CTRL+C handling, which is why the soft signal is CTRL+BREAK.
+    [<Literal>]
+    let private CREATE_NEW_PROCESS_GROUP = 0x00000200u
+
     [<Literal>]
     let private STARTF_USESTDHANDLES = 0x00000100u
 
@@ -395,6 +401,30 @@ module internal Windows =
     /// Hard-kill one Windows process (not its descendants — for that, terminate the whole Job).
     let terminateWindowsProcess (hProcess: nativeint) =
         TerminateProcess(hProcess, 1u) |> ignore
+
+    // Console control events — the best-effort SOFT stop for a console child spawned with
+    // `CREATE_NEW_PROCESS_GROUP`. `CTRL_BREAK_EVENT` is used rather than `CTRL_C_EVENT` because only
+    // CTRL+BREAK can be targeted at a specific process group; CTRL+C can only be broadcast to the whole
+    // console (group id 0), which would also hit the CALLER — so CTRL+BREAK to the child's own group id
+    // is the only way to reach the child without signalling ourselves.
+    [<Literal>]
+    let private CTRL_BREAK_EVENT = 1u
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private GenerateConsoleCtrlEvent(uint32 dwCtrlEvent, uint32 dwProcessGroupId)
+
+    /// Best-effort soft stop for a console child: generate a CTRL+BREAK for the process group
+    /// `processGroupId` (a child spawned with `CREATE_NEW_PROCESS_GROUP`, whose group id is its pid).
+    /// The event is targeted at that SPECIFIC group — never group 0 — so the caller's own console group
+    /// is never signalled. `Ok` on a successful generate; `Error` carries the Win32 message when the API
+    /// itself fails (e.g. the caller has no console). A success means the event was generated for the
+    /// group, not that any child actually handled it: it reaches only console children sharing the
+    /// caller's console, and a child may install its own handler.
+    let sendConsoleCtrlBreakWindows (processGroupId: int) : Result<unit, string> =
+        if GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, uint32 processGroupId) then
+            Ok()
+        else
+            Error(Win32Exception(Marshal.GetLastWin32Error()).Message)
 
     // Tree introspection / suspend-resume for the `process-control` surface.
     [<Literal>]
@@ -800,6 +830,14 @@ module internal Windows =
                      else
                          CREATE_UNICODE_ENVIRONMENT)
                 ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
+                // Opt-in: make the child the root of its own console process group so a later
+                // `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` can soft-signal it (and the tree it
+                // shares a console with) without touching the caller's own group. `Spawned.WindowsCtrlGroup`
+                // records this so `ProcessGroup.Signal` knows which children can receive the event.
+                ||| (if config.WindowsCtrlSignals then
+                         CREATE_NEW_PROCESS_GROUP
+                     else
+                         0u)
                 // The requested CPU priority becomes a priority-class creation flag on the direct child,
                 // set atomically at creation (unlike the POSIX post-spawn nudge), so no window. It is
                 // honored on the immediate child for every level, but Windows only *inherits* a class to
@@ -874,7 +912,8 @@ module internal Windows =
                     { Handle = info.hProcess
                       Stdout = outStream
                       Stderr = errStream
-                      Stdin = stdinStream }
+                      Stdin = stdinStream
+                      WindowsCtrlGroup = config.WindowsCtrlSignals }
         with ex ->
             disposeCreatedPipes ()
             Error(ProcessError.Spawn(command.Program, ex.Message))

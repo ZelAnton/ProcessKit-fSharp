@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `Command.WindowsCtrlSignals` / `Command.windowsCtrlSignals`: spawn a Windows child in its own console process group (`CREATE_NEW_PROCESS_GROUP`) so `ProcessGroup.Signal(Signal.Int)` / `Signal.Term` can deliver it a best-effort console **CTRL+BREAK** — the closest Windows analogue to a graceful `SIGINT`/`SIGTERM` — instead of the hard atomic Job kill, giving a console child a chance to clean up. Best-effort and console-only: the event reaches only a console child that shares the caller's console (a child given its own/hidden console via `CreateNoWindow`, or a parent with no console, cannot receive it), and even a successful send is not guaranteed to be handled. No effect on Unix (which signals the child's process group regardless). The default is unchanged.
 
 ### Changed
--
+- On Windows, `ProcessGroup.Signal(Signal.Int)` / `Signal.Term` now deliver a best-effort console CTRL+BREAK to children started with the new `Command.WindowsCtrlSignals()` (previously every non-`Kill` signal was unconditionally `ProcessError.Unsupported`). When no child in the group opted in, or the caller has no console to share, the call still returns an honest `ProcessError.Unsupported` — never a silent downgrade to the Job kill. `Signal.Kill` and every other Windows signal are unchanged.
 
 ### Fixed
 - The `CgroupBackend` and `ProcessGroupBackend` teardown (`HardRelease`) now atomically drains its tracked children instead of only snapshotting them, matching the Windows Job Object backend: tracking is fully cleared after teardown, and a concurrent racing-spawn cleanup (`ReapEscapee`) now only re-kills/reaps a pid it actually still owns. This closes a window where both could `killpg`/`waitpid` the same pid — after the first reap the OS can reuse that pid, so a second, unguarded `killpg` could land on an unrelated process group.

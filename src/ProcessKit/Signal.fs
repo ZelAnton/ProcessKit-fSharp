@@ -2,9 +2,12 @@ namespace ProcessKit
 
 /// A signal to broadcast to every process in a `ProcessGroup` via `ProcessGroup.Signal`.
 ///
-/// The curated variants map to the POSIX signal of the same name on Unix. On **Windows** only
-/// `Kill` is deliverable (it maps to the Job Object terminate, the same hard kill as
-/// `ProcessGroup.KillAll`); every other variant yields `ProcessError.Unsupported`.
+/// The curated variants map to the POSIX signal of the same name on Unix. On **Windows** `Kill` maps
+/// to the Job Object terminate (the same hard kill as `ProcessGroup.KillAll`), and `Int`/`Term` are
+/// delivered as a best-effort console CTRL+BREAK — but only to a child started with
+/// `Command.WindowsCtrlSignals()`; without one (or without a console to share) they yield
+/// `ProcessError.Unsupported`, never a silent downgrade. Every other variant yields
+/// `ProcessError.Unsupported` on Windows.
 ///
 /// `Other` is an escape hatch carrying a raw signal number on Unix (e.g. `SIGWINCH`); it is always
 /// unsupported on Windows.

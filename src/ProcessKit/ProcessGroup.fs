@@ -252,8 +252,15 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// caller error. An invalid delivery — most notably `Signal.Other` with a signal number the
     /// platform rejects — is a genuine failure and returns `ProcessError.Io` with the errno detail;
     /// when the group has several members, the first genuine failure is reported but every member
-    /// still receives the signal. On **Windows** only `Signal.Kill` is deliverable (it maps to the
-    /// Job terminate); any other signal returns `ProcessError.Unsupported`.
+    /// still receives the signal.
+    ///
+    /// On **Windows** `Signal.Kill` maps to the atomic Job terminate. `Signal.Int` and `Signal.Term`
+    /// are delivered as a best-effort console **CTRL+BREAK**, but ONLY to children started with
+    /// `Command.WindowsCtrlSignals()` (spawned in their own console process group): if the group has
+    /// no such child, or the caller has no console to share with it, the call returns
+    /// `ProcessError.Unsupported` rather than silently downgrading to a kill. Delivery is not
+    /// guaranteed even on success — a console child may install its own handler. Every other Windows
+    /// signal returns `ProcessError.Unsupported`.
     member this.Signal(signal: Signal) : Result<unit, ProcessError> =
         this.WhenLive(fun () -> backend.Signal signal)
 

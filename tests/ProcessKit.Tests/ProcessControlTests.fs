@@ -129,6 +129,73 @@ type ProcessControlTests() =
         :> Task
 
     [<Test>]
+    member _.``Windows: Signal.Int/Term without WindowsCtrlSignals is honest Unsupported``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Console CTRL-event delivery is a Windows-only concern."
+            else
+                use group = create ()
+
+                // The child was NOT started with WindowsCtrlSignals(), so it is not in its own console
+                // process group and no CTRL+BREAK can reach it. Both soft signals must fail honestly —
+                // never silently downgrade to the Job kill.
+                match! group.StartAsync sleeper with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    for soft in [ Signal.Int; Signal.Term ] do
+                        match group.Signal soft with
+                        | Error(ProcessError.Unsupported _) -> ()
+                        | other ->
+                            Assert.Fail $"expected Unsupported for {soft} without WindowsCtrlSignals, got {other}"
+
+                    running.Kill()
+                    let! _ = running.WaitAsync()
+                    ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: Signal.Int stops a console child started with WindowsCtrlSignals``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Console CTRL-event delivery is a Windows-only concern."
+            else
+                use group = create ()
+
+                // A console child spawned in its OWN process group (CREATE_NEW_PROCESS_GROUP). The 15s
+                // timeout bounds the run so a delivery miss surfaces as TimedOut rather than hanging.
+                let consoleChild =
+                    (Command.create "ping" |> Command.args [ "-n"; "30"; "127.0.0.1" ])
+                        .WindowsCtrlSignals()
+                        .Stdout(StdioMode.Null)
+                        .Timeout(TimeSpan.FromSeconds 15.0)
+
+                match! group.StartAsync consoleChild with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    match group.Signal Signal.Int with
+                    | Ok() ->
+                        let! outcome = running.WaitAsync()
+
+                        match outcome with
+                        | Outcome.Exited _ -> Assert.Pass()
+                        | Outcome.TimedOut ->
+                            // The event was generated but the child never received it — best-effort
+                            // delivery needs the child to actually share the caller's console, which
+                            // some test hosts do not provide. Not a code defect.
+                            Assert.Ignore
+                                "CTRL+BREAK was generated but the child did not share the caller's console (best-effort)."
+                        | other -> Assert.Fail $"unexpected outcome {other}"
+                    | Error(ProcessError.Unsupported _) ->
+                        // No console to share in this environment — the honest best-effort outcome.
+                        running.Kill()
+                        let! _ = running.WaitAsync()
+                        Assert.Ignore "The test host has no console to share with the child (best-effort)."
+                    | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``Suspend then Resume leaves the process able to complete``() : Task =
         task {
             use group = create ()

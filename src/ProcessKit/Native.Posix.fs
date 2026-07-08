@@ -647,7 +647,10 @@ module internal Posix =
                             { Handle = nativeint pid
                               Stdout = stdoutParentRead |> Option.map readStream
                               Stderr = stderrParentRead |> Option.map readStream
-                              Stdin = stdinParentWrite |> Option.map writeStream }
+                              Stdin = stdinParentWrite |> Option.map writeStream
+                              // POSIX signals the child's process group directly (killpg); the Windows
+                              // console-ctrl-group flag has no bearing here.
+                              WindowsCtrlGroup = false }
             finally
                 posix_spawn_file_actions_destroy fileActions |> ignore
                 posix_spawnattr_destroy attributes |> ignore

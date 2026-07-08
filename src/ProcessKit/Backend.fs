@@ -1,6 +1,7 @@
 namespace ProcessKit
 
 open System
+open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Diagnostics
 open System.Threading.Tasks
@@ -124,6 +125,14 @@ type internal IContainmentBackend =
 type internal JobObjectBackend(jobHandle: nativeint) =
     let children = TrackedChildren<nativeint>()
 
+    // Children spawned with `Command.WindowsCtrlSignals()` (CREATE_NEW_PROCESS_GROUP), mapped by their
+    // process HANDLE to their console process-group id (= pid), so `Signal.Int`/`Signal.Term` can
+    // `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, groupId)` each of them. Keyed by handle, not pid, so
+    // it stays in lockstep with `children`: while we hold a child's handle open the OS cannot recycle
+    // its pid, so a stored group id is never stale (no wrong-target CTRL+BREAK). Entries are added at
+    // `Track` and removed at exactly the same points the handle is closed.
+    let ctrlGroups = ConcurrentDictionary<nativeint, int>()
+
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.JobObject
 
@@ -134,12 +143,19 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             // The child was assigned to the Job while still suspended at spawn, so it is already
             // contained — tracking its handle is only for waiting. Always succeeds.
             children.Add spawned.Handle
+
+            if spawned.WindowsCtrlGroup then
+                // Its console process-group id is its pid; the handle is still open here, so the pid is
+                // live and unambiguous. Records it as CTRL+BREAK-capable for `Signal.Int`/`Signal.Term`.
+                ctrlGroups[spawned.Handle] <- Native.Windows.processIdWindows spawned.Handle
+
             Ok()
 
         member _.Release(spawned) =
             // Remove the handle before closing so the teardown drain can't double-close a reused
             // handle value; the Job still contains the tree.
             if children.Remove spawned.Handle then
+                ctrlGroups.TryRemove spawned.Handle |> ignore
                 Native.Windows.closeWindowsHandle spawned.Handle
 
         member _.Wait(handle) = Native.Windows.waitWindows handle
@@ -155,6 +171,7 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             // closes the job handle — no TerminateProcess here (a concurrent HardRelease may already have
             // closed this handle value). Just drop our wait-handle if still tracked, so it is not leaked.
             if children.Remove spawned.Handle then
+                ctrlGroups.TryRemove spawned.Handle |> ignore
                 Native.Windows.closeWindowsHandle spawned.Handle
 
         member _.KillTree() =
@@ -172,7 +189,46 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             | Signal.Kill ->
                 Native.Windows.terminateWindowsJob jobHandle
                 Ok()
-            | _ -> Error(ProcessError.Unsupported $"signal {signal} on Windows (only Signal.Kill is deliverable)")
+            | Signal.Int
+            | Signal.Term ->
+                // Best-effort SOFT stop: deliver a console CTRL+BREAK to every child started with
+                // `Command.WindowsCtrlSignals()`, targeting each child's OWN process group id (its pid)
+                // so the caller's own console group is never signalled. `Signal.Int`/`Signal.Term` both
+                // map to CTRL+BREAK — the closest Windows analogue — because CREATE_NEW_PROCESS_GROUP
+                // disables the child's CTRL+C and only CTRL+BREAK can be group-targeted.
+                let groups = ctrlGroups.Values |> List.ofSeq
+
+                if List.isEmpty groups then
+                    // No child in this group can receive a Ctrl event — honest Unsupported, never a
+                    // silent downgrade to the Job kill.
+                    Error(
+                        ProcessError.Unsupported
+                            $"{signal} on Windows is deliverable only to a child started with Command.WindowsCtrlSignals() (CREATE_NEW_PROCESS_GROUP); this group has none"
+                    )
+                else
+                    // Send to every capable child; a member whose send fails (e.g. the caller has no
+                    // console to share) is not silently ignored — the first genuine failure is reported.
+                    let mutable firstFailure: string option = None
+
+                    for groupId in groups do
+                        match Native.Windows.sendConsoleCtrlBreakWindows groupId with
+                        | Ok() -> ()
+                        | Error message ->
+                            if firstFailure.IsNone then
+                                firstFailure <- Some message
+
+                    match firstFailure with
+                    | None -> Ok()
+                    | Some message ->
+                        Error(
+                            ProcessError.Unsupported
+                                $"{signal} on Windows could not be delivered as a console CTRL+BREAK (GenerateConsoleCtrlEvent failed: {message}); the caller may have no console to share with the child"
+                        )
+            | _ ->
+                Error(
+                    ProcessError.Unsupported
+                        $"signal {signal} on Windows (only Signal.Kill, and Signal.Int/Signal.Term to a child started with Command.WindowsCtrlSignals(), are deliverable)"
+                )
 
         member _.Suspend() =
             Native.Windows.suspendWindows jobHandle
@@ -188,6 +244,8 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             | None -> Error(ProcessError.Io "failed to query Job Object accounting")
 
         member _.HardRelease() =
+            ctrlGroups.Clear()
+
             for handle in children.Drain() do
                 Native.Windows.closeWindowsHandle handle
 
