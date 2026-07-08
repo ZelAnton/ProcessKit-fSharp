@@ -2,8 +2,6 @@ namespace ProcessKit.Testing
 
 open System
 open System.Collections.Generic
-open System.Threading
-open System.Threading.Tasks
 open ProcessKit
 
 /// A subprocess-free `IProcessRunner` for a `--dry-run` seam: instead of spawning anything, every verb
@@ -36,6 +34,19 @@ type DryRunRunner() =
         else
             arg
 
+    // Render, append it to the history under the lock (so concurrent verbs can never interleave a
+    // partial append), and build the in-memory fake process every verb shares — mirroring
+    // `ScriptedRunner`'s approach so a dry-run capture and a dry-run stream agree byte-for-byte
+    // (encoding, `OkCodes`, output-buffer policy) and differ only in the final projection `Seam.runner`
+    // applies. A missed (cancelled) run is never recorded — `Seam.runner` guards cancellation before
+    // this ever runs, matching `JobRunner` / `ScriptedRunner`.
+    let resolve (command: Command) : Result<RunningProcess, ProcessError> =
+        let render = DryRunRunner.Render command
+        lock gate (fun () -> history.Add render)
+        Ok(FakeProcess.OfCommand(command).WithStdout(render).Build())
+
+    let seam = Seam.runner resolve
+
     /// Render `command` deterministically: the program, then its arguments (quoted when needed), then
     /// `(cwd: <directory>)` when the command set a working directory. Two commands built the same way
     /// always render identically.
@@ -55,32 +66,12 @@ type DryRunRunner() =
     /// while another verb is still recording concurrently.
     member _.History: IReadOnlyList<string> = lock gate (fun () -> history.ToArray())
 
-    // Render, append it to the history under the lock (so concurrent verbs can never interleave a
-    // partial append), and build the in-memory fake process every verb below shares — mirroring
-    // `ScriptedRunner`'s approach so a dry-run capture and a dry-run stream agree byte-for-byte
-    // (encoding, `OkCodes`, output-buffer policy) and differ only in which verb consumes the built
-    // handle. A cancelled run is always an error and is never recorded, matching `JobRunner` /
-    // `ScriptedRunner`.
-    member private _.Serve
-        (command: Command, cancellationToken: CancellationToken)
-        : Result<RunningProcess, ProcessError> =
-        if cancellationToken.IsCancellationRequested then
-            Error(ProcessError.Cancelled command.Program)
-        else
-            let render = DryRunRunner.Render command
-            lock gate (fun () -> history.Add render)
-            Ok(FakeProcess.OfCommand(command).WithStdout(render).Build())
-
     interface IProcessRunner with
-        member this.CaptureStringAsync(command, cancellationToken) =
-            match this.Serve(command, cancellationToken) with
-            | Ok running -> running.OutputStringAsync()
-            | Error error -> Task.FromResult(Error error)
+        member _.CaptureStringAsync(command, cancellationToken) =
+            seam.CaptureStringAsync(command, cancellationToken)
 
-        member this.SpawnAsync(command, cancellationToken) =
-            Task.FromResult(this.Serve(command, cancellationToken))
+        member _.SpawnAsync(command, cancellationToken) =
+            seam.SpawnAsync(command, cancellationToken)
 
-        member this.CaptureBytesAsync(command, cancellationToken) =
-            match this.Serve(command, cancellationToken) with
-            | Ok running -> running.OutputBytesAsync()
-            | Error error -> Task.FromResult(Error error)
+        member _.CaptureBytesAsync(command, cancellationToken) =
+            seam.CaptureBytesAsync(command, cancellationToken)

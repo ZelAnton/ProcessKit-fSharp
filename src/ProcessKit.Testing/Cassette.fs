@@ -586,7 +586,22 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             with ex ->
                 Error(ProcessError.Io ex.Message)
 
-    member private this.Capture(command: Command, cancellationToken: CancellationToken) =
+    // The shared mode logic behind both capture verbs: Record delegates to `inner` and captures the
+    // live result; Replay serves strictly from the cassette (a miss is `CassetteMiss`, never a
+    // surprise subprocess); Auto replays a hit and delegates+records a miss (VCR "new episodes").
+    // Parameterized over `captureInner` (which of `inner`'s two capture verbs to call),
+    // `entryOf` (how to turn a live result into a `CassetteEntry`), and `resultOf` (how to turn a
+    // replayed entry back into a result — `resultBytes` alone can fail, on a text/pre-v2 entry), so
+    // the text and bytes paths can never drift apart on the mode/lock/dirty discipline itself.
+    member private this.CaptureVia<'a>
+        (
+            command: Command,
+            cancellationToken: CancellationToken,
+            captureInner:
+                IProcessRunner -> Command -> CancellationToken -> Task<Result<ProcessResult<'a>, ProcessError>>,
+            entryOf: Command -> ProcessResult<'a> -> string option -> CassetteEntry,
+            resultOf: Command -> CassetteEntry -> Result<ProcessResult<'a>, ProcessError>
+        ) : Task<Result<ProcessResult<'a>, ProcessError>> =
         task {
             if cancellationToken.IsCancellationRequested then
                 // Honour the cancelled-is-always-an-error contract on every mode: replay ignored the
@@ -598,28 +613,28 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 | Ok digest ->
                     match mode with
                     | RecordMode(inner, recorded, dirty) ->
-                        match! inner.CaptureStringAsync(command, cancellationToken) with
+                        match! captureInner inner command cancellationToken with
                         | Error error -> return Error error
                         | Ok result ->
                             lock gate (fun () ->
-                                recorded.Add(entryOfText command result digest)
+                                recorded.Add(entryOf command result digest)
                                 dirty.Value <- true)
 
                             return Ok result
                     | ReplayMode slots ->
                         match lock gate (fun () -> play slots (keyOf command digest)) with
-                        | Some entry -> return Ok(resultText command entry)
+                        | Some entry -> return resultOf command entry
                         | None -> return Error(ProcessError.CassetteMiss command.Program)
                     | AutoMode(inner, slots, recorded, dirty) ->
                         let key = keyOf command digest
 
                         match lock gate (fun () -> play slots key) with
-                        | Some entry -> return Ok(resultText command entry)
+                        | Some entry -> return resultOf command entry
                         | None ->
-                            match! inner.CaptureStringAsync(command, cancellationToken) with
+                            match! captureInner inner command cancellationToken with
                             | Error error -> return Error error
                             | Ok result ->
-                                let entry = entryOfText command result digest
+                                let entry = entryOf command result digest
 
                                 lock gate (fun () ->
                                     recorded.Add entry
@@ -628,47 +643,24 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
                                 return Ok result
         }
+
+    member private this.Capture(command: Command, cancellationToken: CancellationToken) =
+        this.CaptureVia(
+            command,
+            cancellationToken,
+            (fun inner c t -> inner.CaptureStringAsync(c, t)),
+            entryOfText,
+            (fun c e -> Ok(resultText c e))
+        )
 
     member private this.CaptureBytes(command: Command, cancellationToken: CancellationToken) =
-        task {
-            if cancellationToken.IsCancellationRequested then
-                return Error(ProcessError.Cancelled command.Program)
-            else
-                match stdinDigest command with
-                | Error error -> return Error error
-                | Ok digest ->
-                    match mode with
-                    | RecordMode(inner, recorded, dirty) ->
-                        match! inner.CaptureBytesAsync(command, cancellationToken) with
-                        | Error error -> return Error error
-                        | Ok result ->
-                            lock gate (fun () ->
-                                recorded.Add(entryOfBytes command result digest)
-                                dirty.Value <- true)
-
-                            return Ok result
-                    | ReplayMode slots ->
-                        match lock gate (fun () -> play slots (keyOf command digest)) with
-                        | Some entry -> return resultBytes command entry
-                        | None -> return Error(ProcessError.CassetteMiss command.Program)
-                    | AutoMode(inner, slots, recorded, dirty) ->
-                        let key = keyOf command digest
-
-                        match lock gate (fun () -> play slots key) with
-                        | Some entry -> return resultBytes command entry
-                        | None ->
-                            match! inner.CaptureBytesAsync(command, cancellationToken) with
-                            | Error error -> return Error error
-                            | Ok result ->
-                                let entry = entryOfBytes command result digest
-
-                                lock gate (fun () ->
-                                    recorded.Add entry
-                                    remember slots key entry
-                                    dirty.Value <- true)
-
-                                return Ok result
-        }
+        this.CaptureVia(
+            command,
+            cancellationToken,
+            (fun inner c t -> inner.CaptureBytesAsync(c, t)),
+            entryOfBytes,
+            resultBytes
+        )
 
     // Replay a live handle from the cassette. Record mode cannot capture a live stream without racing
     // the consumer, so it is unsupported there — record a streaming call through a capture verb first.

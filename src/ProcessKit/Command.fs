@@ -334,9 +334,17 @@ type Command internal (config: CommandConfig) =
                 TimeoutGrace = Some grace }
         )
 
-    /// Also cancel the run when `cancellationToken` fires (in addition to any verb token). Applies to
-    /// the run/capture/completion verbs (`RunAsync`/`Output*`/`ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/`FirstLineAsync`); the
-    /// live `StartAsync` handle is driven by its caller, so it observes only the token passed to `StartAsync`.
+    /// Also cancel the run when `cancellationToken` fires (in addition to any verb token). This binds the
+    /// token to the **completion** verbs — `RunAsync`/`Output*`/`ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/`FirstLineAsync`:
+    /// they drive the child to completion, so they watch the token for the whole run and turn a fired token
+    /// into `ProcessError.Cancelled`.
+    ///
+    /// It does **not** reach a live `StartAsync`/`SpawnAsync` handle. On that path the verb's own token is
+    /// checked exactly once, before the actual spawn (an already-cancelled token short-circuits to
+    /// `ProcessError.Cancelled` and starts nothing); once the child is running, neither this `CancelOn`
+    /// token nor the token passed to `StartAsync` is tracked. A live handle is caller-driven — cancel or
+    /// reap it yourself: dispose it, call its `Kill`, or register your own callback on the token that calls
+    /// `Kill`.
     member _.CancelOn(cancellationToken: CancellationToken) =
         Command(
             { config with

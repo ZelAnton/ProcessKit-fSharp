@@ -28,5 +28,12 @@ type IProcessRunner =
 
     /// Start the command and return a live handle for streaming, interactive stdin, and waiting.
     /// (The primitive behind the `StartAsync` verb.)
+    ///
+    /// `cancellationToken` is checked exactly **once**, before the spawn: an already-cancelled token
+    /// reports `ProcessError.Cancelled` without starting a child. Once the child is running the token is
+    /// **no longer tracked** — a live handle is caller-driven, so cancel or reap it yourself (dispose the
+    /// handle, or call its `Kill`). This differs from the completion primitives
+    /// (`CaptureStringAsync`/`CaptureBytesAsync`), which drive the child to completion and so honour the
+    /// token — and the command's `CancelOn` — for the whole run.
     abstract member SpawnAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<RunningProcess, ProcessError>>
