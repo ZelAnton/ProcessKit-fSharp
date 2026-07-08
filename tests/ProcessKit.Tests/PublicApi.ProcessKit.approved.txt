@@ -52,6 +52,7 @@ class ProcessKit.Command
   member TimeoutGrace(System.TimeSpan) : ProcessKit.Command
   member Umask(System.Int32) : ProcessKit.Command
   member UncheckedInPipe() : ProcessKit.Command
+  member WindowsCtrlSignals() : ProcessKit.Command
   new(System.String)
   property Arguments : System.Collections.Generic.IReadOnlyList<System.String> { get }
   property ConfiguredTimeout : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
@@ -93,6 +94,7 @@ module ProcessKit.CommandModule
   static member timeoutGrace(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member umask(System.Int32, ProcessKit.Command) : ProcessKit.Command
   static member uncheckedInPipe(ProcessKit.Command) : ProcessKit.Command
+  static member windowsCtrlSignals(ProcessKit.Command) : ProcessKit.Command
 
 class ProcessKit.CommandVerbs
   static member ExitCodeAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
@@ -985,6 +987,8 @@ class ProcessKit.Supervisor
   member Jitter(System.Boolean) : ProcessKit.Supervisor
   member MaxBackoff(System.TimeSpan) : ProcessKit.Supervisor
   member MaxRestarts(System.Int32) : ProcessKit.Supervisor
+  member OnRestart(System.Action<ProcessKit.SupervisorRestartEvent>) : ProcessKit.Supervisor
+  member OnStormPause(System.Action<ProcessKit.SupervisorStormPauseEvent>) : ProcessKit.Supervisor
   member Restart(ProcessKit.RestartPolicy) : ProcessKit.Supervisor
   member RunAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>>
   member StopWhen(System.Func<ProcessKit.ProcessResult<System.String>, System.Boolean>) : ProcessKit.Supervisor
@@ -994,6 +998,16 @@ class ProcessKit.Supervisor
 
 module ProcessKit.SupervisorModule
   static member create(ProcessKit.Command) : ProcessKit.Supervisor
+
+class ProcessKit.SupervisorRestartEvent
+  property Delay : System.TimeSpan { get }
+  property Program : System.String { get }
+  property Restart : System.Int32 { get }
+
+class ProcessKit.SupervisorStormPauseEvent
+  property Delay : System.TimeSpan { get }
+  property Program : System.String { get }
+  property StormPause : System.Int32 { get }
 
 delegate ProcessKit.TryParser`1 : System.MulticastDelegate
   :> System.ICloneable

@@ -6,6 +6,7 @@ open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+open ProcessKit.Testing
 
 /// A subprocess-free `IProcessRunner` that returns a fixed *sequence* of replies, one per call.
 /// Running out of replies fails the test loudly, so an unexpected restart is caught rather than
@@ -722,6 +723,101 @@ type SupervisorTests() =
                     .RunAsync()
             with
             | Ok _ -> Assert.That(unboundedRunner.SeenPolicy.Value.MaxLines.IsNone, Is.True)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // ----- live observability (OnRestart / OnStormPause) -----
+
+    [<Test>]
+    member _.``OnRestart fires live, once per restart, before the supervisor sleeps out its backoff``() : Task =
+        task {
+            let clock = FakeClock()
+            let mutable calls = 0
+
+            // Crash twice, then succeed. `calls` also serves as the match predicate, so each actual
+            // restart resolves against the runner exactly once (ScriptedRunner has no built-in notion
+            // of "reply N", so the predicate's own side effect stands in for a call counter).
+            let scripted: IProcessRunner =
+                ScriptedRunner()
+                    .When(
+                        Func<Command, bool>(fun _ ->
+                            calls <- calls + 1
+                            calls <= 2),
+                        Reply.Exit 1
+                    )
+                    .Fallback(Reply.Ok "done")
+
+            let events = ResizeArray<SupervisorRestartEvent>()
+            let clockAtEvent = ResizeArray<float>()
+
+            let sup =
+                Supervisor(Command.create "worker")
+                    .WithRunner(scripted)
+                    .Backoff(TimeSpan.FromMilliseconds 100.0, 1.0)
+                    .Jitter(false)
+                    .OnRestart(fun e ->
+                        events.Add e
+                        clockAtEvent.Add(clock.Now()))
+                |> withClock clock
+
+            match! sup.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 2)
+                Assert.That(events.Count, Is.EqualTo 2, "OnRestart must fire once per restart")
+                Assert.That(events[0].Restart, Is.EqualTo 1)
+                Assert.That(events[1].Restart, Is.EqualTo 2)
+                Assert.That(events |> Seq.forall (fun e -> e.Program = "worker"), Is.True)
+                Assert.That(events |> Seq.forall (fun e -> e.Delay = TimeSpan.FromMilliseconds 100.0), Is.True)
+
+                // Proof of "live", not postfactum: each handler observed the clock BEFORE its own
+                // restart's sleep advanced it — the second event fires at 100ms (after the first sleep,
+                // before the second), not at the final 200ms total.
+                Assert.That(clockAtEvent[0], Is.EqualTo 0.0)
+                Assert.That(clockAtEvent[1], Is.EqualTo(0.1).Within 1e-9)
+                Assert.That(totalMs clock, Is.EqualTo(200.0).Within 1.0)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OnStormPause fires live when the storm guard trips``() : Task =
+        task {
+            let clock = FakeClock()
+            let mutable calls = 0
+
+            // Zero backoff -> zero decay: scores 1, 2, 3; the third crosses the 2.5 threshold -> one pause.
+            let scripted: IProcessRunner =
+                ScriptedRunner()
+                    .When(
+                        Func<Command, bool>(fun _ ->
+                            calls <- calls + 1
+                            calls <= 3),
+                        Reply.Exit 1
+                    )
+                    .Fallback(Reply.Ok "done")
+
+            let events = ResizeArray<SupervisorStormPauseEvent>()
+
+            let sup =
+                Supervisor(Command.create "worker")
+                    .WithRunner(scripted)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .StormPause(TimeSpan.FromSeconds 1.0)
+                    .FailureThreshold(2.5)
+                    .FailureDecay(TimeSpan.FromSeconds 1000.0)
+                    .OnStormPause(fun e -> events.Add e)
+                |> withClock clock
+
+            match! sup.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 3)
+                Assert.That(outcome.StormPauses, Is.EqualTo 1)
+                Assert.That(events.Count, Is.EqualTo 1, "OnStormPause must fire exactly once, live")
+                Assert.That(events[0].StormPause, Is.EqualTo 1)
+                Assert.That(events[0].Program, Is.EqualTo "worker")
+                Assert.That(events[0].Delay, Is.EqualTo(TimeSpan.FromSeconds 1.0))
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task

@@ -603,6 +603,27 @@ type CassetteTests() =
             })
 
     [<Test>]
+    member _.``a pre-cancelled token makes both capture verbs report Cancelled without touching inner``() : Task =
+        withCassette (fun path ->
+            task {
+                // The text and bytes capture verbs share `CaptureVia`'s cancellation guard; prove neither
+                // path lost it to the refactor — a cancelled call must short-circuit to `Cancelled` and
+                // never reach `inner` (which would otherwise report a live `Ok` result here).
+                use recorder = RecordReplayRunner.Record(path, FixedBytesRunner([| 1uy |], "", 0))
+                use cts = new CancellationTokenSource()
+                cts.Cancel()
+                let command = Command.create "tool"
+
+                match! (runner recorder).CaptureStringAsync(command, cts.Token) with
+                | Error(ProcessError.Cancelled "tool") -> ()
+                | other -> Assert.Fail $"expected Cancelled from the text verb, got {other}"
+
+                match! (runner recorder).CaptureBytesAsync(command, cts.Token) with
+                | Error(ProcessError.Cancelled "tool") -> ()
+                | other -> Assert.Fail $"expected Cancelled from the bytes verb, got {other}"
+            })
+
+    [<Test>]
     member _.``file-stdin content hashing matches on contents, not path``() : Task =
         task {
             let cassette = Path.Combine(Path.GetTempPath(), $"pk-cass-{Guid.NewGuid():N}.json")

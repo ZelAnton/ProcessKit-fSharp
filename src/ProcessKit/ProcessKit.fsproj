@@ -51,7 +51,9 @@
 		<Compile Include="Native.Cgroup.fs" />
 		<Compile Include="Backend.fs" />
 		<Compile Include="Pump.fs" />
+		<Compile Include="StreamChannel.fs" />
 		<Compile Include="ProcessStdin.fs" />
+		<Compile Include="ReadinessProbe.fs" />
 		<Compile Include="RunningProcess.fs" />
 		<Compile Include="IProcessRunner.fs" />
 		<Compile Include="Runner.fs" />
@@ -75,6 +77,10 @@
 		<!-- The testing doubles build a RunningProcess over ProcessKit's internal RunningHost and
 		     construct ProcessResult<'T> directly (both internal constructors). -->
 		<InternalsVisibleTo Include="ProcessKit.Testing" />
+		<!-- The benchmarks drive the internal Pump.readLines hot path and Log module directly, rather
+		     than only through the public verbs, so BenchmarkDotNet measures the pump/log call itself
+		     instead of a whole process spawn's noise. -->
+		<InternalsVisibleTo Include="ProcessKit.Benchmarks" />
 	</ItemGroup>
 
 	<ItemGroup>

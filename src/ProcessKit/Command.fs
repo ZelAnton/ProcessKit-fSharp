@@ -56,6 +56,11 @@ type internal CommandConfig =
       UncheckedInPipe: bool
       OkCodes: int list
       CreateNoWindow: bool
+      // Windows: spawn the child as its own console process group (`CREATE_NEW_PROCESS_GROUP`) so
+      // `ProcessGroup.Signal(Signal.Int/Term)` can deliver a best-effort console CTRL+BREAK to it
+      // instead of the hard Job kill. Default `false`; no effect on Unix (which signals the child's
+      // process group through `killpg` regardless).
+      WindowsCtrlSignals: bool
       // The child's CPU-scheduling priority, applied at spawn (Windows priority class / Unix nice).
       // `None` (the default) leaves the OS default untouched.
       Priority: Priority option
@@ -99,6 +104,7 @@ module internal CommandConfig =
           UncheckedInPipe = false
           OkCodes = [ 0 ]
           CreateNoWindow = false
+          WindowsCtrlSignals = false
           Priority = None
           Umask = None
           Logger = None
@@ -334,9 +340,17 @@ type Command internal (config: CommandConfig) =
                 TimeoutGrace = Some grace }
         )
 
-    /// Also cancel the run when `cancellationToken` fires (in addition to any verb token). Applies to
-    /// the run/capture/completion verbs (`RunAsync`/`Output*`/`ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/`FirstLineAsync`); the
-    /// live `StartAsync` handle is driven by its caller, so it observes only the token passed to `StartAsync`.
+    /// Also cancel the run when `cancellationToken` fires (in addition to any verb token). This binds the
+    /// token to the **completion** verbs — `RunAsync`/`Output*`/`ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/`FirstLineAsync`:
+    /// they drive the child to completion, so they watch the token for the whole run and turn a fired token
+    /// into `ProcessError.Cancelled`.
+    ///
+    /// It does **not** reach a live `StartAsync`/`SpawnAsync` handle. On that path the verb's own token is
+    /// checked exactly once, before the actual spawn (an already-cancelled token short-circuits to
+    /// `ProcessError.Cancelled` and starts nothing); once the child is running, neither this `CancelOn`
+    /// token nor the token passed to `StartAsync` is tracked. A live handle is caller-driven — cancel or
+    /// reap it yourself: dispose it, call its `Kill`, or register your own callback on the token that calls
+    /// `Kill`.
     member _.CancelOn(cancellationToken: CancellationToken) =
         Command(
             { config with
@@ -389,6 +403,24 @@ type Command internal (config: CommandConfig) =
     /// does not flash a console window. No effect on Unix.
     member _.CreateNoWindow() =
         Command({ config with CreateNoWindow = true })
+
+    /// Windows: spawn the child as its own console process group (`CREATE_NEW_PROCESS_GROUP`), so that
+    /// `ProcessGroup.Signal(Signal.Int)` / `Signal.Term` can deliver it a best-effort console
+    /// **CTRL+BREAK** — the closest Windows analogue to a graceful `SIGINT`/`SIGTERM` — instead of the
+    /// hard atomic Job-Object kill, giving a console child a chance to clean up. **Best-effort and
+    /// console-only:** the event reaches only a console child that shares the caller's console. A child
+    /// given its own or hidden console (via `CreateNoWindow`), or a parent that has no console at all,
+    /// cannot receive it — the send then fails honestly with `ProcessError.Unsupported` rather than a
+    /// silent downgrade — and even on a successful send delivery is not guaranteed (the child may
+    /// install its own console handler). `Signal.Kill` is unaffected (always the atomic Job kill), and
+    /// this has no effect on Unix, where signals reach the child's process group regardless. Note that
+    /// `CREATE_NEW_PROCESS_GROUP` also disables the child's default CTRL+C handling, which is why the
+    /// soft signal is delivered as CTRL+BREAK rather than CTRL+C.
+    member _.WindowsCtrlSignals() =
+        Command(
+            { config with
+                WindowsCtrlSignals = true }
+        )
 
     /// Launch the child — and the process tree it spawns — at a lower (or higher) CPU-scheduling
     /// `priority`: a Windows priority class set at process creation, or a Unix `nice` value applied via
@@ -522,6 +554,10 @@ module Command =
 
     /// Windows: run the child with `CREATE_NO_WINDOW` (no effect on Unix).
     let createNoWindow (command: Command) = command.CreateNoWindow()
+
+    /// Windows: spawn the child as its own console process group so `ProcessGroup.Signal(Signal.Int/Term)`
+    /// can deliver a best-effort CTRL+BREAK (no effect on Unix). See `Command.WindowsCtrlSignals`.
+    let windowsCtrlSignals (command: Command) = command.WindowsCtrlSignals()
 
     /// Launch the child (and its spawned tree) at a lower/higher CPU-scheduling priority (Windows
     /// priority class / Unix nice). Supported on both platforms; the default leaves the OS default.
