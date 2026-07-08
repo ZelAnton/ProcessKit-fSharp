@@ -35,6 +35,9 @@ vocabulary every other guide builds on). Reach for the rest as the need arises, 
 [Platform support](platform-support.md) handy before you ship: it collects every per-OS caveat in
 one place.
 
+The repository also includes runnable sample projects under [`../samples/`](../samples/) for F#
+and C# users who want compiled examples instead of Markdown snippets.
+
 | Guide | Covers |
 |---|---|
 | [Cookbook](cookbook.md) | "I want to …" → working snippet, for every capability; each recipe links to its deep guide |

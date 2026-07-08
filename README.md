@@ -188,6 +188,9 @@ the [Cookbook](docs/cookbook.md) first — it maps "I want to …" tasks to work
 read [Running commands](docs/commands.md) end to end. For a member-by-member lookup instead of a
 narrative guide, browse the generated **[API reference](https://zelanton.github.io/ProcessKit-fSharp/)**.
 
+Prefer compiled examples? The [`samples/`](samples/) directory contains runnable F# and C# console
+projects covering capture, streaming readiness, pipelines, supervision, DI, and test doubles.
+
 | Guide | Covers |
 |---|---|
 | [Cookbook](docs/cookbook.md) | Task → snippet recipes for everything below; the fastest way in |

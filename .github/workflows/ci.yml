@@ -57,7 +57,7 @@ jobs:
         run: dotnet tool restore
 
       - name: Check formatting
-        run: dotnet fantomas --check src tests
+        run: dotnet fantomas --check src tests samples
 
   test:
     if: github.event_name != 'schedule'
@@ -91,6 +91,12 @@ jobs:
 
       - name: Build
         run: dotnet build --no-restore --configuration Release
+
+      - name: Restore samples
+        run: dotnet restore samples/Samples.slnx
+
+      - name: Build samples
+        run: dotnet build samples/Samples.slnx --no-restore --configuration Release
 
       # The Stress category is a flaky-sensitive soak/leak suite (hundreds of concurrent spawns,
       # thread-pool/handle/memory baselines) that would slow down and add noise to every ordinary
