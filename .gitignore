@@ -22,6 +22,11 @@ artifacts/
 # Release pipeline scratch file — written by .github/workflows/release.yml
 release-notes.md
 
+# fsdocs build output (docs.yml generates this; apidocs/ itself — the fsdocs content
+# input — stays tracked) and its incremental-build cache directory.
+apidocs/output/
+.fsdocs/
+
 # Build results
 [Dd]ebug/
 [Rr]elease/

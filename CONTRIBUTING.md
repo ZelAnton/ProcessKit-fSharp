@@ -54,6 +54,32 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
   (written next to the test assembly), and copy it over the matching
   `*.approved.txt`. An unreviewed API change fails the build.
 
+## API reference site
+
+The browsable [API reference](https://zelanton.github.io/ProcessKit-fSharp/) is generated from the
+XML doc comments on `ProcessKit` and `ProcessKit.Extensions.DependencyInjection` with
+[fsdocs](https://fsprojects.github.io/FSharp.Formatting/) (restored as a local tool alongside
+Fantomas). `apidocs/index.md` is the site's hand-written landing page; everything else under
+`reference/` is generated. Build it locally to check how a doc-comment edit renders:
+
+```sh
+dotnet tool restore
+dotnet build ProcessKit.slnx --configuration Release
+dotnet fsdocs build --input apidocs --output apidocs/output \
+  --projects src/ProcessKit/ProcessKit.fsproj src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj \
+  --properties Configuration=Release \
+  --sourcerepo https://github.com/ZelAnton/ProcessKit-fSharp/tree/main \
+  --parameters root "/" fsdocs-collection-name "ProcessKit API Reference" \
+               fsdocs-license-link "https://github.com/ZelAnton/ProcessKit-fSharp/blob/main/LICENSE" \
+               fsdocs-release-notes-link "https://github.com/ZelAnton/ProcessKit-fSharp/blob/main/CHANGELOG.md" \
+  --clean
+```
+
+Then open `apidocs/output/index.html` (or serve the folder with any static file server — `root "/"`
+keeps the generated links relative for local browsing). `apidocs/output/` is git-ignored; the real
+site is built and published by [`.github/workflows/docs.yml`](.github/workflows/docs.yml) on every
+published GitHub Release, with `root` pointed at the actual GitHub Pages URL.
+
 ## Changelog
 
 Every user-visible change ships its [`CHANGELOG.md`](CHANGELOG.md) entry in the
