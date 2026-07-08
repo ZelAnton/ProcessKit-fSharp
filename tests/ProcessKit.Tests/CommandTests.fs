@@ -1,5 +1,6 @@
 namespace ProcessKit.Tests
 
+open System
 open NUnit.Framework
 open ProcessKit
 
@@ -173,6 +174,25 @@ type CommandTests() =
         let withUmask = baseCommand |> Command.umask 0o077
         Assert.That(baseCommand.Config.Umask, Is.EqualTo(None: int option))
         Assert.That(withUmask.Config.Umask, Is.EqualTo(Some 0o077))
+
+    [<Test>]
+    member _.``Umask accepts the boundary values 0 and 0o7777``() =
+        let withZero = Command.create "git" |> Command.umask 0
+        let withMax = Command.create "git" |> Command.umask 0o7777
+        Assert.That(withZero.Config.Umask, Is.EqualTo(Some 0))
+        Assert.That(withMax.Config.Umask, Is.EqualTo(Some 0o7777))
+
+    [<Test>]
+    member _.``Umask rejects a negative mask``() =
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> Command.create "git" |> Command.umask -1 |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``Umask rejects a mask beyond 0o7777``() =
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> Command.create "git" |> Command.umask 0o10000 |> ignore)
+        )
+        |> ignore
 
     // ---- LineTerminator -----------------------------------------------------------------------
 
