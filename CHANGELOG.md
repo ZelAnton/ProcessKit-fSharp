@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `Supervisor.OnRestart` / `OnStormPause`: observe restarts and failure-storm pauses live, as supervision runs, instead of only in the final `SupervisionOutcome` — useful for a health check or crash-loop alerting on a long-lived supervised service. Both callbacks are invoked synchronously from the supervision loop, right before the corresponding delay is slept out, and are purely additive (`SupervisionOutcome.Restarts`/`StormPauses`/`Stopped` are unchanged).
 
 ### Changed
 -

@@ -29,6 +29,7 @@ The samples below run inside a `task { }` block and use `match!`; from C# the sa
 - [Capturing each incarnation](#capturing-each-incarnation)
 - [Stopping](#stopping)
 - [The outcome](#the-outcome)
+- [Live observability](#live-observability)
 - [Supervising inside a shared group](#supervising-inside-a-shared-group)
 - [Hermetic testing](#hermetic-testing)
 - [Errors and cancellation](#errors-and-cancellation)
@@ -360,6 +361,37 @@ if (outcome is { IsOk: true, ResultValue: var o })
 else if (outcome is { IsOk: false, ErrorValue: var err })
     Console.Error.WriteLine(err.Message);
 ```
+
+## Live observability
+
+`SupervisionOutcome` only arrives once supervision *ends* — unusable for a long-lived (potentially
+never-ending) supervised service, where you want to know about a restart or a storm pause as it
+happens, e.g. to feed a health check or crash-loop alert. `OnRestart` and `OnStormPause` report
+those events live:
+
+**F#**
+
+```fsharp
+let supervisor =
+    (Supervisor.create (Command.create "worker"))
+        .OnRestart(fun e -> printfn $"restart #{e.Restart} for {e.Program} after {e.Delay}")
+        .OnStormPause(fun e -> printfn $"storm pause #{e.StormPause} for {e.Program}: {e.Delay}")
+```
+
+**C#**
+
+```csharp
+var supervisor = new Supervisor(new Command("worker"))
+    .OnRestart(e => Console.WriteLine($"restart #{e.Restart} for {e.Program} after {e.Delay}"))
+    .OnStormPause(e => Console.WriteLine($"storm pause #{e.StormPause} for {e.Program}: {e.Delay}"));
+```
+
+Both callbacks are invoked **synchronously**, from the supervision loop itself — the same async
+context driving `RunAsync` — right before the corresponding delay is slept out. Keep handlers quick
+and non-blocking: a slow handler delays every restart/pause. `OnRestart` fires on every restart (a
+crash, a timeout, or a retried transient runner error), never for the initial run; `OnStormPause`
+fires once per pause, only when `StormPause` is set. Both are purely additive — they never change
+`SupervisionOutcome`'s final `Restarts`/`StormPauses`/`Stopped` semantics.
 
 ## Supervising inside a shared group
 

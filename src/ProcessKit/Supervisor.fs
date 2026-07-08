@@ -44,6 +44,41 @@ type StopReason =
     /// directly as `RunAsync`'s `Error`, same as an exhausted budget on that path.
     | GaveUp
 
+/// A single restart, reported live from the supervision loop (see `Supervisor.OnRestart`) — not to
+/// be confused with the final `SupervisionOutcome.Restarts` count.
+///
+/// Sealed with an internal constructor so it can gain fields without breaking the frozen API.
+[<Sealed>]
+type SupervisorRestartEvent internal (program: string, restart: int, delay: TimeSpan) =
+
+    /// The supervised command's program name.
+    member _.Program = program
+
+    /// The 1-based lifetime restart number — matches `SupervisionOutcome.Restarts` once this
+    /// restart becomes the last one.
+    member _.Restart = restart
+
+    /// The backoff delay the supervisor is about to sleep out before this restart.
+    member _.Delay = delay
+
+/// A single failure-storm pause, reported live from the supervision loop (see
+/// `Supervisor.OnStormPause`) — not to be confused with the final `SupervisionOutcome.StormPauses`
+/// count.
+///
+/// Sealed with an internal constructor so it can gain fields without breaking the frozen API.
+[<Sealed>]
+type SupervisorStormPauseEvent internal (program: string, stormPause: int, delay: TimeSpan) =
+
+    /// The supervised command's program name.
+    member _.Program = program
+
+    /// The 1-based lifetime pause number — matches `SupervisionOutcome.StormPauses` once this pause
+    /// becomes the last one.
+    member _.StormPause = stormPause
+
+    /// The jittered pause duration the supervisor is about to sleep out.
+    member _.Delay = delay
+
 /// What a finished supervision reports — the last run plus the keeper's telemetry.
 ///
 /// Sealed with an internal constructor so it can gain fields without breaking the frozen API.
@@ -149,6 +184,8 @@ type internal SupervisorConfig =
       StormPause: TimeSpan option
       StopWhen: (ProcessResult<string> -> bool) option
       GiveUpWhen: (ProcessError -> bool) option
+      OnRestart: (SupervisorRestartEvent -> unit) option
+      OnStormPause: (SupervisorStormPauseEvent -> unit) option
       Capture: OutputBufferPolicy
       // The clock seam: `Now` is a monotonic reading in seconds (only differences matter); `Sleep`
       // waits out a delay. Real implementations by default; tests inject a virtual clock that
@@ -186,6 +223,8 @@ module internal SupervisorConfig =
           StormPause = None
           StopWhen = None
           GiveUpWhen = None
+          OnRestart = None
+          OnStormPause = None
           Capture = Supervision.defaultCapture command
           Now = realNow
           Sleep = realSleep }
@@ -202,6 +241,16 @@ module internal SupervisorConfig =
 ///
 /// Defaults: `OnCrash`, unlimited restarts, backoff `200ms × 2.0` capped at 30 s, jitter on,
 /// failure-storm guard off (enable with `StormPause`; failure half-life 30 s, threshold 5.0).
+///
+/// **Observability while supervision runs.** `RunAsync` only reports its `SupervisionOutcome` at the
+/// very end, which is unusable for a long-lived (potentially never-ending) supervised service — so
+/// two callback seams, `OnRestart` and `OnStormPause`, report restarts and storm pauses *live*, as
+/// they happen (e.g. for a health check or crash-loop alerting). Both callbacks are invoked
+/// synchronously, from the supervision loop itself (the same async context driving `RunAsync`),
+/// right before the corresponding delay is slept out — so a slow or blocking handler delays every
+/// restart/pause; keep handlers quick and non-blocking. Neither callback changes
+/// `SupervisionOutcome`'s semantics — `Restarts`/`StormPauses`/`Stopped` are unaffected and remain
+/// the authoritative final tally; the callbacks are an additive, best-effort live view.
 [<Sealed>]
 type Supervisor internal (config: SupervisorConfig) =
 
@@ -316,6 +365,34 @@ type Supervisor internal (config: SupervisorConfig) =
                 GiveUpWhen = Some(fun error -> classifier.Invoke error) }
         )
 
+    /// Observe restarts live: `handler` runs synchronously, from the supervision loop, right before
+    /// each restart's backoff delay is slept out — after the failed/finished incarnation, before the
+    /// next one starts. Invoked on every restart (a crash, a timeout, or a retried transient runner
+    /// error), never for the initial run. `handler` runs on the same async context driving
+    /// `RunAsync`, so keep it quick and non-blocking — a slow handler delays every restart. Purely
+    /// additive: does not change `SupervisionOutcome.Restarts` or any other final semantics.
+    /// Default: unset.
+    member _.OnRestart(handler: Action<SupervisorRestartEvent>) =
+        ArgumentNullException.ThrowIfNull handler
+
+        Supervisor(
+            { config with
+                OnRestart = Some(fun event -> handler.Invoke event) }
+        )
+
+    /// Observe failure-storm pauses live: `handler` runs synchronously, from the supervision loop,
+    /// right before each pause is slept out — see `StormPause`. Same synchronous,
+    /// keep-it-quick contract as `OnRestart`. No effect unless `StormPause` is set. Purely
+    /// additive: does not change `SupervisionOutcome.StormPauses` or any other final semantics.
+    /// Default: unset.
+    member _.OnStormPause(handler: Action<SupervisorStormPauseEvent>) =
+        ArgumentNullException.ThrowIfNull handler
+
+        Supervisor(
+            { config with
+                OnStormPause = Some(fun event -> handler.Invoke event) }
+        )
+
     /// Internal test seam: inject a virtual clock (advance-on-sleep) for deterministic timing tests.
     member internal _.WithClock(now: unit -> float, sleep: TimeSpan -> CancellationToken -> Task) =
         Supervisor({ config with Now = now; Sleep = sleep })
@@ -377,6 +454,10 @@ type Supervisor internal (config: SupervisorConfig) =
                             Log.stormPause config.Command.Config.Logger program jittered
                             Diag.stormPaused program
 
+                            match config.OnStormPause with
+                            | Some handler -> handler (SupervisorStormPauseEvent(program, stormPauses + 1, jittered))
+                            | None -> ()
+
                             if jittered > TimeSpan.Zero then
                                 do! config.Sleep jittered cancellationToken
 
@@ -397,6 +478,10 @@ type Supervisor internal (config: SupervisorConfig) =
                     let delay = Supervision.applyJitter delay config.Jitter
                     Log.supervisorRestart config.Command.Config.Logger program restartNumber delay
                     Diag.supervisorRestarted program
+
+                    match config.OnRestart with
+                    | Some handler -> handler (SupervisorRestartEvent(program, restartNumber, delay))
+                    | None -> ()
 
                     if delay > TimeSpan.Zero then
                         do! config.Sleep delay cancellationToken
