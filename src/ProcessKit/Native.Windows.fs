@@ -919,10 +919,17 @@ module internal Windows =
             Error(ProcessError.Spawn(command.Program, ex.Message))
 
     let spawnWindows (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
-        // `Command.Umask` is a Unix `umask(2)` file-mode creation mask with no Windows equivalent. Honour
-        // the request honestly as `ProcessError.Unsupported` BEFORE any spawn work, rather than silently
-        // ignoring the requested mask — symmetric to the port's other Unix-only gates (e.g. every
-        // non-`Kill` `Signal` on Windows → `Unsupported` in `Backend.fs`).
-        match command.Config.Umask with
-        | Some _ -> Error(ProcessError.Unsupported "umask")
-        | None -> lock windowsSpawnLock (fun () -> spawnWindowsCore job command)
+        // `Command.Umask`/`Uid`/`Gid`/`Setsid` are Unix-only primitives with no Windows equivalent
+        // (a file-mode creation mask, `setuid`/`setgid` privilege drop, and a `setsid()` session
+        // detach). Honour each request honestly as `ProcessError.Unsupported` BEFORE any spawn work,
+        // rather than silently ignoring it — symmetric to the port's other Unix-only gates (e.g. every
+        // non-`Kill` `Signal` on Windows → `Unsupported` in `Backend.fs`). Reported one at a time; the
+        // first requested-but-unsupported knob names the failure.
+        let config = command.Config
+
+        match config.Umask, config.Uid, config.Gid, config.Setsid with
+        | Some _, _, _, _ -> Error(ProcessError.Unsupported "umask")
+        | _, Some _, _, _ -> Error(ProcessError.Unsupported "uid")
+        | _, _, Some _, _ -> Error(ProcessError.Unsupported "gid")
+        | _, _, _, true -> Error(ProcessError.Unsupported "setsid")
+        | None, None, None, false -> lock windowsSpawnLock (fun () -> spawnWindowsCore job command)

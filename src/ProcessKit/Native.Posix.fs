@@ -783,10 +783,118 @@ module internal Posix =
                 if result = pid then
                     completePending pid (decodeWaitStatus status)
 
+    // ----------------------------------------------------------------------------------
+    // POSIX privilege drop / session detach (Command.Uid / Gid / Setsid)
+    // ----------------------------------------------------------------------------------
+    //
+    // `Setsid` is a native `posix_spawn` attribute (`POSIX_SPAWN_SETSID`, applied by `spawnPosixViaSpawn`
+    // above), so it needs nothing extra here.
+    //
+    // A uid/gid drop, however, cannot be a `posix_spawn` attribute — `posix_spawn` has no `setuid`/
+    // `setgid` hook, and dropping privileges can only happen in the child before `exec`. The obvious port
+    // of the Rust source's `pre_exec` closure — `fork()` and run the drop in the forked child — is NOT
+    // viable on .NET: a forked CoreCLR child that executes ANY managed code (even a single P/Invoke) can
+    // fault or hang, because the runtime's GC / JIT / finalizer threads do not survive the fork yet their
+    // locks and half-states are copied into the child (this was observed here as a hard test-host crash).
+    // So instead of forking, a command that requests `Uid`/`Gid` spawns a small privilege-dropping HELPER
+    // through the SAME safe `posix_spawn` path used by every other command: `setpriv` (util-linux) sets
+    // the gid/uid and clears the supplementary groups, then `exec`s the real program IN PLACE — same pid,
+    // so `Spawned.Handle`, the pgid, and kill-on-drop containment are all unchanged. Every other builder
+    // composes because it is applied to the `setpriv` process and inherited across its `exec`: stdio /
+    // CurrentDir via `posix_spawn` file actions, `Setsid` via `POSIX_SPAWN_SETSID`, `Umask` via the
+    // parent-side set/restore, `Priority` via the post-spawn `setpriority` on the pgid leader (the nice
+    // survives the `exec`), and — for the cgroup backend — the parent migrates the `setpriv` pid (which
+    // IS the target's pid after `exec`) into `cgroup.procs` from the still-privileged parent, so resource
+    // limits apply regardless of the child's dropped uid. This is the "helper process" option the task
+    // calls out, chosen over `fork` because it is the only mechanism that is reliable on .NET.
+    //
+    // Availability & honesty. `setpriv` ships in util-linux, a required package on mainstream Linux
+    // (Debian/Ubuntu — the CI image and GitHub runners), so the drop is real and tested there; where it
+    // is absent (macOS/BSD, a minimal musl image) the spawn fails with a typed `ProcessError.Spawn` that
+    // names the missing helper, never a silently un-dropped child. A drop the OS *refuses* surfaces as
+    // `setpriv` exiting non-zero (carrying its own stderr); the common "not privileged" case is caught
+    // up-front as `ProcessError.Spawn` by `privilegeDropPrecheck` (a non-root caller cannot change to a
+    // different uid/gid).
+
+    // `POSIX_SPAWN_SETSID` differs per libc: 0x0400 on macOS, 0x80 on Linux glibc/musl. Not a `[<Literal>]`
+    // because it is resolved from `isMacOs` at load. Used by `spawnPosixViaSpawn`'s flag block above.
+    let private posixSpawnSetsid = if isMacOs then 0x0400s else 0x80s
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private geteuid()
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private getegid()
+
+    /// Up-front guard for a uid/gid drop: a caller that is not root (euid 0) cannot change the child to a
+    /// DIFFERENT uid/gid, so report that as an honest `ProcessError.Spawn` before spawning the helper
+    /// (rather than letting `setpriv` fail later as a non-zero exit). A no-op request — the target id
+    /// already equals the current one — needs no privilege and is allowed through. `None` = clear to go.
+    let private privilegeDropPrecheck (command: Command) : ProcessError option =
+        let config = command.Config
+
+        if geteuid () = 0 then
+            None
+        else
+            let euid = geteuid ()
+            let egid = getegid ()
+
+            let wantsDifferentUid =
+                match config.Uid with
+                | Some u -> u <> euid
+                | None -> false
+
+            let wantsDifferentGid =
+                match config.Gid with
+                | Some g -> g <> egid
+                | None -> false
+
+            if wantsDifferentUid || wantsDifferentGid then
+                Some(
+                    ProcessError.Spawn(
+                        command.Program,
+                        "dropping to a different Uid/Gid needs privilege (run as root, or with CAP_SETUID/CAP_SETGID)"
+                    )
+                )
+            else
+                None
+
+    // The `setpriv` flags for the requested drop: set the gid and the uid (setpriv sequences them
+    // correctly), and clear the parent's supplementary groups so the child never keeps them.
+    let private setprivFlags (config: CommandConfig) : string list =
+        let regid =
+            match config.Gid with
+            | Some g -> [ $"--regid={g}" ]
+            | None -> []
+
+        let reuid =
+            match config.Uid with
+            | Some u -> [ $"--reuid={u}" ]
+            | None -> []
+
+        regid @ reuid @ [ "--clear-groups" ]
+
+    /// Rewrite `command` to run through the `setpriv` helper: `setpriv <flags> <program> <args...>`. The
+    /// uid/gid are cleared on the rewritten command (so the `spawnPosix` dispatcher does not recurse), and
+    /// every other knob — stdio, env, CurrentDir, Priority, Umask, Setsid — is preserved and applied by
+    /// `posix_spawn` to the `setpriv` process, which inherits them across its `exec` of the real program.
+    let private setprivCommand (command: Command) : Command =
+        let config = command.Config
+        let prefix = setprivFlags config @ [ config.Program ]
+
+        Command(
+            { config with
+                Program = "setpriv"
+                Args = config.Args.InsertRange(0, prefix)
+                Uid = None
+                Gid = None }
+        )
+
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
     /// child's pid) and capture its stdout/stderr. The whole group can later be reaped with
-    /// `killProcessGroup`.
-    let spawnPosix (command: Command) : Result<Spawned, ProcessError> =
+    /// `killProcessGroup`. This is the one real POSIX spawn path; `spawnPosix` routes a command that
+    /// requests `Uid`/`Gid` here too, after rewriting it to run through the `setpriv` helper.
+    let private spawnPosixViaSpawn (command: Command) : Result<Spawned, ProcessError> =
         let config = command.Config
         let stdinWanted = config.StdinSource.IsSome || config.KeepStdinOpen
         // Child-side fds the parent closes after spawn (the child gets its own via dup2).
@@ -1030,15 +1138,34 @@ module internal Posix =
                                 )
                     | _ -> ()
 
-                    let spawnFlags =
-                        if isMacOs then
-                            POSIX_SPAWN_SETPGROUP ||| POSIX_SPAWN_CLOEXEC_DEFAULT
+                    // `Command.Setsid` detaches the child into a new session via `POSIX_SPAWN_SETSID`
+                    // INSTEAD of forming a new process group with `POSIX_SPAWN_SETPGROUP`. This is the
+                    // deliberate coordination with the pgid containment model: `setsid()` already makes
+                    // the child a session AND new-process-group leader (pgid == pid == sid), so the two
+                    // flags are mutually exclusive — combining them (or leaving `SETPGROUP` on) would set
+                    // a pgroup the kernel then overrides. `Spawned.Handle` is still the child pid, and the
+                    // pgid equals it either way, so `killProcessGroup` (killpg on the pid) reaps the whole
+                    // session-group in teardown exactly as it does for a `SETPGROUP` child — containment is
+                    // preserved; the only difference is the detached session and dropped controlling tty.
+                    let groupFlag =
+                        if config.Setsid then
+                            posixSpawnSetsid
                         else
                             POSIX_SPAWN_SETPGROUP
 
+                    let spawnFlags =
+                        if isMacOs then
+                            groupFlag ||| POSIX_SPAWN_CLOEXEC_DEFAULT
+                        else
+                            groupFlag
+
                     register "posix_spawnattr_setflags" (fun () -> posix_spawnattr_setflags (attributes, spawnFlags))
 
-                    register "posix_spawnattr_setpgroup" (fun () -> posix_spawnattr_setpgroup (attributes, 0))
+                    // Only set an explicit pgroup when NOT detaching a session; `POSIX_SPAWN_SETSID`
+                    // establishes the child's own group itself, and a `setpgroup` alongside it is
+                    // redundant (and rejected on some libc).
+                    if not config.Setsid then
+                        register "posix_spawnattr_setpgroup" (fun () -> posix_spawnattr_setpgroup (attributes, 0))
 
                     match err with
                     | Some error ->
@@ -1209,3 +1336,31 @@ module internal Posix =
                 closeChildSideFds ()
                 closeParentEnds ()
                 Error(ProcessError.Spawn(command.Program, ex.Message))
+
+    /// Spawn `command` as a contained POSIX child. A command requesting a privilege drop (`Uid`/`Gid`) is
+    /// rewritten to run through the `setpriv` helper and spawned on the ordinary `posix_spawn` path — the
+    /// drop runs in `setpriv` before it `exec`s the real program, so no managed code runs in a forked
+    /// child (see the section comment above). Everything else — including a lone `Setsid` — spawns
+    /// directly. A refused drop by a non-root caller is rejected up front; a missing `setpriv` helper
+    /// becomes a typed `ProcessError.Spawn`, never a silently un-dropped child.
+    let spawnPosix (command: Command) : Result<Spawned, ProcessError> =
+        let config = command.Config
+
+        if config.Uid.IsSome || config.Gid.IsSome then
+            match privilegeDropPrecheck command with
+            | Some error -> Error error
+            | None ->
+                match spawnPosixViaSpawn (setprivCommand command) with
+                | Error(ProcessError.NotFound _) ->
+                    // `posix_spawn` could not find `setpriv` on PATH — report it against the ORIGINAL
+                    // program (not the helper), so a caller who never mentioned `setpriv` gets a message
+                    // that explains what a `Uid`/`Gid` drop needs on this host.
+                    Error(
+                        ProcessError.Spawn(
+                            command.Program,
+                            "a Uid/Gid privilege drop needs the 'setpriv' helper (util-linux) on PATH; it was not found (available on mainstream Linux; absent on macOS/BSD)"
+                        )
+                    )
+                | other -> other
+        else
+            spawnPosixViaSpawn command

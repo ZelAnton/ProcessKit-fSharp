@@ -1,5 +1,6 @@
 namespace ProcessKit.Tests
 
+open System
 open System.IO
 open System.Runtime.InteropServices
 open System.Text
@@ -7,6 +8,12 @@ open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+
+/// Effective-uid probe for the root-gated privilege-drop tests below. Only ever called on POSIX (the
+/// tests guard with `isWindows` first), so the `libc` entry point is never resolved on Windows.
+module private NativePrivilege =
+    [<DllImport("libc")>]
+    extern int geteuid()
 
 [<TestFixture>]
 type VerbTests() =
@@ -288,5 +295,126 @@ type VerbTests() =
                 match! runner.RunAsync command with
                 | Error(ProcessError.Unsupported _) -> Assert.Pass()
                 | other -> Assert.Fail $"expected Unsupported for umask on Windows, got {other}"
+        }
+        :> Task
+
+    // ---- Setsid / Uid / Gid (privilege drop & session detach, platform-guarded) ---------------
+
+    [<Test>]
+    member _.``Setsid detaches into a new session yet the group still contains it (Unix)``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "setsid is Unix-only; the Windows behaviour is the Unsupported gate below."
+            else
+                match ProcessGroup.Create() with
+                | Error error -> Assert.Fail $"ProcessGroup.Create failed: {error}"
+                | Ok group ->
+                    // THE setsid x process-group coordination regression: with POSIX_SPAWN_SETPGROUP still
+                    // set alongside the session detach, the spawn would fail EPERM — so a successful spawn
+                    // is itself the guard. `setsid` alone stays on the posix_spawn path (POSIX_SPAWN_SETSID).
+                    let detached = Command.create "sleep" |> Command.args [ "30" ] |> Command.setsid
+
+                    match! group.StartAsync detached with
+                    | Error error ->
+                        (group :> IDisposable).Dispose()
+
+                        Assert.Fail
+                            $"a setsid child failed to spawn (EPERM would mean the setsid/pgroup coordination broke): {error}"
+                    | Ok running ->
+                        match running.Pid with
+                        | None ->
+                            running.Kill()
+                            let! _ = running.WaitAsync()
+                            (group :> IDisposable).Dispose()
+                            Assert.Fail "expected a pid for the setsid child"
+                        | Some _ ->
+                            // setsid makes the child its own process-group leader (pgid == pid), so the
+                            // kill-on-drop killpg teardown still reaches it: dropping the group must reap it.
+                            (group :> IDisposable).Dispose()
+                            let wait = running.WaitAsync() :> Task
+                            let! winner = Task.WhenAny(wait, Task.Delay 10000)
+
+                            Assert.That(
+                                Object.ReferenceEquals(winner, wait),
+                                Is.True,
+                                "the setsid child outlived the group drop — containment broke"
+                            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Setsid is honestly Unsupported on Windows (no silent drop)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The setsid Unsupported gate is Windows-only; Unix detaches the session (observed above)."
+            else
+                let command = shell "echo hi" |> Command.setsid
+
+                match! runner.RunAsync command with
+                | Error(ProcessError.Unsupported _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected Unsupported for setsid on Windows, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Uid and Gid drop the child's privileges when run as root (Unix)``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "Privilege drop is Unix-only; the Windows behaviour is the Unsupported gate below."
+            elif NativePrivilege.geteuid () <> 0 then
+                // Dropping to another uid/gid needs privilege; without root setuid/setgid would EPERM, so
+                // the drop is not exercisable here. Skipped explicitly (never a silent always-pass).
+                Assert.Ignore "Dropping to another uid/gid requires root; skipping as an unprivileged user."
+            else
+                // As root, drop to uid/gid 1 and have the child report its own euid via `id -u`. A correct
+                // fork + setgid + setuid before exec makes it print "1". Uid 1 exists on every POSIX system,
+                // and this also exercises the fork path's own PATH resolution + execve of `id`.
+                let dropped = Command.create "id" |> Command.args [ "-u" ] |> Command.user 1 1
+
+                match! runner.RunAsync dropped with
+                | Ok out -> Assert.That(out.Trim(), Is.EqualTo "1", "the child should report the dropped uid")
+                | Error error -> Assert.Fail $"privilege drop as root should succeed, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Uid drop by an unprivileged user fails honestly, never a silent no-drop (Unix)``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "Privilege drop is Unix-only; the Windows behaviour is the Unsupported gate above."
+            elif NativePrivilege.geteuid () = 0 then
+                // Running as root the drop would actually succeed; this test covers the UNPRIVILEGED
+                // rejection (the case exercised on a non-root CI runner). Skipped explicitly as root.
+                Assert.Ignore "This checks the unprivileged rejection; as root the drop would succeed instead."
+            else
+                // A non-root caller cannot change to a different uid, so the spawn must fail honestly with
+                // ProcessError.Spawn (the up-front privilege pre-check) rather than silently running the
+                // child under the parent's uid. Target a uid guaranteed different from the current one.
+                let target = NativePrivilege.geteuid () + 1
+                let cmd = shell "echo hi" |> Command.uid target
+
+                match! runner.RunAsync cmd with
+                | Error(ProcessError.Spawn _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected a Spawn error for an unprivileged uid drop, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Uid and Gid are honestly Unsupported on Windows (no silent drop)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The uid/gid Unsupported gate is Windows-only; Unix applies the drop (observed above)."
+            else
+                let withUid = shell "echo hi" |> Command.uid 1000
+
+                match! runner.RunAsync withUid with
+                | Error(ProcessError.Unsupported _) -> ()
+                | other -> Assert.Fail $"expected Unsupported for uid on Windows, got {other}"
+
+                let withGid = shell "echo hi" |> Command.gid 1000
+
+                match! runner.RunAsync withGid with
+                | Error(ProcessError.Unsupported _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected Unsupported for gid on Windows, got {other}"
         }
         :> Task

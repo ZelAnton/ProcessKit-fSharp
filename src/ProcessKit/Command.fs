@@ -73,6 +73,24 @@ type internal CommandConfig =
       // Windows spawn with `ProcessError.Unsupported` (there is no Windows equivalent), never a silent
       // drop. Only the low permission bits are meaningful, as with `umask(2)` itself.
       Umask: int option
+      // Unix privilege drop: run the child under this user id (`setuid`) / group id (`setgid`). `None`
+      // (the default) inherits the parent's ids. Unix-only: a set value fails a Windows spawn with
+      // `ProcessError.Unsupported`, never a silent drop. Because `posix_spawn` exposes no uid/gid
+      // attribute (and forking a managed runtime to drop in a child is unsafe on .NET), a spawn that
+      // requests either is rewritten to run through the `setpriv` helper (util-linux) on the ordinary
+      // `posix_spawn` path (see `Native.Posix.setprivCommand`): `setpriv` sets the gid before the uid and
+      // clears the parent's supplementary groups, then `exec`s the real program. A non-root caller asking
+      // for a different id is rejected up front with `ProcessError.Spawn`; a missing `setpriv` is a typed
+      // `ProcessError.Spawn`.
+      Uid: int option
+      Gid: int option
+      // Unix `setsid()`: detach the child into a brand-new session with no controlling terminal. `false`
+      // (the default) leaves the child in the caller's session. Unix-only: `true` fails a Windows spawn
+      // with `ProcessError.Unsupported`. `setsid()` also makes the child a new process-group leader
+      // (pgid == pid == sid), so it REPLACES the group's `POSIX_SPAWN_SETPGROUP` for that command rather
+      // than combining with it; the kill-on-drop `killpg(pid)` teardown still reaches the whole session,
+      // so containment is preserved (see `Native.Posix`).
+      Setsid: bool
       Logger: ILogger option
       // A per-run correlation id, stamped once at the verb layer so a run's log/trace events (and its
       // retries) share it. `None` until stamped; a direct spawn gets a per-incarnation id instead.
@@ -112,6 +130,9 @@ module internal CommandConfig =
           WindowsCtrlSignals = false
           Priority = None
           Umask = None
+          Uid = None
+          Gid = None
+          Setsid = false
           Logger = None
           RunId = None }
 
@@ -467,6 +488,48 @@ type Command internal (config: CommandConfig) =
         ArgumentOutOfRangeException.ThrowIfGreaterThan(mask, 0o7777)
         Command({ config with Umask = Some mask })
 
+    /// Run the child under this Unix user id (`setuid`). **Unix-only:** on Windows (which has no
+    /// equivalent) a requested uid fails the spawn with `ProcessError.Unsupported` rather than being
+    /// silently ignored. Because `posix_spawn` has no uid attribute, a command with a uid (or `Gid`) is
+    /// spawned through the `setpriv` helper (util-linux), which drops the gid/uid and clears the
+    /// supplementary groups before `exec`ing the real program in place. Dropping to another user needs
+    /// privilege (root / `CAP_SETUID`): a non-root caller asking for a different uid fails the spawn with
+    /// `ProcessError.Spawn` (never a child that kept the parent's uid), as does a host with no `setpriv`
+    /// (mainstream Linux has it; macOS/BSD do not). `uid` must be non-negative (rejected with
+    /// `ArgumentOutOfRangeException` at the builder boundary). Pair with `Gid` (or `User`) for a full drop.
+    member _.Uid(uid: int) =
+        ArgumentOutOfRangeException.ThrowIfNegative uid
+        Command({ config with Uid = Some uid })
+
+    /// Run the child under this Unix group id (`setgid`) — see `Uid` for the mechanism, platform notes,
+    /// and privilege requirement. `setgid` is applied before any `setuid`, so the two compose into a
+    /// correct privilege drop. `gid` must be non-negative.
+    member _.Gid(gid: int) =
+        ArgumentOutOfRangeException.ThrowIfNegative gid
+        Command({ config with Gid = Some gid })
+
+    /// Run the child under this Unix user **and** group id — the common privilege-drop pair, equivalent
+    /// to `.Gid(gid).Uid(uid)`. See `Uid` for the mechanism, ordering (`setgid` before `setuid`),
+    /// supplementary-group clearing, platform notes, and privilege requirement. Both ids must be
+    /// non-negative.
+    member _.User(uid: int, gid: int) =
+        ArgumentOutOfRangeException.ThrowIfNegative uid
+        ArgumentOutOfRangeException.ThrowIfNegative gid
+
+        Command(
+            { config with
+                Uid = Some uid
+                Gid = Some gid }
+        )
+
+    /// Detach the child into a **new session** (`setsid()`): its own session and process group, with no
+    /// controlling terminal. **Unix-only:** on Windows a requested detach fails the spawn with
+    /// `ProcessError.Unsupported`. `setsid()` makes the child a new process-group leader (pgid == pid),
+    /// so the kill-on-drop group teardown (`killpg`) still reaches the whole session — containment is
+    /// preserved; the new session simply replaces the group's default `POSIX_SPAWN_SETPGROUP` for this
+    /// command. A `setsid()` the OS refuses fails the spawn with `ProcessError.Spawn`.
+    member _.Setsid() = Command({ config with Setsid = true })
+
     /// Emit structured lifecycle events (spawn / exit / timeout / retry) to `logger`. The program
     /// name and non-secret facts only — **argv and environment are never logged**.
     member _.Logger(logger: ILogger) =
@@ -598,6 +661,20 @@ module Command =
     /// Set the child's Unix file-mode creation mask (`umask(2)`). Unix-only: a set mask fails a Windows
     /// spawn with `ProcessError.Unsupported`. The default leaves the inherited umask untouched.
     let umask (mask: int) (command: Command) = command.Umask mask
+
+    /// Run the child under this Unix user id (`setuid`). Unix-only: a set uid fails a Windows spawn with
+    /// `ProcessError.Unsupported`; dropping needs privilege (else `ProcessError.Spawn`). See `Command.Uid`.
+    let uid (value: int) (command: Command) = command.Uid value
+
+    /// Run the child under this Unix group id (`setgid`). Unix-only, same notes as `uid`. See `Command.Gid`.
+    let gid (value: int) (command: Command) = command.Gid value
+
+    /// Run the child under this Unix user and group id (the privilege-drop pair). See `Command.User`.
+    let user (uid: int) (gid: int) (command: Command) = command.User(uid, gid)
+
+    /// Detach the child into a new session (`setsid()`). Unix-only: a set request fails a Windows spawn
+    /// with `ProcessError.Unsupported`. Containment is preserved. See `Command.Setsid`.
+    let setsid (command: Command) = command.Setsid()
 
     /// Emit structured lifecycle events to `logger` (argv/env never logged).
     let logger (logger: ILogger) (command: Command) = command.Logger logger

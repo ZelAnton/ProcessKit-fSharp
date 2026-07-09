@@ -541,6 +541,53 @@ await new Command("helper").CreateNoWindow().RunAsync();
   exhausted (or with no source at all), so you can write to it interactively via
   `RunningProcess.TakeStdin` — see [Streaming & interactive I/O](streaming.md).
 
+### Unix privilege drop & session detach
+
+Four **Unix-only** builders drop the child's privileges or detach its session, for
+running a helper as a less-privileged user (daemons, CI runners, sandboxes):
+
+- **`Uid(uid)`** / **`Gid(gid)`** run the child under a different user / group id
+  (`setuid` / `setgid`). **`User(uid, gid)`** is the common pair, equal to
+  `.Gid(gid).Uid(uid)`.
+- **`Setsid()`** detaches the child into a **new session** (`setsid()`): its own
+  session and process group, no controlling terminal.
+
+```fsharp
+task {
+    // Drop to uid/gid 1000 and detach into a new session (needs privilege to run as another user).
+    let! _ = (Command.create "worker" |> Command.user 1000 1000 |> Command.setsid).RunAsync()
+    ()
+}
+```
+
+```csharp
+// Drop to uid/gid 1000 and detach into a new session.
+await new Command("worker").User(1000, 1000).Setsid().RunAsync();
+```
+
+Honest by construction — never a silent downgrade:
+
+- On **Windows** (no equivalent) any of these fails the spawn with
+  `ProcessError.Unsupported`, exactly like `Umask`.
+- A **uid/gid drop the OS refuses** — dropping to another user needs privilege
+  (root / `CAP_SETUID` / `CAP_SETGID`) — fails with `ProcessError.Spawn`, never a
+  child that kept the parent's ids. The drop also *clears* the parent's
+  supplementary groups and applies `setgid` **before** `setuid`, so it composes
+  into a correct drop.
+- **Containment is preserved under `Setsid`.** A new session still makes the child
+  its own process-group leader, so the kill-on-drop group teardown reaches it. (The
+  session detach replaces the group's default `POSIX_SPAWN_SETPGROUP` for that one
+  command; it is never combined with it.)
+
+Because `posix_spawn` has no uid/gid attribute (and forking a managed .NET runtime
+to drop privileges in the child is unsafe), a command requesting `Uid`/`Gid` is
+rewritten to run through the **`setpriv`** helper (util-linux): it sets the gid/uid
+and clears the supplementary groups, then `exec`s the real program *in place* (same
+pid, so containment is unchanged). `setpriv` ships on mainstream Linux; where it is
+absent (macOS/BSD) a `Uid`/`Gid` drop fails with a typed `ProcessError.Spawn` naming
+the missing helper. `Setsid` alone needs no helper (it is a native `posix_spawn`
+attribute).
+
 ProcessKit wires **pipes**, not a pseudo-terminal, so a tool that *demands* a tty
 — an `ssh` / `sudo` **password** prompt, some credential helpers — won't get one.
 Drive such tools non-interactively instead (key-based auth, `ssh -o BatchMode=yes`,

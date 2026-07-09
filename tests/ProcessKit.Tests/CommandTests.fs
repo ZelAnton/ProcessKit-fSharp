@@ -194,6 +194,76 @@ type CommandTests() =
         )
         |> ignore
 
+    // ---- Uid / Gid / User / Setsid (Unix privilege drop & session detach) ---------------------
+
+    [<Test>]
+    member _.``Uid, Gid and Setsid are unset by default``() =
+        let config = Command.create("git").Config
+        Assert.That(config.Uid, Is.EqualTo(None: int option))
+        Assert.That(config.Gid, Is.EqualTo(None: int option))
+        Assert.That(config.Setsid, Is.False)
+
+    [<Test>]
+    member _.``Uid records the value and the instance method matches the module function``() =
+        let viaModule = Command.create "git" |> Command.uid 1000
+        let viaInstance = Command("git").Uid 1000
+        Assert.That(viaModule.Config.Uid, Is.EqualTo(Some 1000))
+        Assert.That(viaInstance.Config.Uid, Is.EqualTo(Some 1000))
+
+    [<Test>]
+    member _.``Gid records the value and the instance method matches the module function``() =
+        let viaModule = Command.create "git" |> Command.gid 1000
+        let viaInstance = Command("git").Gid 1000
+        Assert.That(viaModule.Config.Gid, Is.EqualTo(Some 1000))
+        Assert.That(viaInstance.Config.Gid, Is.EqualTo(Some 1000))
+
+    [<Test>]
+    member _.``User sets both uid and gid, matching the module function``() =
+        let viaModule = Command.create "git" |> Command.user 1000 2000
+        let viaInstance = Command("git").User(1000, 2000)
+        Assert.That(viaModule.Config.Uid, Is.EqualTo(Some 1000))
+        Assert.That(viaModule.Config.Gid, Is.EqualTo(Some 2000))
+        Assert.That(viaInstance.Config.Uid, Is.EqualTo(Some 1000))
+        Assert.That(viaInstance.Config.Gid, Is.EqualTo(Some 2000))
+
+    [<Test>]
+    member _.``Setsid records the flag and the instance method matches the module function``() =
+        let viaModule = Command.create "git" |> Command.setsid
+        let viaInstance = Command("git").Setsid()
+        Assert.That(viaModule.Config.Setsid, Is.True)
+        Assert.That(viaInstance.Config.Setsid, Is.True)
+
+    [<Test>]
+    member _.``Uid, Gid and Setsid are immutable - setting them returns a new command``() =
+        let baseCommand = Command.create "git"
+        let dropped = baseCommand |> Command.user 1 1 |> Command.setsid
+        Assert.That(baseCommand.Config.Uid, Is.EqualTo(None: int option))
+        Assert.That(baseCommand.Config.Gid, Is.EqualTo(None: int option))
+        Assert.That(baseCommand.Config.Setsid, Is.False)
+        Assert.That(dropped.Config.Uid, Is.EqualTo(Some 1))
+        Assert.That(dropped.Config.Gid, Is.EqualTo(Some 1))
+        Assert.That(dropped.Config.Setsid, Is.True)
+
+    [<Test>]
+    member _.``Uid accepts 0 (root) but rejects a negative value``() =
+        Assert.That((Command.create "git" |> Command.uid 0).Config.Uid, Is.EqualTo(Some 0))
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> Command.create "git" |> Command.uid -1 |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``Gid rejects a negative value``() =
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> Command.create "git" |> Command.gid -1 |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``User rejects a negative uid or gid``() =
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> Command("git").User(-1, 1) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> Command("git").User(1, -1) |> ignore))
+        |> ignore
+
     // ---- LineTerminator -----------------------------------------------------------------------
 
     [<Test>]
