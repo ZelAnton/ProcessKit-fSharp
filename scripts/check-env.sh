@@ -5,10 +5,11 @@
 # matches your shell; both do the same thing).
 #
 # Verifies the .NET SDK is installed and new enough (the major band pinned in
-# global.json). Exits 0 when ready; if a required tool is missing it prints
-# per-OS install commands and exits 1 — install what it names, then re-run.
-# (Fantomas is a local tool restored by `dotnet tool restore`, not a separate
-# environment prerequisite, so it is not checked here.)
+# global.json), and that the .NET 8 runtime required by the full multi-target
+# test run is installed. Exits 0 when ready; if a required tool is missing it
+# prints per-OS install commands and exits 1 — install what it names, then
+# re-run. (Fantomas is a local tool restored by `dotnet tool restore`, not a
+# separate environment prerequisite, so it is not checked here.)
 #
 # Usage: bash ./scripts/check-env.sh
 
@@ -19,6 +20,7 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 
 # Required .NET major version — read from global.json when present, else default.
 required_major=10
+required_runtime_major=8
 global_json="$script_dir/../global.json"
 if [ -f "$global_json" ]; then
   v="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([0-9]\{1,\}\)\..*/\1/p' "$global_json" | head -n1 || true)"
@@ -35,6 +37,16 @@ elif dotnet --list-sdks | awk -F. -v m="$required_major" '($1+0)>=m{f=1} END{exi
   echo "    .NET SDK ${required_major}+ found"
 else
   problems+=("a .NET ${required_major} SDK (dotnet found, but no installed SDK >= ${required_major})")
+fi
+
+missing_runtime=false
+if command -v dotnet >/dev/null 2>&1; then
+  if dotnet --list-runtimes | awk -v m="$required_runtime_major" '$1=="Microsoft.NETCore.App"{split($2,v,"."); if ((v[1]+0)==m) f=1} END{exit f?0:1}'; then
+    echo "    .NET ${required_runtime_major} runtime found"
+  else
+    problems+=("the .NET ${required_runtime_major} runtime (required for the full multi-target test run)")
+    missing_runtime=true
+  fi
 fi
 
 # Soft: git drives the init defaults (author/email) and the VCS workflow.
@@ -55,4 +67,13 @@ echo "Install the .NET ${required_major} SDK, then re-run this check:"
 echo "  Windows : winget install Microsoft.DotNet.SDK.${required_major}"
 echo "  macOS   : brew install --cask dotnet-sdk"
 echo "  Linux   : see https://learn.microsoft.com/dotnet/core/install/linux"
+if [ "$missing_runtime" = true ]; then
+  echo
+  echo "Install the .NET ${required_runtime_major} runtime for the full test run:"
+  echo "  Windows : winget install Microsoft.DotNet.Runtime.${required_runtime_major}"
+  echo "  macOS   : brew install dotnet"
+  echo "  Linux   : see https://learn.microsoft.com/dotnet/core/install/linux"
+  echo "Alternative: run only the .NET ${required_major} test leg with:"
+  echo "  dotnet test --framework net${required_major}.0"
+fi
 exit 1

@@ -6,10 +6,12 @@
 
 .DESCRIPTION
     Verifies the .NET SDK is installed and new enough (the major band pinned in
-    global.json). Prints "Environment ready" and exits 0 on success; if a required
-    tool is missing it prints per-OS install commands and exits 1 — install what it
-    names, then re-run. (Fantomas is a local tool restored by `dotnet tool restore`,
-    not a separate environment prerequisite, so it is not checked here.)
+    global.json), and that the .NET 8 runtime required by the full multi-target
+    test run is installed. Prints "Environment ready" and exits 0 on success; if
+    a required tool is missing it prints per-OS install commands and exits 1 —
+    install what it names, then re-run. (Fantomas is a local tool restored by
+    `dotnet tool restore`, not a separate environment prerequisite, so it is not
+    checked here.)
 
     Run it first, before scripts/init.ps1:
 
@@ -25,6 +27,7 @@ Write-Host "==> Checking environment for F# (.NET) development" -ForegroundColor
 
 # Required .NET major version — read from global.json when present, else default.
 $requiredMajor = 10
+$requiredRuntimeMajor = 8
 $globalJson = Join-Path (Join-Path $PSScriptRoot '..') 'global.json'
 if (Test-Path $globalJson) {
     try {
@@ -48,6 +51,16 @@ if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     } else {
         $problems += "a .NET $requiredMajor SDK (dotnet found, but no installed SDK >= $requiredMajor)"
     }
+
+    $haveRuntime = $false
+    foreach ($line in (& dotnet --list-runtimes)) {
+        if ($line -match '^Microsoft\.NETCore\.App\s+(\d+)\.' -and [int]$Matches[1] -eq $requiredRuntimeMajor) { $haveRuntime = $true }
+    }
+    if ($haveRuntime) {
+        Write-Host "    .NET $requiredRuntimeMajor runtime found" -ForegroundColor DarkGray
+    } else {
+        $problems += "the .NET $requiredRuntimeMajor runtime (required for the full multi-target test run)"
+    }
 }
 
 # Soft: git drives the init defaults (author/email) and the VCS workflow.
@@ -69,4 +82,13 @@ Write-Host "Install the .NET $requiredMajor SDK, then re-run this check:" -Foreg
 Write-Host "  Windows : winget install Microsoft.DotNet.SDK.$requiredMajor"
 Write-Host "  macOS   : brew install --cask dotnet-sdk"
 Write-Host "  Linux   : see https://learn.microsoft.com/dotnet/core/install/linux"
+if ($problems -contains "the .NET $requiredRuntimeMajor runtime (required for the full multi-target test run)") {
+    Write-Host ""
+    Write-Host "Install the .NET $requiredRuntimeMajor runtime for the full test run:" -ForegroundColor Yellow
+    Write-Host "  Windows : winget install Microsoft.DotNet.Runtime.$requiredRuntimeMajor"
+    Write-Host "  macOS   : brew install dotnet"
+    Write-Host "  Linux   : see https://learn.microsoft.com/dotnet/core/install/linux"
+    Write-Host "Alternative: run only the .NET $requiredMajor test leg with:"
+    Write-Host "  dotnet test --framework net$requiredMajor.0"
+}
 exit 1
