@@ -945,15 +945,17 @@ type RunningProcess internal (host: RunningHost) =
                     CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken)
 
                 try
-                    let mutable found = None
+                    let mutable matched = false
+                    let mutable found = Unchecked.defaultof<string>
 
-                    while found.IsNone do
+                    while not matched do
                         let! line = stdoutChannel.Reader.ReadAsync linked.Token
 
                         if predicate.Invoke line then
-                            found <- Some line
+                            found <- line
+                            matched <- true
 
-                    return Ok found.Value
+                    return Ok found
                 with
                 | :? OperationCanceledException ->
                     // The caller's token wins over the deadline: a cancelled wait is an error, a

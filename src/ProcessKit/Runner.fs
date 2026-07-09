@@ -208,7 +208,9 @@ module Runner =
                         else
                             final <- Some(Error error)
 
-                return final.Value
+                match final with
+                | Some result -> return result
+                | None -> return Error(ProcessError.Io "Retry loop ended without a final result.")
             }
 
     // Each capture verb is `withRetry` wrapped around a `CaptureVerbs` derivation of the runner's
