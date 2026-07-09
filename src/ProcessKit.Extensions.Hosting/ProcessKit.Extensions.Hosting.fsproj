@@ -27,9 +27,27 @@
 		<PackageReference Include="Microsoft.Extensions.Options" />
 	</ItemGroup>
 
-	<ItemGroup>
-		<!-- Cross-project reference is the built ProcessKit assembly (build order via the .slnx
-		     BuildDependency), never a ProjectReference — see CLAUDE.md. -->
+	<!-- ProcessKit core dependency.
+	     Everyday / CI build (default): resolve the freshly-built core as a built ASSEMBLY via
+	     <Reference> + AssemblySearchPaths (build order via the .slnx BuildDependency), never a
+	     <ProjectReference> — see AGENTS.md / CLAUDE.md. An assembly <Reference> produces no NuGet
+	     dependency in the packed .nuspec, which is correct for the in-repo build but leaves the
+	     published package with no way to resolve the core transitively.
+	     Release pack only (PackWithCoreDependency=true, set by .github/workflows/release.yml after
+	     the core is packed to a local feed): declare ProcessKit as a real NuGet PackageReference so
+	     the published .nuspec carries a ProcessKit dependency for BOTH target frameworks. The two
+	     forms are mutually exclusive, so an everyday build never restores the core from a feed and
+	     the <Reference> convention stays intact. VersionOverride supplies the version inline under
+	     Central Package Management (ProcessKit is the in-repo project, not a Directory.Packages.props
+	     entry). Pinned to the EXACT co-released core version: all four packages ship in lockstep from
+	     one release, so a consumer always gets a matching core/companion pair. -->
+	<PropertyGroup Condition="'$(PackWithCoreDependency)' == 'true' and '$(CoreDepVersion)' == ''">
+		<CoreDepVersion>$(Version)</CoreDepVersion>
+	</PropertyGroup>
+	<ItemGroup Condition="'$(PackWithCoreDependency)' == 'true'">
+		<PackageReference Include="ProcessKit" VersionOverride="[$(CoreDepVersion)]" />
+	</ItemGroup>
+	<ItemGroup Condition="'$(PackWithCoreDependency)' != 'true'">
 		<Reference Include="ProcessKit" />
 	</ItemGroup>
 

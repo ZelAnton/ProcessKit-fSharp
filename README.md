@@ -85,7 +85,14 @@ unit (Job Object / cgroup v2 / process group), not just the direct child.
 dotnet add package ProcessKit
 # optional — Microsoft.Extensions.DependencyInjection integration (AddProcessKit)
 dotnet add package ProcessKit.Extensions.DependencyInjection
+# optional — Microsoft.Extensions.Hosting integration (supervised child as IHostedService)
+dotnet add package ProcessKit.Extensions.Hosting
+# test projects only — subprocess-free test doubles (ScriptedRunner / FakeProcess / record-replay)
+dotnet add package ProcessKit.Testing
 ```
+
+Each companion package depends on the matching `ProcessKit` version, so installing one pulls in the
+core automatically.
 
 Targets **.NET 8.0** and **.NET 10.0**, and is built for first-class use from **F# and C# alike** —
 every example below is shown in both. To keep them on the usage code, the snippets omit `open` /

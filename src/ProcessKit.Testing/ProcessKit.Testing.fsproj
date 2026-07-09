@@ -5,8 +5,11 @@
 		<AssemblyName>ProcessKit.Testing</AssemblyName>
 
 		<!-- Package identity only; shared metadata is hoisted to Directory.Build.props. -->
+		<!-- Kept in lockstep with the core ProcessKit version: all four packages are built,
+		     versioned, and published together by .github/workflows/release.yml. The release
+		     packs with -p:Version=<computed>, so this value is the pre-release seed/default. -->
 		<PackageId>ProcessKit.Testing</PackageId>
-		<Version>2.0.0</Version>
+		<Version>2.1.0</Version>
 		<Description>Test doubles for ProcessKit — a subprocess-free ScriptedRunner (with Reply), an in-memory FakeProcess handle, and a record/replay IProcessRunner (RecordReplayRunner + cassettes). Shipped as a separate package so the disk/JSON record-replay surface stays out of a consumer's production dependency; reference it only from test projects.</Description>
 		<PackageTags>fsharp;dotnet;process;subprocess;testing;test-double;fake;mock;scripted-runner;record-replay;cassette;iprocessrunner;processkit</PackageTags>
 
@@ -43,9 +46,27 @@
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
 	</ItemGroup>
 
-	<ItemGroup>
-		<!-- Cross-project reference is the built ProcessKit assembly (build order via the .slnx
-		     BuildDependency), never a ProjectReference — see CLAUDE.md. -->
+	<!-- ProcessKit core dependency.
+	     Everyday / CI build (default): resolve the freshly-built core as a built ASSEMBLY via
+	     <Reference> + AssemblySearchPaths (build order via the .slnx BuildDependency), never a
+	     <ProjectReference> — see AGENTS.md / CLAUDE.md. An assembly <Reference> produces no NuGet
+	     dependency in the packed .nuspec, which is correct for the in-repo build but leaves the
+	     published package with no way to resolve the core transitively.
+	     Release pack only (PackWithCoreDependency=true, set by .github/workflows/release.yml after
+	     the core is packed to a local feed): declare ProcessKit as a real NuGet PackageReference so
+	     the published .nuspec carries a ProcessKit dependency for BOTH target frameworks. The two
+	     forms are mutually exclusive, so an everyday build never restores the core from a feed and
+	     the <Reference> convention stays intact. VersionOverride supplies the version inline under
+	     Central Package Management (ProcessKit is the in-repo project, not a Directory.Packages.props
+	     entry). Pinned to the EXACT co-released core version: this package binds ProcessKit internals
+	     via InternalsVisibleTo, so it is only correct against the matching core version. -->
+	<PropertyGroup Condition="'$(PackWithCoreDependency)' == 'true' and '$(CoreDepVersion)' == ''">
+		<CoreDepVersion>$(Version)</CoreDepVersion>
+	</PropertyGroup>
+	<ItemGroup Condition="'$(PackWithCoreDependency)' == 'true'">
+		<PackageReference Include="ProcessKit" VersionOverride="[$(CoreDepVersion)]" />
+	</ItemGroup>
+	<ItemGroup Condition="'$(PackWithCoreDependency)' != 'true'">
 		<Reference Include="ProcessKit" />
 	</ItemGroup>
 

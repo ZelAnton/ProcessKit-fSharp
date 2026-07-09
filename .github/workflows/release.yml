@@ -281,6 +281,33 @@ jobs:
       - name: Pack
         run: dotnet pack src/ProcessKit/ProcessKit.fsproj --no-build --configuration Release --output ./artifacts /p:Version=${{ steps.version.outputs.version }}
 
+      # The three companion packages (Testing, DI, Hosting) reference the core as a built
+      # ASSEMBLY (<Reference> + AssemblySearchPaths — the repo's build-order convention), which
+      # emits NO NuGet dependency in their .nuspec. Publishing them as-is would ship packages an
+      # external consumer cannot resolve the core from. To give each a correct, version-matched
+      # ProcessKit dependency WITHOUT switching the repo-internal reference to a <ProjectReference>
+      # (AGENTS.md / CLAUDE.md), pack them with PackWithCoreDependency=true: that swaps the
+      # <Reference> for a real PackageReference to ProcessKit resolved from the local feed of the
+      # core we just packed (./artifacts) and pins it to the exact co-released version, for both
+      # target frameworks. See each companion .fsproj for the mutually-exclusive reference forms.
+      # This is a fresh build+pack (not --no-build): the companion is recompiled against the packed
+      # core, which is byte-identical to the <Reference> core the solution build/test already
+      # validated (Deterministic build), so the shipped assemblies match the tested ones.
+      - name: Pack companion packages
+        run: |
+          set -euo pipefail
+          # Make the freshly-packed core resolvable as a NuGet package. Append the feed to the repo
+          # nuget.config (which <clear/>s inherited sources, so the feed must live AFTER the clear
+          # to be seen). This edit is ephemeral in CI and is never committed.
+          dotnet nuget add source "$PWD/artifacts" --name local-core --configfile "$PWD/nuget.config"
+          for proj in \
+            src/ProcessKit.Testing/ProcessKit.Testing.fsproj \
+            src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj \
+            src/ProcessKit.Extensions.Hosting/ProcessKit.Extensions.Hosting.fsproj; do
+            dotnet pack "$proj" --configuration Release --output ./artifacts \
+              -p:PackWithCoreDependency=true /p:Version=${{ steps.version.outputs.version }}
+          done
+
       - name: Generate SHA256SUMS
         run: |
           set -euo pipefail
@@ -294,8 +321,18 @@ jobs:
           sha256sum "${files[@]}" > SHA256SUMS
           cat SHA256SUMS
 
+      # Bump the declared <Version> of all four packages in lockstep (they are packed above with
+      # -p:Version=<computed>, so this keeps the repo's seed versions consistent with what shipped).
       - name: Bump version in fsproj
-        run: sed -i -E "s|<Version>[^<]+</Version>|<Version>${{ steps.version.outputs.version }}</Version>|" src/ProcessKit/ProcessKit.fsproj
+        run: |
+          set -euo pipefail
+          for proj in \
+            src/ProcessKit/ProcessKit.fsproj \
+            src/ProcessKit.Testing/ProcessKit.Testing.fsproj \
+            src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj \
+            src/ProcessKit.Extensions.Hosting/ProcessKit.Extensions.Hosting.fsproj; do
+            sed -i -E "s|<Version>[^<]+</Version>|<Version>${{ steps.version.outputs.version }}</Version>|" "$proj"
+          done
 
       - name: Promote Unreleased section in CHANGELOG.md
         env:
@@ -353,7 +390,11 @@ jobs:
           set -euo pipefail
           git config user.name "Anton Zhelezniakou"
           git config user.email "github@zelanton.net"
-          git add src/ProcessKit/ProcessKit.fsproj CHANGELOG.md
+          git add src/ProcessKit/ProcessKit.fsproj \
+            src/ProcessKit.Testing/ProcessKit.Testing.fsproj \
+            src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj \
+            src/ProcessKit.Extensions.Hosting/ProcessKit.Extensions.Hosting.fsproj \
+            CHANGELOG.md
           git commit -m "Release ${{ steps.version.outputs.tag }}"
           git tag "${{ steps.version.outputs.tag }}"
 
