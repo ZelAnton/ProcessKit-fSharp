@@ -600,7 +600,9 @@ type Supervisor internal (config: SupervisorConfig) =
                                 escalation <- escalation + 1
                                 restarts <- restarts + 1
 
-            return final.Value
+            match final with
+            | Some result -> return result
+            | None -> return Error(ProcessError.Io "Supervisor loop ended without a final result.")
         }
 
 /// Pipe-friendly entry points for `Supervisor`.

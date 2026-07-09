@@ -75,8 +75,24 @@ jobs:
       - name: Restore packages
         run: dotnet restore
 
+      # The CLI does not discover MSBuild PackageReference analyzers on its own.
+      # Ionide.Analyzers 0.15.0 is built for fsharp-analyzers 0.36.0; newer
+      # versions may break compatibility, so keep the package/tool pins aligned.
       - name: Analyze F# source
-        run: dotnet fsharp-analyzers --project src/ProcessKit/ProcessKit.fsproj
+        run: |
+          set -euo pipefail
+
+          analyzers_path="${NUGET_PACKAGES:-$HOME/.nuget/packages}/ionide.analyzers/0.15.0/analyzers/dotnet/fs"
+          if [ ! -d "$analyzers_path" ]; then
+            echo "::error::Ionide.Analyzers package was not restored under $analyzers_path"
+            exit 1
+          fi
+
+          dotnet fsharp-analyzers --project src/ProcessKit/ProcessKit.fsproj \
+            --analyzers-path "$analyzers_path" \
+            --exclude-analyzers PostfixGenericsAnalyzer StructDiscriminatedUnionAnalyzer \
+            --treat-as-error IONIDE-001 IONIDE-003 IONIDE-006 \
+            --output-format github
 
   test:
     if: github.event_name != 'schedule'

@@ -25,6 +25,12 @@ fsharp_multiline_bracket_style = cramped
 fsharp_newline_between_type_definition_and_members = true
 fsharp_align_function_signature_to_indentation = false
 
+# Disable style-preference rules that conflict with codebase patterns:
+# PostfixGenericsAnalyzer (IONIDE-002): existing public signatures use prefix style.
+dotnet_diagnostic.IONIDE-002.severity = none
+# StructDiscriminatedUnionAnalyzer (IONIDE-012): low-value allocation hint for API-heavy code.
+dotnet_diagnostic.IONIDE-012.severity = none
+
 [*.{bat,cmd}]
 end_of_line = crlf
 tab_width = 2

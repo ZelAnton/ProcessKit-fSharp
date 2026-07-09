@@ -37,5 +37,5 @@ current.
 > CodeQL workflow. Static hygiene relies instead on `TreatWarningsAsErrors` and
 > Fantomas formatting checks in CI. F# analyzers are integrated through the
 > `fsharp-analyzers` local tool and the Ionide.Analyzers rule package; run
-> `dotnet fsharp-analyzers --project src/ProcessKit/ProcessKit.fsproj` to check
-> the main library locally.
+> `dotnet fsharp-analyzers --project src/ProcessKit/ProcessKit.fsproj` with the
+> restored Ionide.Analyzers package path when checking the main library locally.

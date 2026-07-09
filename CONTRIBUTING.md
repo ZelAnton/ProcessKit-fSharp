@@ -42,10 +42,20 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
 - **Static analysis** uses `fsharp-analyzers` with the Ionide.Analyzers rule
   package. Check the main library locally with:
   ```sh
-  dotnet fsharp-analyzers --project src/ProcessKit/ProcessKit.fsproj
+  analyzers_path="$(find "${NUGET_PACKAGES:-$HOME/.nuget/packages}/ionide.analyzers" -type d -path '*/analyzers/dotnet/fs' | sort -V | tail -n 1)"
+  dotnet fsharp-analyzers --project src/ProcessKit/ProcessKit.fsproj --analyzers-path "$analyzers_path"
   ```
-  For a concise CI-style check, run the same command after `dotnet tool restore`
-  and `dotnet restore`; any reported analyzer violation fails the command.
+  For a concise CI-style check, run:
+  ```sh
+  analyzers_path="$(find "${NUGET_PACKAGES:-$HOME/.nuget/packages}/ionide.analyzers" -type d -path '*/analyzers/dotnet/fs' | sort -V | tail -n 1)"
+  dotnet fsharp-analyzers --project src/ProcessKit/ProcessKit.fsproj \
+    --analyzers-path "$analyzers_path" \
+    --exclude-analyzers PostfixGenericsAnalyzer StructDiscriminatedUnionAnalyzer \
+    --treat-as-error IONIDE-001 IONIDE-003 IONIDE-005 IONIDE-006 IONIDE-008 IONIDE-011 \
+    --output-format github
+  ```
+  Add `--report artifacts/analyzers.sarif --code-root .` when you want a SARIF
+  report file for review.
 - **Compile order matters.** F# resolves declarations top-to-bottom; the
   `<Compile Include="..." />` order in the `.fsproj` is the dependency order, not
   cosmetic. Insert a new file after everything it depends on.
