@@ -569,11 +569,15 @@ Honest by construction — never a silent downgrade:
 
 - On **Windows** (no equivalent) any of these fails the spawn with
   `ProcessError.Unsupported`, exactly like `Umask`.
-- A **uid/gid drop the OS refuses** — dropping to another user needs privilege
-  (root / `CAP_SETUID` / `CAP_SETGID`) — fails with `ProcessError.Spawn`, never a
-  child that kept the parent's ids. The drop also *clears* the parent's
-  supplementary groups and applies `setgid` **before** `setuid`, so it composes
-  into a correct drop.
+- A **uid/gid drop the caller can't make** fails with `ProcessError.Spawn`, never a
+  child that kept the parent's ids. The up-front check is deliberately **root-only**:
+  dropping to another user is allowed only when the caller is root (`euid == 0`). A
+  non-root caller is refused before the spawn — *including* one that holds
+  `CAP_SETUID` / `CAP_SETGID` (a rootless container / sandbox), which is conservatively
+  declined rather than probed (`setpriv` remains the real arbiter, so the guard stays a
+  simple root gate rather than a partial reimplementation of the kernel's capability
+  model). The drop also *clears* the parent's supplementary groups and applies `setgid`
+  **before** `setuid`, so it composes into a correct drop.
 - **Containment is preserved under `Setsid`.** A new session still makes the child
   its own process-group leader, so the kill-on-drop group teardown reaches it. (The
   session detach replaces the group's default `POSIX_SPAWN_SETPGROUP` for that one

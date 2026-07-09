@@ -492,9 +492,11 @@ type Command internal (config: CommandConfig) =
     /// equivalent) a requested uid fails the spawn with `ProcessError.Unsupported` rather than being
     /// silently ignored. Because `posix_spawn` has no uid attribute, a command with a uid (or `Gid`) is
     /// spawned through the `setpriv` helper (util-linux), which drops the gid/uid and clears the
-    /// supplementary groups before `exec`ing the real program in place. Dropping to another user needs
-    /// privilege (root / `CAP_SETUID`): a non-root caller asking for a different uid fails the spawn with
-    /// `ProcessError.Spawn` (never a child that kept the parent's uid), as does a host with no `setpriv`
+    /// supplementary groups before `exec`ing the real program in place. Dropping to another user is
+    /// **root-only** (`euid == 0`): a non-root caller asking for a different uid fails the spawn with
+    /// `ProcessError.Spawn` (never a child that kept the parent's uid) — including one holding
+    /// `CAP_SETUID`/`CAP_SETGID`, which the up-front check conservatively refuses rather than probes — as
+    /// does a host with no `setpriv`
     /// (mainstream Linux has it; macOS/BSD do not). `uid` must be non-negative (rejected with
     /// `ArgumentOutOfRangeException` at the builder boundary). Pair with `Gid` (or `User`) for a full drop.
     member _.Uid(uid: int) =

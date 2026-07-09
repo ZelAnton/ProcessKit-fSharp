@@ -826,10 +826,20 @@ module internal Posix =
     [<DllImport("libc", SetLastError = true)>]
     extern int private getegid()
 
-    /// Up-front guard for a uid/gid drop: a caller that is not root (euid 0) cannot change the child to a
-    /// DIFFERENT uid/gid, so report that as an honest `ProcessError.Spawn` before spawning the helper
-    /// (rather than letting `setpriv` fail later as a non-zero exit). A no-op request — the target id
-    /// already equals the current one — needs no privilege and is allowed through. `None` = clear to go.
+    /// Up-front guard for a uid/gid drop: a caller that is not root (euid 0) is refused a DIFFERENT
+    /// uid/gid here with an honest `ProcessError.Spawn`, before spawning the helper (rather than letting
+    /// `setpriv` fail later as a non-zero exit). A no-op request — the target id already equals the
+    /// current one — needs no privilege and is allowed through. `None` = clear to go.
+    ///
+    /// This is DELIBERATELY a coarse, root-only gate, not a capability probe. A non-root caller that
+    /// holds `CAP_SETUID`/`CAP_SETGID` (a rootless container / sandbox) could in principle perform the
+    /// drop, but is conservatively refused here rather than probed: the precheck exists only to turn the
+    /// common not-privileged case into a clean up-front error, and `setpriv` itself remains the true
+    /// arbiter of a drop the kernel actually permits (bounding set, no-new-privs, LSM/seccomp can all make
+    /// a `CapEff`-positive drop still fail — the very non-zero exit this guard avoids). Root-gating keeps
+    /// the check simple and testable and never ships an untested, more-permissive security path; if a
+    /// real rootless-container need arises, loosening this to capability-aware is a strictly non-breaking
+    /// change. The public docs (Command.Uid, CHANGELOG, docs/commands.md) state this root-only contract.
     let private privilegeDropPrecheck (command: Command) : ProcessError option =
         let config = command.Config
 
@@ -850,12 +860,7 @@ module internal Posix =
                 | None -> false
 
             if wantsDifferentUid || wantsDifferentGid then
-                Some(
-                    ProcessError.Spawn(
-                        command.Program,
-                        "dropping to a different Uid/Gid needs privilege (run as root, or with CAP_SETUID/CAP_SETGID)"
-                    )
-                )
+                Some(ProcessError.Spawn(command.Program, "dropping to a different Uid/Gid needs root (euid 0)"))
             else
                 None
 
