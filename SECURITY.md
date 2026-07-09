@@ -35,6 +35,7 @@ current.
 
 > **No CodeQL.** GitHub CodeQL has no F# support, so this repository ships no
 > CodeQL workflow. Static hygiene relies instead on `TreatWarningsAsErrors` and
-> Fantomas formatting checks in CI. If you want deeper static analysis, wire up
-> F# analyzers (e.g. the [Ionide analyzers](https://github.com/ionide/ionide-analyzers))
-> through `Directory.Build.props`.
+> Fantomas formatting checks in CI. F# analyzers are integrated through the
+> `fsharp-analyzers` local tool and the Ionide.Analyzers rule package; run
+> `dotnet fsharp-analyzers --project src/ProcessKit/ProcessKit.fsproj` to check
+> the main library locally.

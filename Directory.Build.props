@@ -64,5 +64,7 @@
 	<ItemGroup>
 		<!-- SourceLink, repo-wide; PrivateAssets so it never flows to package consumers. -->
 		<PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+		<!-- Rule package for the fsharp-analyzers local tool and CI job; never flows to package consumers. -->
+		<PackageReference Include="Ionide.Analyzers" PrivateAssets="All" />
 	</ItemGroup>
 </Project>

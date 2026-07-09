@@ -24,6 +24,7 @@
 		<PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
 		<PackageVersion Include="coverlet.collector" Version="10.0.1" />
 		<PackageVersion Include="FSharp.Core" Version="10.1.300" />
+		<PackageVersion Include="Ionide.Analyzers" Version="0.15.0" />
 		<PackageVersion Include="FsCheck" Version="3.3.3" />
 		<PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.9" />
 		<PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.9" />

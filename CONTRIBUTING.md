@@ -9,7 +9,8 @@ Thanks for your interest in improving **ProcessKit**.
   full `dotnet test` runs both legs. Run `dotnet test --framework net10.0` to test
   a single target if you don't have the net8 runtime installed.
 - Local tools restored once per clone (`dotnet tool restore`) — this installs
-  [Fantomas](https://fsprojects.github.io/fantomas/), the F# formatter.
+  [Fantomas](https://fsprojects.github.io/fantomas/), the F# formatter, and
+  `fsharp-analyzers`, the Ionide.Analyzers CLI runner used by CI.
 - Optional: PowerShell 7+ and Docker/Rancher Desktop to run the Linux test
   helper (`scripts/test-linux.ps1`).
 
@@ -38,6 +39,13 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
   dotnet fantomas --check src tests
   ```
   CI fails on unformatted F#. Do not reformat code you are not changing.
+- **Static analysis** uses `fsharp-analyzers` with the Ionide.Analyzers rule
+  package. Check the main library locally with:
+  ```sh
+  dotnet fsharp-analyzers --project src/ProcessKit/ProcessKit.fsproj
+  ```
+  For a concise CI-style check, run the same command after `dotnet tool restore`
+  and `dotnet restore`; any reported analyzer violation fails the command.
 - **Compile order matters.** F# resolves declarations top-to-bottom; the
   `<Compile Include="..." />` order in the `.fsproj` is the dependency order, not
   cosmetic. Insert a new file after everything it depends on.
