@@ -46,9 +46,15 @@ type internal TrackingRunner(inner: IProcessRunner) =
 
         member this.CaptureStringAsync(command, cancellationToken) =
             task {
+                // Register a kill-on-cancel backstop: without it, cancelling `cancellationToken`
+                // (e.g. `lifetime.Cancel()` on host shutdown) would never reach an already-running child,
+                // since `OutputStringAsync` itself does not watch any token. This mirrors the pattern
+                // in `CaptureVerbs.runToCompletion` (src/ProcessKit/Runner.fs:123).
                 match! (this :> IProcessRunner).SpawnAsync(command, cancellationToken) with
                 | Error error -> return Error error
                 | Ok running ->
+                    use _registration = cancellationToken.Register(fun () -> running.Kill())
+
                     try
                         let! result = running.OutputStringAsync()
                         return result
@@ -58,9 +64,12 @@ type internal TrackingRunner(inner: IProcessRunner) =
 
         member this.CaptureBytesAsync(command, cancellationToken) =
             task {
+                // See `CaptureStringAsync` above for why this registers a kill-on-cancel backstop.
                 match! (this :> IProcessRunner).SpawnAsync(command, cancellationToken) with
                 | Error error -> return Error error
                 | Ok running ->
+                    use _registration = cancellationToken.Register(fun () -> running.Kill())
+
                     try
                         let! result = running.OutputBytesAsync()
                         return result
