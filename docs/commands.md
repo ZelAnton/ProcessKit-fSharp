@@ -365,7 +365,12 @@ the head; `OverflowMode.Error` makes the ceiling **fail loud** instead of droppi
 A line cap alone doesn't bound memory — without a byte cap an enormous newline-free
 "line" grows whole. `WithMaxBytes` caps the retained bytes **and** the in-flight
 (not-yet-terminated) line — force-flushed at the cap — so even a newline-free flood
-stays bounded (set either ceiling, or both):
+stays bounded (set either ceiling, or both). This also covers the opposite shape: an
+unbounded flood of *empty* lines (bare newlines). Each retained line counts its own
+UTF-8 bytes **plus one byte** for the `\n` separator the reassembled text needs, so
+even an empty line (`0` content bytes) still costs `1` toward the cap — `MaxBytes`
+alone (no `MaxLines`) genuinely bounds an empty-line flood too, not just a
+newline-free one:
 
 **F#**
 
@@ -412,7 +417,9 @@ bytes, and `DropNewest` keeps the **first** `cap` bytes — the dropping modes s
 `ProcessResult.Truncated`. `MaxBytes = None` (the default) leaves the raw stdout
 capture **unbounded**, exactly as before. `ProcessResult.Truncated` on a byte
 capture reflects truncation of stdout *or* stderr, and `OutputTooLarge` fires if
-either stream trips its fail-loud ceiling.
+either stream trips its fail-loud ceiling. Unlike the line-based path above, a raw
+byte capture has no per-line separator surcharge — `cap` is the literal byte count,
+since there is no line structure to reassemble.
 
 ```fsharp
 // Keep the last 1 MiB of a binary stream; anything earlier is dropped, Truncated is set:

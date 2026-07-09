@@ -196,6 +196,78 @@ type PumpTests() =
         Assert.That(buf.Truncated, Is.True)
 
     [<Test>]
+    member _.``LineBuffer byte accounting charges the separator Text reintroduces, so a cap bounds the reassembled size``
+        ()
+        =
+        // Two 1-byte lines "a"/"b" sum to 2 content bytes, exactly the cap below — the pre-fix
+        // accounting (each line's own UTF-8 byte count only) would have retained both, reassembling
+        // via Text to "a\nb" (3 bytes), which *exceeds* the configured cap of 2. Charging a separator
+        // byte per retained line closes that gap: the second line now reads as over-cap, gets evicted,
+        // and the reassembled size never exceeds the cap.
+        let buf = Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes 2)
+        [ "a"; "b" ] |> List.iter buf.Add
+        Assert.That(buf.Text, Is.EqualTo "b")
+        Assert.That(buf.Truncated, Is.True)
+        Assert.That(Encoding.UTF8.GetByteCount buf.Text, Is.LessThanOrEqualTo 2)
+
+    [<Test>]
+    member _.``LineBuffer under a byte cap alone bounds an empty-line flood with DropOldest``() =
+        // A bare-newline flood produces an unbounded number of empty-string lines. Under the pre-fix
+        // accounting an empty line cost 0 bytes, so retention was unbounded even with MaxBytes set and
+        // no MaxLines. The corrected accounting charges a separator byte per line, so retention stays
+        // bounded to (roughly) the cap regardless of how many empty lines arrive.
+        let buf = Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes 10)
+
+        for _ in 1..100_000 do
+            buf.Add ""
+
+        Assert.That(buf.TotalLines, Is.EqualTo 100_000)
+        Assert.That(buf.Truncated, Is.True)
+        Assert.That(Encoding.UTF8.GetByteCount buf.Text, Is.LessThanOrEqualTo 10)
+
+    [<Test>]
+    member _.``LineBuffer under a byte cap alone bounds an empty-line flood with DropNewest``() =
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes(10).WithOverflow OverflowMode.DropNewest)
+
+        for _ in 1..100_000 do
+            buf.Add ""
+
+        Assert.That(buf.TotalLines, Is.EqualTo 100_000)
+        Assert.That(buf.Truncated, Is.True)
+        Assert.That(Encoding.UTF8.GetByteCount buf.Text, Is.LessThanOrEqualTo 10)
+
+    [<Test>]
+    member _.``LineBuffer under a byte cap alone bounds an empty-line flood with Error``() =
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes(10).WithOverflow OverflowMode.Error)
+
+        for _ in 1..100_000 do
+            buf.Add ""
+
+        Assert.That(buf.TotalLines, Is.EqualTo 100_000)
+        Assert.That(buf.TooLarge, Is.True)
+        // Error retains nothing once tripped — the fail-loud ceiling counts but never retains.
+        Assert.That(Encoding.UTF8.GetByteCount buf.Text, Is.LessThanOrEqualTo 10)
+
+    [<Test>]
+    member _.``LineBuffer with MaxBytes = 0 retains nothing but still flags every overflow mode sanely``() =
+        for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest; OverflowMode.Error ] do
+            let buf =
+                Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes(0).WithOverflow overflow)
+
+            for _ in 1..1000 do
+                buf.Add ""
+
+            Assert.That(buf.Text, Is.EqualTo "", $"{overflow} text")
+            Assert.That(buf.TotalLines, Is.EqualTo 1000, $"{overflow} total lines")
+
+            if overflow = OverflowMode.Error then
+                Assert.That(buf.TooLarge, Is.True, $"{overflow} tooLarge")
+            else
+                Assert.That(buf.Truncated, Is.True, $"{overflow} truncated")
+
+    [<Test>]
     member _.``readLines force-flushes an over-long unterminated line at the cap``() =
         // A 7-char newline-free blob with a cap of 3 is flushed as <=3-char segments, so the in-flight
         // buffer never grows past the cap — a newline-free flood can't outgrow it.

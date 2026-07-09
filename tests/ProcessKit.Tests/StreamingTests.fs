@@ -744,6 +744,33 @@ type StreamingTests() =
         }
         :> Task
 
+    [<Test>]
+    member _.``OutputStringAsync bounds an empty-line flood under a byte cap alone (no MaxLines)``() : Task =
+        task {
+            // A bare-newline flood with `MaxBytes` set and no `MaxLines`: the pre-fix `LineBuffer`
+            // accounting charged an empty line 0 bytes, so this would retain an unbounded number of
+            // empty-string line records — defeating the byte cap as a memory bound. The corrected
+            // accounting must keep the reassembled stdout genuinely bounded to (roughly) the configured
+            // cap, exercised end-to-end through `OutputStringAsync`/`OutputBufferPolicy`, not just the
+            // internal `LineBuffer` directly.
+            let cap = 64
+            let payload = String('\n', 100_000)
+
+            let config =
+                (Command.create "test"
+                 |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes cap))
+                    .Config
+
+            use running = syntheticStdoutProcess config payload
+
+            match! running.OutputStringAsync() with
+            | Ok result ->
+                Assert.That(result.Truncated, Is.True)
+                Assert.That(Encoding.UTF8.GetByteCount result.Stdout, Is.LessThanOrEqualTo cap)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
     // --- OutputBytesAsync honours the OutputBuffer byte cap + overflow (T-011) ---
 
     [<Test>]
