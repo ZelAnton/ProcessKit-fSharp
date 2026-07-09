@@ -180,7 +180,7 @@ Hard kill first writes `1` to `cgroup.kill` (kernel 5.14+). If unavailable, it b
 
 ## Pump layer and output buffering
 
-`Pump.LineBuffer` retains decoded lines as `(string, UTF-8 byte count)` entries. `Add` always increments total line count and, when needed, total byte count before applying retention. This distinction lets diagnostics report the full stream even when retained content was truncated.
+`Pump.LineBuffer` retains decoded lines as `(string, UTF-8 byte count + 1)` entries, charging every line one additional byte for the separator that `Text` reintroduces. `Add` always increments total line count and, when needed, total byte count before applying retention. This distinction lets diagnostics report the full stream even when retained content was truncated.
 
 The modes are:
 
@@ -189,7 +189,7 @@ The modes are:
 - `Error`: mark the capture too large when a cap is crossed, while the pump continues draining the pipe. With no caps, this mode is intentionally zero-tolerance for line-pumped output.
 - Unbounded behavior is represented by `OutputBufferPolicy.Unbounded` (`MaxLines = None`, `MaxBytes = None`, with `DropOldest` irrelevant because no cap fills).
 
-Line and byte caps solve different problems. A line cap bounds object/count overhead but permits a few enormous strings. A byte cap bounds retained UTF-8 payload and also supplies `readLines` with an in-flight line-length cap: newline-free output is force-flushed into segments rather than growing one `StringBuilder` indefinitely. Conversely, many empty or tiny lines can exhaust memory under a byte-only policy, so the line cap remains independent. Raw byte capture has no line structure and uses only `MaxBytes` through `RawBuffer`.
+Line and byte caps solve different problems. A line cap bounds object/count overhead but permits a few enormous strings. A byte cap bounds retained UTF-8 payload and also supplies `readLines` with an in-flight line-length cap: newline-free output is force-flushed into segments rather than growing one `StringBuilder` indefinitely. It now genuinely bounds retained memory for empty-line floods as well, because every retained line is charged for its separator byte. The line cap remains independent so callers can place a direct bound on object/count overhead. Raw byte capture has no line structure and uses only `MaxBytes` through `RawBuffer`.
 
 `readLines` reads 8192-byte chunks, tees raw bytes before decoding, strips a leading BOM from decoded text only, and applies the configured terminator rules across chunk boundaries. Its `onLine` callback returns `ValueTask`; awaiting it in the hot loop is what makes channel backpressure real. EOF resolves a pending carriage return and flushes a final unterminated line.
 

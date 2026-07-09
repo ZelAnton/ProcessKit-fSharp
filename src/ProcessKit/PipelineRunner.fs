@@ -41,6 +41,13 @@ type internal PipelineCapture =
 /// `ProcessGroup`, which it drives purely through that group's public/internal surface.
 module internal PipelineRunner =
 
+    /// Internal test seam (T-061): invoked on the staging thread immediately after each stage
+    /// successfully spawns, with that stage's zero-based index. It lets a deterministic regression test
+    /// fire cancellation in the exact window between two spawns — proving that once cancellation/timeout
+    /// is observed no later stage is started, and any stage that raced the sweep is reaped before `run`
+    /// returns. `None` (the default) in every production run; nothing but a test ever sets it.
+    let mutable stageSpawnedTestHook: (int -> unit) option = None
+
     /// Spawn every stage into one fresh shared group, wire each stage's stdout to the next stage's
     /// stdin (no shell involved), capture the last stage's stdout, and reap the whole tree on exit.
     /// Cancellation or the optional `timeout` hard-kill the tree.
@@ -85,7 +92,21 @@ module internal PipelineRunner =
                     | Some duration when Timeouts.isArmable duration -> timeoutCts.CancelAfter duration
                     | _ -> ()
 
-                    use _registration = linkedCts.Token.Register(fun () -> group.KillTree())
+                    // Serialize each stage spawn against the cancellation/timeout sweep. `KillTree` leaves
+                    // the group usable for further spawns, so the one-shot callback (which kills the stages
+                    // running when it fires) would otherwise MISS a stage the sequential loop starts right
+                    // afterwards — that stage would outlive the cancellation it should have been swept into.
+                    // The gate makes "spawn a stage" and "mark cancelled, then sweep" mutually exclusive:
+                    // `cancellationFired` is set UNDER the gate before the callback's `KillTree`, so a spawn
+                    // taking the same gate either observes it and starts nothing, or has already made the
+                    // child a group member the sweep then reaps. No stage can start after the sweep (T-061).
+                    let stagingGate = obj ()
+                    let mutable cancellationFired = false
+
+                    use _registration =
+                        linkedCts.Token.Register(fun () ->
+                            lock stagingGate (fun () -> cancellationFired <- true)
+                            group.KillTree())
 
                     // Dispose a pipe stream, swallowing the teardown-race exceptions (double close, or
                     // a broken pipe surfaced while flushing on dispose because the peer is gone).
@@ -96,6 +117,10 @@ module internal PipelineRunner =
                     let stderrTasks = ResizeArray<Task<Pump.RawCapture>>()
                     let mutable prevStdout: Stream option = None
                     let mutable spawnError = None
+                    // Set when a spawn is skipped because cancellation/timeout already fired (the gate
+                    // short-circuited it): the loop stops, and the post-loop match reaps the partial set and
+                    // returns a prompt Cancelled/timed-out result instead of the normal full-chain path.
+                    let mutable stagingHalted = false
                     let mutable stage0Feed: Task<exn option> option = None
                     let mutable index = 0
 
@@ -108,7 +133,7 @@ module internal PipelineRunner =
                     let mutable telemetry: RunTelemetryScope option = None
                     let mutable startTimeUtc = DateTime.UtcNow
 
-                    while index < stages.Length && spawnError.IsNone do
+                    while index < stages.Length && spawnError.IsNone && not stagingHalted do
                         // The pipeline owns stdout wiring: every stage's stdout must be a pipe —
                         // intermediate stages feed the next stage's stdin and the last stage's stdout is
                         // captured. Force `Piped` over any user-set `Null`/`Inherit` so an unwired
@@ -120,9 +145,23 @@ module internal PipelineRunner =
 
                         let stage = if index > 0 then piped.KeepStdinOpen() else piped
 
-                        match group.SpawnInto stage with
-                        | Error error -> spawnError <- Some error
-                        | Ok sp ->
+                        // Take `stagingGate` for the spawn itself, mutually exclusive with the cancellation
+                        // callback's "mark fired + KillTree" (above): either we observe `cancellationFired`
+                        // and start nothing (the loop halts), or the child becomes a group member BEFORE the
+                        // callback's sweep, which then reaps it. Either way no stage outlives the sweep.
+                        let spawnOutcome =
+                            lock stagingGate (fun () ->
+                                if cancellationFired then
+                                    ValueNone
+                                else
+                                    ValueSome(group.SpawnInto stage))
+
+                        match spawnOutcome with
+                        | ValueNone ->
+                            // Cancellation/timeout already fired: do not start this — or any later — stage.
+                            stagingHalted <- true
+                        | ValueSome(Error error) -> spawnError <- Some error
+                        | ValueSome(Ok sp) ->
                             spawned.Add sp
 
                             if index = 0 then
@@ -182,6 +221,10 @@ module internal PipelineRunner =
 
                             prevStdout <- sp.Stdout
 
+                            // Test seam only (never set in production): let a regression test act in the
+                            // exact window between this spawn and the next — see `stageSpawnedTestHook`.
+                            stageSpawnedTestHook |> Option.iter (fun hook -> hook index)
+
                         index <- index + 1
 
                     match spawnError with
@@ -217,6 +260,96 @@ module internal PipelineRunner =
                         telemetry |> Option.iter (fun t -> t.Abandon())
 
                         return Error error
+                    | None when stagingHalted ->
+                        // Cancellation or the timeout fired mid-staging, so the gate short-circuited the loop
+                        // and only `spawned.Count` of `stages.Length` stages ever started. The callback's
+                        // `KillTree` already covered exactly this set (the gate guarantees none escaped); reap
+                        // and drain them here — like the spawn-failure path above — so the caller gets a
+                        // prompt Cancelled/timed-out result with no straggling stage and no process/pipe
+                        // handle leak. The explicit `KillTree` makes the kill happen-before the waits, so the
+                        // reap can never block on a raced stage the callback had not reached yet.
+                        group.KillTree()
+
+                        let! killedOutcomes =
+                            spawned
+                            |> Seq.map (fun sp -> group.WaitHandle sp.Handle)
+                            |> Seq.toArray
+                            |> Task.WhenAll
+
+                        for t in copyTasks do
+                            do! t
+
+                        let! stderrCaptures = Task.WhenAll(stderrTasks.ToArray())
+
+                        for sp in spawned do
+                            Pump.closeSpawned sp
+
+                        let duration = Stopwatch.GetElapsedTime startedAt
+                        let timedOut = timeoutCts.IsCancellationRequested
+
+                        // The chain reached a terminal state (deliberately torn down), so — exactly like the
+                        // full-spawn cancel/timeout path below — Conclude the run's telemetry before the
+                        // returned Result is decided, so `runs.active` never leaks. `telemetry` is `Some` iff
+                        // stage 0 spawned; a cancellation that beat even stage 0 leaves it `None` (nothing to
+                        // close), matching a stage-0 spawn failure. A timed-out chain reports `TimedOut` (and
+                        // logs its deadline); an externally cancelled one carries the stages' own kill outcome.
+                        let overallOutcome =
+                            if timedOut then
+                                Outcome.TimedOut
+                            elif killedOutcomes.Length > 0 then
+                                killedOutcomes[killedOutcomes.Length - 1]
+                            else
+                                Outcome.Signalled None
+
+                        let timeoutForLog = if timedOut then timeout else None
+
+                        telemetry
+                        |> Option.iter (fun t ->
+                            t.Conclude(logger, overallOutcome, None, duration, ?timeout = timeoutForLog))
+
+                        if cancellationToken.IsCancellationRequested then
+                            // External cancellation takes precedence over a co-firing timeout (mirroring the
+                            // full-spawn path's `cancellationToken`-first check): report `Cancelled`.
+                            return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
+                        else
+                            // A pure timeout that landed during staging. Report `TimedOut` against the whole
+                            // chain's last stage — the same observable contract the full-spawn timeout yields
+                            // (`OutputStringAsync` → `IsTimedOut`, `RunAsync` → `Error`), so a timeout is never
+                            // silently downgraded to `Cancelled` just because it raced stage startup. Every
+                            // command is represented so `Pipeline.representative` reports the timeout against
+                            // the chain's last stage; stages past `spawned.Count` never started (they carry a
+                            // `TimedOut`/empty-stderr placeholder, which a `TimedOut` capture ignores anyway).
+                            let stageResults =
+                                [ for i in 0 .. stages.Length - 1 ->
+                                      let outcome =
+                                          if i < killedOutcomes.Length then
+                                              killedOutcomes[i]
+                                          else
+                                              Outcome.TimedOut
+
+                                      let stderr =
+                                          if i < stderrCaptures.Length then
+                                              stages[i].Config.StderrEncoding.GetString stderrCaptures[i].Bytes
+                                          else
+                                              ""
+
+                                      { Program = stages[i].Program
+                                        Outcome = outcome
+                                        Unchecked = stages[i].Config.UncheckedInPipe
+                                        Stderr = stderr
+                                        OkCodes = stages[i].Config.OkCodes
+                                        TornDown = false } ]
+
+                            return
+                                Ok
+                                    { LastStdout = Array.empty
+                                      LastStdoutTruncated = false
+                                      LastStdoutTooLarge = false
+                                      LastStdoutTotalBytes = 0
+                                      Stages = stageResults
+                                      Duration = duration
+                                      TimedOut = true
+                                      Stdin0Error = None }
                     | None ->
                         let lastSpawned = spawned[spawned.Count - 1]
 
