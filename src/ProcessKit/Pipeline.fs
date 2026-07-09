@@ -209,15 +209,42 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         else
             None
 
-    // The pipeline's captured stdout tripped the last stage's fail-loud (`OverflowMode.Error`) byte
-    // ceiling — surface it as `ProcessError.OutputTooLarge`, consistent with a single command's byte
-    // verb. The overflow is on the raw byte capture, so it carries no lines (`TotalLines = 0`); the
-    // limits are the last stage's configured caps. The program is the last stage's, whose output
-    // overflowed. Checked before the pipefail/stdin classification, mirroring the single-command order.
-    static let outputTooLargeError (commands: Command list) (capture: PipelineCapture) : ProcessError =
-        let last = List.last commands
-        let policy = last.Config.OutputBuffer
-        ProcessError.OutputTooLarge(last.Program, policy.MaxLines, policy.MaxBytes, 0, capture.LastStdoutTotalBytes)
+    // A pipeline honours the fail-loud (`OverflowMode.Error`) byte ceiling on EVERY captured stream, not
+    // just the last stage's stdout: the last stage's captured stdout AND every stage's drained stderr can
+    // each trip its own stage's `OutputBuffer` cap. When more than one trips at once (several stages, and/
+    // or a stage's stderr together with the final stdout), one deterministic error is chosen by
+    // **first-offending-stage-in-pipeline-order** — the leftmost stage in the chain wins, because that is
+    // the earliest point the chain overflowed; within a single stage its captured stdout (only the last
+    // stage has one) is preferred over its stderr. That tie-break keeps the pre-existing "only the final
+    // stdout overflowed" case reported exactly as before — same program, limits, and totals — while an
+    // overflow on any earlier stage's stderr now takes precedence over the final stdout. Each candidate
+    // names the offending stage's program and its configured caps (`MaxLines`/`MaxBytes` from THAT stage's
+    // `OutputBuffer`); the overflow is on a raw byte capture, so it carries no lines (`TotalLines = 0`),
+    // matching a single command's byte verb. Returns `None` when nothing overflowed. Checked before the
+    // pipefail/stdin classification, mirroring the single-command order. The precedence rule is documented
+    // in `docs/pipelines.md`; keep the two in sync.
+    static let outputTooLargeError (commands: Command list) (capture: PipelineCapture) : ProcessError option =
+        let cmds = List.toArray commands
+        let lastIndex = cmds.Length - 1
+
+        let build (index: int) (totalBytes: int) =
+            let policy = cmds[index].Config.OutputBuffer
+            ProcessError.OutputTooLarge(cmds[index].Program, policy.MaxLines, policy.MaxBytes, 0, totalBytes)
+
+        // Overflow candidates keyed by `(stageIndex, streamRank)`: a lower stageIndex is further left in
+        // the chain (higher precedence); within one stage stdout (rank 0) precedes stderr (rank 1). Sorting
+        // by that key and taking the first yields the leftmost-stage, stdout-before-stderr winner.
+        let candidates =
+            [ if capture.LastStdoutTooLarge then
+                  (lastIndex, 0, build lastIndex capture.LastStdoutTotalBytes)
+              for index, stage in List.indexed capture.Stages do
+                  if stage.StderrTooLarge then
+                      (index, 1, build index stage.StderrTotalBytes) ]
+
+        candidates
+        |> List.sortBy (fun (stageIndex, streamRank, _) -> (stageIndex, streamRank))
+        |> List.tryHead
+        |> Option.map (fun (_, _, error) -> error)
 
     /// Append another stage; its stdin is fed from the current last stage's stdout. Rejects
     /// (`ArgumentException`) a stage that sets a per-stage `Timeout`/`IdleTimeout`/`Retry`/`CancelOn` or
@@ -268,9 +295,9 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             match! this.Execute cancellationToken with
             | Error error -> return Error error
             | Ok capture ->
-                if capture.LastStdoutTooLarge then
-                    return Error(outputTooLargeError commands capture)
-                else
+                match outputTooLargeError commands capture with
+                | Some error -> return Error error
+                | None ->
                     let stage = representative capture
 
                     match stdinErrorOnSuccess (List.head commands).Program capture stage with
@@ -299,9 +326,9 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             match! this.Execute cancellationToken with
             | Error error -> return Error error
             | Ok capture ->
-                if capture.LastStdoutTooLarge then
-                    return Error(outputTooLargeError commands capture)
-                else
+                match outputTooLargeError commands capture with
+                | Some error -> return Error error
+                | None ->
                     let stage = representative capture
 
                     match stdinErrorOnSuccess (List.head commands).Program capture stage with

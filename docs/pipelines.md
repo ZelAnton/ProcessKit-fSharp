@@ -21,6 +21,7 @@ surface is `await`-able fluent methods.
 - [Building a pipeline](#building-a-pipeline)
 - [The verbs](#the-verbs)
 - [Pipefail: the result and the ends](#pipefail-the-result-and-the-ends)
+- [Fail-loud output overflow](#fail-loud-output-overflow)
 - [Unchecked stages](#unchecked-stages)
 - [Timeouts and cancellation](#timeouts-and-cancellation)
 - [Re-running a pipeline](#re-running-a-pipeline)
@@ -219,8 +220,11 @@ The two ends of the chain behave like a single `Command`:
 - Every stage's **stdout** is wired into a pipe — feeding the next stage's stdin, or captured
   at the end — so a `Stdout` mode of `Null` / `Inherit` set on a stage is overridden to keep the
   chain connected.
-- Each inner stage's **stderr** is captured per-stage for pipefail diagnostics; only the
-  last stage's stdout reaches you.
+- Every stage's **stderr** is captured per-stage for pipefail diagnostics under that stage's own
+  [`OutputBuffer`](commands.md#raw-byte-captures-obey-the-byte-cap-too) byte cap (`MaxBytes` +
+  `Overflow`); only the last stage's stdout reaches you. A fail-loud (`OverflowMode.Error`) overflow
+  is honoured on **any** stage's stderr, not only the final stdout — see
+  [Fail-loud output overflow](#fail-loud-output-overflow) below.
 - [`Command.MergeStderr`](commands.md#merging-stderr-into-stdout-21) (a shell `2>&1`) is allowed
   only on the **last** stage — its stdout is the pipeline's captured output, so merging there
   captures the final stage's combined stdout+stderr. On an earlier stage it is rejected
@@ -231,9 +235,12 @@ The two ends of the chain behave like a single `Command`:
   [Timeouts and cancellation](#timeouts-and-cancellation)); a per-stage `Logger` or `StreamBuffer`
   has no effect inside a chain — observe or bound an individual command by running it on its own.
 - The **last** stage's [`OutputBuffer`](commands.md#raw-byte-captures-obey-the-byte-cap-too) byte
-  cap (`MaxBytes` + `Overflow`) bounds the captured stdout — the same way a single command's
+  cap (`MaxBytes` + `Overflow`) bounds the captured **stdout** — the same way a single command's
   `OutputBytesAsync` does (`Error` -> `OutputTooLarge`, `DropOldest`/`DropNewest` -> a tail/head with
-  `Truncated` set). Its `MaxLines`, and every intermediate stage's buffer policy, do not apply.
+  `Truncated` set). Its `MaxLines`, and every intermediate stage's **stdout** buffer policy, do not
+  apply (an intermediate stdout is plumbing into the next stage, not a capture). Each stage's
+  **stderr** cap, by contrast, applies on every stage — see
+  [Fail-loud output overflow](#fail-loud-output-overflow).
 
 **F#**
 
@@ -263,6 +270,31 @@ Console.WriteLine(await uniqueCount.RunAsync() switch
     { IsOk: false, ErrorValue: var err } => err.Message,
 });
 ```
+
+## Fail-loud output overflow
+
+Every captured stream in a chain obeys **its own stage's**
+[`OutputBuffer`](commands.md#raw-byte-captures-obey-the-byte-cap-too) byte cap (`MaxBytes` +
+`Overflow`) — not only the final stdout. Two kinds of capture are subject to a cap:
+
+- the **last** stage's **stdout** — the pipeline's captured output, and
+- **every** stage's **stderr** — drained per-stage for diagnostics, bounded so a chatty stage can
+  never exhaust memory regardless of its position in the chain.
+
+Under `OverflowMode.Error` a cap is **fail-loud**: once the stream exceeds it, the verb returns
+`ProcessError.OutputTooLarge` — naming the offending stage's program and *its* configured caps —
+exactly like a single command's byte capture, and consistently whether the overflow is on the final
+stdout or on any stage's stderr (an intermediate stage's stderr fail-loud overflow is no longer
+silently dropped). Under `DropOldest` / `DropNewest` the same overflow stays **lossy but
+non-erroring** (a bounded tail/head with `Truncated` set), for stderr just as for stdout.
+
+When more than one stream overflows at once — several stages, and/or a stage's stderr together with
+the final stdout — one deterministic error is chosen by
+**first-offending-stage-in-pipeline-order**: the **leftmost** stage in the chain wins (the earliest
+point the chain overflowed), and within a single stage its captured **stdout** (only the last stage
+has one) is preferred over its **stderr**. So an overflow on an earlier stage's stderr outranks the
+final stdout's, while the pre-existing "only the final stdout overflowed" case is reported exactly as
+before (same program, limits, and totals).
 
 ## Unchecked stages
 

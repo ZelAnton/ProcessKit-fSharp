@@ -14,6 +14,16 @@ type internal PipelineStage =
         Unchecked: bool
         Stderr: string
         OkCodes: int list
+        /// This stage's stderr capture tripped its OWN `OutputBuffer` fail-loud (`OverflowMode.Error`)
+        /// byte ceiling. Carried (with `StderrTotalBytes`) so `Pipeline` can surface a deterministic
+        /// `ProcessError.OutputTooLarge` naming this stage — the per-stage stderr analogue of the last
+        /// stage's `PipelineCapture.LastStdoutTooLarge`, so a fail-loud stderr overflow on ANY stage is
+        /// honoured, not silently dropped. Always false for the dropping modes (`DropOldest`/`DropNewest`,
+        /// which stay lossy but non-erroring) and for a stage without a `MaxBytes` cap.
+        StderrTooLarge: bool
+        /// Cumulative stderr bytes this stage produced (saturating at `Int32.MaxValue`), carried into the
+        /// `OutputTooLarge` diagnostics when `StderrTooLarge` is set.
+        StderrTotalBytes: int
         /// The stage was ended by the chain's *proactive teardown* — the shared group was hard-killed
         /// after some *other* (checked) stage failed — rather than by a failure of its own. Such a
         /// victim is de-prioritized in the pipefail fold (`Pipeline.representative`) so the stage that
@@ -23,9 +33,11 @@ type internal PipelineStage =
 
 /// The captured result of running a whole pipeline: the last stage's stdout (with its byte-cap
 /// truncation / fail-loud / total signals from the last stage's `OutputBuffer`), every stage's
-/// terminal state (left-to-right), the wall-clock duration, whether the pipeline timed out, and a
-/// genuine stage-0 stdin source-acquisition failure observed by the feeder (surfaced by `Pipeline`
-/// as `ProcessError.Stdin` on an otherwise-successful run, like a single command).
+/// terminal state (left-to-right, each carrying its own stderr fail-loud / total signals so an
+/// `OverflowMode.Error` stderr overflow on any stage — not just the final stdout — is surfaced), the
+/// wall-clock duration, whether the pipeline timed out, and a genuine stage-0 stdin source-acquisition
+/// failure observed by the feeder (surfaced by `Pipeline` as `ProcessError.Stdin` on an
+/// otherwise-successful run, like a single command).
 type internal PipelineCapture =
     { LastStdout: byte[]
       LastStdoutTruncated: bool
@@ -333,11 +345,23 @@ module internal PipelineRunner =
                                           else
                                               ""
 
+                                      // A stage that never started (staging halted mid-chain) has no stderr
+                                      // capture, so it never overflowed — default its fail-loud state off.
+                                      let stderrTooLarge = i < stderrCaptures.Length && stderrCaptures[i].TooLarge
+
+                                      let stderrTotalBytes =
+                                          if i < stderrCaptures.Length then
+                                              stderrCaptures[i].TotalBytes
+                                          else
+                                              0
+
                                       { Program = stages[i].Program
                                         Outcome = outcome
                                         Unchecked = stages[i].Config.UncheckedInPipe
                                         Stderr = stderr
                                         OkCodes = stages[i].Config.OkCodes
+                                        StderrTooLarge = stderrTooLarge
+                                        StderrTotalBytes = stderrTotalBytes
                                         TornDown = false } ]
 
                             return
@@ -450,6 +474,12 @@ module internal PipelineRunner =
                                         Unchecked = stages[i].Config.UncheckedInPipe
                                         Stderr = stages[i].Config.StderrEncoding.GetString stderrCaptures[i].Bytes
                                         OkCodes = stages[i].Config.OkCodes
+                                        // Carry this stage's stderr fail-loud state so `Pipeline` can
+                                        // surface a stderr overflow on ANY stage, not just the final
+                                        // stdout. Every stage spawned on this path, so `stderrCaptures[i]`
+                                        // exists for each `i`.
+                                        StderrTooLarge = stderrCaptures[i].TooLarge
+                                        StderrTotalBytes = stderrCaptures[i].TotalBytes
                                         TornDown = tornDown[i] } ]
 
                             // Observe the stage-0 stdin fault without blocking: only a feed that has

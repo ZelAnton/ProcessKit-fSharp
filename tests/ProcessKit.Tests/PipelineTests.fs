@@ -93,6 +93,32 @@ type PipelineTests() =
             |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes maxBytes)
         | None -> stage
 
+    // A stage that writes `errLineCount` 32-char lines to stderr (never stdout) then exits 0, capturing
+    // its stderr under `policy` — drives a stage's OWN stderr past a fail-loud (`Error`) byte cap so the
+    // pipeline must surface it (T-062). Exiting 0 keeps pipefail silent, so an `OutputTooLarge` can only
+    // come from the stderr overflow, not the exit code.
+    let stderrStage (errLineCount: int) (policy: OutputBufferPolicy) =
+        let line = String.replicate 32 "x"
+        // Space-padded on Windows so cmd.exe does not misparse a trailing `1>&2` against the next `&`.
+        let sep = if isWindows then " & " else "; "
+
+        let script =
+            List.replicate errLineCount (sprintf "echo %s 1>&2" line) |> String.concat sep
+
+        shell script |> Command.outputBuffer policy
+
+    // A stage that writes `stdoutLines` to stdout AND `errLineCount` 32-char lines to stderr, then exits
+    // 0, under `policy` — the collision fixture (T-062): its stderr can overflow while it still feeds the
+    // downstream stage enough stdout for the LAST stage's own stdout cap to overflow too, so both a
+    // stage's stderr and the final stdout trip at once.
+    let dualStreamStage (stdoutLines: string list) (errLineCount: int) (policy: OutputBufferPolicy) =
+        let errLine = String.replicate 32 "x"
+        let sep = if isWindows then " & " else "; "
+        let stdoutCmds = stdoutLines |> List.map (sprintf "echo %s")
+        let errCmds = List.replicate errLineCount (sprintf "echo %s 1>&2" errLine)
+        let script = (stdoutCmds @ errCmds) |> String.concat sep
+        shell script |> Command.outputBuffer policy
+
     // A silent producer that never writes (and would run a long time) — the stage whose empty,
     // still-open stdout blocks the relay's read, so proactive teardown, not a broken pipe, is what
     // must end it once a downstream stage fails.
@@ -287,6 +313,100 @@ type PipelineTests() =
 
                 Assert.That(retainedLines, Is.EqualTo 50, "an uncapped stage's stderr must retain every line")
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // --- A fail-loud (`OverflowMode.Error`) stderr overflow on ANY stage surfaces OutputTooLarge (T-062) ---
+
+    [<Test>]
+    member _.``an intermediate stage's fail-loud stderr overflow surfaces OutputTooLarge naming that stage``() : Task =
+        task {
+            // Stage 0's stderr overflows its own fail-loud byte cap; the last stage (sort) is uncapped and
+            // exits 0, so nothing else can fail the run — the surfaced error must be stage 0's stderr.
+            let cap = 16
+
+            let noisy =
+                stderrStage 50 ((OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow OverflowMode.Error)
+
+            match! (noisy.Pipe sortStage).OutputBytesAsync() with
+            | Error(ProcessError.OutputTooLarge(program, _, byteLimit, totalLines, totalBytes)) ->
+                Assert.That(program, Is.EqualTo noisy.Program, "the error must name the overflowing stage")
+                Assert.That(byteLimit, Is.EqualTo(Some cap), "the limit must be the offending stage's own cap")
+                Assert.That(totalLines, Is.EqualTo 0, "a raw stderr byte capture has no line structure")
+                Assert.That(totalBytes, Is.GreaterThan cap, "the totals must reflect the overflow past the cap")
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the last stage's fail-loud stderr overflow surfaces OutputTooLarge naming the last stage``() : Task =
+        task {
+            // The last stage overflows its OWN stderr cap (its stdout stays empty, so the final-stdout path
+            // is not what trips); the run must still fail loud, naming the last stage's own cap.
+            let cap = 16
+
+            let noisyLast =
+                stderrStage 50 ((OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow OverflowMode.Error)
+
+            match! ((emit [ "banana"; "apple" ]).Pipe noisyLast).OutputBytesAsync() with
+            | Error(ProcessError.OutputTooLarge(program, _, byteLimit, _, totalBytes)) ->
+                Assert.That(program, Is.EqualTo noisyLast.Program)
+                Assert.That(byteLimit, Is.EqualTo(Some cap), "the last stage's own stderr cap must be reported")
+                Assert.That(totalBytes, Is.GreaterThan cap)
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an earlier stage's stderr overflow outranks a simultaneous final-stdout overflow``() : Task =
+        task {
+            // first-offending-stage-in-pipeline-order: stage 0's stderr AND the last stage's stdout both
+            // trip their fail-loud caps at once; the leftmost stage (stage 0's stderr) must win, reported
+            // with ITS cap (16) and program — never the last stage's stdout cap (3).
+            let stderrCap = 16
+            let stdoutCap = 3
+
+            let stage0 =
+                dualStreamStage
+                    [ "banana"; "apple" ]
+                    50
+                    ((OutputBufferPolicy.Unbounded.WithMaxBytes stderrCap).WithOverflow OverflowMode.Error)
+
+            let last =
+                sortStage
+                |> Command.outputBuffer (
+                    (OutputBufferPolicy.Unbounded.WithMaxBytes stdoutCap).WithOverflow OverflowMode.Error
+                )
+
+            match! (stage0.Pipe last).OutputBytesAsync() with
+            | Error(ProcessError.OutputTooLarge(program, _, byteLimit, _, _)) ->
+                Assert.That(program, Is.EqualTo stage0.Program, "the leftmost offending stage must be blamed")
+
+                Assert.That(
+                    byteLimit,
+                    Is.EqualTo(Some stderrCap),
+                    "the leftmost stage's stderr cap must be reported, not the final stdout's"
+                )
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a DropOldest/DropNewest stderr overflow on a stage stays lossy, never an error``() : Task =
+        task {
+            let mutable okCount = 0
+
+            // The same stderr flood that fails loud under Error stays lossy-but-Ok under a drop mode —
+            // no new Error path for the bounded drop modes.
+            for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest ] do
+                let noisy =
+                    stderrStage 50 ((OutputBufferPolicy.Unbounded.WithMaxBytes 16).WithOverflow overflow)
+
+                match! (noisy.Pipe sortStage).OutputBytesAsync() with
+                | Ok _ -> okCount <- okCount + 1
+                | Error error -> Assert.Fail $"a dropping-mode stderr overflow must not error, got {error}"
+
+            Assert.That(okCount, Is.EqualTo 2, "both drop modes must succeed without a new Error path")
         }
         :> Task
 
