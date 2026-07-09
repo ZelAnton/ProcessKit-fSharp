@@ -228,6 +228,55 @@ streaming, and per-line handlers to see anything. `StdioMode.Inherit` lets the
 child share the parent's stream (its output goes straight to your terminal and
 can't be captured); `StdioMode.Null` discards the stream without tying up a pipe.
 
+### Merging stderr into stdout (`2>&1`)
+
+`Command.MergeStderr` folds the child's standard error into its standard output
+**at the OS level** — the library equivalent of a shell `2>&1`. The native spawn
+points the child's stderr at the very same pipe/handle as its stdout (a POSIX
+`dup2` of fd 2 onto stdout's target; on Windows one handle shared across
+`STARTUPINFO.hStdOutput`/`hStdError`), so the two streams interleave **honestly,
+byte for byte** on the single stdout stream — the real terminal-order view. This
+is the "log exactly as the terminal shows it" case, and it is what
+`ProcessResult.Combined` (a post-hoc concatenation of the two *separately*
+captured streams — stdout, then stderr) cannot give you: `Combined` never
+reproduces the true interleaving, `MergeStderr` does.
+
+**F#**
+
+```fsharp
+task {
+    let cmd = Command.create "noisy-build" |> Command.mergeStderr
+
+    match! cmd.OutputStringAsync() with
+    | Ok result -> printfn $"{result.Stdout}" // stdout + stderr, in real order
+    | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+**C#**
+
+```csharp
+var cmd = new Command("noisy-build").MergeStderr();
+
+Console.WriteLine(await cmd.OutputStringAsync() switch
+{
+    { IsOk: true, ResultValue: var result } => result.Stdout,
+    { IsOk: false, ErrorValue: var err }   => err.Message,
+});
+```
+
+When merging is on there is **no separate stderr stream**, and the API says so
+rather than downgrading silently: `ProcessResult.Stderr` is empty, the streamed
+`OutputEventsAsync` emits only `OutputEvent.Stdout` events (the stderr lines are
+already interleaved into the stdout byte stream), and the separate-stderr
+*observation* knobs are rejected in combination — `StderrTee` and `OnStderrLine`
+throw `ArgumentException` alongside `MergeStderr`, in either chaining order.
+The remaining stderr knobs are **no-ops** under merge: the merged bytes follow
+stdout's settings, so `StderrEncoding` gives way to `StdoutEncoding`,
+`StderrLineTerminator` to `StdoutLineTerminator`, and the `Stderr` `StdioMode` to
+stdout's destination. Inside a [pipeline](pipelines.md) `MergeStderr` is allowed
+only on the last stage.
+
 ### Encodings
 
 Captured output is decoded line by line, **UTF-8 by default**. Invalid bytes
@@ -725,8 +774,8 @@ The accessors:
 
 | Member | Meaning |
 |---|---|
-| `Stdout` | Captured stdout — `string` (text verbs) or `byte[]` (bytes verbs) |
-| `Stderr` | Captured stderr, as decoded text |
+| `Stdout` | Captured stdout — `string` (text verbs) or `byte[]` (bytes verbs); carries the merged stdout+stderr under `MergeStderr` |
+| `Stderr` | Captured stderr, as decoded text (empty under `MergeStderr` — the stderr is merged into `Stdout`) |
 | `Code` | The exit code, or `None` for a signal kill / timeout |
 | `Signal` | The terminating signal number (Unix), else `None` |
 | `IsSuccess` | The code is in `AcceptedCodes` (`{0}` by default) |
@@ -735,7 +784,7 @@ The accessors:
 | `Duration` | Wall-clock duration of the run |
 | `Truncated` | A buffer policy dropped output |
 | `AcceptedCodes` | The exit codes treated as success — `OkCodes` (`{0}` by default) |
-| `Combined` | Stdout and stderr joined (stdout, then stderr on a new line when both are non-empty) |
+| `Combined` | Stdout and stderr joined (stdout, then stderr on a new line when both are non-empty) — a post-hoc concatenation, *not* the real interleaving; use `MergeStderr` for a byte-exact `2>&1` |
 | `OutputContainsAny(needles)` | Case-insensitive search of both streams — for the "a known marker makes a non-zero exit benign" idiom below |
 
 `ProcessResult.ensureSuccess` (or the instance `result.EnsureSuccess()`) converts a

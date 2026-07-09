@@ -973,19 +973,31 @@ module internal Posix =
 
         // stderr
         if failure.IsNone then
-            match config.StderrMode with
-            | StdioMode.Piped ->
-                match makeStdioChannel "stderr" with
-                | Some(readFd, writeFd) ->
-                    stderrParentRead <- Some readFd
-                    stderrChildFd <- writeFd
-                    childSideFds.Add writeFd
-                | None -> ()
-            | StdioMode.Null -> stderrChildFd <- openNul "stderr" O_WRONLY
-            | StdioMode.Inherit ->
-                // See the stdout note: a self-dup2 (2 -> 2) keeps fd 2 alive under macOS
-                // POSIX_SPAWN_CLOEXEC_DEFAULT; Linux inherits it without a file action.
-                stderrChildFd <- if isMacOs then 2 else -1
+            if config.MergeStderr then
+                // `Command.MergeStderr` (2>&1): route the child's stderr at the SAME destination as its
+                // stdout, at the OS level, by dup2'ing fd 2 onto stdout's child-side fd below — so both
+                // fd 1 and fd 2 reference the one stdout target (the pipe write end, the /dev/null fd, or
+                // the inherited fd 1) and the child's stdout+stderr interleave honestly on the single
+                // stdout stream. There is NO separate stderr channel: `stderrParentRead` stays `None`
+                // (`Spawned.Stderr = None`). Reuse `stdoutChildFd` WITHOUT re-adding it to `childSideFds`
+                // (it is registered and closed exactly once by the stdout branch above); for an inherited
+                // stdout on Linux (`stdoutChildFd = -1`, no dup2) point fd 2 at fd 1 explicitly so stderr
+                // still follows the inherited stdout.
+                stderrChildFd <- if stdoutChildFd >= 0 then stdoutChildFd else 1
+            else
+                match config.StderrMode with
+                | StdioMode.Piped ->
+                    match makeStdioChannel "stderr" with
+                    | Some(readFd, writeFd) ->
+                        stderrParentRead <- Some readFd
+                        stderrChildFd <- writeFd
+                        childSideFds.Add writeFd
+                    | None -> ()
+                | StdioMode.Null -> stderrChildFd <- openNul "stderr" O_WRONLY
+                | StdioMode.Inherit ->
+                    // See the stdout note: a self-dup2 (2 -> 2) keeps fd 2 alive under macOS
+                    // POSIX_SPAWN_CLOEXEC_DEFAULT; Linux inherits it without a file action.
+                    stderrChildFd <- if isMacOs then 2 else -1
 
         let closeFd fd = close fd |> ignore
 

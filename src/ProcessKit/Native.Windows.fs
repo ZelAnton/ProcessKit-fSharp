@@ -806,7 +806,19 @@ module internal Windows =
                     handle, None, (fun () -> closeHandleIfValid handle)
 
             let outChild, outStream, outCleanup = setupOut config.StdoutMode STD_OUTPUT_HANDLE
-            let errChild, errStream, errCleanup = setupOut config.StderrMode STD_ERROR_HANDLE
+
+            let errChild, errStream, errCleanup =
+                if config.MergeStderr then
+                    // `Command.MergeStderr` (2>&1): the child's stderr shares the SAME inherited handle as
+                    // its stdout (`hStdError` = `hStdOutput` below), so both write into the one stdout
+                    // destination (pipe / NUL / inherited) and interleave honestly. No separate stderr
+                    // pipe is set up, so there is no separate parent stream (`errStream = None`) and
+                    // nothing extra to close — `outCleanup` already drops the parent's copy of `outChild`,
+                    // so `errCleanup` is a no-op (a second `CloseHandle` on that same handle would be a
+                    // double-close).
+                    outChild, None, (fun () -> ())
+                else
+                    setupOut config.StderrMode STD_ERROR_HANDLE
 
             let mutable startup = STARTUPINFO()
             startup.cb <- Marshal.SizeOf<STARTUPINFO>()

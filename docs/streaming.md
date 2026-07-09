@@ -197,6 +197,14 @@ From C#, `await foreach (var ev in proc.OutputEventsAsync()) { ... }`. Choose `O
 *or* `StdoutLinesAsync()` for a given run — both consume stdout, so they are alternatives,
 not companions.
 
+`OutputEventsAsync()` tags each line with the stream it *came from*, keeping the two
+channels distinguishable. When you instead want them merged into one stream — with the
+real byte-for-byte interleaving preserved, but no origin tag — reach for
+[`Command.MergeStderr`](commands.md#merging-stderr-into-stdout-21) (a shell `2>&1`): the
+child's stderr is folded into its stdout at the OS level, so `StdoutLinesAsync()` alone
+yields every line in order and `OutputEventsAsync()` emits only `Stdout` events (there is
+no longer a separate stderr stream to tag).
+
 ## Bounding the streaming backlog
 
 By default, the channel that feeds `StdoutLinesAsync()` / `OutputEventsAsync()` / `WaitForLineAsync()`

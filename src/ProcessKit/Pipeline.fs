@@ -74,6 +74,21 @@ module internal PipelineStageGuard =
                 )
             )
 
+    /// Reject `MergeStderr` on a stage that is (or is about to become) a **non-last** pipeline stage. On
+    /// an intermediate stage stdout is wired into the next stage's stdin, so an OS-level `2>&1` merge
+    /// would inject that stage's stderr bytes into the downstream stage's input data — a silent change to
+    /// what the next stage reads. Only the LAST stage may merge (its stdout is the pipeline's captured
+    /// output, so a `2>&1` there is the meaningful "capture the final stage's merged output"). Enforced at
+    /// build time the moment a stage stops being last — i.e. when another stage is appended after it.
+    let rejectMergeOnNonLast (paramName: string) (stageIndex: int) (command: Command) =
+        if command.Config.MergeStderr then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets MergeStderr but is not the last stage: a pipeline wires each stage's stdout into the next stage's stdin, so merging stderr into an intermediate stage's stdout would inject it into the downstream stage's input. Only the last stage of a pipeline may set MergeStderr (its stdout is the pipeline's captured output).",
+                    paramName
+                )
+            )
+
 /// An immutable left-to-right chain of commands wired stdout -> stdin, with **no shell** involved:
 /// each stage's standard output feeds the next stage's standard input directly. The whole chain
 /// runs inside one shared kill-on-dispose group, so cancelling, timing out, or disposing the run
@@ -111,6 +126,12 @@ module internal PipelineStageGuard =
 /// likewise a verb-layer mechanism the direct stage spawn bypasses; only the chain-level
 /// `Pipeline.CancelOn` cancels a pipeline). Set the deadline on the pipeline, cancel the whole chain
 /// with `Pipeline.CancelOn`, feed stage 0, or run the command on its own.
+///
+/// `MergeStderr` (a shell `2>&1`) is allowed only on the **last** stage — its stdout is the pipeline's
+/// captured output, so merging captures the final stage's combined stdout+stderr. On any earlier stage
+/// it is rejected (`ArgumentException`) the moment the stage stops being last (another stage is appended
+/// after it): a pipeline wires each stage's stdout into the next stage's stdin, so an OS-level merge on
+/// an intermediate stage would inject its stderr into the downstream stage's input data.
 ///
 /// Observability is whole-pipeline, not per-stage: running the chain emits one `Log.spawn`/`Log.exit`
 /// pair (plus `Log.timeout` on a timeout) and one `Diag.runStarted`/`runCompleted`/`runEnded` triple,
@@ -205,6 +226,9 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     member _.Pipe(command: Command) =
         ArgumentNullException.ThrowIfNull command
         PipelineStageGuard.validate (nameof command) commands.Length command
+        // Appending demotes the current last stage to an intermediate one, where an OS-level MergeStderr
+        // would leak its stderr into `command`'s stdin — reject it now (the moment it stops being last).
+        PipelineStageGuard.rejectMergeOnNonLast (nameof command) (commands.Length - 1) (List.last commands)
         Pipeline(commands @ [ command ], timeout, cancelOn)
 
     /// Kill the whole pipeline after `duration`, reporting the result as `Outcome.TimedOut`. A
@@ -357,6 +381,9 @@ type PipelineExtensions =
         ArgumentNullException.ThrowIfNull next
         PipelineStageGuard.validate (nameof command) 0 command
         PipelineStageGuard.validate (nameof next) 1 next
+        // `command` (stage 0) is not the last stage, so an OS-level MergeStderr on it would leak its
+        // stderr into `next`'s stdin — reject it (only the last stage, `next`, may merge).
+        PipelineStageGuard.rejectMergeOnNonLast (nameof command) 0 command
         Pipeline([ command; next ], None, None)
 
 /// Pipe-friendly functions over `Pipeline`, mirroring the instance methods.

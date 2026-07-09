@@ -221,6 +221,12 @@ The two ends of the chain behave like a single `Command`:
   chain connected.
 - Each inner stage's **stderr** is captured per-stage for pipefail diagnostics; only the
   last stage's stdout reaches you.
+- [`Command.MergeStderr`](commands.md#merging-stderr-into-stdout-21) (a shell `2>&1`) is allowed
+  only on the **last** stage — its stdout is the pipeline's captured output, so merging there
+  captures the final stage's combined stdout+stderr. On an earlier stage it is rejected
+  (`ArgumentException`) the moment another stage is appended after it: the chain wires each stage's
+  stdout into the next stage's stdin, so an OS-level merge on an intermediate stage would inject its
+  stderr into the downstream stage's input data.
 - A per-stage `Timeout`, `Retry`, or `CancelOn` is rejected when the stage is piped (see
   [Timeouts and cancellation](#timeouts-and-cancellation)); a per-stage `Logger` or `StreamBuffer`
   has no effect inside a chain — observe or bound an individual command by running it on its own.

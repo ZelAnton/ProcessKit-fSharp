@@ -67,7 +67,10 @@ type ProcessResult<'T>
 
     /// The captured stdout and stderr joined into one string — stdout, then stderr on a new line when
     /// both are non-empty (for a `byte[]` stdout, UTF-8-decoded). Shares the exact join rule with
-    /// `ProcessError.Combined`.
+    /// `ProcessError.Combined`. This is a **post-hoc concatenation** of the two *separately* captured
+    /// streams, so it does **not** reproduce their real terminal interleaving. For an honest, byte-for-byte
+    /// `2>&1` view use `Command.MergeStderr`, which merges the streams at the OS level: the interleaved
+    /// output then arrives on `Stdout` (and `Stderr` is empty, so `Combined` equals `Stdout`).
     member this.Combined: string = ProcessError.CombineStreams(this.StdoutText, stderr)
 
     /// True when any of `needles` appears (case-insensitive, ordinal) in either captured stream — the

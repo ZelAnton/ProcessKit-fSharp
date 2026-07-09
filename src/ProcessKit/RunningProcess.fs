@@ -917,7 +917,10 @@ type RunningProcess internal (host: RunningHost) =
 
             true
 
-    /// Stream merged stdout+stderr line events as they arrive.
+    /// Stream merged stdout+stderr line events as they arrive, each tagged with its origin
+    /// (`OutputEvent.Stdout`/`OutputEvent.Stderr`). Under `Command.MergeStderr` the child has no separate
+    /// stderr stream (it is folded into stdout at the OS level), so every event is an `OutputEvent.Stdout`
+    /// — the stderr lines are already interleaved, in order, within the stdout byte stream.
     member this.OutputEventsAsync() : IAsyncEnumerable<OutputEvent> =
         if not (this.StartEventStreaming()) then
             raise (InvalidOperationException alreadyConsumedMessage)

@@ -33,6 +33,7 @@
 		<Compile Include="DependencyInjectionTests.fs" />
 		<Compile Include="ContainmentBugTests.fs" />
 		<Compile Include="PosixSpawnCleanupTests.fs" />
+		<Compile Include="MergeStderrTests.fs" />
 		<Compile Include="CorrectnessBugTests.fs" />
 		<Compile Include="ApiParityTests.fs" />
 		<Compile Include="TestabilityTests.fs" />

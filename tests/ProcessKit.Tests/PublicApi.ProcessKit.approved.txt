@@ -33,6 +33,7 @@ class ProcessKit.Command
   member KeepStdinOpen() : ProcessKit.Command
   member LineTerminator(ProcessKit.LineTerminator) : ProcessKit.Command
   member Logger(Microsoft.Extensions.Logging.ILogger) : ProcessKit.Command
+  member MergeStderr() : ProcessKit.Command
   member OkCodes(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.Command
   member OnStderrLine(System.Action<System.String>) : ProcessKit.Command
   member OnStdoutLine(System.Action<System.String>) : ProcessKit.Command
@@ -80,6 +81,7 @@ module ProcessKit.CommandModule
   static member keepStdinOpen(ProcessKit.Command) : ProcessKit.Command
   static member lineTerminator(ProcessKit.LineTerminator, ProcessKit.Command) : ProcessKit.Command
   static member logger(Microsoft.Extensions.Logging.ILogger, ProcessKit.Command) : ProcessKit.Command
+  static member mergeStderr(ProcessKit.Command) : ProcessKit.Command
   static member okCodes(System.Collections.Generic.IEnumerable<System.Int32>, ProcessKit.Command) : ProcessKit.Command
   static member onStderrLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command
   static member onStdoutLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command

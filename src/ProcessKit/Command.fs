@@ -38,6 +38,17 @@ type internal CommandConfig =
       OnStderrLine: Action<string> option
       StdoutTee: Stream option
       StderrTee: Stream option
+      // Merge the child's stderr into its stdout at the OS level (like a shell `2>&1`): the native spawn
+      // routes the child's stderr at the SAME pipe/handle as its stdout (POSIX `dup2` of fd 2 onto
+      // stdout's target; Windows shares one handle across `STARTUPINFO.hStdOutput`/`hStdError`), so the
+      // two streams interleave honestly, byte for byte, on the single stdout stream. `false` (the
+      // default) keeps the separate stdout/stderr behaviour unchanged. When `true` there is NO separate
+      // stderr stream: `Spawned.Stderr` is `None`, `ProcessResult.Stderr` is empty, `OnStderrLine` never
+      // fires, and `OutputEventsAsync` emits only `Stdout` events. Incompatible with the separate-stderr
+      // observation hooks (`StderrTee`/`OnStderrLine`, rejected at the builder boundary); `StderrEncoding`/
+      // `StderrLineTerminator`/`Stderr` mode become documented no-ops (the merged bytes follow stdout's
+      // encoding/framing/destination). See `Command.MergeStderr`.
+      MergeStderr: bool
       OutputBuffer: OutputBufferPolicy
       // Opt-in bounded/backpressure policy for the streaming verbs (`StdoutLinesAsync`/
       // `OutputEventsAsync`/`WaitForLineAsync`). `None` (the default) keeps the unbounded streaming
@@ -116,6 +127,7 @@ module internal CommandConfig =
           OnStderrLine = None
           StdoutTee = None
           StderrTee = None
+          MergeStderr = false
           OutputBuffer = OutputBufferPolicy.Default
           StreamBuffer = None
           Timeout = None
@@ -144,6 +156,33 @@ module internal CommandConfig =
             raise (ArgumentException("an environment variable key must not be empty", nameof key))
         elif key.Contains '=' then
             raise (ArgumentException("an environment variable key must not contain '='", nameof key))
+
+    /// The `ArgumentException` for combining `MergeStderr` with a separate-stderr observation hook. Named
+    /// after the offending knob so the message points at whichever of the pair was set second (the check
+    /// is bidirectional — see below), the project's "no silent downgrade" rule at the builder boundary.
+    let private mergeStderrConflict (knob: string) =
+        ArgumentException(
+            $"{knob} cannot be combined with MergeStderr: MergeStderr folds the child's stderr into its stdout at the OS level (like a shell 2>&1), so there is no separate stderr stream for {knob} to observe. Drop one of the two.",
+            knob
+        )
+
+    /// Guard `MergeStderr()`: reject it when a separate-stderr observation hook (`StderrTee`/`OnStderrLine`)
+    /// is already set. `StderrEncoding`/`StderrLineTerminator`/`Stderr` mode are deliberately NOT rejected
+    /// (documented no-ops under merge, and `Encoding()`/`LineTerminator()` set them as a pair, so rejecting
+    /// them would make those pair setters conflict with `MergeStderr`).
+    let ensureNoMergeStderrObservers (config: CommandConfig) =
+        if config.StderrTee.IsSome then
+            raise (mergeStderrConflict "StderrTee")
+
+        if config.OnStderrLine.IsSome then
+            raise (mergeStderrConflict "OnStderrLine")
+
+    /// Guard `StderrTee`/`OnStderrLine`: reject them when `MergeStderr` is already set. The mirror of
+    /// `ensureNoMergeStderrObservers`, so the conflict is caught regardless of the order the two knobs are
+    /// chained in.
+    let ensureNoMergeStderr (config: CommandConfig) (knob: string) =
+        if config.MergeStderr then
+            raise (mergeStderrConflict knob)
 
 /// An immutable description of a process to run.
 ///
@@ -310,9 +349,12 @@ type Command internal (config: CommandConfig) =
                 OnStdoutLine = Some handler }
         )
 
-    /// Invoke `handler` for each captured stderr line, as it is pumped.
+    /// Invoke `handler` for each captured stderr line, as it is pumped. Rejected (`ArgumentException`)
+    /// together with `MergeStderr`, which folds stderr into stdout at the OS level, leaving no separate
+    /// stderr stream for the handler to observe.
     member _.OnStderrLine(handler: Action<string>) =
         ArgumentNullException.ThrowIfNull handler
+        CommandConfig.ensureNoMergeStderr config "OnStderrLine"
 
         Command(
             { config with
@@ -324,10 +366,44 @@ type Command internal (config: CommandConfig) =
         ArgumentNullException.ThrowIfNull sink
         Command({ config with StdoutTee = Some sink })
 
-    /// Copy raw captured stderr bytes to `sink` (a tee), in addition to capture.
+    /// Copy raw captured stderr bytes to `sink` (a tee), in addition to capture. Rejected
+    /// (`ArgumentException`) together with `MergeStderr`, which folds stderr into stdout at the OS level,
+    /// leaving no separate stderr stream to tee.
     member _.StderrTee(sink: Stream) =
         ArgumentNullException.ThrowIfNull sink
+        CommandConfig.ensureNoMergeStderr config "StderrTee"
         Command({ config with StderrTee = Some sink })
+
+    /// Merge the child's standard **error** into its standard **output** at the OS level — the library
+    /// equivalent of a shell `2>&1`. The native spawn points the child's stderr at the very same
+    /// pipe/handle as its stdout (POSIX `dup2` of fd 2 onto stdout's target; Windows shares one handle
+    /// across `STARTUPINFO.hStdOutput`/`hStdError`), so the two streams interleave **honestly, byte for
+    /// byte** on the single stdout stream — the real terminal-order `2>&1` view that the post-hoc
+    /// `ProcessResult.Combined` (a concatenation of two *separately* captured streams) cannot reproduce.
+    /// It works uniformly for the buffering verbs, the streaming verbs (`StdoutLinesAsync`/
+    /// `OutputEventsAsync`), and pipeline stages. The default is off (separate stdout/stderr, unchanged).
+    ///
+    /// **There is then no separate stderr stream, and the API reflects that honestly** (never a silent
+    /// downgrade): `ProcessResult.Stderr` is always empty, the streamed stderr stream is absent, and
+    /// `OutputEventsAsync` emits only `OutputEvent.Stdout` events — the stderr lines already live, in
+    /// order, in the stdout byte stream. Because the merge removes the separate stream, the
+    /// separate-stderr **observation** knobs are rejected at the builder boundary with an
+    /// `ArgumentException` (in either chaining order) rather than silently never firing: `StderrTee` and
+    /// `OnStderrLine` cannot be combined with `MergeStderr`. The remaining stderr knobs are documented
+    /// **no-ops** under merge — the merged bytes follow stdout's settings: `StderrEncoding` (the merged
+    /// stream decodes with `StdoutEncoding`), `StderrLineTerminator` (framed with `StdoutLineTerminator`),
+    /// and the `Stderr` `StdioMode` (stderr follows stdout's destination). These are not rejected because
+    /// `Encoding()` and `LineTerminator()` set the stdout+stderr pair together, so rejecting them would
+    /// make those pair setters conflict with `MergeStderr`.
+    ///
+    /// Inside a `Pipeline`, `MergeStderr` is allowed only on the **last** stage — its stdout is the
+    /// pipeline's captured output, so a `2>&1` there captures the final stage's merged output. Setting it
+    /// on any earlier stage is rejected (`ArgumentException`) the moment the stage stops being last: a
+    /// pipeline wires each stage's stdout into the next stage's stdin, so merging an intermediate stage's
+    /// stderr would inject it into the downstream stage's input data.
+    member _.MergeStderr() =
+        CommandConfig.ensureNoMergeStderrObservers config
+        Command({ config with MergeStderr = true })
 
     /// Bound the in-memory backlog of captured lines.
     member _.OutputBuffer(policy: OutputBufferPolicy) =
@@ -613,6 +689,11 @@ module Command =
 
     /// Copy raw captured stderr bytes to `sink`.
     let stderrTee (sink: Stream) (command: Command) = command.StderrTee sink
+
+    /// Merge the child's stderr into its stdout at the OS level (like a shell `2>&1`); the two streams
+    /// then interleave byte-for-byte on the single stdout stream, and there is no separate stderr stream.
+    /// See `Command.MergeStderr`.
+    let mergeStderr (command: Command) = command.MergeStderr()
 
     /// Bound the in-memory backlog of captured lines.
     let outputBuffer (policy: OutputBufferPolicy) (command: Command) = command.OutputBuffer policy
