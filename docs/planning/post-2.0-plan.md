@@ -87,7 +87,12 @@ carries one product decision (change the default vs opt-in) — settle that befo
   Native` module. The wait seam is `IContainmentBackend.Wait: nativeint -> Task<Outcome>`
   (`Backend.fs:79`), implemented per backend at `Backend.fs:135/205/280`.
 
-### What to do
+### SHIPPED
+
+Shipped: Windows overlapped pipes, POSIX pidfd/reaper (CHANGELOG)
+
+<details>
+<summary>Archived implementation plan</summary>
 
 Two independent sub-tasks, each behind an `internal` seam. Ship them separately.
 
@@ -118,6 +123,8 @@ replacement. Reconcile with the existing teardown reaper `Native.reapLeader` (`N
 used by `PosixReap.leader`, `Backend.fs:32`) and the pgid model so a child is never
 double-reaped and no zombie leaks. Handle `EINTR`/`ECHILD` and detect `pidfd_open`'s `ENOSYS`
 to fall back.
+
+</details>
 
 ### Why
 
@@ -179,7 +186,12 @@ it the .NET way.
   line, sets `Truncated`), `Error` (fail-loud → `ProcessError.OutputTooLarge`). No bounded
   channel, no backpressure, no awaited `WriteAsync` anywhere.
 
-### What to do
+### SHIPPED
+
+Shipped: Command.StreamBuffer/StreamBufferPolicy (CHANGELOG)
+
+<details>
+<summary>Archived implementation plan</summary>
 
 Add an **opt-in** bounded/backpressure mode for the streaming verbs, mirroring the policy the
 buffered verbs already have. Introduce a streaming policy (extend `OutputBufferPolicy` to cover
@@ -207,6 +219,8 @@ behavior change, strengthen docs) **or** change the default to a large bounded c
 backpressure (safer by default, but an observable behavior change — a child that assumed it
 could dump-and-exit now blocks). Recommend **opt-in, default unchanged**, plus a clearer doc
 warning; changing the default is a `### Changed` behavior break to weigh with the user.
+
+</details>
 
 ### Why
 
@@ -268,7 +282,12 @@ concurrent fleet), **no** `System.Diagnostics.Activity`/`ActivitySource`, **no**
 only ever receive `program: string`). Logging is threaded via `CommandConfig.Logger` into
 `RunningProcess`, so it already covers streaming, not just capture/run.
 
-### What to do
+### SHIPPED
+
+Shipped: EventIds, LoggerMessage.Define, RunId, Activity/Meter (CHANGELOG)
+
+<details>
+<summary>Archived implementation plan</summary>
 
 Incremental, most additive. Do the quick wins first.
 
@@ -297,6 +316,8 @@ Incremental, most additive. Do the quick wins first.
   full argv.
 
 Every new signal must uphold the argv/env redaction invariant.
+
+</details>
 
 ### Why
 
@@ -346,7 +367,12 @@ pre-existing `IProcessRunner` registration wins. No options overload, no `IConfi
 binding, no keyed/named runners, no `CliClient`/`ProcessGroup`/`Supervisor` registration, no
 keyed-services usage.
 
-### What to do
+### SHIPPED
+
+Shipped: options, keyed clients, ProcessGroup (CHANGELOG)
+
+<details>
+<summary>Archived implementation plan</summary>
 
 Additive overloads that bring standard .NET DI ergonomics:
 
@@ -369,6 +395,8 @@ Additive overloads that bring standard .NET DI ergonomics:
   ensure the `LoggingRunner` path picks up the new EventIds.
 
 Preserve `TryAdd` no-clobber semantics and the Abstractions-only footprint where possible.
+
+</details>
 
 ### Why
 
@@ -420,7 +448,12 @@ in order then repeat the last. Verbs: **`CaptureStringAsync` supported** (`:364-
 `Lines`/`Reader`/`AsyncLines` → `Unsupported` (one-shot, can't key without consuming). Writes are
 atomic (temp + `File.Move`) and **0600** on Unix from creation (`:139-182`).
 
-### What to do
+### SHIPPED
+
+Shipped: bytes base64, streaming, hooks, Auto mode (CHANGELOG)
+
+<details>
+<summary>Archived implementation plan</summary>
 
 Close the two hard rejections first (highest value), then the ergonomics.
 
@@ -444,6 +477,8 @@ Close the two hard rejections first (highest value), then the ergonomics.
 - **(F) Version policy.** Replace the exact-`≠` load check with a documented back-compat policy
   (load compatible older versions, reject truly-incompatible newer ones) so v1 cassettes keep
   loading after the v2 bytes bump; resolve the doc/code comment mismatch at `:60`/`:98`/`:282`.
+
+</details>
 
 ### Why
 
