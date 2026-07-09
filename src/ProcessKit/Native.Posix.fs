@@ -359,18 +359,361 @@ module internal Posix =
                     sigchldRegistration <-
                         Some(PosixSignalRegistration.Create(PosixSignal.SIGCHLD, (fun _ -> reapAllPending ()))))
 
-    /// Reap a POSIX child and report how it concluded — event-driven: a shared, process-wide SIGCHLD
-    /// registration (not a thread parked per child) re-checks every outstanding wait when any child
-    /// changes state, so a piped POSIX child no longer holds a dedicated thread-pool thread blocked in
-    /// `waitpid` for its whole lifetime.
+    // ----------------------------------------------------------------------------------
+    // Linux >= 5.4: per-child pidfd + one shared epoll reaper (the pid-reuse-safe fast path)
+    // ----------------------------------------------------------------------------------
+    //
+    // The SIGCHLD path above is the portable fallback: one process-wide signal handler that, on every
+    // child state change, re-scans EVERY pending pid with `waitpid(pid, WNOHANG)`. Two costs are
+    // inherent to that model. (1) Dispatch is O(pending) per SIGCHLD — POSIX signals do not queue, so a
+    // burst of near-simultaneous exits coalesces into one delivery that carries no "which child", and
+    // the only correct response is to re-probe them all. (2) The reap is by *pid number*: between a
+    // child becoming a zombie and our `waitpid` landing, if anything else reaps it (classically a
+    // double-forked grandchild reaped by init) the pid can be recycled, and a `waitpid(pid)` on a
+    // recycled number is the pid-reuse window the ROADMAP calls out as this model's limitation.
+    //
+    // On Linux >= 5.4 we replace both. Each child gets its own `pidfd_open(pid)` handle, registered once
+    // with a single shared `epoll` instance served by one background thread. When the child exits its
+    // pidfd becomes readable, so dispatch is O(1) for THAT child (no rescan of the others), and the reap
+    // is `waitid(P_PIDFD, pidfd, WEXITED)` — which refers to the exact process the pidfd was opened on,
+    // NOT a pid number, so it is immune to pid reuse. The reuse window on this path is therefore narrowed
+    // to essentially nothing: the only remaining `waitpid(pid)` on a live child is `reapLeader`
+    // (teardown), coordinated with this path exactly as the SIGCHLD path already is — through the shared
+    // `pendingWaits` registry — so a child is still reaped exactly once and no status is lost.
+    //
+    // Which mechanism is used is decided ONCE, at first use (`pidfdSupported`), never per-run: Linux with
+    // a working `pidfd_open` + `waitid(P_PIDFD)` uses this path for the whole process lifetime; macOS, a
+    // non-Linux POSIX, or a kernel too old (`ENOSYS`/`EINVAL`) uses the SIGCHLD fallback for the whole
+    // process lifetime. The two never run side by side for the same child in production, so no new
+    // double-reap window is introduced. (Coordination via `pendingWaits` is nonetheless race-safe even
+    // if both are active — see `completePidfdReg` — which is what the test-only fallback seam relies on.)
+
+    [<Literal>]
+    let private SYS_pidfd_open = 434 // same syscall number on x86_64/arm64/x86/arm/riscv (Linux 5.3+)
+
+    // waitid idtype: wait on the process a pidfd refers to (P_ALL=0, P_PID=1, P_PGID=2, P_PIDFD=3).
+    [<Literal>]
+    let private P_PIDFD = 3
+
+    // waitid option: report a child that has TERMINATED (as opposed to stopped/continued).
+    [<Literal>]
+    let private WEXITED = 4
+
+    // errno: no (more) child of ours matches — someone else already reaped it.
+    [<Literal>]
+    let private ECHILD = 10
+
+    // siginfo si_code values for a terminated child (asm-generic; shared across the Linux archs we run).
+    [<Literal>]
+    let private CLD_EXITED = 1
+
+    [<Literal>]
+    let private CLD_KILLED = 2
+
+    [<Literal>]
+    let private CLD_DUMPED = 3
+
+    // epoll: interest in readability, add/delete ops, and close-on-exec for the epoll fd itself.
+    [<Literal>]
+    let private EPOLLIN = 0x001
+
+    [<Literal>]
+    let private EPOLL_CTL_ADD = 1
+
+    [<Literal>]
+    let private EPOLL_CTL_DEL = 2
+
+    [<Literal>]
+    let private EPOLL_CLOEXEC = 0x80000
+
+    // How many ready pidfds one `epoll_wait` may harvest at once; the rest wait for the next call
+    // (level-triggered), so this only bounds a batch — it never drops an event.
+    [<Literal>]
+    let private maxEpollEvents = 64
+
+    // `struct epoll_event { uint32 events; epoll_data (u64); }` is `__attribute__((packed))` ONLY on
+    // x86_64 (12 bytes, data at offset 4); every other arch aligns the u64 to 8 (16 bytes, data at
+    // offset 8). x86 keeps the u64 4-aligned, so it matches x86_64's offset. We marshal the struct by
+    // raw offset rather than a `[<StructLayout>]` type to get this arch split exactly right.
+    let private epollDataOffset =
+        match RuntimeInformation.ProcessArchitecture with
+        | Architecture.X64
+        | Architecture.X86 -> 4
+        | _ -> 8
+
+    let private epollEventSize = epollDataOffset + 8
+
+    // siginfo_t field offsets. si_signo/si_errno/si_code are the first three ints (si_code at 8); the
+    // _sigchld union follows, 8-byte aligned on LP64 (an int `__pad0` sits at 12 and the union starts at
+    // 16: si_pid@16, si_status@24) and 4-byte aligned on 32-bit (union at 12: si_pid@12, si_status@20).
+    let private siPidOffset = if IntPtr.Size = 8 then 16 else 12
+    let private siStatusOffset = if IntPtr.Size = 8 then 24 else 20
+
+    [<DllImport("libc", SetLastError = true, EntryPoint = "syscall")>]
+    extern nativeint private syscall3(nativeint number, int arg1, uint arg2)
+
+    // waitid(idtype, id, siginfo*, options). The libc wrapper is a fixed-signature function (not
+    // variadic), so a plain P/Invoke is correct on every ABI including AArch64.
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private waitid(int idtype, uint id, nativeint infop, int options)
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private epoll_create1(int flags)
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private epoll_ctl(int epfd, int op, int fd, nativeint event)
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private epoll_wait(int epfd, nativeint events, int maxevents, int timeout)
+
+    // pidfd_open(pid, flags) via syscall(2). There is no fixed-signature libc wrapper before glibc 2.36,
+    // so we go through `syscall`, whose glibc stub reads its arguments from REGISTERS (hand-written asm,
+    // not a C variadic) — so a fixed-signature P/Invoke passes them correctly even on AArch64, unlike the
+    // genuinely-variadic `fcntl` this file deliberately avoids for exactly that reason.
+    let private pidfdOpen (pid: int) : int =
+        int (syscall3 (nativeint SYS_pidfd_open, pid, 0u))
+
+    // Decide ONCE whether the pidfd fast path is usable, for the whole process lifetime. `pidfd_open`
+    // arrived in Linux 5.3 but `waitid(P_PIDFD)` only in 5.4, so we confirm BOTH: open a pidfd on our own
+    // (always-live) process, then probe `waitid(P_PIDFD)` on it. A kernel that understands P_PIDFD
+    // answers ECHILD (we are not our own child); a 5.3 kernel rejects the idtype with EINVAL, and a
+    // pre-5.3 kernel already failed `pidfd_open` with ENOSYS. Any non-Linux host (macOS, other POSIX)
+    // skips the probe and uses the SIGCHLD fallback.
+    let private detectPidfdSupport () : bool =
+        if not (RuntimeInformation.IsOSPlatform OSPlatform.Linux) then
+            false
+        else
+            let fd = pidfdOpen (Environment.ProcessId)
+
+            if fd < 0 then
+                false
+            else
+                let siginfo = Marshal.AllocHGlobal 128
+
+                try
+                    let rc = waitid (P_PIDFD, uint fd, siginfo, WEXITED ||| WNOHANG)
+                    let errno = Marshal.GetLastWin32Error()
+                    // rc = 0 (nothing to report for a live non-child) or rc < 0 with ECHILD both mean the
+                    // kernel UNDERSTANDS P_PIDFD; EINVAL (old kernel) means it does not.
+                    rc = 0 || errno = ECHILD
+                finally
+                    Marshal.FreeHGlobal siginfo
+                    close fd |> ignore
+
+    let private pidfdSupported = detectPidfdSupport ()
+
+    /// Internal diagnostic (not public API): the POSIX exit-wait mechanism this process selected — `true`
+    /// = the Linux pidfd fast path, `false` = the shared SIGCHLD fallback. For tests / observability.
+    let pidfdActive = pidfdSupported
+
+    /// Decode a `waitid` siginfo buffer into an `Outcome`. Unlike a `waitpid` status word, waitid hands
+    /// back already-decoded fields: CLD_EXITED carries the exit code directly in si_status;
+    /// CLD_KILLED / CLD_DUMPED carry the terminating signal number.
+    let private decodeSiginfo (siginfo: nativeint) : Outcome =
+        let siCode = Marshal.ReadInt32(siginfo, 8)
+        let siStatus = Marshal.ReadInt32(siginfo, siStatusOffset)
+
+        if siCode = CLD_EXITED then
+            Outcome.Exited siStatus
+        elif siCode = CLD_KILLED || siCode = CLD_DUMPED then
+            Outcome.Signalled(Some siStatus)
+        else
+            Outcome.Unobserved $"unexpected waitid si_code {siCode} (neither exited nor signalled)"
+
+    // One in-flight pidfd wait: the pid and the exact `pendingWaits` entry (by reference) this pidfd
+    // owns. Keyed by pidfd in `pidfdRegs`. Carrying the entry by reference — rather than re-looking it up
+    // by pid — is what keeps the reaper pid-reuse-safe: a stale pidfd whose pid has since been recycled
+    // can never resolve a NEWER generation's wait for the same pid number (see `completePidfdReg`).
+    [<NoComparison; NoEquality>]
+    type private PidfdReg = { Pid: int; Pending: PendingWait }
+
+    let private pidfdRegs = ConcurrentDictionary<int, PidfdReg>()
+
+    let mutable private epollFd = -1
+    let private epollInitLock = obj ()
+
+    // Resolve exactly the wait THIS pidfd registration owns. Remove the shared `pendingWaits` entry only
+    // when it still maps to this exact registration (reference equality via the value comparer), so a
+    // stale pidfd for a reused pid can't evict a newer generation's entry; then set our own TCS
+    // (idempotent). Symmetric to the SIGCHLD path's `completePending`, but keyed by registration identity
+    // instead of by pid — the pid-reuse-safe reap the pidfd path exists for.
+    let private completePidfdReg (reg: PidfdReg) (outcome: Outcome) =
+        pendingWaits.TryRemove(System.Collections.Generic.KeyValuePair(reg.Pid, reg.Pending))
+        |> ignore
+
+        reg.Pending.Tcs.TrySetResult outcome |> ignore
+
+    // `waitid` came back ECHILD (or a spurious wake): the genuine winner — `reapLeader` racing this
+    // child's teardown — holds the real status and is about to deliver it via `completePending`. Give it
+    // the same brief grace the SIGCHLD path's ECHILD branch gives, then resolve OUR registration
+    // honestly. Keyed by registration identity throughout, so a reused pid is never crossed. Runs on the
+    // thread pool so it never blocks the shared reaper thread.
+    let private graceThenResolve (reg: PidfdReg) : Task =
+        task {
+            let mutable spins = 0
+
+            while (match pendingWaits.TryGetValue reg.Pid with
+                   | true, current -> obj.ReferenceEquals(current, reg.Pending)
+                   | false, _ -> false)
+                  && spins < 20 do
+                do! Task.Delay 1
+                spins <- spins + 1
+
+            completePidfdReg reg (Outcome.Unobserved "the process's exit status could not be observed (ECHILD race)")
+        }
+        :> Task
+
+    // Handle one pidfd the reaper thread found readable: the child it refers to has terminated. Reap it
+    // pid-reuse-safely with `waitid(P_PIDFD)`, resolve the owning wait, then unregister and close the
+    // pidfd (a dead process's pidfd stays readable, so it MUST be removed or epoll would report it
+    // forever). Runs only on the single reaper thread.
+    let private reapReadyPidfd (pidfd: int) (siginfo: nativeint) =
+        match pidfdRegs.TryGetValue pidfd with
+        | false, _ ->
+            // Already processed and removed (no event should arrive after the DEL below): nothing to do.
+            ()
+        | true, reg ->
+            Marshal.WriteInt32(siginfo, siPidOffset, 0)
+            let mutable rc = waitid (P_PIDFD, uint pidfd, siginfo, WEXITED ||| WNOHANG)
+
+            while rc < 0 && Marshal.GetLastWin32Error() = EINTR do
+                Marshal.WriteInt32(siginfo, siPidOffset, 0)
+                rc <- waitid (P_PIDFD, uint pidfd, siginfo, WEXITED ||| WNOHANG)
+
+            let siPid = Marshal.ReadInt32(siginfo, siPidOffset)
+
+            if rc = 0 && siPid <> 0 then
+                // We won the reap — this is the real, pid-reuse-safe status.
+                completePidfdReg reg (decodeSiginfo siginfo)
+            else
+                // ECHILD (or a spurious wake): `reapLeader` (teardown) reaped this child first and holds
+                // the real status. Give it a brief grace to land it, then resolve honestly.
+                graceThenResolve reg |> ignore
+
+            // Unregister from `pidfdRegs` BEFORE closing, so a concurrent `pidfdOpen` that reuses this fd
+            // number (only possible after the close) never lands on the stale registration; then DEL
+            // (needs the fd still open) and close.
+            pidfdRegs.TryRemove pidfd |> ignore
+            epoll_ctl (epollFd, EPOLL_CTL_DEL, pidfd, IntPtr.Zero) |> ignore
+            close pidfd |> ignore
+
+    // The single shared reaper: one thread for the whole process, blocking in `epoll_wait` and
+    // dispatching each ready pidfd. Never returns; a background thread so it does not hold process exit
+    // open. Its scratch buffers live for the thread's lifetime (intentionally never freed).
+    let private epollReaperLoop () =
+        let eventsBuf = Marshal.AllocHGlobal(maxEpollEvents * epollEventSize)
+        let siginfo = Marshal.AllocHGlobal 128
+
+        while true do
+            let n = epoll_wait (epollFd, eventsBuf, maxEpollEvents, -1)
+
+            if n < 0 then
+                // EINTR is routine (a signal interrupted the wait); anything else is unexpected — a brief
+                // pause avoids a hot spin before retrying, since epollFd is never closed.
+                if Marshal.GetLastWin32Error() <> EINTR then
+                    Thread.Sleep 1
+            else
+                for i in 0 .. n - 1 do
+                    let pidfd = int (Marshal.ReadInt64(eventsBuf, i * epollEventSize + epollDataOffset))
+
+                    reapReadyPidfd pidfd siginfo
+
+    // Lazily create the one epoll instance + reaper thread, the first time the pidfd path is used.
+    let private ensureEpoll () =
+        if epollFd < 0 then
+            lock epollInitLock (fun () ->
+                if epollFd < 0 then
+                    let fd = epoll_create1 EPOLL_CLOEXEC
+
+                    if fd >= 0 then
+                        // Publish the fd BEFORE starting the thread so the loop reads a valid epollFd.
+                        epollFd <- fd
+                        let thread = Thread(ThreadStart(epollReaperLoop))
+                        thread.IsBackground <- true
+                        thread.Name <- "ProcessKit-pidfd-reaper"
+                        thread.Start())
+
+    // Register a pidfd with the shared epoll for readability (level-triggered, so an already-dead child
+    // is reported at once). Returns false if `epoll_ctl` rejects it (pathological on a pidfd-capable
+    // kernel), so the caller can fall back for this child.
+    let private armEpoll (pidfd: int) : bool =
+        let ev = Marshal.AllocHGlobal epollEventSize
+
+        try
+            Marshal.WriteInt32(ev, 0, EPOLLIN)
+
+            if epollDataOffset <> 4 then
+                // Zero the 4-byte alignment gap on the unpacked layout; harmless but tidy.
+                Marshal.WriteInt32(ev, 4, 0)
+
+            Marshal.WriteInt64(ev, epollDataOffset, int64 pidfd)
+            epoll_ctl (epollFd, EPOLL_CTL_ADD, pidfd, ev) = 0
+        finally
+            Marshal.FreeHGlobal ev
+
+    // Last-resort per-child fallback when `pidfd_open`/`epoll_ctl` can't be used for THIS child (the
+    // child was already reaped — ESRCH — or the fd table is momentarily exhausted). Confined to this rare
+    // corner so the global pidfd path stays park-free: a single blocking `waitpid(pid, 0)` on a pool
+    // thread, resolving the owning registration so it coordinates with `reapLeader` exactly like the
+    // epoll path. This is the only place the pidfd path parks a thread, and only under fd exhaustion or an
+    // already-gone child.
+    let private blockingReapFallback (pending: PendingWait) (pid: int) =
+        let reg = { Pid = pid; Pending = pending }
+
+        let work () : Task =
+            task {
+                let mutable status = 0
+                let mutable result = waitpid (pid, &status, 0)
+
+                while result < 0 && Marshal.GetLastWin32Error() = EINTR do
+                    result <- waitpid (pid, &status, 0)
+
+                if result = pid then
+                    completePidfdReg reg (decodeWaitStatus status)
+                else
+                    // ECHILD (already reaped, most likely by `reapLeader`): grace-then-resolve.
+                    do! graceThenResolve reg
+            }
+            :> Task
+
+        Task.Run(work) |> ignore
+
+    // Begin a pidfd-based wait for one freshly-registered child: open its pidfd and arm epoll; on any
+    // per-child failure, degrade just this child via `blockingReapFallback`. The reap itself happens
+    // later on the reaper thread when the pidfd signals readiness.
+    let private beginPidfdWait (pid: int) (pending: PendingWait) =
+        ensureEpoll ()
+
+        if epollFd < 0 then
+            // The epoll instance could not be created (pathological): degrade this child.
+            blockingReapFallback pending pid
+        else
+            let pidfd = pidfdOpen pid
+
+            if pidfd < 0 then
+                blockingReapFallback pending pid
+            else
+                pidfdRegs[pidfd] <- { Pid = pid; Pending = pending }
+
+                if not (armEpoll pidfd) then
+                    // Could not arm epoll for it: undo and degrade this child.
+                    pidfdRegs.TryRemove pidfd |> ignore
+                    close pidfd |> ignore
+                    blockingReapFallback pending pid
+
+    /// Reap a POSIX child and report how it concluded, without parking a thread per child. On Linux
+    /// >= 5.4 each child is awaited through its own `pidfd` on one shared epoll reaper (O(1) dispatch,
+    /// pid-reuse-safe `waitid(P_PIDFD)` reap); elsewhere — macOS, an old kernel — through the shared
+    /// process-wide SIGCHLD registration. Which one is chosen is fixed for the process at first use; the
+    /// public contract (the decoded `Outcome`, zombie-free teardown, the `nativeint` pid handle) is
+    /// identical either way.
     ///
     /// Idempotent per pid: a second call while a wait for the same pid is already in flight reuses the
-    /// existing registration's task instead of overwriting it in `pendingWaits` — an unconditional
-    /// overwrite would strand the earlier `TaskCompletionSource` forever (nothing would ever complete
-    /// it, since `completePending`'s `TryRemove` only ever observes the newer entry). Both callers
+    /// existing registration's task instead of opening a second pidfd or overwriting `pendingWaits` — an
+    /// unconditional overwrite would strand the earlier `TaskCompletionSource` forever (nothing would
+    /// complete it, since the `TryRemove` handoffs only ever observe the newer entry). Both callers
     /// observe the same eventual outcome.
-    let rec waitPosix (pid: nativeint) : Task<Outcome> =
-        ensureSigchldRegistration ()
+    let rec private waitPosixCore (usePidfd: bool) (pid: nativeint) : Task<Outcome> =
         let intPid = int pid
 
         match pendingWaits.TryGetValue intPid with
@@ -382,14 +725,29 @@ module internal Posix =
             let pending = { Tcs = tcs }
 
             if pendingWaits.TryAdd(intPid, pending) then
-                // The child may already have exited — even before this call started — so probe once
-                // immediately rather than waiting on a SIGCHLD that may already have been delivered.
-                tryReapPending intPid |> ignore
+                if usePidfd && pidfdSupported then
+                    beginPidfdWait intPid pending
+                else
+                    ensureSigchldRegistration ()
+                    // The child may already have exited — even before this call started — so probe once
+                    // immediately rather than waiting on a SIGCHLD that may already have been delivered.
+                    tryReapPending intPid |> ignore
+
                 tcs.Task
             else
-                // Lost the race to register first — a concurrent `waitPosix` call for the same pid won
-                // in between our `TryGetValue` miss and this `TryAdd`. Reuse the winner's entry instead.
-                waitPosix pid
+                // Lost the race to register first — a concurrent call for the same pid won in between our
+                // `TryGetValue` miss and this `TryAdd`. Reuse the winner's entry instead.
+                waitPosixCore usePidfd pid
+
+    /// Reap a POSIX child on the mechanism selected once for this process (pidfd fast path where
+    /// available, else the shared SIGCHLD reaper). See `waitPosixCore`.
+    let waitPosix (pid: nativeint) : Task<Outcome> = waitPosixCore true pid
+
+    /// Test seam (internal, not public API): force the shared-SIGCHLD fallback path regardless of pidfd
+    /// support, so the fallback stays covered by an explicit test even on a pidfd-capable Linux host. In
+    /// production this is never called — `waitPosix` is the only entry — so the pidfd path never has the
+    /// SIGCHLD registration installed alongside it.
+    let waitPosixViaSigchldForTests (pid: nativeint) : Task<Outcome> = waitPosixCore false pid
 
     /// Best-effort synchronous reap of a POSIX child we own (a group leader, whose pid == its pgid)
     /// during teardown — it was just SIGKILLed, so it becomes a zombie within a moment. Uses a
