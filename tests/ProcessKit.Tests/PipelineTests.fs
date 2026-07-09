@@ -508,6 +508,22 @@ type PipelineTests() =
         |> ignore
 
     [<Test>]
+    member _.``a per-stage IdleTimeout is rejected on any stage when piped``() =
+        // A pipeline captures only the last stage's output and does not monitor per-stage output
+        // activity, so a stage's own idle deadline could never fire — reject it at build time (like the
+        // per-stage Timeout) rather than silently dropping it.
+        let withIdle cmd =
+            cmd |> Command.idleTimeout (TimeSpan.FromSeconds 2.0)
+
+        // On the first stage (index 0)...
+        Assert.Throws<ArgumentException>(Action(fun () -> (withIdle (emit [ "x" ])).Pipe sortStage |> ignore))
+        |> ignore
+
+        // ...and on a later stage (index 1).
+        Assert.Throws<ArgumentException>(Action(fun () -> (emit [ "x" ]).Pipe(withIdle sortStage) |> ignore))
+        |> ignore
+
+    [<Test>]
     member _.``a per-stage Retry is rejected when piped``() =
         let withRetry cmd =
             cmd |> Command.retry 3 (TimeSpan.FromMilliseconds 10.0) (fun _ -> true)

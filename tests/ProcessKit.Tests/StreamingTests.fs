@@ -67,6 +67,24 @@ type StreamingTests() =
         else
             shell "echo line1; echo line2; echo line3"
 
+    // A process that emits one line immediately, then stays alive and silent for several seconds — the
+    // "hung after a burst" shape a `Command.IdleTimeout` is meant to catch.
+    let quietAfterBurst =
+        if isWindows then
+            shell "echo hi& ping 127.0.0.1 -n 10 >NUL"
+        else
+            shell "echo hi; sleep 8"
+
+    // A process that keeps dripping output on a sub-idle cadence for longer than the 2s idle window used
+    // in the tests below, then exits cleanly — proves the idle deadline is actually reset by each chunk
+    // of output. Windows has no sub-second sleep, so its cadence is ~1s `ping` gaps (still well under 2s).
+    let idleDrip =
+        if isWindows then
+            shell
+                "echo tick& ping 127.0.0.1 -n 2 >NUL& echo tick& ping 127.0.0.1 -n 2 >NUL& echo tick& ping 127.0.0.1 -n 2 >NUL& echo tick& ping 127.0.0.1 -n 2 >NUL& echo tick"
+        else
+            shell "for i in 1 2 3 4 5 6 7 8 9 10; do echo tick; sleep 0.3; done"
+
     // Start `command` and collect its stdout as raw bytes through the byte verb (the verb reaps the
     // tree). Used by the OutputBuffer byte-cap tests below.
     let runBytes (command: Command) : Task<Result<ProcessResult<byte[]>, ProcessError>> =
@@ -1100,3 +1118,116 @@ type StreamingTests() =
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
+
+    // --- Idle timeout (`Command.IdleTimeout`): kill a run that stops producing output (T-052). The
+    //     deadline is reset by each chunk of stdout/stderr (byte granularity, across every verb), and
+    //     surfaces — like the total `Timeout` — as `Outcome.TimedOut`. ---
+
+    [<Test>]
+    member _.``IdleTimeout kills a run that goes quiet and reports TimedOut``() : Task =
+        task {
+            let command =
+                quietAfterBurst |> Command.idleTimeout (TimeSpan.FromMilliseconds 600.0)
+
+            let stopwatch = Stopwatch.StartNew()
+
+            match! command.OutputStringAsync() with
+            | Ok result ->
+                stopwatch.Stop()
+                Assert.That(result.IsTimedOut, Is.True, "the idle deadline should have fired")
+                // It fires shortly after the single burst goes quiet — nowhere near the 8s the child
+                // would otherwise stay alive.
+                Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 5.0))
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``IdleTimeout does not fire while output keeps coming (the deadline is reset)``() : Task =
+        task {
+            // The drip outlives the 2s idle window but never goes quiet for that long, so a working reset
+            // keeps it alive to a clean exit; a broken (fixed-from-start) deadline would fire at ~2s.
+            let command = idleDrip |> Command.idleTimeout (TimeSpan.FromSeconds 2.0)
+
+            match! command.OutputStringAsync() with
+            | Ok result ->
+                Assert.That(result.IsTimedOut, Is.False, "output kept flowing, so the idle deadline must not fire")
+                Assert.That(result.IsSuccess, Is.True, "the drip should exit cleanly")
+                // The run outlived the idle window, so the "did not fire" result is meaningful (a
+                // non-reset deadline would have killed it before this).
+                Assert.That(result.Duration, Is.GreaterThan(TimeSpan.FromSeconds 2.0))
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``IdleTimeout and total Timeout coexist without a double outcome``() : Task =
+        task {
+            // Both deadlines are armed; the short idle one fires first. `RunAsync` yields exactly one
+            // result, so a single `Timeout` here is proof there is no double kill / double report.
+            let command =
+                quietAfterBurst
+                |> Command.timeout (TimeSpan.FromSeconds 8.0)
+                |> Command.idleTimeout (TimeSpan.FromMilliseconds 500.0)
+
+            let stopwatch = Stopwatch.StartNew()
+            let! result = command.RunAsync()
+            stopwatch.Stop()
+
+            match result with
+            | Error(ProcessError.Timeout _) -> ()
+            | other -> Assert.Fail $"expected Timeout, got {other}"
+
+            // The idle deadline (500ms) won over the total (8s) — the run ends promptly, not at 8s.
+            Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 5.0))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``IdleTimeout honours TimeoutGrace``() : Task =
+        task {
+            // Idle fires, then the graceful-kill machinery (SIGTERM, then SIGKILL after the grace) runs
+            // exactly as it does for the total timeout — still a single, prompt `TimedOut`.
+            let command =
+                quietAfterBurst
+                |> Command.idleTimeout (TimeSpan.FromMilliseconds 400.0)
+                |> Command.timeoutGrace (TimeSpan.FromMilliseconds 200.0)
+
+            let stopwatch = Stopwatch.StartNew()
+
+            match! command.OutputStringAsync() with
+            | Ok result ->
+                stopwatch.Stop()
+                Assert.That(result.IsTimedOut, Is.True)
+                Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 5.0))
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``IdleTimeout fires on the streaming path too``() : Task =
+        task {
+            // The idle deadline is armed once the streaming session's exit wait begins and reset by the
+            // stdout/stderr reads the pumps do — so a streamed run that hangs is killed just like a
+            // buffered one, surfacing `TimedOut` through `FinishAsync`.
+            let command =
+                quietAfterBurst |> Command.idleTimeout (TimeSpan.FromMilliseconds 600.0)
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok started ->
+                use running = started
+                let! _lines = collect (running.StdoutLinesAsync())
+
+                match! running.FinishAsync() with
+                | Ok finished -> Assert.That(finished.Outcome.IsTimedOut, Is.True)
+                | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``IdleTimeout rejects a negative duration at the builder boundary``() =
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> Command.create "x" |> Command.idleTimeout (TimeSpan.FromSeconds -1.0) |> ignore)
+        )
+        |> ignore

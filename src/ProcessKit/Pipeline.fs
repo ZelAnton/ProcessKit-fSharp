@@ -21,6 +21,9 @@ module internal PipelineStageGuard =
     /// `ArgumentException` blames the right parameter):
     /// - a per-stage `Timeout` on **any** stage — only the chain-level `Pipeline.Timeout` bounds a
     ///   pipeline; a stage's own `Command.Timeout` never fires;
+    /// - a per-stage `IdleTimeout` on **any** stage — a pipeline wires each stage's stdout into the next
+    ///   stage's stdin and captures only the last stage's output, so it does not monitor per-stage
+    ///   output activity; only the chain-level `Pipeline.Timeout` bounds a pipeline;
     /// - a per-stage `Retry` on **any** stage — retry is a verb-layer mechanism and stages spawn
     ///   directly, bypassing it;
     /// - a per-stage `CancelOn` on **any** stage — a stage's own `Command.CancelOn` is a verb-layer
@@ -35,6 +38,14 @@ module internal PipelineStageGuard =
             raise (
                 ArgumentException(
                     $"pipeline stage {stageIndex} ('{command.Program}') sets a per-stage Timeout, which a pipeline cannot honour: only the chain-level Pipeline.Timeout bounds a pipeline. Set the deadline on the pipeline instead.",
+                    paramName
+                )
+            )
+
+        if config.IdleTimeout.IsSome then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets a per-stage IdleTimeout, which a pipeline cannot honour: a pipeline wires each stage's stdout into the next stage's stdin and captures only the last stage's output, so it does not monitor per-stage output activity — only the chain-level Pipeline.Timeout bounds a pipeline. Run the command on its own to use an idle timeout.",
                     paramName
                 )
             )
@@ -93,6 +104,8 @@ module internal PipelineStageGuard =
 /// a `Stdin` source on any stage *after the first* (its stdin is always rewired to the previous
 /// stage's stdout — only stage 0 may set a source), a per-stage `Timeout` on any stage (only the
 /// chain-level `Pipeline.Timeout` bounds a pipeline; `Command.Timeout` on a stage never fires), a
+/// per-stage `IdleTimeout` on any stage (a pipeline captures only the last stage's output and does not
+/// monitor per-stage output activity, so a stage's own idle deadline can never fire), a
 /// per-stage `Retry` on any stage (retry is a verb-layer mechanism, and stages spawn directly,
 /// bypassing it), and a per-stage `CancelOn` on any stage (a stage's own `Command.CancelOn` token is
 /// likewise a verb-layer mechanism the direct stage spawn bypasses; only the chain-level
@@ -186,9 +199,9 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         ProcessError.OutputTooLarge(last.Program, policy.MaxLines, policy.MaxBytes, 0, capture.LastStdoutTotalBytes)
 
     /// Append another stage; its stdin is fed from the current last stage's stdout. Rejects
-    /// (`ArgumentException`) a stage that sets a per-stage `Timeout`/`Retry`/`CancelOn` or a `Stdin`
-    /// source — a pipeline cannot honour those (see the type doc); the appended stage is always after
-    /// the first.
+    /// (`ArgumentException`) a stage that sets a per-stage `Timeout`/`IdleTimeout`/`Retry`/`CancelOn` or
+    /// a `Stdin` source — a pipeline cannot honour those (see the type doc); the appended stage is
+    /// always after the first.
     member _.Pipe(command: Command) =
         ArgumentNullException.ThrowIfNull command
         PipelineStageGuard.validate (nameof command) commands.Length command
@@ -335,9 +348,9 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
 type PipelineExtensions =
 
     /// Start a pipeline that feeds this command's stdout into `next`'s stdin. Rejects
-    /// (`ArgumentException`) either stage setting a per-stage `Timeout`/`Retry`/`CancelOn`, or `next`
-    /// (stage 1) setting a `Stdin` source — a pipeline cannot honour those (see the `Pipeline` type
-    /// doc). `command` is stage 0, so a `Stdin` source on it (feeding the whole chain) is allowed.
+    /// (`ArgumentException`) either stage setting a per-stage `Timeout`/`IdleTimeout`/`Retry`/`CancelOn`,
+    /// or `next` (stage 1) setting a `Stdin` source — a pipeline cannot honour those (see the `Pipeline`
+    /// type doc). `command` is stage 0, so a `Stdin` source on it (feeding the whole chain) is allowed.
     [<Extension>]
     static member Pipe(command: Command, next: Command) =
         ArgumentNullException.ThrowIfNull command

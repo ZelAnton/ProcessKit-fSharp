@@ -87,6 +87,28 @@ type RunningProcess internal (host: RunningHost) =
     let readStdoutLineCount () = Volatile.Read(&stdoutLineCount)
     let readStderrLineCount () = Volatile.Read(&stderrLineCount)
 
+    // Idle-timeout (`Command.IdleTimeout`, opt-in): a resettable "no output" watchdog, plus thin
+    // activity-tracking wrappers around the stdout/stderr pipes that reset it on every non-empty read.
+    // Byte granularity — honest and uniform across every verb (line pumps, byte drains, raw captures
+    // all reset it), and independent of the line counters above. Unset (the default): no timer, and the
+    // raw pipe streams pass straight through with zero overhead, keeping the idle path entirely opt-in.
+    // Armed by `waitWithTimeout` (via `Timeouts.raceTimeout`) when the exit wait begins; disposed with
+    // this handle.
+    let idleTimer: Timeouts.IdleTimer option =
+        match config.IdleTimeout with
+        | Some idle when Timeouts.isArmable idle -> Some(new Timeouts.IdleTimer(idle))
+        | _ -> None
+
+    let watchActivity (stream: Stream option) : Stream option =
+        match idleTimer with
+        | Some timer ->
+            stream
+            |> Option.map (fun s -> new Timeouts.ActivityStream(s, timer.Reset) :> Stream)
+        | None -> stream
+
+    let stdoutStream = watchActivity host.Stdout
+    let stderrStream = watchActivity host.Stderr
+
     // Cancels a writer parked on a bounded stream's `StreamFullMode.Backpressure` (`WriteAsync`) once
     // this handle is torn down, so an abandoned bounded stream can't leave its pump running forever: a
     // `Command.Timeout` kills the CHILD but does not by itself free a writer waiting here if nothing
@@ -252,7 +274,7 @@ type RunningProcess internal (host: RunningHost) =
         }
 
     let pumpStdoutBuffer () =
-        match host.Stdout with
+        match stdoutStream with
         | Some s ->
             pumpToBuffer
                 s
@@ -264,7 +286,7 @@ type RunningProcess internal (host: RunningHost) =
         | None -> Task.FromResult(Pump.LineBuffer config.OutputBuffer)
 
     let pumpStderrBuffer () =
-        match host.Stderr with
+        match stderrStream with
         | Some s ->
             pumpToBuffer
                 s
@@ -295,8 +317,10 @@ type RunningProcess internal (host: RunningHost) =
         else
             None
 
-    // Wait for exit, applying a configured timeout: on the deadline, kill the tree (gracefully if
-    // `TimeoutGrace` is set, else hard) and report `Outcome.TimedOut`.
+    // Wait for exit, applying the configured total and/or idle timeout: on whichever deadline fires,
+    // kill the tree (gracefully if `TimeoutGrace` is set, else hard) — one shared kill for both, so no
+    // double kill — and report `Outcome.TimedOut`. The idle watchdog is armed inside `raceTimeout` as
+    // the wait begins and reset by each stdout/stderr read through the activity-tracking wrappers.
     let waitWithTimeout () : Task<Outcome> =
         let onTimeout () : Task =
             task {
@@ -306,7 +330,7 @@ type RunningProcess internal (host: RunningHost) =
             }
             :> Task
 
-        Timeouts.raceTimeout config.Logger config.Program runId config.Timeout onTimeout (host.Wait())
+        Timeouts.raceTimeout config.Logger config.Program runId config.Timeout idleTimer onTimeout (host.Wait())
 
     // Start (and memoize) a buffered verb's single exit wait. Every buffered verb calls this instead
     // of `waitWithTimeout()` directly, storing the resulting task in `bufferedOutcome` synchronously —
@@ -560,7 +584,7 @@ type RunningProcess internal (host: RunningHost) =
                 // (unbounded when `MaxBytes = None`, exactly as before); `MaxLines` does not apply to a
                 // byte stream, so it is ignored here — it still governs the line-pumped stderr below.
                 let stdoutTask =
-                    Pump.captureRawOrEmpty host.Stdout config.StdoutTee config.OutputBuffer CancellationToken.None
+                    Pump.captureRawOrEmpty stdoutStream config.StdoutTee config.OutputBuffer CancellationToken.None
 
                 let stderrTask = pumpStderrBuffer ()
                 // Observe both pumps before reading either, so a throwing stderr handler (or a raw-drain
@@ -603,8 +627,8 @@ type RunningProcess internal (host: RunningHost) =
         task {
             use _reap = reapGuard ()
             // Drain both pipes (so the child never blocks on a full buffer) without retaining.
-            let stdoutTask = Pump.drainDiscardOrEmpty host.Stdout CancellationToken.None
-            let stderrTask = Pump.drainDiscardOrEmpty host.Stderr CancellationToken.None
+            let stdoutTask = Pump.drainDiscardOrEmpty stdoutStream CancellationToken.None
+            let stderrTask = Pump.drainDiscardOrEmpty stderrStream CancellationToken.None
             // Observe both drains together so an I/O fault on one can't orphan the other;
             // `awaitBufferedOutcome` additionally guarantees this even if the exit wait itself faults.
             let! outcome = awaitBufferedOutcome (startBufferedWait ()) [| stdoutTask; stderrTask |]
@@ -660,8 +684,8 @@ type RunningProcess internal (host: RunningHost) =
                         ()
                 }
 
-            let stdoutTask = Pump.drainDiscardOrEmpty host.Stdout CancellationToken.None
-            let stderrTask = Pump.drainDiscardOrEmpty host.Stderr CancellationToken.None
+            let stdoutTask = Pump.drainDiscardOrEmpty stdoutStream CancellationToken.None
+            let stderrTask = Pump.drainDiscardOrEmpty stderrStream CancellationToken.None
 
             // Capture a fault rather than letting it escape immediately, so the sampler is ALWAYS
             // cancelled and awaited before its CTS is disposed at scope exit — never left running as
@@ -715,7 +739,7 @@ type RunningProcess internal (host: RunningHost) =
                     try
                         do!
                             StreamChannel.pumpLines
-                                host.Stdout
+                                stdoutStream
                                 config.StdoutEncoding
                                 config.StdoutLineTerminator
                                 config.StdoutTee
@@ -743,7 +767,7 @@ type RunningProcess internal (host: RunningHost) =
 
             let stderrPump =
                 StreamChannel.pumpLines
-                    host.Stderr
+                    stderrStream
                     config.StderrEncoding
                     config.StderrLineTerminator
                     config.StderrTee
@@ -838,7 +862,7 @@ type RunningProcess internal (host: RunningHost) =
 
             let stdoutPump =
                 eventPump
-                    host.Stdout
+                    stdoutStream
                     config.StdoutEncoding
                     config.StdoutLineTerminator
                     config.StdoutTee
@@ -849,7 +873,7 @@ type RunningProcess internal (host: RunningHost) =
 
             let stderrPump =
                 eventPump
-                    host.Stderr
+                    stderrStream
                     config.StderrEncoding
                     config.StderrLineTerminator
                     config.StderrTee
@@ -1010,10 +1034,10 @@ type RunningProcess internal (host: RunningHost) =
                         // These drains are fire-and-forget for a race loser the caller may dispose
                         // mid-drain, so they must complete quietly on teardown rather than fault unobserved.
                         let stdoutDrain =
-                            Pump.drainDiscardOrEmptyUntilDone host.Stdout CancellationToken.None
+                            Pump.drainDiscardOrEmptyUntilDone stdoutStream CancellationToken.None
 
                         let stderrDrain =
-                            Pump.drainDiscardOrEmptyUntilDone host.Stderr CancellationToken.None
+                            Pump.drainDiscardOrEmptyUntilDone stderrStream CancellationToken.None
 
                         let! outcome = waitWithTimeout ()
                         do! Task.WhenAll([| stdoutDrain; stderrDrain |])
@@ -1077,6 +1101,9 @@ type RunningProcess internal (host: RunningHost) =
     interface IAsyncDisposable with
         member _.DisposeAsync() =
             disposalCts.Cancel()
+            // Stop and release the idle-timeout watchdog (if any); a pump still resetting it races this
+            // harmlessly (`Reset` after disposal is a no-op).
+            idleTimer |> Option.iter (fun t -> (t :> IDisposable).Dispose())
             // Clear `runs.active` for a handle disposed without ever reaching a terminal verb — a no-op
             // (guarded by `concludedFlag`) when `conclude` already ran, so a normal verb-then-dispose
             // sequence, or a repeated dispose, cannot double-decrement.
