@@ -78,6 +78,20 @@ jobs:
       # The CLI does not discover MSBuild PackageReference analyzers on its own.
       # Ionide.Analyzers 0.15.0 is built for fsharp-analyzers 0.36.0; newer
       # versions may break compatibility, so keep the package/tool pins aligned.
+      #
+      # fsharp-analyzers 0.36.0 ships only a net8.0 executable (see .config/dotnet-tools.json
+      # and the `tools/net8.0/any` layout of the restored package) — it relies on its
+      # runtimeconfig.json's `"rollForward": "LatestMajor"` to run on newer runtimes. That
+      # roll-forward only kicks in when no exact framework match is found. GitHub-hosted
+      # ubuntu-latest runners ship a net8.0 runtime pre-installed regardless of this job's own
+      # `dotnet-version: '10.0.x'`, so the tool's own apphost resolves an exact net8.0 match and
+      # runs natively on net8.0 -- but Ionide.ProjInfo then loads the MSBuild toolset from the
+      # only SDK actually installed here (net10.0, pinned by global.json), and loading a
+      # net10.0-targeted MSBuild toolset into a net8.0 host process fails with "could not find
+      # System.Runtime, Version=10.0.0.0" (confirmed by reproducing both the failure and the fix
+      # in a clean ubuntu container with a net8.0 runtime added alongside net10.0). Invoking the
+      # tool DLL directly via `dotnet exec --fx-version` forces it to run natively on the
+      # installed net10.0 runtime instead, so the host and the MSBuild toolset it loads agree.
       - name: Analyze F# source
         run: |
           set -euo pipefail
@@ -88,7 +102,20 @@ jobs:
             exit 1
           fi
 
-          dotnet fsharp-analyzers --project src/ProcessKit/ProcessKit.fsproj \
+          nuget_packages="${NUGET_PACKAGES:-$HOME/.nuget/packages}"
+          tool_dll="$nuget_packages/fsharp-analyzers/0.36.0/tools/net8.0/any/FSharp.Analyzers.Cli.dll"
+          if [ ! -f "$tool_dll" ]; then
+            echo "::error::fsharp-analyzers tool assembly was not restored under $tool_dll"
+            exit 1
+          fi
+
+          fx_version="$(dotnet --list-runtimes | awk '/^Microsoft\.NETCore\.App 10\./ { print $2 }' | sort -V | tail -1)"
+          if [ -z "$fx_version" ]; then
+            echo "::error::No installed net10.0 Microsoft.NETCore.App runtime found"
+            exit 1
+          fi
+
+          dotnet exec --fx-version "$fx_version" "$tool_dll" --project src/ProcessKit/ProcessKit.fsproj \
             --analyzers-path "$analyzers_path" \
             --exclude-analyzers PostfixGenericsAnalyzer StructDiscriminatedUnionAnalyzer \
             --treat-as-error IONIDE-001 IONIDE-003 IONIDE-006 \
