@@ -431,6 +431,49 @@ type PipelineTests() =
         :> Task
 
     [<Test>]
+    member _.``cancellation between stage spawns starts no later stage and reaps promptly``() : Task =
+        // Regression (T-061): the staging loop registered ONE `linkedCts` callback that KillTree's the
+        // stages then running, but never re-checked the token between spawns. `KillTree` leaves the group
+        // usable, so a cancellation landing in the window between two spawns killed the running stages,
+        // then the loop spawned the NEXT stage right afterwards — a stage the one-shot sweep never
+        // targeted, which therefore outlived the pipeline (the caller either lost track of it or blocked
+        // on its natural exit). The seam fires cancellation in exactly that window; the fix must start no
+        // later stage and return a prompt `Cancelled`, never wait on the long-running escapee.
+        task {
+            let longStage =
+                if isWindows then
+                    shell "ping -n 30 127.0.0.1 >nul"
+                else
+                    shell "sleep 30"
+
+            // Two long stages: without the fix, stage 1 (spawned right after the sweep) escapes and the
+            // run blocks ~30s on its natural exit; with the fix it never starts and the run is prompt.
+            let pipeline = longStage.Pipe longStage
+            use cts = new CancellationTokenSource()
+
+            // Fire cancellation the instant stage 0 has spawned — i.e. between the two spawns, the exact
+            // race window. `Cancel` runs the linked KillTree callback inline before the loop reaches
+            // stage 1, reproducing "the sweep fired, now the loop wants to start the next stage".
+            PipelineRunner.stageSpawnedTestHook <-
+                Some(fun index ->
+                    if index = 0 then
+                        cts.Cancel())
+
+            try
+                let run = pipeline.RunAsync cts.Token
+                // Won the race against a 15s deadline (far below the 30s stage): a stage started after the
+                // sweep would have escaped it and blocked the run on its ~30s natural exit.
+                do! assertFinishesPromptly run
+
+                match! run with
+                | Error(ProcessError.Cancelled _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected a prompt Cancelled once staging was cancelled, got {other}"
+            finally
+                PipelineRunner.stageSpawnedTestHook <- None
+        }
+        :> Task
+
+    [<Test>]
     member _.``Pipeline module builders compose a pipeline``() : Task =
         task {
             // Builders pipe (module); the terminal verb is an instance method.
