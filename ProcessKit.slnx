@@ -4,11 +4,13 @@
 			<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
 			<BuildDependency Project="src/ProcessKit.Testing/ProcessKit.Testing.fsproj" />
 			<BuildDependency Project="src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj" />
+			<BuildDependency Project="src/ProcessKit.Extensions.Hosting/ProcessKit.Extensions.Hosting.fsproj" />
 		</Project>
 		<Project Path="tests/ProcessKit.CSharp.Tests/ProcessKit.CSharp.Tests.csproj">
 			<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
 			<BuildDependency Project="src/ProcessKit.Testing/ProcessKit.Testing.fsproj" />
 			<BuildDependency Project="src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj" />
+			<BuildDependency Project="src/ProcessKit.Extensions.Hosting/ProcessKit.Extensions.Hosting.fsproj" />
 		</Project>
 	</Folder>
 	<Project Path="src/ProcessKit/ProcessKit.fsproj" />
@@ -16,6 +18,9 @@
 		<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
 	</Project>
 	<Project Path="src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj">
+		<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
+	</Project>
+	<Project Path="src/ProcessKit.Extensions.Hosting/ProcessKit.Extensions.Hosting.fsproj">
 		<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
 	</Project>
 	<Project Path="benchmarks/ProcessKit.Benchmarks/ProcessKit.Benchmarks.fsproj">

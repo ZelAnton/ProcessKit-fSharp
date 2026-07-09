@@ -49,6 +49,22 @@ type PosixEventDrivenWaitTests() =
                 return Ok(firstOutcome, secondOutcome)
         }
 
+    // Spawn a short-lived child through `Native.Posix.spawnPosix` and reap it through `waiter`, returning
+    // its decoded `Outcome`. Bounded by a deadline so a stranded wait fails fast instead of hanging.
+    let waitOutcomeVia (waiter: nativeint -> Task<Outcome>) (script: string) =
+        task {
+            match Native.Posix.spawnPosix (shell script) with
+            | Error e ->
+                Assert.Fail $"spawn failed: {e.Message}"
+                return Outcome.Unobserved "unreachable"
+            | Ok spawned ->
+                let! outcome = withDeadline 5000 (waiter spawned.Handle)
+                spawned.Stdout |> Option.iter (fun s -> s.Dispose())
+                spawned.Stderr |> Option.iter (fun s -> s.Dispose())
+                spawned.Stdin |> Option.iter (fun s -> s.Dispose())
+                return outcome
+        }
+
     [<Test>]
     member _.``waitPosix is idempotent for a repeated pid and does not leak a descriptor``() : Task =
         task {
@@ -191,6 +207,58 @@ type PosixEventDrivenWaitTests() =
             match! (shell "kill -TERM $$").RunAsync() with
             | Error(ProcessError.Signalled _) -> ()
             | other -> Assert.Fail $"expected a Signalled outcome, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the SIGCHLD fallback wait decodes exit, clean exit, and signal correctly``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: exercises the shared-SIGCHLD fallback path directly"
+
+            // `waitPosixViaSigchldForTests` forces the fallback regardless of pidfd support, so this
+            // covers the fallback's `waitpid`/`decodeWaitStatus` decoding even on a pidfd-capable host
+            // (where `waitPosix` itself would otherwise take the pidfd path and never touch it).
+            let via = Native.Posix.waitPosixViaSigchldForTests
+
+            match! waitOutcomeVia via "exit 0" with
+            | Outcome.Exited 0 -> ()
+            | other -> Assert.Fail $"clean exit via fallback: expected Exited 0, got {other}"
+
+            match! waitOutcomeVia via "exit 7" with
+            | Outcome.Exited 7 -> ()
+            | other -> Assert.Fail $"exit code via fallback: expected Exited 7, got {other}"
+
+            match! waitOutcomeVia via "kill -TERM $$" with
+            | Outcome.Signalled(Some _) -> ()
+            | other -> Assert.Fail $"signal via fallback: expected Signalled, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the active wait mechanism and the SIGCHLD fallback agree on a child's outcome``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: cross-checks the two Native.Posix wait mechanisms"
+
+            // The pidfd fast path is Linux-only — it must never be selected on macOS/other POSIX. (On an
+            // old Linux kernel it is simply off, which is also fine; we only assert the negative.)
+            if not isLinux then
+                Assert.That(Native.Posix.pidfdActive, Is.False, "the pidfd fast path must never be selected off Linux")
+
+            // For each shape (clean exit / non-zero exit / signal), the active mechanism (`waitPosix` —
+            // the pidfd `waitid(P_PIDFD)` decode where supported) and the forced SIGCHLD fallback
+            // (`waitpid`/`decodeWaitStatus`) must agree, so `decodeSiginfo` matches the status-word decode.
+            for script in [ "exit 0"; "exit 7"; "kill -TERM $$" ] do
+                let! viaActive = waitOutcomeVia Native.Posix.waitPosix script
+                let! viaFallback = waitOutcomeVia Native.Posix.waitPosixViaSigchldForTests script
+
+                Assert.That(
+                    viaActive,
+                    Is.EqualTo viaFallback,
+                    $"the pidfd path and the SIGCHLD fallback disagreed for `{script}` \
+                      (pidfdActive={Native.Posix.pidfdActive})"
+                )
         }
         :> Task
 

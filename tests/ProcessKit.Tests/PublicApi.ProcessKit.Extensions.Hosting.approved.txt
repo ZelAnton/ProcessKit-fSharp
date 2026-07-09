@@ -1,0 +1,17 @@
+class ProcessKit.Extensions.Hosting.HostedProcessOptions
+  new()
+  property ShutdownGracePeriod : System.TimeSpan { get; set }
+
+class ProcessKit.Extensions.Hosting.HostedProcessService
+  :> Microsoft.Extensions.Hosting.IHostedService
+  :> System.IDisposable
+  new(System.String, ProcessKit.Command, System.Func<ProcessKit.Supervisor, ProcessKit.Supervisor>, ProcessKit.IProcessRunner, ProcessKit.Extensions.Hosting.HostedProcessOptions)
+  property LastOutcome : Microsoft.FSharp.Core.FSharpOption<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>> { get }
+  property LastStopOutcome : Microsoft.FSharp.Core.FSharpOption<ProcessKit.Outcome> { get }
+  property Name : System.String { get }
+
+class ProcessKit.Extensions.Hosting.HostedServiceCollectionExtensions
+  static member AddProcessKitHostedProcess(Microsoft.Extensions.DependencyInjection.IServiceCollection, System.String, ProcessKit.Command) : Microsoft.Extensions.DependencyInjection.IServiceCollection
+  static member AddProcessKitHostedProcess(Microsoft.Extensions.DependencyInjection.IServiceCollection, System.String, ProcessKit.Command, System.Func<ProcessKit.Supervisor, ProcessKit.Supervisor>) : Microsoft.Extensions.DependencyInjection.IServiceCollection
+  static member ConfigureProcessKitHostedProcess(Microsoft.Extensions.DependencyInjection.IServiceCollection, System.String, System.Action<ProcessKit.Extensions.Hosting.HostedProcessOptions>) : Microsoft.Extensions.DependencyInjection.IServiceCollection
+
