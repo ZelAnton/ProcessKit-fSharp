@@ -13,10 +13,25 @@ module internal Pump =
 
     /// Accumulates retained output lines under an `OutputBufferPolicy`, tracking cumulative
     /// totals and whether the fail-loud ceiling tripped. Not thread-safe; one per stream.
+    ///
+    /// Byte accounting: a retained line's accounted cost is `Encoding.UTF8.GetByteCount line + 1` —
+    /// the line's own UTF-8 bytes, plus one byte for the `\n` separator that `Text` reintroduces when
+    /// it joins retained lines back together (`String.Join('\n', ...)`). Every retained line is
+    /// charged the separator byte, including the very last one (which needs no *trailing* separator
+    /// once reassembled), so the accounted total is a deliberate, small over-estimate — by at most one
+    /// byte per retained line — of what `Text` actually produces; it never under-counts, so a
+    /// configured `MaxBytes` genuinely bounds the reassembled string's size. Charging the separator
+    /// this way is also what makes an empty line cost a non-zero amount: without it,
+    /// `Encoding.UTF8.GetByteCount ""` is `0`, so an unbounded flood of bare newlines under `MaxBytes`
+    /// alone (no `MaxLines`) would retain an unbounded number of empty-string records — defeating the
+    /// byte cap as a memory bound. This is a line-buffer-only convention: the raw-byte capture path
+    /// (`RawBuffer`/`RawCapture`, used by `OutputBytesAsync` and pipeline stdout/stderr capture) has no
+    /// line structure and charges the literal byte count, unaffected by any of this.
     type LineBuffer(policy: OutputBufferPolicy) =
-        // Each retained line carries its own UTF-8 byte length alongside it (computed once, on Add),
-        // so a `DropOldest` eviction can subtract the stored length instead of re-scanning the evicted
-        // string through `Encoding.UTF8.GetByteCount` a second time.
+        // Each retained line carries its own accounted byte cost alongside it (computed once, on
+        // Add — see the type doc comment above), so a `DropOldest` eviction can subtract the stored
+        // cost instead of re-scanning the evicted string through `Encoding.UTF8.GetByteCount` a second
+        // time.
         let retained = LinkedList<struct (string * int)>()
         let mutable retainedBytes = 0
         let mutable totalLines = 0
@@ -25,8 +40,8 @@ module internal Pump =
         let mutable tooLarge = false
 
         // The retained/total byte counts only matter when a byte cap is set or the fail-loud ceiling
-        // is in play; under the default (line-only / unbounded) policy, skip the per-line UTF-8 scan.
-        // `TotalBytes` is therefore meaningful only in those modes.
+        // is in play; under the default (line-only / unbounded) policy, skip the per-line UTF-8 scan
+        // and its separator surcharge. `TotalBytes` is therefore meaningful only in those modes.
         let needBytes = policy.MaxBytes.IsSome || policy.Overflow = OverflowMode.Error
 
         let overLineCap () =
@@ -46,9 +61,10 @@ module internal Pump =
 
         member _.Text = String.Join('\n', retained |> Seq.map (fun struct (s, _) -> s))
 
-        /// Record a complete line, applying the policy.
+        /// Record a complete line, applying the policy. See the type doc comment for how `line`'s
+        /// accounted byte cost is derived (its own UTF-8 bytes plus one separator byte).
         member _.Add(line: string) =
-            let bytes = if needBytes then Encoding.UTF8.GetByteCount line else 0
+            let bytes = if needBytes then Encoding.UTF8.GetByteCount line + 1 else 0
             totalLines <- totalLines + 1
             totalBytes <- totalBytes + bytes
             let unbounded = policy.MaxLines.IsNone && policy.MaxBytes.IsNone

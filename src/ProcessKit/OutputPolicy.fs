@@ -50,14 +50,24 @@ type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, ov
     /// pipeline's captured last-stage stdout have no line structure, so only `MaxBytes` bounds those.
     member _.MaxLines = maxLines
 
-    /// Maximum retained bytes (sum of the retained lines' UTF-8 lengths): `None` is unbounded. Also
-    /// bounds the in-flight (not-yet-newline-terminated) line for the buffered verbs: an unterminated
-    /// line is force-flushed once it reaches this many characters, so a child emitting a newline-free
-    /// flood can't grow the assembly buffer past the cap (the flushed segments are dropped/errored per
-    /// `Overflow`, like any other over-cap output). This cap is also the ceiling on a **raw byte**
-    /// capture (`OutputBytesAsync`'s stdout and a pipeline's captured last-stage stdout): `Some cap`
-    /// enforces it per `Overflow` (`Error` -> `OutputTooLarge`, `DropOldest` -> last `cap` bytes,
-    /// `DropNewest` -> first `cap` bytes), while `None` leaves the raw capture unbounded.
+    /// Maximum retained bytes: `None` is unbounded. Also bounds the in-flight (not-yet-newline-
+    /// terminated) line for the buffered verbs: an unterminated line is force-flushed once it reaches
+    /// this many characters, so a child emitting a newline-free flood can't grow the assembly buffer
+    /// past the cap (the flushed segments are dropped/errored per `Overflow`, like any other over-cap
+    /// output).
+    ///
+    /// For the **line-capturing** paths (the text verbs' stdout/stderr, and a byte verb's line-pumped
+    /// stderr — see `Pump.LineBuffer`), each retained line counts its own UTF-8 byte length **plus one
+    /// byte** for the `\n` separator reintroduced when the retained lines are joined back into text —
+    /// so this cap genuinely bounds the reassembled text's size (not merely the sum of the lines' own
+    /// content), and an empty line still costs a non-zero amount (bounding an empty-line flood, which
+    /// would otherwise cost `0` bytes per line and defeat the cap).
+    ///
+    /// This cap is also the ceiling on a **raw byte** capture (`OutputBytesAsync`'s stdout and a
+    /// pipeline's captured last-stage stdout — see `Pump.RawBuffer`), which has no line structure and
+    /// so no separator surcharge: `Some cap` enforces the literal byte cap per `Overflow` (`Error` ->
+    /// `OutputTooLarge`, `DropOldest` -> last `cap` bytes, `DropNewest` -> first `cap` bytes), while
+    /// `None` leaves the raw capture unbounded.
     member _.MaxBytes = maxBytes
 
     /// Which line to drop, or whether to error, when a cap is reached.
