@@ -499,8 +499,9 @@ follows a documented back-compat policy (`:255-263`) — a version newer than th
 is rejected, an older still-supported one (v1) loads with its missing fields defaulted — replacing
 the original exact-`≠` check. Security invariants (env-name-only redaction, atomic write, `0600`
 on Unix) are unchanged. See `CHANGELOG.md` § `2.0.0` → `### Added` (the `RecordReplayRunner`,
-`RecordReplayOptions`, `RecordReplayRunner.Auto`, `FakeProcess`, `ScriptedRunner`, "separate
-`ProcessKit.Testing` NuGet package", and "versioned JSON envelope" bullets).
+`RecordReplayOptions`, `RecordReplayRunner.Auto`, `FakeProcess`, and `ScriptedRunner` bullets)
+and → `### Changed` (the "separate `ProcessKit.Testing` NuGet package" and "versioned JSON
+envelope" bullets).
 
 <details>
 <summary>Archived: original pre-shipment plan (historical baseline, file/line references from
