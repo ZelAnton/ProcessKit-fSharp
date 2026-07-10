@@ -67,11 +67,10 @@ module internal Pump =
             let bytes = if needBytes then Encoding.UTF8.GetByteCount line + 1 else 0
             totalLines <- totalLines + 1
             totalBytes <- totalBytes + bytes
-            let unbounded = policy.MaxLines.IsNone && policy.MaxBytes.IsNone
             let full = overLineCap () || wouldOverByteCap bytes
 
             match policy.Overflow with
-            | OverflowMode.Error when full || unbounded ->
+            | OverflowMode.Error when full ->
                 // Fail-loud ceiling: count but never retain.
                 tooLarge <- true
             | OverflowMode.DropNewest when full -> truncated <- true

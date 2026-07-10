@@ -64,6 +64,17 @@ type internal Consumption =
 type RunningProcess internal (host: RunningHost) =
 
     let config = host.Config
+
+    // The one lock that serializes every transition of this handle's consumption state machine —
+    // claiming the pipes (`claimBuffered`, the streaming-session setup), memoizing the single exit
+    // wait (`ensureBufferedWait`, `ExitTask`), and handing out the interactive stdin (`TakeStdin`).
+    // These are once-per-handle setup steps, never a hot path, so a single Monitor keeps their
+    // check-then-act pairs atomic under concurrent verbs without the subtlety of a field-by-field
+    // lock-free scheme. No genuine `await` is ever held across it: a `task { }` built inside the lock
+    // returns to the builder (releasing the Monitor) at its first real suspension, so only synchronous
+    // setup runs under it.
+    let stateLock = obj ()
+
     let mutable stdinTaken = false
     let mutable stdoutLineCount = 0
     let mutable stderrLineCount = 0
@@ -159,7 +170,7 @@ type RunningProcess internal (host: RunningHost) =
     let mutable eventOutcome = Unchecked.defaultof<Task<Outcome>>
 
     // A buffered verb's single exit wait (`OutputStringAsync`/`OutputBytesAsync`/`WaitAsync`/
-    // `ProfileAsync`, via `startBufferedWait`). ExitTask reuses it for an already-`Buffered` handle —
+    // `ProfileAsync`, via `ensureBufferedWait`). ExitTask reuses it for an already-`Buffered` handle —
     // the "verb, then WaitAny/WaitAll" order — so it does not start a second `host.Wait()` racing the
     // verb's own, mirroring `streamOutcome`/`eventOutcome` above for the streaming sessions.
     let mutable bufferedOutcome = Unchecked.defaultof<Task<Outcome>>
@@ -168,27 +179,21 @@ type RunningProcess internal (host: RunningHost) =
     // (OutputString/OutputBytes/Wait/Profile) consumes them whole; the streaming verbs form one
     // session (`StdoutStreaming`: StdoutLines/WaitForLine/Finish share the stdout channel;
     // `EventStreaming`: OutputEvents owns the event channel). A second, different consumer would race
-    // two readers on the same pipe — splitting/losing output — so it is refused. Verb calls are
-    // assumed sequential (the class is not built for concurrent verbs), so a plain field suffices.
+    // two readers on the same pipe — splitting/losing output — so it is refused. Every transition of
+    // this field runs under `stateLock`, so concurrent verbs (or a verb racing `ExitTask`) resolve to
+    // exactly one winning consumer rather than both observing `Fresh` and double-pumping.
     let mutable consumption = Consumption.Fresh
 
-    // Claim the pipes for a one-shot buffered verb — only from fresh (no re-entry: a second buffered
-    // verb would re-pump already-torn-down streams).
+    // Claim the pipes for a one-shot buffered verb — atomically, only from fresh (no re-entry: a
+    // second buffered verb would re-pump already-torn-down streams). Two concurrent buffered verbs
+    // therefore resolve to exactly one winner; the loser is refused (`alreadyConsumedError`).
     let claimBuffered () =
-        if consumption = Consumption.Fresh then
-            consumption <- Consumption.Buffered
-            true
-        else
-            false
-
-    // Claim the pipes for a streaming session, allowing re-entry of the *same* streaming mode (so
-    // StdoutLines → Finish, or repeated StdoutLines, compose) but rejecting a different consumer.
-    let claimStreaming (mode: Consumption) =
-        if consumption = Consumption.Fresh then
-            consumption <- mode
-            true
-        else
-            consumption = mode
+        lock stateLock (fun () ->
+            if consumption = Consumption.Fresh then
+                consumption <- Consumption.Buffered
+                true
+            else
+                false)
 
     let alreadyConsumedMessage =
         "this RunningProcess has already been consumed by another verb"
@@ -332,27 +337,59 @@ type RunningProcess internal (host: RunningHost) =
 
         Timeouts.raceTimeout config.Logger config.Program runId config.Timeout idleTimer onTimeout (host.Wait())
 
-    // Start (and memoize) a buffered verb's single exit wait. Every buffered verb calls this instead
-    // of `waitWithTimeout()` directly, storing the resulting task in `bufferedOutcome` synchronously —
-    // before the caller's `let!` can suspend — so a concurrent `ExitTask` access on the same handle
-    // (the "verb, then WaitAny/WaitAll" order) always observes a fully-assigned `bufferedOutcome` and
-    // can reuse it instead of racing a second reader on the same pipes and a second `host.Wait()`.
-    let startBufferedWait () : Task<Outcome> =
-        let wait = waitWithTimeout ()
-        bufferedOutcome <- wait
-        wait
+    // Start (and memoize) a buffered verb's single exit wait, under `stateLock`. Every buffered verb
+    // calls this instead of `waitWithTimeout()` directly; the first caller creates the wait, and both
+    // the verb that owns the pipes and a concurrent `ExitTask` on the same handle (the "verb, then
+    // WaitAny/WaitAll" order) share that one wait — one `host.Wait()`, one set of readers — with
+    // correct cross-thread visibility of `bufferedOutcome` in either arrival order.
+    let ensureBufferedWait () : Task<Outcome> =
+        lock stateLock (fun () ->
+            if obj.ReferenceEquals(bufferedOutcome, null) then
+                bufferedOutcome <- waitWithTimeout ()
 
-    // Await a buffered verb's exit wait (`waitTask`, from `startBufferedWait`) together with its
-    // already-running `pumps`, guaranteeing the pumps are drained before a fault from `waitTask`
-    // propagates — the same guard `ProfileAsync` applies around its own `startBufferedWait`. Although
-    // `backend.Wait` (the innermost primitive) is designed never to fault, `waitWithTimeout` layers a
-    // timeout race on top of it whose `onTimeout` hook calls into `host.GracefulKill`/`host.StartKill`
-    // (native kill syscalls), so the composed wait CAN throw. `reapGuard`'s teardown disposes the
-    // streams the pumps read, so a pump still in-flight when such a fault escaped this scope would race
-    // that dispose; awaiting the pumps best-effort before re-raising closes that gap. A pump's own
-    // fault (thrown from `Task.WhenAll pumps` on the success path) is not swallowed — it propagates
-    // exactly as before, unaffected by this guard.
+            bufferedOutcome)
+
+    // Kill the tree the moment an output pump faults, so a still-producing child can't wedge the exit
+    // wait — and the pump's siblings — by blocking on a full pipe that nobody drains once the pump
+    // reading it has died. Fire-and-forget and best-effort: the kill only unblocks the child so the
+    // exit wait can conclude and the child is reaped in bounded time even with no configured timeout;
+    // the ORIGINAL pump fault is still surfaced by whoever awaits the pump (`Task.WhenAll pumps`
+    // below / `streamOutcome` / `eventOutcome`), so what propagates is that fault, not a secondary
+    // closed-pipe/channel error. The continuation inspects only `IsFaulted` (never `Exception`), so
+    // the pump's exception stays available for its real awaiter, and the continuation itself can't
+    // fault (the `StartKill` call is guarded). Runs synchronously on the faulting pump's completion so
+    // the kill is prompt.
+    let killTreeOnPumpFault (pump: Task) : unit =
+        pump.ContinueWith(
+            Action<Task>(fun completed ->
+                if completed.IsFaulted then
+                    try
+                        host.StartKill()
+                    with _ ->
+                        // Best-effort: `reapGuard`'s teardown still reaps the tree, and the pump fault
+                        // is surfaced by its awaiter, so a hiccup in this early kill loses nothing.
+                        ()),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        )
+        |> ignore
+
+    // Await a buffered verb's exit wait (`waitTask`, from `ensureBufferedWait`) together with its
+    // already-running `pumps`. Fault-aware in both directions:
+    //  - A pump fault kills the tree at once (see `killTreeOnPumpFault`), so the child can't wedge
+    //    `waitTask` by blocking on a pipe its dead pump no longer drains; `waitTask` then completes
+    //    (the killed child is reaped) and the ORIGINAL pump fault surfaces from `Task.WhenAll pumps`.
+    //  - `backend.Wait` (the innermost primitive) is designed never to fault, but `waitWithTimeout`
+    //    layers a timeout race whose `onTimeout` hook calls native kill syscalls, so the composed wait
+    //    CAN throw. `reapGuard`'s teardown disposes the streams the pumps read, so a pump still
+    //    in-flight when such a fault escaped this scope would race that dispose; awaiting the pumps
+    //    best-effort before re-raising closes that gap.
+    // A pump's own fault on the success path (thrown from `Task.WhenAll pumps`) still propagates
+    // exactly as before.
     let awaitBufferedOutcome (waitTask: Task<Outcome>) (pumps: Task[]) : Task<Outcome> =
+        pumps |> Array.iter killTreeOnPumpFault
+
         task {
             let mutable error: exn option = None
             let mutable outcome = Unchecked.defaultof<Outcome>
@@ -442,11 +479,14 @@ type RunningProcess internal (host: RunningHost) =
     /// Take the interactive stdin handle — `Some` only when the command kept stdin open without a
     /// source attached, and only once.
     member _.TakeStdin() : ProcessStdin option =
-        match host.Stdin with
-        | Some stream when config.KeepStdinOpen && config.StdinSource.IsNone && not stdinTaken ->
-            stdinTaken <- true
-            Some(ProcessStdin stream)
-        | _ -> None
+        // Under `stateLock` so two concurrent `TakeStdin` calls can't both observe `not stdinTaken`
+        // and hand out the same interactive stdin stream twice.
+        lock stateLock (fun () ->
+            match host.Stdin with
+            | Some stream when config.KeepStdinOpen && config.StdinSource.IsNone && not stdinTaken ->
+                stdinTaken <- true
+                Some(ProcessStdin stream)
+            | _ -> None)
 
     /// Signal the process tree to die without waiting (fire-and-forget, like `Process.Kill()`); the
     /// tree is fully reaped when the handle is disposed. For a blocking kill, dispose the handle.
@@ -526,7 +566,7 @@ type RunningProcess internal (host: RunningHost) =
                 // never orphans the other as an unobserved task (mirrors the streaming path's WhenAll);
                 // `awaitBufferedOutcome` additionally guarantees this even if the exit wait itself faults.
                 let! outcome =
-                    awaitBufferedOutcome (startBufferedWait ()) [| (stdoutTask :> Task); (stderrTask :> Task) |]
+                    awaitBufferedOutcome (ensureBufferedWait ()) [| (stdoutTask :> Task); (stderrTask :> Task) |]
 
                 let! outBuf = stdoutTask
                 let! errBuf = stderrTask
@@ -591,7 +631,7 @@ type RunningProcess internal (host: RunningHost) =
                 // I/O fault) can't orphan the other as an unobserved task; `awaitBufferedOutcome`
                 // additionally guarantees this even if the exit wait itself faults.
                 let! outcome =
-                    awaitBufferedOutcome (startBufferedWait ()) [| (stdoutTask :> Task); (stderrTask :> Task) |]
+                    awaitBufferedOutcome (ensureBufferedWait ()) [| (stdoutTask :> Task); (stderrTask :> Task) |]
 
                 let! stdoutCapture = stdoutTask
                 let! errBuf = stderrTask
@@ -631,7 +671,7 @@ type RunningProcess internal (host: RunningHost) =
             let stderrTask = Pump.drainDiscardOrEmpty stderrStream CancellationToken.None
             // Observe both drains together so an I/O fault on one can't orphan the other;
             // `awaitBufferedOutcome` additionally guarantees this even if the exit wait itself faults.
-            let! outcome = awaitBufferedOutcome (startBufferedWait ()) [| stdoutTask; stderrTask |]
+            let! outcome = awaitBufferedOutcome (ensureBufferedWait ()) [| stdoutTask; stderrTask |]
             conclude outcome
             return outcome
         }
@@ -696,7 +736,7 @@ type RunningProcess internal (host: RunningHost) =
             let mutable outcome = Unchecked.defaultof<Outcome>
 
             try
-                let! settled = startBufferedWait ()
+                let! settled = ensureBufferedWait ()
                 do! Task.WhenAll([| stdoutTask; stderrTask |])
                 outcome <- settled
             with ex ->
@@ -724,73 +764,85 @@ type RunningProcess internal (host: RunningHost) =
         this.ProfileAsync(TimeSpan.FromMilliseconds 100.0)
 
     // Returns false when a different consumption (a buffered verb, or event streaming) already owns the
-    // pipes; true once the stdout streaming session is (or already was) ours.
+    // pipes; true once the stdout streaming session is (or already was) ours. The whole check + claim +
+    // session setup runs under `stateLock`, so a concurrent second `StdoutLinesAsync`/`WaitForLineAsync`/
+    // `FinishAsync` either observes a fully-constructed session (channel + pumps + `streamOutcome` all
+    // assigned) or, if it is an incompatible consumer, is atomically refused — never a half-built
+    // session, and never two racing setups building two readers on the one channel.
     member private _.StartStdoutStreaming() : bool =
-        if consumption = Consumption.StdoutStreaming then
-            true
-        elif not (claimStreaming Consumption.StdoutStreaming) then
-            false
-        else
-            let stderrBuffer = Pump.LineBuffer(config.OutputBuffer)
-            stderrStreamBuffer <- stderrBuffer
+        lock stateLock (fun () ->
+            if consumption = Consumption.StdoutStreaming then
+                true
+            elif consumption <> Consumption.Fresh then
+                false
+            else
+                consumption <- Consumption.StdoutStreaming
+                let stderrBuffer = Pump.LineBuffer(config.OutputBuffer)
+                stderrStreamBuffer <- stderrBuffer
 
-            let stdoutPump =
-                task {
-                    try
-                        do!
-                            StreamChannel.pumpLines
-                                stdoutStream
-                                config.StdoutEncoding
-                                config.StdoutLineTerminator
-                                config.StdoutTee
-                                (fun line ->
-                                    invokeLine config.OnStdoutLine line
-                                    bumpStdoutLine ()
+                let stdoutPump =
+                    task {
+                        try
+                            do!
+                                StreamChannel.pumpLines
+                                    stdoutStream
+                                    config.StdoutEncoding
+                                    config.StdoutLineTerminator
+                                    config.StdoutTee
+                                    (fun line ->
+                                        invokeLine config.OnStdoutLine line
+                                        bumpStdoutLine ()
 
-                                    writeStreamItem
-                                        stdoutChannel.Writer
-                                        stdoutChannel.Reader
-                                        readStdoutLineCount
-                                        bumpDroppedStreamLine
-                                        line)
+                                        writeStreamItem
+                                            stdoutChannel.Writer
+                                            stdoutChannel.Reader
+                                            readStdoutLineCount
+                                            bumpDroppedStreamLine
+                                            line)
 
-                        stdoutChannel.Writer.Complete()
-                    with ex ->
-                        // A pump fault — a throwing `OnStdoutLine` handler, or `StreamFullMode.Error`
-                        // tripping its cap — must still complete the channel, carrying the error, so a
-                        // `StdoutLinesAsync` consumer observes it instead of hanging on a reader that
-                        // never ends. Re-raise (preserving the original stack; `reraise` is unavailable
-                        // inside a task CE) so `streamOutcome` / `FinishAsync` surface the same fault.
-                        stdoutChannel.Writer.Complete ex
-                        ExceptionDispatchInfo.Throw ex
-                }
+                            stdoutChannel.Writer.Complete()
+                        with ex ->
+                            // A pump fault — a throwing `OnStdoutLine` handler, or `StreamFullMode.Error`
+                            // tripping its cap — must still complete the channel, carrying the error, so a
+                            // `StdoutLinesAsync` consumer observes it instead of hanging on a reader that
+                            // never ends. Re-raise (preserving the original stack; `reraise` is unavailable
+                            // inside a task CE) so `streamOutcome` / `FinishAsync` surface the same fault.
+                            stdoutChannel.Writer.Complete ex
+                            ExceptionDispatchInfo.Throw ex
+                    }
 
-            let stderrPump =
-                StreamChannel.pumpLines
-                    stderrStream
-                    config.StderrEncoding
-                    config.StderrLineTerminator
-                    config.StderrTee
-                    (fun line ->
-                        invokeLine config.OnStderrLine line
-                        bumpStderrLine ()
-                        stderrBuffer.Add line
-                        ValueTask.CompletedTask)
+                let stderrPump =
+                    StreamChannel.pumpLines
+                        stderrStream
+                        config.StderrEncoding
+                        config.StderrLineTerminator
+                        config.StderrTee
+                        (fun line ->
+                            invokeLine config.OnStderrLine line
+                            bumpStderrLine ()
+                            stderrBuffer.Add line
+                            ValueTask.CompletedTask)
 
-            streamOutcome <-
-                task {
-                    let! outcome = waitWithTimeout ()
-                    // Await both pumps together so neither task is left unobserved if the other faults.
-                    do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
-                    return outcome
-                }
+                // A fault in either pump kills the tree at once, so a still-producing child can't wedge
+                // `waitWithTimeout()` (below) by blocking on a pipe its dead pump no longer drains — the
+                // exit wait then completes and `streamOutcome` surfaces the original pump fault.
+                killTreeOnPumpFault (stdoutPump :> Task)
+                killTreeOnPumpFault (stderrPump :> Task)
 
-            // A `StdoutLinesAsync()` consumer can abandon `FinishAsync()` (e.g. its enumeration throws
-            // because a faulting `OnStdoutLine` handler completed the channel with the error), so observe
-            // the outcome fault here.
-            observeFault streamOutcome
+                streamOutcome <-
+                    task {
+                        let! outcome = waitWithTimeout ()
+                        // Await both pumps together so neither task is left unobserved if the other faults.
+                        do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
+                        return outcome
+                    }
 
-            true
+                // A `StdoutLinesAsync()` consumer can abandon `FinishAsync()` (e.g. its enumeration throws
+                // because a faulting `OnStdoutLine` handler completed the channel with the error), so observe
+                // the outcome fault here.
+                observeFault streamOutcome
+
+                true)
 
     /// Stream stdout line by line as it arrives. Call `FinishAsync` afterwards for stderr + outcome.
     member this.StdoutLinesAsync() : IAsyncEnumerable<string> =
@@ -819,103 +871,113 @@ type RunningProcess internal (host: RunningHost) =
             }
 
     // Returns false when a different consumption (a buffered verb, or stdout streaming) already owns the
-    // pipes; true once the event streaming session is (or already was) ours.
+    // pipes; true once the event streaming session is (or already was) ours. As with
+    // `StartStdoutStreaming`, the whole check + claim + setup runs under `stateLock`, so a concurrent
+    // second `OutputEventsAsync` observes a fully-constructed session or is atomically refused.
     member private _.StartEventStreaming() : bool =
-        if consumption = Consumption.EventStreaming then
-            true
-        elif not (claimStreaming Consumption.EventStreaming) then
-            false
-        else
-            // Each pump completes the shared event channel on its own fault (carrying the error), so an
-            // `OutputEventsAsync` consumer observes a throwing handler promptly rather than hanging until the
-            // process exits — `eventOutcome` below only completes the channel after the exit wait, which
-            // for a long-running child can be far away. `TryComplete` because the two pumps and the
-            // combined task below all race to complete the one channel; re-raise so `eventOutcome` faults.
-            // One helper for both streams so the fault-completion invariant lives in a single place.
-            let eventPump
-                (stream: Stream option)
-                encoding
-                terminator
-                tee
-                (onLine: Action<string> option)
-                (bump: unit -> unit)
-                (countSoFar: unit -> int)
-                (wrap: OutputLine -> OutputEvent)
-                =
-                task {
-                    try
-                        do!
-                            StreamChannel.pumpLines stream encoding terminator tee (fun line ->
-                                invokeLine onLine line
-                                bump ()
+        lock stateLock (fun () ->
+            if consumption = Consumption.EventStreaming then
+                true
+            elif consumption <> Consumption.Fresh then
+                false
+            else
+                consumption <- Consumption.EventStreaming
+                // Each pump completes the shared event channel on its own fault (carrying the error), so an
+                // `OutputEventsAsync` consumer observes a throwing handler promptly rather than hanging until the
+                // process exits — `eventOutcome` below only completes the channel after the exit wait, which
+                // for a long-running child can be far away. `TryComplete` because the two pumps and the
+                // combined task below all race to complete the one channel; re-raise so `eventOutcome` faults.
+                // One helper for both streams so the fault-completion invariant lives in a single place.
+                let eventPump
+                    (stream: Stream option)
+                    encoding
+                    terminator
+                    tee
+                    (onLine: Action<string> option)
+                    (bump: unit -> unit)
+                    (countSoFar: unit -> int)
+                    (wrap: OutputLine -> OutputEvent)
+                    =
+                    task {
+                        try
+                            do!
+                                StreamChannel.pumpLines stream encoding terminator tee (fun line ->
+                                    invokeLine onLine line
+                                    bump ()
 
-                                writeStreamItem
-                                    eventChannel.Writer
-                                    eventChannel.Reader
-                                    countSoFar
-                                    bumpDroppedStreamLine
-                                    (wrap (OutputLine line)))
-                    with ex ->
-                        eventChannel.Writer.TryComplete ex |> ignore
-                        ExceptionDispatchInfo.Throw ex
-                }
+                                    writeStreamItem
+                                        eventChannel.Writer
+                                        eventChannel.Reader
+                                        countSoFar
+                                        bumpDroppedStreamLine
+                                        (wrap (OutputLine line)))
+                        with ex ->
+                            eventChannel.Writer.TryComplete ex |> ignore
+                            ExceptionDispatchInfo.Throw ex
+                    }
 
-            let stdoutPump =
-                eventPump
-                    stdoutStream
-                    config.StdoutEncoding
-                    config.StdoutLineTerminator
-                    config.StdoutTee
-                    config.OnStdoutLine
-                    bumpStdoutLine
-                    readStdoutLineCount
-                    OutputEvent.Stdout
+                let stdoutPump =
+                    eventPump
+                        stdoutStream
+                        config.StdoutEncoding
+                        config.StdoutLineTerminator
+                        config.StdoutTee
+                        config.OnStdoutLine
+                        bumpStdoutLine
+                        readStdoutLineCount
+                        OutputEvent.Stdout
 
-            let stderrPump =
-                eventPump
-                    stderrStream
-                    config.StderrEncoding
-                    config.StderrLineTerminator
-                    config.StderrTee
-                    config.OnStderrLine
-                    bumpStderrLine
-                    readStderrLineCount
-                    OutputEvent.Stderr
+                let stderrPump =
+                    eventPump
+                        stderrStream
+                        config.StderrEncoding
+                        config.StderrLineTerminator
+                        config.StderrTee
+                        config.OnStderrLine
+                        bumpStderrLine
+                        readStderrLineCount
+                        OutputEvent.Stderr
 
-            eventOutcome <-
-                task {
-                    let mutable error: exn option = None
-                    let mutable outcome = Unchecked.defaultof<Outcome>
+                // A fault in either pump kills the tree at once, so a still-producing child can't wedge
+                // `waitWithTimeout()` (below) by blocking on a pipe its dead pump no longer drains — the
+                // exit wait then completes and `eventOutcome` surfaces the original pump fault.
+                killTreeOnPumpFault (stdoutPump :> Task)
+                killTreeOnPumpFault (stderrPump :> Task)
 
-                    try
-                        let! settled = waitWithTimeout ()
-                        outcome <- settled
-                        // Await both pumps together so neither is left unobserved if the other faults.
-                        do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
-                        eventChannel.Writer.TryComplete() |> ignore
-                    with ex ->
-                        error <- Some ex
-                        // A fault (a throwing handler, or the exit wait itself) completes the channel WITH
-                        // the error so an `OutputEventsAsync` consumer observes it instead of hanging — idempotent
-                        // with the per-pump completion above. The fault is otherwise consumed here (and by
-                        // the ContinueWith below) rather than surfacing as an unobserved task exception.
-                        eventChannel.Writer.TryComplete ex |> ignore
+                eventOutcome <-
+                    task {
+                        let mutable error: exn option = None
+                        let mutable outcome = Unchecked.defaultof<Outcome>
 
-                    // Surface the outcome, or re-raise the fault for a concurrent ExitTask (WaitAny/WaitAll
-                    // on this handle). The ContinueWith below observes that fault, so the OutputEvents-only
-                    // case never leaves an unobserved task exception.
-                    match error with
-                    | Some ex -> return! Task.FromException<Outcome> ex
-                    | None ->
-                        conclude outcome
-                        return outcome
-                }
+                        try
+                            let! settled = waitWithTimeout ()
+                            outcome <- settled
+                            // Await both pumps together so neither is left unobserved if the other faults.
+                            do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
+                            eventChannel.Writer.TryComplete() |> ignore
+                        with ex ->
+                            error <- Some ex
+                            // A fault (a throwing handler, or the exit wait itself) completes the channel WITH
+                            // the error so an `OutputEventsAsync` consumer observes it instead of hanging — idempotent
+                            // with the per-pump completion above. The fault is otherwise consumed here (and by
+                            // the ContinueWith below) rather than surfacing as an unobserved task exception.
+                            eventChannel.Writer.TryComplete ex |> ignore
 
-            // Observe any fault on this otherwise fire-and-forget task (the OutputEvents-only case, where
-            // nothing awaits `ExitTask`).
-            observeFault eventOutcome
+                        // Surface the outcome, or re-raise the fault for a concurrent ExitTask (WaitAny/WaitAll
+                        // on this handle). The ContinueWith below observes that fault, so the OutputEvents-only
+                        // case never leaves an unobserved task exception.
+                        match error with
+                        | Some ex -> return! Task.FromException<Outcome> ex
+                        | None ->
+                            conclude outcome
+                            return outcome
+                    }
 
-            true
+                // Observe any fault on this otherwise fire-and-forget task (the OutputEvents-only case, where
+                // nothing awaits `ExitTask`).
+                observeFault eventOutcome
+
+                true)
 
     /// Stream merged stdout+stderr line events as they arrive, each tagged with its origin
     /// (`OutputEvent.Stdout`/`OutputEvent.Stderr`). Under `Command.MergeStderr` the child has no separate
@@ -1003,58 +1065,59 @@ type RunningProcess internal (host: RunningHost) =
         ReadinessProbe.waitFor config.Program probe timeout cancellationToken
 
     /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
-    /// the racing primitive behind `WaitAnyAsync`/`WaitAllAsync`. Reuses whichever consumption already
-    /// owns the pipes instead of ever starting a second reader on them:
+    /// the racing primitive behind `WaitAnyAsync`/`WaitAllAsync`. Built exactly once under `stateLock`
+    /// (so concurrent `WaitAnyAsync`/`WaitAllAsync` on the same handle can't create two racing waits),
+    /// reusing whichever consumption already owns the pipes instead of ever starting a second reader:
     /// - `StdoutStreaming`/`EventStreaming`: the session's own combined outcome.
     /// - `Buffered` (a capture verb already started — the "verb, then WaitAny/WaitAll" order): the
-    ///   verb's own in-flight `bufferedOutcome`, set synchronously by `startBufferedWait` before the
-    ///   verb's `let!` can suspend, so it is always assigned by the time a sequential caller reaches
-    ///   this property.
+    ///   verb's own single wait, shared via `ensureBufferedWait` (memoized under the same lock, so it
+    ///   is observed here regardless of which of the two reached it first).
     /// - `Fresh` (WaitAny/WaitAll arrives first): claims the buffered slot itself and runs its own
     ///   drains, so a terminal verb called afterwards on the same handle is refused
     ///   (`alreadyConsumedError`) rather than racing a second reader.
     member internal _.ExitTask: Task<Outcome> =
-        if not exitStarted then
-            exitStarted <- true
+        lock stateLock (fun () ->
+            if not exitStarted then
+                exitStarted <- true
 
-            exitTaskValue <-
-                if consumption = Consumption.StdoutStreaming then
-                    streamOutcome
-                elif consumption = Consumption.EventStreaming then
-                    // The event pumps already drain both pipes; reuse their shared outcome rather than
-                    // starting our own drains here, which would race a second reader on the same streams.
-                    eventOutcome
-                elif consumption = Consumption.Buffered then
-                    // A buffered verb already claimed the pipes and is already awaiting its own single
-                    // wait; reuse it rather than starting a second pair of readers on the same pipes and
-                    // a second `host.Wait()`.
-                    bufferedOutcome
-                else
-                    // Fresh: no verb has run yet. Claim the buffered slot so a terminal verb called
-                    // after WaitAny/WaitAll on the same handle is refused rather than racing a second
-                    // reader on these pipes.
-                    claimBuffered () |> ignore
+                exitTaskValue <-
+                    if consumption = Consumption.StdoutStreaming then
+                        streamOutcome
+                    elif consumption = Consumption.EventStreaming then
+                        // The event pumps already drain both pipes; reuse their shared outcome rather than
+                        // starting our own drains here, which would race a second reader on the same streams.
+                        eventOutcome
+                    elif consumption = Consumption.Buffered then
+                        // A buffered verb already claimed the pipes; share its single wait (memoized under
+                        // this same lock) rather than starting a second pair of readers and a second
+                        // `host.Wait()`. Its own pumps drain the pipes, so the reused wait needs none.
+                        ensureBufferedWait ()
+                    else
+                        // Fresh: no verb has run yet. Claim the buffered slot (inline — we already hold
+                        // `stateLock`) so a terminal verb called after WaitAny/WaitAll on the same handle
+                        // is refused rather than racing a second reader on these pipes.
+                        consumption <- Consumption.Buffered
 
-                    task {
-                        // These drains are fire-and-forget for a race loser the caller may dispose
-                        // mid-drain, so they must complete quietly on teardown rather than fault unobserved.
-                        let stdoutDrain =
-                            Pump.drainDiscardOrEmptyUntilDone stdoutStream CancellationToken.None
+                        task {
+                            // These drains are fire-and-forget for a race loser the caller may dispose
+                            // mid-drain, so they must complete quietly on teardown rather than fault unobserved.
+                            let stdoutDrain =
+                                Pump.drainDiscardOrEmptyUntilDone stdoutStream CancellationToken.None
 
-                        let stderrDrain =
-                            Pump.drainDiscardOrEmptyUntilDone stderrStream CancellationToken.None
+                            let stderrDrain =
+                                Pump.drainDiscardOrEmptyUntilDone stderrStream CancellationToken.None
 
-                        let! outcome = waitWithTimeout ()
-                        do! Task.WhenAll([| stdoutDrain; stderrDrain |])
-                        // Racing this handle to exit *is* its completion (conclude does not reap, so the
-                        // no-reap contract holds), so a `WaitAny`/`WaitAll`-only run still records its
-                        // exit/metrics/span and clears the in-flight mark. Once-guarded, so a terminal verb
-                        // afterwards (already refused by the buffered claim above) can't double-count.
-                        conclude outcome
-                        return outcome
-                    }
+                            let! outcome = waitWithTimeout ()
+                            do! Task.WhenAll([| stdoutDrain; stderrDrain |])
+                            // Racing this handle to exit *is* its completion (conclude does not reap, so the
+                            // no-reap contract holds), so a `WaitAny`/`WaitAll`-only run still records its
+                            // exit/metrics/span and clears the in-flight mark. Once-guarded, so a terminal verb
+                            // afterwards (already refused by the buffered claim above) can't double-count.
+                            conclude outcome
+                            return outcome
+                        }
 
-        exitTaskValue
+            exitTaskValue)
 
     /// Wait for the first of `processes` to exit; returns its index and outcome. Does not reap any
     /// of them — dispose them yourself. Safe to call on a handle a buffered verb (`OutputStringAsync`/
