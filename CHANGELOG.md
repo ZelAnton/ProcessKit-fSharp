@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - On Windows, `ProcessGroup.Suspend`/`Resume` now re-verify (`IsProcessInJob`) that a job member's process handle is still actually a member of the job right after opening it, closing a narrow pid-reuse race: previously, if a member (typically a handle-less grandchild) exited and its pid was immediately reused by an unrelated process between the member snapshot and `OpenProcess`, that unrelated process could be frozen/thawed instead. The re-check is fail-safe (any failure to open the process or query its membership leaves it untouched) and the fix touches only this internal handle-acquisition step — no public API change.
+- On Linux, a failed `cgroup.procs` read (e.g. EACCES/EIO racing teardown) is no longer folded into an empty member list. Graceful shutdown and the kill fallback for the cgroup v2 `limits` backend now treat a read failure as "membership unknown, not drained," so they keep escalating instead of concluding the tree already exited early; `ProcessGroup.Members`/`Stats` propagate the read failure as an honest `ProcessError.Io` rather than reporting a fabricated empty group / zero active processes.
 
 ## [2.2.0] - 2026-07-10
 
