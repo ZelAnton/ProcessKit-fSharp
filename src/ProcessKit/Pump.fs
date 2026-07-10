@@ -229,6 +229,31 @@ module internal Pump =
         }
         :> Task
 
+    /// Flush a tee sink after a pump's read loop ends, so a buffered tee (a `BufferedStream`, a
+    /// compression/encryption wrapper, a `StreamWriter`-backed stream) hands its last bytes to a
+    /// concurrent reader without waiting for the caller to dispose it. Runs on every pump exit path —
+    /// clean EOF as well as a read-loop failure — because the caller (`try`/`finally` around the pump
+    /// body) invokes it unconditionally. ProcessKit does not own the caller-supplied tee and never
+    /// disposes it — only flushes it — and the flush itself is teardown-race-safe: it swallows the
+    /// same two exceptions `disposeQuietly` does (a tee closed out from under us, or its underlying
+    /// pipe/file breaking mid-flush), so a torn-down tee can never mask the pump's own outcome.
+    let private flushTeeQuietly (tee: Stream option) (cancellationToken: CancellationToken) : Task =
+        task {
+            match tee with
+            | Some sink ->
+                try
+                    do! sink.FlushAsync cancellationToken
+                with
+                | :? ObjectDisposedException ->
+                    // The tee was disposed out from under us during a teardown race; nothing to flush.
+                    ()
+                | :? IOException ->
+                    // The tee's underlying pipe/file broke while flushing during teardown; best-effort.
+                    ()
+            | None -> ()
+        }
+        :> Task
+
     /// Read `stream` to EOF: tee the raw bytes (if a sink is set), decode with `encoding`, split into
     /// lines under `terminator`, and pass each complete line — including a final unterminated one — to
     /// `onLine`. `terminator` decides where a line ends: `Lf` (the default) splits on `\n` only,
@@ -243,7 +268,11 @@ module internal Pump =
     /// e.g. a bounded channel's backpressured `WriteAsync`, which must stop this very read loop from
     /// draining more of the pipe until the consumer catches up. A buffered sink (a `LineBuffer`) is
     /// synchronous work wrapped in `ValueTask.CompletedTask`, so it costs nothing extra on that path.
-    let readLines
+    ///
+    /// The line-splitting body itself lives in `readLinesBody`; this function only adds the
+    /// `finally`-flush of `tee` (see `flushTeeQuietly`), which must run on every exit path of the read
+    /// loop — clean EOF as well as a read failure — not just the happy path.
+    let private readLinesBody
         (stream: Stream)
         (encoding: Encoding)
         (terminator: LineTerminator)
@@ -509,6 +538,38 @@ module internal Pump =
         }
         :> Task
 
+    /// Read `stream` to EOF via `readLinesBody`, then flush `tee` (if set) so a buffered tee sink sees
+    /// its last bytes without waiting for the caller to dispose it — on both the clean-EOF path and a
+    /// read-loop failure (the `finally` runs either way). See `flushTeeQuietly`.
+    let readLines
+        (stream: Stream)
+        (encoding: Encoding)
+        (terminator: LineTerminator)
+        (tee: Stream option)
+        (onLine: string -> ValueTask)
+        (maxLineLength: int option)
+        (cancellationToken: CancellationToken)
+        : Task =
+        task {
+            // The F# `task` builder doesn't support an async (`do!`) `finally` clause (FS0750), so the
+            // "flush on every exit path" guarantee is hand-rolled here: catch, flush unconditionally,
+            // then rethrow the original exception (via `ExceptionDispatchInfo`, preserving its stack)
+            // so a read-loop failure still propagates to the caller after the tee is flushed.
+            let mutable fault: exn option = None
+
+            try
+                do! readLinesBody stream encoding terminator tee onLine maxLineLength cancellationToken
+            with ex ->
+                fault <- Some ex
+
+            do! flushTeeQuietly tee cancellationToken
+
+            match fault with
+            | Some ex -> ExceptionDispatchInfo.Throw ex
+            | None -> ()
+        }
+        :> Task
+
     /// `readLines` for a background pump: swallows the disposal / broken-pipe exceptions of a
     /// teardown race (the stream closed underneath an in-flight read), so the task never faults
     /// unobserved.
@@ -548,24 +609,39 @@ module internal Pump =
         }
         :> Task
 
-    /// Read `stream` to EOF as raw bytes (no line splitting), teeing if a sink is set.
+    /// Read `stream` to EOF as raw bytes (no line splitting), teeing if a sink is set. `tee` is flushed
+    /// once the read loop ends — clean EOF or a read failure alike, via `finally` — so a buffered tee
+    /// sink sees its last bytes without waiting for the caller to dispose it (see `flushTeeQuietly`).
     let drainRaw (stream: Stream) (tee: Stream option) (cancellationToken: CancellationToken) : Task<byte[]> =
         task {
             use buffer = new MemoryStream()
-            let chunk = Array.zeroCreate<byte> 8192
-            let mutable reading = true
+            // See the comment on `readLines`'s wrapper for why this is hand-rolled instead of an async
+            // `finally` (FS0750): flush unconditionally, then rethrow the original fault (if any).
+            let mutable fault: exn option = None
 
-            while reading do
-                let! read = stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)
+            try
+                let chunk = Array.zeroCreate<byte> 8192
+                let mutable reading = true
 
-                if read = 0 then
-                    reading <- false
-                else
-                    do! buffer.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
+                while reading do
+                    let! read = stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)
 
-                    match tee with
-                    | Some sink -> do! sink.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
-                    | None -> ()
+                    if read = 0 then
+                        reading <- false
+                    else
+                        do! buffer.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
+
+                        match tee with
+                        | Some sink -> do! sink.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
+                        | None -> ()
+            with ex ->
+                fault <- Some ex
+
+            do! flushTeeQuietly tee cancellationToken
+
+            match fault with
+            | Some ex -> ExceptionDispatchInfo.Throw ex
+            | None -> ()
 
             return buffer.ToArray()
         }
@@ -613,7 +689,10 @@ module internal Pump =
     /// teeing the FULL byte stream if a sink is set — the tee mirrors exactly what the child produced,
     /// so it is independent of the in-memory retention policy (just as `readLines` tees before its line
     /// buffer applies). Returns the retained bytes plus the truncation / fail-loud / total signals. The
-    /// child never blocks: the pipe is always drained to EOF even after the cap is reached.
+    /// child never blocks: the pipe is always drained to EOF even after the cap is reached. `tee` is
+    /// flushed once the read loop ends — clean EOF or a read failure alike, via `finally` — so a
+    /// buffered tee sink sees its last bytes without waiting for the caller to dispose it (see
+    /// `flushTeeQuietly`).
     let drainRawBounded
         (stream: Stream)
         (tee: Stream option)
@@ -623,20 +702,33 @@ module internal Pump =
         : Task<RawCapture> =
         task {
             let buffer = RawBuffer(cap, overflow)
-            let chunk = Array.zeroCreate<byte> 8192
-            let mutable reading = true
+            // See the comment on `readLines`'s wrapper for why this is hand-rolled instead of an async
+            // `finally` (FS0750): flush unconditionally, then rethrow the original fault (if any).
+            let mutable fault: exn option = None
 
-            while reading do
-                let! read = stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)
+            try
+                let chunk = Array.zeroCreate<byte> 8192
+                let mutable reading = true
 
-                if read = 0 then
-                    reading <- false
-                else
-                    match tee with
-                    | Some sink -> do! sink.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
-                    | None -> ()
+                while reading do
+                    let! read = stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)
 
-                    buffer.Append(chunk, 0, read)
+                    if read = 0 then
+                        reading <- false
+                    else
+                        match tee with
+                        | Some sink -> do! sink.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
+                        | None -> ()
+
+                        buffer.Append(chunk, 0, read)
+            with ex ->
+                fault <- Some ex
+
+            do! flushTeeQuietly tee cancellationToken
+
+            match fault with
+            | Some ex -> ExceptionDispatchInfo.Throw ex
+            | None -> ()
 
             return
                 { Bytes = buffer.ToArray()

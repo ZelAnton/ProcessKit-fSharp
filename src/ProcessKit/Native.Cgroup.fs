@@ -193,8 +193,12 @@ module internal Cgroup =
             finally
                 closeFd fd |> ignore
 
-    /// The live member pids of a cgroup (`cgroup.procs`).
-    let cgroupMembers (cgroupPath: string) : int list =
+    /// The live member pids of a cgroup (`cgroup.procs`), distinguishing "read, and it's empty" from
+    /// "the read itself failed" (EACCES/EIO, a race with teardown removing the directory, …). Folding
+    /// both into `[]` (the previous behaviour) made a transient read failure indistinguishable from a
+    /// genuinely drained group — every fail-safe decision below (`cgroupAlive`, the `killCgroup` sweep,
+    /// `terminateCgroup`, `signalCgroup`, `CgroupBackend.Members`/`Stats`) depends on telling them apart.
+    let cgroupMembers (cgroupPath: string) : Result<int list, string> =
         try
             File.ReadAllLines(Path.Combine(cgroupPath, "cgroup.procs"))
             |> Array.choose (fun line ->
@@ -202,11 +206,18 @@ module internal Cgroup =
                 | true, pid -> Some pid
                 | _ -> None)
             |> List.ofArray
-        with _ ->
-            []
+            |> Ok
+        with ex ->
+            Error ex.Message
 
+    /// "Not yet drained" for the graceful-teardown poll loop (`GracefulKillTree`) and the legacy sweep
+    /// below: a read failure is UNKNOWN membership, not an empty group, so it must report `true` (still
+    /// alive) — never let an unreadable `cgroup.procs` look like the tree already drained and cut the
+    /// teardown short.
     let cgroupAlive (cgroupPath: string) =
-        not (List.isEmpty (cgroupMembers cgroupPath))
+        match cgroupMembers cgroupPath with
+        | Ok members -> not (List.isEmpty members)
+        | Error _ -> true
 
     /// Hard-kill the whole subtree via `cgroup.kill` (kernel >= 5.14); on older kernels, freeze then
     /// run a bounded per-pid SIGKILL sweep.
@@ -228,9 +239,20 @@ module internal Cgroup =
 
             let mutable sweep = 0
 
+            // `cgroupAlive` reports a read failure as "still alive," so a persistent (or transient)
+            // `cgroup.procs` read failure keeps this loop running for its full iteration budget instead
+            // of stopping on the first failed read — self-healing if the failure clears within the
+            // budget, and otherwise leaving the caller correctly unsure the tree is fully dead rather
+            // than falsely told it drained.
             while cgroupAlive cgroupPath && sweep < 50 do
-                for pid in cgroupMembers cgroupPath do
-                    kill (pid, SIGKILL) |> ignore
+                match cgroupMembers cgroupPath with
+                | Ok members ->
+                    for pid in members do
+                        kill (pid, SIGKILL) |> ignore
+                | Error _ ->
+                    // Unknown membership this iteration — nothing safe to target; the loop condition
+                    // above already keeps sweeping rather than treating this as drained.
+                    ()
 
                 System.Threading.Thread.Sleep 2
                 sweep <- sweep + 1
@@ -244,26 +266,41 @@ module internal Cgroup =
 
     /// SIGTERM every member (graceful); the caller polls then escalates with `killCgroup`.
     let terminateCgroup (cgroupPath: string) =
-        for pid in cgroupMembers cgroupPath do
-            kill (pid, SIGTERM) |> ignore
+        match cgroupMembers cgroupPath with
+        | Ok members ->
+            for pid in members do
+                kill (pid, SIGTERM) |> ignore
+        | Error _ ->
+            // Unknown membership: there is nobody safe to signal this call, but silently doing nothing
+            // must not look like "the group is already empty" — `GracefulKillTree`'s poll loop that
+            // follows relies on `cgroupAlive` (not this call's return) to treat the same read failure as
+            // "not drained," so the teardown still escalates to `killCgroup`'s retrying sweep instead of
+            // quietly completing.
+            ()
 
     /// Broadcast a raw signal to every member of a cgroup, aggregating the per-pid outcomes: a member
     /// that already exited (ESRCH) does not abort the broadcast — every member still gets the signal —
-    /// but the first genuine delivery failure is what the aggregated result reports.
+    /// but the first genuine delivery failure is what the aggregated result reports. An unreadable
+    /// member list is reported as a delivery failure too (never a false "delivered to nobody" success)
+    /// — signalling nobody must not look like a successful broadcast to an unknown group.
     let signalCgroup (cgroupPath: string) (signalNum: int) : SignalDelivery =
-        let mutable firstFailure: SignalDelivery option = None
+        match cgroupMembers cgroupPath with
+        | Error message ->
+            SignalDelivery.DeliveryFailed(0, $"could not read cgroup.procs to broadcast the signal: {message}")
+        | Ok members ->
+            let mutable firstFailure: SignalDelivery option = None
 
-        for pid in cgroupMembers cgroupPath do
-            match signalPid pid signalNum with
-            | SignalDelivery.Delivered
-            | SignalDelivery.TargetGone -> ()
-            | SignalDelivery.DeliveryFailed _ as failure ->
-                if firstFailure.IsNone then
-                    firstFailure <- Some failure
+            for pid in members do
+                match signalPid pid signalNum with
+                | SignalDelivery.Delivered
+                | SignalDelivery.TargetGone -> ()
+                | SignalDelivery.DeliveryFailed _ as failure ->
+                    if firstFailure.IsNone then
+                        firstFailure <- Some failure
 
-        match firstFailure with
-        | Some failure -> failure
-        | None -> SignalDelivery.Delivered
+            match firstFailure with
+            | Some failure -> failure
+            | None -> SignalDelivery.Delivered
 
     /// Freeze (`true`) or thaw (`false`) a cgroup (`cgroup.freeze`).
     let freezeCgroup (cgroupPath: string) (frozen: bool) =
