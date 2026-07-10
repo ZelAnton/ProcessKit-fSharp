@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [2.2.0] - 2026-07-10
+
+### Added
 - `Command.MergeStderr` / `Command.mergeStderr`: fold the child's stderr into its stdout at the OS level — the library equivalent of a shell `2>&1`. The native spawn routes the child's stderr at the same pipe/handle as its stdout (POSIX `dup2` of fd 2 onto stdout's target; Windows shares one handle across `STARTUPINFO.hStdOutput`/`hStdError`), so the two streams interleave honestly, byte for byte, on the single stdout stream — the real terminal-order view that the post-hoc `ProcessResult.Combined` (a concatenation of two separately captured streams) cannot reproduce. It works uniformly for the buffering verbs, the streaming verbs (`StdoutLinesAsync`/`OutputEventsAsync`), and pipeline stages; the default is off (separate stdout/stderr, unchanged). There is then no separate stderr stream, and the API reflects that honestly rather than downgrading silently: `ProcessResult.Stderr` is empty, `OutputEventsAsync` emits only `Stdout` events, and the separate-stderr observation hooks `StderrTee`/`OnStderrLine` are rejected in combination with `MergeStderr` (`ArgumentException`, in either chaining order) — while `StderrEncoding`/`StderrLineTerminator`/`Stderr` mode are documented no-ops (the merged bytes follow stdout's encoding/framing/destination). Inside a `Pipeline` it is allowed only on the last stage (whose stdout is the captured output); an earlier stage is rejected the moment it stops being last, since a merge there would inject its stderr into the next stage's input.
 - Runnable F# and C# sample projects under `samples/`, built separately in CI, covering capture, streaming readiness, pipelines, supervision, dependency injection, and test doubles.
 - `ProcessKit.Extensions.Hosting`: register a supervised child process as an `IHostedService` with `AddProcessKitHostedProcess`, including graceful host-shutdown via `RunningProcess.StopAsync` and final supervision outcome access for health reporting.
@@ -182,6 +193,7 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - POSIX: the SIGCHLD dispatch callback no longer blocks on a `Thread.Sleep` spin while resolving a reap race against a concurrent `reapLeader` (group teardown) — the same bounded grace period now runs on the thread pool instead of the shared signal-dispatch thread, so it can no longer delay reaping every other pending child. A race that genuinely can't be resolved within the grace period now reports `Outcome.Unobserved` rather than a fabricated clean exit; the far more common case — the concurrent reap actually landing the real status — is unaffected.
 - Linux cgroup v2: a child that cannot be migrated into the cgroup (the write to `cgroup.procs` fails) is now killed and reaped, and the spawn fails with `ProcessError.ResourceLimit`, instead of being silently left to run in the parent cgroup entirely outside the requested resource limits. The `Mechanism.CgroupV2` / `ProcessGroup.Create` docs now also state the spawn→migrate window honestly: the limits apply to the child and every descendant it forks *after* migration, while a grandchild forked in the brief window before the migration write completes stays in the parent cgroup — still reaped by kill-on-drop teardown, but outside the resource limits.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v0.0.0...v2.0.0
