@@ -285,3 +285,147 @@ type ProcessControlTests() =
             )
         }
         :> Task
+
+    // --- T-069: a cancellable, fully observable stdin feeder (RunningProcess + ProcessGroup call sites).
+    // The `HangingStdinAsyncLines` / `FaultyStdin*` doubles are shared from `PipelineTests.fs`. The fault
+    // tests feed a stdin-reading child (`sort`, reads to EOF then exits 0) so a source fault that closes
+    // stdin as its last act is always observed before the child — and thus the run — exits. ---
+
+    [<Test>]
+    member _.``a run stops a hung async stdin feed on teardown and disposes its enumerator``() : Task =
+        task {
+            // The child exits at once without reading stdin, so the `FromAsyncLines` feed is left parked
+            // in `MoveNextAsync`. The run's teardown must Stop the feeder — cancelling the hung feed and
+            // disposing the user's enumerator — instead of leaking it past the run (early child exit).
+            let source = HangingStdinAsyncLines()
+            let cmd = (shell "exit 0") |> Command.stdin (Stdin.FromAsyncLines source)
+
+            match! cmd.OutputStringAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"expected a successful run, got {error}"
+
+            let! completed = Task.WhenAny(source.Disposed, Task.Delay 5000)
+            Assert.That(completed, Is.SameAs source.Disposed, "the hung async enumerator was never disposed")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``cancelling a run during a hung stdin feed reports Cancelled and disposes the enumerator``() : Task =
+        task {
+            // A live child plus a hung `FromAsyncLines` feed: cancelling the run mid-feed must report
+            // `Cancelled` and — via teardown — Stop the feeder so the parked enumerator is disposed.
+            let source = HangingStdinAsyncLines()
+            let cmd = sleeper |> Command.stdin (Stdin.FromAsyncLines source)
+            use cts = new CancellationTokenSource()
+            let run = cmd.OutputStringAsync cts.Token
+
+            // Cancel only once the feed is genuinely parked in `MoveNextAsync`.
+            let! started = Task.WhenAny(source.Started, Task.Delay 5000)
+            Assert.That(started, Is.SameAs source.Started, "the async feed never started")
+            cts.Cancel()
+
+            match! run with
+            | Error(ProcessError.Cancelled _) -> ()
+            | Error other -> Assert.Fail $"expected Cancelled, got {other.Message}"
+            | Ok _ -> Assert.Fail "expected a cancelled run to error"
+
+            let! completed = Task.WhenAny(source.Disposed, Task.Delay 5000)
+            Assert.That(completed, Is.SameAs source.Disposed, "the parked enumerator was never disposed on cancel")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a FromLines source that throws at GetEnumerator surfaces as ProcessError.Stdin``() : Task =
+        task {
+            // The sync source faults acquiring its enumerator — the entry stage the pre-fix code let
+            // slip past into the benign-broken-pipe bucket. On an otherwise-successful run it must
+            // surface as `ProcessError.Stdin`.
+            let cmd =
+                (Command.create "sort")
+                |> Command.stdin (Stdin.FromLines(FaultyStdinLines AtGetEnumerator))
+
+            match! cmd.OutputStringAsync() with
+            | Error(ProcessError.Stdin _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Stdin, got {other.Message}"
+            | Ok _ -> Assert.Fail "expected a GetEnumerator fault to surface as ProcessError.Stdin"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a FromAsyncLines source that throws at MoveNextAsync surfaces as ProcessError.Stdin``() : Task =
+        task {
+            let cmd =
+                (Command.create "sort")
+                |> Command.stdin (Stdin.FromAsyncLines(FaultyStdinAsyncLines AtMoveNext))
+
+            match! cmd.OutputStringAsync() with
+            | Error(ProcessError.Stdin _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Stdin, got {other.Message}"
+            | Ok _ -> Assert.Fail "expected a MoveNextAsync fault to surface as ProcessError.Stdin"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a FromAsyncLines source that throws at Current surfaces as ProcessError.Stdin``() : Task =
+        task {
+            let cmd =
+                (Command.create "sort")
+                |> Command.stdin (Stdin.FromAsyncLines(FaultyStdinAsyncLines AtCurrent))
+
+            match! cmd.OutputStringAsync() with
+            | Error(ProcessError.Stdin _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Stdin, got {other.Message}"
+            | Ok _ -> Assert.Fail "expected a Current fault to surface as ProcessError.Stdin"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ProcessGroup StartAsync stops a hung stdin feed when the shared run is disposed``() : Task =
+        task {
+            // The shared-group start path (BuildHost with ownsGroup=false) must Stop the feeder on the
+            // run's teardown too: disposing the `RunningProcess` cancels the hung feed and disposes the
+            // user's enumerator.
+            use group = create ()
+            let source = HangingStdinAsyncLines()
+            let cmd = (shell "exit 0") |> Command.stdin (Stdin.FromAsyncLines source)
+
+            match! group.StartAsync cmd with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let! started = Task.WhenAny(source.Started, Task.Delay 5000)
+                Assert.That(started, Is.SameAs source.Started, "the shared-run async feed never started")
+                let! _ = running.WaitAsync()
+                do! (running :> IAsyncDisposable).DisposeAsync()
+
+                let! completed = Task.WhenAny(source.Disposed, Task.Delay 5000)
+                Assert.That(completed, Is.SameAs source.Disposed, "disposing the shared run did not stop the hung feed")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Stdin factories reject null arguments at the API boundary``() =
+        Assert.Throws<ArgumentNullException>(Action(fun () -> Stdin.FromString(Unchecked.defaultof<string>) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentNullException>(Action(fun () -> Stdin.FromBytes(Unchecked.defaultof<byte[]>) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentNullException>(Action(fun () -> Stdin.FromFile(Unchecked.defaultof<string>) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> Stdin.FromStream(Unchecked.defaultof<IO.Stream>) |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> Stdin.FromLines(Unchecked.defaultof<seq<string>>) |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () ->
+                Stdin.FromAsyncLines(Unchecked.defaultof<Collections.Generic.IAsyncEnumerable<string>>)
+                |> ignore)
+        )
+        |> ignore

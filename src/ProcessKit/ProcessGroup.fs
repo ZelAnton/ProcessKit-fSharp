@@ -188,7 +188,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // The rest of the host is closures and stream references that do not touch the container's
             // release state, so it is built outside the lock. The background stdin feed writes to the
             // child's own stdin pipe (not the container), so kicking it off here is race-free.
-            let stdinFeed = Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
+            let stdinFeeder = Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
 
             let closeStreams () =
                 // Close the pipe streams (OS handles/fds) before releasing/detaching.
@@ -206,19 +206,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
               Wait = (fun () -> waitOutcome spawned.Handle)
-              // Observe the stashed source failure without blocking: read it only once the feed has
-              // finished, else `None`. `IsCompletedSuccessfully` + `.Result` is race-free — `feedStdin`
-              // never faults, so completion establishes the happens-before for the stashed value. We
-              // deliberately do NOT await the feed (a source parked mid-read would hang the verb), so
-              // an async-manifesting source fault that loses the race with the child's own exit is not
-              // surfaced — matching ProcessKit-rs. The common case, a missing `FromFile`, faults
-              // synchronously at spawn (`File.OpenRead`), so it is always observed.
-              StdinError =
-                (fun () ->
-                    if stdinFeed.IsCompletedSuccessfully then
-                        stdinFeed.Result
-                    else
-                        None)
+              // Observe the stashed source failure without blocking: `StdinFeeder.Fault` reads it only
+              // once the feed has finished, else `None`. Race-free — `feedStdin` never faults, so
+              // completion establishes the happens-before for the stashed value. We deliberately do NOT
+              // await the feed (a source parked mid-read would hang the verb), so an async-manifesting
+              // source fault that loses the race with the child's own exit is not surfaced — matching
+              // ProcessKit-rs. The common case, a missing `FromFile`, faults synchronously at spawn
+              // (`File.OpenRead`), so it is always observed.
+              StdinError = (fun () -> stdinFeeder.Fault)
               StartKill =
                 (if ownsGroup then
                      backend.KillTree
@@ -231,6 +226,12 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                      (fun _ -> task { backend.KillChild spawned } :> Task))
               Teardown =
                 fun () ->
+                    // Stop the stdin feeder first: cancelling its lifecycle token unblocks a feed parked
+                    // in the user's source (a hung `FromAsyncLines`) so it unwinds and disposes the
+                    // user's enumerator/stream, instead of leaking it past teardown. Idempotent, so the
+                    // redundant call on a second Teardown (verb reapGuard, then handle disposal) is
+                    // harmless. Closing the stdin stream below still covers a write-parked feed.
+                    stdinFeeder.Stop()
                     closeStreams ()
 
                     if ownsGroup then

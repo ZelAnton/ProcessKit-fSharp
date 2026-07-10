@@ -9,6 +9,59 @@ open NUnit.Framework
 open NUnit.Framework.Legacy
 open ProcessKit
 
+/// A stdin `Stream` whose every write throws a broken-pipe `IOException` (the child closed its stdin
+/// early). The T-069 feeder must treat this as benign — never a stdin error — and it must not mask a
+/// simultaneous source fault. Private to this file; the source/enumerator doubles come from
+/// `PipelineTests.fs`.
+type private BrokenPipeStdinStream() =
+    inherit Stream()
+
+    override _.CanRead = false
+    override _.CanSeek = false
+    override _.CanWrite = true
+    override _.Length = 0L
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = ()
+    override _.Read(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Write(_buffer, _offset, _count) = raise (IOException "broken-pipe")
+
+    override _.WriteAsync(_buffer: ReadOnlyMemory<byte>, _cancellationToken: CancellationToken) : ValueTask =
+        raise (IOException "broken-pipe")
+
+    override _.FlushAsync(_cancellationToken: CancellationToken) : Task = raise (IOException "broken-pipe")
+
+/// A `FromStream` source whose reads throw — a source that faults mid-read. The T-069 feeder must
+/// surface it as a genuine source fault, not a benign broken pipe.
+type private FaultyReadStdinStream() =
+    inherit Stream()
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = ()
+
+    override _.Read(_buffer, _offset, _count) : int =
+        raise (InvalidOperationException "read-source-boom")
+
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+
+    override _.ReadAsync(_buffer: Memory<byte>, _cancellationToken: CancellationToken) : ValueTask<int> =
+        raise (InvalidOperationException "read-source-boom")
+
 /// Direct tests of the internal output pump: decoding (BOM, multibyte boundaries, line endings)
 /// and the `OutputBufferPolicy` retention logic. These drive `Pump.readLines` / `Pump.LineBuffer`
 /// over in-memory streams, so they are deterministic and need no subprocess.
@@ -52,6 +105,12 @@ type PumpTests() =
             i <- i + n
 
     let bytesOf (s: string) = Encoding.UTF8.GetBytes s
+
+    // Run `source` to completion against `stdin` via the real `feedStdinSource` entry point (its own
+    // lifecycle CTS, close-when-done) and return the genuine fault it stashed, or `None`. (T-069)
+    let feederFault (source: Stdin) (stdin: Stream) : exn option =
+        let feeder = Pump.feedStdinSource (Some stdin) (Some source)
+        feeder.Task.Result
 
     [<Test>]
     member _.``readLines strips a leading UTF-8 BOM``() =
@@ -596,3 +655,113 @@ type PumpTests() =
             Action(fun () -> OutputBufferPolicy.Unbounded.WithMaxBytes -1 |> ignore)
         )
         |> ignore
+
+    // --- T-069: the stdin feeder (`Pump.feedStdin` / `feedStdinSource` / `StdinFeeder`). Deterministic,
+    // over in-memory streams and the `FaultyStdin*` / `HangingStdinAsyncLines` doubles from PipelineTests. ---
+
+    [<Test>]
+    member _.``feedStdin surfaces a File source whose open fails with a non-allow-listed error``() =
+        // An embedded NUL makes `File.OpenRead` throw `ArgumentException` — NOT one of the three types
+        // on the old benign allow-list. The pre-fix code lost it; it must now surface as a source fault.
+        use stdin = new MemoryStream()
+
+        match feederFault (Stdin.FromFile("bad" + string (char 0) + "path")) stdin with
+        | Some _ -> ()
+        | None -> Assert.Fail "a failed File.OpenRead must surface as a genuine stdin-source fault"
+
+    [<Test>]
+    member _.``feedStdin surfaces a FromStream source whose read faults``() =
+        use stdin = new MemoryStream()
+
+        match feederFault (Stdin.FromStream(new FaultyReadStdinStream())) stdin with
+        | Some ex -> Assert.That(ex.Message, Does.Contain "read-source-boom")
+        | None -> Assert.Fail "a source-stream read fault must surface as a genuine stdin-source fault"
+
+    [<Test>]
+    member _.``feedStdin keeps a broken-pipe write benign``() =
+        // The child closed stdin early: every write throws a broken-pipe IOException, which is routine
+        // and must NOT surface as a stdin error.
+        match feederFault (Stdin.FromString "payload") (new BrokenPipeStdinStream()) with
+        | None -> ()
+        | Some ex -> Assert.Fail $"a broken-pipe write must stay benign, got {ex.Message}"
+
+    [<Test>]
+    member _.``feedStdin does not let a broken-pipe write mask a source fault``() =
+        // The source faults acquiring its enumerator AND the stdin stream is a broken pipe. The source
+        // fault must still win — it is raised before any write is attempted.
+        match feederFault (Stdin.FromLines(FaultyStdinLines AtGetEnumerator)) (new BrokenPipeStdinStream()) with
+        | Some _ -> ()
+        | None -> Assert.Fail "a source fault must not be masked by a co-occurring broken-pipe write"
+
+    [<Test>]
+    member _.``feedStdin surfaces a fault at every sync enumeration stage``() =
+        for stage in [ AtGetEnumerator; AtMoveNext; AtCurrent ] do
+            use stdin = new MemoryStream()
+
+            match feederFault (Stdin.FromLines(FaultyStdinLines stage)) stdin with
+            | Some _ -> ()
+            | None -> Assert.Fail $"a sync fault at {stage} must surface as a genuine stdin-source fault"
+
+    [<Test>]
+    member _.``feedStdin surfaces a fault at every async enumeration stage``() =
+        for stage in [ AtGetEnumerator; AtMoveNext; AtCurrent ] do
+            use stdin = new MemoryStream()
+
+            match feederFault (Stdin.FromAsyncLines(FaultyStdinAsyncLines stage)) stdin with
+            | Some _ -> ()
+            | None -> Assert.Fail $"an async fault at {stage} must surface as a genuine stdin-source fault"
+
+    [<Test>]
+    member _.``StdinFeeder Stop cancels a hung async feed and disposes the enumerator``() : Task =
+        task {
+            let source = HangingStdinAsyncLines()
+            use stdin = new MemoryStream()
+
+            let feeder =
+                Pump.feedStdinSource (Some(stdin :> Stream)) (Some(Stdin.FromAsyncLines source))
+
+            // Wait until the feed is genuinely parked in `MoveNextAsync`.
+            let! started = Task.WhenAny(source.Started, Task.Delay 5000)
+            Assert.That(started, Is.SameAs source.Started, "the feed never started")
+
+            feeder.Stop()
+
+            let! fault = feeder.Task
+
+            match fault with
+            | None -> ()
+            | Some ex -> Assert.Fail $"a cancelled feed must report no fault, got {ex.Message}"
+
+            Assert.That(Option.isNone feeder.Fault, Is.True)
+
+            let! disposed = Task.WhenAny(source.Disposed, Task.Delay 5000)
+            Assert.That(disposed, Is.SameAs source.Disposed, "the hung async enumerator was never disposed")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdinFeeder Stop is idempotent and the nothing-to-feed feeder is inert``() : Task =
+        task {
+            // Nothing to feed (no child stdin pipe): no token, `Stop` is a no-op, `Fault` is always None.
+            let noop = Pump.feedStdinSource None (Some(Stdin.FromString "ignored"))
+            noop.Stop()
+            noop.Stop()
+            let! noopFault = noop.Task
+            Assert.That(Option.isNone noopFault, Is.True)
+            Assert.That(Option.isNone noop.Fault, Is.True)
+
+            // A real feed: repeated `Stop`, including after the feed has finished, stays a safe no-op.
+            let source = HangingStdinAsyncLines()
+            use stdin = new MemoryStream()
+
+            let feeder =
+                Pump.feedStdinSource (Some(stdin :> Stream)) (Some(Stdin.FromAsyncLines source))
+
+            let! _ = source.Started
+            feeder.Stop()
+            let! _ = feeder.Task
+            feeder.Stop()
+            feeder.Stop()
+            Assert.That(Option.isNone feeder.Fault, Is.True)
+        }
+        :> Task
