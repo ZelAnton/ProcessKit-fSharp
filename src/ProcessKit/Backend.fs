@@ -89,12 +89,6 @@ type internal IContainmentBackend =
     /// Hard-kill a single contained child (not the whole tree).
     abstract KillChild: Native.Common.Spawned -> unit
 
-    /// Kill and reap a child that escaped the teardown snapshot — one tracked in the race window after
-    /// `HardRelease` began — so a spawn racing `Dispose` can never leave it running uncontained or as a
-    /// zombie. Backend-specific: the Windows Job already kills it on close, the POSIX backends must
-    /// killpg the subtree and reap the leader.
-    abstract ReapEscapee: Native.Common.Spawned -> unit
-
     /// Hard-kill the whole contained tree now (no grace) without releasing the container.
     abstract KillTree: unit -> unit
 
@@ -165,14 +159,6 @@ type internal JobObjectBackend(jobHandle: nativeint) =
 
         member _.KillChild(spawned) =
             Native.Windows.terminateWindowsProcess spawned.Handle
-
-        member _.ReapEscapee(spawned) =
-            // The child was assigned to the Job at spawn, so KILL_ON_JOB_CLOSE kills it when HardRelease
-            // closes the job handle — no TerminateProcess here (a concurrent HardRelease may already have
-            // closed this handle value). Just drop our wait-handle if still tracked, so it is not leaked.
-            if children.Remove spawned.Handle then
-                ctrlGroups.TryRemove spawned.Handle |> ignore
-                Native.Windows.closeWindowsHandle spawned.Handle
 
         member _.KillTree() =
             Native.Windows.terminateWindowsJob jobHandle
@@ -275,13 +261,19 @@ type internal CgroupBackend(cgroupPath: string) =
             // covered by kill-on-drop (the child is its own pgid leader, so teardown's killpg reaps that
             // subtree) but NOT by the resource limits. On a migration FAILURE the child would run wholly
             // outside the cgroup, so instead of the old silent downgrade we kill and reap it here (drop
-            // it from tracking, then killpg its group + reap the leader — the same kill+reap ReapEscapee
-            // does) and report an honest error, leaving no live, uncontained child behind.
+            // it from tracking, then killpg its group + reap the leader) and report an honest error,
+            // leaving no live, uncontained child behind.
             match Native.Cgroup.migrateToCgroup cgroupPath pid with
             | Ok() -> Ok()
             | Error detail ->
-                children.Remove pid |> ignore
-                PosixReap.leader pid
+                // Reap ONLY if this call is the one that takes the pid out of tracking. A `HardRelease`
+                // that raced this spawn may have already drained and reaped it (`Remove` then returns
+                // false); reaping again would `killpg`/`waitpid` a pid the OS may have recycled for an
+                // unrelated process group — a wrong-target kill / double-reap. `ProcessGroup` now serializes
+                // spawn+track against release under one lock, so in practice `Remove` wins here; the guard
+                // keeps the backend correct on its own even when driven concurrently (e.g. in tests).
+                if children.Remove pid then
+                    PosixReap.leader pid
 
                 Error(
                     ProcessError.ResourceLimit
@@ -298,18 +290,6 @@ type internal CgroupBackend(cgroupPath: string) =
 
         member _.KillChild(spawned) =
             Native.Posix.killProcess (int spawned.Handle)
-
-        member _.ReapEscapee(spawned) =
-            let pid = int spawned.Handle
-            // Only reap if this call is the one that actually takes the pid out of tracking: a
-            // concurrent HardRelease's Drain may have already taken (and reaped) it, in which case
-            // Remove returns false here and reaping again would killpg/waitpid a pid the OS may have
-            // already reused for an unrelated process group (wrong-target kill).
-            if children.Remove pid then
-                // Mirror HardRelease's per-child cleanup: the child is its own pgid leader, so killpg
-                // covers any subtree it spawned (whether or not it migrated into the cgroup), then reap
-                // the leader.
-                PosixReap.leader pid
 
         member _.KillTree() = Native.Cgroup.killCgroup cgroupPath
 
@@ -357,9 +337,10 @@ type internal CgroupBackend(cgroupPath: string) =
             // child that failed to migrate runs outside the cgroup entirely. Every child is also its own
             // process-group leader, so killpg cleans up an escapee's subtree; then reap the leader.
             // Drain (atomic take-and-clear), not Snapshot: a Snapshot would leave the tracking list
-            // populated after teardown, and a concurrent ReapEscapee could still see (and re-reap) the
-            // same pid — after the first killpg/waitpid the OS may reuse that pid, so a second killpg
-            // would land on an unrelated process group (wrong-target kill).
+            // populated after teardown, and a concurrent per-child cleanup (a run's `Release`, or a
+            // `Track` migration-failure reap) could still see (and re-reap) the same pid — after the first
+            // killpg/waitpid the OS may reuse that pid, so a second killpg would land on an unrelated
+            // process group (wrong-target kill).
             for pid in children.Drain() do
                 PosixReap.leader pid
 
@@ -396,17 +377,6 @@ type internal ProcessGroupBackend() =
 
         member _.KillChild(spawned) =
             Native.Posix.killProcessGroup (int spawned.Handle)
-
-        member _.ReapEscapee(spawned) =
-            let pgid = int spawned.Handle
-            // Only reap if this call is the one that actually takes the pgid out of tracking: a
-            // concurrent HardRelease's Drain may have already taken (and reaped) it, in which case
-            // Remove returns false here and reaping again would killpg/waitpid a pid the OS may have
-            // already reused for an unrelated process group (wrong-target kill).
-            if children.Remove pgid then
-                // killpg the leader's group, then reap the leader we posix_spawned (killpg does not
-                // waitpid our own child), matching HardRelease's per-pgid cleanup.
-                PosixReap.leader pgid
 
         member _.KillTree() =
             for pgid in children.Snapshot() do
@@ -474,8 +444,8 @@ type internal ProcessGroupBackend() =
             // SIGKILLs the group but does not reap our own children. Reap the leaders we still track (a
             // run verb Releases the ones it already reaped); other group members reparent to init.
             // Drain (atomic take-and-clear), not Snapshot: a Snapshot would leave the tracking list
-            // populated after teardown, and a concurrent ReapEscapee could still see (and re-reap) the
-            // same pgid — after the first killpg/waitpid the OS may reuse that pid, so a second killpg
-            // would land on an unrelated process group (wrong-target kill).
+            // populated after teardown, and a concurrent per-child cleanup (a run's `Release`) could still
+            // see (and re-reap) the same pgid — after the first killpg/waitpid the OS may reuse that pid,
+            // so a second killpg would land on an unrelated process group (wrong-target kill).
             for pgid in children.Drain() do
                 PosixReap.leader pgid

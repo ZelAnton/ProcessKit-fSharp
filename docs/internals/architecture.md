@@ -119,7 +119,6 @@ type internal IContainmentBackend =
     abstract Wait: nativeint -> Task<Outcome>
     abstract PidOf: Native.Common.Spawned -> int option
     abstract KillChild: Native.Common.Spawned -> unit
-    abstract ReapEscapee: Native.Common.Spawned -> unit
     abstract KillTree: unit -> unit
     abstract GracefulKillTree: TimeSpan -> Task
     abstract Members: unit -> Result<int list, ProcessError>
@@ -130,7 +129,7 @@ type internal IContainmentBackend =
     abstract HardRelease: unit -> unit
 ```
 
-The current interface has 16 abstract members:
+The current interface has 15 abstract members:
 
 - `Mechanism` identifies the primitive honestly.
 - `Spawn` starts a child, initially not in the backend's tracking collection.
@@ -139,7 +138,6 @@ The current interface has 16 abstract members:
 - `Wait` waits for and decodes one child outcome.
 - `PidOf` retrieves a known PID.
 - `KillChild` kills one child's containment subtree where applicable.
-- `ReapEscapee` closes the spawn-versus-dispose race.
 - `KillTree` immediately kills the whole container without releasing it.
 - `GracefulKillTree` requests termination, waits for the grace period, then escalates where supported.
 - `Members` snapshots membership.
@@ -216,18 +214,13 @@ Spawn -> Track -> expose RunningProcess -> pump + Wait -> Release -> dispose str
                `---- teardown owns ----'
 ```
 
-For a private per-run group, disposing `RunningProcess` disposes its `ProcessGroup`, so the whole tree dies. For a shared group, disposing a child handle detaches that run's I/O; the group remains the lifetime owner until `ShutdownAsync` or group disposal. `ProcessGroup` implements deterministic `IDisposable`/`IAsyncDisposable` teardown, and its finalizer is the last-resort safety net when callers fail to dispose. `Interlocked.Exchange` ensures `HardRelease` runs once across synchronous disposal, asynchronous shutdown, and finalization.
+For a private per-run group, disposing `RunningProcess` disposes its `ProcessGroup`, so the whole tree dies. For a shared group, disposing a child handle detaches that run's I/O; the group remains the lifetime owner until `ShutdownAsync` or group disposal. `ProcessGroup` implements deterministic `IDisposable`/`IAsyncDisposable` teardown, and its finalizer is the last-resort safety net when callers fail to dispose.
 
-The spawn/dispose race deserves special attention:
+`ProcessGroup` guards its whole lifecycle with one lock (`sync`). A spawn+track (and the start of a run) and every control/accounting verb run their released-flag check *and* their native backend call inside that lock, so each either completes fully on the live container or observes the flag and returns `Unsupported` before touching native. The live→released transition also flips the flag under `sync`: acquiring the lock waits out any in-flight operation (each holds the lock for its whole native call), and once the flag is set every later operation bails. Whichever of `Dispose`/`DisposeAsync`/`ShutdownAsync`/finalizer wins that flip owns the one-shot `HardRelease`; the losers are no-ops, so teardown runs exactly once. `HardRelease` is bounded (SIGKILL + `waitpid` + close) and also runs under `sync`, but `ShutdownAsync` deliberately keeps its *unbounded* graceful-stop wait off the lock — the flag is already set, so no new operation can start during that wait.
 
-1. `SpawnInto` checks `releasedFlag` before spawn.
-2. The backend spawns and tracks the child.
-3. `SpawnInto` checks `releasedFlag` again.
-4. If teardown began between the checks and its `Drain` snapshot missed the new child, `ReapEscapee` takes responsibility for it.
+This makes the spawn-versus-dispose race trivial: because the spawn+track transaction and the release transition are mutually exclusive, a child is either tracked before teardown (and then reaped exactly once by teardown's `Drain`) or never spawned (the start fails fast with a non-transient error). No separate escapee-reap fixup is needed, and a `RunningProcess` is never built over a container whose teardown has begun.
 
-Windows needs only remove/close the wait handle because assignment happened during suspended spawn and closing the Job already kills the child. POSIX and cgroup backends conditionally remove the PID/pgid and then `killpg` plus `waitpid`. The conditional `Remove` determines which racer owns cleanup.
-
-This ownership arbitration also mitigates PID reuse. After a successful `waitpid`, the kernel may immediately reuse the numeric PID as an unrelated process-group ID. If both `HardRelease` and `ReapEscapee` acted on the same snapshot, the second `killpg` could kill an unrelated process. `TrackedChildren.Drain` versus `Remove` makes exactly one path win. The same principle explains why Windows tracking uses open process handles rather than bare PIDs.
+PID reuse still matters for the paths that reap *outside* that lock — a normal run's `Release` and the cgroup `Track` migration-failure cleanup can each race teardown's `Drain`. After a successful `waitpid` the kernel may immediately reuse the numeric PID, so a second `killpg` on the same value could hit an unrelated process group. `TrackedChildren.Drain` versus `Remove` makes exactly one path own each PID/pgid: the reap fires only when `Remove` returns true. The same principle explains why Windows tracking uses open process handles rather than bare PIDs.
 
 ## Telemetry lifecycle
 

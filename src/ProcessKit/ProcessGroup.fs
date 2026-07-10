@@ -19,16 +19,58 @@ open System.Threading.Tasks
 [<Sealed>]
 type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOptions) =
 
-    // 0 = live, 1 = released. Interlocked so Dispose/DisposeAsync/Shutdown/finalizer run the
-    // teardown exactly once. All containment behaviour lives in `backend`; this type only
-    // orchestrates the once-only teardown, the stdin/stream wiring, and the runner/disposable seams.
+    // The single lifecycle gate. Every operation that must not race teardown — a spawn+track, and each
+    // public control/stat verb — runs its released-flag check AND its native backend call inside
+    // `lock sync`. So it either completes fully on the live backend, or observes the flag and returns
+    // `Unsupported` BEFORE touching native — never half of each. The live->released transition also
+    // flips the flag under `sync`: acquiring the lock drains any in-flight op (an op holds `sync` for
+    // its whole native call), and once the flag is set every later op bails, so the (bounded) teardown
+    // runs with no concurrent backend op. This is the one critical section that used to be an
+    // unsynchronized flag re-check plus a per-child escapee-reap dance.
+    let sync = obj ()
+
+    // 0 = live, 1 = released. Read and written only under `sync`. Set to 1 exactly once, by whichever
+    // of Dispose/DisposeAsync/ShutdownAsync/finalizer wins the transition; that winner then owns the
+    // one-shot teardown.
     let mutable releasedFlag = 0
 
     let waitOutcome (handle: nativeint) : Task<Outcome> = backend.Wait handle
 
+    // Spawn + track as one transaction. The caller runs this under `sync` (via `WhenLive`) so the whole
+    // thing is atomic with the release transition: either it tracks the child on a live backend (a later
+    // teardown then reaps it exactly once via its drain), or it never runs because the group was already
+    // released. A `Track` failure means the backend already killed and reaped the child it could not
+    // contain, so there is no live, uncontained child left to clean up here — just surface the error.
+    let spawnAndTrack (command: Command) : Result<Native.Common.Spawned, ProcessError> =
+        match backend.Spawn command with
+        | Error error -> Error error
+        | Ok spawned ->
+            match backend.Track spawned with
+            | Error trackError -> Error trackError
+            | Ok() -> Ok spawned
+
+    // Flip live->released exactly once, under `sync`. Returns `true` for the single caller that won the
+    // transition; that caller then owns running the teardown. Acquiring `sync` here waits out any
+    // in-flight backend op, and setting the flag makes every later op bail — so the winner's teardown
+    // has exclusive access without holding the lock across it.
+    let claimRelease () : bool =
+        lock sync (fun () ->
+            if releasedFlag = 0 then
+                releasedFlag <- 1
+                true
+            else
+                false)
+
+    // The hard teardown, always under `sync` so it can never interleave with a control/stat/spawn op
+    // that raced the release. Only the `claimRelease` winner calls it, so it runs exactly once. Bounded
+    // work (SIGKILL + waitpid + close), so holding the monitor across it is fine — unlike ShutdownAsync's
+    // unbounded graceful wait, which is deliberately kept OFF the lock.
+    let hardRelease () =
+        lock sync (fun () -> backend.HardRelease())
+
     let releaseContainer () =
-        if Interlocked.Exchange(&releasedFlag, 1) = 0 then
-            backend.HardRelease()
+        if claimRelease () then
+            hardRelease ()
 
     /// The OS primitive containing this group on the current platform.
     member _.Mechanism = backend.Mechanism
@@ -89,6 +131,12 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // No limits: the POSIX group forms when children are spawned (each becomes its own pgid).
             withBackend (ProcessGroupBackend())
 
+    /// Test-only seam: wrap an arbitrary containment backend so the lifecycle guard (spawn / control /
+    /// stat versus release) can be exercised against a synthetic backend, with no real OS handles.
+    /// Internal — production code always goes through `Create`, which picks the platform backend.
+    static member internal FromBackend(backend: IContainmentBackend, options: ProcessGroupOptions) : ProcessGroup =
+        new ProcessGroup(backend, options)
+
     /// Wait for one contained process handle to conclude. Internal — used by pipeline staging.
     member internal _.WaitHandle(handle: nativeint) : Task<Outcome> = waitOutcome handle
 
@@ -96,35 +144,30 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// pipeline cancellation/timeout.
     member internal _.KillTree() = backend.KillTree()
 
+    // Tree-control / accounting verbs, spawn+track, and the release transition all serialize on `sync`.
+    // A verb runs its live check AND its native backend call under the lock, so a concurrent
+    // Dispose/ShutdownAsync either waits for it to finish on the live backend or flips the flag first and
+    // the verb then returns `Unsupported` before any native call. After teardown the backend's Job handle
+    // is closed (and POSIX pgids may have been recycled), so calling in would otherwise be a
+    // use-after-close or a wrong-target kill.
+    member private _.WhenLive(action: unit -> Result<'T, ProcessError>) : Result<'T, ProcessError> =
+        // A released group is a permanent condition, not a transient I/O blip — use `Unsupported`
+        // (which `ProcessError.isTransient` rejects) so a retry classifier never re-tries a dead group.
+        lock sync (fun () ->
+            if releasedFlag <> 0 then
+                Error(ProcessError.Unsupported "the process group has been released")
+            else
+                action ())
+
     /// Spawn `command` into the group, tracking the child for signalling / teardown. Internal.
-    member internal _.SpawnInto(command: Command) : Result<Native.Common.Spawned, ProcessError> =
+    member internal this.SpawnInto(command: Command) : Result<Native.Common.Spawned, ProcessError> =
         // Refuse to spawn into a released group: on Windows the child is created before it is assigned
-        // to the (now-closed) Job, so spawning after teardown would leak an UNCONTAINED child. Fail
-        // fast with a non-transient error instead. (Same released-flag guard as the control verbs.)
-        if releasedFlag <> 0 then
-            Error(ProcessError.Unsupported "the process group has been released")
-        else
-            match backend.Spawn command with
-            | Error error -> Error error
-            | Ok spawned ->
-                match backend.Track spawned with
-                | Error trackError ->
-                    // The backend could not actually contain the child (e.g. the cgroup backend failed
-                    // to migrate it into the cgroup). It has already killed and reaped the child on this
-                    // path, so there is no live child to clean up here — just surface the honest error
-                    // rather than let an uncontained child run.
-                    Error trackError
-                | Ok() ->
-                    // Re-check after tracking: if the group was released concurrently between the guard
-                    // above and `Track`, `HardRelease`'s kill/reap snapshot may have missed this child (it
-                    // would then run uncontained on the POSIX/cgroup backends). The release flag is set
-                    // before that snapshot runs, so observing it set here means the child may have escaped —
-                    // reap it ourselves rather than leak it, preserving the kill-on-drop guarantee.
-                    if releasedFlag <> 0 then
-                        backend.ReapEscapee spawned
-                        Error(ProcessError.Unsupported "the process group has been released")
-                    else
-                        Ok spawned
+        // to the (now-closed) Job, so spawning after teardown would leak an UNCONTAINED child. Running
+        // the whole spawn+track under `sync` makes this atomic with the release transition — either it
+        // completes with the child tracked on the live backend (teardown then reaps it), or the group is
+        // already released and it fails fast with a non-transient error BEFORE the native spawn. No child
+        // can be tracked in a window teardown has already drained, so no escapee-reap fixup is needed.
+        this.WhenLive(fun () -> spawnAndTrack command)
 
     /// Spawn `command` into the group and build a `RunningHost`. `ownsGroup` decides what disposing
     /// the resulting `RunningProcess` does: when **true** (a private per-run group) it reaps this
@@ -133,66 +176,74 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// difference between the two start paths, so it lives here as one branch each on `StartKill`,
     /// `GracefulKill`, and `Teardown`.
     member private this.BuildHost(command: Command, ownsGroup: bool) : Result<RunningHost, ProcessError> =
-        match this.SpawnInto command with
-        | Error error -> Error error
-        | Ok spawned ->
+        // Spawn+track AND read the child's pid atomically with the release transition, all under `sync`
+        // (via `SpawnInto`/`WhenLive`): a `RunningProcess` is therefore never built over a backend whose
+        // teardown has already begun, and reading the pid can't race the Job handle being closed. Once
+        // this returns Ok the child is tracked, so a later Dispose/ShutdownAsync reaps it exactly once.
+        this.WhenLive(fun () ->
+            match spawnAndTrack command with
+            | Error error -> Error error
+            | Ok spawned -> Ok(spawned, backend.PidOf spawned))
+        |> Result.map (fun (spawned, pid) ->
+            // The rest of the host is closures and stream references that do not touch the container's
+            // release state, so it is built outside the lock. The background stdin feed writes to the
+            // child's own stdin pipe (not the container), so kicking it off here is race-free.
             let stdinFeed = Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
 
             let closeStreams () =
                 // Close the pipe streams (OS handles/fds) before releasing/detaching.
                 Pump.closeSpawned spawned
 
-            Ok
-                { Config = command.Config
-                  Pid = backend.PidOf spawned
-                  Stdout = spawned.Stdout
-                  Stderr = spawned.Stderr
-                  Stdin =
-                    (if command.Config.StdinSource.IsSome then
-                         None
-                     else
-                         spawned.Stdin)
-                  StartTime = DateTime.UtcNow
-                  StartedTimestamp = Stopwatch.GetTimestamp()
-                  Wait = (fun () -> waitOutcome spawned.Handle)
-                  // Observe the stashed source failure without blocking: read it only once the feed has
-                  // finished, else `None`. `IsCompletedSuccessfully` + `.Result` is race-free — `feedStdin`
-                  // never faults, so completion establishes the happens-before for the stashed value. We
-                  // deliberately do NOT await the feed (a source parked mid-read would hang the verb), so
-                  // an async-manifesting source fault that loses the race with the child's own exit is not
-                  // surfaced — matching ProcessKit-rs. The common case, a missing `FromFile`, faults
-                  // synchronously at spawn (`File.OpenRead`), so it is always observed.
-                  StdinError =
-                    (fun () ->
-                        if stdinFeed.IsCompletedSuccessfully then
-                            stdinFeed.Result
-                        else
-                            None)
-                  StartKill =
-                    (if ownsGroup then
-                         backend.KillTree
-                     else
-                         (fun () -> backend.KillChild spawned))
-                  GracefulKill =
-                    (if ownsGroup then
-                         (fun grace -> this.GracefulKillTree grace)
-                     else
-                         (fun _ -> task { backend.KillChild spawned } :> Task))
-                  Teardown =
-                    fun () ->
-                        closeStreams ()
+            { Config = command.Config
+              Pid = pid
+              Stdout = spawned.Stdout
+              Stderr = spawned.Stderr
+              Stdin =
+                (if command.Config.StdinSource.IsSome then
+                     None
+                 else
+                     spawned.Stdin)
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = Stopwatch.GetTimestamp()
+              Wait = (fun () -> waitOutcome spawned.Handle)
+              // Observe the stashed source failure without blocking: read it only once the feed has
+              // finished, else `None`. `IsCompletedSuccessfully` + `.Result` is race-free — `feedStdin`
+              // never faults, so completion establishes the happens-before for the stashed value. We
+              // deliberately do NOT await the feed (a source parked mid-read would hang the verb), so
+              // an async-manifesting source fault that loses the race with the child's own exit is not
+              // surfaced — matching ProcessKit-rs. The common case, a missing `FromFile`, faults
+              // synchronously at spawn (`File.OpenRead`), so it is always observed.
+              StdinError =
+                (fun () ->
+                    if stdinFeed.IsCompletedSuccessfully then
+                        stdinFeed.Result
+                    else
+                        None)
+              StartKill =
+                (if ownsGroup then
+                     backend.KillTree
+                 else
+                     (fun () -> backend.KillChild spawned))
+              GracefulKill =
+                (if ownsGroup then
+                     (fun grace -> this.GracefulKillTree grace)
+                 else
+                     (fun _ -> task { backend.KillChild spawned } :> Task))
+              Teardown =
+                fun () ->
+                    closeStreams ()
 
-                        if ownsGroup then
-                            // Owned group: closing the run reaps the whole tree.
-                            (this :> IDisposable).Dispose()
-                        else
-                            // Shared group: detach this run's I/O only — the GROUP owns the child's
-                            // lifetime (Shutdown/Dispose reaps it). Stop tracking it — POSIX only
-                            // once its group is empty, so a still-live child stays reapable by the
-                            // group; Windows closes the handle (the Job still contains the tree).
-                            backend.Release spawned
+                    if ownsGroup then
+                        // Owned group: closing the run reaps the whole tree.
+                        (this :> IDisposable).Dispose()
+                    else
+                        // Shared group: detach this run's I/O only — the GROUP owns the child's
+                        // lifetime (Shutdown/Dispose reaps it). Stop tracking it — POSIX only
+                        // once its group is empty, so a still-live child stays reapable by the
+                        // group; Windows closes the handle (the Job still contains the tree).
+                        backend.Release spawned
 
-                        ValueTask.CompletedTask }
+                    ValueTask.CompletedTask })
 
     /// Spawn `command` into the group and build a `RunningHost`. Disposing the resulting
     /// `RunningProcess` reaps this whole group (the group is owned by the running process).
@@ -224,18 +275,6 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                 | Error error -> return Error error
                 | Ok host -> return Ok(RunningProcess host)
         }
-
-    // Tree-control / accounting verbs become an error once the group is released: after teardown the
-    // backend's Job handle is closed (and POSIX pgids may have been recycled), so calling in would be
-    // a use-after-close or a wrong-target kill. Guarding here (as `Stats` already did) closes the
-    // window for a verb racing a concurrent `Dispose`/`ShutdownAsync`.
-    member private _.WhenLive(action: unit -> Result<'T, ProcessError>) : Result<'T, ProcessError> =
-        // A released group is a permanent condition, not a transient I/O blip — use `Unsupported`
-        // (which `ProcessError.isTransient` rejects) so a retry classifier never re-tries a dead group.
-        if releasedFlag <> 0 then
-            Error(ProcessError.Unsupported "the process group has been released")
-        else
-            action ()
 
     /// Immediately hard-kill every process currently in the group (the honest name for the tree kill —
     /// no graceful signal). Idempotent; the group stays usable for further spawns. Returns `Result` for
@@ -335,9 +374,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// alive after `gracePeriod`. On Windows: an atomic Job kill. Idempotent with `Dispose`.
     member this.ShutdownAsync(gracePeriod: TimeSpan) : Task =
         task {
-            if Interlocked.Exchange(&releasedFlag, 1) = 0 then
+            // Win the transition first (flag flipped under `sync`), so from here no StartAsync/Signal/
+            // Stats/... touches the backend. The graceful wait is UNBOUNDED (up to `gracePeriod`), so it
+            // runs with NO lock held — the flag already fends off every new op. Only the winner reaches
+            // the wait, so the one-shot teardown that follows runs exactly once.
+            if claimRelease () then
                 do! backend.GracefulKillTree gracePeriod
-                backend.HardRelease()
+                hardRelease ()
                 GC.SuppressFinalize this
         }
         :> Task

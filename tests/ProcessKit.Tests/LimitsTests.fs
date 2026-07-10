@@ -186,6 +186,61 @@ type LimitsTests() =
         :> Task
 
     [<Test>]
+    member _.``CgroupBackend: Track racing HardRelease reaps the child exactly once``() : Task =
+        task {
+            if isWindows || isMacOs then
+                Assert.Ignore "cgroup v2 migration is Linux-only"
+            else
+                // The cgroup failure-path double-reap the fix closes. With a missing cgroup directory the
+                // migration write fails, so Track must kill+reap the child — but a teardown (HardRelease)
+                // draining the tracked pid can race it. Track now reaps ONLY if it still owns the pid
+                // (guarded on `children.Remove`) and HardRelease drains atomically, so exactly one side
+                // reaps: the second killpg/waitpid on an OS-recycled pid (a wrong-target kill) can no
+                // longer happen. Deterministically asserted: after the race the child is fully reaped
+                // (gone, not a zombie) with no exception or hang, however the two interleave.
+                for _ in 1..25 do
+                    let missingCgroup =
+                        Path.Combine(Path.GetTempPath(), $"processkit-race-cgroup-{Guid.NewGuid():N}")
+
+                    let backend: IContainmentBackend = CgroupBackend missingCgroup
+
+                    let child =
+                        Command.create "sleep"
+                        |> Command.args [ "30" ]
+                        |> Command.stdout StdioMode.Null
+                        |> Command.stderr StdioMode.Null
+
+                    let spawned =
+                        match backend.Spawn child with
+                        | Ok s -> s
+                        | Error e -> failwith $"spawn failed: {e}"
+
+                    let pid =
+                        match backend.PidOf spawned with
+                        | Some p -> p
+                        | None -> failwith "expected a spawned pid"
+
+                    // Race Track (migration fails -> guarded reap) against HardRelease (drain -> reap).
+                    let trackTask = Task.Run(fun () -> backend.Track spawned |> ignore)
+                    let releaseTask = Task.Run(fun () -> backend.HardRelease())
+                    do! Task.WhenAll(trackTask, releaseTask)
+
+                    // Exactly one side reaped it, so the child is gone. Poll briefly for the SIGKILL to land.
+                    let mutable gone = false
+                    let mutable attempts = 0
+
+                    while not gone && attempts < 200 do
+                        match Native.Posix.signalPid pid 0 with
+                        | Native.Common.SignalDelivery.TargetGone -> gone <- true
+                        | _ ->
+                            do! Task.Delay 10
+                            attempts <- attempts + 1
+
+                    Assert.That(gone, Is.True, "the child survived the Track-vs-HardRelease race")
+        }
+        :> Task
+
+    [<Test>]
     member _.``the cgroup mechanism drives the control verbs``() : Task =
         task {
             if isWindows || isMacOs then

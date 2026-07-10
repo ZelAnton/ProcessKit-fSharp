@@ -8,6 +8,116 @@ open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
 
+/// A synthetic `IContainmentBackend` for the lifecycle-guard barrier tests. It owns no real OS handle:
+/// `Spawn` hands out a fresh fake handle with no streams, and every verb is a book-keeping no-op. Its
+/// job is to police the guard's invariant — it records whether teardown (`HardRelease`) has run and
+/// FLAGS any spawn/control/stat op driven after teardown, which is exactly what `ProcessGroup`'s single
+/// critical section must make impossible (an op either completes on the live backend or is refused
+/// before it reaches the backend). It also records which fake children were reaped, so a double-reap or
+/// an un-reaped child left tracked after teardown is observable.
+type internal SyntheticBackend() =
+    let gate = obj ()
+    let tracked = System.Collections.Generic.HashSet<nativeint>()
+    let reaped = System.Collections.Generic.List<nativeint>()
+    let violations = System.Collections.Generic.List<string>()
+    let mutable released = false
+    let mutable hardReleaseCount = 0
+    let mutable spawnCount = 0
+    let mutable nextHandle = 0
+
+    let note (message: string) =
+        lock gate (fun () -> violations.Add message)
+
+    // Assert the backend is live at entry AND after a yield that widens the race window. Under a correct
+    // guard `released` cannot flip while an op runs — the op and the teardown serialize on ProcessGroup's
+    // lifecycle lock — so both reads see `false`; a broken guard would let `HardRelease` slip in between.
+    let requireLive (op: string) =
+        if lock gate (fun () -> released) then
+            note $"{op} entered after HardRelease"
+
+        Thread.Yield() |> ignore
+
+        if lock gate (fun () -> released) then
+            note $"{op} completed after HardRelease"
+
+    let freshHandle () =
+        lock gate (fun () ->
+            nextHandle <- nextHandle + 1
+            nativeint nextHandle)
+
+    /// How many times teardown ran — must be exactly one across any mix of Dispose/DisposeAsync/Shutdown.
+    member _.HardReleaseCount = lock gate (fun () -> hardReleaseCount)
+    /// How many children were actually spawned (a start that lost the race to the release spawns none).
+    member _.SpawnCount = lock gate (fun () -> spawnCount)
+    /// Children still tracked — must be zero after teardown drains them.
+    member _.TrackedCount = lock gate (fun () -> tracked.Count)
+    /// Children reaped by teardown, with duplicates preserved so a double-reap is visible.
+    member _.ReapedCount = lock gate (fun () -> reaped.Count)
+
+    member _.DistinctReapedCount =
+        lock gate (fun () -> reaped |> Seq.distinct |> Seq.length)
+
+    /// Every use-after-teardown the guard let through — must stay empty.
+    member _.Violations = lock gate (fun () -> List.ofSeq violations)
+
+    interface IContainmentBackend with
+        member _.Mechanism = Mechanism.ProcessGroup
+
+        member _.Spawn(_command) =
+            requireLive "Spawn"
+            let handle = freshHandle ()
+            lock gate (fun () -> spawnCount <- spawnCount + 1)
+
+            Ok
+                { Native.Common.Spawned.Handle = handle
+                  Stdout = None
+                  Stderr = None
+                  Stdin = None
+                  WindowsCtrlGroup = false }
+
+        member _.Track(spawned) =
+            requireLive "Track"
+            lock gate (fun () -> tracked.Add spawned.Handle |> ignore)
+            Ok()
+
+        member _.Release(spawned) =
+            lock gate (fun () -> tracked.Remove spawned.Handle |> ignore)
+
+        member _.Wait(_handle) = task { return Outcome.Exited 0 }
+        member _.PidOf(spawned) = Some(int spawned.Handle)
+        member _.KillChild(_spawned) = ()
+        member _.KillTree() = requireLive "KillTree"
+        member _.GracefulKillTree(_grace) = Task.CompletedTask
+
+        member _.Members() =
+            requireLive "Members"
+            lock gate (fun () -> Ok(tracked |> Seq.map int |> List.ofSeq))
+
+        member _.Signal(_signal) =
+            requireLive "Signal"
+            Ok()
+
+        member _.Suspend() =
+            requireLive "Suspend"
+            Ok()
+
+        member _.Resume() =
+            requireLive "Resume"
+            Ok()
+
+        member _.Stats() =
+            requireLive "Stats"
+            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None))
+
+        member _.HardRelease() =
+            // Drain (reap) every tracked child exactly once and mark released, all under one lock — the
+            // atomic teardown the guard must serialize every backend op against.
+            lock gate (fun () ->
+                reaped.AddRange tracked
+                tracked.Clear()
+                released <- true
+                hardReleaseCount <- hardReleaseCount + 1)
+
 /// Regression tests for containment-integrity fixes: spawning into a released group, pipeline
 /// mid-chain spawn failures, inherited stdio, and teardown reaping (no zombie leaders).
 [<TestFixture>]
@@ -135,11 +245,11 @@ type ContainmentBugTests() =
     [<Test>]
     member _.``TrackedChildren.Drain and Remove of the same item never both win the race``() : Task =
         task {
-            // The mutual-exclusion primitive underlying the HardRelease/ReapEscapee fix: a concurrent
-            // Drain (HardRelease's atomic take-and-clear) and Remove (ReapEscapee's guard) for the same
-            // tracked item must never both report success — exactly one of them may act on the item, or
-            // Drain must win outright (it always empties the whole list). Run it many times under
-            // `Task.WhenAll` to shake out any lock-ordering issue.
+            // The mutual-exclusion primitive underlying teardown's per-child ownership: a concurrent
+            // Drain (HardRelease's atomic take-and-clear) and Remove (a run's `Release`, or the cgroup
+            // `Track` migration-failure reap) for the same tracked item must never both report success —
+            // exactly one of them may act on the item, or Drain must win outright (it always empties the
+            // whole list). Run it many times under `Task.WhenAll` to shake out any lock-ordering issue.
             for _ in 1..500 do
                 let children = TrackedChildren<int>()
                 children.Add 42
@@ -164,36 +274,108 @@ type ContainmentBugTests() =
         }
 
     [<Test>]
-    member _.``ProcessGroupBackend: HardRelease racing ReapEscapee never leaves the pgid tracked twice``() : Task =
+    member _.``StartAsync racing Dispose never builds a run over a released backend and reaps once``() : Task =
         task {
-            // The full-stack shape of the fix: HardRelease (teardown) and ReapEscapee (racing-spawn
-            // cleanup) contend for the SAME tracked pgid. Before this fix HardRelease used Snapshot (no
-            // clear) and ReapEscapee unconditionally re-reaped, so both could killpg/waitpid the same
-            // leader — after the first waitpid the OS may reuse that pid for an unrelated process
-            // group, so the second killpg would land on the wrong target. Actually observing a
-            // wrong-target kill needs a pid-reuse window this test cannot force deterministically; what
-            // IS deterministic and asserted here is that only one side ever "wins" the pgid (Members()
-            // is empty afterwards either way, and no exception/hang occurs from a double reap racing).
-            if isWindows then
-                Assert.Ignore "ProcessGroupBackend is the POSIX (non-cgroup) mechanism only"
+            // The spawn-versus-dispose race at the ProcessGroup level, over a synthetic backend that
+            // fails loud if any op touches it after teardown. With the single lifecycle lock the start
+            // either wins outright — the child is spawned, tracked, and then reaped exactly once by the
+            // teardown — or it loses and spawns nothing, returning the non-transient released error. It
+            // is never a RunningProcess built over a backend whose teardown has already begun.
+            for _ in 1..300 do
+                let backend = SyntheticBackend()
+                let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+                let command = Command.create "synthetic"
 
-            for _ in 1..20 do
-                let backend = ProcessGroupBackend() :> IContainmentBackend
+                let mutable startResult = Unchecked.defaultof<Result<RunningProcess, ProcessError>>
 
-                let spawned =
-                    match backend.Spawn(shell "sleep 5") with
-                    | Ok s -> s
-                    | Error e -> failwith $"spawn failed: {e}"
+                let startTask =
+                    Task.Run(fun () -> startResult <- group.StartAsync(command).GetAwaiter().GetResult())
 
-                match backend.Track spawned with
-                | Ok() -> ()
-                | Error e -> failwith $"track failed: {e}"
+                let disposeTask = Task.Run(fun () -> (group :> IDisposable).Dispose())
+                do! Task.WhenAll(startTask, disposeTask)
 
-                let hardReleaseTask = Task.Run(fun () -> backend.HardRelease())
-                let reapEscapeeTask = Task.Run(fun () -> backend.ReapEscapee spawned)
-                do! Task.WhenAll(hardReleaseTask, reapEscapeeTask)
+                Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+                // Dispose owns the one teardown; a shared-group start never releases the group.
+                Assert.That(backend.HardReleaseCount, Is.EqualTo 1)
+                Assert.That(backend.TrackedCount, Is.EqualTo 0, "a child was left tracked after teardown")
+                Assert.That(backend.DistinctReapedCount, Is.EqualTo backend.ReapedCount, "a child was reaped twice")
 
-                match backend.Members() with
-                | Ok members -> Assert.That(members, Is.Empty, "the pgid must not remain tracked after both race")
-                | Error e -> failwith $"Members failed: {e}"
+                match startResult with
+                | Ok running ->
+                    // Won the race: exactly one spawn, and the group reaped it on Dispose (one reap).
+                    Assert.That(backend.SpawnCount, Is.EqualTo 1)
+                    Assert.That(backend.ReapedCount, Is.EqualTo 1)
+                    GC.KeepAlive running
+                | Error err ->
+                    // Lost the race: released before the spawn, so nothing was spawned and the error is
+                    // the non-transient released condition (a retry must not re-try a dead group).
+                    Assert.That(backend.SpawnCount, Is.EqualTo 0)
+                    Assert.That(ProcessError.isTransient err, Is.False)
+        }
+
+    [<Test>]
+    member _.``control and stat verbs racing Dispose run on the live backend or fail Unsupported``() : Task =
+        task {
+            // Signal/Stats/Members/Suspend racing a concurrent Dispose. The guard makes each verb atomic
+            // with the release: it either completes fully on the live backend (Ok) or is refused before
+            // touching native (a non-transient Unsupported) — never a half-run against a torn-down
+            // backend. The synthetic backend flags any op that reaches it after teardown.
+            for _ in 1..300 do
+                let backend = SyntheticBackend()
+                let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+                match! group.StartAsync(Command.create "synthetic") with
+                | Ok running -> GC.KeepAlive running
+                | Error e -> failwith $"seed start failed: {e}"
+
+                let results =
+                    System.Collections.Concurrent.ConcurrentQueue<Result<unit, ProcessError>>()
+
+                let signalTask = Task.Run(fun () -> results.Enqueue(group.Signal Signal.Term))
+
+                let statsTask =
+                    Task.Run(fun () -> results.Enqueue(group.Stats() |> Result.map ignore))
+
+                let membersTask =
+                    Task.Run(fun () -> results.Enqueue(group.Members() |> Result.map ignore))
+
+                let suspendTask = Task.Run(fun () -> results.Enqueue(group.Suspend()))
+                let disposeTask = Task.Run(fun () -> (group :> IDisposable).Dispose())
+                do! Task.WhenAll(signalTask, statsTask, membersTask, suspendTask, disposeTask)
+
+                Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+                Assert.That(backend.HardReleaseCount, Is.EqualTo 1)
+
+                for result in results do
+                    match result with
+                    | Ok() -> ()
+                    | Error err -> Assert.That(ProcessError.isTransient err, Is.False)
+        }
+
+    [<Test>]
+    member _.``concurrent Dispose, DisposeAsync, and ShutdownAsync tear down exactly once``() : Task =
+        task {
+            // The once-only teardown under a three-way race. Exactly one of the paths wins the release
+            // transition and runs HardRelease; the losers are no-ops. The seeded child is reaped exactly
+            // once, and no op is driven against the backend after teardown.
+            for _ in 1..300 do
+                let backend = SyntheticBackend()
+                let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+                match! group.StartAsync(Command.create "synthetic") with
+                | Ok running -> GC.KeepAlive running
+                | Error e -> failwith $"seed start failed: {e}"
+
+                let disposeTask = Task.Run(fun () -> (group :> IDisposable).Dispose())
+
+                let disposeAsyncTask: Task =
+                    Task.Run(fun () -> (group :> IAsyncDisposable).DisposeAsync().AsTask())
+
+                let shutdownTask: Task = Task.Run(fun () -> group.ShutdownAsync TimeSpan.Zero)
+                do! Task.WhenAll(disposeTask, disposeAsyncTask, shutdownTask)
+
+                Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+                Assert.That(backend.HardReleaseCount, Is.EqualTo 1, "teardown ran more than once")
+                Assert.That(backend.ReapedCount, Is.EqualTo 1, "the seeded child was not reaped exactly once")
+                Assert.That(backend.DistinctReapedCount, Is.EqualTo backend.ReapedCount, "a child was reaped twice")
         }
