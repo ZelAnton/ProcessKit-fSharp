@@ -9,11 +9,12 @@ class ProcessKit.Testing.CassetteEntry
   member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
   member ToString() : System.String
   new()
-  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double)
+  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double)
   property Args : System.String[] { get; set }
   property Code : System.Nullable<System.Int32> { get; set }
   property Cwd : System.String { get; set }
   property DurationMs : System.Double { get; set }
+  property EnvFingerprint : System.String { get; set }
   property EnvNames : System.String[] { get; set }
   property HasStdin : System.Boolean { get; set }
   property Program : System.String { get; set }

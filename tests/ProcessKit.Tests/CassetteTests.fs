@@ -108,6 +108,31 @@ type CassetteTests() =
             return List.ofSeq acc
         }
 
+    /// Record `recorded` (a fixed reply), persist, then strict-replay `probe` — so a test can assert
+    /// whether two commands share a replay key by whether the probe replays the recording or misses.
+    let recordThenProbe
+        (path: string)
+        (recorded: Command)
+        (probe: Command)
+        : Task<Result<ProcessResult<string>, ProcessError>> =
+        task {
+            do!
+                task {
+                    use recorder = RecordReplayRunner.Record(path, FixedRunner("recorded-output", 0))
+                    let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
+
+                    match recorder.Save() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"save: {error}"
+                }
+
+            match RecordReplayRunner.Replay path with
+            | Error error ->
+                Assert.Fail $"replay load: {error}"
+                return Error error
+            | Ok replayer -> return! (runner replayer).OutputStringAsync(probe, CancellationToken.None)
+        }
+
     [<Test>]
     member _.``a cassette entry with omitted fields replays without a NullReferenceException``() : Task =
         withCassette (fun path ->
@@ -789,4 +814,170 @@ type CassetteTests() =
                         match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
                         | Ok result -> Assert.That(result.Stdout, Is.EqualTo "live")
                         | Error error -> Assert.Fail $"grown cassette must replay: {error}"
+            })
+
+    // --- Environment is part of the replay key (T-080) ---------------------------------------------
+
+    [<Test>]
+    member _.``a changed env value misses instead of replaying an unrelated recording``() : Task =
+        withCassette (fun path ->
+            task {
+                // The security case: a test that swaps in a NEW secret must NOT get the OLD success back.
+                let recorded = Command.create "tool" |> Command.env "TOKEN" "old-secret"
+                let probe = Command.create "tool" |> Command.env "TOKEN" "new-secret"
+
+                match! recordThenProbe path recorded probe with
+                | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
+                | other -> Assert.Fail $"a changed env value must miss, got {other}"
+            })
+
+    [<Test>]
+    member _.``the same effective env replays, and repeated overrides normalize``() : Task =
+        withCassette (fun path ->
+            task {
+                // Recorded with a superseded earlier override; the probe expresses the same net effect (A=2)
+                // directly. Repeated overrides with the same final effect must key identically and replay.
+                let recorded = Command.create "tool" |> Command.env "A" "1" |> Command.env "A" "2"
+                let probe = Command.create "tool" |> Command.env "A" "2"
+
+                match! recordThenProbe path recorded probe with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded-output")
+                | Error error -> Assert.Fail $"the same effective env must replay: {error}"
+            })
+
+    [<Test>]
+    member _.``a different env name misses``() : Task =
+        withCassette (fun path ->
+            task {
+                let recorded = Command.create "tool" |> Command.env "A" "x"
+                let probe = Command.create "tool" |> Command.env "B" "x"
+
+                match! recordThenProbe path recorded probe with
+                | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
+                | other -> Assert.Fail $"a different env name must miss, got {other}"
+            })
+
+    [<Test>]
+    member _.``an env removal is part of the key and normalizes``() : Task =
+        withCassette (fun path ->
+            task {
+                // A removal is a distinct instruction: removing A is not the same as never touching it,
+                // nor the same as setting it. A prior set that a removal cancels normalizes to the removal.
+                let recorded = Command.create "tool" |> Command.env "A" "1" |> Command.envRemove "A"
+
+                // A plain command (no override of A) must not falsely match the removal.
+                match! recordThenProbe path recorded (Command.create "tool") with
+                | Error(ProcessError.CassetteMiss _) -> ()
+                | other ->
+                    Assert.Fail $"a removal must not match a command that leaves the name untouched, got {other}"
+
+                // The same net effect (just remove A) replays.
+                match! recordThenProbe path recorded (Command.create "tool" |> Command.envRemove "A") with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded-output")
+                | Error error -> Assert.Fail $"an equivalent removal must replay: {error}"
+
+                // Removing A differs from setting A.
+                match! recordThenProbe path recorded (Command.create "tool" |> Command.env "A" "1") with
+                | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
+                | other -> Assert.Fail $"a removal must differ from a set of the same name, got {other}"
+            })
+
+    [<Test>]
+    member _.``EnvClear is part of the key``() : Task =
+        withCassette (fun path ->
+            task {
+                // A cleared environment is not the inherited one, even with no overrides — it must key apart.
+                let recorded = Command.create "tool" |> Command.envClear
+
+                match! recordThenProbe path recorded (Command.create "tool") with
+                | Error(ProcessError.CassetteMiss _) -> ()
+                | other -> Assert.Fail $"EnvClear must not match an un-cleared command, got {other}"
+
+                // The same EnvClear replays.
+                match! recordThenProbe path recorded (Command.create "tool" |> Command.envClear) with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded-output")
+                | Error error -> Assert.Fail $"the same EnvClear must replay: {error}"
+            })
+
+    [<Test>]
+    member _.``env name casing follows the platform's case sensitivity``() : Task =
+        withCassette (fun path ->
+            task {
+                // Windows env names are case-insensitive (Path == PATH → same variable → replay); POSIX
+                // names are case-sensitive (Path and PATH are different variables → miss).
+                let recorded = Command.create "tool" |> Command.env "Path" "x"
+                let probe = Command.create "tool" |> Command.env "PATH" "x"
+
+                match! recordThenProbe path recorded probe with
+                | result ->
+                    if isWindows then
+                        match result with
+                        | Ok r -> Assert.That(r.Stdout, Is.EqualTo "recorded-output")
+                        | Error error ->
+                            Assert.Fail
+                                $"on Windows a case-only difference is the same variable and must replay: {error}"
+                    else
+                        match result with
+                        | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
+                        | other ->
+                            Assert.Fail
+                                $"on POSIX a case-only difference is a different variable and must miss, got {other}"
+            })
+
+    [<Test>]
+    member _.``env values are never stored in the cassette``() : Task =
+        withCassette (fun path ->
+            task {
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("ok", 0))
+
+                        let command =
+                            Command.create "tool"
+                            |> Command.env "TOKEN" "sup3r-s3cret-value"
+                            |> Command.envRemove "REMOVED"
+
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                let onDisk = File.ReadAllText path
+
+                Assert.That(
+                    onDisk,
+                    Does.Not.Contain "sup3r-s3cret-value",
+                    "an env value must never reach disk in clear text"
+                )
+                // Names are not secret and stay inspectable; a redacting fingerprint replaces the values.
+                Assert.That(onDisk, Does.Contain "TOKEN")
+                Assert.That(onDisk, Does.Contain "EnvFingerprint")
+            })
+
+    [<Test>]
+    member _.``a pre-v3 entry keys as the default environment and does not falsely match a customized call``() : Task =
+        withCassette (fun path ->
+            task {
+                // A hand-written pre-v3 cassette (no EnvFingerprint field).
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 2, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "old", "Stderr": "" } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a pre-v3 cassette must still load: {error}"
+                | Ok replayer ->
+                    // A default-env command replays it unchanged (backward compatible).
+                    match! (runner replayer).OutputStringAsync(Command.create "tool", CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "old")
+                    | Error error -> Assert.Fail $"a default-env command must replay a pre-v3 entry: {error}"
+
+                    // An env-customized command must NOT be handed the un-fingerprinted recording.
+                    let customized = Command.create "tool" |> Command.env "TOKEN" "x"
+
+                    match! (runner replayer).OutputStringAsync(customized, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
+                    | other -> Assert.Fail $"an env-customized call must not falsely match a pre-v3 entry, got {other}"
             })

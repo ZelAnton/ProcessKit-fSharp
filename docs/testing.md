@@ -419,7 +419,7 @@ Semantics worth knowing before you commit a cassette:
 | Aspect | Behaviour |
 |---|---|
 | Match key | program + args + cwd + a stdin **source digest** (plus whether stdin was present). In-memory bytes hash their content; a `Stdin.FromFile` source hashes its path (opt into hashing its **contents** with `RecordReplayOptions.WithFileStdinContentHashing`) |
-| Environment | override **values never reach the file** — only the variable names are stored, so env secrets can't leak, and env is not part of the match key |
+| Environment | now part of the match key through a redacting **fingerprint** of the effective environment — the `EnvClear` flag plus the net effect of the `Env`/`EnvRemove` overrides (removals and last-write-wins included; env-name case is insensitive on Windows, sensitive on POSIX), while repeated/no-op overrides with the same final effect still match. Override **values never reach the file** — only the variable names and a versioned SHA-256 fingerprint — so env secrets can't leak, yet a call with a different value, name, removal, or `EnvClear` no longer replays an unrelated recording |
 | Miss | an unmatched call is `ProcessError.CassetteMiss` (distinct from a missing program) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded before/after sequence replays faithfully, while retry/probe loops keep getting a stable final answer |
 | Bytes | `CaptureBytesAsync` / `outputBytes` is supported: a **bytes recording** stores the exact stdout bytes (base64) and replays them byte-for-byte, including non-UTF-8 output. A **text** recording (or a pre-v2 cassette) replayed through the bytes verb is honestly `ProcessError.Unsupported` — it never hands back a lossy re-encode — so re-record that call through the bytes verb |
@@ -427,7 +427,7 @@ Semantics worth knowing before you commit a cassette:
 | Fidelity | for the **capture** verbs, a recording's **truncation** flag and wall-clock **duration** survive replay, so `ProcessResult.Truncated` / `Duration` read true on replay (not a synthetic `false` / `0`). Streaming replay (`SpawnAsync`) reconstructs the recorded lines and outcome; its duration is measured live and truncation is not replayed |
 | Err results | not recorded — only completed runs (a non-zero exit and a captured timeout *are* results and are recorded) |
 | One-shot stdin | `Stdin.FromStream` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
-| Format | a versioned JSON envelope — `{ "Version", "Entries" }` (current version **2**); a cassette **newer** than this build understands is rejected on load, while an older compatible one (a v1 cassette) still loads (missing fields default). A partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
+| Format | a versioned JSON envelope — `{ "Version", "Entries" }` (current version **3**); a cassette **newer** than this build understands is rejected on load, while an older compatible one (a v1/v2 cassette) still loads (missing fields default — a pre-v3 entry with no env fingerprint keys as the default, un-customized environment). A partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
 
 Only env *values* are redacted. `program`, `args`, `stdout`, and `stderr` are
 stored **verbatim** and can carry secrets (a `--password=…` flag, a token echoed

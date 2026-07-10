@@ -14,8 +14,9 @@ open ProcessKit
 
 /// One captured `invocation → result` pair — a row inside the `CassetteFile` envelope (public so
 /// `System.Text.Json` can serialize it; inspect a cassette file directly rather than depending on
-/// this shape). Only env *names* are stored (values redacted); `program`, `args`, `cwd`, `stdout`,
-/// and `stderr` are verbatim and can carry secrets — review a cassette before committing it.
+/// this shape). Env values are never stored in clear text — only the variable *names* and a redacting
+/// `EnvFingerprint` of the effective environment; `program`, `args`, `cwd`, `stdout`, and `stderr`
+/// are verbatim and can carry secrets — review a cassette before committing it.
 [<CLIMutable>]
 type CassetteEntry =
     {
@@ -34,6 +35,17 @@ type CassetteEntry =
         HasStdin: bool
         /// Names of the environment variables set on the command — values are redacted, never stored.
         EnvNames: string[]
+        /// A stable, versioned fingerprint of the child's **effective** environment semantics — whether
+        /// the inherited environment was cleared (`EnvClear`) plus the final effect of the explicit
+        /// overrides (each name's last set value or its removal, folded under the platform's env-name
+        /// case rules). It is part of the replay match key, so a call with a genuinely different
+        /// environment (a changed value, name, removal, or `EnvClear`) no longer replays an unrelated
+        /// recording, while repeated/no-op overrides with the same net effect still match. Env **values**
+        /// are hashed into it (SHA-256), never stored in clear text — but a low-entropy value (a short
+        /// token/PIN) can be recovered from the digest by brute force, so treat a cassette recorded with
+        /// secret env values as sensitive. `null` in a pre-v3 cassette (no fingerprint recorded): such an
+        /// entry keys as the default, un-customized environment (see `RecordReplayRunner`).
+        EnvFingerprint: string | null
         /// The captured standard output as text (verbatim; may contain secrets). For a `byte[]` capture
         /// (recorded via the bytes verb) this is empty and the exact bytes live in `StdoutBase64` — a
         /// string-verb replay of such an entry decodes `StdoutBase64` with the command's stdout encoding.
@@ -113,9 +125,9 @@ type RecordReplayOptions
         ArgumentNullException.ThrowIfNull redact
         RecordReplayOptions(hashFileStdinContents, argNormalizer, Some redact.Invoke)
 
-// Match key: program + args + cwd + whether-stdin + stdin digest. F# tuple/list have structural
-// equality, so this works as a Dictionary key.
-type private Key = string * string list * string option * bool * string option
+// Match key: program + args + cwd + whether-stdin + stdin digest + effective-environment fingerprint.
+// F# tuple/list have structural equality, so this works as a Dictionary key.
+type private Key = string * string list * string option * bool * string option * string
 
 // One key's entries in capture order, with the order-then-repeat-last cursor. `Entries` is mutable so
 // Auto mode can append a freshly-recorded (missed) entry to an existing key's group.
@@ -142,7 +154,9 @@ type private Mode =
 /// failure) record nothing; non-zero exits and captured timeouts are results and are recorded.
 ///
 /// **Replay** mode loads the cassette and serves results with **no subprocess**: a match is keyed on
-/// program + args + cwd + stdin-source digest; duplicates replay in capture order then repeat the
+/// program + args + cwd + stdin-source digest + an effective-environment fingerprint (so a call whose
+/// env values/names/removals or `EnvClear` differ no longer replays an unrelated recording — a pre-v3
+/// cassette with no fingerprint keys as the un-customized environment); duplicates replay in capture order then repeat the
 /// last; an unmatched call is `ProcessError.CassetteMiss` (never a surprise subprocess). Covers the
 /// text and **bytes** capture verbs (`CaptureStringAsync` / `CaptureBytesAsync`, the latter reproducing
 /// exact bytes from a bytes recording) and `SpawnAsync` (a live handle is reconstructed from the
@@ -162,8 +176,9 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
     // The cassette format version this build writes. Older, still-supported versions load (missing
     // fields default); a version newer than this is rejected. Bump when the on-disk schema changes.
-    // v2 added `StdoutBase64` (exact bytes for the bytes capture verb).
-    static let currentFormatVersion = 2
+    // v2 added `StdoutBase64` (exact bytes for the bytes capture verb); v3 added `EnvFingerprint` (the
+    // effective-environment fingerprint that folds env semantics into the replay match key).
+    static let currentFormatVersion = 3
 
     static let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
@@ -183,6 +198,79 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // SHA-256 hex of raw bytes — the shared digest for in-memory stdin and (opt-in) file-content stdin.
     static let hashBytes (bytes: byte[]) : string =
         Convert.ToHexString(SHA256.HashData bytes)
+
+    // The env-fingerprint scheme version, independent of the cassette FILE version: it tags the string
+    // below so a fingerprint from an older scheme can never silently compare equal to a newer one. Bump
+    // it if the canonical serialization changes.
+    static let envFingerprintScheme = 1
+
+    // The fingerprint of the default environment: inherit the parent's, no overrides, not cleared. A
+    // pre-v3 entry (no stored fingerprint) maps here as well, so a cassette recorded from commands that
+    // never customized the environment keeps replaying unchanged after the upgrade. It is distinct from
+    // an `EnvClear` with no overrides (an empty environment, not an inherited one), which is hashed below.
+    static let defaultEnvFingerprint = $"{envFingerprintScheme}|default"
+
+    // A stable, versioned fingerprint of a command's effective environment SEMANTICS: the `ClearEnv`
+    // flag plus the FINAL effect of the ordered overrides (last write wins per name; a name ends either
+    // set to a value or removed), folded under the platform's env-name case rules (Windows names are
+    // case-insensitive → canonical upper-case; POSIX case-sensitive → verbatim). Repeated or no-op
+    // overrides with the same net effect collapse to one fingerprint; a genuinely different environment
+    // (a changed value, name, removal, or `ClearEnv`) yields a different one. Env VALUES are hashed in
+    // (SHA-256 over a length-prefixed canonical form — each name/value is written as `<charCount>:<text>`
+    // so no name or value, whatever it contains, can straddle a field boundary and collide with another),
+    // never emitted in clear text.
+    static let envFingerprint (clearEnv: bool) (overrides: (string * string option) seq) : string =
+        let canon (name: string) =
+            if isWindows then name.ToUpperInvariant() else name
+
+        let effective = Dictionary<string, string option>(StringComparer.Ordinal)
+
+        for name, value in overrides do
+            effective[canon name] <- value // last write wins per canonical name
+
+        if not clearEnv && effective.Count = 0 then
+            // No environment customization at all: the shared default fingerprint (also the pre-v3 map).
+            defaultEnvFingerprint
+        else
+            let sb = StringBuilder()
+
+            sb
+                .Append(envFingerprintScheme)
+                .Append('|')
+                .Append(if isWindows then 'i' else 's')
+                .Append('|')
+                .Append(if clearEnv then "clear" else "keep")
+            |> ignore
+
+            // Ordinal name sort (F#'s default string comparison) keeps the serialization order-stable and
+            // culture-independent, so the same effective environment always hashes to the same digest.
+            // Each field is length-prefixed (`<charCount>:<text>`), a self-delimiting (netstring-style)
+            // form: the reader consumes exactly that many chars, so no name/value — whatever characters it
+            // holds — can straddle a boundary and let two distinct environments encode to the same bytes.
+            let appendField (text: string) =
+                sb.Append(text.Length).Append(':').Append(text) |> ignore
+
+            for name in effective.Keys |> Seq.sort do
+                match effective[name] with
+                | Some value ->
+                    sb.Append 'S' |> ignore
+                    appendField name
+                    appendField value
+                | None ->
+                    sb.Append 'R' |> ignore
+                    appendField name
+
+            let digest =
+                Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())))
+
+            $"{envFingerprintScheme}|{digest}"
+
+    // The env fingerprint stored in a cassette entry — the recorded value for a v3 entry, or the default
+    // fingerprint for a pre-v3 entry (`null`), so a legacy entry keys as the un-customized environment.
+    static let entryEnvFingerprint (entry: CassetteEntry) : string =
+        match entry.EnvFingerprint with
+        | null -> defaultEnvFingerprint
+        | fingerprint -> fingerprint
 
     // Apply the optional argument normalizer for keying (used identically when building the replay index
     // and when matching a live command). A user-supplied `Func` could return null despite its type, so a
@@ -231,7 +319,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 applyNormalizer normalizer entry.Args,
                 Option.ofObj entry.Cwd,
                 entry.HasStdin,
-                Option.ofObj entry.StdinDigest
+                Option.ofObj entry.StdinDigest,
+                entryEnvFingerprint entry
 
             match grouped.TryGetValue key with
             | true, bucket -> bucket.Add entry
@@ -355,7 +444,13 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
     let keyOf (command: Command) (digest: string option) : Key =
         let args = applyNormalizer options.ArgNormalizer (Seq.toArray command.Config.Args)
-        command.Program, args, command.WorkingDirectory, command.Config.StdinSource.IsSome, digest
+
+        command.Program,
+        args,
+        command.WorkingDirectory,
+        command.Config.StdinSource.IsSome,
+        digest,
+        envFingerprint command.Config.ClearEnv command.Config.EnvOverrides
 
     let envNamesOf (command: Command) : string[] =
         command.Config.EnvOverrides
@@ -382,6 +477,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           StdinDigest = Option.toObj digest
           HasStdin = command.Config.StdinSource.IsSome
           EnvNames = envNamesOf command
+          EnvFingerprint = envFingerprint command.Config.ClearEnv command.Config.EnvOverrides
           Stdout = redactText result.Stdout
           Stderr = redactText result.Stderr
           StdoutBase64 = null
@@ -400,6 +496,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           StdinDigest = Option.toObj digest
           HasStdin = command.Config.StdinSource.IsSome
           EnvNames = envNamesOf command
+          EnvFingerprint = envFingerprint command.Config.ClearEnv command.Config.EnvOverrides
           Stdout = ""
           Stderr = redactText result.Stderr
           StdoutBase64 = Convert.ToBase64String result.Stdout
