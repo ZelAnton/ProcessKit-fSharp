@@ -219,6 +219,28 @@ type PumpTests() =
         Assert.That(buf.TotalBytes, Is.EqualTo 7)
 
     [<Test>]
+    member _.``LineBuffer Error with MaxLines 0 errors from the first line``() =
+        // R-1: the contract's "strictly after exceeding" must hold at the zero-limit boundary too — a
+        // `MaxLines = Some 0` ceiling is exceeded by the very first retained line.
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxLines(0).WithOverflow OverflowMode.Error)
+
+        [ "a"; "b" ] |> List.iter buf.Add
+        Assert.That(buf.Text, Is.EqualTo "")
+        Assert.That(buf.TooLarge, Is.True)
+        Assert.That(buf.TotalLines, Is.EqualTo 2)
+
+    [<Test>]
+    member _.``LineBuffer Error with MaxBytes 0 errors from the first line``() =
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes(0).WithOverflow OverflowMode.Error)
+
+        [ "a"; "b" ] |> List.iter buf.Add
+        Assert.That(buf.Text, Is.EqualTo "")
+        Assert.That(buf.TooLarge, Is.True)
+        Assert.That(buf.TotalBytes, Is.EqualTo 4)
+
+    [<Test>]
     member _.``LineBuffer Error with MaxLines 2 and MaxBytes 10 errors at the first limit``() =
         let buf =
             Pump.LineBuffer(
