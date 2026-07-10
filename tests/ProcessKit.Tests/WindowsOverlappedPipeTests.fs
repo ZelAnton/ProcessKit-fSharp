@@ -256,10 +256,11 @@ type WindowsOverlappedPipeTests() =
         :> Task
 
 /// Deterministic fault injection at the Windows native containment boundary (`Native.Windows`): a forced
-/// `ResumeThread` failure on the CREATE_SUSPENDED spawn path, and the Job-Object member-list buffer
-/// growth / query-failure classification — all driven through the module's test seams so a genuinely
-/// failing WinAPI (which cannot be provoked on demand) and a job with thousands of members (which would
-/// otherwise need thousands of real processes) are exercised without touching production code.
+/// `ResumeThread` failure on the CREATE_SUSPENDED spawn path, the Job-Object member-list buffer
+/// growth / query-failure classification, and the `IsProcessInJob` pid-recycle re-check on
+/// `suspend`/`resume` — all driven through the module's test seams so a genuinely failing WinAPI
+/// (which cannot be provoked on demand) and a job with thousands of members (which would otherwise
+/// need thousands of real processes) are exercised without touching production code.
 [<TestFixture>]
 type WindowsNativeContainmentFaultTests() =
 
@@ -390,3 +391,68 @@ type WindowsNativeContainmentFaultTests() =
             | other -> Assert.Fail $"expected Error(ProcessError.Io), got {other}"
         finally
             Windows.queryInformationJobObjectHook <- original
+
+    [<Test>]
+    member _.``suspendWindows leaves a foreign live process alone when its pid is falsely reported as a member``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: exercises the IsProcessInJob pid-recycle guard"
+
+            // Simulates the pid-recycle race the guard closes: the members-query seam reports a pid that is
+            // NOT actually assigned to `job` — as if a genuine member had exited and its pid were reused by
+            // an unrelated live process. `foreignGroup`'s child plays that unrelated live process: it is
+            // real and running, but a member of a DIFFERENT job, never of `job` below. Without the
+            // post-`OpenProcess` `IsProcessInJob` re-check inside `forEachMemberHandle`, `suspendWindows`
+            // would freeze it — it would then never resume and its `WaitAsync` would time out instead of
+            // exiting on schedule.
+            use foreignGroup =
+                match ProcessGroup.Create() with
+                | Ok group -> group
+                | Error error -> failwith $"ProcessGroup.Create failed: {error}"
+
+            let printer =
+                Command.create "cmd.exe"
+                |> Command.args [ "/c"; "ping -n 2 127.0.0.1 >nul & echo done" ]
+                |> Command.timeout (TimeSpan.FromSeconds 10.0)
+
+            match! foreignGroup.StartAsync printer with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let foreignPid =
+                    match running.Pid with
+                    | Some pid -> pid
+                    | None -> failwith "expected a pid"
+
+                let job =
+                    match Windows.createWindowsJob () with
+                    | Ok job -> job
+                    | Error error -> failwith $"createWindowsJob failed: {error}"
+
+                let original = Windows.queryInformationJobObjectHook
+
+                try
+                    Windows.queryInformationJobObjectHook <-
+                        fun _job _infoClass buffer _bufferSize ->
+                            Marshal.WriteInt32(buffer, 0, 1) // NumberOfAssignedProcesses
+                            Marshal.WriteInt32(buffer, 4, 1) // NumberOfProcessIdsInList
+                            Marshal.WriteIntPtr(buffer, 8, nativeint foreignPid)
+                            struct (true, 0)
+
+                    match Windows.suspendWindows job with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"suspendWindows: {error}"
+
+                    let! outcome = running.WaitAsync()
+
+                    match outcome with
+                    | Outcome.Exited _ -> Assert.Pass()
+                    | Outcome.TimedOut -> Assert.Fail "the foreign process was frozen — the pid-recycle guard regressed"
+                    | other -> Assert.Fail $"{other}"
+                finally
+                    Windows.queryInformationJobObjectHook <- original
+                    Windows.terminateWindowsJob job
+                    Windows.closeWindowsHandle job
+        }
+        :> Task

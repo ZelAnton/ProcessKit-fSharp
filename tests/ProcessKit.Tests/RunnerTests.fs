@@ -1,6 +1,8 @@
 namespace ProcessKit.Tests
 
 open System
+open System.IO
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
@@ -262,6 +264,188 @@ type RunnerTests() =
             | other -> Assert.Fail $"expected an Exit error, got {other}"
 
             Assert.That(calls, Is.EqualTo 3)
+        }
+        :> Task
+
+    // ----- one-shot stdin + retry (T-088) -----
+
+    [<Test>]
+    member _.``retry refuses a one-shot stdin source (FromStream) before the first attempt``() : Task =
+        task {
+            let mutable calls = 0
+
+            let alwaysFailing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Ok(ProcessResult.Failure "" "boom" 1))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Failure [||] "boom" 1))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run alwaysFailing CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected an Unsupported error, got {other}"
+
+            // Refused before the first attempt — never spawned at all, so it can never observe the
+            // stream already exhausted by a prior attempt.
+            Assert.That(calls, Is.EqualTo 0)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``retry refuses a one-shot stdin source (FromLines) before the first attempt``() : Task =
+        task {
+            let mutable calls = 0
+
+            let alwaysFailing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Ok(ProcessResult.Failure "" "boom" 1))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Failure [||] "boom" 1))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (
+                    Stdin.FromLines(
+                        seq {
+                            "one"
+                            "two"
+                        }
+                    )
+                )
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run alwaysFailing CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected an Unsupported error, got {other}"
+
+            Assert.That(calls, Is.EqualTo 0)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``retry with a repeatable stdin source (FromString) is unaffected``() : Task =
+        task {
+            let mutable calls = 0
+
+            // Fails twice, then succeeds on the 3rd attempt — proves the retry loop still runs
+            // normally when the stdin source is repeatable.
+            let flaky =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+
+                        if calls < 3 then
+                            Task.FromResult(Ok(ProcessResult.Failure "" "boom" 1))
+                        else
+                            Task.FromResult(Ok(ProcessResult.Success "hello"))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromString "payload")
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run flaky CancellationToken.None
+
+            match result with
+            | Ok text -> Assert.That(text, Is.EqualTo "hello")
+            | Error error -> Assert.Fail $"expected Ok, got {error}"
+
+            Assert.That(calls, Is.EqualTo 3)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a single run (no retry) with a one-shot stdin source is unaffected``() : Task =
+        task {
+            let mutable calls = 0
+
+            let succeeding =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Ok(ProcessResult.Success "hello"))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            // No `Retry` configured at all: a one-shot stdin source must run exactly like before —
+            // only an active Retry with more than one attempt triggers the pre-flight refusal.
+            let command = Command.create "svc" |> Command.stdin (Stdin.FromStream stream)
+
+            let! result = command |> Runner.run succeeding CancellationToken.None
+
+            match result with
+            | Ok text -> Assert.That(text, Is.EqualTo "hello")
+            | Error error -> Assert.Fail $"expected Ok, got {error}"
+
+            Assert.That(calls, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Retry(1, ...) with a one-shot stdin source is unaffected (a single run, not a retry)``() : Task =
+        task {
+            let mutable calls = 0
+
+            let succeeding =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Ok(ProcessResult.Success "hello"))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 1 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run succeeding CancellationToken.None
+
+            match result with
+            | Ok text -> Assert.That(text, Is.EqualTo "hello")
+            | Error error -> Assert.Fail $"expected Ok, got {error}"
+
+            Assert.That(calls, Is.EqualTo 1)
         }
         :> Task
 

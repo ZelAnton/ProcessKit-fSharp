@@ -1321,6 +1321,62 @@ type StreamingTests() =
         }
         :> Task
 
+    // --- Tee flush after pump completion (T-086): a buffered tee sink (here a real `BufferedStream`,
+    //     which genuinely holds written bytes in its own buffer until `Flush`/a large-enough write/
+    //     dispose) must see its last bytes as soon as the pump's read loop ends — not only once the
+    //     caller eventually disposes the tee. ProcessKit never disposes a caller-supplied tee, so these
+    //     tests deliberately assert BEFORE the `use` bindings dispose anything. ---
+
+    [<Test>]
+    member _.``StdoutTee flushes a buffered sink after the pump completes, before the caller disposes it``() : Task =
+        task {
+            // `underlying` only ever sees what `tee` (the `BufferedStream`) has actually flushed to it —
+            // its buffer (64 KiB) is far larger than the payload, so nothing forces an implicit flush on
+            // write. If the pump never flushed the tee, `underlying` would still be empty here.
+            use underlying = new MemoryStream()
+            use tee = new BufferedStream(underlying, 65536)
+
+            let config = (Command.create "test" |> Command.stdoutTee tee).Config
+            use running = syntheticStdoutProcess config "line1\nline2\n"
+
+            match! running.OutputStringAsync() with
+            | Ok _ ->
+                Assert.That(
+                    Encoding.UTF8.GetString(underlying.ToArray()),
+                    Is.EqualTo "line1\nline2\n",
+                    "the buffered stdout tee must be flushed by the pump itself, without the caller disposing it"
+                )
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StderrTee flushes a buffered sink after the pump completes, before the caller disposes it``() : Task =
+        task {
+            use underlying = new MemoryStream()
+            use tee = new BufferedStream(underlying, 65536)
+
+            let command = threeLinesToStderr |> Command.stderrTee tee
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match! running.OutputBytesAsync() with
+                | Ok result ->
+                    // The tee is byte-exact (it may carry the shell's own CRLF line endings on
+                    // Windows, plus the trailing line terminator after the last line), while
+                    // `result.Stderr` is decoded/line-joined with '\n' and has no trailing separator —
+                    // normalize before comparing so this asserts "the tee got flushed with everything
+                    // the pump read", not byte-for-byte equality with the decoded text.
+                    Assert.That(
+                        Encoding.UTF8.GetString(underlying.ToArray()).Replace("\r\n", "\n").TrimEnd '\n',
+                        Is.EqualTo result.Stderr,
+                        "the buffered stderr tee must be flushed by the pump itself, without the caller disposing it"
+                    )
+                | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
     // --- Idle timeout (`Command.IdleTimeout`): kill a run that stops producing output (T-052). The
     //     deadline is reset by each chunk of stdout/stderr (byte granularity, across every verb), and
     //     surfaces — like the total `Timeout` — as `Outcome.TimedOut`. ---

@@ -59,3 +59,32 @@ type Stdin internal (source: StdinSource) =
     static member FromAsyncLines(lines: IAsyncEnumerable<string>) =
         ArgumentNullException.ThrowIfNull lines
         Stdin(StdinSource.AsyncLines lines)
+
+[<RequireQualifiedAccess>]
+module internal StdinSource =
+
+    /// True for a source that can only be pumped once: a live `Stream` (`FromStream`), or a sequence
+    /// of lines (`FromLines`/`FromAsyncLines`) that may be backed by a one-shot enumerator (a
+    /// generator, a non-seekable reader). Re-pumping an already-exhausted one-shot source into a
+    /// second attempt silently feeds the child empty/truncated input instead of replaying the
+    /// original one — see T-088 (ports ProcessKit-rs `c1f39c7`/`8472007`). The repeatable sources are
+    /// unaffected: `Empty` has nothing to exhaust, `Bytes` is an immutable in-memory array pumped
+    /// fresh from the start on every attempt, and `File` reopens its path fresh on every attempt.
+    let isOneShot (source: StdinSource) : bool =
+        match source with
+        | StdinSource.Reader _
+        | StdinSource.Lines _
+        | StdinSource.AsyncLines _ -> true
+        | StdinSource.Empty
+        | StdinSource.Bytes _
+        | StdinSource.File _ -> false
+
+[<RequireQualifiedAccess>]
+module internal Stdin =
+
+    /// True when `stdin` carries a one-shot source (see `StdinSource.isOneShot`); `false` for `None`
+    /// — no stdin source at all is trivially repeatable, since there is nothing to exhaust.
+    let isOneShot (stdin: Stdin option) : bool =
+        stdin
+        |> Option.map (fun s -> StdinSource.isOneShot s.Source)
+        |> Option.defaultValue false
