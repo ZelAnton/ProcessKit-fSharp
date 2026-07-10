@@ -172,7 +172,7 @@ The fallback has no kernel tree resource limits and its `Stats` can report only 
 
 `CgroupBackend` is selected only on Linux when resource limits are requested. `Native.Cgroup` probes `/sys/fs/cgroup` and the hybrid `/sys/fs/cgroup/unified`, requiring a non-empty `cgroup.controllers`. Creation enables the required `memory`, `pids`, and/or `cpu` controllers and writes `memory.max`, `pids.max`, and `cpu.max`.
 
-POSIX spawn starts the child before ProcessKit can write its PID to `cgroup.procs`. This creates an unavoidable migration window: descendants forked before migration remain in the parent cgroup and are not limited. They are still covered by the child's process group during teardown. If migration itself fails, `Track` removes the PID from tracking, kills its process group, reaps the leader, and returns `ResourceLimit`; running unconstrained is not an accepted fallback.
+`posix_spawn` starts a child running immediately, so a bare parent-side write of the PID to `cgroup.procs` would land after the child had already executed — a spawn-to-migrate window where a descendant forked in that first instant is created in the parent cgroup and escapes the limits. ProcessKit closes it by launching the child through a small `/bin/sh` helper that writes its own PID into `cgroup.procs` and then `exec`s the real program in place (same PID): the target's first instruction already runs inside the cgroup, so any descendant it forks inherits the cgroup too. This mirrors the `setpriv` uid/gid helper — no managed code runs in a post-fork child — and a requested uid/gid drop is nested inside the launcher so the privileged cgroup join happens before the drop. `Track` still writes the PID to `cgroup.procs` as an idempotent confirmation: a genuine open/write failure (missing or unwritable cgroup) means the launcher's own self-migrate failed too, so `Track` removes the PID from tracking, kills its process group, reaps the leader, and returns `ResourceLimit`; running unconstrained is not an accepted fallback. A write that races a fast target's exit (`ESRCH`) is treated as success — the target ran inside the cgroup and is gone.
 
 Hard kill first writes `1` to `cgroup.kill` (kernel 5.14+). If unavailable, it best-effort freezes the cgroup, repeatedly SIGKILLs current members (up to 50 sweeps), then thaws survivors. `HardRelease` also kills/reaps every directly spawned POSIX leader because cgroup kill does not perform `waitpid`, then removes the directory. Resource-limit requests do not fall back to an unbounded process group when cgroup creation or delegation fails.
 
@@ -242,7 +242,7 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 | Capability | Windows Job Object | POSIX process group | Linux cgroup v2 |
 |---|---|---|---|
 | Selection | Windows, with or without limits | macOS/BSD; Linux without requested limits | Linux when limits are requested |
-| Containment timing | Child suspended, assigned to Job, then resumed | Group created atomically by `posix_spawn` attributes | POSIX group at spawn; cgroup migration immediately afterward |
+| Containment timing | Child suspended, assigned to Job, then resumed | Group created atomically by `posix_spawn` attributes | POSIX group at spawn; `/bin/sh` launcher joins the cgroup before `exec`ing the target (already contained on its first instruction) |
 | Whole-tree hard kill | Terminate Job or close kill-on-close Job handle | `killpg(SIGKILL)` for each tracked pgid | `cgroup.kill`; freeze-and-SIGKILL sweep fallback |
 | Graceful tree stop | No Job-wide soft stop; hard kill | `SIGTERM`, poll, then `SIGKILL` | signal members with `SIGTERM`, poll, then cgroup hard kill |
 | General signals | Kill; Int/Term as opt-in CTRL+BREAK only | `killpg` with mapped/raw signal | per-current-member signal sweep; Kill is atomic cgroup kill |
@@ -251,7 +251,7 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 | Membership snapshot | All Job PIDs | Tracked group leaders, not every descendant PID | Current `cgroup.procs` PIDs |
 | Accounting | Active count, CPU, peak committed memory | Live group count only | Active members, CPU use, peak memory when files exist |
 | Reaping obligation | Handles close; Job kills on close | ProcessKit `waitpid`s direct leaders; other descendants reparent | cgroup kill plus `waitpid` of direct leaders |
-| Main failure mode | Job creation/assignment or console delivery failure | No tree limits; PID/pgid reuse if ownership rules are broken | Missing/delegation-denied controllers, migration window/failure, older-kernel kill fallback |
+| Main failure mode | Job creation/assignment or console delivery failure | No tree limits; PID/pgid reuse if ownership rules are broken | Missing/delegation-denied controllers, migration failure (honest `ResourceLimit`), older-kernel kill fallback |
 
 On macOS, the POSIX backend is the only mechanism: whole-tree limits are rejected rather than approximated. `Native.Posix` also accounts for macOS `POSIX_SPAWN_CLOEXEC_DEFAULT` when preserving inherited standard descriptors, and current-directory support requires `posix_spawn_file_actions_addchdir_np` (macOS 10.15+). Signal and zombie-reaping semantics remain POSIX: `killpg` sends signals but never substitutes for reaping ProcessKit's direct child.
 

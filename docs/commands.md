@@ -316,7 +316,10 @@ Console.WriteLine(await cmd.OutputStringAsync() switch
 
 A single persistent decoder runs over the whole stream, so a multi-byte sequence
 that straddles two reads still decodes correctly and a `0x0A` byte inside a wider
-code unit isn't mistaken for a line break. A leading byte-order mark of the chosen
+code unit isn't mistaken for a line break. The decoder is finalized at EOF, so an
+incomplete trailing sequence follows the encoding's configured decoder fallback:
+the default emits `U+FFFD`, while `DecoderExceptionFallback` raises its decoding
+exception. A leading byte-order mark of the chosen
 encoding is stripped once, from the **decoded text only** — `OutputBytesAsync` and the
 raw [tee](#line-handlers-and-tees) stay byte-exact.
 

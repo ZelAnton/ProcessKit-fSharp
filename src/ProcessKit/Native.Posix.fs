@@ -1381,3 +1381,91 @@ module internal Posix =
                 | other -> other
         else
             spawnPosixViaSpawn command
+
+    // ----------------------------------------------------------------------------------
+    // Linux cgroup v2: place the child INSIDE its cgroup atomically with its own execution
+    // ----------------------------------------------------------------------------------
+    //
+    // `posix_spawn` starts the child running immediately (there is no portable "start stopped"), so the
+    // parent-side `CgroupBackend.Track` write of the child's pid to `cgroup.procs` necessarily lands
+    // AFTER the child has already executed some instructions. A user target that forks in that first
+    // instant would create a descendant in the PARENT cgroup — outside the requested memory/pids/cpu
+    // caps — a real enforcement bypass, not merely a cleanup risk.
+    //
+    // The fix places the target inside its cgroup BEFORE it runs a single instruction, using the SAME
+    // safe helper-process pattern as the `setpriv` uid/gid drop (no managed .NET code runs in an unsafe
+    // post-fork child — the obvious `fork()`-in-child port is unsafe on CoreCLR, as the `setpriv` note
+    // above explains). A tiny `/bin/sh` launcher writes its OWN pid (`$$`) into the target cgroup's
+    // `cgroup.procs` — joining the cgroup — and only THEN `exec`s the real program IN PLACE ($2...). An
+    // `exec` keeps the pid, so the target's very first instruction runs with its pid already a cgroup
+    // member, and every descendant it forks inherits that cgroup from the kernel. A failed self-migrate
+    // (missing / unwritable cgroup) `exit`s WITHOUT exec, so the target never runs outside the cgroup —
+    // no escapee. Because the launcher is a separate program reached through the ordinary `posix_spawn`
+    // path, everything else composes exactly as it does for `setpriv`: stdio / cwd / env via posix_spawn
+    // file actions, `Setsid` via `POSIX_SPAWN_SETSID`, `Umask` via the parent-side set/restore,
+    // `Priority` via the post-spawn `setpriority` on the leader (pgid == the launcher's pid == the
+    // target's pid after exec), and kill-on-drop via that unchanged pgid. A requested `Uid`/`Gid` drop
+    // is nested INSIDE the launcher (`exec setpriv ... program ...`), so the privileged cgroup join runs
+    // BEFORE the drop and is never blocked by the child's lowered credentials (cgroup membership is
+    // independent of uid and survives the drop). The migration write is by `$$` (the launcher's own,
+    // definitionally-live pid), so it can only fail at OPEN (missing/denied cgroup) — never ESRCH — which
+    // is what makes the parent-side confirmation (`Native.Cgroup.migrateToCgroup`) able to tell a genuine
+    // failure apart from a fast target that has already exited.
+
+    // The self-migrating cgroup launcher script (POSIX sh). `$1` is the target cgroup's `cgroup.procs`
+    // path; the program and its args are $2.. and are exec'd verbatim through `"$@"` (passed as separate
+    // positional parameters, never interpolated into the script — so no shell parsing of user data). A
+    // failed self-migrate exits 127 without exec, so the program never runs outside the cgroup.
+    [<Literal>]
+    let private cgroupLauncherScript =
+        "echo $$ > \"$1\" || exit 127; shift; exec \"$@\""
+
+    /// Spawn `command` so that its pid is placed into the cgroup whose `cgroup.procs` path is
+    /// `cgroupProcs` BEFORE the program executes a single instruction, closing the spawn-to-migrate
+    /// window (see the section comment above). Linux cgroup-backend only. A requested `Uid`/`Gid` drop is
+    /// honoured (nested inside the launcher, after the privileged migration) with the same up-front
+    /// non-root rejection as `spawnPosix`. `/bin/sh` missing (pathological on Linux) surfaces as an honest
+    /// `ProcessError.ResourceLimit`, never a silent unconstrained run.
+    let spawnPosixIntoCgroup (command: Command) (cgroupProcs: string) : Result<Spawned, ProcessError> =
+        let config = command.Config
+
+        let launch () =
+            // The argv the launcher `exec`s after migrating: the real program (and its args), or — when a
+            // uid/gid drop is requested — the `setpriv` helper wrapping it, so the drop happens AFTER the
+            // privileged cgroup join. Mirrors `setprivCommand`'s `setpriv <flags> <program> <args...>`.
+            let innerArgv =
+                if config.Uid.IsSome || config.Gid.IsSome then
+                    "setpriv" :: (setprivFlags config @ (config.Program :: List.ofSeq config.Args))
+                else
+                    config.Program :: List.ofSeq config.Args
+
+            let launcherArgs = "-c" :: cgroupLauncherScript :: "sh" :: cgroupProcs :: innerArgv
+
+            // Every other knob (stdio, cwd, env, Priority, Umask, Setsid) is preserved and applied by
+            // posix_spawn to the launcher, then inherited across its `exec`(s). `Uid`/`Gid` are cleared so
+            // `spawnPosixViaSpawn` does not ALSO wrap the launcher in a second `setpriv` layer.
+            let launcherConfig =
+                { config with
+                    Program = "/bin/sh"
+                    Args = System.Collections.Immutable.ImmutableList.CreateRange launcherArgs
+                    Uid = None
+                    Gid = None }
+
+            match spawnPosixViaSpawn (Command launcherConfig) with
+            | Error(ProcessError.NotFound _) ->
+                // Only `/bin/sh` itself can be NotFound here (a missing target program instead makes the
+                // launcher's `exec` fail and the shell exit 127 — an honest non-zero run, not a spawn
+                // NotFound). Placing the child in its cgroup atomically needs the launcher, so report an
+                // honest limit-enforcement failure rather than a silent unconstrained run.
+                Error(
+                    ProcessError.ResourceLimit
+                        "placing the process into its cgroup atomically needs /bin/sh (the migration launcher), which was not found on this host"
+                )
+            | other -> other
+
+        if config.Uid.IsSome || config.Gid.IsSome then
+            match privilegeDropPrecheck command with
+            | Some error -> Error error
+            | None -> launch ()
+        else
+            launch ()
