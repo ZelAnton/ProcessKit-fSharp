@@ -550,9 +550,15 @@ Probe semantics are deliberately uniform:
   server.
 - A failed probe **never kills the child.** You decide what happens next: retry, log
   and continue, or tear down.
-- `WaitForLineAsync` consumes stdout up to (and including) the matching line — continue with
-  `FinishAsync()` or further streaming afterwards. `WaitForPortAsync` / `WaitForAsync` don't touch the
-  pipes at all.
+- All three probes background-drain the child's piped stdout/stderr while polling, so a chatty
+  child that writes more than one OS pipe buffer of startup output (~64 KiB on Linux) before
+  becoming ready can't block in `write()` and spuriously fail the probe with `NotReady`.
+  `WaitForLineAsync` hands the drained stdout back to you (consumed up to and including the
+  matching line — continue with `FinishAsync()` or further streaming afterwards); `WaitForPortAsync`
+  / `WaitForAsync` discard what they drain and stop draining once the probe concludes. Either way, a
+  capture verb called afterward (`OutputStringAsync`/`OutputBytesAsync`/a fresh
+  `StdoutLinesAsync`/`OutputEventsAsync`) only sees output the child wrote *after* the probe
+  concluded — run probes before a capturing verb if you need the complete output.
 
 `WaitForAsync` takes a function returning `Task<bool>` (`Func<Task<bool>>` from C#), so any
 async health check fits — re-evaluated until it returns `true` or the deadline elapses.

@@ -205,6 +205,22 @@ type RunningProcess internal (host: RunningHost) =
     let alreadyConsumedError () =
         ProcessError.Unsupported alreadyConsumedMessage
 
+    // Hand `stdoutStream`/`stderrStream` to a readiness probe (`WaitForPortAsync`/`WaitForAsync`) for
+    // its background drain — but only a still-`Fresh` handle's pipes: if a buffered verb or a
+    // streaming session already claimed them, that consumer's own pump already drains them, and
+    // handing the same streams to the probe as well would start a second, racing reader on the same
+    // pipe. A snapshot read (not a claim: `consumption` is left untouched, so a real verb can still
+    // claim the pipes normally once the probe stops draining) taken once, before the probe's first
+    // attempt — the same narrow race window every other snapshot-then-act check in this class
+    // accepts (concurrently calling two verbs on one handle from different threads without
+    // WaitAny/WaitAll is already undefined elsewhere in this API).
+    let probeDrainStreams () : Stream option * Stream option =
+        lock stateLock (fun () ->
+            if consumption = Consumption.Fresh then
+                stdoutStream, stderrStream
+            else
+                None, None)
+
     let elapsed () =
         Stopwatch.GetElapsedTime host.StartedTimestamp
 
@@ -1058,25 +1074,35 @@ type RunningProcess internal (host: RunningHost) =
             }
 
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`
-    /// (or `Cancelled` if `cancellationToken` fires first). Unlike `WaitForLineAsync`, this does not read
-    /// the child's stdout/stderr while polling — a child that floods a *piped* stream before it is
-    /// ready can block on a full pipe; consume its output concurrently (`StdoutLinesAsync`/`OutputEventsAsync`)
-    /// or run it with `Stdout`/`Stderr` set to `Inherit`/`Null` when polling a chatty process.
+    /// (or `Cancelled` if `cancellationToken` fires first). Background-drains (and discards) the
+    /// child's piped stdout/stderr for the duration of the poll — like `WaitForLineAsync`, so a child
+    /// that writes more than one OS pipe buffer of startup output (~64 KiB on Linux) before becoming
+    /// ready can't block in `write()` and spuriously time out this probe — but unlike
+    /// `WaitForLineAsync`, the drained bytes are discarded rather than handed back, and draining stops
+    /// once the probe concludes rather than continuing as an established streaming session. A capture
+    /// verb (`OutputStringAsync`/`OutputBytesAsync`/`StdoutLinesAsync`/`OutputEventsAsync`) called
+    /// AFTER this probe therefore only sees what the child wrote after the probe concluded, not the
+    /// full run — the same "doesn't compose with a subsequent fresh capture" limitation
+    /// `WaitForLineAsync` already documents, now uniform across all three readiness probes. If a
+    /// buffered/streaming verb already claimed the pipes before this call, that verb's own pump is
+    /// already draining them and this probe leaves them alone (no second reader).
     member _.WaitForPortAsync
         (endpoint: IPEndPoint, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull endpoint
-        ReadinessProbe.waitForPort config.Program endpoint timeout cancellationToken
+        let stdout, stderr = probeDrainStreams ()
+        ReadinessProbe.waitForPort config.Program stdout stderr endpoint timeout cancellationToken
 
     /// Poll `probe` until it returns true, or fail with `NotReady` after `timeout` (or `Cancelled`
-    /// if `cancellationToken` fires first). Like `WaitForPortAsync`, this does not drain the child's
-    /// stdout/stderr while polling — consume a piped, chatty child's output concurrently (or run it
-    /// with `Stdout`/`Stderr` `Inherit`/`Null`) so it can't block on a full pipe before becoming ready.
+    /// if `cancellationToken` fires first). Background-drains (and discards) the child's piped
+    /// stdout/stderr for the duration of the poll, exactly like `WaitForPortAsync` — see its doc for
+    /// what that does and doesn't compose with afterward.
     member _.WaitForAsync
         (probe: Func<Task<bool>>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull probe
-        ReadinessProbe.waitFor config.Program probe timeout cancellationToken
+        let stdout, stderr = probeDrainStreams ()
+        ReadinessProbe.waitFor config.Program stdout stderr probe timeout cancellationToken
 
     /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
     /// the racing primitive behind `WaitAnyAsync`/`WaitAllAsync`. Built exactly once under `stateLock`

@@ -14,7 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `RunningProcess.WaitForPortAsync` / `WaitForAsync` now background-drain the child's piped
+  stdout/stderr while polling, matching `WaitForLineAsync`. Previously a child that wrote more than
+  one OS pipe buffer (~64 KiB on Linux) of startup output before becoming ready would block in its
+  own `write()`, and the probe would spin until its deadline and fail with a spurious
+  `ProcessError.NotReady` even though the child was alive and about to become ready. Unlike
+  `WaitForLineAsync`, the drained bytes are discarded and draining stops once the probe concludes; a
+  capture verb called afterward only sees output written after the probe concluded — the same
+  "doesn't compose with a subsequent fresh capture" limitation `WaitForLineAsync` already had, now
+  uniform across all three readiness probes.
 
 ## [2.2.0] - 2026-07-10
 
