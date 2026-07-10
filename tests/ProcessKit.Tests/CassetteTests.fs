@@ -981,3 +981,105 @@ type CassetteTests() =
                     | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
                     | other -> Assert.Fail $"an env-customized call must not falsely match a pre-v3 entry, got {other}"
             })
+
+    // --- Terminal-state / base64 validation (T-081) -------------------------------------------------
+
+    [<Test>]
+    member _.``corrupt base64 stdout gives the same Io error for string, bytes, and spawn replay``() : Task =
+        withCassette (fun path ->
+            task {
+                // A hand-corrupted base64 payload: none of the three replay paths may silently swap it
+                // for an empty/placeholder stdout — all three must report the SAME `ProcessError.Io`.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 2, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "StdoutBase64": "not-valid-base64!!", "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    let command = Command.create "tool"
+                    let live = runner replayer
+
+                    let! stringResult = live.CaptureStringAsync(command, CancellationToken.None)
+                    let! bytesResult = live.CaptureBytesAsync(command, CancellationToken.None)
+                    let! spawnResult = live.SpawnAsync(command, CancellationToken.None)
+
+                    match stringResult, bytesResult, spawnResult with
+                    | Error(ProcessError.Io stringMessage),
+                      Error(ProcessError.Io bytesMessage),
+                      Error(ProcessError.Io spawnMessage) ->
+                        Assert.That(stringMessage, Is.EqualTo bytesMessage, "string vs bytes error message must match")
+                        Assert.That(stringMessage, Is.EqualTo spawnMessage, "string vs spawn error message must match")
+                    | other -> Assert.Fail $"expected Io from all three verbs for corrupt base64, got {other}"
+            })
+
+    [<Test>]
+    member _.``an entry with no recorded terminal state replays as Unobserved, never a fabricated Exited 0``() : Task =
+        withCassette (fun path ->
+            task {
+                // No TimedOut / Signal / Code at all (an omitted / hand-crafted entry) must never surface
+                // as a fabricated clean exit.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 1, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "out", "Stderr": "" } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    match! (runner replayer).CaptureStringAsync(Command.create "tool", CancellationToken.None) with
+                    | Ok result ->
+                        match result.Outcome with
+                        | Outcome.Unobserved _ -> Assert.Pass()
+                        | other -> Assert.Fail $"expected Outcome.Unobserved for a missing terminal state, got {other}"
+                    | Error error -> Assert.Fail $"a missing terminal state must still replay: {error}"
+            })
+
+    [<Test>]
+    member _.``a contradictory terminal state is rejected at load, naming the offending entry's index``() : Task =
+        withCassette (fun path ->
+            task {
+                // Entry 0 is valid; entry 1 sets BOTH Signal and Code — mutually exclusive terminal states.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 1, "Entries": [
+                        { "Program": "ok", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "Code": 0 },
+                        { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "Signal": 9, "Code": 0 }
+                    ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error(ProcessError.Io message) ->
+                    Assert.That(message, Does.Contain "entry 1", "the error must name the offending entry's index")
+                | other -> Assert.Fail $"expected a rejected load for a contradictory terminal state, got {other}"
+            })
+
+    [<Test>]
+    member _.``TimedOut combined with Code is also a contradictory terminal state``() : Task =
+        withCassette (fun path ->
+            task {
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 1, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "TimedOut": true, "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error(ProcessError.Io message) -> Assert.That(message, Does.Contain "entry 0")
+                | other -> Assert.Fail $"expected a rejected load for TimedOut+Code, got {other}"
+            })
+
+    [<Test>]
+    member _.``a cassette entry missing the required Program field is rejected at load, naming its index``() : Task =
+        withCassette (fun path ->
+            task {
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 1, "Entries": [ { "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "" } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error(ProcessError.Io message) ->
+                    Assert.That(message, Does.Contain "entry 0", "the error must name the offending entry's index")
+                | other -> Assert.Fail $"expected a rejected load for a missing Program, got {other}"
+            })

@@ -335,6 +335,42 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
         slots
 
+    // Reject an entry whose terminal-state fields are self-contradictory (more than one of
+    // TimedOut/Signal/Code set) or that is missing its required `Program` — a corrupted or hand-edited
+    // cassette, not a value a real recording ever produces. Absence of ALL THREE terminal-state fields
+    // is deliberately NOT rejected here: it is a legitimate (if degenerate) partial cassette and replays
+    // honestly as `Outcome.Unobserved` (see `outcomeOf`) rather than being rejected or fabricating a
+    // clean exit. The index identifies the offending entry without echoing any of its (possibly secret)
+    // content — `Program`/`Args`/`Stdout`/`Stderr` never appear in this message.
+    static let validateEntry (index: int) (entry: CassetteEntry) : Result<CassetteEntry, ProcessError> =
+        let terminalStatesSet =
+            [ entry.TimedOut; entry.Signal.HasValue; entry.Code.HasValue ]
+            |> List.filter id
+            |> List.length
+
+        if terminalStatesSet > 1 then
+            Error(
+                ProcessError.Io
+                    $"cassette entry {index} has a contradictory terminal state (more than one of TimedOut/Signal/Code is set)"
+            )
+        elif String.IsNullOrWhiteSpace entry.Program then
+            Error(ProcessError.Io $"cassette entry {index} is missing its required 'Program' field")
+        else
+            Ok entry
+
+    // Validate every entry in capture order, failing on the FIRST invalid one (its index pinpoints the
+    // offending row without scanning/reporting the rest).
+    static let validateEntries (entries: CassetteEntry[]) : Result<CassetteEntry[], ProcessError> =
+        let rec loop index =
+            if index >= entries.Length then
+                Ok entries
+            else
+                match validateEntry index entries[index] with
+                | Error error -> Error error
+                | Ok _ -> loop (index + 1)
+
+        loop 0
+
     // Parse and normalize a cassette file, rejecting a version this build does not understand. Shared by
     // Replay and Auto (Auto tolerates a missing file — a fresh cassette to grow).
     static let loadEntries (path: string) : Result<CassetteEntry[], ProcessError> =
@@ -352,7 +388,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                         $"unsupported cassette format version {file.Version} (this build reads versions 1..{currentFormatVersion})"
                 )
             else
-                Ok(arrayOrEmpty file.Entries |> Array.map normalizeEntry)
+                arrayOrEmpty file.Entries |> Array.map normalizeEntry |> validateEntries
         with ex ->
             Error(ProcessError.Io ex.Message)
 
@@ -507,11 +543,13 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           DurationMs = result.Duration.TotalMilliseconds }
 
     // The cassette schema records exactly the three "normal" outcomes (`TimedOut`/`Signal`/`Code`) a
-    // live run can be recorded as via `entryOfText`/`entryOfBytes` — `Outcome.Unobserved` is not one of
-    // them, so it is not round-tripped: recording one (an astronomically rare native-race edge case, not
-    // something a deterministic test fixture would ever intentionally set up) degrades to this final
-    // fallback on replay. That is an accepted, documented simplification of the cassette format, not a
-    // live fabrication of a clean exit — nothing here reports a *real* run's unobserved status as `Exited 0`.
+    // live run can be recorded as via `entryOfText`/`entryOfBytes`. `loadEntries`/`validateEntry` already
+    // rejected any entry setting more than one of them, so by the time an entry reaches here at most one
+    // is set. If NONE is set (an omitted / hand-crafted / pre-1.x entry, or a partial cassette the caller
+    // is still growing by hand) this is honestly `Outcome.Unobserved` — never a fabricated `Exited 0`.
+    // (`Outcome.Unobserved` itself is not one of the three recordable states, so a *live* one degrades to
+    // this same fallback on replay — an astronomically rare native-race edge case, not something a
+    // deterministic test fixture would ever intentionally set up.)
     let outcomeOf (entry: CassetteEntry) : Outcome =
         if entry.TimedOut then
             Outcome.TimedOut
@@ -520,30 +558,50 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         elif entry.Code.HasValue then
             Outcome.Exited entry.Code.Value
         else
-            Outcome.Exited 0
+            Outcome.Unobserved "cassette entry has no recorded terminal state (TimedOut/Signal/Code all absent)"
+
+    // Decode a cassette entry's base64 stdout, reporting corruption as the SAME `ProcessError.Io` shape
+    // regardless of which verb (string capture, bytes capture, or replayed `SpawnAsync`) is asking — a
+    // corrupt payload is never silently swapped for an empty/placeholder stdout on any of the three paths.
+    let decodeStdoutBase64 (command: Command) (base64: string) : Result<byte[], ProcessError> =
+        try
+            Ok(Convert.FromBase64String base64)
+        with ex ->
+            Error(ProcessError.Io $"corrupt base64 stdout in cassette entry for '{command.Program}': {ex.Message}")
 
     // The recorded stdout as text: a bytes recording (base64 present) decodes with the command's stdout
-    // encoding — exactly what a real bytes→text conversion would do; a text recording uses `Stdout`.
-    let stdoutText (command: Command) (entry: CassetteEntry) : string =
+    // encoding — exactly what a real bytes→text conversion would do; a text recording uses `Stdout`. A
+    // corrupt base64 payload (or a decode that the configured `StdoutEncoding` can't complete) is an
+    // honest `Io` error here, never a silent fallback to `Stdout`/empty text.
+    let stdoutText (command: Command) (entry: CassetteEntry) : Result<string, ProcessError> =
         match entry.StdoutBase64 with
-        | null -> entry.Stdout
+        | null -> Ok entry.Stdout
         | base64 ->
-            try
-                command.Config.StdoutEncoding.GetString(Convert.FromBase64String base64)
-            with _ ->
-                // A hand-corrupted base64 field can't take down replay — fall back to the text form.
-                entry.Stdout
+            match decodeStdoutBase64 command base64 with
+            | Error error -> Error error
+            | Ok bytes ->
+                try
+                    Ok(command.Config.StdoutEncoding.GetString bytes)
+                with ex ->
+                    Error(
+                        ProcessError.Io $"corrupt base64 stdout in cassette entry for '{command.Program}': {ex.Message}"
+                    )
 
-    let resultText (command: Command) (entry: CassetteEntry) : ProcessResult<string> =
-        ProcessResult<string>(
-            command.Program,
-            stdoutText command entry,
-            entry.Stderr,
-            outcomeOf entry,
-            TimeSpan.FromMilliseconds entry.DurationMs,
-            entry.Truncated,
-            command.Config.OkCodes
-        )
+    let resultText (command: Command) (entry: CassetteEntry) : Result<ProcessResult<string>, ProcessError> =
+        match stdoutText command entry with
+        | Error error -> Error error
+        | Ok stdout ->
+            Ok(
+                ProcessResult<string>(
+                    command.Program,
+                    stdout,
+                    entry.Stderr,
+                    outcomeOf entry,
+                    TimeSpan.FromMilliseconds entry.DurationMs,
+                    entry.Truncated,
+                    command.Config.OkCodes
+                )
+            )
 
     // Replay a bytes result: only a bytes recording (base64 present) can promise exact bytes; a text /
     // pre-v2 entry is rejected rather than handing back a lossy re-encode (the honest-results contract).
@@ -555,11 +613,13 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                     "this cassette entry was recorded as text; re-record the call with the bytes capture verb to replay exact bytes"
             )
         | base64 ->
-            try
+            match decodeStdoutBase64 command base64 with
+            | Error error -> Error error
+            | Ok bytes ->
                 Ok(
                     ProcessResult<byte[]>(
                         command.Program,
-                        Convert.FromBase64String base64,
+                        bytes,
                         entry.Stderr,
                         outcomeOf entry,
                         TimeSpan.FromMilliseconds entry.DurationMs,
@@ -567,19 +627,23 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                         command.Config.OkCodes
                     )
                 )
-            with ex ->
-                Error(ProcessError.Io $"corrupt base64 stdout in cassette entry for '{command.Program}': {ex.Message}")
 
     // Reconstruct a live handle from a recorded entry, reusing the same in-memory `FakeProcess` the
     // scripted double builds — so a replayed stream agrees with a real run on line splitting, encoding,
-    // OkCodes, and outcome.
-    let spawnFromEntry (command: Command) (entry: CassetteEntry) : RunningProcess =
-        FakeProcess
-            .OfCommand(command)
-            .WithStdout(stdoutText command entry)
-            .WithStderr(entry.Stderr)
-            .WithOutcome(outcomeOf entry)
-            .Build()
+    // OkCodes, and outcome. A corrupt base64 stdout errors here exactly as it does for the capture verbs,
+    // rather than silently starting the fake process with empty/placeholder stdout.
+    let spawnFromEntry (command: Command) (entry: CassetteEntry) : Result<RunningProcess, ProcessError> =
+        match stdoutText command entry with
+        | Error error -> Error error
+        | Ok stdout ->
+            Ok(
+                FakeProcess
+                    .OfCommand(command)
+                    .WithStdout(stdout)
+                    .WithStderr(entry.Stderr)
+                    .WithOutcome(outcomeOf entry)
+                    .Build()
+            )
 
     let play (slots: Dictionary<Key, ReplaySlot>) (key: Key) : CassetteEntry option =
         match slots.TryGetValue key with
@@ -747,7 +811,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             cancellationToken,
             (fun inner c t -> inner.CaptureStringAsync(c, t)),
             entryOfText,
-            (fun c e -> Ok(resultText c e))
+            resultText
         )
 
     member private this.CaptureBytes(command: Command, cancellationToken: CancellationToken) =
@@ -779,7 +843,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 | Error error -> Error error
                 | Ok digest ->
                     match lock gate (fun () -> play slots (keyOf command digest)) with
-                    | Some entry -> Ok(spawnFromEntry command entry)
+                    | Some entry -> spawnFromEntry command entry
                     | None ->
                         // Auto cannot auto-record a live stream any more than record mode can; both surface
                         // a miss rather than a surprise subprocess or a silently uncaptured recording.
