@@ -151,17 +151,73 @@ module internal Posix =
     // the existing `windowsSpawnLock` (Native.Windows) and `sigchldInitLock` module-level `lock`s.
     let private umaskSpawnLock = obj ()
 
-    /// Marshal a list of strings into a NULL-terminated `char* []`. Returns the array pointer
-    /// and the individual string allocations to free afterwards.
+    // ----------------------------------------------------------------------------------
+    // Fault-injection seams (internal, test-only). Production leaves all three `None` and runs the real
+    // path; sequential tests set one, run a single spawn, and reset it in a `finally`. Each makes a
+    // specific step of the spawn throw or fail on demand — an OOM part-way through marshalling
+    // argv/envp, a privilege-refused `setpriority`, or a `Socket`/`NetworkStream` ctor failure while
+    // wrapping a retained parent-side stream — none of which can be provoked reliably on a healthy host,
+    // so the leak-free unwind (free the partially built argv/envp; kill + reap the just-spawned child;
+    // close every parent/child fd exactly once) stays covered by explicit tests. Mirrors the existing
+    // `resumeThreadHook` fault seam in Native.Windows.
+    // ----------------------------------------------------------------------------------
+
+    /// Test seam (internal, not public API): invoked before each unmanaged-string allocation inside
+    /// `marshalCStringArray`, with the number already allocated. A test throws once at least one has been
+    /// allocated, to exercise the partial-free path (every earlier block freed before the throw escapes).
+    let mutable marshalCStringFaultForTests: (int -> unit) option = None
+
+    /// Test seam (internal, not public API): overrides the post-spawn `setpriority` when set, so a test
+    /// can force its privilege-refused (non-zero) return deterministically — regardless of whether it
+    /// runs as root — and exercise the kill + reap of the just-spawned leader on a priority failure.
+    /// Arguments mirror `setpriority(which, who, prio)`.
+    let mutable setpriorityForTests: (int -> int -> int -> int) option = None
+
+    /// Test seam (internal, not public API): invoked when wrapping a retained parent-side fd
+    /// ("stdout"/"stderr"/"stdin") into its owning `Socket`/`NetworkStream`. A test throws for a chosen
+    /// slot to exercise the post-spawn kill + reap and the exactly-once release of every parent/child fd
+    /// when a stream ctor fails.
+    let mutable streamWrapFaultForTests: (string -> unit) option = None
+
+    /// Marshal a list of strings into a NULL-terminated `char* []`. Returns the array pointer and the
+    /// individual string allocations to free afterwards (via `freeCStringArray`).
+    ///
+    /// Exception/OOM-safe: the per-string `StringToCoTaskMemUTF8` allocations and the pointer-array
+    /// `AllocHGlobal` are made one at a time, and if ANY of them throws — an `OutOfMemoryException`
+    /// part-way through, or the `marshalCStringFaultForTests` seam — every block allocated so far is
+    /// freed before the exception propagates. The invariant is therefore total: either it returns a
+    /// fully built (array, pointers) the caller owns and must free, or it throws having freed everything
+    /// it allocated — a partially built argv/envp never strands unmanaged memory (the leak this closes).
     let private marshalCStringArray (items: string list) : nativeint * nativeint list =
-        let stringPointers = items |> List.map Marshal.StringToCoTaskMemUTF8
-        let array = Marshal.AllocHGlobal((List.length stringPointers + 1) * IntPtr.Size)
+        let stringPointers = System.Collections.Generic.List<nativeint>()
+        let mutable array = IntPtr.Zero
 
-        stringPointers
-        |> List.iteri (fun i pointer -> Marshal.WriteIntPtr(array, i * IntPtr.Size, pointer))
+        try
+            for item in items do
+                marshalCStringFaultForTests
+                |> Option.iter (fun fault -> fault stringPointers.Count)
 
-        Marshal.WriteIntPtr(array, List.length stringPointers * IntPtr.Size, IntPtr.Zero)
-        array, stringPointers
+                stringPointers.Add(Marshal.StringToCoTaskMemUTF8 item)
+
+            array <- Marshal.AllocHGlobal((stringPointers.Count + 1) * IntPtr.Size)
+
+            for i in 0 .. stringPointers.Count - 1 do
+                Marshal.WriteIntPtr(array, i * IntPtr.Size, stringPointers[i])
+
+            Marshal.WriteIntPtr(array, stringPointers.Count * IntPtr.Size, IntPtr.Zero)
+            array, List.ofSeq stringPointers
+        with _ ->
+            // Free every block allocated so far before re-raising, so a failure mid-build (an OOM or the
+            // test fault seam) leaks nothing — the pointer array itself only if it was already allocated.
+            // Not a swallowing handler: `reraise ()` propagates the original fault to the caller, which
+            // reports it as an honest `ProcessError.Spawn`.
+            for pointer in stringPointers do
+                Marshal.FreeCoTaskMem pointer
+
+            if array <> IntPtr.Zero then
+                Marshal.FreeHGlobal array
+
+            reraise ()
 
     let private freeCStringArray (array: nativeint) (stringPointers: nativeint list) =
         for pointer in stringPointers do
@@ -1241,90 +1297,127 @@ module internal Posix =
                             else
                                 Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
                         else
-                            // Apply the requested CPU priority to the freshly spawned leader (pgid = its pid).
-                            // `posix_spawn` has no nice attribute, so this is a post-spawn `setpriority` from the
-                            // parent; the nice inherits across `fork`, so every descendant the leader spawns runs
-                            // at it (whole-tree, modulo the sub-millisecond window before this call lands — see
-                            // `Priority`). Lowering nice (raising priority) can be refused for lack of privilege:
-                            // rather than silently running the child at a lower-than-requested priority, kill and
-                            // reap it and fail the spawn honestly — matching the contract that priority is never
-                            // downgraded silently.
-                            let priorityApplied =
-                                match config.Priority with
-                                | None -> Ok()
-                                | Some priority ->
-                                    if setpriority (PRIO_PROCESS, pid, PriorityMapping.niceValue priority) = 0 then
-                                        Ok()
-                                    else
-                                        let errno = Marshal.GetLastWin32Error()
+                            // posix_spawnp succeeded: the child is running with pid `pid` (== its own pgid).
+                            // From here on ANY failure in the parent-side managed initialization — a refused
+                            // `setpriority`, or a `Socket`/`NetworkStream` ctor that throws while wrapping a
+                            // retained stream end — must not strand the live child. `postSpawnTeardown` kills the
+                            // process group (the child is its own leader), reaps the leader, disposes every stream
+                            // already wrapped, and closes whatever parent-side fds were not yet handed to a stream —
+                            // each fd released exactly once (wrapping clears its option as ownership transfers).
+                            // The ORIGINAL error is then returned; the teardown is best-effort and never masks it,
+                            // nor escapes as a raw exception. Without this, a throw while wrapping a stream would
+                            // unwind to the outer handler, which closes fds but never kills the already-running
+                            // child (the orphan/zombie leak this fixes); with it, the outer handler only ever sees
+                            // pre-spawn faults, where no child exists yet.
+                            let createdStreams = System.Collections.Generic.List<Stream>()
 
-                                        Error(
-                                            ProcessError.Spawn(
-                                                command.Program,
-                                                $"could not set process priority via setpriority (errno {errno}); raising priority may require privilege (CAP_SYS_NICE)"
-                                            )
-                                        )
-
-                            match priorityApplied with
-                            | Error error ->
-                                // The child is already running but must not run at an unintended priority: killpg
-                                // its group (it is its own leader) and reap the leader, then drop the parent pipe
-                                // ends before reporting the failure — the same kill+reap+cleanup a failed spawn does.
+                            let postSpawnTeardown () =
                                 killProcessGroup pid
                                 reapLeader pid
+
+                                for stream in createdStreams do
+                                    try
+                                        stream.Dispose()
+                                    with _ ->
+                                        // Best-effort teardown of a just-built stream: a Dispose fault here must
+                                        // not mask the primary spawn error nor escape as a raw exception.
+                                        ()
+
                                 closeParentEnds ()
-                                Error error
-                            | Ok() ->
-                                // Wrap a retained parent-side socketpair end in a `Socket` +
-                                // `NetworkStream`: its ReadAsync/WriteAsync complete through the runtime's
-                                // epoll/kqueue `SocketAsyncEngine`, so a piped POSIX child no longer parks a
-                                // thread-pool thread in a blocking `FileStream` read/write for the stream's
-                                // whole lifetime (the linear thread-pool pressure this closes). `ownsHandle`/
-                                // `ownsSocket` give the stream sole ownership, so disposing it closes the fd
-                                // exactly once, with the SafeSocketHandle finalizer as the GC-time safety net
-                                // — the same single-owner contract the FileStream + SafeFileHandle had. A
-                                // socketpair end is bidirectional, but each stream is only ever read
-                                // (stdout/stderr) xor written (stdin) by its one consumer.
-                                let pipeStream fd =
-                                    let socket = new Socket(new SafeSocketHandle(nativeint fd, ownsHandle = true))
 
-                                    new NetworkStream(socket, ownsSocket = true) :> Stream
+                            try
+                                // Apply the requested CPU priority to the freshly spawned leader (pgid = its pid).
+                                // `posix_spawn` has no nice attribute, so this is a post-spawn `setpriority` from the
+                                // parent; the nice inherits across `fork`, so every descendant the leader spawns runs
+                                // at it (whole-tree, modulo the sub-millisecond window before this call lands — see
+                                // `Priority`). Lowering nice (raising priority) can be refused for lack of privilege:
+                                // rather than silently running the child at a lower-than-requested priority, kill and
+                                // reap it and fail the spawn honestly — matching the contract that priority is never
+                                // downgraded silently.
+                                let priorityRc =
+                                    match config.Priority with
+                                    | None -> 0
+                                    | Some priority ->
+                                        match setpriorityForTests with
+                                        | Some hook -> hook PRIO_PROCESS pid (PriorityMapping.niceValue priority)
+                                        | None -> setpriority (PRIO_PROCESS, pid, PriorityMapping.niceValue priority)
 
-                                // Wrap each retained parent end into an owning stream, clearing its fd
-                                // tracker as ownership transfers so that if a later step (or the outer
-                                // handler) runs, it never double-closes an fd the stream now owns.
-                                let stdoutStream =
-                                    match stdoutParentRead with
-                                    | Some fd ->
-                                        let stream = pipeStream fd
-                                        stdoutParentRead <- None
-                                        Some stream
-                                    | None -> None
+                                if priorityRc <> 0 then
+                                    // The child is already running but must not run at an unintended priority: tear
+                                    // it down (kill + reap + drop the parent pipe ends), then report the honest
+                                    // priority failure — the ORIGINAL error, never the cleanup's.
+                                    let errno = Marshal.GetLastWin32Error()
+                                    postSpawnTeardown ()
 
-                                let stderrStream =
-                                    match stderrParentRead with
-                                    | Some fd ->
-                                        let stream = pipeStream fd
-                                        stderrParentRead <- None
-                                        Some stream
-                                    | None -> None
+                                    Error(
+                                        ProcessError.Spawn(
+                                            command.Program,
+                                            $"could not set process priority via setpriority (errno {errno}); raising priority may require privilege (CAP_SYS_NICE)"
+                                        )
+                                    )
+                                else
+                                    // Wrap a retained parent-side socketpair end in a `Socket` +
+                                    // `NetworkStream`: its ReadAsync/WriteAsync complete through the runtime's
+                                    // epoll/kqueue `SocketAsyncEngine`, so a piped POSIX child no longer parks a
+                                    // thread-pool thread in a blocking `FileStream` read/write for the stream's
+                                    // whole lifetime (the linear thread-pool pressure this closes). `ownsHandle`/
+                                    // `ownsSocket` give the stream sole ownership, so disposing it closes the fd
+                                    // exactly once, with the SafeSocketHandle finalizer as the GC-time safety net
+                                    // — the same single-owner contract the FileStream + SafeFileHandle had. A
+                                    // socketpair end is bidirectional, but each stream is only ever read
+                                    // (stdout/stderr) xor written (stdin) by its one consumer. A ctor that throws
+                                    // is caught below: the streams already built are tracked in `createdStreams`,
+                                    // so the teardown disposes them and closes the not-yet-wrapped ends — each fd
+                                    // exactly once — after killing and reaping the child.
+                                    let pipeStream (label: string) fd =
+                                        streamWrapFaultForTests |> Option.iter (fun fault -> fault label)
+                                        let socket = new Socket(new SafeSocketHandle(nativeint fd, ownsHandle = true))
+                                        let stream = new NetworkStream(socket, ownsSocket = true) :> Stream
+                                        createdStreams.Add stream
+                                        stream
 
-                                let stdinStream =
-                                    match stdinParentWrite with
-                                    | Some fd ->
-                                        let stream = pipeStream fd
-                                        stdinParentWrite <- None
-                                        Some stream
-                                    | None -> None
+                                    // Wrap each retained parent end into an owning stream, clearing its fd
+                                    // tracker as ownership transfers so that if a later step (or the teardown)
+                                    // runs, it never double-closes an fd the stream now owns.
+                                    let stdoutStream =
+                                        match stdoutParentRead with
+                                        | Some fd ->
+                                            let stream = pipeStream "stdout" fd
+                                            stdoutParentRead <- None
+                                            Some stream
+                                        | None -> None
 
-                                Ok
-                                    { Handle = nativeint pid
-                                      Stdout = stdoutStream
-                                      Stderr = stderrStream
-                                      Stdin = stdinStream
-                                      // POSIX signals the child's process group directly (killpg); the
-                                      // Windows console-ctrl-group flag has no bearing here.
-                                      WindowsCtrlGroup = false }
+                                    let stderrStream =
+                                        match stderrParentRead with
+                                        | Some fd ->
+                                            let stream = pipeStream "stderr" fd
+                                            stderrParentRead <- None
+                                            Some stream
+                                        | None -> None
+
+                                    let stdinStream =
+                                        match stdinParentWrite with
+                                        | Some fd ->
+                                            let stream = pipeStream "stdin" fd
+                                            stdinParentWrite <- None
+                                            Some stream
+                                        | None -> None
+
+                                    Ok
+                                        { Handle = nativeint pid
+                                          Stdout = stdoutStream
+                                          Stderr = stderrStream
+                                          Stdin = stdinStream
+                                          // POSIX signals the child's process group directly (killpg); the
+                                          // Windows console-ctrl-group flag has no bearing here.
+                                          WindowsCtrlGroup = false }
+                            with ex ->
+                                // A stream ctor (or the priority hook) threw after the child was spawned: tear the
+                                // child down and release every parent/child fd exactly once, then report the
+                                // original fault as an honest Spawn error — never a raw exception, and the cleanup
+                                // never replaces the primary cause.
+                                postSpawnTeardown ()
+                                Error(ProcessError.Spawn(command.Program, ex.Message))
                 finally
                     // Release the native scratch on every path (success, honest helper failure, or an
                     // exception unwinding through here) — destroying only the structs that initialized
@@ -1345,11 +1438,15 @@ module internal Posix =
                     freeCStringArray argvPointer argvAllocations
                     freeCStringArray envpPointer envpAllocations
             with ex ->
-                // An OOM in AllocHGlobal/marshalCStringArray, or an EntryPointNotFoundException from any
-                // other posix_spawn* import, must not escape this Result-returning function: close
-                // whatever fds are still open and report an honest Spawn error (symmetric to
-                // `spawnWindowsCore`'s `with ex -> ...`). The `finally` above has already released the
-                // native scratch on this same unwind.
+                // Reached only for a fault BEFORE `posix_spawnp` returns a live child — an OOM in
+                // `AllocHGlobal`/`marshalCStringArray` (whose own unwind already freed its partial
+                // argv/envp), or an `EntryPointNotFoundException` from a posix_spawn* import while wiring
+                // the file actions/attributes. No child has been spawned yet, so there is nothing to
+                // kill: close whatever fds are still open and report an honest Spawn error (symmetric to
+                // `spawnWindowsCore`'s `with ex -> ...`). A fault AFTER a successful `posix_spawnp` is
+                // handled by the post-spawn block's own inner try/with, which additionally kills and
+                // reaps the running child. The `finally` above has already released the native scratch on
+                // this same unwind.
                 closeChildSideFds ()
                 closeParentEnds ()
                 Error(ProcessError.Spawn(command.Program, ex.Message))
