@@ -71,8 +71,10 @@
 		<PackageReference Include="NUnit3TestAdapter" />
 		<!-- Only for ReadinessTests' bounded-backpressure synthetic pipes (deterministic across the CI
 		     matrix, unlike racing real OS pipe buffering); in-box under net10.0's shared framework, but
-		     net8.0 needs it as an explicit package. -->
-		<PackageReference Include="System.IO.Pipelines" />
+		     net8.0 needs it as an explicit package. Conditioned to the net8.0 leg only: an unconditional
+		     reference trips NuGet's NU1510 pruning warning (treated as an error) when TargetFrameworks is
+		     overridden to net10.0-only, as the test-cgroup-limits CI job does. -->
+		<PackageReference Include="System.IO.Pipelines" Condition="'$(TargetFramework)' == 'net8.0'" />
 	</ItemGroup>
 
 	<ItemGroup>
