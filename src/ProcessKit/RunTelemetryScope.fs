@@ -39,13 +39,21 @@ type internal RunTelemetryScope
         (logger: ILogger option, outcome: Outcome, pid: int option, duration: TimeSpan, ?timeout: TimeSpan)
         =
         if tryClaimEnd () then
-            match timeout with
-            | Some deadline -> Log.timeout logger program deadline runId
-            | None -> ()
+            try
+                match timeout with
+                | Some deadline -> Log.timeout logger program deadline runId
+                | None -> ()
 
-            Log.exit logger program outcome duration runId
-            Diag.runCompleted program runId outcome pid startTime duration parentContext
-            Diag.runEnded program
+                Log.exit logger program outcome duration runId
+                Diag.runCompleted program runId outcome pid startTime duration parentContext
+            finally
+                // Balance `runs.active` in a `finally` so the in-flight mark clears exactly once even if a
+                // log/metric/trace emission above faults — a broken observability sink can never leave a run
+                // counted as forever in flight (T-007's leak, now robust to a throwing sink too). Both
+                // `Log.*` and `Diag.*` already swallow sink faults internally, so nothing above escapes
+                // today; this `finally` keeps the guarantee even if that contract ever changes, and
+                // `Diag.runEnded` is itself self-guarded, so it can never throw out of the `finally`.
+                Diag.runEnded program
 
     /// The run left "in flight" without ever reaching a terminal verb (a streaming/event-driven
     /// handle that was only consumed and dropped, or a later pipeline stage that failed to spawn) —

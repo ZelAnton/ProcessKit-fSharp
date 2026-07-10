@@ -445,7 +445,13 @@ type RunningProcess internal (host: RunningHost) =
         outcomeTask.ContinueWith(Action<Task<Outcome>>(fun t -> t.Exception |> ignore))
         |> ignore
 
-    // Log the spawn once, at construction.
+    // Log the spawn once, at construction. Both this `Log.spawn` and the `RunTelemetryScope.Start`
+    // (`Diag.runStarted`) above swallow any fault the consumer's logger / metric / trace sink raises, so
+    // constructing this handle can never throw *from observability*. That is what closes the ownership
+    // window between the native spawn (already done inside `host`) and the hand-off to the caller: the
+    // freshly-spawned tree's deterministic owner — this handle — is always successfully constructed and
+    // returned, so a broken logger can never orphan the child here. The runner's construction site
+    // (`JobRunner.start`) adds a defence-in-depth teardown as a backstop for any non-observability fault.
     do Log.spawn config.Logger config.Program host.Pid runId
 
     /// The pid, when known.

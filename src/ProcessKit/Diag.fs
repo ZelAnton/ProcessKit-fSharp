@@ -69,15 +69,37 @@ module internal Diag =
         tags.Add("processkit.outcome", label)
         tags
 
+    // A registered `MeterListener` measurement callback (invoked synchronously by a `Counter`/
+    // `UpDownCounter`/`Histogram` `Add`/`Record`) or an `ActivityListener` (invoked by `StartActivity` and
+    // the span's `Dispose`) runs the consumer's code inside these emits, so a listener that throws must
+    // never derail the process operation that emitted the event — instrumentation is strictly
+    // observational, exactly like the `Log` sink. `emitSafely` is the single seam every emit flows through
+    // and swallows any such fault; the instruments are free no-ops when nothing is listening, so on the
+    // common path the guard adds no work at all.
+    let private emitSafely (emit: unit -> unit) =
+        try
+            emit ()
+        with _ ->
+            // A metrics/activity listener threw; instrumentation is observational, so the run proceeds
+            // unaffected. Not reported through the `ILogger` sink either — that too could be a faulting
+            // consumer sink, and the two are kept independent.
+            ()
+
     /// A run was spawned: count it and mark it in flight. Returns the `Activity` context current *now*
     /// (at spawn) so the backdated span emitted at completion still nests under it. Paired with exactly
     /// one `runEnded` call per run — see that function's doc for how the two ends of the run's lifetime
     /// are tracked separately from whether it ever reached a terminal verb.
     let runStarted (program: string) : ActivityContext =
-        let mutable startedTags = programTag program
-        let mutable activeTags = programTag program
-        runsStarted.Add(1L, &startedTags)
-        runsActive.Add(1L, &activeTags)
+        emitSafely (fun () ->
+            let mutable startedTags = programTag program
+            runsStarted.Add(1L, &startedTags))
+
+        // Guarded independently of the started counter above, so a listener that throws on one instrument
+        // can never skip the in-flight `+1`: its matching `runEnded` `-1` is emitted unconditionally, and
+        // `runs.active` must stay balanced against it (never left permanently inflated by a partial start).
+        emitSafely (fun () ->
+            let mutable activeTags = programTag program
+            runsActive.Add(1L, &activeTags))
 
         match Activity.Current with
         | null -> Unchecked.defaultof<ActivityContext>
@@ -135,11 +157,12 @@ module internal Diag =
         (duration: TimeSpan)
         (parentContext: ActivityContext)
         =
-        let label = outcomeLabel outcome
-        let mutable completedTags = outcomeTags program label
-        runsCompleted.Add(1L, &completedTags)
-        runDuration.Record(duration.TotalSeconds, &completedTags)
-        emitSpan program runId outcome pid startTime parentContext
+        emitSafely (fun () ->
+            let label = outcomeLabel outcome
+            let mutable completedTags = outcomeTags program label
+            runsCompleted.Add(1L, &completedTags)
+            runDuration.Record(duration.TotalSeconds, &completedTags)
+            emitSpan program runId outcome pid startTime parentContext)
 
     /// A run left "in flight" — clears the `runs.active` mark `runStarted` set. Deliberately separate
     /// from `runCompleted`: a run reaching a terminal verb (`runCompleted` + `runEnded`, both called) is
@@ -150,17 +173,23 @@ module internal Diag =
     /// run — whichever of "reached a terminal verb" / "handle disposed" happens first — since `Diag` has
     /// no per-run identity of its own to de-duplicate on.
     let runEnded (program: string) =
-        let mutable tags = programTag program
-        runsActive.Add(-1L, &tags)
+        // Must never throw: `RunTelemetryScope.Conclude`/`Abandon` call this from a `finally`/once-guard to
+        // balance `runs.active`, so a listener fault here would break that guarantee — swallow it.
+        emitSafely (fun () ->
+            let mutable tags = programTag program
+            runsActive.Add(-1L, &tags))
 
     let retried (program: string) =
-        let mutable tags = programTag program
-        retriesCounter.Add(1L, &tags)
+        emitSafely (fun () ->
+            let mutable tags = programTag program
+            retriesCounter.Add(1L, &tags))
 
     let supervisorRestarted (program: string) =
-        let mutable tags = programTag program
-        restartsCounter.Add(1L, &tags)
+        emitSafely (fun () ->
+            let mutable tags = programTag program
+            restartsCounter.Add(1L, &tags))
 
     let stormPaused (program: string) =
-        let mutable tags = programTag program
-        stormPausesCounter.Add(1L, &tags)
+        emitSafely (fun () ->
+            let mutable tags = programTag program
+            stormPausesCounter.Add(1L, &tags))
