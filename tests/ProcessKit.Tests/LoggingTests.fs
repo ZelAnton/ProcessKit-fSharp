@@ -47,6 +47,20 @@ type private DisabledThrowingLogger() =
             { new IDisposable with
                 member _.Dispose() = () }
 
+/// An `ILogger` that reports every level enabled but throws whenever it is actually asked to log —
+/// a deliberately broken sink, to prove that a faulting logger provider can never change the result
+/// of spawn/run/retry/pipeline/supervisor or leak the `runs.active` metric.
+type private ThrowingLogger() =
+    interface ILogger with
+        member _.Log(_logLevel, _eventId, _state, _error, _formatter) =
+            failwith "a broken ILogger must never derail process control"
+
+        member _.IsEnabled(_logLevel) = true
+
+        member _.BeginScope(_state) =
+            { new IDisposable with
+                member _.Dispose() = () }
+
 /// A runner that always reports a crash — to drive a supervisor restart deterministically.
 type private AlwaysCrash() =
     interface IProcessRunner with
@@ -345,5 +359,179 @@ type LoggingTests() =
             Assert.That(started (), Is.EqualTo 1L)
             Assert.That(completed (), Is.EqualTo 1L, "a run through a terminal verb must count as completed")
             Assert.That(activeDeltas |> Seq.sum, Is.EqualTo 0L, "active must settle at zero, not go negative")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing logger changes neither a run's result nor its metrics``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            // The logger throws on spawn AND exit; the run must still succeed with the right output, and
+            // its `runs.started`/`runs.completed`/`runs.active` accounting must be exactly as if it hadn't.
+            let command = shell "echo logged" |> Command.logger (ThrowingLogger())
+
+            match! command.RunAsync() with
+            | Ok stdout -> Assert.That(stdout, Is.EqualTo "logged")
+            | Error error -> Assert.Fail $"a broken logger must not fail the run: {error}"
+
+            Assert.That(started (), Is.EqualTo 1L)
+            Assert.That(completed (), Is.EqualTo 1L)
+
+            Assert.That(
+                activeDeltas |> Seq.sum,
+                Is.EqualTo 0L,
+                "runs.active must return to zero even when the logger faults on every event"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing logger does not break a timeout``() : Task =
+        task {
+            let sleeper =
+                if isWindows then
+                    shell "ping -n 6 127.0.0.1 >nul"
+                else
+                    shell "sleep 5"
+
+            // The timeout path logs `Log.timeout` (Warning) then `Log.exit`; a throw from either must not
+            // stop the deadline kill from being observed as a timeout.
+            let command =
+                sleeper
+                |> Command.timeout (TimeSpan.FromMilliseconds 300.0)
+                |> Command.logger (ThrowingLogger())
+
+            match! command.OutputStringAsync() with
+            | Ok result ->
+                Assert.That(
+                    result.IsTimedOut,
+                    Is.True,
+                    "the run must still be reported timed out despite the logger fault"
+                )
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing logger does not break retry``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            // Every retry logs `Log.retry`; a throw from it must not abort the retry loop — all three
+            // attempts (initial + two retries) must still run and be accounted for.
+            let command =
+                shell "exit 1"
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+                |> Command.logger (ThrowingLogger())
+
+            match! command.RunAsync() with
+            | Ok _ -> Assert.Fail "a command that always exits 1 must fail after exhausting its retries"
+            | Error _ -> ()
+
+            Assert.That(started (), Is.EqualTo 3L, "the retry loop must run every attempt despite the logger fault")
+
+            Assert.That(
+                completed (),
+                Is.EqualTo 3L,
+                "each attempt reaped its (non-zero) exit, so each counts as completed"
+            )
+
+            Assert.That(activeDeltas |> Seq.sum, Is.EqualTo 0L, "runs.active must settle at zero across the retries")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing logger does not break a pipeline``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            // Stage 0's logger is the pipeline's logger; it throws on the whole-run spawn/exit events. The
+            // pipeline must still produce the right output and account for exactly one run.
+            let pipeline =
+                (shell "echo hi" |> Command.logger (ThrowingLogger())).Pipe(Command.create "sort")
+
+            match! pipeline.RunAsync() with
+            | Ok stdout -> Assert.That(stdout, Is.EqualTo "hi")
+            | Error error -> Assert.Fail $"a broken logger must not fail the pipeline: {error}"
+
+            Assert.That(started (), Is.EqualTo 1L, "a pipeline is one whole-run started measurement")
+            Assert.That(completed (), Is.EqualTo 1L)
+            Assert.That(activeDeltas |> Seq.sum, Is.EqualTo 0L, "runs.active must return to zero for the pipeline")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing logger does not break a supervisor restart``() : Task =
+        task {
+            // `Log.supervisorRestart` fires on the restart; a throw from it must not fail supervision.
+            let sup =
+                Supervisor(Command.create "worker" |> Command.logger (ThrowingLogger()))
+                    .WithRunner(AlwaysCrash())
+                    .MaxRestarts(1)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+
+            match! sup.RunAsync() with
+            | Ok outcome ->
+                Assert.That(
+                    outcome.Restarts,
+                    Is.EqualTo 1,
+                    "supervision must complete its one restart despite the logger fault"
+                )
+
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.RestartsExhausted)
+            | Error error -> Assert.Fail $"a broken logger must not fail supervision: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing metrics listener does not break a run``() : Task =
+        task {
+            // A `MeterListener` whose measurement callback throws on every emit (runs.started/active/
+            // completed) must not derail the run — the `Diag` emits swallow the fault.
+            use listener = new MeterListener()
+
+            listener.InstrumentPublished <-
+                (fun instrument l ->
+                    if instrument.Meter.Name = ProcessKitDiagnostics.MeterName then
+                        l.EnableMeasurementEvents instrument)
+
+            listener.SetMeasurementEventCallback<int64>(
+                MeasurementCallback<int64>(fun _instrument _value _tags _state ->
+                    failwith "a broken metrics listener must never derail process control")
+            )
+
+            listener.Start()
+
+            match! (shell "echo hi").RunAsync() with
+            | Ok stdout -> Assert.That(stdout, Is.EqualTo "hi")
+            | Error error -> Assert.Fail $"a broken metrics listener must not fail the run: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing activity listener does not break a run``() : Task =
+        task {
+            // An `ActivityListener` whose start/stop callbacks throw must not derail the completion-span
+            // emission that runs inside `Diag.runCompleted` — the emit swallows the fault.
+            use listener = new ActivityListener()
+            listener.ShouldListenTo <- (fun s -> s.Name = ProcessKitDiagnostics.ActivitySourceName)
+            listener.Sample <- SampleActivity<ActivityContext>(fun _o -> ActivitySamplingResult.AllData)
+
+            listener.ActivityStarted <-
+                (fun _a -> failwith "a broken activity listener must never derail process control")
+
+            listener.ActivityStopped <-
+                (fun _a -> failwith "a broken activity listener must never derail process control")
+
+            ActivitySource.AddActivityListener listener
+
+            match! (shell "echo hi").RunAsync() with
+            | Ok stdout -> Assert.That(stdout, Is.EqualTo "hi")
+            | Error error -> Assert.Fail $"a broken activity listener must not fail the run: {error}"
         }
         :> Task

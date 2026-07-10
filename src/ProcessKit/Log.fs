@@ -74,50 +74,57 @@ module internal Log =
             "processkit: supervisor failure storm for {Program} — pausing restarts for {PauseMs}ms"
         )
 
-    /// A child was spawned.
-    let spawn (logger: ILogger option) (program: string) (pid: int option) (runId: string) =
+    // Every lifecycle event runs the consumer's `ILogger` synchronously (its `IsEnabled`/`Log`), so a
+    // faulty sink must never derail the process operation that emitted the event — logging is strictly
+    // observational. `emitSafely` is the single seam every event flows through: it short-circuits when no
+    // logger is configured (the common case, free) and swallows any fault the sink raises, so no call
+    // site (spawn/exit/timeout/retry/supervisor/pipeline) can be broken by a broken logger. A raised
+    // fault is deliberately NOT re-reported through the same (faulting) logger — that risks recursion — so
+    // it is dropped rather than routed back into the sink that raised it. Not on any hot path: these fire
+    // once per lifecycle event, never per output line, so the guarded closure costs nothing that matters.
+    let private emitSafely (logger: ILogger option) (emit: ILogger -> unit) =
         match logger with
         | Some log ->
+            try
+                emit log
+            with _ ->
+                // The consumer's ILogger threw; logging is observational, so the process operation must
+                // proceed unaffected. Not re-logged through the same (faulting) logger, to avoid recursion.
+                ()
+        | None -> ()
+
+    /// A child was spawned.
+    let spawn (logger: ILogger option) (program: string) (pid: int option) (runId: string) =
+        emitSafely logger (fun log ->
             let pidText =
                 match pid with
                 | Some p -> string p
                 | None -> "?"
 
-            spawnMessage.Invoke(log, program, pidText, runId, null)
-        | None -> ()
+            spawnMessage.Invoke(log, program, pidText, runId, null))
 
     /// A run finished (exit reaped).
     let exit (logger: ILogger option) (program: string) (outcome: Outcome) (duration: TimeSpan) (runId: string) =
-        match logger with
-        | Some log -> exitMessage.Invoke(log, program, string outcome, duration.TotalMilliseconds, runId, null)
-        | None -> ()
+        emitSafely logger (fun log ->
+            exitMessage.Invoke(log, program, string outcome, duration.TotalMilliseconds, runId, null))
 
     /// A run was killed for exceeding its timeout.
     let timeout (logger: ILogger option) (program: string) (deadline: TimeSpan) (runId: string) =
-        match logger with
-        | Some log -> timeoutMessage.Invoke(log, program, deadline.TotalMilliseconds, runId, null)
-        | None -> ()
+        emitSafely logger (fun log -> timeoutMessage.Invoke(log, program, deadline.TotalMilliseconds, runId, null))
 
     /// A run was killed for producing no output for its idle deadline.
     let idleTimeout (logger: ILogger option) (program: string) (idle: TimeSpan) (runId: string) =
-        match logger with
-        | Some log -> idleTimeoutMessage.Invoke(log, program, idle.TotalMilliseconds, runId, null)
-        | None -> ()
+        emitSafely logger (fun log -> idleTimeoutMessage.Invoke(log, program, idle.TotalMilliseconds, runId, null))
 
     /// A failed run is being retried.
     let retry (logger: ILogger option) (program: string) (attempt: int) (delay: TimeSpan) (runId: string) =
-        match logger with
-        | Some log -> retryMessage.Invoke(log, program, attempt, delay.TotalMilliseconds, runId, null)
-        | None -> ()
+        emitSafely logger (fun log -> retryMessage.Invoke(log, program, attempt, delay.TotalMilliseconds, runId, null))
 
     /// A supervisor is restarting its child.
     let supervisorRestart (logger: ILogger option) (program: string) (restart: int) (delay: TimeSpan) =
-        match logger with
-        | Some log -> supervisorRestartMessage.Invoke(log, program, restart, delay.TotalMilliseconds, null)
-        | None -> ()
+        emitSafely logger (fun log ->
+            supervisorRestartMessage.Invoke(log, program, restart, delay.TotalMilliseconds, null))
 
     /// A supervisor's failure-storm guard paused restarts.
     let stormPause (logger: ILogger option) (program: string) (pause: TimeSpan) =
-        match logger with
-        | Some log -> stormPauseMessage.Invoke(log, program, pause.TotalMilliseconds, null)
-        | None -> ()
+        emitSafely logger (fun log -> stormPauseMessage.Invoke(log, program, pause.TotalMilliseconds, null))

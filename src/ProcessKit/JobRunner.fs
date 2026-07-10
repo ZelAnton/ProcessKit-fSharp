@@ -1,6 +1,7 @@
 namespace ProcessKit
 
 open System
+open System.Runtime.ExceptionServices
 open System.Threading
 open System.Threading.Tasks
 
@@ -19,7 +20,26 @@ type JobRunner() =
                 | Error error ->
                     (group :> IDisposable).Dispose()
                     return Error error
-                | Ok host -> return Ok(RunningProcess host)
+                | Ok host ->
+                    // Ownership of the freshly-spawned tree transfers to the caller through the returned
+                    // handle. Constructing that handle is non-throwing in practice — its observability
+                    // (`Log.spawn` / `Diag.runStarted`) swallows sink faults — but guard it anyway: should
+                    // it ever fault after the native spawn, reap the tree and release the container here so
+                    // the child is deterministically killed/reaped instead of being orphaned to GC-time
+                    // kill-on-close, then re-raise the original fault (never a silent swallow of a genuine
+                    // construction bug — the caller still sees it, just without a leaked process tree).
+                    let constructed =
+                        try
+                            Ok(RunningProcess host)
+                        with ex ->
+                            Error ex
+
+                    match constructed with
+                    | Ok running -> return Ok running
+                    | Error ex ->
+                        do! host.Teardown()
+                        ExceptionDispatchInfo.Throw ex
+                        return Unchecked.defaultof<_>
         }
 
     // Run a started process to a completion result via the shared `CaptureVerbs.runToCompletion`,
