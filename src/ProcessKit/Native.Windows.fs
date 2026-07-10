@@ -439,6 +439,11 @@ module internal Windows =
     [<Literal>]
     let private PROCESS_SUSPEND_RESUME = 0x0800u
 
+    // Least-privilege addition to the suspend/resume handle so the same handle can also be used
+    // for the `IsProcessInJob` re-check below, without a second `OpenProcess` call.
+    [<Literal>]
+    let private PROCESS_QUERY_LIMITED_INFORMATION = 0x1000u
+
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private QueryInformationJobObject(
         nativeint hJob,
@@ -450,6 +455,9 @@ module internal Windows =
 
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern nativeint private OpenProcess(uint32 dwDesiredAccess, bool bInheritHandle, uint32 dwProcessId)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private IsProcessInJob(nativeint processHandle, nativeint jobHandle, bool& result)
 
     // NtSuspendProcess/NtResumeProcess freeze/thaw every thread of a process in one call. They are
     // undocumented ntdll entry points but stable and the standard way to suspend a whole process;
@@ -554,15 +562,28 @@ module internal Windows =
     // SIGSTOP/SIGCONT). A genuine members-query failure propagates as `ProcessError.Io` instead of being
     // silently treated as an empty group, so `Suspend`/`Resume` can never report success without having
     // touched the real job.
+    //
+    // Recycle-safe: the member pid list is a snapshot, so a member (typically a handle-less
+    // grandchild) can exit and its pid be reused by an unrelated process between the snapshot and
+    // `OpenProcess` below. Re-verify with `IsProcessInJob` that the just-opened handle is STILL a
+    // member of THIS job before invoking `action` (`NtSuspendProcess`/`NtResumeProcess`), so a
+    // recycled pid can never divert a suspend/resume onto a foreign process. Fail-safe: any failure
+    // to open the process or query its membership is treated as "not our member" — an uncertain
+    // result never touches the process.
     let private forEachMemberHandle (job: nativeint) (action: nativeint -> unit) : Result<unit, ProcessError> =
         match membersWindows job with
         | Error error -> Error error
         | Ok pids ->
             for pid in pids do
-                let handle = OpenProcess(PROCESS_SUSPEND_RESUME, false, uint32 pid)
+                let handle =
+                    OpenProcess(PROCESS_SUSPEND_RESUME ||| PROCESS_QUERY_LIMITED_INFORMATION, false, uint32 pid)
 
                 if handle <> IntPtr.Zero then
-                    action handle
+                    let mutable stillMember = false
+
+                    if IsProcessInJob(handle, job, &stillMember) && stillMember then
+                        action handle
+
                     CloseHandle handle |> ignore
 
             Ok()
