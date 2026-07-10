@@ -6,6 +6,7 @@ open System.IO
 open System.IO.Pipelines
 open System.Net
 open System.Net.Sockets
+open System.Runtime.CompilerServices
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
@@ -216,6 +217,452 @@ type ReadinessTests() =
             match! running.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 5.0) with
             | Ok() -> Assert.That(burst.IsCompletedSuccessfully, Is.True, "the >64 KiB burst never finished writing")
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitFor reports NotReady at the shared deadline even though the predicate never completes``() : Task =
+        task {
+            match! runner.StartAsync(lingering (), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                let neverReady () = TaskCompletionSource<bool>().Task
+                let elapsed = Stopwatch.StartNew()
+
+                let waitTask = running.WaitForAsync(neverReady, TimeSpan.FromMilliseconds 200.0)
+                // Independent watchdog: if the deadline logic is broken and `waitTask` never
+                // completes, fail fast with a clear assertion instead of hanging the test run.
+                let watchdog = Task.Delay(TimeSpan.FromSeconds 5.0)
+                let! winner = Task.WhenAny(waitTask :> Task, watchdog)
+
+                Assert.That(
+                    obj.ReferenceEquals(winner, watchdog),
+                    Is.False,
+                    "WaitForAsync did not honor the shared deadline within the watchdog window"
+                )
+
+                match! waitTask with
+                | Error(ProcessError.NotReady _) ->
+                    // Bounded by the shared deadline, not left hanging on the never-completing task.
+                    Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+                | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitFor honors the deadline even when the predicate blocks synchronously and never returns a task``
+        ()
+        : Task =
+        task {
+            match! runner.StartAsync(lingering (), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                let elapsed = Stopwatch.StartNew()
+
+                // A probe that blocks *synchronously* inside `Invoke` — it never even returns a task
+                // until its long sleep self-releases (comfortably past the watchdog below, so a broken
+                // implementation that awaits the invocation on the polling thread fails deterministically
+                // rather than merely running slow). Only isolating the invocation on the thread pool
+                // (Task.Run) keeps such a probe from pinning the polling loop and defeating the deadline.
+                // The sleep is finite so the pool thread is not pinned for the whole test process.
+                let blocksSynchronously () : Task<bool> =
+                    Thread.Sleep(TimeSpan.FromSeconds 10.0)
+                    Task.FromResult true
+
+                let waitTask =
+                    running.WaitForAsync(blocksSynchronously, TimeSpan.FromMilliseconds 200.0)
+
+                let watchdog = Task.Delay(TimeSpan.FromSeconds 5.0)
+                let! winner = Task.WhenAny(waitTask :> Task, watchdog)
+
+                Assert.That(
+                    obj.ReferenceEquals(winner, watchdog),
+                    Is.False,
+                    "WaitForAsync did not honor the deadline against a synchronously-blocking probe"
+                )
+
+                match! waitTask with
+                | Error(ProcessError.NotReady _) ->
+                    // Returned at the deadline, not after the probe's own 10s synchronous block.
+                    Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+                | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitFor is cancelled by the external token even though the predicate never completes``() : Task =
+        task {
+            match! runner.StartAsync(lingering (), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 100.0)
+                let neverReady () = TaskCompletionSource<bool>().Task
+                let elapsed = Stopwatch.StartNew()
+
+                let waitTask =
+                    running.WaitForAsync(neverReady, TimeSpan.FromSeconds 30.0, cts.Token)
+                // Independent watchdog: if cancellation propagation is broken and `waitTask` never
+                // completes, fail fast with a clear assertion instead of hanging the test run.
+                let watchdog = Task.Delay(TimeSpan.FromSeconds 5.0)
+                let! winner = Task.WhenAny(waitTask :> Task, watchdog)
+
+                Assert.That(
+                    obj.ReferenceEquals(winner, watchdog),
+                    Is.False,
+                    "WaitForAsync did not honor external cancellation within the watchdog window"
+                )
+
+                match! waitTask with
+                | Error(ProcessError.Cancelled _) ->
+                    // The external token wins over the (much longer) overall timeout.
+                    Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+                | other -> Assert.Fail $"expected Cancelled, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitFor succeeds when the predicate flips true just before the deadline``() : Task =
+        task {
+            match! runner.StartAsync(lingering (), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                let started = Stopwatch.StartNew()
+                // Flips true at 85% of the 2s budget (1.7s), leaving only ~300ms of margin — close
+                // enough to the deadline to exercise the edge case, while still tolerant of scheduler
+                // jitter given the implementation's own 50ms polling granularity.
+                let timeout = TimeSpan.FromSeconds 2.0
+                let readyAt = TimeSpan.FromMilliseconds 1700.0
+
+                let almostReady () =
+                    Task.FromResult(started.Elapsed > readyAt)
+
+                match! running.WaitForAsync(almostReady, timeout) with
+                | Ok() -> Assert.That(started.Elapsed, Is.LessThan timeout)
+                | other -> Assert.Fail $"expected Ok, got {other}"
+        }
+        :> Task
+
+    /// Runs `WaitForAsync` against a predicate whose task fault arrives after the deadline, then hands
+    /// back only a `WeakReference` to that abandoned predicate task — never the task itself. Isolated in
+    /// a `NoInlining` helper (and not returning the strong reference) so nothing in the calling test
+    /// method's frame can keep the task rooted, which would otherwise let debug-mode locals or JIT
+    /// tiering silently invalidate the GC-based verification below.
+    [<MethodImpl(MethodImplOptions.NoInlining)>]
+    member private _.RunFaultingProbeAndGetWeakRef(running: RunningProcess) : Task<WeakReference> =
+        task {
+            let mutable probeTaskRef: Task<bool> = Unchecked.defaultof<Task<bool>>
+
+            let faultsLate () : Task<bool> =
+                let t =
+                    task {
+                        do! Task.Delay 300
+                        return failwith "late predicate fault"
+                    }
+
+                probeTaskRef <- t
+                t
+
+            match! running.WaitForAsync(faultsLate, TimeSpan.FromMilliseconds 100.0) with
+            | Error(ProcessError.NotReady _) -> ()
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+
+            let weak = WeakReference(box probeTaskRef)
+            probeTaskRef <- Unchecked.defaultof<Task<bool>>
+            return weak
+        }
+
+    [<Test>]
+    member this.``WaitFor observes a late fault from the abandoned predicate task instead of leaving it unobserved``
+        ()
+        : Task =
+        task {
+            let mutable unobserved = false
+
+            let handler =
+                EventHandler<UnobservedTaskExceptionEventArgs>(fun _ args ->
+                    unobserved <- true
+                    args.SetObserved())
+
+            TaskScheduler.UnobservedTaskException.AddHandler handler
+
+            try
+                match! runner.StartAsync(lingering (), CancellationToken.None) with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    use running = running
+                    let! weakProbeTask = this.RunFaultingProbeAndGetWeakRef running
+
+                    // Let the abandoned predicate task fault, then force a GC pass: the CLR reports a
+                    // still-unobserved task fault from the finalizer once the task itself is collected.
+                    do! Task.Delay 500
+                    GC.Collect()
+                    GC.WaitForPendingFinalizers()
+                    GC.Collect()
+
+                    // Verify the test's own methodology is sound first: if the abandoned probe task was
+                    // never actually collected, the absence of UnobservedTaskException below would be a
+                    // false pass rather than proof that the implementation observed the fault.
+                    Assert.That(
+                        weakProbeTask.IsAlive,
+                        Is.False,
+                        "abandoned predicate task was not collected — GC-based verification is inconclusive"
+                    )
+
+                    Assert.That(unobserved, Is.False)
+            finally
+                TaskScheduler.UnobservedTaskException.RemoveHandler handler
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForPort reports NotReady close to a short timeout, not a fixed connect-attempt window``() : Task =
+        task {
+            // Reserve a loopback port, then release it: nothing is listening, so every connect attempt
+            // is refused rather than hanging — this isolates the "no fixed 1s-per-attempt overrun" fix.
+            let probeListener = new TcpListener(IPAddress.Loopback, 0)
+            probeListener.Start()
+            let port = (probeListener.LocalEndpoint :?> IPEndPoint).Port
+            probeListener.Stop()
+
+            match! runner.StartAsync(lingering (), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                let endpoint = IPEndPoint(IPAddress.Loopback, port)
+                let elapsed = Stopwatch.StartNew()
+
+                match! running.WaitForPortAsync(endpoint, TimeSpan.FromMilliseconds 150.0) with
+                | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 1.0))
+                | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForPort respects the shared deadline while a connect attempt itself is still in flight``() : Task =
+        task {
+            // Deterministic stand-in for a connect attempt that never completes on its own, exercised
+            // directly against `ReadinessProbe.waitForPortUsing` (bypassing the real `TcpClient` wiring
+            // in `waitForPort`). This exercises deadline cancellation of an in-flight connect, not just
+            // the refused-connection retry/backoff loop covered above — without depending on real network
+            // behaviour (e.g. an unassigned TEST-NET-1 address), which is neither refused nor accepted
+            // consistently across sandboxed CI environments and previously left this test able to pass
+            // without ever exercising the in-flight case it claims to cover.
+            let neverConnects (_: IPEndPoint) (ct: CancellationToken) : Task = Task.Delay(Timeout.Infinite, ct)
+
+            let endpoint = IPEndPoint(IPAddress.Loopback, 1)
+            let elapsed = Stopwatch.StartNew()
+
+            match!
+                ReadinessProbe.waitForPortUsing
+                    neverConnects
+                    "test"
+                    endpoint
+                    (TimeSpan.FromMilliseconds 200.0)
+                    CancellationToken.None
+            with
+            | Error(ProcessError.NotReady _) ->
+                // Bounded below (the connect only stops once the deadline actually fires) and above (the
+                // shared deadline, not the never-completing connect, decides when this returns).
+                Assert.That(elapsed.Elapsed, Is.GreaterThanOrEqualTo(TimeSpan.FromMilliseconds 150.0))
+                Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 1.0))
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForPort reports NotReady at the deadline without waiting for a non-cooperative connect to finish``
+        ()
+        : Task =
+        task {
+            // `lateConnect` ignores the cancellation token it is handed (as a real, already-in-flight
+            // `TcpClient.ConnectAsync` effectively does once the OS has committed to completing the
+            // handshake) and only ever succeeds — 300ms after invocation, well past the 100ms shared
+            // deadline. Regression test for two things at once: (1) the deadline is honored even though
+            // the connect itself never observes cancellation — this must not block for the connect's own
+            // 300ms, only race it against the deadline, and (2) once the abandoned connect does complete
+            // in the background, its stale success is still reported as NotReady, never surfaced as a
+            // late `Ok` from this call (which has already returned).
+            let mutable lateConnectTask: Task = Unchecked.defaultof<Task>
+
+            let lateConnect (_: IPEndPoint) (_: CancellationToken) : Task =
+                let t = task { do! Task.Delay 300 }
+                lateConnectTask <- t
+                t
+
+            let endpoint = IPEndPoint(IPAddress.Loopback, 1)
+            let elapsed = Stopwatch.StartNew()
+
+            match!
+                ReadinessProbe.waitForPortUsing
+                    lateConnect
+                    "test"
+                    endpoint
+                    (TimeSpan.FromMilliseconds 100.0)
+                    CancellationToken.None
+            with
+            | Error(ProcessError.NotReady _) ->
+                // Bounded well below the connect's own 300ms — the fix under test is that a
+                // non-cooperative connect is raced against the shared deadline rather than blocked on.
+                Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromMilliseconds 250.0))
+                // The abandoned connect keeps running past the deadline in the background; wait for it
+                // to actually finish and confirm it completed successfully (not faulted), demonstrating
+                // its stale success never reaches this already-returned call as an `Ok`.
+                do! lateConnectTask
+                Assert.That(lateConnectTask.IsCompletedSuccessfully, Is.True)
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    /// Runs `waitForPortUsing` against a connect stub whose task fault arrives after the deadline, then
+    /// hands back only a `WeakReference` to that abandoned connect task — never the task itself. Isolated
+    /// in a `NoInlining` helper (and not returning the strong reference) for the same reason as
+    /// `RunFaultingProbeAndGetWeakRef` above: nothing in the calling test method's frame may keep the task
+    /// rooted, or the GC-based verification below would be silently invalidated.
+    [<MethodImpl(MethodImplOptions.NoInlining)>]
+    member private _.RunFaultingConnectAndGetWeakRef() : Task<WeakReference> =
+        task {
+            let mutable connectTaskRef: Task = Unchecked.defaultof<Task>
+
+            let faultsLate (_: IPEndPoint) (_: CancellationToken) : Task =
+                let t: Task =
+                    task {
+                        do! Task.Delay 300
+                        failwith "late connect fault"
+                    }
+
+                connectTaskRef <- t
+                t
+
+            let endpoint = IPEndPoint(IPAddress.Loopback, 1)
+
+            match!
+                ReadinessProbe.waitForPortUsing
+                    faultsLate
+                    "test"
+                    endpoint
+                    (TimeSpan.FromMilliseconds 100.0)
+                    CancellationToken.None
+            with
+            | Error(ProcessError.NotReady _) -> ()
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+
+            let weak = WeakReference(box connectTaskRef)
+            connectTaskRef <- Unchecked.defaultof<Task>
+            return weak
+        }
+
+    [<Test>]
+    member this.``WaitForPort observes a late fault from the abandoned connect task instead of leaving it unobserved``
+        ()
+        : Task =
+        task {
+            let mutable unobserved = false
+
+            let handler =
+                EventHandler<UnobservedTaskExceptionEventArgs>(fun _ args ->
+                    unobserved <- true
+                    args.SetObserved())
+
+            TaskScheduler.UnobservedTaskException.AddHandler handler
+
+            try
+                let! weakConnectTask = this.RunFaultingConnectAndGetWeakRef()
+
+                // Let the abandoned connect task fault, then force a GC pass: the CLR reports a
+                // still-unobserved task fault from the finalizer once the task itself is collected.
+                do! Task.Delay 500
+                GC.Collect()
+                GC.WaitForPendingFinalizers()
+                GC.Collect()
+
+                // Verify the test's own methodology is sound first: if the abandoned connect task was
+                // never actually collected, the absence of UnobservedTaskException below would be a
+                // false pass rather than proof that the implementation observed the fault.
+                Assert.That(
+                    weakConnectTask.IsAlive,
+                    Is.False,
+                    "abandoned connect task was not collected — GC-based verification is inconclusive"
+                )
+
+                Assert.That(unobserved, Is.False)
+            finally
+                TaskScheduler.UnobservedTaskException.RemoveHandler handler
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForPort connects once a slow-to-start listener comes up, before the deadline``() : Task =
+        task {
+            let probeListener = new TcpListener(IPAddress.Loopback, 0)
+            probeListener.Start()
+            let port = (probeListener.LocalEndpoint :?> IPEndPoint).Port
+            probeListener.Stop()
+
+            let mutable listener = Unchecked.defaultof<TcpListener>
+            use startLateCts = new CancellationTokenSource()
+
+            let startLate =
+                task {
+                    do! Task.Delay(200, startLateCts.Token)
+                    listener <- new TcpListener(IPAddress.Loopback, port)
+                    listener.Start()
+                }
+
+            try
+                match! runner.StartAsync(lingering (), CancellationToken.None) with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    use running = running
+                    let endpoint = IPEndPoint(IPAddress.Loopback, port)
+
+                    let waitTask = running.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 3.0)
+                    do! startLate
+
+                    match! waitTask with
+                    | Ok() -> Assert.Pass()
+                    | error -> Assert.Fail $"expected Ok, got {error}"
+            finally
+                // `startLate` is a hot task started before this `try`, so a failure earlier in the try
+                // (e.g. `runner.StartAsync` returning `Error`) can reach here before its 200ms delay
+                // elapses. Cancel it so it can never create/start a listener after this teardown runs —
+                // without this, the listener assignment below would race a background task that outlives
+                // the test, orphaning a bound socket. Swallow the resulting `OperationCanceledException`
+                // from `startLate` itself; it only signals that teardown pre-empted it.
+                startLateCts.Cancel()
+
+                try
+                    startLate.GetAwaiter().GetResult()
+                with :? OperationCanceledException ->
+                    ()
+
+                if not (isNull (box listener)) then
+                    listener.Stop()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForPort is cancelled by the external token while polling an unreachable port``() : Task =
+        task {
+            let probeListener = new TcpListener(IPAddress.Loopback, 0)
+            probeListener.Start()
+            let port = (probeListener.LocalEndpoint :?> IPEndPoint).Port
+            probeListener.Stop()
+
+            match! runner.StartAsync(lingering (), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 100.0)
+                let endpoint = IPEndPoint(IPAddress.Loopback, port)
+                let elapsed = Stopwatch.StartNew()
+
+                match! running.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 30.0, cts.Token) with
+                | Error(ProcessError.Cancelled _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+                | other -> Assert.Fail $"expected Cancelled, got {other}"
         }
         :> Task
 

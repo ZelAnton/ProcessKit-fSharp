@@ -14,6 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProcessKit.Testing` cassette matching no longer keys on the working directory (`Command.CurrentDir`) by default: two otherwise-identical invocations recorded/replayed from different absolute directories (a developer's checkout vs. a CI runner's workspace) now match, instead of missing with `ProcessError.CassetteMiss` purely because of `cwd`. `CassetteEntry.Cwd` still stores the working directory verbatim for inspection. This is a behavioural change for an existing cassette that relied on `cwd` alone to distinguish two entries — those entries now collapse to the same match key and one of them "wins" (replays for both) in capture order; add `RecordReplayOptions.WithCwdMatching()` (applied symmetrically at record and replay time) to restore the previous cwd-sensitive matching.
 
 ### Fixed
+- `RunningProcess.WaitForAsync` / `WaitForPortAsync` now enforce their `timeout` and cancellation as a
+  single shared deadline instead of ignoring it while an attempt is outstanding. Previously
+  `WaitForAsync` awaited the probe unconditionally, so a probe that hung (or blocked synchronously
+  without ever returning a task) made the call ignore both the timeout and the caller's cancellation
+  token and never return; `WaitForPortAsync` gave each connect attempt a fixed ~1 s window regardless
+  of the remaining budget, so a short overall `timeout` could be overrun by nearly a second. Every
+  attempt and polling backoff is now raced against the one shared deadline, so both verbs return within
+  a small scheduler tolerance of the deadline; a probe invocation is isolated on the thread pool so
+  even a synchronously-blocking one cannot pin the loop; the caller's token takes priority over a
+  concurrent success; a success observed after the deadline is reported as `ProcessError.NotReady`; and
+  an abandoned probe/connect that cannot be cancelled keeps running in the background but its late fault
+  is safely observed rather than surfacing as an unobserved task exception. An out-of-range `timeout` is
+  clamped (a negative one is an immediate `NotReady`; an over-long one is capped at ~24.8 days) and the
+  clamped value is what `NotReady` reports.
 - `RunningProcess.WaitForPortAsync` / `WaitForAsync` now background-drain the child's piped
   stdout/stderr while polling, matching `WaitForLineAsync`. Previously a child that wrote more than
   one OS pipe buffer (~64 KiB on Linux) of startup output before becoming ready would block in its

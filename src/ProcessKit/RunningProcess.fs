@@ -1138,9 +1138,12 @@ type RunningProcess internal (host: RunningHost) =
                         return Unchecked.defaultof<_>
             }
 
-    /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` after `timeout`
-    /// (or `Cancelled` if `cancellationToken` fires first). Background-drains (and discards) the
-    /// child's piped stdout/stderr for the duration of the poll — like `WaitForLineAsync`, so a child
+    /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` once the shared
+    /// `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). Every connect
+    /// attempt and polling backoff shares that one deadline, so a slow or non-cooperative connect can
+    /// never overrun a short `timeout` — see `ReadinessProbe.waitForPortUsing` for the full contract,
+    /// including the ratified scheduler-bounded window at the deadline. Background-drains (and discards)
+    /// the child's piped stdout/stderr for the duration of the poll — like `WaitForLineAsync`, so a child
     /// that writes more than one OS pipe buffer of startup output (~64 KiB on Linux) before becoming
     /// ready can't block in `write()` and spuriously time out this probe — but unlike
     /// `WaitForLineAsync`, the drained bytes are discarded rather than handed back, and draining stops
@@ -1158,10 +1161,17 @@ type RunningProcess internal (host: RunningHost) =
         let stdout, stderr = probeDrainStreams ()
         ReadinessProbe.waitForPort config.Program stdout stderr endpoint timeout cancellationToken
 
-    /// Poll `probe` until it returns true, or fail with `NotReady` after `timeout` (or `Cancelled`
-    /// if `cancellationToken` fires first). Background-drains (and discards) the child's piped
-    /// stdout/stderr for the duration of the poll, exactly like `WaitForPortAsync` — see its doc for
-    /// what that does and doesn't compose with afterward.
+    /// Poll `probe` until it returns true, or fail with `NotReady` once the shared `timeout` deadline
+    /// elapses (or `Cancelled` if `cancellationToken` fires first). The deadline is honored even if
+    /// `probe` never completes — or blocks synchronously without ever returning a task: the invocation
+    /// is isolated on the thread pool and raced against the shared deadline, and the caller's token
+    /// takes priority over a concurrent success. The API cannot force a caller-owned `probe` to stop, so
+    /// an abandoned invocation keeps running in the background, but its late outcome is safely observed
+    /// (a late fault never becomes an unobserved task exception). See `ReadinessProbe.waitForCore` for
+    /// the full contract, including the ratified scheduler-bounded window at the deadline.
+    /// Background-drains (and discards) the child's piped stdout/stderr for the duration of the poll,
+    /// exactly like `WaitForPortAsync` — see its doc for what that does and doesn't compose with
+    /// afterward.
     member _.WaitForAsync
         (probe: Func<Task<bool>>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
