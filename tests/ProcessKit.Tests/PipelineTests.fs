@@ -73,6 +73,109 @@ type private BlockingTee() =
         firstWrite.TrySetResult() |> ignore
         ValueTask(release.Task)
 
+// --- T-069 stdin-feeder test doubles, shared across PipelineTests / ProcessControlTests / PumpTests.
+// Defined here (non-private) because PipelineTests is the earliest of the three in the .fsproj compile
+// order, so the later two can reuse these instead of redefining them. Interfaces are fully qualified to
+// avoid `open System.Collections.Generic` shadowing the F# `List` module used throughout this file.
+
+/// The enumeration stage at which a stdin-source double faults — proving a fault at ANY stage (not just
+/// `MoveNext`/`ReadAsync`) surfaces as `ProcessError.Stdin` instead of a benign broken pipe.
+type StdinFaultStage =
+    | AtGetEnumerator
+    | AtMoveNext
+    | AtCurrent
+
+/// A `FromLines` source (`seq<string>`) that throws at the requested enumeration stage.
+type FaultyStdinLines(stage: StdinFaultStage) =
+    interface System.Collections.Generic.IEnumerable<string> with
+        member _.GetEnumerator() : System.Collections.Generic.IEnumerator<string> =
+            if stage = AtGetEnumerator then
+                raise (InvalidOperationException "sync-get-enumerator-boom")
+
+            { new System.Collections.Generic.IEnumerator<string> with
+                member _.Current =
+                    if stage = AtCurrent then
+                        raise (InvalidOperationException "sync-current-boom")
+                    else
+                        ""
+              interface System.Collections.IEnumerator with
+                  member _.Current = box ""
+
+                  member _.MoveNext() =
+                      if stage = AtMoveNext then
+                          raise (InvalidOperationException "sync-move-next-boom")
+
+                      true
+
+                  member _.Reset() = ()
+              interface IDisposable with
+                  member _.Dispose() = () }
+
+    interface System.Collections.IEnumerable with
+        member this.GetEnumerator() : System.Collections.IEnumerator =
+            (this :> System.Collections.Generic.IEnumerable<string>).GetEnumerator() :> System.Collections.IEnumerator
+
+/// A `FromAsyncLines` source that throws at the requested enumeration stage.
+type FaultyStdinAsyncLines(stage: StdinFaultStage) =
+    interface System.Collections.Generic.IAsyncEnumerable<string> with
+        member _.GetAsyncEnumerator(_: CancellationToken) : System.Collections.Generic.IAsyncEnumerator<string> =
+            if stage = AtGetEnumerator then
+                raise (InvalidOperationException "async-get-enumerator-boom")
+
+            { new System.Collections.Generic.IAsyncEnumerator<string> with
+                member _.Current =
+                    if stage = AtCurrent then
+                        raise (InvalidOperationException "async-current-boom")
+                    else
+                        ""
+
+                member _.MoveNextAsync() : ValueTask<bool> =
+                    if stage = AtMoveNext then
+                        raise (InvalidOperationException "async-move-next-boom")
+
+                    ValueTask<bool>(true)
+              interface IAsyncDisposable with
+                  member _.DisposeAsync() : ValueTask = ValueTask() }
+
+/// A `FromAsyncLines` source whose `MoveNextAsync` parks until the enumerator's cancellation token
+/// fires, recording when enumeration started and when the enumerator was disposed — so a test can prove
+/// that stopping the feeder (teardown / cancellation / early child exit) cancels a hung feed AND
+/// disposes the user's enumerator.
+type HangingStdinAsyncLines() =
+    let started =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let disposed =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    /// Completes once `MoveNextAsync` has been entered (the feed is parked).
+    member _.Started: Task = started.Task
+
+    /// Completes once the enumerator's `DisposeAsync` has run.
+    member _.Disposed: Task = disposed.Task
+
+    interface System.Collections.Generic.IAsyncEnumerable<string> with
+        member _.GetAsyncEnumerator
+            (cancellationToken: CancellationToken)
+            : System.Collections.Generic.IAsyncEnumerator<string> =
+            { new System.Collections.Generic.IAsyncEnumerator<string> with
+                member _.Current = ""
+
+                member _.MoveNextAsync() : ValueTask<bool> =
+                    started.TrySetResult() |> ignore
+
+                    ValueTask<bool>(
+                        task {
+                            // Park until the feeder's lifecycle token cancels this feed.
+                            do! Task.Delay(Timeout.Infinite, cancellationToken)
+                            return true
+                        }
+                    )
+              interface IAsyncDisposable with
+                  member _.DisposeAsync() : ValueTask =
+                      disposed.TrySetResult() |> ignore
+                      ValueTask() }
+
 [<TestFixture>]
 type PipelineTests() =
 
@@ -829,6 +932,50 @@ type PipelineTests() =
             match! pipeline.RunAsync() with
             | Ok output -> Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana" ]))
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // --- T-069: the pipeline call site of the stdin feeder (stage 0's source) ---
+
+    [<Test>]
+    member _.``a pipeline stops a hung stage-0 async stdin feed and disposes its enumerator``() : Task =
+        task {
+            // Stage 0 exits at once without reading stdin, so the `FromAsyncLines` feed is left parked
+            // in `MoveNextAsync`. When the pipeline reaches its terminal state it must Stop the feeder —
+            // cancelling the hung feed and disposing the user's enumerator — rather than leaking it.
+            let source = HangingStdinAsyncLines()
+
+            let pipeline =
+                ((shell "exit 0") |> Command.stdin (Stdin.FromAsyncLines source)).Pipe sortStage
+
+            match! pipeline.OutputStringAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"expected a successful pipeline, got {error}"
+
+            // The run tore down, so the feeder was stopped: its enumerator disposes shortly after.
+            let! completed = Task.WhenAny(source.Disposed, Task.Delay 5000)
+            Assert.That(completed, Is.SameAs source.Disposed, "the hung stage-0 async enumerator was never disposed")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a pipeline surfaces a stage-0 async source that faults at GetAsyncEnumerator as ProcessError.Stdin``
+        ()
+        : Task =
+        task {
+            // The first stage's source faults acquiring its async enumerator — a stage the pre-fix
+            // classification let slip into the benign-broken-pipe bucket. On an otherwise-successful
+            // pipeline it must surface as `ProcessError.Stdin`.
+            let pipeline =
+                ((shell "exit 0")
+                 |> Command.stdin (Stdin.FromAsyncLines(FaultyStdinAsyncLines AtGetEnumerator)))
+                    .Pipe
+                    sortStage
+
+            match! pipeline.OutputStringAsync() with
+            | Error(ProcessError.Stdin _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Stdin, got {other.Message}"
+            | Ok _ -> Assert.Fail "expected a stage-0 async source fault to surface as ProcessError.Stdin"
         }
         :> Task
 

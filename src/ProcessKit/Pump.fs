@@ -742,6 +742,23 @@ module internal Pump =
             | ex -> return raise (StdinSourceFault ex)
         }
 
+    /// Run one *synchronous* acquisition/read step against the user-supplied stdin source
+    /// (`seq.GetEnumerator`, `IAsyncEnumerable.GetAsyncEnumerator`, an enumerator's `Current`, or
+    /// `File.OpenRead`), wrapping any exception it raises as a `StdinSourceFault` — except a
+    /// cancellation, which is rethrown as itself (via `ExceptionDispatchInfo`, preserving its stack) so
+    /// it still classifies through `genuineStdinFault`'s ordinary "a cancelled feed is not the caller's
+    /// error" handling. The synchronous companion to `readSource`: together they make a fault at ANY
+    /// enumeration stage — not just `MoveNext`/`ReadAsync` — surface as `ProcessError.Stdin` instead of
+    /// slipping past into the outer handler and being mistaken for a benign broken pipe.
+    let private sourceStep (step: unit -> 'T) : 'T =
+        try
+            step ()
+        with
+        | :? OperationCanceledException as ex ->
+            ExceptionDispatchInfo.Throw ex
+            Unchecked.defaultof<'T>
+        | ex -> raise (StdinSourceFault ex)
+
     /// Copy `source` to `destination` chunk-by-chunk, reading via `readSource` so a read-side fault
     /// against a `FromFile`/`FromStream` source is distinguishable, by where it was thrown, from a
     /// write-side broken pipe. Used instead of `Stream.CopyToAsync`, which performs both sides in one
@@ -782,18 +799,29 @@ module internal Pump =
                 | StdinSource.Empty -> ()
                 | StdinSource.Bytes bytes -> do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                 | StdinSource.File path ->
-                    use file = File.OpenRead path
+                    // `File.OpenRead` through `sourceStep`, so ANY open failure (not just the three
+                    // types on `genuineStdinFault`'s allow-list) surfaces as a genuine source fault
+                    // instead of being mistaken for a benign broken pipe.
+                    use file = sourceStep (fun () -> File.OpenRead path)
                     do! pumpStream file stdinStream cancellationToken
                 | StdinSource.Reader reader -> do! pumpStream reader stdinStream cancellationToken
                 | StdinSource.Lines lines ->
-                    use enumerator = lines.GetEnumerator()
+                    // `GetEnumerator`/`Current` through `sourceStep` (as `MoveNext` already goes through
+                    // `readSource`), so a fault at any of the three enumeration stages surfaces.
+                    use enumerator = sourceStep (fun () -> lines.GetEnumerator())
                     let mutable more = true
 
                     while more do
+                        // Stop promptly between lines when the lifecycle token is cancelled — a sync
+                        // `MoveNext` can't be interrupted mid-call, but an infinite/slow generator must
+                        // not keep feeding a torn-down child. A cancelled feed is not the caller's error
+                        // (it falls through to `genuineStdinFault` as `None`).
+                        cancellationToken.ThrowIfCancellationRequested()
                         let! hasNext = readSource (fun () -> Task.FromResult(enumerator.MoveNext()))
 
                         if hasNext then
-                            let bytes = Encoding.UTF8.GetBytes(enumerator.Current + "\n")
+                            let current = sourceStep (fun () -> enumerator.Current)
+                            let bytes = Encoding.UTF8.GetBytes(current + "\n")
                             do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                         else
                             more <- false
@@ -804,14 +832,15 @@ module internal Pump =
                     // `WriteAsync`, and on cancellation — instead of blocking a thread-pool thread on
                     // `.DisposeAsync().AsTask().GetAwaiter().GetResult()`. Any exception raised here
                     // still propagates to the outer `with ex ->` below unchanged.
-                    use enumerator = lines.GetAsyncEnumerator cancellationToken
+                    use enumerator = sourceStep (fun () -> lines.GetAsyncEnumerator cancellationToken)
                     let mutable more = true
 
                     while more do
                         let! has = readSource (fun () -> enumerator.MoveNextAsync().AsTask())
 
                         if has then
-                            let bytes = Encoding.UTF8.GetBytes(enumerator.Current + "\n")
+                            let current = sourceStep (fun () -> enumerator.Current)
+                            let bytes = Encoding.UTF8.GetBytes(current + "\n")
                             do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                         else
                             more <- false
@@ -835,11 +864,81 @@ module internal Pump =
             return fault
         }
 
+    /// A started background stdin feed together with the lifecycle token that stops it. Created by
+    /// `feedStdinSource`, one per started child.
+    ///
+    /// Closing the child's stdin pipe only ever unblocks a feed parked on a *write*; a feed parked in a
+    /// user source's own read step (a `FromAsyncLines` hung in `MoveNextAsync`, an endless
+    /// `FromLines`) is unblocked only by cancelling this token. `Stop` does exactly that, so teardown,
+    /// cancellation, a timeout, or an early child exit can prompt the feed to unwind and dispose the
+    /// user's enumerator/stream instead of leaking it past teardown. The feed never faults (every
+    /// exception is swallowed into a stashed fault), so a stopped feed simply completes with no fault.
+    ///
+    /// `Fault` reports a genuine source failure, but only once the feed has finished — a still-running
+    /// feed yields `None` and never blocks — preserving the "surface `ProcessError.Stdin` only on an
+    /// otherwise-successful run" contract (the caller deliberately never awaits the feed, so a
+    /// source fault that loses the race with the child's own exit is not surfaced).
+    type StdinFeeder internal (feed: Task<exn option>, cts: CancellationTokenSource option) =
+        // Serializes the lifecycle CTS's `Cancel` (from `Stop`) against its single `Dispose` (from the
+        // completion cleanup below) so cancelling can never race the dispose. Not a hot path — one
+        // feeder per started child, touched only at teardown/completion.
+        let gate = obj ()
+        let mutable disposed = false
+
+        // Release the lifecycle CTS once the feed has finished — on its own or because `Stop` cancelled
+        // it. Scheduled (NOT `ExecuteSynchronously`) so this can never run inline on the thread inside
+        // `Stop`'s `Cancel`; combined with `gate` it either runs before `Stop` observes `disposed`
+        // (then `Stop` is a no-op) or waits for `Stop`'s `Cancel` to return first.
+        do
+            match cts with
+            | Some source ->
+                feed.ContinueWith(
+                    (fun (_: Task<exn option>) ->
+                        lock gate (fun () ->
+                            if not disposed then
+                                disposed <- true
+                                source.Dispose())),
+                    CancellationToken.None,
+                    TaskContinuationOptions.None,
+                    TaskScheduler.Default
+                )
+                |> ignore
+            | None -> ()
+
+        /// The background feed task. It never faults; a genuine source failure is stashed in its result.
+        member _.Task = feed
+
+        /// A genuine stdin-source failure, observable only once the feed has finished, else `None`.
+        member _.Fault: exn option = if feed.IsCompletedSuccessfully then feed.Result else None
+
+        /// Stop the feed: cancel its lifecycle token so a feed parked in the user's source unwinds and
+        /// disposes the user's enumerator/stream. Idempotent and teardown-race-safe (a no-op once the
+        /// feed has finished, and for the nothing-to-feed feeder).
+        member _.Stop() =
+            match cts with
+            | Some source ->
+                lock gate (fun () ->
+                    if not disposed then
+                        try
+                            source.Cancel()
+                        with :? ObjectDisposedException ->
+                            // The feed finished and the completion cleanup disposed the CTS between our
+                            // `disposed` check and here; there is nothing left to cancel.
+                            ())
+            | None -> ()
+
     /// Feed a stdin `source` (if any) into the child's `stdin` (if piped) in the background, then EOF.
-    /// A source is the child's complete input, so stdin is closed after. Returns the feed task so the
-    /// run can observe a genuine source failure once it has finished (`Task.FromResult None` when
-    /// there is nothing to feed). (The no-source interactive case keeps the stream for `TakeStdin`.)
-    let feedStdinSource (stdin: Stream option) (source: Stdin option) : Task<exn option> =
+    /// A source is the child's complete input, so stdin is closed after. Returns a `StdinFeeder` — the
+    /// feed task plus its lifecycle token — so the run can observe a genuine source failure once the
+    /// feed has finished AND stop the feed at teardown. When there is nothing to feed the feeder is an
+    /// inert no-op (no token, `Stop` does nothing, `Fault` is always `None`). (The no-source
+    /// interactive case keeps the stream for `TakeStdin`.)
+    let feedStdinSource (stdin: Stream option) (source: Stdin option) : StdinFeeder =
         match stdin, source with
-        | Some stdinStream, Some src -> feedStdin src.Source stdinStream true CancellationToken.None
-        | _ -> Task.FromResult(None: exn option)
+        | Some stdinStream, Some src ->
+            // The lifecycle token: cancelling it stops the feed (unblocking a parked source read),
+            // disposed by the feeder once the feed has finished.
+            let cts = new CancellationTokenSource()
+            let feed = feedStdin src.Source stdinStream true cts.Token
+            StdinFeeder(feed, Some cts)
+        | _ -> StdinFeeder(Task.FromResult(None: exn option), None)
