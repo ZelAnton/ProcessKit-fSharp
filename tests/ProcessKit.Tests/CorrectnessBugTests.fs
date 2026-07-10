@@ -176,6 +176,26 @@ type CorrectnessBugTests() =
         Command.create "whatever" |> Command.env "KEY" "value" |> ignore
 
     [<Test>]
+    member _.``Command.Env and EnvRemove reject an embedded NUL in the key, and Env rejects one in the value``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> Command.create "whatever" |> Command.env (sprintf "KE%cY" '\000') "value" |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> Command.create "whatever" |> Command.env "KEY" (sprintf "val%cue" '\000') |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> Command.create "whatever" |> Command.envRemove (sprintf "KE%cY" '\000') |> ignore)
+        )
+        |> ignore
+
+        // Valid Unicode keys/values still work.
+        Command.create "whatever" |> Command.env "KÉY_日本語" "vàlüe-日本語" |> ignore
+
+    [<Test>]
     member _.``a timeout larger than the timer range is treated as no timeout, not a throw``() : Task =
         task {
             // TimeSpan.MaxValue would overflow Task.Delay and throw synchronously, faulting the run and

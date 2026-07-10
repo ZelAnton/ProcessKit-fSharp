@@ -40,6 +40,56 @@ type CommandTests() =
         Assert.That(command.Arguments, Is.EqualTo(box [| "rev-parse"; "--short"; "HEAD" |]))
 
     [<Test>]
+    member _.``Command rejects an empty program``() =
+        Assert.Throws<ArgumentException>(Action(fun () -> Command("") |> ignore)) |> ignore
+
+    [<Test>]
+    member _.``Command rejects a program containing an embedded NUL``() =
+        Assert.Throws<ArgumentException>(Action(fun () -> Command(sprintf "git%cexe" '\000') |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``Arg rejects a value containing an embedded NUL``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> Command.create "git" |> Command.arg (sprintf "--opt%cevil" '\000') |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``Args rejects a null element in the sequence``() =
+        let withNull: string[] = [| "a"; Unchecked.defaultof<string>; "c" |]
+
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> Command.create "git" |> Command.args withNull |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``Args rejects an element containing an embedded NUL``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> Command.create "git" |> Command.args [ "a"; sprintf "b%cc" '\000' ] |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``CurrentDir rejects a directory containing an embedded NUL``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> Command.create "git" |> Command.currentDir (sprintf "/tmp/%cevil" '\000') |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``program, arg and cwd accept valid non-ASCII Unicode values``() =
+        let command =
+            Command.create "gí†"
+            |> Command.arg "héllo-wörld-日本語"
+            |> Command.currentDir "/tmp/日本語-dir"
+
+        Assert.That(command.Program, Is.EqualTo "gí†")
+        Assert.That(command.Arguments, Is.EqualTo(box [| "héllo-wörld-日本語" |]))
+        Assert.That(command.WorkingDirectory, Is.EqualTo(Some "/tmp/日本語-dir"))
+
+    [<Test>]
     member _.``ProcessError.isNotFound classifies only NotFound``() =
         Assert.That(ProcessError.isNotFound (ProcessError.NotFound("git", None)), Is.True)
         Assert.That(ProcessError.isNotFound (ProcessError.Spawn("git", "x")), Is.False)

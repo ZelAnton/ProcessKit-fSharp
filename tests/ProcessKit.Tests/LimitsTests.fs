@@ -62,6 +62,45 @@ type LimitsTests() =
         |> ignore
 
     [<Test>]
+    member _.``ResourceLimits.WithCpuQuota rejects infinities and a value that would overflow the cgroup quota``() =
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithCpuQuota Double.PositiveInfinity |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithCpuQuota Double.NegativeInfinity |> ignore)
+        )
+        |> ignore
+
+        // Native.Cgroup.cpuMaxValue rounds cores * 100_000 (microseconds) into an int64; a value that
+        // makes that product reach or exceed Int64.MaxValue must be rejected up front, uniformly, rather
+        // than only failing later and only on the Linux cgroup backend.
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithCpuQuota 1e20 |> ignore)
+        )
+        |> ignore
+
+        // A large-but-safe value (well under the overflow boundary) is still accepted.
+        let accepted = ResourceLimits.None.WithCpuQuota 1_000_000.0
+        Assert.That(accepted.CpuQuota, Is.EqualTo(Some 1_000_000.0))
+
+    [<Test>]
+    member _.``ProcessGroupOptions.WithCpuQuota rejects the same invalid values as ResourceLimits``() =
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ProcessGroupOptions().WithCpuQuota Double.PositiveInfinity |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ProcessGroupOptions().WithCpuQuota 1e20 |> ignore)
+        )
+        |> ignore
+
+        let accepted = ProcessGroupOptions().WithCpuQuota 2.0
+        Assert.That(accepted.Limits.CpuQuota, Is.EqualTo(Some 2.0))
+
+    [<Test>]
     member _.``ProcessGroupOptions.WithShutdownTimeout rejects a negative window but accepts zero``() =
         ProcessGroupOptions().WithShutdownTimeout TimeSpan.Zero |> ignore
 
