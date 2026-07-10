@@ -74,6 +74,69 @@ type PumpTests() =
         CollectionAssert.AreEqual([ prefix + "é" ], collect bytes Encoding.UTF8)
 
     [<Test>]
+    member _.``readLines replaces a truncated UTF-8 sequence at EOF in every terminator mode``() =
+        let bytes = [| byte 'a'; 0xC3uy |]
+
+        for terminator in
+            [ LineTerminator.Lf
+              LineTerminator.Cr
+              LineTerminator.CrLf
+              LineTerminator.Any ] do
+            CollectionAssert.AreEqual([ "a\uFFFD" ], collectWith terminator bytes Encoding.UTF8, string terminator)
+
+    [<Test>]
+    member _.``readLines replaces a truncated UTF-16 surrogate at EOF``() =
+        let bytes = [| byte 'a'; 0uy; 0uy; 0xD8uy |]
+        CollectionAssert.AreEqual([ "a\uFFFD" ], collect bytes Encoding.Unicode)
+
+    [<Test>]
+    member _.``readLines applies the line cap to replacement characters flushed at EOF``() =
+        use stream = new MemoryStream([| byte 'a'; byte 'b'; 0xC3uy |])
+        let lines = ResizeArray<string>()
+
+        (Pump.readLines
+            stream
+            Encoding.UTF8
+            LineTerminator.Lf
+            None
+            (fun line ->
+                lines.Add line
+                ValueTask.CompletedTask)
+            (Some 2)
+            CancellationToken.None)
+            .Wait()
+
+        CollectionAssert.AreEqual([ "ab"; "\uFFFD" ], lines)
+
+    [<Test>]
+    member _.``readLines resolves a pending CR before flushing a truncated sequence``() =
+        let bytes = [| byte 'a'; byte '\r'; 0xC3uy |]
+
+        for terminator, expected in
+            [ LineTerminator.Cr, [ "a"; "\uFFFD" ]
+              LineTerminator.CrLf, [ "a\r\uFFFD" ]
+              LineTerminator.Any, [ "a"; "\uFFFD" ] ] do
+            CollectionAssert.AreEqual(expected, collectWith terminator bytes Encoding.UTF8, string terminator)
+
+    [<Test>]
+    member _.``readLinesUntilDone propagates decoder exception fallback raised at EOF``() =
+        use stream = new MemoryStream([| 0xC3uy |])
+        let encoding = UTF8Encoding(false, true)
+
+        let action =
+            Func<Task>(fun () ->
+                Pump.readLinesUntilDone
+                    stream
+                    encoding
+                    LineTerminator.Lf
+                    None
+                    (fun _ -> ValueTask.CompletedTask)
+                    None
+                    CancellationToken.None)
+
+        Assert.ThrowsAsync<DecoderFallbackException>(action) |> ignore
+
+    [<Test>]
     member _.``readLines strips CRLF and LF``() =
         CollectionAssert.AreEqual([ "a"; "b"; "c" ], collect (Encoding.UTF8.GetBytes "a\r\nb\nc") Encoding.UTF8)
 
