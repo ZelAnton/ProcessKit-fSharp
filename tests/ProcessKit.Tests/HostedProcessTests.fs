@@ -81,6 +81,19 @@ type private BlockingRunner() =
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "not used"))
 
+/// An `IProcessRunner` whose `SpawnAsync` throws instead of returning a `Result` error — simulating a
+/// failure that escapes an already-built `Supervisor.RunAsync` rather than one it classifies itself.
+type private ThrowingRunner() =
+    interface IProcessRunner with
+        member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
+            raise (InvalidOperationException "boom from ThrowingRunner")
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used"))
+
 [<TestFixture>]
 type HostedProcessTests() =
 
@@ -363,5 +376,66 @@ type HostedProcessTests() =
             // Neither a repeat Dispose nor a repeat StopAsync should throw once torn down.
             Assert.DoesNotThrow(Action(fun () -> (service :> IDisposable).Dispose()))
             do! hosted.StopAsync(CancellationToken.None)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``DisposeAsync awaits supervision to actually finish before returning``() : Task =
+        task {
+            let runner = BlockingRunner()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+            do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            do! (service :> IAsyncDisposable).DisposeAsync().AsTask()
+
+            // No polling here (unlike the plain-`Dispose` test above): by the time `DisposeAsync`
+            // returns, supervision must have actually finished.
+            Assert.That(service.LastOutcome.IsSome, Is.True)
+
+            // Idempotent: a repeat DisposeAsync must not throw and completes immediately.
+            do! (service :> IAsyncDisposable).DisposeAsync().AsTask()
+
+            // Dispose permanently forbids new starts, same as the plain `Dispose` path.
+            do! hosted.StartAsync(CancellationToken.None)
+            do! Task.Delay(TimeSpan.FromMilliseconds 200.0)
+            Assert.That(runner.SpawnCount, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``An exception escaping the built supervisor surfaces as an observable LastOutcome``() : Task =
+        task {
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(fun supervisor -> supervisor.Restart RestartPolicy.Never))
+                    (Some(ThrowingRunner() :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+
+            let serviceForWait = service
+
+            let! completed = waitUntil (fun () -> serviceForWait.LastOutcome.IsSome)
+
+            Assert.That(
+                completed,
+                Is.True,
+                "an exception escaping the supervisor should surface as LastOutcome, not only a log"
+            )
+
+            match service.LastOutcome with
+            | Some(Error error) -> Assert.That(error.Message, Does.Contain "boom from ThrowingRunner")
+            | other -> Assert.Fail $"expected an Error outcome, got %A{other}"
         }
         :> Task

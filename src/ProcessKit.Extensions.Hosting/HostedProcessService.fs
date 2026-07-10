@@ -142,6 +142,33 @@ type HostedProcessService
         with :? ObjectDisposedException ->
             ()
 
+    // Claims the one-and-only teardown transition, shared by `Dispose` and `DisposeAsync`: returns
+    // `true` for exactly the first call across any race between the two (or repeats of either),
+    // `false` for every call after. Concurrent-safe with `StartAsync`/`StopAsync` via the same `gate`.
+    let claimTeardown () =
+        lock gate (fun () ->
+            if disposed then
+                false
+            else
+                disposed <- true
+                true)
+
+    // The synchronous half of hard teardown, shared by `Dispose` and `DisposeAsync`: forbids new
+    // starts, hard-kills whatever child is currently active, and cancels the supervision loop (and any
+    // in-flight backoff sleep). Only ever runs once `claimTeardown` has granted the transition.
+    let beginHardTeardown () =
+        // Prevent a restart-policy decision racing this teardown from restarting the child: once
+        // the active incarnation's kill below completes its run, `StopWhen` must end supervision
+        // rather than schedule another restart.
+        Volatile.Write(&stopping, 1)
+        // Hard-kill the active child directly (belt-and-suspenders: independent of whether a
+        // registration on `lifetime.Token` happens to be live right now) ...
+        trackingRunner.KillActive()
+        // ... and cancel the supervision loop itself — this also unblocks any in-flight backoff
+        // sleep and the `TrackingRunner.CaptureStringAsync` kill-on-cancel registration, so a
+        // child that starts running just as teardown runs is still torn down.
+        cancelLifetime ()
+
     // `configureSupervisor` is caller-supplied and may throw, or — since it is a `Func` callable from
     // C# — return null. Either would otherwise be silently swallowed by the catch-all below, leaving
     // the hosted service looking "started" while nothing actually supervises the child. Surface it the
@@ -181,7 +208,15 @@ type HostedProcessService
                 // Host shutdown cancelled the background supervision wait; the child stop path has
                 // already observed the host token, so there is no further recovery to perform here.
                 ()
-            | ex -> logError ex
+            | ex ->
+                // An exception here is not a `configureSupervisor` failure (that is already handled
+                // above, via `buildSupervisor`) — it escaped the already-built `Supervisor.RunAsync`
+                // itself (e.g. the injected `IProcessRunner` threw instead of returning a `Result`
+                // error). Publish it the same way any other supervision failure is published: as an
+                // observable `LastOutcome`, not only a log — otherwise a caller reading `LastOutcome`
+                // sees `None` and believes supervision is still active when it has in fact crashed.
+                logError ex
+                publishOutcome (Error(ProcessError.Io $"hosted process '{name}' supervision failed: {ex.Message}"))
         }
         :> Task
 
@@ -253,29 +288,38 @@ type HostedProcessService
         /// Idempotent hard teardown: permanently forbids new starts, cancels the supervision loop (and
         /// any in-flight backoff sleep), hard-kills whatever child is currently active, and releases the
         /// lifetime token source — all without waiting for a graceful shutdown or for the supervision
-        /// task to actually finish (a plain `Dispose()` cannot await). Safe to call repeatedly, and
-        /// safe to race against `StartAsync`/`StopAsync`: the `disposed` flag and `gate` lock ensure
-        /// only the first `Dispose` call performs the teardown, and every access to `lifetime` elsewhere
-        /// tolerates it being cancelled/disposed underneath a concurrent caller.
+        /// task to actually finish (a plain `Dispose()` cannot await, so this only *initiates* teardown;
+        /// it does not itself guarantee the child has already exited by the time it returns). Safe to
+        /// call repeatedly, and safe to race against `StartAsync`/`StopAsync`: the `disposed` flag and
+        /// `gate` lock ensure only the first `Dispose`/`DisposeAsync` call across either performs the
+        /// teardown, and every access to `lifetime` elsewhere tolerates it being cancelled/disposed
+        /// underneath a concurrent caller. Prefer `DisposeAsync` (e.g. `await using`) when the caller
+        /// needs the stronger guarantee that supervision has actually finished before teardown returns.
         member _.Dispose() =
-            let shouldTearDown =
-                lock gate (fun () ->
-                    if disposed then
-                        false
-                    else
-                        disposed <- true
-                        true)
-
-            if shouldTearDown then
-                // Prevent a restart-policy decision racing this teardown from restarting the child: once
-                // the active incarnation's kill below completes its run, `StopWhen` must end supervision
-                // rather than schedule another restart.
-                Volatile.Write(&stopping, 1)
-                // Hard-kill the active child directly (belt-and-suspenders: independent of whether a
-                // registration on `lifetime.Token` happens to be live right now) ...
-                trackingRunner.KillActive()
-                // ... and cancel the supervision loop itself — this also unblocks any in-flight backoff
-                // sleep and the `TrackingRunner.CaptureStringAsync` kill-on-cancel registration, so a
-                // child that starts running just as `Dispose` runs is still torn down.
-                cancelLifetime ()
+            if claimTeardown () then
+                beginHardTeardown ()
                 lifetime.Dispose()
+
+    interface IAsyncDisposable with
+        /// Deterministic counterpart to `Dispose()`: performs the same idempotent hard teardown
+        /// (forbid new starts, hard-kill the active child, cancel the supervision loop), but
+        /// additionally awaits the supervision loop itself to actually finish before returning — so by
+        /// the time this completes, there is genuinely no live background supervision task, unlike the
+        /// synchronous `Dispose()`, which cannot await and only initiates the teardown. Shares
+        /// `claimTeardown` with `Dispose()`, so only the first call across either performs the teardown;
+        /// a repeat (of either) is a no-op that completes immediately.
+        member _.DisposeAsync() : ValueTask =
+            ValueTask(
+                task {
+                    if claimTeardown () then
+                        beginHardTeardown ()
+                        // Snapshotted once under `gate`, after `disposed` is already `true`, so no
+                        // concurrent `StartAsync` can reassign it out from under this await (same
+                        // pattern as `StopAsync`). `runSupervision` itself never lets an exception or
+                        // cancellation escape its own task (see its `with` handlers above), so this
+                        // await cannot fault or be cancelled.
+                        let toAwait = lock gate (fun () -> supervisionTask)
+                        do! toAwait
+                        lifetime.Dispose()
+                }
+            )
