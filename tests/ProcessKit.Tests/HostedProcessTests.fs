@@ -412,6 +412,41 @@ type HostedProcessTests() =
         :> Task
 
     [<Test>]
+    member _.``DisposeAsync still awaits supervision to finish when a prior Dispose already claimed teardown``
+        ()
+        : Task =
+        task {
+            let runner = BlockingRunner()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+            do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            // The synchronous `Dispose()` wins the teardown claim first, exactly as the regression
+            // required: it initiates teardown (hard-kill + cancel) but cannot itself await supervision.
+            (service :> IDisposable).Dispose()
+
+            // `DisposeAsync()` loses the claim race (teardown already claimed by `Dispose()` above), but
+            // must still await supervision to actually finish before returning — its documented contract
+            // does not depend on winning the race.
+            do! (service :> IAsyncDisposable).DisposeAsync().AsTask()
+
+            Assert.That(
+                service.LastOutcome.IsSome,
+                Is.True,
+                "DisposeAsync must await supervision to completion even when a prior Dispose already claimed teardown"
+            )
+        }
+        :> Task
+
+    [<Test>]
     member _.``An exception escaping the built supervisor surfaces as an observable LastOutcome``() : Task =
         task {
             let provider, hosted, service =

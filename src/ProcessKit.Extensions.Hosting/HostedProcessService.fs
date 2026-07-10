@@ -302,24 +302,33 @@ type HostedProcessService
 
     interface IAsyncDisposable with
         /// Deterministic counterpart to `Dispose()`: performs the same idempotent hard teardown
-        /// (forbid new starts, hard-kill the active child, cancel the supervision loop), but
-        /// additionally awaits the supervision loop itself to actually finish before returning — so by
-        /// the time this completes, there is genuinely no live background supervision task, unlike the
-        /// synchronous `Dispose()`, which cannot await and only initiates the teardown. Shares
-        /// `claimTeardown` with `Dispose()`, so only the first call across either performs the teardown;
-        /// a repeat (of either) is a no-op that completes immediately.
+        /// (forbid new starts, hard-kill the active child, cancel the supervision loop) — but,
+        /// unlike `Dispose()`, unconditionally awaits the supervision loop itself to actually finish
+        /// before returning, so by the time this completes, there is genuinely no live background
+        /// supervision task. This holds whether or not *this* call wins the `claimTeardown` race
+        /// against a concurrent/prior `Dispose()`/`DisposeAsync()`: `supervisionTask` is stable once
+        /// `disposed` is `true` (`StartAsync` never reassigns it after that), so every caller — the one
+        /// that claimed the teardown transition and every one that lost the race — reads the same task
+        /// and awaits it to completion. Only the call that actually claims the transition performs the
+        /// teardown itself (hard-kill + cancel + `lifetime.Dispose()`), so teardown remains exactly
+        /// once; every other call still gets the documented "supervision has finished" guarantee.
         member _.DisposeAsync() : ValueTask =
             ValueTask(
                 task {
-                    if claimTeardown () then
+                    let claimedTeardown = claimTeardown ()
+
+                    if claimedTeardown then
                         beginHardTeardown ()
-                        // Snapshotted once under `gate`, after `disposed` is already `true`, so no
-                        // concurrent `StartAsync` can reassign it out from under this await (same
-                        // pattern as `StopAsync`). `runSupervision` itself never lets an exception or
-                        // cancellation escape its own task (see its `with` handlers above), so this
-                        // await cannot fault or be cancelled.
-                        let toAwait = lock gate (fun () -> supervisionTask)
-                        do! toAwait
+
+                    // Snapshotted under `gate` after `disposed` is (by now, one way or another)
+                    // already `true`, so no concurrent `StartAsync` can reassign it out from under
+                    // this await (same pattern as `StopAsync`). `runSupervision` itself never lets an
+                    // exception or cancellation escape its own task (see its `with` handlers above),
+                    // so this await cannot fault or be cancelled.
+                    let toAwait = lock gate (fun () -> supervisionTask)
+                    do! toAwait
+
+                    if claimedTeardown then
                         lifetime.Dispose()
                 }
             )
