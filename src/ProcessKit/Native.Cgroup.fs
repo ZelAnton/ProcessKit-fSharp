@@ -8,9 +8,11 @@ open ProcessKit.Native.Common
 open ProcessKit.Native.Posix
 
 /// Linux cgroup v2 — the `limits` backend and cgroup-scoped tree control. All plain file I/O over
-/// /sys/fs/cgroup, plus per-member signal sweeps. Depends on `Native.Common` (`SignalDelivery`) and
-/// `Native.Posix` (the single-pid `kill` and `signalPid`, and the `SIGKILL`/`SIGTERM` numbers), so
-/// it compiles after both.
+/// /sys/fs/cgroup, plus per-member signal delivery. Depends on `Native.Common` (`SignalDelivery`) and
+/// `Native.Posix` (the raw `kill` and the `SIGKILL`/`SIGTERM` numbers used by the best-effort teardown
+/// sweep in `killCgroup`, and the pidfd primitives `pidfdOpenChecked`/`pidfdSendSignalChecked`/
+/// `closePidfd` that make per-member SIGTERM / arbitrary-signal delivery identity-safe against pid
+/// recycling), so it compiles after both.
 module internal Cgroup =
 
     // ----------------------------------------------------------------------------------
@@ -219,8 +221,20 @@ module internal Cgroup =
         | Ok members -> not (List.isEmpty members)
         | Error _ -> true
 
-    /// Hard-kill the whole subtree via `cgroup.kill` (kernel >= 5.14); on older kernels, freeze then
-    /// run a bounded per-pid SIGKILL sweep.
+    /// Hard-kill the whole subtree via `cgroup.kill` (kernel >= 5.14) — the atomic, race-free whole-subtree
+    /// SIGKILL that also catches a process forked after any membership snapshot. On older kernels (< 5.14,
+    /// no `cgroup.kill`) fall back to freezing the tree and running a bounded per-pid `kill(pid, SIGKILL)`
+    /// sweep.
+    ///
+    /// That fallback sweep is deliberately **best-effort, not identity-safe against pid recycling** — it is
+    /// NOT presented as TOCTOU-safe. Unlike `signalCgroup`/`terminateCgroup` (which pin each pid with a
+    /// pidfd before delivering, see `deliverIdentitySafe`), it signals raw pid numbers snapshotted from
+    /// `cgroup.procs`, so in the tiny window between the snapshot and the `kill` a member could exit and its
+    /// number be recycled by an unrelated process that then receives the SIGKILL. This is an accepted
+    /// trade-off confined to teardown on ancient kernels: the freeze halts new forks while the sweep runs,
+    /// SIGKILL is the least-harmful signal to misdirect, and a kernel without `cgroup.kill` (< 5.14) is old
+    /// enough that pinning is not the point of this legacy path. The atomic `cgroup.kill` above is the
+    /// race-free path used on every current kernel.
     let killCgroup (cgroupPath: string) =
         let viaKillFile =
             try
@@ -247,6 +261,11 @@ module internal Cgroup =
             while cgroupAlive cgroupPath && sweep < 50 do
                 match cgroupMembers cgroupPath with
                 | Ok members ->
+                    // Best-effort raw sweep (see the docstring): NOT identity-safe against pid recycling,
+                    // unlike the pidfd-pinned `signalCgroup`/`terminateCgroup` path. Confined to teardown on
+                    // kernels < 5.14 that lack the atomic `cgroup.kill`; the freeze above halts new forks
+                    // while it runs, and SIGKILL is the least-harmful signal to misdirect in the tiny
+                    // snapshot->kill window.
                     for pid in members do
                         kill (pid, SIGKILL) |> ignore
                 | Error _ ->
@@ -264,43 +283,158 @@ module internal Cgroup =
                  // torn down regardless, so a failure here is not actionable.
                  ())
 
-    /// SIGTERM every member (graceful); the caller polls then escalates with `killCgroup`.
-    let terminateCgroup (cgroupPath: string) =
-        match cgroupMembers cgroupPath with
-        | Ok members ->
-            for pid in members do
-                kill (pid, SIGTERM) |> ignore
-        | Error _ ->
-            // Unknown membership: there is nobody safe to signal this call, but silently doing nothing
-            // must not look like "the group is already empty" — `GracefulKillTree`'s poll loop that
-            // follows relies on `cgroupAlive` (not this call's return) to treat the same read failure as
-            // "not drained," so the teardown still escalates to `killCgroup`'s retrying sweep instead of
-            // quietly completing.
-            ()
+    // errno: the kernel does not implement the syscall — a pre-5.3 kernel lacking `pidfd_open`, a pre-5.1
+    // kernel lacking `pidfd_send_signal`, or a seccomp filter blocking either. Turned into an honest
+    // fail-safe error below rather than a racy raw-kill fallback.
+    [<Literal>]
+    let private ENOSYS = 38
 
-    /// Broadcast a raw signal to every member of a cgroup, aggregating the per-pid outcomes: a member
-    /// that already exited (ESRCH) does not abort the broadcast — every member still gets the signal —
-    /// but the first genuine delivery failure is what the aggregated result reports. An unreadable
-    /// member list is reported as a delivery failure too (never a false "delivered to nobody" success)
-    /// — signalling nobody must not look like a successful broadcast to an unknown group.
-    let signalCgroup (cgroupPath: string) (signalNum: int) : SignalDelivery =
+    /// The classified outcome of one identity-safe per-member delivery attempt (see `deliverIdentitySafe`).
+    /// Distinct from `SignalDelivery`: "the pinned target is gone" and "the pid left the cgroup, so it was
+    /// deliberately skipped" are both broadcast success, yet must be told apart from a real failure that
+    /// has to surface.
+    [<RequireQualifiedAccess; NoComparison; NoEquality>]
+    type Delivery =
+        /// The signal reached the confirmed member, or a benign exit race made it a no-op — either the
+        /// target exited before it could be pinned, or the *pinned* task exited before the send (an ESRCH
+        /// the pidfd guarantees is the target's own exit, never a signal leaked to a recycled pid).
+        | Delivered
+        /// The pinned pid was no longer a member when reconfirmed: its number may have been recycled by a
+        /// process *outside* the cgroup, so it was refused a signal. Nothing was sent.
+        | Skipped
+        /// A real failure to surface: EPERM (a member that changed uid, or a seccomp/container policy), an
+        /// unreadable membership (fail-safe: never signal when membership cannot be confirmed), or a kernel
+        /// lacking pidfd (fail-safe: refuse to downgrade to a racy raw kill).
+        | Failed of Errno: int * Message: string
+
+    // The honest failure when the kernel lacks pidfd, so per-member signalling refuses to fall back to a
+    // racy `kill(pid, ...)` that could hit a pid recycled by a process outside the cgroup. Carries ENOSYS
+    // so `SignalDelivery.DeliveryFailed` still reports a real errno.
+    let private pidfdUnsupported () : Delivery =
+        Delivery.Failed(
+            ENOSYS,
+            "identity-safe per-member signalling needs pidfd (pidfd_open/pidfd_send_signal, Linux >= 5.3); "
+            + "this kernel lacks it, so ProcessKit refuses to fall back to a racy kill(pid, ...) that could "
+            + "hit a pid recycled by a process outside the cgroup — use SIGKILL teardown (the atomic "
+            + "cgroup.kill) or run on a >= 5.3 kernel"
+        )
+
+    /// The identity-safe per-member signal primitive, factored over its syscall seam so the pid-reuse race
+    /// is testable without real pidfd syscalls. Three steps, and their ORDER is what makes it race-free:
+    ///
+    /// 1. `openPin pid` **pins** the exact task currently running as `pid` (a pidfd in production). From
+    ///    here the send in step 3 can only ever reach *that* task — never a later process that recycles the
+    ///    number.
+    /// 2. `stillMember pid` **reconfirms** membership, read *after* the pin. If the pin captured a process
+    ///    that had already recycled `pid` (the original member exited in the snapshot->pin window), that
+    ///    impostor is not a member of our cgroup, so this reports `false` and delivery is skipped.
+    /// 3. `send handle sig` delivers through the pinned handle.
+    ///
+    /// Why a *live* process outside the cgroup is never signalled: a delivery reaches a live process only
+    /// if the pinned task is still alive at step 3, in which case it has held `pid` continuously since the
+    /// pin (a live process keeps its pid), so it *is* the process step 2 read at `pid` — and step 2 only
+    /// let us proceed if that process was a member. If the pinned task instead exited, the send is a benign
+    /// ESRCH, never a hit on whoever recycled the number.
+    ///
+    /// Generic over the pin handle so a test can pin with a token instead of a real fd; `closePin` releases
+    /// the handle exactly once (the pidfd's `close` in production, a no-op for a test token).
+    let deliverIdentitySafe
+        (pid: int)
+        (signalNum: int)
+        (openPin: int -> Result<'H, int>)
+        (stillMember: int -> Result<bool, string>)
+        (send: 'H -> int -> Result<unit, int>)
+        (closePin: 'H -> unit)
+        : Delivery =
+        // 1. Pin the exact task currently at `pid`.
+        match openPin pid with
+        // Already gone before it could be pinned — the intended end state (gone) already holds. Benign,
+        // exactly like an ESRCH from the old raw `kill`; membership is not even consulted.
+        | Error errno when errno = ESRCH -> Delivery.Delivered
+        // No pidfd on this kernel (< 5.3) or a seccomp block: fail safe, never a racy raw-kill downgrade.
+        | Error errno when errno = ENOSYS -> pidfdUnsupported ()
+        | Error errno -> Delivery.Failed(errno, System.ComponentModel.Win32Exception(errno).Message)
+        | Ok handle ->
+            try
+                // 2. Reconfirm membership *after* pinning.
+                match stillMember pid with
+                // The pinned pid left the cgroup — its number may have been recycled by a process outside
+                // our tree. Refuse to signal it.
+                | Ok false -> Delivery.Skipped
+                // Membership unknown (an unreadable cgroup.procs): never signal when it cannot be confirmed.
+                | Error message -> Delivery.Failed(0, message)
+                | Ok true ->
+                    // 3. Deliver through the pinned handle — the pinned task or nothing.
+                    match send handle signalNum with
+                    | Ok() -> Delivery.Delivered
+                    // The pinned target exited between the reconfirm and the send. The pidfd guarantees this
+                    // ESRCH is *our* target's exit, never a signal leaked to a recycled pid — benign.
+                    | Error errno when errno = ESRCH -> Delivery.Delivered
+                    | Error errno when errno = ENOSYS -> pidfdUnsupported ()
+                    // A real delivery failure (EPERM, ...): surface it, never read as success.
+                    | Error errno -> Delivery.Failed(errno, System.ComponentModel.Win32Exception(errno).Message)
+            finally
+                closePin handle
+
+    /// Broadcast `signalNum` to every current member through the identity-safe pidfd primitive
+    /// (`deliverIdentitySafe`), aggregating the per-member outcomes into one `SignalDelivery`: a benign
+    /// race (a member gone, or a pid that left the cgroup) never aborts the broadcast — every member still
+    /// gets its chance — while the first genuine delivery failure is what the aggregate reports. An
+    /// unreadable member list is itself a delivery failure (never a false "delivered to nobody" success).
+    let private broadcastIdentitySafe (cgroupPath: string) (signalNum: int) : SignalDelivery =
         match cgroupMembers cgroupPath with
         | Error message ->
             SignalDelivery.DeliveryFailed(0, $"could not read cgroup.procs to broadcast the signal: {message}")
         | Ok members ->
+            // Reconfirm membership *after* each pidfd pins its pid: re-read cgroup.procs and ask whether the
+            // pinned pid is still listed. If it left, the pidfd may now point at a process outside the
+            // cgroup that recycled the number, so `deliverIdentitySafe` refuses to send.
+            let stillMember (pid: int) : Result<bool, string> =
+                match cgroupMembers cgroupPath with
+                | Ok current -> Ok(List.contains pid current)
+                | Error message -> Error message
+
             let mutable firstFailure: SignalDelivery option = None
 
             for pid in members do
-                match signalPid pid signalNum with
-                | SignalDelivery.Delivered
-                | SignalDelivery.TargetGone -> ()
-                | SignalDelivery.DeliveryFailed _ as failure ->
+                match
+                    deliverIdentitySafe pid signalNum pidfdOpenChecked stillMember pidfdSendSignalChecked closePidfd
+                with
+                | Delivery.Delivered
+                | Delivery.Skipped -> ()
+                | Delivery.Failed(errno, message) ->
                     if firstFailure.IsNone then
-                        firstFailure <- Some failure
+                        firstFailure <- Some(SignalDelivery.DeliveryFailed(errno, message))
 
             match firstFailure with
             | Some failure -> failure
             | None -> SignalDelivery.Delivered
+
+    /// SIGTERM every member (graceful); the caller polls then escalates with `killCgroup`. Each delivery is
+    /// identity-safe (see `broadcastIdentitySafe`/`deliverIdentitySafe`): a pid recycled by a process
+    /// outside the cgroup is never SIGTERM'd. The aggregated outcome is deliberately discarded — this is
+    /// the graceful attempt tier, and `GracefulKillTree`'s poll loop relies on `cgroupAlive` (not this
+    /// call's return) to decide whether to escalate. That preserves the old fail-safe: an unreadable
+    /// membership signals nobody but must not look like "the group is already empty," and the poll loop's
+    /// `cgroupAlive` (a read failure reads as "not drained") still drives escalation to `killCgroup`. On a
+    /// kernel without pidfd every delivery fails safe (no raw kill), so nothing is signalled and the poll
+    /// loop escalates to `killCgroup`'s atomic teardown — an honest degradation to a hard kill, never a
+    /// misdirected SIGTERM.
+    let terminateCgroup (cgroupPath: string) =
+        broadcastIdentitySafe cgroupPath SIGTERM |> ignore
+
+    /// Broadcast a raw signal to every member of a cgroup, aggregating the per-pid outcomes: a member
+    /// that already exited (or whose pid left the cgroup) does not abort the broadcast — every member
+    /// still gets the signal — but the first genuine delivery failure is what the aggregated result
+    /// reports. An unreadable member list is reported as a delivery failure too (never a false "delivered
+    /// to nobody" success) — signalling nobody must not look like a successful broadcast to an unknown
+    /// group. Each delivery is **identity-safe** against pid recycling (see `deliverIdentitySafe`): the old
+    /// raw `kill(pid, sig)` could hit a pid recycled by an unrelated process between the `cgroup.procs`
+    /// snapshot and the syscall; pinning with a pidfd and reconfirming membership closes that TOCTOU
+    /// window. On a kernel without pidfd this fails safe with an honest error rather than downgrading to
+    /// the racy raw kill.
+    let signalCgroup (cgroupPath: string) (signalNum: int) : SignalDelivery =
+        broadcastIdentitySafe cgroupPath signalNum
 
     /// Freeze (`true`) or thaw (`false`) a cgroup (`cgroup.freeze`).
     let freezeCgroup (cgroupPath: string) (frozen: bool) =
