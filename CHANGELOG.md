@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `Command.Retry`/`Supervisor` now refuse a command whose stdin comes from a one-shot source (`Stdin.FromStream`/`FromLines`/`FromAsyncLines`) up front, with `ProcessError.Unsupported`, instead of silently re-running or restarting it against the already-exhausted source on the second attempt — previously the child could receive truncated or empty stdin without any error. Repeatable sources (`FromString`/`FromBytes`/`FromFile`/`Stdin.Empty`) and a single run without an active retry/restart are unaffected.
 
 ## [2.2.0] - 2026-07-10
 

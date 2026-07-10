@@ -417,6 +417,16 @@ type Supervisor internal (config: SupervisorConfig) =
         let command = config.Command.OutputBuffer config.Capture
         let program = config.Command.Program
 
+        // Restart-capable: the policy could restart at least once more (`Never`, or an explicit
+        // `MaxRestarts(0)`, never restarts at all — those are effectively a single run). Computed from
+        // *configuration* alone, not from whether a restart actually happens at runtime: a one-shot
+        // stdin source must be refused up front, before the first incarnation ever reads it, not only
+        // once a crash would trigger the restart that exhausts it.
+        let restartCapable =
+            match config.Policy with
+            | RestartPolicy.Never -> false
+            | _ -> config.MaxRestarts |> Option.forall (fun limit -> limit > 0)
+
         task {
             let mutable restarts = 0
             // The backoff *escalation* exponent — distinct from the lifetime `restarts` (which drives the
@@ -427,7 +437,26 @@ type Supervisor internal (config: SupervisorConfig) =
             let mutable stormScore = 0.0
             let mutable lastFailureAt: float option = None
             let mutable stormPauses = 0
-            let mutable final: Result<SupervisionOutcome, ProcessError> option = None
+
+            // Seeded up front (instead of `None`) when the command is refused before its first
+            // incarnation: a one-shot stdin source (`FromStream`/`FromLines`/`FromAsyncLines`) can only
+            // be pumped once, so restarting the incarnation would silently feed the next one
+            // empty/truncated input instead of replaying the original one. Fail loudly, before the first
+            // incarnation ever runs, rather than let a restart quietly corrupt the input (T-088; ports
+            // ProcessKit-rs `c1f39c7`/`8472007`). Seeding `final` here — rather than branching around the
+            // loop — makes the `while final.IsNone` loop below skip its body outright, no restructuring
+            // needed. `RestartPolicy.Never` / an explicit `MaxRestarts(0)` is unaffected (not
+            // restart-capable), and so is every repeatable source (`Bytes`/`String`/`File`/`Empty`).
+            let mutable final: Result<SupervisionOutcome, ProcessError> option =
+                if restartCapable && Stdin.isOneShot command.Config.StdinSource then
+                    Some(
+                        Error(
+                            ProcessError.Unsupported
+                                $"'{program}' has a one-shot stdin source and cannot be supervised with restarts enabled: a restarted incarnation would find the source already exhausted"
+                        )
+                    )
+                else
+                    None
 
             // The failure-storm gate, run before the backoff of every *failure*-driven restart:
             // fold the failure into the decaying score and, past the threshold, sleep out one
