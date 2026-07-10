@@ -186,7 +186,7 @@ The modes are:
 
 - `DropOldest`: append the new line, then evict from the front until both caps fit. A single line larger than the byte cap is itself evicted.
 - `DropNewest`: when either cap would be exceeded, retain the existing prefix and discard the incoming line.
-- `Error`: mark the capture too large when a cap is crossed, while the pump continues draining the pipe. With no caps, this mode is intentionally zero-tolerance for line-pumped output.
+- `Error`: mark the capture too large when a cap is crossed, while the pump continues draining the pipe. With no caps set (`MaxLines = None` and `MaxBytes = None`) there is no ceiling to cross, so `Error` retains everything and never trips `OutputTooLarge`.
 - Unbounded behavior is represented by `OutputBufferPolicy.Unbounded` (`MaxLines = None`, `MaxBytes = None`, with `DropOldest` irrelevant because no cap fills).
 
 Line and byte caps solve different problems. A line cap bounds object/count overhead but permits a few enormous strings. A byte cap bounds retained UTF-8 payload and also supplies `readLines` with an in-flight line-length cap: newline-free output is force-flushed into segments rather than growing one `StringBuilder` indefinitely. It now genuinely bounds retained memory for empty-line floods as well, because every retained line is charged for its separator byte. The line cap remains independent so callers can place a direct bound on object/count overhead. Raw byte capture has no line structure and uses only `MaxBytes` through `RawBuffer`.

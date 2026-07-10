@@ -31,8 +31,10 @@ type OverflowMode =
 
     /// Fail-loud ceiling: once the cap is reached the run errors with
     /// `ProcessError.OutputTooLarge` rather than silently dropping. The pipe is still drained
-    /// (the child never blocks); excess lines are counted but not retained. On an *unbounded*
-    /// buffer this is zero-tolerance — any line-pumped output errors.
+    /// (the child never blocks); excess lines are counted but not retained. With no cap set
+    /// (`MaxLines = None` and `MaxBytes = None`) there is no ceiling to cross, so `Error`
+    /// behaves like the other overflow modes on an unbounded buffer: it retains everything and
+    /// never trips `OutputTooLarge`.
     | Error
 
 /// Caps how many captured/streamed output lines are retained in memory.

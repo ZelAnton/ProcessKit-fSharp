@@ -189,6 +189,49 @@ type PumpTests() =
         Assert.That(buf.Truncated, Is.True)
 
     [<Test>]
+    member _.``LineBuffer Error with no limits retains all lines``() =
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithOverflow OverflowMode.Error)
+
+        [ "a"; "b"; "c"; "d" ] |> List.iter buf.Add
+        Assert.That(buf.Text, Is.EqualTo "a\nb\nc\nd")
+        Assert.That(buf.TooLarge, Is.False)
+        Assert.That(buf.TotalLines, Is.EqualTo 4)
+
+    [<Test>]
+    member _.``LineBuffer Error with MaxLines 3 errors after line 3``() =
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxLines(3).WithOverflow OverflowMode.Error)
+
+        [ "a"; "b"; "c"; "d" ] |> List.iter buf.Add
+        Assert.That(buf.Text, Is.EqualTo "a\nb\nc")
+        Assert.That(buf.TooLarge, Is.True)
+        Assert.That(buf.TotalLines, Is.EqualTo 4)
+
+    [<Test>]
+    member _.``LineBuffer Error with MaxBytes 5 errors after byte 5``() =
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes(5).WithOverflow OverflowMode.Error)
+
+        [ "ab"; "c"; "d" ] |> List.iter buf.Add
+        Assert.That(buf.Text, Is.EqualTo "ab\nc")
+        Assert.That(buf.TooLarge, Is.True)
+        Assert.That(buf.TotalBytes, Is.EqualTo 7)
+
+    [<Test>]
+    member _.``LineBuffer Error with MaxLines 2 and MaxBytes 10 errors at the first limit``() =
+        let buf =
+            Pump.LineBuffer(
+                OutputBufferPolicy.Unbounded.WithMaxLines(2).WithMaxBytes(10).WithOverflow OverflowMode.Error
+            )
+
+        [ "abc"; "def"; "g" ] |> List.iter buf.Add
+        Assert.That(buf.Text, Is.EqualTo "abc\ndef")
+        Assert.That(buf.TooLarge, Is.True)
+        Assert.That(buf.TotalLines, Is.EqualTo 3)
+        Assert.That(buf.TotalBytes, Is.EqualTo 10)
+
+    [<Test>]
     member _.``LineBuffer byte cap evicts oldest to fit``() =
         let buf = Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes 3)
         [ "aa"; "bb" ] |> List.iter buf.Add

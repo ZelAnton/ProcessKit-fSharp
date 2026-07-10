@@ -744,6 +744,90 @@ type StreamingTests() =
         }
         :> Task
 
+    // --- OverflowMode.Error without a configured cap keeps output unbounded (T-067) ---
+
+    [<Test>]
+    member _.``OutputStringAsync Error with no line or byte cap retains all output``() : Task =
+        task {
+            // `Unbounded.WithOverflow Error` has no `MaxLines`/`MaxBytes`, so there is no ceiling for
+            // `Error` to cross — end-to-end through `OutputStringAsync`, this must behave like any
+            // other overflow mode on an unbounded policy: retain everything, never `OutputTooLarge`.
+            let command =
+                threeLines
+                |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithOverflow OverflowMode.Error)
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match! running.OutputStringAsync() with
+                | Ok result ->
+                    Assert.That(result.Stdout, Does.Contain "line1")
+                    Assert.That(result.Stdout, Does.Contain "line2")
+                    Assert.That(result.Stdout, Does.Contain "line3")
+                    Assert.That(result.Truncated, Is.False)
+                | Error error -> Assert.Fail $"expected Ok (unbounded Error must not trip), got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputStringAsync Error with a line cap alone trips OutputTooLarge once exceeded``() : Task =
+        task {
+            let command =
+                threeLines
+                |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxLines(1).WithOverflow OverflowMode.Error)
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match! running.OutputStringAsync() with
+                | Error(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, _)) ->
+                    Assert.That(lineLimit, Is.EqualTo(Some 1))
+                    Assert.That(byteLimit, Is.EqualTo None)
+                    Assert.That(totalLines, Is.GreaterThan 1)
+                | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputStringAsync Error with a byte cap alone trips OutputTooLarge once exceeded``() : Task =
+        task {
+            let command =
+                threeLines
+                |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes(2).WithOverflow OverflowMode.Error)
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match! running.OutputStringAsync() with
+                | Error(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, _, totalBytes)) ->
+                    Assert.That(lineLimit, Is.EqualTo None)
+                    Assert.That(byteLimit, Is.EqualTo(Some 2))
+                    Assert.That(totalBytes, Is.GreaterThan 2)
+                | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputStringAsync Error with combined line and byte caps trips OutputTooLarge``() : Task =
+        task {
+            let command =
+                threeLines
+                |> Command.outputBuffer (
+                    OutputBufferPolicy.Unbounded.WithMaxLines(2).WithMaxBytes(1_000_000).WithOverflow OverflowMode.Error
+                )
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match! running.OutputStringAsync() with
+                | Error(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, _)) ->
+                    Assert.That(lineLimit, Is.EqualTo(Some 2))
+                    Assert.That(byteLimit, Is.EqualTo(Some 1_000_000))
+                    Assert.That(totalLines, Is.GreaterThan 2)
+                | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
     [<Test>]
     member _.``OutputStringAsync bounds an empty-line flood under a byte cap alone (no MaxLines)``() : Task =
         task {
