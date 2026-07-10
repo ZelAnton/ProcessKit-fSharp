@@ -23,7 +23,7 @@ anything they spawned — as a single kernel operation.
 | `Mechanism` | Platform | How containment works |
 |---|---|---|
 | `Mechanism.JobObject` | Windows | A Job Object created with kill-on-close. Children are spawned suspended, assigned to the job, then resumed, so even a grandchild forked in the first instant is already contained. Teardown closes the job handle (`KILL_ON_JOB_CLOSE`) or terminates the job. |
-| `Mechanism.CgroupV2` | Linux (when resource limits are requested and a usable cgroup v2 root exists) | A private cgroup under the unified hierarchy. Each child is migrated into `cgroup.procs`; teardown is `cgroup.kill` followed by removing the cgroup directory. |
+| `Mechanism.CgroupV2` | Linux (when resource limits are requested and a usable cgroup v2 root exists) | A private cgroup under the unified hierarchy. Each child is launched through a small `/bin/sh` helper that joins the cgroup (writes its own pid to `cgroup.procs`) before `exec`ing the target in place, so the target is contained on its first instruction and a child it forks immediately inherits the limits; teardown is `cgroup.kill` followed by removing the cgroup directory. |
 | `Mechanism.ProcessGroup` | macOS/BSD, and the Linux default when no limits are requested | POSIX process groups. Each spawned child forms its own process-group id (pgid); teardown sends `SIGKILL` to the tracked pgids (`killpg`). |
 
 ### When each mechanism is chosen

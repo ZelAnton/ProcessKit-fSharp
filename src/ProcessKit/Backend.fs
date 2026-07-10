@@ -168,7 +168,9 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             task { Native.Windows.terminateWindowsJob jobHandle } :> Task
 
         member _.Members() =
-            Ok(Native.Windows.membersWindows jobHandle)
+            // `membersWindows` already returns a `Result` — it grows the buffer to the whole job and
+            // surfaces a genuine query failure as `ProcessError.Io` rather than a fabricated empty list.
+            Native.Windows.membersWindows jobHandle
 
         member _.Signal(signal) =
             match signal with
@@ -216,13 +218,9 @@ type internal JobObjectBackend(jobHandle: nativeint) =
                         $"signal {signal} on Windows (only Signal.Kill, and Signal.Int/Signal.Term to a child started with Command.WindowsCtrlSignals(), are deliverable)"
                 )
 
-        member _.Suspend() =
-            Native.Windows.suspendWindows jobHandle
-            Ok()
+        member _.Suspend() = Native.Windows.suspendWindows jobHandle
 
-        member _.Resume() =
-            Native.Windows.resumeWindows jobHandle
-            Ok()
+        member _.Resume() = Native.Windows.resumeWindows jobHandle
 
         member _.Stats() =
             match Native.Windows.jobStatsWindows jobHandle with
@@ -244,25 +242,31 @@ type internal CgroupBackend(cgroupPath: string) =
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.CgroupV2
-        member _.Spawn(command) = Native.Posix.spawnPosix command
+
+        member _.Spawn(command) =
+            // Spawn through the self-migrating cgroup launcher (a tiny `/bin/sh` that writes its own pid
+            // into this cgroup's cgroup.procs, then `exec`s the real program in place), so the target's
+            // pid is already a cgroup member before it runs a single instruction — closing the old
+            // spawn->migrate window where a descendant forked in that first instant could escape the
+            // limits. See `Native.Posix.spawnPosixIntoCgroup`. `Spawned.Handle` is the launcher pid,
+            // which becomes the target's pid unchanged across `exec`.
+            Native.Posix.spawnPosixIntoCgroup command (System.IO.Path.Combine(cgroupPath, "cgroup.procs"))
 
         member _.Track(spawned) =
             let pid = int spawned.Handle
             // Track the pid first so teardown can always reap it (cgroup.kill SIGKILLs but does not
-            // waitpid our own children), and so a concurrent HardRelease can see it even if migration
-            // then fails.
+            // waitpid our own children), and so a concurrent HardRelease can see it even if the
+            // migration confirmation then fails.
             children.Add pid
 
-            // Migrate the child into the cgroup by writing its pid to cgroup.procs. The child and every
-            // descendant it forks AFTER this write are subject to the cgroup's resource limits. There is
-            // an unavoidable spawn->migrate window: the child is already running (posix_spawn starts it
-            // immediately — there is no portable "start stopped" for posix_spawn), so any descendant it
-            // forks BEFORE this write completes is created in the PARENT cgroup and stays there —
-            // covered by kill-on-drop (the child is its own pgid leader, so teardown's killpg reaps that
-            // subtree) but NOT by the resource limits. On a migration FAILURE the child would run wholly
-            // outside the cgroup, so instead of the old silent downgrade we kill and reap it here (drop
-            // it from tracking, then killpg its group + reap the leader) and report an honest error,
-            // leaving no live, uncontained child behind.
+            // Confirm (and idempotently re-apply) the cgroup migration the launcher already performed
+            // in `Spawn`: the target starts already inside the cgroup, so this parent-side write to
+            // cgroup.procs is a confirmation whose real value is honest error classification (see
+            // `Native.Cgroup.migrateToCgroup` — a write success or an ESRCH on a fast-exited target is
+            // `Ok`; a genuine open/write failure means the cgroup could not be joined). On a genuine
+            // FAILURE the launcher's own self-migrate failed too, so the target never ran — but the
+            // launcher process itself is still ours to reap: drop it from tracking, then killpg its
+            // group + reap the leader, and report an honest error, leaving no live, uncontained child.
             match Native.Cgroup.migrateToCgroup cgroupPath pid with
             | Ok() -> Ok()
             | Error detail ->

@@ -9,6 +9,7 @@ open System.Threading.Tasks
 open NUnit.Framework
 open NUnit.Framework.Legacy
 open ProcessKit
+open ProcessKit.Native
 
 /// Deterministic Windows-only fault injection for `Native.Windows`'s `StdioMode.Inherit` path
 /// (`inheritableStdHandle` → `GetStdHandle`): `SetStdHandle` lets a test force `GetStdHandle` to
@@ -253,3 +254,139 @@ type WindowsOverlappedPipeTests() =
                 |> ignore
         }
         :> Task
+
+/// Deterministic fault injection at the Windows native containment boundary (`Native.Windows`): a forced
+/// `ResumeThread` failure on the CREATE_SUSPENDED spawn path, and the Job-Object member-list buffer
+/// growth / query-failure classification — all driven through the module's test seams so a genuinely
+/// failing WinAPI (which cannot be provoked on demand) and a job with thousands of members (which would
+/// otherwise need thousands of real processes) are exercised without touching production code.
+[<TestFixture>]
+type WindowsNativeContainmentFaultTests() =
+
+    let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+
+    [<Test>]
+    member _.``a forced ResumeThread failure terminates the suspended child and fails the spawn``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: exercises the CREATE_SUSPENDED -> ResumeThread spawn path"
+
+            // Real Job + real CreateProcessW (the child is created suspended and assigned to the job), but
+            // the resume is forced to return the (DWORD)-1 sentinel through the seam. The child therefore
+            // never runs; the fix must terminate it inside the job and fail the spawn, not hand back a
+            // handle to a process hung forever in the suspended state.
+            let job =
+                match Windows.createWindowsJob () with
+                | Ok job -> job
+                | Error error -> failwith $"createWindowsJob failed: {error}"
+
+            let original = Windows.resumeThreadHook
+            use proc = Process.GetCurrentProcess()
+
+            try
+                Windows.resumeThreadHook <- fun _ -> UInt32.MaxValue
+
+                let command =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/c"; "ping -n 30 127.0.0.1 >nul" ]
+                    |> Command.stdout StdioMode.Null
+                    |> Command.stderr StdioMode.Null
+
+                // 1) Honest failure, and the suspended child is terminated inside the job — not left
+                //    lingering. A terminated process leaves the job promptly, so poll the real member list
+                //    to empty rather than assume an instant.
+                match Windows.spawnWindows job command with
+                | Ok _ -> Assert.Fail "expected the forced ResumeThread failure to fail the spawn"
+                | Error(ProcessError.Spawn _) ->
+                    let mutable emptied = false
+                    let mutable attempts = 0
+
+                    while not emptied && attempts < 50 do
+                        match Windows.membersWindows job with
+                        | Ok [] -> emptied <- true
+                        | Ok _ ->
+                            attempts <- attempts + 1
+                            do! Task.Delay 40
+                        | Error error -> failwith $"membersWindows failed: {error}"
+
+                    Assert.That(emptied, Is.True, "the suspended child was left in the job instead of terminated")
+                | Error other -> Assert.Fail $"expected ProcessError.Spawn, got {other}"
+
+                // 2) Handles closed: repeating the failed spawn must not leak the child's process/thread or
+                //    stdio handles. Warm up once so the baseline is steady state, then assert the count is
+                //    stable across many forced-failure attempts — a per-attempt handle leak would grow it
+                //    roughly in step with the loop, which a generous absolute slack cannot mask.
+                match Windows.spawnWindows job command with
+                | Error(ProcessError.Spawn _) -> ()
+                | other -> Assert.Fail $"expected ProcessError.Spawn, got {other}"
+
+                proc.Refresh()
+                let baseline = proc.HandleCount
+
+                for _ in 1..40 do
+                    match Windows.spawnWindows job command with
+                    | Error(ProcessError.Spawn _) -> ()
+                    | other -> Assert.Fail $"expected ProcessError.Spawn, got {other}"
+
+                proc.Refresh()
+                let after = proc.HandleCount
+
+                Assert.That(
+                    after,
+                    Is.LessThan(baseline + 40),
+                    $"handle count grew from {baseline} to {after} across 40 forced ResumeThread failures \
+                      — the child's process/thread/stdio handles are leaking on the failure path"
+                )
+            finally
+                Windows.resumeThreadHook <- original
+                Windows.terminateWindowsJob job
+                Windows.closeWindowsHandle job
+        }
+        :> Task
+
+    [<Test>]
+    member _.``membersWindows grows its buffer past 1024 to return every job member``() =
+        // No real processes: the QueryInformationJobObject seam fabricates a job of `total` members — more
+        // than the initial 1024-pid buffer — so the grow-and-retry loop is what is under test. The first
+        // (too-small) query reports the true assigned count, driving the grow; the retry, now large enough,
+        // returns the full list. Deterministic and OS-independent (the seam replaces the only native call).
+        let total = 3000
+        let original = Windows.queryInformationJobObjectHook
+
+        try
+            Windows.queryInformationJobObjectHook <-
+                fun _job _infoClass buffer bufferSize ->
+                    let capacity = (int bufferSize - 8) / IntPtr.Size
+                    Marshal.WriteInt32(buffer, 0, total) // NumberOfAssignedProcesses (the true count)
+                    let fit = min total capacity
+                    Marshal.WriteInt32(buffer, 4, fit) // NumberOfProcessIdsInList (what this buffer holds)
+
+                    for i in 0 .. fit - 1 do
+                        Marshal.WriteIntPtr(buffer, 8 + i * IntPtr.Size, nativeint (1000 + i))
+
+                    struct (true, 0)
+
+            match Windows.membersWindows IntPtr.Zero with
+            | Ok pids ->
+                Assert.That(pids.Length, Is.EqualTo total, "the grow-and-retry loop dropped members")
+                CollectionAssert.AreEqual([ for i in 0 .. total - 1 -> 1000 + i ], pids)
+            | Error error -> Assert.Fail $"expected the full member list, got {error}"
+        finally
+            Windows.queryInformationJobObjectHook <- original
+
+    [<Test>]
+    member _.``membersWindows surfaces a genuine query failure as ProcessError.Io``() =
+        // A real API failure (not a too-small buffer): the seam returns FALSE with a last-error that is NOT
+        // the ERROR_MORE_DATA (234) overflow signal, so it must become a typed ProcessError.Io rather than
+        // a silent empty list that would let Members/Suspend/Resume claim a false success.
+        let original = Windows.queryInformationJobObjectHook
+
+        try
+            // ERROR_ACCESS_DENIED (5): an honest failure, distinct from the overflow signal that retries.
+            Windows.queryInformationJobObjectHook <- fun _ _ _ _ -> struct (false, 5)
+
+            match Windows.membersWindows IntPtr.Zero with
+            | Error(ProcessError.Io _) -> ()
+            | other -> Assert.Fail $"expected Error(ProcessError.Io), got {other}"
+        finally
+            Windows.queryInformationJobObjectHook <- original
