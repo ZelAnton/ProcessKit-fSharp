@@ -8,11 +8,55 @@ open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
 
+/// A zero-cost stand-in for a pidfd used by the identity-safe delivery seam tests below:
+/// `Native.Cgroup.deliverIdentitySafe` is generic over the pin handle, so a test pins with this token
+/// instead of a real file descriptor.
+type private FakePidfd = FakeHandle
+
 [<TestFixture>]
 type LimitsTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
     let isMacOs = RuntimeInformation.IsOSPlatform OSPlatform.OSX
+    let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
+
+    // POSIX errno numbers the identity-safe delivery seam tests inject through the syscall closures.
+    let ESRCH = 3
+    let ENOSYS = 38
+    let EPERM = 1
+
+    // Probe whether this kernel/sandbox actually exposes pidfd_open, by pinning our own pid; the
+    // real-pidfd integration tests below skip (rather than false-fail) when it does not. This is the
+    // signal path's true requirement (pidfd_open + pidfd_send_signal), which is looser than the wait
+    // path's `Native.Posix.pidfdActive` (that also needs waitid(P_PIDFD), Linux 5.4+).
+    let pidfdAvailable () =
+        match Native.Posix.pidfdOpenChecked Environment.ProcessId with
+        | Ok fd ->
+            Native.Posix.closePidfd fd
+            true
+        | Error _ -> false
+
+    // A real, long-lived child to pin: `sleep` is POSIX-standard and does not trap SIGTERM, so a
+    // delivered SIGTERM kills it.
+    let spawnSleeper () : System.Diagnostics.Process =
+        let psi = System.Diagnostics.ProcessStartInfo("sleep", "30")
+        psi.UseShellExecute <- false
+
+        match System.Diagnostics.Process.Start psi with
+        | null -> failwith "Process.Start returned null spawning `sleep 30`"
+        | proc -> proc
+
+    // Ensure a spawned sleeper is killed and reaped however a test concluded.
+    let killAndReap (child: System.Diagnostics.Process) =
+        (try
+            if not child.HasExited then
+                child.Kill()
+                child.WaitForExit()
+         with :? InvalidOperationException ->
+             // The child already exited/was reaped between the HasExited check and Kill — nothing to do.
+             ())
+
+        child.Dispose()
 
     let shell (script: string) =
         if isWindows then
@@ -397,3 +441,283 @@ type LimitsTests() =
                         ()
         }
         :> Task
+
+    // ---- identity-safe per-member delivery (Native.Cgroup.deliverIdentitySafe) ----
+    //
+    // These drive the pin -> reconfirm-membership -> send decision logic through injected syscall
+    // closures, so the pid-reuse race is exercised deterministically without a real pidfd or cgroup —
+    // and are platform-independent (they never touch a real syscall). The production
+    // signalCgroup/terminateCgroup wire the same primitive to the real
+    // pidfdOpenChecked/pidfdSendSignalChecked; the real-pidfd tests further down cover that live path.
+
+    [<Test>]
+    member _.``deliverIdentitySafe skips a pinned pid that is no longer a cgroup member (recycled outside)``() =
+        // The pin succeeds, but by the time membership is reconfirmed the original member has exited and
+        // its pid was recycled by a process OUTSIDE the cgroup, so `stillMember` reports false. The
+        // primitive must skip and never call `send` — the core pid-reuse safety this task adds.
+        let mutable sent = false
+        let mutable closed = false
+
+        let outcome =
+            Native.Cgroup.deliverIdentitySafe
+                1234
+                Native.Posix.SIGTERM
+                (fun _ -> Ok FakeHandle)
+                (fun _ -> Ok false)
+                (fun _ _ ->
+                    sent <- true
+                    Ok())
+                (fun _ -> closed <- true)
+
+        match outcome with
+        | Native.Cgroup.Delivery.Skipped -> ()
+        | other -> Assert.Fail $"expected Skipped, got {other}"
+
+        Assert.That(sent, Is.False, "a pid recycled outside the cgroup must never be signalled")
+        Assert.That(closed, Is.True, "the pin must be released even when delivery is skipped")
+
+    [<Test>]
+    member _.``deliverIdentitySafe delivers the requested signal to a confirmed member``() =
+        let mutable sentSignal = None
+        let mutable closed = false
+
+        let outcome =
+            Native.Cgroup.deliverIdentitySafe
+                42
+                Native.Posix.SIGTERM
+                (fun _ -> Ok FakeHandle)
+                (fun _ -> Ok true)
+                (fun _ signalNum ->
+                    sentSignal <- Some signalNum
+                    Ok())
+                (fun _ -> closed <- true)
+
+        match outcome with
+        | Native.Cgroup.Delivery.Delivered -> ()
+        | other -> Assert.Fail $"expected Delivered, got {other}"
+
+        Assert.That(
+            sentSignal,
+            Is.EqualTo(Some Native.Posix.SIGTERM),
+            "the requested signal reaches a confirmed member"
+        )
+
+        Assert.That(closed, Is.True, "the pin must be released after a delivery")
+
+    [<Test>]
+    member _.``deliverIdentitySafe treats a member gone before the pin as a benign no-op``() =
+        // openPin (pidfd_open) fails ESRCH: the member exited before it could be pinned. Benign — the
+        // intended end state (gone) already holds — and membership is not even consulted, nor is send.
+        let mutable membershipChecked = false
+        let mutable sent = false
+
+        let outcome =
+            Native.Cgroup.deliverIdentitySafe
+                7
+                Native.Posix.SIGTERM
+                (fun _ -> Error ESRCH)
+                (fun _ ->
+                    membershipChecked <- true
+                    Ok true)
+                (fun _ _ ->
+                    sent <- true
+                    Ok())
+                ignore
+
+        match outcome with
+        | Native.Cgroup.Delivery.Delivered -> ()
+        | other -> Assert.Fail $"expected Delivered, got {other}"
+
+        Assert.That(membershipChecked, Is.False, "membership must not be checked once the pin fails ESRCH")
+        Assert.That(sent, Is.False)
+
+    [<Test>]
+    member _.``deliverIdentitySafe fails safe (no raw kill) when the kernel lacks pidfd``() =
+        // openPin fails ENOSYS (kernel < 5.3 / seccomp): the primitive must surface an honest failure,
+        // NOT silently fall back to a racy raw kill by pid number.
+        let mutable sent = false
+
+        let outcome =
+            Native.Cgroup.deliverIdentitySafe
+                7
+                Native.Posix.SIGTERM
+                (fun _ -> Error ENOSYS)
+                (fun _ -> Ok true)
+                (fun _ _ ->
+                    sent <- true
+                    Ok())
+                ignore
+
+        match outcome with
+        | Native.Cgroup.Delivery.Failed(errno, message) ->
+            Assert.That(errno, Is.EqualTo ENOSYS)
+            Assert.That(message, Does.Contain "pidfd")
+        | other -> Assert.Fail $"a kernel without pidfd must fail safe, not signal; got {other}"
+
+        Assert.That(sent, Is.False, "fail-safe must not send any signal")
+
+    [<Test>]
+    member _.``deliverIdentitySafe fails safe without sending when membership is unreadable``() =
+        // Reconfirming membership fails (e.g. EACCES on cgroup.procs): unknown membership must not be
+        // signalled — fail safe, surface the error, no send.
+        let mutable sent = false
+
+        let outcome =
+            Native.Cgroup.deliverIdentitySafe
+                7
+                Native.Posix.SIGTERM
+                (fun _ -> Ok FakeHandle)
+                (fun _ -> Error "cgroup.procs unreadable (EACCES)")
+                (fun _ _ ->
+                    sent <- true
+                    Ok())
+                ignore
+
+        match outcome with
+        | Native.Cgroup.Delivery.Failed(_, message) -> Assert.That(message, Does.Contain "unreadable")
+        | other -> Assert.Fail $"an unreadable membership must fail safe; got {other}"
+
+        Assert.That(sent, Is.False)
+
+    [<Test>]
+    member _.``deliverIdentitySafe treats an ESRCH on send (pinned target exited) as benign``() =
+        // Membership is confirmed, but the pinned task exits before the send, so send returns ESRCH. The
+        // pidfd guarantees that ESRCH is our own target's exit (never a recycled pid), so it is benign.
+        let outcome =
+            Native.Cgroup.deliverIdentitySafe
+                7
+                Native.Posix.SIGTERM
+                (fun _ -> Ok FakeHandle)
+                (fun _ -> Ok true)
+                (fun _ _ -> Error ESRCH)
+                ignore
+
+        match outcome with
+        | Native.Cgroup.Delivery.Delivered -> ()
+        | other -> Assert.Fail $"a pinned target's own exit (ESRCH on send) is benign; got {other}"
+
+    [<Test>]
+    member _.``deliverIdentitySafe surfaces a real EPERM delivery failure``() =
+        // A confirmed member that changed uid (or a seccomp/container policy) rejects the signal with
+        // EPERM — a real delivery failure that must not read as success.
+        let outcome =
+            Native.Cgroup.deliverIdentitySafe
+                7
+                Native.Posix.SIGTERM
+                (fun _ -> Ok FakeHandle)
+                (fun _ -> Ok true)
+                (fun _ _ -> Error EPERM)
+                ignore
+
+        match outcome with
+        | Native.Cgroup.Delivery.Failed(errno, _) -> Assert.That(errno, Is.EqualTo EPERM)
+        | other -> Assert.Fail $"EPERM is a real delivery failure and must surface; got {other}"
+
+    // ---- the real pidfd mechanism (Native.Posix.pidfdOpenChecked / pidfdSendSignalChecked) ----
+    //
+    // Linux integration coverage driving the ACTUAL pidfd syscalls against real child processes (no
+    // cgroup mount needed), skipping — rather than failing — where the kernel lacks pidfd. Complements
+    // the deterministic seam tests above.
+
+    [<Test>]
+    member _.``pidfd pins a child's identity and reports its exit as ESRCH, never a recycled pid``() =
+        if not isLinux then
+            Assert.Ignore "pidfd (pidfd_open/pidfd_send_signal) is Linux-only"
+        elif not (pidfdAvailable ()) then
+            Assert.Ignore "pidfd_open unavailable on this kernel/sandbox"
+        else
+            let child = spawnSleeper ()
+
+            try
+                let fd =
+                    match Native.Posix.pidfdOpenChecked child.Id with
+                    | Ok fd -> fd
+                    | Error errno -> failwith $"pidfd_open on a live child failed (errno {errno})"
+
+                try
+                    // Signal 0 is a pure existence/permission probe: the child is alive, so Ok.
+                    match Native.Posix.pidfdSendSignalChecked fd 0 with
+                    | Ok() -> ()
+                    | Error errno -> Assert.Fail $"null-signalling a live pinned child failed (errno {errno})"
+
+                    // Kill and reap, then the pinned fd must report the task gone (ESRCH). It can NEVER be
+                    // revived by a process that later recycles the pid — the whole point of pinning by pidfd.
+                    child.Kill()
+                    child.WaitForExit()
+
+                    match Native.Posix.pidfdSendSignalChecked fd 0 with
+                    | Error e when e = ESRCH -> ()
+                    | Ok() -> Assert.Fail "a reaped, pinned task must not be signallable"
+                    | Error errno -> Assert.Fail $"expected ESRCH for a reaped pinned task, got errno {errno}"
+                finally
+                    Native.Posix.closePidfd fd
+            finally
+                killAndReap child
+
+    [<Test>]
+    member _.``the real pidfd primitive skips (never signals) a live non-member``() =
+        if not isLinux then
+            Assert.Ignore "pidfd is Linux-only"
+        elif not (pidfdAvailable ()) then
+            Assert.Ignore "pidfd_open unavailable on this kernel/sandbox"
+        else
+            let child = spawnSleeper ()
+
+            try
+                // Real pidfd_open/pidfd_send_signal, but the membership reconfirm reports "not a member"
+                // (modelling a pid recycled by a process outside the cgroup). The primitive must skip: the
+                // would-be-fatal SIGKILL is never sent, so the child stays alive.
+                let outcome =
+                    Native.Cgroup.deliverIdentitySafe
+                        child.Id
+                        Native.Posix.SIGKILL
+                        Native.Posix.pidfdOpenChecked
+                        (fun _ -> Ok false)
+                        Native.Posix.pidfdSendSignalChecked
+                        Native.Posix.closePidfd
+
+                match outcome with
+                | Native.Cgroup.Delivery.Skipped -> ()
+                | other -> Assert.Fail $"a live non-member must be skipped, got {other}"
+
+                Assert.That(
+                    child.HasExited,
+                    Is.False,
+                    "a non-member must receive no signal — the live child is untouched"
+                )
+            finally
+                killAndReap child
+
+    [<Test>]
+    member _.``the real pidfd primitive delivers to a confirmed live member``() =
+        if not isLinux then
+            Assert.Ignore "pidfd is Linux-only"
+        elif not (pidfdAvailable ()) then
+            Assert.Ignore "pidfd_open unavailable on this kernel/sandbox"
+        else
+            let child = spawnSleeper ()
+
+            try
+                // Confirmed member + real syscalls: SIGTERM is delivered and the sleeper, which does not
+                // trap SIGTERM, exits. Proves the real pidfd send path works end to end, not just the
+                // fail-safe branches.
+                let outcome =
+                    Native.Cgroup.deliverIdentitySafe
+                        child.Id
+                        Native.Posix.SIGTERM
+                        Native.Posix.pidfdOpenChecked
+                        (fun _ -> Ok true)
+                        Native.Posix.pidfdSendSignalChecked
+                        Native.Posix.closePidfd
+
+                match outcome with
+                | Native.Cgroup.Delivery.Delivered -> ()
+                | other -> Assert.Fail $"a confirmed live member must be delivered to, got {other}"
+
+                Assert.That(
+                    child.WaitForExit 5000,
+                    Is.True,
+                    "the sleeper must exit on the SIGTERM delivered through the pidfd"
+                )
+            finally
+                killAndReap child

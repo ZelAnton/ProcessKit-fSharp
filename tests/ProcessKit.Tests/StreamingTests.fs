@@ -48,6 +48,38 @@ module private DevNullExhaustion =
     [<Literal>]
     let O_RDONLY = 0
 
+/// A stdout/stderr double whose read yields `chunks` (if any), in order, then throws `fault` on the
+/// next read — the `RunningProcess`-level analogue of `PumpTests.fs`'s `ErroringReadStream` (T-087),
+/// used to prove a genuine mid-stream OS read fault surfaces as `ProcessError.Io` from the
+/// completion verbs (`OutputStringAsync`/`WaitAsync`/`ProfileAsync`/`FinishAsync`) instead of a
+/// silently truncated capture.
+type private ErroringStream(chunks: byte[] list, fault: exn) =
+    inherit Stream()
+    let mutable remaining = chunks
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = ()
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) : int = raise (NotSupportedException())
+
+    override _.ReadAsync(buffer: Memory<byte>, _cancellationToken: CancellationToken) : ValueTask<int> =
+        match remaining with
+        | chunk :: rest ->
+            remaining <- rest
+            chunk.AsSpan().CopyTo(buffer.Span)
+            ValueTask<int>(chunk.Length)
+        | [] -> raise fault
+
 [<TestFixture>]
 type StreamingTests() =
 
@@ -158,6 +190,30 @@ type StreamingTests() =
               Pid = None
               Stdout = Some stdout
               Stderr = None
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = Stopwatch.GetTimestamp()
+              Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+              StdinError = fun () -> None
+              StartKill = ignore
+              GracefulKill = fun _ -> Task.CompletedTask
+              Teardown = fun () -> ValueTask() }
+
+        new RunningProcess(host)
+
+    // Like `syntheticStdoutProcess`, but over caller-supplied stdout/stderr streams instead of a
+    // fixed in-memory payload — used by the T-087 read-fault tests below to inject an `ErroringStream`
+    // that throws a genuine OS-level read error partway through.
+    let syntheticProcessOverStreams
+        (config: CommandConfig)
+        (stdout: Stream option)
+        (stderr: Stream option)
+        : RunningProcess =
+        let host: RunningHost =
+            { Config = config
+              Pid = None
+              Stdout = stdout
+              Stderr = stderr
               Stdin = None
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
@@ -1226,6 +1282,107 @@ type StreamingTests() =
             match error with
             | Some(ProcessError.OutputTooLarge _) -> Assert.Pass()
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    // --- T-087: a genuine mid-stream stdout/stderr read fault surfaces as ProcessError.Io ---
+
+    [<Test>]
+    member _.``OutputStringAsync surfaces a genuine stdout read fault as ProcessError.Io``() : Task =
+        task {
+            let fault = IOException "disk read error"
+            use stdout = new ErroringStream([ Encoding.UTF8.GetBytes "line1\n" ], fault)
+            let config = (Command.create "test").Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            try
+                let! _ = running.OutputStringAsync()
+                Assert.Fail "expected a genuine read fault to surface"
+            with :? ProcessException as pe ->
+                match pe.Error with
+                | ProcessError.Io _ -> ()
+                | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputStringAsync surfaces a genuine stderr read fault as ProcessError.Io``() : Task =
+        task {
+            let fault = IOException "disk read error"
+            use stderr = new ErroringStream([ Encoding.UTF8.GetBytes "line1\n" ], fault)
+            let config = (Command.create "test").Config
+            use running = syntheticProcessOverStreams config None (Some(stderr :> Stream))
+
+            try
+                let! _ = running.OutputStringAsync()
+                Assert.Fail "expected a genuine read fault to surface"
+            with :? ProcessException as pe ->
+                match pe.Error with
+                | ProcessError.Io _ -> ()
+                | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitAsync surfaces a genuine stdout read fault as ProcessError.Io``() : Task =
+        task {
+            let fault = IOException "disk read error"
+            use stdout = new ErroringStream([ Encoding.UTF8.GetBytes "line1\n" ], fault)
+            let config = (Command.create "test").Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            try
+                let! _ = running.WaitAsync()
+                Assert.Fail "expected a genuine read fault to surface"
+            with :? ProcessException as pe ->
+                match pe.Error with
+                | ProcessError.Io _ -> ()
+                | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ProfileAsync surfaces a genuine stdout read fault as ProcessError.Io``() : Task =
+        task {
+            let fault = IOException "disk read error"
+            use stdout = new ErroringStream([ Encoding.UTF8.GetBytes "line1\n" ], fault)
+            let config = (Command.create "test").Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            try
+                let! _ = running.ProfileAsync()
+                Assert.Fail "expected a genuine read fault to surface"
+            with :? ProcessException as pe ->
+                match pe.Error with
+                | ProcessError.Io _ -> ()
+                | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``FinishAsync surfaces a genuine stdout read fault as ProcessError.Io, faulting StdoutLinesAsync too``
+        ()
+        : Task =
+        task {
+            let fault = IOException "disk read error"
+            use stdout = new ErroringStream([ Encoding.UTF8.GetBytes "line1\n" ], fault)
+            let config = (Command.create "test").Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            let! drain = drainWithDeadline (running.StdoutLinesAsync()) 5000
+            let! streamError = processError drain
+
+            match streamError with
+            | Some(ProcessError.Io _) -> ()
+            | other -> Assert.Fail $"expected the streaming enumerator to fault with ProcessError.Io, got {other}"
+
+            try
+                let! _ = running.FinishAsync()
+                Assert.Fail "expected FinishAsync to surface the same genuine read fault"
+            with :? ProcessException as pe ->
+                match pe.Error with
+                | ProcessError.Io _ -> ()
+                | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
         }
         :> Task
 
