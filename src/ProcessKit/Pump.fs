@@ -317,6 +317,33 @@ module internal Pump =
                                 line.Clear() |> ignore
                                 pos <- newlineIndex + 1
 
+                let flushedChars = decoder.GetChars(byteBuffer, 0, 0, charBuffer, 0, true)
+                let mutable flushedPos = consumeBom flushedChars
+
+                while flushedPos < flushedChars do
+                    let newlineIndex =
+                        Array.IndexOf(charBuffer, '\n', flushedPos, flushedChars - flushedPos)
+
+                    let runEnd = if newlineIndex >= 0 then newlineIndex else flushedChars
+
+                    match maxLineLength with
+                    | None ->
+                        if runEnd > flushedPos then
+                            line.Append(charBuffer, flushedPos, runEnd - flushedPos) |> ignore
+
+                        flushedPos <- runEnd
+                    | Some cap ->
+                        do! appendCapped line charBuffer flushedPos runEnd cap onLine
+                        flushedPos <- runEnd
+
+                    if newlineIndex >= 0 then
+                        if line.Length > 0 && line[line.Length - 1] = '\r' then
+                            line.Length <- line.Length - 1
+
+                        do! onLine (line.ToString())
+                        line.Clear() |> ignore
+                        flushedPos <- newlineIndex + 1
+
                 if line.Length > 0 then
                     if line[line.Length - 1] = '\r' then
                         line.Length <- line.Length - 1
@@ -434,6 +461,48 @@ module internal Pump =
                     else
                         // Content under `CrLf` — keep the trailing '\r' on the final line.
                         do! appendChar '\r'
+
+                    pendingCr <- false
+
+                let flushedChars = decoder.GetChars(byteBuffer, 0, 0, charBuffer, 0, true)
+                let mutable flushedPos = consumeBom flushedChars
+
+                while flushedPos < flushedChars do
+                    if pendingCr then
+                        if charBuffer[flushedPos] = '\n' then
+                            do! emitLine ()
+                            flushedPos <- flushedPos + 1
+                        elif crSplits then
+                            do! emitLine ()
+                        else
+                            do! appendChar '\r'
+
+                        pendingCr <- false
+                    else
+                        let crIndex = Array.IndexOf(charBuffer, '\r', flushedPos, flushedChars - flushedPos)
+                        let lfIndex = Array.IndexOf(charBuffer, '\n', flushedPos, flushedChars - flushedPos)
+
+                        let sigIndex =
+                            match crIndex, lfIndex with
+                            | -1, -1 -> -1
+                            | -1, n -> n
+                            | r, -1 -> r
+                            | r, n -> min r n
+
+                        let runEnd = if sigIndex >= 0 then sigIndex else flushedChars
+                        do! appendRun flushedPos runEnd
+
+                        if sigIndex < 0 then
+                            flushedPos <- flushedChars
+                        elif charBuffer[sigIndex] = '\n' then
+                            if lfSplits then do! emitLine () else do! appendChar '\n'
+                            flushedPos <- sigIndex + 1
+                        else
+                            pendingCr <- true
+                            flushedPos <- sigIndex + 1
+
+                if pendingCr then
+                    if crSplits then do! emitLine () else do! appendChar '\r'
 
                 if line.Length > 0 then
                     do! onLine (line.ToString())

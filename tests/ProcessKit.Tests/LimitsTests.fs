@@ -62,6 +62,45 @@ type LimitsTests() =
         |> ignore
 
     [<Test>]
+    member _.``ResourceLimits.WithCpuQuota rejects infinities and a value that would overflow the cgroup quota``() =
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithCpuQuota Double.PositiveInfinity |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithCpuQuota Double.NegativeInfinity |> ignore)
+        )
+        |> ignore
+
+        // Native.Cgroup.cpuMaxValue rounds cores * 100_000 (microseconds) into an int64; a value that
+        // makes that product reach or exceed Int64.MaxValue must be rejected up front, uniformly, rather
+        // than only failing later and only on the Linux cgroup backend.
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithCpuQuota 1e20 |> ignore)
+        )
+        |> ignore
+
+        // A large-but-safe value (well under the overflow boundary) is still accepted.
+        let accepted = ResourceLimits.None.WithCpuQuota 1_000_000.0
+        Assert.That(accepted.CpuQuota, Is.EqualTo(Some 1_000_000.0))
+
+    [<Test>]
+    member _.``ProcessGroupOptions.WithCpuQuota rejects the same invalid values as ResourceLimits``() =
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ProcessGroupOptions().WithCpuQuota Double.PositiveInfinity |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ProcessGroupOptions().WithCpuQuota 1e20 |> ignore)
+        )
+        |> ignore
+
+        let accepted = ProcessGroupOptions().WithCpuQuota 2.0
+        Assert.That(accepted.Limits.CpuQuota, Is.EqualTo(Some 2.0))
+
+    [<Test>]
     member _.``ProcessGroupOptions.WithShutdownTimeout rejects a negative window but accepts zero``() =
         ProcessGroupOptions().WithShutdownTimeout TimeSpan.Zero |> ignore
 
@@ -241,6 +280,28 @@ type LimitsTests() =
         :> Task
 
     [<Test>]
+    member _.``migrateToCgroup writes the pid and reports success on a writable cgroup.procs``() =
+        if isWindows then
+            Assert.Ignore "the cgroup migration write is a POSIX libc (open/write/close) path"
+        else
+            // Exercise the raw open/write/close SUCCESS path deterministically without needing cgroup
+            // root: point migrateToCgroup at a writable regular file standing in for cgroup.procs (the
+            // function only does open(O_WRONLY) + write(pid) + close on it). The missing/unwritable
+            // target — the ENOENT branch — is already covered by the failure-injection tests above.
+            let dir = Directory.CreateTempSubdirectory("pk-procs-").FullName
+
+            try
+                let procs = Path.Combine(dir, "cgroup.procs")
+                File.WriteAllText(procs, "")
+
+                match Native.Cgroup.migrateToCgroup dir 12345 with
+                | Ok() -> Assert.That(File.ReadAllText procs, Does.Contain "12345")
+                | Error detail ->
+                    Assert.Fail $"expected Ok writing a pid to a writable cgroup.procs stand-in, got: {detail}"
+            finally
+                Directory.Delete(dir, true)
+
+    [<Test>]
     member _.``the cgroup mechanism drives the control verbs``() : Task =
         task {
             if isWindows || isMacOs then
@@ -278,6 +339,62 @@ type LimitsTests() =
                         match group.Resume() with
                         | Ok() -> ()
                         | Error error -> Assert.Fail $"resume: {error}"
+
+                        running.Kill()
+                        let! _ = running.WaitAsync()
+                        ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a cgroup target and a child it forks immediately are both cgroup members``() : Task =
+        task {
+            if isWindows || isMacOs then
+                Assert.Ignore "cgroup v2 is Linux-only"
+            else
+                // The window this closes: the target must be inside its cgroup BEFORE it runs, so a
+                // descendant it forks in its very first instant inherits the cgroup (and its limits)
+                // rather than being created in the parent cgroup. The self-migrating launcher guarantees
+                // this — the target's pid is a cgroup member before a single instruction of it runs — so
+                // a target that forks a child as its first action has BOTH itself and that child listed
+                // in cgroup.procs. (This can only be exercised where cgroup enforcement is real: the
+                // privileged CI leg at the cgroup root; otherwise it fails fast and is ignored.)
+                let options =
+                    ProcessGroupOptions().WithMaxProcesses(64).WithMemoryMax(256L * 1024L * 1024L)
+
+                match ProcessGroup.Create options with
+                | Error(ProcessError.ResourceLimit _) ->
+                    Assert.Ignore "cgroup v2 limits not enforceable here (not at the real cgroup root)"
+                | Error other -> Assert.Fail $"{other}"
+                | Ok group ->
+                    use group = group
+                    Assert.That(group.Mechanism, Is.EqualTo Mechanism.CgroupV2)
+
+                    // A target that forks a child as its first action, then both sleep so both stay
+                    // observable. With the spawn-into-cgroup launcher the target starts already inside
+                    // the cgroup, so the immediately-forked child inherits it — both appear in
+                    // cgroup.procs.
+                    match! group.StartAsync(shell "sleep 30 & sleep 30") with
+                    | Error error -> Assert.Fail $"{error}"
+                    | Ok running ->
+                        // Poll briefly for both processes to show up as cgroup members.
+                        let mutable memberCount = 0
+                        let mutable attempts = 0
+
+                        while memberCount < 2 && attempts < 200 do
+                            match group.Members() with
+                            | Ok m -> memberCount <- m.Count
+                            | Error e -> Assert.Fail $"members: {e}"
+
+                            if memberCount < 2 then
+                                do! Task.Delay 20
+                                attempts <- attempts + 1
+
+                        Assert.That(
+                            memberCount,
+                            Is.GreaterThanOrEqualTo 2,
+                            "the target and the child it forked immediately should both be cgroup members (the spawn-to-migrate window is closed)"
+                        )
 
                         running.Kill()
                         let! _ = running.WaitAsync()

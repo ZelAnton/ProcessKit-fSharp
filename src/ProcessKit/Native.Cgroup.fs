@@ -3,6 +3,7 @@ namespace ProcessKit.Native
 open ProcessKit
 open System
 open System.IO
+open System.Runtime.InteropServices
 open ProcessKit.Native.Common
 open ProcessKit.Native.Posix
 
@@ -131,17 +132,66 @@ module internal Cgroup =
             with ex ->
                 Error ex.Message
 
-    /// Migrate a process into the cgroup (a single write to `cgroup.procs`). Returns the write's
-    /// failure detail on `Error` instead of swallowing it: a failure would otherwise leave the child
-    /// running in the parent cgroup, entirely outside the requested limits. The caller
-    /// (`CgroupBackend.Track`) turns that `Error` into an honest spawn failure — killing and reaping
-    /// the child — rather than silently downgrading to an unconstrained run.
+    // Raw libc for the cgroup.procs write. Done via `open`/`write`/`close` rather than
+    // `File.WriteAllText` so the exact errno is available (`Marshal.GetLastWin32Error`), which is what
+    // lets `migrateToCgroup` tell a genuine failure (ENOENT/EACCES on OPEN) apart from a fast target
+    // that has already exited (ESRCH on WRITE) — a distinction .NET's exception types blur.
+    [<Literal>]
+    let private O_WRONLY = 1
+
+    // errno: the pid written to cgroup.procs no longer exists. Only reachable on the WRITE (open of a
+    // valid cgroup.procs succeeds first), i.e. the launcher already migrated and a fast target exited.
+    [<Literal>]
+    let private ESRCH = 3
+
+    [<DllImport("libc", SetLastError = true, EntryPoint = "open", CharSet = CharSet.Ansi)>]
+    extern int private openWrite(string path, int flags)
+
+    [<DllImport("libc", SetLastError = true, EntryPoint = "write")>]
+    extern nativeint private writeAll(int fd, byte[] buffer, nativeint count)
+
+    [<DllImport("libc", SetLastError = true, EntryPoint = "close")>]
+    extern int private closeFd(int fd)
+
+    /// Confirm the child was placed into the cgroup, and belt-and-suspenders migrate it. The `/bin/sh`
+    /// launcher (`Native.Posix.spawnPosixIntoCgroup`) already writes the child's own pid into
+    /// `cgroup.procs` before it `exec`s the target, so the target starts already contained; this parent
+    /// write is an idempotent confirmation whose real value is honest error classification:
+    ///
+    ///  * write succeeds → the pid is in the cgroup (migrated & confirmed) → `Ok`.
+    ///  * ESRCH on write → the cgroup opened fine but the pid is gone → the launcher already migrated it
+    ///    and a fast target exited before this write landed (a self-write of `$$` can never ESRCH in the
+    ///    launcher, so a writable cgroup means the launcher's migration succeeded) → `Ok`.
+    ///  * open fails (missing/unwritable cgroup) or any other write error → a genuine failure the
+    ///    launcher hit too, so the target never ran → `Error`.
+    ///
+    /// The caller (`CgroupBackend.Track`) turns an `Error` into an honest spawn failure — killing and
+    /// reaping the launcher/target — rather than silently downgrading to an unconstrained run.
     let migrateToCgroup (cgroupPath: string) (pid: int) : Result<unit, string> =
-        try
-            File.WriteAllText(Path.Combine(cgroupPath, "cgroup.procs"), string pid)
-            Ok()
-        with ex ->
-            Error ex.Message
+        let procs = Path.Combine(cgroupPath, "cgroup.procs")
+        let fd = openWrite (procs, O_WRONLY)
+
+        if fd < 0 then
+            let errno = Marshal.GetLastWin32Error()
+            Error $"could not open {procs} for the cgroup migration write (errno {errno})"
+        else
+            try
+                let payload = System.Text.Encoding.ASCII.GetBytes(string pid)
+                let written = writeAll (fd, payload, nativeint payload.Length)
+
+                if written >= 0n then
+                    Ok()
+                else
+                    let errno = Marshal.GetLastWin32Error()
+
+                    if errno = ESRCH then
+                        // The launcher already placed the process in the cgroup and a fast target exited
+                        // before this confirmation write; the target ran inside the cgroup, not a failure.
+                        Ok()
+                    else
+                        Error $"writing pid {pid} to {procs} failed (errno {errno})"
+            finally
+                closeFd fd |> ignore
 
     /// The live member pids of a cgroup (`cgroup.procs`).
     let cgroupMembers (cgroupPath: string) : int list =

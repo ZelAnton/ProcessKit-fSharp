@@ -148,14 +148,34 @@ module internal CommandConfig =
           Logger = None
           RunId = None }
 
-    /// Validate an environment-variable key for `Command.Env`/`Command.EnvRemove`: must be non-empty
-    /// and must not contain `=` (an env var name can never contain one; a key that did would corrupt
-    /// the child's environment block, since `KEY=VALUE` is the wire format on every platform).
+    /// Reject a string carrying an embedded NUL (`'\000'`) at the `Command`/`CommandConfig` builder
+    /// boundary. POSIX argv/environment marshalling treats a NUL byte as the end of a string (or, for
+    /// a raw pointer, the end of the whole array), and the Windows command-line / environment-block
+    /// encodings truncate at the first embedded NUL — so a string that reached the native layer with
+    /// one inside could silently run (or observe) something other than what was actually requested.
+    /// Checked once, here, before dispatch to either backend (`Native.Posix`/`Native.Windows`), so the
+    /// rejection is identical regardless of which one ends up spawning. `paramName` names the actual
+    /// offending public parameter/element (`program`, `Args[2]`, `cwd`, an env key or value, …) so the
+    /// exception points straight at the culprit.
+    let rejectEmbeddedNul (paramName: string) (value: string) =
+        if value.Contains '\000' then
+            raise (ArgumentException($"{paramName} must not contain an embedded NUL character ('\\0')", paramName))
+
+    /// Validate an environment-variable key for `Command.Env`/`Command.EnvRemove`: must be non-empty,
+    /// must not contain `=` (an env var name can never contain one; a key that did would corrupt the
+    /// child's environment block, since `KEY=VALUE` is the wire format on every platform), and must not
+    /// contain an embedded NUL (see `rejectEmbeddedNul`).
     let validateEnvKey (key: string) =
         if key.Length = 0 then
             raise (ArgumentException("an environment variable key must not be empty", nameof key))
         elif key.Contains '=' then
             raise (ArgumentException("an environment variable key must not contain '='", nameof key))
+        else
+            rejectEmbeddedNul (nameof key) key
+
+    /// Validate an environment-variable value for `Command.Env`: must not contain an embedded NUL (see
+    /// `rejectEmbeddedNul`). Unlike the key, an env value has no other shape restriction.
+    let validateEnvValue (value: string) = rejectEmbeddedNul (nameof value) value
 
     /// The `ArgumentException` for combining `MergeStderr` with a separate-stderr observation hook. Named
     /// after the offending knob so the message points at whichever of the pair was set second (the check
@@ -193,9 +213,16 @@ module internal CommandConfig =
 [<Sealed>]
 type Command internal (config: CommandConfig) =
 
-    /// Start a new command for the given program (resolved on PATH unless a path is given).
+    /// Start a new command for the given program (resolved on PATH unless a path is given). `program`
+    /// must be non-empty and must not contain an embedded NUL (`'\000'`) — either would let the actual
+    /// spawned command diverge from the one requested (see `CommandConfig.rejectEmbeddedNul`).
     new(program: string) =
         ArgumentNullException.ThrowIfNull program
+
+        if program.Length = 0 then
+            raise (ArgumentException("program must not be empty", nameof program))
+
+        CommandConfig.rejectEmbeddedNul (nameof program) program
         Command(CommandConfig.create program)
 
     member internal _.Config = config
@@ -209,39 +236,60 @@ type Command internal (config: CommandConfig) =
     /// The working directory, when overridden.
     member _.WorkingDirectory = config.WorkingDirectory
 
-    /// Append a single argument.
+    /// Append a single argument. `value` must not contain an embedded NUL (`'\000'`) — see
+    /// `CommandConfig.rejectEmbeddedNul`.
     member _.Arg(value: string) =
         ArgumentNullException.ThrowIfNull value
+        CommandConfig.rejectEmbeddedNul (nameof value) value
 
         Command(
             { config with
                 Args = config.Args.Add value }
         )
 
-    /// Append several arguments, in order.
+    /// Append several arguments, in order. Every element must be non-null (a null element inside an
+    /// otherwise non-null `seq` — a C#-reachable shape `ArgumentNullException.ThrowIfNull values` on
+    /// the sequence itself cannot catch) and must not contain an embedded NUL (`'\000'`); the exception
+    /// names the offending element by index (`Args[2]`).
     member _.Args(values: seq<string>) =
         ArgumentNullException.ThrowIfNull values
 
+        let materialized = values |> Seq.toArray
+
+        materialized
+        |> Array.iteri (fun index value ->
+            let paramName = $"Args[{index}]"
+
+            if isNull (box value) then
+                raise (ArgumentNullException(paramName, "an Args element must not be null"))
+
+            CommandConfig.rejectEmbeddedNul paramName value)
+
         Command(
             { config with
-                Args = config.Args.AddRange values }
+                Args = config.Args.AddRange materialized }
         )
 
-    /// Set the working directory for the run.
+    /// Set the working directory for the run. `directory` must not contain an embedded NUL (`'\000'`)
+    /// — see `CommandConfig.rejectEmbeddedNul`.
     member _.CurrentDir(directory: string) =
         ArgumentNullException.ThrowIfNull directory
+        CommandConfig.rejectEmbeddedNul (nameof directory) directory
 
         Command(
             { config with
                 WorkingDirectory = Some directory }
         )
 
-    /// Set an environment variable for the child. `key` must be non-empty and must not contain `=`
-    /// (rejected with `ArgumentException` — either would corrupt the child's environment block).
+    /// Set an environment variable for the child. `key` must be non-empty, must not contain `=`, and
+    /// neither `key` nor `value` may contain an embedded NUL (`'\000'`) — all rejected with
+    /// `ArgumentException` (either would corrupt the child's environment block, or let it diverge from
+    /// what was requested).
     member _.Env(key: string, value: string) =
         ArgumentNullException.ThrowIfNull key
         ArgumentNullException.ThrowIfNull value
         CommandConfig.validateEnvKey key
+        CommandConfig.validateEnvValue value
 
         Command(
             { config with
