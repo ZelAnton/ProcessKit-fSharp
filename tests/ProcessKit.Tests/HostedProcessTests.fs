@@ -19,17 +19,31 @@ type private BlockingRunner() =
     let stopRequested =
         new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
+    let killed =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
     let finished =
         new TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
 
+    let mutable spawnCount = 0
+
     member _.Started = started.Task
     member _.StopRequested = stopRequested.Task
+
+    /// Resolves once the (fire-and-forget) hard kill path — `RunningProcess.Kill()` /
+    /// `IHostedService`'s `Dispose` — runs, as distinct from a graceful `StopRequested`.
+    member _.Killed = killed.Task
+
+    /// Total `SpawnAsync` calls so far — lets a test assert a second `StartAsync` (e.g. after
+    /// `Dispose`) never spawns another child.
+    member _.SpawnCount = Volatile.Read(&spawnCount)
 
     interface IProcessRunner with
         member _.SpawnAsync(command, cancellationToken) =
             if cancellationToken.IsCancellationRequested then
                 Task.FromResult(Error(ProcessError.Cancelled command.Program))
             else
+                Interlocked.Increment(&spawnCount) |> ignore
                 let stdout = new MemoryStream()
                 let stderr = new MemoryStream()
 
@@ -43,7 +57,10 @@ type private BlockingRunner() =
                       StartedTimestamp = Stopwatch.GetTimestamp()
                       Wait = fun () -> finished.Task
                       StdinError = fun () -> None
-                      StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
+                      StartKill =
+                        fun () ->
+                            killed.TrySetResult() |> ignore
+                            finished.TrySetResult(Outcome.Signalled None) |> ignore
                       GracefulKill =
                         fun _ ->
                             stopRequested.TrySetResult() |> ignore
@@ -57,6 +74,19 @@ type private BlockingRunner() =
 
                 started.TrySetResult() |> ignore
                 Task.FromResult(Ok(new RunningProcess(host)))
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used"))
+
+/// An `IProcessRunner` whose `SpawnAsync` throws instead of returning a `Result` error — simulating a
+/// failure that escapes an already-built `Supervisor.RunAsync` rather than one it classifies itself.
+type private ThrowingRunner() =
+    interface IProcessRunner with
+        member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
+            raise (InvalidOperationException "boom from ThrowingRunner")
 
         member _.CaptureStringAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "not used"))
@@ -250,5 +280,197 @@ type HostedProcessTests() =
 
             do! hosted.StopAsync(CancellationToken.None)
             Assert.That(service.LastOutcome.IsSome, Is.True)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Dispose without a prior StopAsync hard-kills the active child and ends supervision``() : Task =
+        task {
+            let runner = BlockingRunner()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+            do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            (service :> IDisposable).Dispose()
+
+            do! runner.Killed.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            let! outcomeSettled = waitUntil (fun () -> service.LastOutcome.IsSome)
+            Assert.That(outcomeSettled, Is.True, "supervision should end once Dispose kills the active child")
+
+            // Idempotent: a repeat Dispose must not throw (e.g. re-cancelling/re-disposing the CTS).
+            Assert.DoesNotThrow(Action(fun () -> (service :> IDisposable).Dispose()))
+
+            // Dispose permanently forbids new starts: a subsequent StartAsync must not spawn again.
+            do! hosted.StartAsync(CancellationToken.None)
+            do! Task.Delay(TimeSpan.FromMilliseconds 200.0)
+            Assert.That(runner.SpawnCount, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StartAsync with an already-cancelled token starts no supervision or child``() : Task =
+        task {
+            let runner = BlockingRunner()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+
+            use cts = new CancellationTokenSource()
+            cts.Cancel()
+
+            let startTask = hosted.StartAsync(cts.Token)
+
+            try
+                do! startTask
+                Assert.Fail "expected StartAsync to report a cancelled task"
+            with :? OperationCanceledException ->
+                ()
+
+            Assert.That(startTask.IsCanceled, Is.True)
+
+            do! Task.Delay(TimeSpan.FromMilliseconds 200.0)
+            Assert.That(runner.Started.IsCompleted, Is.False)
+            Assert.That(service.LastOutcome.IsNone, Is.True)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Concurrent StopAsync and Dispose race safely against a long-lived child``() : Task =
+        task {
+            let runner = BlockingRunner()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+            do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            let stopTask = hosted.StopAsync(CancellationToken.None)
+            let disposeTask = Task.Run(fun () -> (service :> IDisposable).Dispose())
+
+            do! Task.WhenAll(stopTask, disposeTask)
+
+            let! outcomeSettled = waitUntil (fun () -> service.LastOutcome.IsSome)
+            Assert.That(outcomeSettled, Is.True)
+
+            // Neither a repeat Dispose nor a repeat StopAsync should throw once torn down.
+            Assert.DoesNotThrow(Action(fun () -> (service :> IDisposable).Dispose()))
+            do! hosted.StopAsync(CancellationToken.None)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``DisposeAsync awaits supervision to actually finish before returning``() : Task =
+        task {
+            let runner = BlockingRunner()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+            do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            do! (service :> IAsyncDisposable).DisposeAsync().AsTask()
+
+            // No polling here (unlike the plain-`Dispose` test above): by the time `DisposeAsync`
+            // returns, supervision must have actually finished.
+            Assert.That(service.LastOutcome.IsSome, Is.True)
+
+            // Idempotent: a repeat DisposeAsync must not throw and completes immediately.
+            do! (service :> IAsyncDisposable).DisposeAsync().AsTask()
+
+            // Dispose permanently forbids new starts, same as the plain `Dispose` path.
+            do! hosted.StartAsync(CancellationToken.None)
+            do! Task.Delay(TimeSpan.FromMilliseconds 200.0)
+            Assert.That(runner.SpawnCount, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``DisposeAsync still awaits supervision to finish when a prior Dispose already claimed teardown``
+        ()
+        : Task =
+        task {
+            let runner = BlockingRunner()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+            do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            // The synchronous `Dispose()` wins the teardown claim first, exactly as the regression
+            // required: it initiates teardown (hard-kill + cancel) but cannot itself await supervision.
+            (service :> IDisposable).Dispose()
+
+            // `DisposeAsync()` loses the claim race (teardown already claimed by `Dispose()` above), but
+            // must still await supervision to actually finish before returning — its documented contract
+            // does not depend on winning the race.
+            do! (service :> IAsyncDisposable).DisposeAsync().AsTask()
+
+            Assert.That(
+                service.LastOutcome.IsSome,
+                Is.True,
+                "DisposeAsync must await supervision to completion even when a prior Dispose already claimed teardown"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``An exception escaping the built supervisor surfaces as an observable LastOutcome``() : Task =
+        task {
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(fun supervisor -> supervisor.Restart RestartPolicy.Never))
+                    (Some(ThrowingRunner() :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+
+            let serviceForWait = service
+
+            let! completed = waitUntil (fun () -> serviceForWait.LastOutcome.IsSome)
+
+            Assert.That(
+                completed,
+                Is.True,
+                "an exception escaping the supervisor should surface as LastOutcome, not only a log"
+            )
+
+            match service.LastOutcome with
+            | Some(Error error) -> Assert.That(error.Message, Does.Contain "boom from ThrowingRunner")
+            | other -> Assert.Fail $"expected an Error outcome, got %A{other}"
         }
         :> Task

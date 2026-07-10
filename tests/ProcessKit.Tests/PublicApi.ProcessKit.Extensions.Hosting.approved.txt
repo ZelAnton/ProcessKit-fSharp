@@ -4,6 +4,7 @@ class ProcessKit.Extensions.Hosting.HostedProcessOptions
 
 class ProcessKit.Extensions.Hosting.HostedProcessService
   :> Microsoft.Extensions.Hosting.IHostedService
+  :> System.IAsyncDisposable
   :> System.IDisposable
   new(System.String, ProcessKit.Command, System.Func<ProcessKit.Supervisor, ProcessKit.Supervisor>, ProcessKit.IProcessRunner, ProcessKit.Extensions.Hosting.HostedProcessOptions)
   property LastOutcome : Microsoft.FSharp.Core.FSharpOption<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>> { get }
