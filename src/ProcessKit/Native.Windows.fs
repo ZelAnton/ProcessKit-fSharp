@@ -197,6 +197,12 @@ module internal Windows =
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern uint32 private ResumeThread(nativeint hThread)
 
+    // Test seam: `ResumeThread`, overridable so a fault-injection test can force the `(DWORD)-1`
+    // (`UInt32.MaxValue`) error sentinel deterministically — a genuinely failing `ResumeThread` cannot
+    // be provoked on demand. Production always runs the real entry point; only the (sequential) tests
+    // reassign it, and restore it in a `finally`.
+    let mutable resumeThreadHook: nativeint -> uint32 = ResumeThread
+
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private GetExitCodeProcess(nativeint hProcess, uint32& lpExitCode)
 
@@ -454,41 +460,117 @@ module internal Windows =
     [<DllImport("ntdll.dll")>]
     extern int private NtResumeProcess(nativeint hProcess)
 
-    /// Snapshot the pids assigned to a Job Object (the whole contained tree). A point-in-time view;
-    /// a process can exit immediately after. Caps at 1024 members (ample for a diagnostic snapshot).
-    let membersWindows (job: nativeint) : int list =
-        let capacity = 1024
-        let headerSize = 8 // two DWORDs: NumberOfAssignedProcesses, NumberOfProcessIdsInList
-        let size = headerSize + capacity * IntPtr.Size
-        let buffer = Marshal.AllocHGlobal size
+    // `QueryInformationJobObject` signals "your buffer was too small" for `JobObjectBasicProcessIdList`
+    // by returning FALSE with this last-error (as well as, on some paths, returning TRUE but reporting a
+    // `NumberOfAssignedProcesses` larger than the list it could fit); both are handled by growing.
+    [<Literal>]
+    let private ERROR_MORE_DATA = 234
 
-        try
+    // Grow-and-retry rounds `membersWindows` will attempt. Growth jumps straight to the reported assigned
+    // count (or doubles on a bare ERROR_MORE_DATA), so a real job fits within one or two rounds; this is
+    // only a defensive cap against a pathological job that keeps signalling overflow without ever fitting.
+    [<Literal>]
+    let private maxQueryAttempts = 24
+
+    // Two DWORDs — NumberOfAssignedProcesses, NumberOfProcessIdsInList — then the pid array (8-aligned, so
+    // it starts right at offset 8 on 64-bit; the header itself is already 8 bytes).
+    [<Literal>]
+    let private processIdListHeaderSize = 8
+
+    // Test seam: one `QueryInformationJobObject` call — the caller passes a buffer of `bufferSize` bytes,
+    // the call writes the process-id list into it and returns `struct (succeeded, lastError)`. The real
+    // seam captures `GetLastWin32Error` right after the P/Invoke so the classification below works off a
+    // returned value rather than thread-global state; a fault-injection test reassigns it to simulate a
+    // job with more members than the initial buffer (driving grow-and-retry) and a genuine query failure,
+    // without spawning thousands of real processes. Only the members path is routed through it.
+    let mutable queryInformationJobObjectHook: nativeint -> int -> nativeint -> uint32 -> struct (bool * int) =
+        fun job infoClass buffer bufferSize ->
             let mutable returnLength = 0u
 
-            if QueryInformationJobObject(job, JobObjectBasicProcessIdList, buffer, uint32 size, &returnLength) then
-                let count = min (Marshal.ReadInt32(buffer, 4)) capacity
+            let ok =
+                QueryInformationJobObject(job, infoClass, buffer, bufferSize, &returnLength)
 
-                [ for i in 0 .. count - 1 -> int (Marshal.ReadIntPtr(buffer, headerSize + i * IntPtr.Size)) ]
-            else
-                []
-        finally
-            Marshal.FreeHGlobal buffer
+            struct (ok, (if ok then 0 else Marshal.GetLastWin32Error()))
 
-    // Suspend / resume every member process of a Job. Best-effort and not atomic: a process can
-    // spawn between the snapshot and the suspend; Windows keeps per-thread suspend counts, so nested
-    // suspends stack and need matching resumes (unlike the level-triggered POSIX SIGSTOP/SIGCONT).
-    let private forEachMemberHandle (job: nativeint) (action: nativeint -> unit) =
-        for pid in membersWindows job do
-            let handle = OpenProcess(PROCESS_SUSPEND_RESUME, false, uint32 pid)
+    /// Snapshot the pids assigned to a Job Object (the whole contained tree). A point-in-time view;
+    /// a process can exit immediately after. The buffer grows to fit however many processes the job
+    /// holds (starting at 1024, then re-querying at the reported assigned count), so no member is
+    /// silently dropped; a genuine query failure (as opposed to a too-small buffer) is returned as
+    /// `ProcessError.Io` rather than an empty list, so `Members`/`Suspend`/`Resume` can never quietly
+    /// report success without having touched the real job.
+    let membersWindows (job: nativeint) : Result<int list, ProcessError> =
+        let rec loop (capacity: int) (attempt: int) : Result<int list, ProcessError> =
+            let size = processIdListHeaderSize + capacity * IntPtr.Size
+            let buffer = Marshal.AllocHGlobal size
 
-            if handle <> IntPtr.Zero then
-                action handle
-                CloseHandle handle |> ignore
+            // Decide inside the `try` (the buffer must still be alive to be read), then act after freeing
+            // it: `Choice1Of2 newCapacity` = grow and retry, `Choice2Of2 result` = done.
+            let decision =
+                try
+                    let struct (ok, lastError) =
+                        queryInformationJobObjectHook job JobObjectBasicProcessIdList buffer (uint32 size)
 
-    let suspendWindows (job: nativeint) =
+                    if ok then
+                        let assigned = Marshal.ReadInt32(buffer, 0)
+
+                        if assigned > capacity && attempt < maxQueryAttempts then
+                            // More members than this buffer can hold: grow straight to the reported count
+                            // (plus headroom for members that may appear before the retry) and re-query.
+                            Choice1Of2(assigned + assigned / 2 + 16)
+                        else
+                            let count = min (Marshal.ReadInt32(buffer, 4)) capacity
+
+                            Choice2Of2(
+                                Ok
+                                    [ for i in 0 .. count - 1 ->
+                                          int (Marshal.ReadIntPtr(buffer, processIdListHeaderSize + i * IntPtr.Size)) ]
+                            )
+                    elif lastError = ERROR_MORE_DATA && attempt < maxQueryAttempts then
+                        // Overflow signalled as a failure rather than a truncated success — grow and retry.
+                        Choice1Of2(capacity * 2)
+                    else
+                        // A genuine query failure (not a size problem): surface it honestly rather than
+                        // reporting an empty group and letting Members/Suspend/Resume claim a false success.
+                        Choice2Of2(
+                            Error(
+                                ProcessError.Io
+                                    $"could not enumerate job members (QueryInformationJobObject failed): {Win32Exception(lastError).Message}"
+                            )
+                        )
+                finally
+                    Marshal.FreeHGlobal buffer
+
+            match decision with
+            | Choice1Of2 newCapacity -> loop newCapacity (attempt + 1)
+            | Choice2Of2 result -> result
+
+        loop 1024 1
+
+    // Suspend / resume every member process of a Job over the COMPLETE `membersWindows` snapshot (the
+    // buffer grows to fit the whole job, so no member is dropped by an artificial cap). Best-effort and
+    // not atomic: a process can still spawn between the snapshot and the suspend — the only documented
+    // race, now scoped to genuinely later arrivals rather than a truncated list; Windows keeps per-thread
+    // suspend counts, so nested suspends stack and need matching resumes (unlike the level-triggered POSIX
+    // SIGSTOP/SIGCONT). A genuine members-query failure propagates as `ProcessError.Io` instead of being
+    // silently treated as an empty group, so `Suspend`/`Resume` can never report success without having
+    // touched the real job.
+    let private forEachMemberHandle (job: nativeint) (action: nativeint -> unit) : Result<unit, ProcessError> =
+        match membersWindows job with
+        | Error error -> Error error
+        | Ok pids ->
+            for pid in pids do
+                let handle = OpenProcess(PROCESS_SUSPEND_RESUME, false, uint32 pid)
+
+                if handle <> IntPtr.Zero then
+                    action handle
+                    CloseHandle handle |> ignore
+
+            Ok()
+
+    let suspendWindows (job: nativeint) : Result<unit, ProcessError> =
         forEachMemberHandle job (fun handle -> NtSuspendProcess handle |> ignore)
 
-    let resumeWindows (job: nativeint) =
+    let resumeWindows (job: nativeint) : Result<unit, ProcessError> =
         forEachMemberHandle job (fun handle -> NtResumeProcess handle |> ignore)
 
     // Job-Object accounting for `stats`: cumulative CPU + active count (basic accounting) and peak
@@ -904,8 +986,19 @@ module internal Windows =
                 CloseHandle info.hProcess |> ignore
                 releaseStdio ()
                 Error(ProcessError.Spawn(command.Program, $"could not assign process to job object: {message}"))
+            elif resumeThreadHook info.hThread = UInt32.MaxValue then
+                // `ResumeThread` returned its `(DWORD)-1` failure sentinel: the child is assigned to the
+                // job but still SUSPENDED and will never run. Leaving it would masquerade as a healthy
+                // spawn while the child hangs forever, so terminate it inside the job, release every
+                // handle and stream, and report an honest `ProcessError.Spawn` — the same shape as the
+                // `AssignProcessToJobObject` failure just above.
+                let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                TerminateProcess(info.hProcess, 1u) |> ignore
+                CloseHandle info.hThread |> ignore
+                CloseHandle info.hProcess |> ignore
+                releaseStdio ()
+                Error(ProcessError.Spawn(command.Program, $"could not resume the suspended child: {message}"))
             else
-                ResumeThread info.hThread |> ignore
                 CloseHandle info.hThread |> ignore
                 // Drop the parent's copies of the child-side handles now that the child has inherited
                 // them, so reads see EOF when the child exits.

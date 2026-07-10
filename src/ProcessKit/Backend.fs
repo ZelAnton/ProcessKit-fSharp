@@ -168,7 +168,9 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             task { Native.Windows.terminateWindowsJob jobHandle } :> Task
 
         member _.Members() =
-            Ok(Native.Windows.membersWindows jobHandle)
+            // `membersWindows` already returns a `Result` — it grows the buffer to the whole job and
+            // surfaces a genuine query failure as `ProcessError.Io` rather than a fabricated empty list.
+            Native.Windows.membersWindows jobHandle
 
         member _.Signal(signal) =
             match signal with
@@ -216,13 +218,9 @@ type internal JobObjectBackend(jobHandle: nativeint) =
                         $"signal {signal} on Windows (only Signal.Kill, and Signal.Int/Signal.Term to a child started with Command.WindowsCtrlSignals(), are deliverable)"
                 )
 
-        member _.Suspend() =
-            Native.Windows.suspendWindows jobHandle
-            Ok()
+        member _.Suspend() = Native.Windows.suspendWindows jobHandle
 
-        member _.Resume() =
-            Native.Windows.resumeWindows jobHandle
-            Ok()
+        member _.Resume() = Native.Windows.resumeWindows jobHandle
 
         member _.Stats() =
             match Native.Windows.jobStatsWindows jobHandle with
