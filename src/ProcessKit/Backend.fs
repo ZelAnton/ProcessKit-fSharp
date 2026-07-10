@@ -305,7 +305,12 @@ type internal CgroupBackend(cgroupPath: string) =
                 grace
 
         member _.Members() =
-            Ok(Native.Cgroup.cgroupMembers cgroupPath)
+            // `cgroupMembers` already distinguishes "read, and it's empty" from "the read failed" — surface
+            // a read failure honestly as `ProcessError.Io` rather than reporting a fabricated empty group.
+            match Native.Cgroup.cgroupMembers cgroupPath with
+            | Ok members -> Ok members
+            | Error message ->
+                Error(ProcessError.Io $"could not read cgroup.procs to list the group's members: {message}")
 
         member _.Signal(signal) =
             match signal with
@@ -330,9 +335,17 @@ type internal CgroupBackend(cgroupPath: string) =
             Ok()
 
         member _.Stats() =
-            let active = List.length (Native.Cgroup.cgroupMembers cgroupPath)
-            let cpu, peak = Native.Cgroup.cgroupStats cgroupPath
-            Ok(ProcessGroupStats(active, cpu, peak))
+            // The active-process count comes from the same read as `Members`: a read failure must
+            // propagate as an honest error, not be silently reported as zero active processes.
+            match Native.Cgroup.cgroupMembers cgroupPath with
+            | Error message ->
+                Error(
+                    ProcessError.Io $"could not read cgroup.procs for stats (active process count unknown): {message}"
+                )
+            | Ok members ->
+                let active = List.length members
+                let cpu, peak = Native.Cgroup.cgroupStats cgroupPath
+                Ok(ProcessGroupStats(active, cpu, peak))
 
         member _.HardRelease() =
             Native.Cgroup.killCgroup cgroupPath
