@@ -292,6 +292,61 @@ type CassetteTests() =
             })
 
     [<Test>]
+    member _.``by default cwd does not participate in the match key``() : Task =
+        withCassette (fun path ->
+            task {
+                let recorded =
+                    Command.create "tool" |> Command.currentDir "/one/dir" |> Command.arg "x"
+
+                let probe =
+                    Command.create "tool" |> Command.currentDir "/another/dir" |> Command.arg "x"
+
+                match! recordThenProbe path recorded probe with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded-output")
+                | Error error -> Assert.Fail $"a different cwd should still match by default: {error}"
+            })
+
+    [<Test>]
+    member _.``WithCwdMatching() restores cwd as part of the match key``() : Task =
+        withCassette (fun path ->
+            task {
+                let options = RecordReplayOptions().WithCwdMatching()
+
+                let recorded =
+                    Command.create "tool" |> Command.currentDir "/one/dir" |> Command.arg "x"
+
+                do!
+                    task {
+                        use recorder =
+                            RecordReplayRunner.Record(path, FixedRunner("recorded-output", 0), options)
+
+                        let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Replay(path, options) with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    // Same cwd still matches.
+                    let same = Command.create "tool" |> Command.currentDir "/one/dir" |> Command.arg "x"
+
+                    match! (runner replayer).OutputStringAsync(same, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded-output")
+                    | Error error -> Assert.Fail $"same cwd should match: {error}"
+
+                    // A different cwd now misses.
+                    let different =
+                        Command.create "tool" |> Command.currentDir "/another/dir" |> Command.arg "x"
+
+                    match! (runner replayer).OutputStringAsync(different, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
+                    | other -> Assert.Fail $"a different cwd should miss with WithCwdMatching(), got {other}"
+            })
+
+    [<Test>]
     member _.``a one-shot stdin source cannot be keyed``() : Task =
         withCassette (fun path ->
             task {

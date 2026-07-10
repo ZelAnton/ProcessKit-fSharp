@@ -100,28 +100,36 @@ type CassetteFile =
     }
 
 /// Optional knobs for a `RecordReplayRunner` — matching customization (a stdin file-content digest, an
-/// argument normalizer) and a record-time redaction hook. Immutable and fluent; the same instance must
-/// be used at record and replay time, since it changes how invocations are keyed. Default: path-only
-/// stdin-file matching, verbatim args, no redaction.
+/// argument normalizer, opt-in `cwd` matching) and a record-time redaction hook. Immutable and fluent;
+/// the same instance must be used at record and replay time, since it changes how invocations are keyed.
+/// Default: path-only stdin-file matching, verbatim args, no redaction, and the working directory does
+/// **not** participate in matching (see `WithCwdMatching`).
 [<Sealed>]
 type RecordReplayOptions
     private
-    (hashFileStdinContents: bool, argNormalizer: (string[] -> string[]) option, redaction: (string -> string) option) =
+    (
+        hashFileStdinContents: bool,
+        argNormalizer: (string[] -> string[]) option,
+        redaction: (string -> string) option,
+        matchCwd: bool
+    ) =
 
     /// The defaults: a `Stdin.FromFile` source is keyed by its **path** (not contents), arguments are
-    /// matched verbatim, and captured output is stored as-is.
-    new() = RecordReplayOptions(false, None, None)
+    /// matched verbatim, captured output is stored as-is, and the working directory is **not** part of
+    /// the match key (see `WithCwdMatching`).
+    new() = RecordReplayOptions(false, None, None, false)
 
     member internal _.HashFileStdinContents = hashFileStdinContents
     member internal _.ArgNormalizer = argNormalizer
     member internal _.Redaction = redaction
+    member internal _.MatchCwd = matchCwd
 
     /// Key a `Stdin.FromFile` source by its **contents** (a SHA-256 of the file's bytes) rather than its
     /// path, so a cassette matches on what was actually fed to the child. Opt-in: reading the file has a
     /// cost, and the file must exist at both record and replay time (an unreadable file surfaces
     /// `ProcessError.Stdin`). A content digest matches a `Stdin.FromBytes` of the same bytes.
     member _.WithFileStdinContentHashing() =
-        RecordReplayOptions(true, argNormalizer, redaction)
+        RecordReplayOptions(true, argNormalizer, redaction, matchCwd)
 
     /// Normalize the argument list before it is used to match an invocation, so a volatile argument (a
     /// temp directory, a nonce) no longer defeats the match — e.g. drop it, or rewrite it to a stable
@@ -129,7 +137,7 @@ type RecordReplayOptions
     /// **raw** arguments are still stored verbatim in the cassette for inspection.
     member _.WithArgNormalizer(normalizer: Func<string[], string[]>) =
         ArgumentNullException.ThrowIfNull normalizer
-        RecordReplayOptions(hashFileStdinContents, Some normalizer.Invoke, redaction)
+        RecordReplayOptions(hashFileStdinContents, Some normalizer.Invoke, redaction, matchCwd)
 
     /// Scrub captured **text** before it is written to the cassette, so a secret echoed to stdout/stderr
     /// (a token, a password) never reaches disk. Applied at record time to the stdout and stderr text of
@@ -137,10 +145,25 @@ type RecordReplayOptions
     /// (base64) and is **not** passed through the redactor.
     member _.WithRedaction(redact: Func<string, string>) =
         ArgumentNullException.ThrowIfNull redact
-        RecordReplayOptions(hashFileStdinContents, argNormalizer, Some redact.Invoke)
+        RecordReplayOptions(hashFileStdinContents, argNormalizer, Some redact.Invoke, matchCwd)
 
-// Match key: program + args + cwd + whether-stdin + stdin digest + effective-environment fingerprint.
-// F# tuple/list have structural equality, so this works as a Dictionary key.
+    /// Restore the working directory (`Command.CurrentDir`) as part of the replay match key, so two
+    /// otherwise-identical invocations that ran in different directories are treated as distinct
+    /// recordings. Opt-in: by default `cwd` does **not** participate in matching, because a cassette's
+    /// absolute working directory is almost always an artifact of where it happened to be recorded (a
+    /// developer's checkout, a CI runner's workspace) rather than something a call genuinely depends on —
+    /// with `cwd` in the key by default, a cassette recorded on one machine silently fails to replay on
+    /// another (`ProcessError.CassetteMiss`), which is the common case this option exists to opt back out
+    /// of. `cwd` is still stored verbatim in every `CassetteEntry.Cwd` for inspection regardless of this
+    /// setting. Must be applied symmetrically — the same setting used to record a cassette must be used
+    /// to replay it, or the match key will silently disagree between the two.
+    member _.WithCwdMatching() =
+        RecordReplayOptions(hashFileStdinContents, argNormalizer, redaction, true)
+
+// Match key: program + args + cwd (only when `RecordReplayOptions.WithCwdMatching` is set; `None`
+// otherwise, so `cwd` never distinguishes two entries by default) + whether-stdin + stdin digest +
+// effective-environment fingerprint. F# tuple/list have structural equality, so this works as a
+// Dictionary key.
 type private Key = string * string list * string option * bool * string option * string
 
 // One key's entries in capture order, with the order-then-repeat-last cursor. `Entries` is mutable so
@@ -168,10 +191,14 @@ type private Mode =
 /// failure) record nothing; non-zero exits and captured timeouts are results and are recorded.
 ///
 /// **Replay** mode loads the cassette and serves results with **no subprocess**: a match is keyed on
-/// program + args + cwd + stdin-source digest + an effective-environment fingerprint (so a call whose
-/// env values/names/removals or `EnvClear` differ no longer replays an unrelated recording — a pre-v3
-/// cassette with no fingerprint keys as the un-customized environment); duplicates replay in capture order then repeat the
-/// last; an unmatched call is `ProcessError.CassetteMiss` (never a surprise subprocess). Covers the
+/// program + args + stdin-source digest + an effective-environment fingerprint (so a call whose env
+/// values/names/removals or `EnvClear` differ no longer replays an unrelated recording — a pre-v3
+/// cassette with no fingerprint keys as the un-customized environment); the working directory does
+/// **not** participate in the key by default (a cassette recorded in one `cwd` replays from another),
+/// though `CassetteEntry.Cwd` still stores it verbatim for inspection — opt into cwd-sensitive matching
+/// with `RecordReplayOptions.WithCwdMatching()`, applied symmetrically at record and replay time;
+/// duplicates replay in capture order then repeat the last; an unmatched call is
+/// `ProcessError.CassetteMiss` (never a surprise subprocess). Covers the
 /// text and **bytes** capture verbs (`CaptureStringAsync` / `CaptureBytesAsync`, the latter reproducing
 /// exact bytes from a bytes recording) and `SpawnAsync` (a live handle is reconstructed from the
 /// recording, so streaming/readiness consumers replay too). A one-shot stdin source (`FromStream` /
@@ -320,9 +347,11 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
     // Build a replay index from cassette entries, grouping duplicates of a key in capture order and
     // freezing each group to an immutable array once (not `Array.append` per duplicate, which is O(n²)).
-    // The key uses the same argument normalizer that a live match will, so the two sides stay symmetric.
+    // The key uses the same argument normalizer (and the same cwd-matching setting) that a live match
+    // will, so the two sides stay symmetric.
     static let buildSlots
         (normalizer: (string[] -> string[]) option)
+        (matchCwd: bool)
         (entries: CassetteEntry[])
         : Dictionary<Key, ReplaySlot> =
         let grouped = Dictionary<Key, ResizeArray<CassetteEntry>>()
@@ -331,7 +360,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             let key =
                 entry.Program,
                 applyNormalizer normalizer entry.Args,
-                Option.ofObj entry.Cwd,
+                (if matchCwd then Option.ofObj entry.Cwd else None),
                 entry.HasStdin,
                 Option.ofObj entry.StdinDigest,
                 entryEnvFingerprint entry
@@ -538,7 +567,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
         command.Program,
         args,
-        command.WorkingDirectory,
+        (if options.MatchCwd then command.WorkingDirectory else None),
         command.Config.StdinSource.IsSome,
         digest,
         envFingerprint command.Config.ClearEnv command.Config.EnvOverrides
@@ -738,7 +767,14 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
         match loadEntries path with
         | Error error -> Error error
-        | Ok entries -> Ok(new RecordReplayRunner(ReplayMode(buildSlots options.ArgNormalizer entries), path, options))
+        | Ok entries ->
+            Ok(
+                new RecordReplayRunner(
+                    ReplayMode(buildSlots options.ArgNormalizer options.MatchCwd entries),
+                    path,
+                    options
+                )
+            )
 
     /// Replay a cassette at `path`, recording and persisting any invocation that **misses** (VCR "new
     /// episodes"): existing entries replay hermetically, a first-seen call is delegated to `inner`,
@@ -777,7 +813,12 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         | Ok entries ->
             Ok(
                 new RecordReplayRunner(
-                    AutoMode(inner, buildSlots options.ArgNormalizer entries, List<CassetteEntry>(entries), ref false),
+                    AutoMode(
+                        inner,
+                        buildSlots options.ArgNormalizer options.MatchCwd entries,
+                        List<CassetteEntry>(entries),
+                        ref false
+                    ),
                     path,
                     options
                 )

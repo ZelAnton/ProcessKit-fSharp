@@ -418,7 +418,7 @@ Semantics worth knowing before you commit a cassette:
 
 | Aspect | Behaviour |
 |---|---|
-| Match key | program + args + cwd + a stdin **source digest** (plus whether stdin was present). In-memory bytes hash their content; a `Stdin.FromFile` source hashes its path (opt into hashing its **contents** with `RecordReplayOptions.WithFileStdinContentHashing`) |
+| Match key | program + args + a stdin **source digest** (plus whether stdin was present). In-memory bytes hash their content; a `Stdin.FromFile` source hashes its path (opt into hashing its **contents** with `RecordReplayOptions.WithFileStdinContentHashing`). The working directory does **not** participate by default — a cassette recorded in one `cwd` still replays from another — opt in with `RecordReplayOptions.WithCwdMatching()` |
 | Environment | now part of the match key through a redacting **fingerprint** of the effective environment — the `EnvClear` flag plus the net effect of the `Env`/`EnvRemove` overrides (removals and last-write-wins included; env-name case is insensitive on Windows, sensitive on POSIX), while repeated/no-op overrides with the same final effect still match. Override **values never reach the file** — only the variable names and a versioned SHA-256 fingerprint — so env secrets can't leak, yet a call with a different value, name, removal, or `EnvClear` no longer replays an unrelated recording |
 | Miss | an unmatched call is `ProcessError.CassetteMiss` (distinct from a missing program) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded before/after sequence replays faithfully, while retry/probe loops keep getting a stable final answer |
@@ -464,6 +464,10 @@ since they change how invocations are keyed):
   echoed to stdout/stderr never reaches disk. Applied at record time to a string capture's
   stdout/stderr and a bytes capture's stderr; a `byte[]` stdout capture is stored opaquely
   (base64) and is not passed through the redactor.
+- `WithCwdMatching()` — restore the working directory (`Command.CurrentDir`) as part of the match
+  key, so two otherwise-identical invocations that ran in different directories are treated as
+  distinct recordings. `CassetteEntry.Cwd` always stores the working directory verbatim for
+  inspection regardless of this setting; only its participation in *matching* is opt-in.
 
 ```csharp
 var options = new RecordReplayOptions()

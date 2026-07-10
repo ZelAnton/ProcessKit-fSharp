@@ -60,6 +60,7 @@ class ProcessKit.Testing.FakeProcess
 
 class ProcessKit.Testing.RecordReplayOptions
   member WithArgNormalizer(System.Func<System.String[], System.String[]>) : ProcessKit.Testing.RecordReplayOptions
+  member WithCwdMatching() : ProcessKit.Testing.RecordReplayOptions
   member WithFileStdinContentHashing() : ProcessKit.Testing.RecordReplayOptions
   member WithRedaction(System.Func<System.String, System.String>) : ProcessKit.Testing.RecordReplayOptions
   new()

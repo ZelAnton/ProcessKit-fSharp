@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `RecordReplayOptions.WithCwdMatching()`: opt-in restoration of the working directory (`Command.CurrentDir`) as part of a `ProcessKit.Testing` cassette's replay match key.
 
 ### Changed
--
+- `ProcessKit.Testing` cassette matching no longer keys on the working directory (`Command.CurrentDir`) by default: two otherwise-identical invocations recorded/replayed from different absolute directories (a developer's checkout vs. a CI runner's workspace) now match, instead of missing with `ProcessError.CassetteMiss` purely because of `cwd`. `CassetteEntry.Cwd` still stores the working directory verbatim for inspection. This is a behavioural change for an existing cassette that relied on `cwd` alone to distinguish two entries — those entries now collapse to the same match key and one of them "wins" (replays for both) in capture order; add `RecordReplayOptions.WithCwdMatching()` (applied symmetrically at record and replay time) to restore the previous cwd-sensitive matching.
 
 ### Fixed
 - `RunningProcess.WaitForPortAsync` / `WaitForAsync` now background-drain the child's piped
