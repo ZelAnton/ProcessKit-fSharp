@@ -54,11 +54,7 @@ type ResourceLimits internal (memoryMax: int64 option, maxProcesses: int option,
     member _.WithCpuQuota(cores: float) =
         if Double.IsNaN cores || Double.IsInfinity cores || cores <= 0.0 then
             raise (
-                ArgumentOutOfRangeException(
-                    nameof cores,
-                    cores,
-                    "CPU quota must be a finite, positive number of cores"
-                )
+                ArgumentOutOfRangeException(nameof cores, cores, "CPU quota must be a finite, positive number of cores")
             )
 
         // Mirror of Native.Cgroup.cpuMaxValue's "quota period" microsecond conversion: period is

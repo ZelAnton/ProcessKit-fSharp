@@ -41,7 +41,8 @@ type CommandTests() =
 
     [<Test>]
     member _.``Command rejects an empty program``() =
-        Assert.Throws<ArgumentException>(Action(fun () -> Command("") |> ignore)) |> ignore
+        Assert.Throws<ArgumentException>(Action(fun () -> Command("") |> ignore))
+        |> ignore
 
     [<Test>]
     member _.``Command rejects a program containing an embedded NUL``() =
@@ -59,9 +60,7 @@ type CommandTests() =
     member _.``Args rejects a null element in the sequence``() =
         let withNull: string[] = [| "a"; Unchecked.defaultof<string>; "c" |]
 
-        Assert.Throws<ArgumentNullException>(
-            Action(fun () -> Command.create "git" |> Command.args withNull |> ignore)
-        )
+        Assert.Throws<ArgumentNullException>(Action(fun () -> Command.create "git" |> Command.args withNull |> ignore))
         |> ignore
 
     [<Test>]
@@ -74,7 +73,10 @@ type CommandTests() =
     [<Test>]
     member _.``CurrentDir rejects a directory containing an embedded NUL``() =
         Assert.Throws<ArgumentException>(
-            Action(fun () -> Command.create "git" |> Command.currentDir (sprintf "/tmp/%cevil" '\000') |> ignore)
+            Action(fun () ->
+                Command.create "git"
+                |> Command.currentDir (sprintf "/tmp/%cevil" '\000')
+                |> ignore)
         )
         |> ignore
 

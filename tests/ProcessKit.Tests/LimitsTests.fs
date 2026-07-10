@@ -76,9 +76,7 @@ type LimitsTests() =
         // Native.Cgroup.cpuMaxValue rounds cores * 100_000 (microseconds) into an int64; a value that
         // makes that product reach or exceed Int64.MaxValue must be rejected up front, uniformly, rather
         // than only failing later and only on the Linux cgroup backend.
-        Assert.Throws<ArgumentOutOfRangeException>(
-            Action(fun () -> ResourceLimits.None.WithCpuQuota 1e20 |> ignore)
-        )
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> ResourceLimits.None.WithCpuQuota 1e20 |> ignore))
         |> ignore
 
         // A large-but-safe value (well under the overflow boundary) is still accepted.
@@ -92,9 +90,7 @@ type LimitsTests() =
         )
         |> ignore
 
-        Assert.Throws<ArgumentOutOfRangeException>(
-            Action(fun () -> ProcessGroupOptions().WithCpuQuota 1e20 |> ignore)
-        )
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> ProcessGroupOptions().WithCpuQuota 1e20 |> ignore))
         |> ignore
 
         let accepted = ProcessGroupOptions().WithCpuQuota 2.0
