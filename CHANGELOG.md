@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- A buffered tee sink (`Command.StdoutTee`/`StderrTee`, e.g. a `BufferedStream`-backed writer) now gets flushed as soon as the pump's read loop ends — on both clean EOF and a read failure — instead of only once the caller eventually disposes it, so a consumer reading the tee concurrently no longer sees truncated output. ProcessKit still never disposes the caller-supplied tee.
 
 ## [2.2.0] - 2026-07-10
 
