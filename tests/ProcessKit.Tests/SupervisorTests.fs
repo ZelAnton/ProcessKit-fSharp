@@ -2,6 +2,8 @@ namespace ProcessKit.Tests
 
 open System
 open System.Collections.Generic
+open System.IO
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
@@ -819,6 +821,105 @@ type SupervisorTests() =
                 Assert.That(events[0].Program, Is.EqualTo "worker")
                 Assert.That(events[0].Delay, Is.EqualTo(TimeSpan.FromSeconds 1.0))
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // ----- one-shot stdin + restart-capable supervision (T-088) -----
+
+    [<Test>]
+    member _.``a restart-capable supervisor refuses a one-shot stdin source (FromStream) up front``() : Task =
+        task {
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command = Command.create "fake" |> Command.stdin (Stdin.FromStream stream)
+
+            // Default policy (`OnCrash`, unlimited restarts) is restart-capable. An empty reply list
+            // proves the runner is never even invoked: a call would throw `SequenceRunner ran out of
+            // scripted replies`, failing the test loudly instead of silently.
+            let supervisor =
+                Supervisor(command).WithRunner(runner []).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+            match! supervisor.RunAsync() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected an Unsupported error, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a restart-capable supervisor refuses a one-shot stdin source (FromAsyncLines) up front``() : Task =
+        task {
+            // `FaultyStdinAsyncLines AtGetEnumerator` (shared T-069 test double, defined in
+            // `PipelineTests.fs`) throws the instant it is enumerated — proving the source is never
+            // even touched: the refusal happens before the first incarnation is attempted.
+            let source = FaultyStdinAsyncLines AtGetEnumerator
+            let command = Command.create "fake" |> Command.stdin (Stdin.FromAsyncLines source)
+
+            let supervisor =
+                Supervisor(command).WithRunner(runner []).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+            match! supervisor.RunAsync() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected an Unsupported error, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``RestartPolicy.Never with a one-shot stdin source is unaffected (a single run, not a restart)``() : Task =
+        task {
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command = Command.create "fake" |> Command.stdin (Stdin.FromStream stream)
+
+            let supervisor =
+                Supervisor(command)
+                    .WithRunner(runner [ failWith 1 ])
+                    .Restart(RestartPolicy.Never)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+
+            match! supervisor.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 0)
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
+            | Error error -> Assert.Fail $"expected Ok, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``MaxRestarts(0) with a one-shot stdin source is unaffected (no restart budget at all)``() : Task =
+        task {
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command = Command.create "fake" |> Command.stdin (Stdin.FromStream stream)
+
+            let supervisor =
+                Supervisor(command)
+                    .WithRunner(runner [ failWith 1 ])
+                    .MaxRestarts(0)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+
+            match! supervisor.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 0)
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.RestartsExhausted)
+            | Error error -> Assert.Fail $"expected Ok, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a restart-capable supervisor with a repeatable stdin source (FromString) is unaffected``() : Task =
+        task {
+            let command = Command.create "fake" |> Command.stdin (Stdin.FromString "payload")
+
+            let supervisor =
+                Supervisor(command).WithRunner(runner [ failWith 1; ok () ]).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+            match! supervisor.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 1)
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.PolicySatisfied)
+            | Error error -> Assert.Fail $"expected Ok, got {error}"
         }
         :> Task
 

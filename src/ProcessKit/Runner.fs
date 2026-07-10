@@ -159,6 +159,19 @@ module Runner =
         match command.Config.RetryDisabled, command.Config.Retry with
         | true, _
         | _, None -> action command
+        | false, Some(maxAttempts, _, _) when maxAttempts > 1 && Stdin.isOneShot command.Config.StdinSource ->
+            // A one-shot stdin source (`FromStream`/`FromLines`/`FromAsyncLines`) can only be pumped
+            // once: a second attempt would silently feed the child empty/truncated input instead of
+            // replaying the original one. Fail loudly, before the first attempt even runs, rather than
+            // let a retry quietly corrupt the input on attempt 2 (T-088; ports ProcessKit-rs
+            // `c1f39c7`/`8472007`). `maxAttempts <= 1` (a single run, no retry) is unaffected, and so is
+            // every repeatable source (`Bytes`/`String`/`File`/`Empty`).
+            Task.FromResult(
+                Error(
+                    ProcessError.Unsupported
+                        $"'{command.Program}' has a one-shot stdin source and cannot be retried ({maxAttempts} attempts requested): a second attempt would find the source already exhausted"
+                )
+            )
         | false, Some(maxAttempts, delay, shouldRetry) ->
             task {
                 // `maxAttempts` is the TOTAL number of runs (the initial run plus retries), so the

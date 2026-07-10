@@ -12,6 +12,20 @@ open System.Threading
 open System.Threading.Tasks
 open ProcessKit
 
+// libc `open`/`fsync`/`close` for the Unix-only best-effort parent-directory fsync in `writeCassette`
+// below (a plain `File.Open` cannot open a directory, so this needs a raw P/Invoke rather than a
+// managed API). A module, not class `static let` bindings, because F# DllImport `extern` declarations
+// must be module-level or type `static member` — a `static let` in a class cannot carry `DllImport`.
+module private NativeDirFsync =
+    [<DllImport("libc", EntryPoint = "open", SetLastError = true, CharSet = CharSet.Ansi)>]
+    extern int openDirFd(string path, int flags)
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int fsyncFd(int fd)
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int closeFd(int fd)
+
 /// One captured `invocation → result` pair — a row inside the `CassetteFile` envelope (public so
 /// `System.Text.Json` can serialize it; inspect a cassette file directly rather than depending on
 /// this shape). Env values are never stored in clear text — only the variable *names* and a redacting
@@ -392,10 +406,43 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         with ex ->
             Error(ProcessError.Io ex.Message)
 
+    static let O_RDONLY_FOR_DIR_FSYNC = 0
+
+    // Best-effort fsync of the directory containing `path`, so a preceding atomic `rename` into it is
+    // durable across a crash — the renamed file's own bytes are already flushed to disk by `writeContent`
+    // (see `writeCassette`), but the directory-entry swap `rename` performs is a separate metadata write
+    // that needs its own flush. Unix-only (Windows has no portable directory-fsync; NTFS's own metadata
+    // journaling plus `File.Move`'s atomic rename already provide the durable-replacement guarantee
+    // there) and deliberately best-effort: any failure (a read-only/unusual filesystem, a sandboxed host)
+    // is swallowed rather than surfaced, because the rename itself already succeeded and the cassette
+    // write must not fail just because the OS could not also confirm the directory entry hit disk.
+    static let bestEffortFsyncParentDir (path: string) : unit =
+        if not isWindows then
+            try
+                let dir =
+                    match Path.GetDirectoryName path with
+                    | null
+                    | "" -> "."
+                    | d -> d
+
+                let fd = NativeDirFsync.openDirFd (dir, O_RDONLY_FOR_DIR_FSYNC)
+
+                if fd >= 0 then
+                    try
+                        NativeDirFsync.fsyncFd fd |> ignore
+                    finally
+                        NativeDirFsync.closeFd fd |> ignore
+            with _ ->
+                // Best-effort: an unwriteable/exotic filesystem or a sandboxed host must not fail a
+                // write whose rename already succeeded.
+                ()
+
     // Write the cassette atomically and owner-only: serialize into a sibling temp file created `0600`
-    // from the start (so the secret-bearing bytes are never even briefly group/world-readable), then
-    // rename it over the target — same-directory rename is atomic on one filesystem, so a reader never
-    // sees a half-written cassette. On Windows the file inherits the directory ACL (restrict the
+    // from the start (so the secret-bearing bytes are never even briefly group/world-readable), flush
+    // its content to disk before the rename (so the bytes are durable even if the process crashes right
+    // after), then rename it over the target — same-directory rename is atomic on one filesystem, so a
+    // reader never sees a half-written cassette — and best-effort fsync the parent directory on Unix so
+    // the rename itself is durable too. On Windows the file inherits the directory ACL (restrict the
     // directory instead). Throws on failure after cleaning up the temp; callers decide how to report.
     static let writeCassette (path: string) (snapshot: CassetteEntry[]) : unit =
         let json =
@@ -429,10 +476,18 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 use stream = new FileStream(tempPath, options)
                 use writer = new StreamWriter(stream)
                 writer.Write json
+                writer.Flush()
+                // `flushToDisk = true` asks the OS to fsync the temp file's own bytes, so they are
+                // durable BEFORE the rename below swaps it into place — a crash right after the rename
+                // can then never leave `path` pointing at a renamed-but-not-yet-flushed temp.
+                stream.Flush true
 
         try
             writeContent () // `use` disposes here, flushing/closing before the rename
             File.Move(tempPath, path, true)
+            // Best-effort: the directory-entry swap the rename just performed is a separate metadata
+            // write from the file's own (already-durable) bytes; failure here must not fail the write.
+            bestEffortFsyncParentDir path
         with _ ->
             try
                 File.Delete tempPath

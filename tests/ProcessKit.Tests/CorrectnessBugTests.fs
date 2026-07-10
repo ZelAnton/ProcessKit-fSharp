@@ -101,6 +101,7 @@ type private ThrowingTeeStream() =
 type CorrectnessBugTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
     let runner: IProcessRunner = JobRunner()
 
     // A minimal synthetic `RunningHost` over the given config with no pipes and an immediate clean
@@ -843,5 +844,96 @@ type CorrectnessBugTests() =
             )
 
             Assert.That(teardowns, Is.GreaterThanOrEqualTo 1, "the faulted streaming verb must still reap the tree")
+        }
+        :> Task
+
+    // --- T-082: an unreadable cgroup.procs must not look like an empty (drained) group ---
+
+    [<Test>]
+    member _.``an unreadable cgroup.procs is a read failure, not an empty (drained) group``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "cgroup.procs fail-safe reads are Linux-only"
+
+            // A throwaway directory standing in for a cgroup, with its cgroup.procs made unreadable
+            // (chmod 000) — reproduces an EACCES read failure without needing a real cgroup v2 mount.
+            let dir =
+                Path.Combine(Path.GetTempPath(), $"processkit-cgroup-failsafe-{Guid.NewGuid():N}")
+
+            Directory.CreateDirectory dir |> ignore
+            let procsPath = Path.Combine(dir, "cgroup.procs")
+            File.WriteAllText(procsPath, "")
+            File.SetUnixFileMode(procsPath, UnixFileMode.None)
+
+            try
+                match Native.Cgroup.cgroupMembers dir with
+                | Ok _ ->
+                    // Running with a privilege that reads past chmod 000 (e.g. root) — the fail-safe
+                    // path under test is not reachable in this environment.
+                    Assert.Ignore
+                        "this environment can read past chmod 000 (likely running as root) — the fail-safe path under test is not reachable here"
+                | Error _ ->
+                    // The read genuinely failed — proceed to exercise every fail-safe decision built on it.
+                    ()
+
+                // The graceful-teardown "alive" (not-yet-drained) check must treat the unreadable member
+                // list as unknown, not empty — this is exactly what keeps `GracefulKillTree`'s poll loop
+                // escalating instead of reporting the tree already gone.
+                Assert.That(
+                    Native.Cgroup.cgroupAlive dir,
+                    Is.True,
+                    "an unreadable cgroup.procs must not be treated as an empty (drained) group"
+                )
+
+                // `CgroupBackend.Members`/`Stats` must propagate the read failure as an honest `Error`,
+                // never a fabricated empty member list / zero-active-process stats snapshot.
+                let backend: IContainmentBackend = CgroupBackend dir
+
+                match backend.Members() with
+                | Error(ProcessError.Io _) -> ()
+                | Error other -> Assert.Fail $"expected ProcessError.Io from Members, got {other}"
+                | Ok members -> Assert.Fail $"expected Members to surface the read failure, got Ok {members}"
+
+                match backend.Stats() with
+                | Error(ProcessError.Io _) -> ()
+                | Error other -> Assert.Fail $"expected ProcessError.Io from Stats, got {other}"
+                | Ok stats ->
+                    Assert.Fail $"expected Stats to surface the read failure, got Ok active={stats.ActiveProcessCount}"
+
+                // Block new file creation in `dir` too, so `killCgroup`'s `cgroup.kill` write (which would
+                // otherwise trivially succeed against a writable temp directory) fails and it falls
+                // through to the legacy per-pid SIGKILL sweep — the bounded retry loop this fix keeps
+                // running to its full iteration budget (50 * 2ms) instead of exiting on the first failed
+                // read.
+                File.SetUnixFileMode(dir, UnixFileMode.UserRead ||| UnixFileMode.UserExecute)
+
+                try
+                    let stopwatch = Stopwatch.StartNew()
+                    Native.Cgroup.killCgroup dir
+                    stopwatch.Stop()
+
+                    Assert.That(
+                        stopwatch.Elapsed,
+                        Is.GreaterThanOrEqualTo(TimeSpan.FromMilliseconds 90.0),
+                        "killCgroup's bounded sweep must not exit early on a persistent cgroup.procs read failure"
+                    )
+                finally
+                    // Restore write access before the outer cleanup deletes the directory.
+                    File.SetUnixFileMode(
+                        dir,
+                        UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute
+                    )
+            finally
+                (try
+                    File.SetUnixFileMode(procsPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                 with _ ->
+                     // Best-effort restore before delete; a failure here is not actionable in test cleanup.
+                     ())
+
+                (try
+                    Directory.Delete(dir, true)
+                 with _ ->
+                     // Best-effort cleanup; a leftover temp dir does not fail the test.
+                     ())
         }
         :> Task
