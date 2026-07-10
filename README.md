@@ -56,7 +56,11 @@ signal to one pid:
   shell-free pipelines, supervision — all return `Task<…>` and stream as `IAsyncEnumerable<…>`.
 - **Honest results.** A non-zero exit is data (`ProcessResult`) until you ask for success; a
   timeout is *captured* in the result; a cancellation is always an error; every platform
-  divergence is typed or documented.
+  divergence is typed or documented. A `ProcessError.Timeout` from ProcessKit carries the exact
+  configured total, idle, or pipeline deadline that fired, while `ProcessResult.Duration` remains
+  actual wall-clock time including teardown. If a custom `IProcessRunner` returns `Outcome.TimedOut`
+  without that internal cause, the configured duration is unknown and the error honestly falls back
+  to the result's actual elapsed duration.
 - **Testable.** One interface seam (`IProcessRunner`) swaps the real spawner for scripted doubles
   or record/replay cassettes — no subprocess in your tests.
 

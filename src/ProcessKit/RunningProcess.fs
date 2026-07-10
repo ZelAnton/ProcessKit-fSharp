@@ -175,6 +175,10 @@ type RunningProcess internal (host: RunningHost) =
     // verb's own, mirroring `streamOutcome`/`eventOutcome` above for the streaming sessions.
     let mutable bufferedOutcome = Unchecked.defaultof<Task<Outcome>>
 
+    // Set by the winning total/idle deadline before teardown begins, then threaded into buffered
+    // ProcessResult construction. Duration remains the complete wall-clock elapsed time.
+    let mutable configuredTimeoutDuration: TimeSpan option = None
+
     // Single-consumption guard: the output pipes are pumped exactly once. A buffered one-shot verb
     // (OutputString/OutputBytes/Wait/Profile) consumes them whole; the streaming verbs form one
     // session (`StdoutStreaming`: StdoutLines/WaitForLine/Finish share the stdout channel;
@@ -327,8 +331,10 @@ type RunningProcess internal (host: RunningHost) =
     // double kill — and report `Outcome.TimedOut`. The idle watchdog is armed inside `raceTimeout` as
     // the wait begins and reset by each stdout/stderr read through the activity-tracking wrappers.
     let waitWithTimeout () : Task<Outcome> =
-        let onTimeout () : Task =
+        let onTimeout (configuredDuration: TimeSpan) : Task =
             task {
+                configuredTimeoutDuration <- Some configuredDuration
+
                 match config.TimeoutGrace with
                 | Some grace -> do! host.GracefulKill grace
                 | None -> host.StartKill()
@@ -592,7 +598,8 @@ type RunningProcess internal (host: RunningHost) =
                                     outcome,
                                     elapsed (),
                                     outBuf.Truncated || errBuf.Truncated,
-                                    config.OkCodes
+                                    config.OkCodes,
+                                    ?configuredTimeoutDuration = configuredTimeoutDuration
                                 )
                             )
             }
@@ -654,7 +661,8 @@ type RunningProcess internal (host: RunningHost) =
                                     outcome,
                                     elapsed (),
                                     stdoutCapture.Truncated || errBuf.Truncated,
-                                    config.OkCodes
+                                    config.OkCodes,
+                                    ?configuredTimeoutDuration = configuredTimeoutDuration
                                 )
                             )
             }

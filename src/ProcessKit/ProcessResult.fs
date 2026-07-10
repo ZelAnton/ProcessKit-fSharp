@@ -19,8 +19,14 @@ type ProcessResult<'T>
         outcome: Outcome,
         duration: TimeSpan,
         truncated: bool,
-        okCodes: int list
+        okCodes: int list,
+        ?configuredTimeoutDuration: TimeSpan
     ) =
+
+    // Real runners supply the configured deadline that actually fired. Results created by third-party
+    // runners and test doubles cannot always identify that cause, so their honest backward-compatible
+    // fallback is the actual elapsed duration rather than a fabricated configured value.
+    let timeoutDuration = defaultArg configuredTimeoutDuration duration
 
     /// The program that was run.
     member _.Program = program
@@ -100,7 +106,7 @@ type ProcessResult<'T>
         match outcome with
         | Outcome.Exited code -> ProcessError.Exit(program, code, this.StdoutText, stderr)
         | Outcome.Signalled signal -> ProcessError.Signalled(program, signal, this.StdoutText, stderr)
-        | Outcome.TimedOut -> ProcessError.Timeout(program, duration, this.StdoutText, stderr)
+        | Outcome.TimedOut -> ProcessError.Timeout(program, timeoutDuration, this.StdoutText, stderr)
         | Outcome.Unobserved reason -> ProcessError.Unobserved(program, reason)
 
     /// Demand a successful run (an **accepted** exit code — one in `Command.OkCodes`, `{0}` by default):

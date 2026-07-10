@@ -207,16 +207,17 @@ type TestabilityTests() =
         | other -> Assert.Fail $"expected an Exit error, got {other}"
 
     [<Test>]
-    member _.``ProcessResult.Create carries a chosen Outcome and duration``() =
-        let result =
-            ProcessResult.Create "" "" Outcome.TimedOut (System.TimeSpan.FromSeconds 5.0)
+    member _.``ProcessResult.Create uses elapsed duration when a timeout's configured cause is unknown``() =
+        let elapsed = System.TimeSpan.FromSeconds 5.0
+        let result = ProcessResult.Create "" "" Outcome.TimedOut elapsed
 
         Assert.That(result.IsTimedOut, Is.True)
         Assert.That(result.IsSuccess, Is.False)
-        Assert.That(result.Duration, Is.EqualTo(System.TimeSpan.FromSeconds 5.0))
+        Assert.That(result.Duration, Is.EqualTo elapsed)
 
         match ProcessResult.ensureSuccess result with
-        | Error(ProcessError.Timeout _) -> ()
+        | Error(ProcessError.Timeout(_, timeout, _, _)) ->
+            Assert.That(timeout, Is.EqualTo elapsed, "configured duration unknown — using actual elapsed")
         | other -> Assert.Fail $"expected a Timeout error, got {other}"
 
     [<Test>]

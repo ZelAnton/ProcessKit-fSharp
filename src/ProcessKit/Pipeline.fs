@@ -312,7 +312,8 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                                     stage.Outcome,
                                     capture.Duration,
                                     capture.LastStdoutTruncated,
-                                    stage.OkCodes
+                                    stage.OkCodes,
+                                    ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None)
                                 )
                             )
         }
@@ -346,7 +347,8 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                                     stage.Outcome,
                                     capture.Duration,
                                     capture.LastStdoutTruncated,
-                                    stage.OkCodes
+                                    stage.OkCodes,
+                                    ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None)
                                 )
                             )
         }

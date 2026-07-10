@@ -580,6 +580,45 @@ type PipelineTests() =
         :> Task
 
     [<Test>]
+    member _.``a pipeline timeout error preserves its configured duration through delayed drain``() : Task =
+        task {
+            let configured = TimeSpan.FromMilliseconds 200.0
+            use tee = new BlockingTee()
+
+            let last =
+                (if isWindows then
+                     shell "echo ready&ping -n 6 127.0.0.1 >nul"
+                 else
+                     shell "echo ready; sleep 5")
+                |> Command.stdoutTee tee
+
+            let pipeline = ((emit [ "input" ]).Pipe last).Timeout configured
+            let stopwatch = System.Diagnostics.Stopwatch.StartNew()
+            let runTask = pipeline.OutputStringAsync()
+
+            try
+                do! tee.FirstWrite.WaitAsync(TimeSpan.FromSeconds 3.0)
+                do! Task.Delay 700
+            finally
+                tee.Release()
+
+            match! runTask with
+            | Ok result ->
+                stopwatch.Stop()
+                Assert.That(result.IsTimedOut, Is.True)
+                Assert.That(result.Duration, Is.GreaterThan configured)
+                Assert.That(stopwatch.Elapsed, Is.GreaterThan(TimeSpan.FromMilliseconds 600.0))
+
+                match result.EnsureSuccess() with
+                | Error(ProcessError.Timeout(program, actual, _, _) as error) ->
+                    Assert.That(actual, Is.EqualTo configured)
+                    Assert.That(error.Message, Is.EqualTo($"'{program}' timed out after {configured.TotalSeconds}s"))
+                | other -> Assert.Fail $"expected Timeout, got {other}"
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``a cancelled token cancels the whole pipeline``() : Task =
         task {
             let sleeper =

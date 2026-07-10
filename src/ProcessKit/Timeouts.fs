@@ -120,8 +120,9 @@ module internal Timeouts =
     /// Race a process `wait` against a total deadline (`timeout`) and/or a resettable idle deadline
     /// (`idle`, armed here as the exit wait begins). With neither armed, just returns `wait`. Otherwise:
     /// if the wait wins, cancel the total-timeout timer and return its outcome; on whichever deadline
-    /// fires first, run `onTimeout` (the kill — shared by both, so there is never a double kill), await
-    /// `wait` so the child is reaped, log the cause that fired (total vs idle), and report `TimedOut`.
+    /// fires first, pass its configured duration to `onTimeout` (the kill — shared by both, so there is
+    /// never a double kill), await `wait` so the child is reaped, log the cause that fired (total vs
+    /// idle), and report `TimedOut`.
     /// One home for the subtle CTS-cancel + reference-equality-winner logic shared by the run verbs and
     /// the group runner. (Negatives are rejected by the builder; `isArmable` screens the total defensively,
     /// so `Task.Delay` here can never throw synchronously; the idle timer was screened at construction.)
@@ -131,7 +132,7 @@ module internal Timeouts =
         (runId: string)
         (timeout: TimeSpan option)
         (idle: IdleTimer option)
-        (onTimeout: unit -> Task)
+        (onTimeout: TimeSpan -> Task)
         (wait: Task<Outcome>)
         : Task<Outcome> =
         let total =
@@ -149,10 +150,10 @@ module internal Timeouts =
                 // Each deadline task is paired with the log to emit if it is the one that fired, so a
                 // single race can carry both the total-timeout and the idle deadline yet still name the
                 // right cause.
-                let deadlines: (Task * (unit -> unit)) list =
+                let deadlines: (Task * TimeSpan * (unit -> unit)) list =
                     [ match total with
                       | Some t ->
-                          yield (Task.Delay(t, timeoutCts.Token), (fun () -> Log.timeout logger program t runId))
+                          yield (Task.Delay(t, timeoutCts.Token), t, (fun () -> Log.timeout logger program t runId))
                       | None -> ()
 
                       match idle with
@@ -160,10 +161,10 @@ module internal Timeouts =
                           // Start the idle countdown now (the exit wait has begun); each stdout/stderr
                           // read resets it via the activity-tracking stream wrapper.
                           timer.Arm()
-                          yield (timer.Expired, (fun () -> Log.idleTimeout logger program timer.Idle runId))
+                          yield (timer.Expired, timer.Idle, (fun () -> Log.idleTimeout logger program timer.Idle runId))
                       | None -> () ]
 
-                let deadlineTasks = deadlines |> List.map fst
+                let deadlineTasks = deadlines |> List.map (fun (deadline, _, _) -> deadline)
                 let! winner = Task.WhenAny(waitBase :: deadlineTasks)
 
                 if obj.ReferenceEquals(winner, waitBase) then
@@ -172,13 +173,16 @@ module internal Timeouts =
                     timeoutCts.Cancel()
                     return! wait
                 else
-                    // A deadline won: kill (once), reap the child, then log whichever deadline fired.
-                    do! onTimeout ()
+                    // A deadline won: carry its configured duration into teardown/result construction,
+                    // kill (once), reap the child, then log whichever deadline fired.
+                    let _, configuredDuration, emit =
+                        deadlines
+                        |> List.find (fun (deadline, _, _) -> obj.ReferenceEquals(deadline, winner))
+
+                    do! onTimeout configuredDuration
                     let! _ = wait
 
-                    deadlines
-                    |> List.tryFind (fun (t, _) -> obj.ReferenceEquals(t, winner))
-                    |> Option.iter (fun (_, emit) -> emit ())
+                    emit ()
 
                     return Outcome.TimedOut
             }
