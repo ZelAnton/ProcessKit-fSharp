@@ -229,8 +229,16 @@ module internal PipelineRunner =
                     // short-circuited it): the loop stops, and the post-loop match reaps the partial set and
                     // returns a prompt Cancelled/timed-out result instead of the normal full-chain path.
                     let mutable stagingHalted = false
-                    let mutable stage0Feed: Task<exn option> option = None
+                    let mutable stage0Feed: Pump.StdinFeeder option = None
                     let mutable index = 0
+
+                    // Stop stage 0's stdin feeder on every terminal path (spawn error, cancel/timeout
+                    // mid-staging, normal completion): cancelling its lifecycle token unwinds a feed
+                    // parked in the user's source (a hung `FromAsyncLines`) and disposes the user's
+                    // enumerator/stream, instead of leaking it past the run. Idempotent no-op when stage
+                    // 0 carried no source. Observe `Fault` BEFORE stopping on the success path.
+                    let stopStage0Feed () =
+                        stage0Feed |> Option.iter (fun feeder -> feeder.Stop())
 
                     // Set exactly once, the moment stage 0 actually spawns — mirroring the
                     // single-command rule that a spawn failure is never counted as a run
@@ -283,10 +291,10 @@ module internal PipelineRunner =
                                 Log.spawn logger programLabel None runId
 
                                 // Only the first stage may carry its own stdin source; feed it and keep the
-                                // feed task so a genuine source-acquisition failure (a missing `FromFile`
+                                // feeder so a genuine source-acquisition failure (a missing `FromFile`
                                 // path, say) can surface as `ProcessError.Stdin` on an otherwise-successful
                                 // pipeline — uniformly with a single command — instead of silently feeding
-                                // the stage empty input.
+                                // the stage empty input, and so the feed can be stopped on teardown.
                                 stage0Feed <- Some(Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource)
                             else
                                 match prevStdout, sp.Stdin with
@@ -342,6 +350,7 @@ module internal PipelineRunner =
                         // group's `use` dispose alone hard-kills but does not waitpid POSIX leaders or
                         // close these parent-side streams, so without this they would leak.
                         group.KillTree()
+                        stopStage0Feed ()
 
                         let! _ =
                             spawned
@@ -377,6 +386,7 @@ module internal PipelineRunner =
                         // handle leak. The explicit `KillTree` makes the kill happen-before the waits, so the
                         // reap can never block on a raced stage the callback had not reached yet.
                         group.KillTree()
+                        stopStage0Feed ()
 
                         let! killedOutcomes =
                             spawned
@@ -586,11 +596,11 @@ module internal PipelineRunner =
 
                             // Observe the stage-0 stdin fault without blocking: only a feed that has
                             // finished (a missing `FromFile` faults synchronously at spawn) yields its
-                            // stashed source failure — matching the single-command observer.
-                            let stdin0Error =
-                                match stage0Feed with
-                                | Some feed when feed.IsCompletedSuccessfully -> feed.Result
-                                | _ -> None
+                            // stashed source failure — matching the single-command observer. Stop the
+                            // feeder afterwards so a still-parked source feed (a hung `FromAsyncLines`)
+                            // is cancelled and its enumerator disposed rather than leaked past the run.
+                            let stdin0Error = stage0Feed |> Option.bind (fun feeder -> feeder.Fault)
+                            stopStage0Feed ()
 
                             return
                                 Ok
