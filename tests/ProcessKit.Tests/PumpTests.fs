@@ -62,6 +62,36 @@ type private FaultyReadStdinStream() =
     override _.ReadAsync(_buffer: Memory<byte>, _cancellationToken: CancellationToken) : ValueTask<int> =
         raise (InvalidOperationException "read-source-boom")
 
+/// A stdout/stderr double whose read yields `chunks` (if any), in order, then throws `fault` on the
+/// next read — the deterministic way to drive `Pump.readLinesUntilDone`'s genuine-read-fault-vs-
+/// teardown-race classification (T-087) without a live child pipe.
+type private ErroringReadStream(chunks: byte[] list, fault: exn) =
+    inherit Stream()
+    let mutable remaining = chunks
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = ()
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) : int = raise (NotSupportedException())
+
+    override _.ReadAsync(buffer: Memory<byte>, _cancellationToken: CancellationToken) : ValueTask<int> =
+        match remaining with
+        | chunk :: rest ->
+            remaining <- rest
+            chunk.AsSpan().CopyTo(buffer.Span)
+            ValueTask<int>(chunk.Length)
+        | [] -> raise fault
+
 /// Direct tests of the internal output pump: decoding (BOM, multibyte boundaries, line endings)
 /// and the `OutputBufferPolicy` retention logic. These drive `Pump.readLines` / `Pump.LineBuffer`
 /// over in-memory streams, so they are deterministic and need no subprocess.
@@ -191,9 +221,95 @@ type PumpTests() =
                     None
                     (fun _ -> ValueTask.CompletedTask)
                     None
+                    (fun () -> false)
                     CancellationToken.None)
 
         Assert.ThrowsAsync<DecoderFallbackException>(action) |> ignore
+
+    // --- T-087: readLinesUntilDone's genuine-read-fault vs teardown-race classification ---
+
+    [<Test>]
+    member _.``readLinesUntilDone surfaces a genuine mid-stream IOException when teardown has not begun``() =
+        use stream =
+            new ErroringReadStream([ Encoding.UTF8.GetBytes "partial" ], IOException "disk read error")
+
+        let lines = ResizeArray<string>()
+
+        let action =
+            Func<Task>(fun () ->
+                Pump.readLinesUntilDone
+                    stream
+                    Encoding.UTF8
+                    LineTerminator.Lf
+                    None
+                    (fun l ->
+                        lines.Add l
+                        ValueTask.CompletedTask)
+                    None
+                    (fun () -> false)
+                    CancellationToken.None)
+
+        Assert.ThrowsAsync<IOException>(action) |> ignore
+
+    [<Test>]
+    member _.``readLinesUntilDone surfaces a genuine ObjectDisposedException when teardown has not begun``() =
+        use stream = new ErroringReadStream([], ObjectDisposedException "stream")
+
+        let action =
+            Func<Task>(fun () ->
+                Pump.readLinesUntilDone
+                    stream
+                    Encoding.UTF8
+                    LineTerminator.Lf
+                    None
+                    (fun _ -> ValueTask.CompletedTask)
+                    None
+                    (fun () -> false)
+                    CancellationToken.None)
+
+        Assert.ThrowsAsync<ObjectDisposedException>(action) |> ignore
+
+    [<Test>]
+    member _.``readLinesUntilDone swallows an IOException once teardown has begun (no false positive)``() =
+        // Non-regression: the routine dispose/broken-pipe race this library's own teardown triggers by
+        // design must still be swallowed quietly, not misclassified as a genuine fault. The task
+        // completes without throwing (the still-unterminated in-flight line is never flushed, since the
+        // fault interrupts the read loop before the clean-EOF path that would flush it — same as any
+        // other mid-line teardown race).
+        use stream =
+            new ErroringReadStream([ Encoding.UTF8.GetBytes "partial" ], IOException "pipe closed")
+
+        let lines = ResizeArray<string>()
+
+        (Pump.readLinesUntilDone
+            stream
+            Encoding.UTF8
+            LineTerminator.Lf
+            None
+            (fun l ->
+                lines.Add l
+                ValueTask.CompletedTask)
+            None
+            (fun () -> true)
+            CancellationToken.None)
+            .Wait()
+
+        CollectionAssert.AreEqual([], lines)
+
+    [<Test>]
+    member _.``readLinesUntilDone swallows an ObjectDisposedException once teardown has begun (no false positive)``() =
+        use stream = new ErroringReadStream([], ObjectDisposedException "stream")
+
+        (Pump.readLinesUntilDone
+            stream
+            Encoding.UTF8
+            LineTerminator.Lf
+            None
+            (fun _ -> ValueTask.CompletedTask)
+            None
+            (fun () -> true)
+            CancellationToken.None)
+            .Wait()
 
     [<Test>]
     member _.``readLines strips CRLF and LF``() =

@@ -113,10 +113,20 @@ module internal StreamChannel =
     // of `Pump`'s buffered capture (which captures to a `LineBuffer` instead). No-op when the stream
     // isn't piped. The caller owns the sink (a channel writer, a buffer) and any completion signal.
     // No in-flight line cap for streaming: it is consumer-paced and applies no buffer policy, so a
-    // consumer receives whole lines (the in-flight cap is a buffered-verb concern).
-    let pumpLines (stream: Stream option) encoding terminator tee (onLine: string -> ValueTask) =
+    // consumer receives whole lines (the in-flight cap is a buffered-verb concern). `isTearingDown`
+    // is threaded straight through to `Pump.readLinesUntilDone`'s genuine-vs-teardown-race
+    // classification (T-087) — the caller reports whether ITS handle's own teardown has begun.
+    let pumpLines
+        (stream: Stream option)
+        encoding
+        terminator
+        tee
+        (onLine: string -> ValueTask)
+        (isTearingDown: unit -> bool)
+        =
         task {
             match stream with
-            | Some s -> do! Pump.readLinesUntilDone s encoding terminator tee onLine None CancellationToken.None
+            | Some s ->
+                do! Pump.readLinesUntilDone s encoding terminator tee onLine None isTearingDown CancellationToken.None
             | None -> ()
         }

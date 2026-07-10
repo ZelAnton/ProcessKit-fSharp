@@ -282,6 +282,20 @@ type RunningProcess internal (host: RunningHost) =
         | Some cb -> cb.Invoke line
         | None -> ()
 
+    // Reclassify a fault escaping a stdout/stderr pump into a typed `ProcessError.Io` when it is one
+    // of the two exception types that only ever reach a pump's caller as a GENUINE read fault —
+    // `Pump.readLinesUntilDone`'s `genuineReadFault` already filtered out the routine teardown-race
+    // case for the streaming pumps below, and the buffered pumps (`pumpToBuffer` / the discard drains
+    // in `WaitAsync`/`ProfileAsync`) never race this handle's own teardown at all (`reapGuard`'s
+    // load-bearing invariant: every verb awaits its pumps before disposing). Any other pump fault (a
+    // throwing line handler, a decoder failure, an already-typed `ProcessException` from
+    // `StreamChannel`'s fail-loud bounded-channel mode) passes through unchanged — T-087.
+    let reportedPumpFault (ex: exn) : exn =
+        match ex with
+        | :? IOException
+        | :? ObjectDisposedException -> ProcessException(ProcessError.Io ex.Message) :> exn
+        | _ -> ex
+
     let pumpToBuffer (stream: Stream) encoding terminator tee (callback: Action<string> option) counter =
         task {
             let buffer = Pump.LineBuffer(config.OutputBuffer)
@@ -294,9 +308,38 @@ type RunningProcess internal (host: RunningHost) =
 
             // Pass the buffer's byte cap as the in-flight line ceiling too, so a newline-free flood
             // can't grow the assembly buffer past it (the forced segments go through `buffer`'s policy).
-            do! Pump.readLines stream encoding terminator tee onLine config.OutputBuffer.MaxBytes CancellationToken.None
+            //
+            // A genuine OS read fault here (`IOException`/`ObjectDisposedException`) is reclassified
+            // into `ProcessError.Io` (via `reportedPumpFault`) so the caller reports an honest,
+            // incomplete-capture failure instead of a silently truncated success — T-087.
+            try
+                do!
+                    Pump.readLines
+                        stream
+                        encoding
+                        terminator
+                        tee
+                        onLine
+                        config.OutputBuffer.MaxBytes
+                        CancellationToken.None
+            with
+            | :? IOException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
+            | :? ObjectDisposedException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
+
             return buffer
         }
+
+    // Drain a stream to EOF discarding output (`WaitAsync`/`ProfileAsync`), reclassifying a genuine
+    // OS read fault into `ProcessError.Io` exactly like `pumpToBuffer` above — T-087.
+    let drainDiscardReporting (stream: Stream option) : Task =
+        task {
+            try
+                do! Pump.drainDiscardOrEmpty stream CancellationToken.None
+            with
+            | :? IOException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
+            | :? ObjectDisposedException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
+        }
+        :> Task
 
     let pumpStdoutBuffer () =
         match stdoutStream with
@@ -697,8 +740,8 @@ type RunningProcess internal (host: RunningHost) =
         task {
             use _reap = reapGuard ()
             // Drain both pipes (so the child never blocks on a full buffer) without retaining.
-            let stdoutTask = Pump.drainDiscardOrEmpty stdoutStream CancellationToken.None
-            let stderrTask = Pump.drainDiscardOrEmpty stderrStream CancellationToken.None
+            let stdoutTask = drainDiscardReporting stdoutStream
+            let stderrTask = drainDiscardReporting stderrStream
             // Observe both drains together so an I/O fault on one can't orphan the other;
             // `awaitBufferedOutcome` additionally guarantees this even if the exit wait itself faults.
             let! outcome = awaitBufferedOutcome (ensureBufferedWait ()) [| stdoutTask; stderrTask |]
@@ -754,8 +797,8 @@ type RunningProcess internal (host: RunningHost) =
                         ()
                 }
 
-            let stdoutTask = Pump.drainDiscardOrEmpty stdoutStream CancellationToken.None
-            let stderrTask = Pump.drainDiscardOrEmpty stderrStream CancellationToken.None
+            let stdoutTask = drainDiscardReporting stdoutStream
+            let stderrTask = drainDiscardReporting stderrStream
 
             // Capture a fault rather than letting it escape immediately, so the sampler is ALWAYS
             // cancelled and awaited before its CTS is disposed at scope exit — never left running as
@@ -829,29 +872,42 @@ type RunningProcess internal (host: RunningHost) =
                                             readStdoutLineCount
                                             bumpDroppedStreamLine
                                             line)
+                                    (fun () -> disposalCts.Token.IsCancellationRequested)
 
                             stdoutChannel.Writer.Complete()
                         with ex ->
-                            // A pump fault — a throwing `OnStdoutLine` handler, or `StreamFullMode.Error`
-                            // tripping its cap — must still complete the channel, carrying the error, so a
-                            // `StdoutLinesAsync` consumer observes it instead of hanging on a reader that
-                            // never ends. Re-raise (preserving the original stack; `reraise` is unavailable
-                            // inside a task CE) so `streamOutcome` / `FinishAsync` surface the same fault.
-                            stdoutChannel.Writer.Complete ex
-                            ExceptionDispatchInfo.Throw ex
+                            // A pump fault — a throwing `OnStdoutLine` handler, `StreamFullMode.Error`
+                            // tripping its cap, or a genuine OS read fault (reclassified into
+                            // `ProcessError.Io` by `reportedPumpFault` — T-087) — must still complete the
+                            // channel, carrying the error, so a `StdoutLinesAsync` consumer observes it
+                            // instead of hanging on a reader that never ends. Re-raise (preserving the
+                            // original stack; `reraise` is unavailable inside a task CE) so `streamOutcome`
+                            // / `FinishAsync` surface the same fault.
+                            let reported = reportedPumpFault ex
+                            stdoutChannel.Writer.Complete reported
+                            ExceptionDispatchInfo.Throw reported
                     }
 
                 let stderrPump =
-                    StreamChannel.pumpLines
-                        stderrStream
-                        config.StderrEncoding
-                        config.StderrLineTerminator
-                        config.StderrTee
-                        (fun line ->
-                            invokeLine config.OnStderrLine line
-                            bumpStderrLine ()
-                            stderrBuffer.Add line
-                            ValueTask.CompletedTask)
+                    task {
+                        try
+                            do!
+                                StreamChannel.pumpLines
+                                    stderrStream
+                                    config.StderrEncoding
+                                    config.StderrLineTerminator
+                                    config.StderrTee
+                                    (fun line ->
+                                        invokeLine config.OnStderrLine line
+                                        bumpStderrLine ()
+                                        stderrBuffer.Add line
+                                        ValueTask.CompletedTask)
+                                    (fun () -> disposalCts.Token.IsCancellationRequested)
+                        with ex ->
+                            // A genuine OS read fault is reclassified into `ProcessError.Io` (T-087) before
+                            // it faults `streamOutcome` / `FinishAsync` below.
+                            ExceptionDispatchInfo.Throw(reportedPumpFault ex)
+                    }
 
                 // A fault in either pump kills the tree at once, so a still-producing child can't wedge
                 // `waitWithTimeout()` (below) by blocking on a pipe its dead pump no longer drains — the
@@ -931,19 +987,28 @@ type RunningProcess internal (host: RunningHost) =
                     task {
                         try
                             do!
-                                StreamChannel.pumpLines stream encoding terminator tee (fun line ->
-                                    invokeLine onLine line
-                                    bump ()
+                                StreamChannel.pumpLines
+                                    stream
+                                    encoding
+                                    terminator
+                                    tee
+                                    (fun line ->
+                                        invokeLine onLine line
+                                        bump ()
 
-                                    writeStreamItem
-                                        eventChannel.Writer
-                                        eventChannel.Reader
-                                        countSoFar
-                                        bumpDroppedStreamLine
-                                        (wrap (OutputLine line)))
+                                        writeStreamItem
+                                            eventChannel.Writer
+                                            eventChannel.Reader
+                                            countSoFar
+                                            bumpDroppedStreamLine
+                                            (wrap (OutputLine line)))
+                                    (fun () -> disposalCts.Token.IsCancellationRequested)
                         with ex ->
-                            eventChannel.Writer.TryComplete ex |> ignore
-                            ExceptionDispatchInfo.Throw ex
+                            // A genuine OS read fault is reclassified into `ProcessError.Io` (T-087)
+                            // before it completes the channel / faults `eventOutcome` below.
+                            let reported = reportedPumpFault ex
+                            eventChannel.Writer.TryComplete reported |> ignore
+                            ExceptionDispatchInfo.Throw reported
                     }
 
                 let stdoutPump =

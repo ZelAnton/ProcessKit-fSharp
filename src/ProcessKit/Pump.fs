@@ -570,9 +570,32 @@ module internal Pump =
         }
         :> Task
 
+    /// Classify an `ObjectDisposedException`/`IOException` caught by a background pump
+    /// (`readLinesUntilDone`) reading a live child's stdout/stderr pipe. `isTearingDown` is polled
+    /// at the moment the exception is CAUGHT (not when the read started), reporting whether this
+    /// handle's own teardown has already begun disposing the pipe streams (`RunningProcess`'s
+    /// `disposalCts` is cancelled immediately before `host.Teardown()` runs — see
+    /// `RunningProcess.reapGuard`/`DisposeAsync`). When it has, the identical exception types are
+    /// the routine dispose/broken-pipe race this library's own teardown triggers by design (closing
+    /// the streams while a still-running background pump may be mid-read) and are swallowed
+    /// (`None`) — the run's outcome still reflects the child. Otherwise the exception is a genuine
+    /// OS-level read failure (or an unexpected external dispose) and is returned (`Some`) so the
+    /// caller can surface it as `ProcessError.Io` instead of silently ending the capture as if it
+    /// were a clean EOF. By analogy with `genuineStdinFault`/`StdinSourceFault` below, which draw
+    /// the equivalent genuine-vs-benign distinction for the stdin-feed side.
+    let private genuineReadFault (isTearingDown: unit -> bool) (ex: exn) : exn option =
+        match ex with
+        | :? ObjectDisposedException
+        | :? IOException -> if isTearingDown () then None else Some ex
+        | _ -> Some ex
+
     /// `readLines` for a background pump: swallows the disposal / broken-pipe exceptions of a
-    /// teardown race (the stream closed underneath an in-flight read), so the task never faults
-    /// unobserved.
+    /// teardown race — the stream closed underneath an in-flight read AFTER `isTearingDown` started
+    /// reporting `true` (see `genuineReadFault`) — so the task never faults unobserved on a routine
+    /// teardown. A GENUINE read fault — the identical exception types, but caught while
+    /// `isTearingDown` still reports `false` — is a real OS-level read failure and is re-raised
+    /// (preserving its original stack via `ExceptionDispatchInfo`) so the caller can surface it as
+    /// `ProcessError.Io` instead of silently reporting a truncated capture as a success.
     let readLinesUntilDone
         (stream: Stream)
         (encoding: Encoding)
@@ -580,18 +603,25 @@ module internal Pump =
         (tee: Stream option)
         (onLine: string -> ValueTask)
         (maxLineLength: int option)
+        (isTearingDown: unit -> bool)
         (cancellationToken: CancellationToken)
         : Task =
         task {
             try
                 do! readLines stream encoding terminator tee onLine maxLineLength cancellationToken
             with
-            | :? ObjectDisposedException ->
-                // The stream was torn down (early dispose) while reading. Stop quietly.
-                ()
-            | :? IOException ->
-                // The pipe broke during teardown. Stop; the run's outcome reflects the child.
-                ()
+            | :? ObjectDisposedException as ex ->
+                match genuineReadFault isTearingDown ex with
+                | Some fault -> ExceptionDispatchInfo.Throw fault
+                | None ->
+                    // The stream was torn down (early dispose) while reading. Stop quietly.
+                    ()
+            | :? IOException as ex ->
+                match genuineReadFault isTearingDown ex with
+                | Some fault -> ExceptionDispatchInfo.Throw fault
+                | None ->
+                    // The pipe broke during teardown. Stop; the run's outcome reflects the child.
+                    ()
         }
         :> Task
 
