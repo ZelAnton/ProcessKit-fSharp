@@ -68,6 +68,32 @@ type private GatedStream(payload: byte[]) =
 
         ValueTask<int>(run)
 
+/// A write-only `Stream` whose every write throws — a stand-in for a `Command.stdoutTee` sink that
+/// faults, so the T-066 fault-teardown tests can drive a pump fault through the *tee* path (as
+/// distinct from a throwing line handler) and prove it still kills the tree instead of hanging.
+type private ThrowingTeeStream() =
+    inherit Stream()
+
+    override _.CanRead = false
+    override _.CanSeek = false
+    override _.CanWrite = true
+    override _.Length = 0L
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) = raise (NotSupportedException())
+
+    override _.Write(_buffer, _offset, _count) =
+        raise (InvalidOperationException "tee-boom")
+
+    override _.WriteAsync(_buffer: ReadOnlyMemory<byte>, _cancellationToken: CancellationToken) : ValueTask =
+        raise (InvalidOperationException "tee-boom")
+
 /// Regression tests for the correctness & robustness fixes: timeout validation/clamping, the
 /// single-consumption guard on `RunningProcess`, pipeline per-stage `OkCodes`, and pipeline wiring
 /// of a stage whose stdout was set non-piped.
@@ -76,6 +102,23 @@ type CorrectnessBugTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
     let runner: IProcessRunner = JobRunner()
+
+    // A minimal synthetic `RunningHost` over the given config with no pipes and an immediate clean
+    // exit — the T-066 concurrency/fault tests below override just the fields they need (`Stdout`,
+    // `Wait`, `StartKill`, `Teardown`) with `{ baseHost cfg with ... }`.
+    let baseHost (config: CommandConfig) : RunningHost =
+        { Config = config
+          Pid = None
+          Stdout = None
+          Stderr = None
+          Stdin = None
+          StartTime = DateTime.UtcNow
+          StartedTimestamp = Stopwatch.GetTimestamp()
+          Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+          StdinError = fun () -> None
+          StartKill = ignore
+          GracefulKill = fun _ -> Task.CompletedTask
+          Teardown = fun () -> ValueTask() }
 
     let shell (script: string) =
         if isWindows then
@@ -503,3 +546,273 @@ type CorrectnessBugTests() =
                 Assert.Fail "a pipefail failure must win over the stdin failure, not surface ProcessError.Stdin"
             | Error other -> Assert.Fail $"unexpected error: {other.Message}"
         }
+
+    // --- T-066: atomic claim/transition state machine, and fault-aware terminal teardown ---
+
+    [<Test>]
+    member _.``concurrent buffered verbs on one handle resolve to a single winner``() : Task =
+        task {
+            // A synchronous barrier releases many threads onto the SAME handle at once; the atomic
+            // `claimBuffered` must let exactly one win and refuse every other with `Unsupported`,
+            // rather than several observing `Fresh` and double-pumping the one stdout pipe.
+            let attempts = 24
+            let config = (Command.create "test").Config
+            let stdout = new MemoryStream(Encoding.UTF8.GetBytes "hello\n") :> Stream
+
+            let host =
+                { baseHost config with
+                    Stdout = Some stdout }
+
+            use running = new RunningProcess(host)
+            let results = Array.zeroCreate<int> attempts
+            use ready = new CountdownEvent(attempts)
+            use gate = new ManualResetEventSlim(false)
+
+            let threads =
+                [| for i in 0 .. attempts - 1 do
+                       let t =
+                           Thread(
+                               ThreadStart(fun () ->
+                                   ready.Signal() |> ignore
+                                   gate.Wait()
+
+                                   results[i] <-
+                                       match running.OutputStringAsync().GetAwaiter().GetResult() with
+                                       | Ok _ -> 1
+                                       | Error(ProcessError.Unsupported _) -> 0
+                                       | Error _ -> -1)
+                           )
+
+                       t.IsBackground <- true
+                       t.Start()
+                       yield t |]
+
+            ready.Wait()
+            gate.Set()
+
+            for t in threads do
+                t.Join()
+
+            Assert.That(results |> Array.contains -1, Is.False, "a verb failed with an unexpected error")
+
+            Assert.That(
+                results |> Array.filter (fun r -> r = 1) |> Array.length,
+                Is.EqualTo 1,
+                "exactly one buffered verb must win the claim"
+            )
+
+            Assert.That(
+                results |> Array.filter (fun r -> r = 0) |> Array.length,
+                Is.EqualTo(attempts - 1),
+                "every loser must be refused with Unsupported"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``concurrent TakeStdin hands out the interactive stdin at most once``() : Task =
+        task {
+            // Two concurrent `TakeStdin` calls must not both observe `not stdinTaken` and hand out the
+            // same stdin stream twice — the atomic guard admits exactly one.
+            let attempts = 24
+            let config = (Command.create "test" |> Command.keepStdinOpen).Config
+            let stdin = new MemoryStream() :> Stream
+
+            let host =
+                { baseHost config with
+                    Stdin = Some stdin }
+
+            use running = new RunningProcess(host)
+            let granted = Array.zeroCreate<bool> attempts
+            use ready = new CountdownEvent(attempts)
+            use gate = new ManualResetEventSlim(false)
+
+            let threads =
+                [| for i in 0 .. attempts - 1 do
+                       let t =
+                           Thread(
+                               ThreadStart(fun () ->
+                                   ready.Signal() |> ignore
+                                   gate.Wait()
+                                   granted[i] <- (running.TakeStdin()).IsSome)
+                           )
+
+                       t.IsBackground <- true
+                       t.Start()
+                       yield t |]
+
+            ready.Wait()
+            gate.Set()
+
+            for t in threads do
+                t.Join()
+
+            Assert.That(
+                granted |> Array.filter id |> Array.length,
+                Is.EqualTo 1,
+                "TakeStdin must hand out the stdin stream to exactly one concurrent caller"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``concurrent ExitTask access builds the exit wait exactly once``() : Task =
+        task {
+            // Many threads race `ExitTask` on a fresh handle behind a barrier. The memoization must be
+            // atomic: every caller receives the one same task object, and only one drain ever reads the
+            // pipe (a `GatedStream` proves no two readers were ever in flight at once).
+            let attempts = 24
+            let config = (Command.create "test").Config
+            let stdout = new GatedStream(Encoding.UTF8.GetBytes "hello")
+
+            let host =
+                { baseHost config with
+                    Stdout = Some(stdout :> Stream) }
+
+            use running = new RunningProcess(host)
+            let results = Array.zeroCreate<Task<Outcome>> attempts
+            use ready = new CountdownEvent(attempts)
+            use gate = new ManualResetEventSlim(false)
+
+            let threads =
+                [| for i in 0 .. attempts - 1 do
+                       let t =
+                           Thread(
+                               ThreadStart(fun () ->
+                                   ready.Signal() |> ignore
+                                   gate.Wait()
+                                   results[i] <- running.ExitTask)
+                           )
+
+                       t.IsBackground <- true
+                       t.Start()
+                       yield t |]
+
+            ready.Wait()
+            gate.Set()
+
+            for t in threads do
+                t.Join()
+
+            Assert.That(
+                results |> Array.forall (fun t -> obj.ReferenceEquals(t, results[0])),
+                Is.True,
+                "every concurrent ExitTask must return the one memoized task"
+            )
+
+            // Let the single drain finish so nothing is left pending, then confirm only one reader ran.
+            stdout.Release()
+            let! _ = results[0]
+            Assert.That(stdout.EverConcurrent, Is.False, "two readers pumped the same stdout pipe")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a faulting output pump kills the tree instead of hanging on a wedged exit wait``() : Task =
+        task {
+            // The child never exits on its own — only a kill completes `Wait`, exactly like a verbose
+            // child wedged writing to a full pipe once its faulted pump stopped draining. A throwing
+            // OnStdoutLine handler must therefore kill the tree so the exit wait concludes and the run
+            // is reaped in bounded time WITHOUT any configured timeout — surfacing the ORIGINAL fault.
+            let mutable teardowns = 0
+
+            let killTcs =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let stdout =
+                new MemoryStream(Encoding.UTF8.GetBytes "line1\nline2\nline3\n") :> Stream
+
+            let config =
+                (Command.create "test"
+                 |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom")))
+                    .Config
+
+            let host =
+                { baseHost config with
+                    Stdout = Some stdout
+                    Wait = fun () -> killTcs.Task
+                    StartKill = fun () -> killTcs.TrySetResult(Outcome.Exited 137) |> ignore
+                    Teardown =
+                        fun () ->
+                            teardowns <- teardowns + 1
+                            ValueTask() }
+
+            use running = new RunningProcess(host)
+            let verb = running.OutputStringAsync() :> Task
+            let! winner = Task.WhenAny(verb, Task.Delay 10000)
+
+            Assert.That(
+                obj.ReferenceEquals(winner, verb),
+                Is.True,
+                "the verb hung — a faulting pump did not kill the wedged exit wait"
+            )
+
+            let mutable caught = None
+
+            try
+                do! verb
+            with ex ->
+                caught <- Some ex.Message
+
+            Assert.That(
+                caught,
+                Is.EqualTo(Some "boom"),
+                "the original handler fault must surface, not a secondary closed-pipe error"
+            )
+
+            Assert.That(teardowns, Is.GreaterThanOrEqualTo 1, "the faulted verb must still reap the tree")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a faulting stdout tee kills the tree on the streaming path instead of hanging``() : Task =
+        task {
+            // The same wedge, on the streaming terminal path (`FinishAsync`) and via a faulting tee
+            // rather than a line handler: the tee fault must kill the tree so `streamOutcome`'s exit
+            // wait concludes and `FinishAsync` surfaces the original tee fault in bounded time.
+            let mutable teardowns = 0
+
+            let killTcs =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let stdout = new MemoryStream(Encoding.UTF8.GetBytes "line1\nline2\n") :> Stream
+
+            let config =
+                (Command.create "test" |> Command.stdoutTee (new ThrowingTeeStream() :> Stream)).Config
+
+            let host =
+                { baseHost config with
+                    Stdout = Some stdout
+                    Wait = fun () -> killTcs.Task
+                    StartKill = fun () -> killTcs.TrySetResult(Outcome.Exited 137) |> ignore
+                    Teardown =
+                        fun () ->
+                            teardowns <- teardowns + 1
+                            ValueTask() }
+
+            use running = new RunningProcess(host)
+            let finish = running.FinishAsync() :> Task
+            let! winner = Task.WhenAny(finish, Task.Delay 10000)
+
+            Assert.That(
+                obj.ReferenceEquals(winner, finish),
+                Is.True,
+                "FinishAsync hung — a faulting tee did not kill the wedged exit wait"
+            )
+
+            let mutable caught = None
+
+            try
+                do! finish
+            with ex ->
+                caught <- Some ex.Message
+
+            Assert.That(
+                caught,
+                Is.EqualTo(Some "tee-boom"),
+                "the original tee fault must surface, not a secondary closed-pipe error"
+            )
+
+            Assert.That(teardowns, Is.GreaterThanOrEqualTo 1, "the faulted streaming verb must still reap the tree")
+        }
+        :> Task
