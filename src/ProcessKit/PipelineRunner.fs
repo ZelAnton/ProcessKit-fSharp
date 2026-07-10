@@ -60,6 +60,102 @@ module internal PipelineRunner =
     /// returns. `None` (the default) in every production run; nothing but a test ever sets it.
     let mutable stageSpawnedTestHook: (int -> unit) option = None
 
+    /// The terminal observation of every pipeline stage, as seen when the whole chain has finished:
+    /// each stage's final `Outcome` (left-to-right), whether the chain's own proactive teardown caught
+    /// it (`TornDown` victim — de-prioritized by the pipefail fold so a killed sibling never steals the
+    /// blame), and whether the whole-chain deadline had fired by the moment the LAST stage reached a
+    /// terminal state (`TimedOut`). The timeout verdict is fixed here — the instant every stage is done,
+    /// *before* any slow relay/tee/stderr drain — so a lingering user tee or a slow drain can never
+    /// retroactively turn an already-decided success into a timeout (T-071).
+    type internal StageObservation =
+        { Outcomes: Outcome[]
+          TornDown: bool[]
+          TimedOut: bool }
+
+    /// Observe every stage's exit in the order the exits are actually *seen* — one sequential `WhenAny`
+    /// drain of the per-stage wait tasks rather than N parallel continuations each reading a shared
+    /// teardown token after its own `await`. That is the crux of T-071: the "finished before vs. after
+    /// the proactive teardown fired" classification must follow real completion order, not the
+    /// scheduler's order of running continuations. With N independent continuations, a stage whose
+    /// process exited *before* a sibling's failure could still be mislabelled a teardown victim purely
+    /// because its continuation happened to run *after* the sibling's fired the teardown — and the
+    /// pipefail fold would then blame the wrong stage. A single sequential drain removes that slop: each
+    /// exit is classified atomically with the kill decision at the point it is observed.
+    ///
+    /// For each stage, in completion order: record its outcome; mark it a teardown **victim**
+    /// (`TornDown`) iff the teardown had already fired when this exit was seen; and, if this stage is
+    /// itself the first genuine *checked* failure (not already a victim, and not under a whole-chain
+    /// cancel/timeout teardown), fire the proactive teardown that hard-kills the still-running rest of
+    /// the chain. Once every stage is terminal, sample the timeout verdict and disarm the deadline timer
+    /// before returning, so the caller's subsequent (possibly slow) drain/tee runs with no armed timer.
+    ///
+    /// - `isCheckedFailure i outcome` — stage `i`'s outcome is a blame-worthy *checked* failure (its own
+    ///   `UncheckedInPipe`/`OkCodes` already applied).
+    /// - `killTree` — the proactive teardown kill (idempotent; a no-op once the tree is already down).
+    /// - `externallyCancelled` — the whole chain is already being torn down by its timeout or an external
+    ///   cancellation, so a stage failing under it must NOT fire a second, redundant teardown.
+    /// - `timeoutFired` — the whole-chain deadline (`timeoutCts`) has fired; sampled exactly once, the
+    ///   moment every stage is terminal, to fix the timeout verdict before the optional slow drain/tee.
+    /// - `disarmTimeout` — disarm the deadline timer once all stages are terminal, so it can neither fire
+    ///   during the slow drain/tee nor leave an armed timer able to convert a settled success into a timeout.
+    let internal observeStages
+        (waits: Task<Outcome>[])
+        (isCheckedFailure: int -> Outcome -> bool)
+        (killTree: unit -> unit)
+        (externallyCancelled: unit -> bool)
+        (timeoutFired: unit -> bool)
+        (disarmTimeout: unit -> unit)
+        : Task<StageObservation> =
+        task {
+            let count = waits.Length
+            let outcomes = Array.zeroCreate<Outcome> count
+            let tornDown = Array.zeroCreate<bool> count
+            let mutable teardownFired = false
+            // The stage indices not yet observed, drained in real completion order by `WhenAny` below.
+            let remaining = ResizeArray<int>(seq { 0 .. count - 1 })
+
+            while remaining.Count > 0 do
+                let pending = [| for i in remaining -> waits[i] |]
+                let! completed = Task.WhenAny pending
+
+                // `completed` is reference-equal to whichever `pending` element finished first; map it
+                // back to its original stage index before draining it from the remaining set.
+                let slot =
+                    pending
+                    |> Array.findIndex (fun (t: Task<Outcome>) -> obj.ReferenceEquals(t, completed))
+
+                let index = remaining[slot]
+                remaining.RemoveAt slot
+
+                // Await the finished wait to unwrap its outcome (and propagate a genuine wait fault
+                // exactly as the previous `Task.WhenAll` over the per-stage waits would have).
+                let! outcome = completed
+                outcomes[index] <- outcome
+
+                // Victim iff the teardown had already fired when THIS exit was seen. Because the drain is
+                // sequential, this snapshot is atomic against the kill decision below: a stage seen before
+                // the teardown is never mislabelled a victim by a later-running sibling continuation.
+                let victim = teardownFired
+                tornDown[index] <- victim
+
+                if not victim && not (externallyCancelled ()) && isCheckedFailure index outcome then
+                    // The first genuine checked failure fires the proactive teardown once (idempotent),
+                    // hard-killing the still-running rest of the chain instead of waiting on a pipe EOF a
+                    // quiet sibling may never deliver. It stays the (non-torn) culprit.
+                    teardownFired <- true
+                    killTree ()
+
+            // Every stage is terminal: fix the timeout verdict now — before the caller's slow relay/tee/
+            // stderr drain — and disarm the deadline timer so it cannot fire during that tail.
+            let timedOut = timeoutFired ()
+            disarmTimeout ()
+
+            return
+                { Outcomes = outcomes
+                  TornDown = tornDown
+                  TimedOut = timedOut }
+        }
+
     /// Spawn every stage into one fresh shared group, wire each stage's stdout to the next stage's
     /// stdin (no shell involved), capture the last stage's stdout, and reap the whole tree on exit.
     /// Cancellation or the optional `timeout` hard-kill the tree.
@@ -399,38 +495,40 @@ module internal PipelineRunner =
                         // genuine stage failure fires it: an `UncheckedInPipe` stage's unclean exit is
                         // forgiven (never a pipefail culprit, so never a teardown trigger), and a tree
                         // already being torn down by the whole-chain timeout or cancellation (`linkedCts`)
-                        // suppresses it — that path is killing the tree itself.
-                        use teardownCts = new CancellationTokenSource()
-                        let tornDown = Array.zeroCreate<bool> spawned.Count
+                        // suppresses it — that path is killing the tree itself. The whole before/after-
+                        // teardown classification, plus the timeout verdict, is decided in one sequential
+                        // drain (`observeStages`, T-071) so it follows real exit order rather than the
+                        // order stray continuations happen to run in.
+                        let isCheckedFailure (index: int) (outcome: Outcome) =
+                            not stages[index].Config.UncheckedInPipe
+                            && not (outcome.IsAcceptedBy stages[index].Config.OkCodes)
 
-                        let observeStage (index: int) : Task<Outcome> =
-                            task {
-                                let! outcome = group.WaitHandle spawned[index].Handle
+                        // Disarm the whole-chain deadline the instant every stage is terminal, so a slow
+                        // user tee or stderr drain that runs afterwards cannot re-fire the timer and turn
+                        // an already-settled success into a spurious `TimedOut` (T-071). Re-arming to
+                        // `Infinite` cancels the pending one-shot without cancelling the token.
+                        let disarmTimeout () =
+                            try
+                                timeoutCts.CancelAfter Timeout.InfiniteTimeSpan
+                            with :? ObjectDisposedException ->
+                                // The CTS was disposed by a concurrent teardown; a disarmed timer no longer matters.
+                                ()
 
-                                // Snapshot before possibly firing: a teardown already in flight when this
-                                // stage ends marks it a victim (`TornDown`); the first genuine checked
-                                // failure sees no teardown yet, fires it, and stays the (non-torn) culprit.
-                                let victim = teardownCts.IsCancellationRequested
-                                tornDown[index] <- victim
+                        let waits =
+                            [| for index in 0 .. spawned.Count - 1 -> group.WaitHandle spawned[index].Handle |]
 
-                                let checkedFailure =
-                                    not stages[index].Config.UncheckedInPipe
-                                    && not (outcome.IsAcceptedBy stages[index].Config.OkCodes)
+                        let! observation =
+                            observeStages
+                                waits
+                                isCheckedFailure
+                                group.KillTree
+                                (fun () -> linkedCts.IsCancellationRequested)
+                                (fun () -> timeoutCts.IsCancellationRequested)
+                                disarmTimeout
 
-                                if not victim && not linkedCts.IsCancellationRequested && checkedFailure then
-                                    // `Cancel` marks the teardown fired (so later-finishing siblings read
-                                    // themselves as victims); `KillTree` reaps the still-running rest of the
-                                    // chain. Both are idempotent, so a benign race between two near-
-                                    // simultaneous genuine failures (each a legitimate culprit) is harmless.
-                                    teardownCts.Cancel()
-                                    group.KillTree()
-
-                                return outcome
-                            }
-
-                        let waitTasks = [| for index in 0 .. spawned.Count - 1 -> observeStage index |]
-
-                        let! outcomes = Task.WhenAll waitTasks
+                        // Only NOW, with every stage terminal and the deadline disarmed, drain the
+                        // (possibly slow) relay/tee/stderr tail. A timer firing here can no longer flip
+                        // the verdict — it was fixed by `observeStages` above.
                         do! Task.WhenAll(copyTasks.ToArray())
                         let! lastCapture = captureTask
                         let! stderrCaptures = Task.WhenAll(stderrTasks.ToArray())
@@ -439,7 +537,8 @@ module internal PipelineRunner =
                             Pump.closeSpawned sp
 
                         let duration = Stopwatch.GetElapsedTime startedAt
-                        let timedOut = timeoutCts.IsCancellationRequested
+                        let timedOut = observation.TimedOut
+                        let outcomes = observation.Outcomes
 
                         // The whole chain reaped, its stdout captured: the run reached a terminal
                         // state. Report it exactly once here — before the cancellation check below can
@@ -465,6 +564,9 @@ module internal PipelineRunner =
                             t.Conclude(logger, overallOutcome, None, duration, ?timeout = timeoutForLog))
 
                         if cancellationToken.IsCancellationRequested then
+                            // External cancellation keeps its priority over the returned result — even one
+                            // that landed during the drain/tee above — but only after every relay/pump task
+                            // was awaited, so none is left unobserved (T-071).
                             return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
                         else
                             let stageResults =
@@ -480,7 +582,7 @@ module internal PipelineRunner =
                                         // exists for each `i`.
                                         StderrTooLarge = stderrCaptures[i].TooLarge
                                         StderrTotalBytes = stderrCaptures[i].TotalBytes
-                                        TornDown = tornDown[i] } ]
+                                        TornDown = observation.TornDown[i] } ]
 
                             // Observe the stage-0 stdin fault without blocking: only a feed that has
                             // finished (a missing `FromFile` faults synchronously at spawn) yields its
@@ -498,6 +600,6 @@ module internal PipelineRunner =
                                       LastStdoutTotalBytes = lastCapture.TotalBytes
                                       Stages = stageResults
                                       Duration = duration
-                                      TimedOut = timeoutCts.IsCancellationRequested
+                                      TimedOut = timedOut
                                       Stdin0Error = stdin0Error }
         }

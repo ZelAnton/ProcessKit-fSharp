@@ -3,6 +3,7 @@ namespace ProcessKit.Tests
 open System
 open System.Collections.Concurrent
 open System.Diagnostics.Metrics
+open System.IO
 open System.Runtime.InteropServices
 open System.Text
 open System.Text.RegularExpressions
@@ -30,6 +31,48 @@ type private PipelineCapturingLogger() =
             { new IDisposable with
                 member _.Dispose() = () }
 
+/// A write-only tee whose `WriteAsync` parks the pipeline's stdout capture until the test releases it —
+/// the "slow tee" of T-071 that keeps the last stage's capture (and, before the fix, an armed whole-chain
+/// deadline) alive well after every stage has already exited. `FirstWrite` completes the instant the
+/// capture first reaches the tee, so a test can time the deadline window deterministically against it.
+type private BlockingTee() =
+    inherit Stream()
+
+    let firstWrite =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let release =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    /// Completes when the capture first writes into the tee (the last stage produced output).
+    member _.FirstWrite: Task = firstWrite.Task
+
+    /// Unblock every parked (and future) write, letting the capture drain to completion.
+    member _.Release() = release.TrySetResult() |> ignore
+
+    override _.CanRead = false
+    override _.CanSeek = false
+    override _.CanWrite = true
+    override _.Length = 0L
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_, _) = raise (NotSupportedException())
+    override _.SetLength _ = ()
+    override _.Read(_, _, _) = raise (NotSupportedException())
+    override _.Write(_, _, _) = ()
+
+    override _.WriteAsync(_: byte[], _: int, _: int, _: CancellationToken) =
+        firstWrite.TrySetResult() |> ignore
+        release.Task
+
+    override _.WriteAsync(_: ReadOnlyMemory<byte>, _: CancellationToken) =
+        firstWrite.TrySetResult() |> ignore
+        ValueTask(release.Task)
+
 [<TestFixture>]
 type PipelineTests() =
 
@@ -51,6 +94,10 @@ type PipelineTests() =
             shell (lines |> List.map (sprintf "echo %s") |> String.concat "&")
         else
             shell (lines |> List.map (sprintf "echo %s") |> String.concat "; ")
+
+    // Any non-clean exit is a genuine checked failure for the `observeStages` observation tests below
+    // (a stage's OkCodes default to {0}, so anything but `Exited 0` is a blame-worthy failure).
+    let checkedFailure = (fun (_: int) (o: Outcome) -> o <> Outcome.Exited 0)
 
     // Split captured output into trimmed, non-empty lines (newline + CR agnostic).
     let lines (text: string) =
@@ -908,5 +955,181 @@ type PipelineTests() =
                 Assert.That(completed (), Is.EqualTo 0L)
                 Assert.That(activeDeltas |> Seq.isEmpty, Is.True, "no runs.active mark was ever armed")
             | Ok _ -> Assert.Fail "expected an error from the missing stage-0 program"
+        }
+        :> Task
+
+    // --- Causally-stable terminal classification: the timeout verdict and the teardown-victim labelling
+    //     are decided by the stages' real completion order at the deadline, not by the order stray wait
+    //     continuations happen to run in (T-071). These drive `PipelineRunner.observeStages` directly with
+    //     controllable wait-tasks, so both races reproduce deterministically with no wall-clock timing. ---
+
+    [<Test>]
+    member _.``observeStages does not flip a settled success when the deadline fires after all stages exit``() : Task =
+        // The core of the timeout-after-success race: every stage exits cleanly BEFORE the deadline, so the
+        // verdict is fixed as "not timed out" and the timer is disarmed — a deadline that only fires during
+        // the later slow tee/drain (modelled by flipping `timerFired` afterwards) can no longer time it out.
+        task {
+            let w0 = TaskCompletionSource<Outcome>()
+            let w1 = TaskCompletionSource<Outcome>()
+            let mutable timerFired = false
+            let mutable disarmed = 0
+            let mutable kills = 0
+
+            let observation =
+                PipelineRunner.observeStages
+                    [| w0.Task; w1.Task |]
+                    checkedFailure
+                    (fun () -> kills <- kills + 1)
+                    (fun () -> false)
+                    (fun () -> timerFired)
+                    (fun () -> disarmed <- disarmed + 1)
+
+            w0.SetResult(Outcome.Exited 0)
+            w1.SetResult(Outcome.Exited 0)
+
+            let! result = observation
+
+            // The deadline fires only now — after the run has already settled (the slow-tee window).
+            timerFired <- true
+
+            Assert.That(result.TimedOut, Is.False, "a deadline firing after the run settled must not time it out")
+            Assert.That(result.TornDown, Is.EqualTo(box [| false; false |]))
+            Assert.That(disarmed, Is.EqualTo 1, "the deadline timer is disarmed once every stage is terminal")
+            Assert.That(kills, Is.EqualTo 0, "a fully successful chain never fires the proactive teardown")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``observeStages reports TimedOut when the deadline had already fired at terminal``() : Task =
+        // The contrasting genuine timeout: the deadline caught the stages still running, so the whole chain
+        // is being torn down and the verdict sampled at terminal is TimedOut.
+        task {
+            let w0 = TaskCompletionSource<Outcome>()
+            let w1 = TaskCompletionSource<Outcome>()
+            let mutable disarmed = 0
+
+            let observation =
+                PipelineRunner.observeStages
+                    [| w0.Task; w1.Task |]
+                    checkedFailure
+                    (fun () -> ())
+                    (fun () -> true) // the whole chain is already being torn down by the timeout
+                    (fun () -> true) // the deadline has fired
+                    (fun () -> disarmed <- disarmed + 1)
+
+            w0.SetResult Outcome.TimedOut
+            w1.SetResult Outcome.TimedOut
+
+            let! result = observation
+
+            Assert.That(
+                result.TimedOut,
+                Is.True,
+                "a deadline that fired before all stages finished times the chain out"
+            )
+
+            Assert.That(disarmed, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``observeStages blames the checked failure seen first and torns down the later sibling``() : Task =
+        task {
+            let w0 = TaskCompletionSource<Outcome>()
+            let w1 = TaskCompletionSource<Outcome>()
+            let teardown = TaskCompletionSource<unit>()
+            let mutable kills = 0
+
+            let observation =
+                PipelineRunner.observeStages
+                    [| w0.Task; w1.Task |]
+                    checkedFailure
+                    (fun () ->
+                        kills <- kills + 1
+                        teardown.TrySetResult() |> ignore)
+                    (fun () -> false)
+                    (fun () -> false)
+                    (fun () -> ())
+
+            // Stage 0 (left) is SEEN first: it is the genuine culprit and fires the teardown.
+            w0.SetResult(Outcome.Exited 3)
+            do! teardown.Task // the teardown has fired before stage 1 is even observed
+
+            // Stage 1 (right) is only seen after the teardown fired -> it is the victim.
+            w1.SetResult(Outcome.Exited 3)
+
+            let! result = observation
+            Assert.That(result.TornDown[0], Is.False, "the failure seen first is the culprit, never a victim")
+            Assert.That(result.TornDown[1], Is.True, "a sibling seen only after the teardown fired is a victim")
+            Assert.That(kills, Is.EqualTo 1, "the proactive teardown fires exactly once")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``observeStages fixes the victim by real completion order, not by stage position``() : Task =
+        // Regression (T-071): the torn-down victim was decided by reading a shared teardown token AFTER each
+        // stage's wait continuation, so a stage that actually finished BEFORE a sibling's failure could be
+        // mislabelled a victim purely because its continuation ran later — and pipefail would then blame the
+        // wrong stage. Observing exits in real completion order fixes it: whichever checked failure is SEEN
+        // first is the culprit, regardless of its position — here the RIGHTMOST stage finishes first.
+        task {
+            let w0 = TaskCompletionSource<Outcome>()
+            let w1 = TaskCompletionSource<Outcome>()
+            let teardown = TaskCompletionSource<unit>()
+            let mutable kills = 0
+
+            let observation =
+                PipelineRunner.observeStages
+                    [| w0.Task; w1.Task |]
+                    checkedFailure
+                    (fun () ->
+                        kills <- kills + 1
+                        teardown.TrySetResult() |> ignore)
+                    (fun () -> false)
+                    (fun () -> false)
+                    (fun () -> ())
+
+            // Stage 1 (RIGHT) finishes first this time and is the culprit, even though it is the last stage.
+            w1.SetResult(Outcome.Exited 3)
+            do! teardown.Task
+            // Stage 0 (left) is seen only after the teardown fired -> it is the torn-down victim.
+            w0.SetResult(Outcome.Exited 3)
+
+            let! result = observation
+
+            Assert.That(
+                result.TornDown[1],
+                Is.False,
+                "the failure seen first is the culprit even when it is the last stage"
+            )
+
+            Assert.That(result.TornDown[0], Is.True, "the stage seen only after the teardown fired is the victim")
+            Assert.That(kills, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a slow stdout tee does not let the deadline turn a settled success into a timeout``() : Task =
+        // End-to-end (T-071): the whole-chain deadline used to stay armed through the last stage's stdout
+        // tee/drain, so a slow user tee running AFTER every stage had already exited could let the timer fire
+        // and retroactively report a successful pipeline as TimedOut. `echo | sort` both exit in a few ms —
+        // far below the 700ms deadline, which the timer would trip mid-tee on the old behaviour — yet the
+        // test holds the tee for 1.5s, proving a late timer can no longer flip the already-finished success.
+        task {
+            use tee = new BlockingTee()
+            let last = sortStage |> Command.stdoutTee tee
+
+            let pipeline =
+                (emit [ "banana"; "apple" ]).Pipe(last).Timeout(TimeSpan.FromMilliseconds 700.0)
+
+            let run = pipeline.RunAsync()
+
+            do! tee.FirstWrite
+            do! Task.Delay(TimeSpan.FromSeconds 1.5) // well past the 700ms deadline the old timer would trip
+            tee.Release()
+
+            match! run with
+            | Ok output -> Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana" ]))
+            | Error error -> Assert.Fail $"a slow tee must not time out a settled success, got {error}"
         }
         :> Task
