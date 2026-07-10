@@ -179,6 +179,31 @@ module internal Posix =
     /// when a stream ctor fails.
     let mutable streamWrapFaultForTests: (string -> unit) option = None
 
+    /// Test seam (internal, not public API): overrides the by-number process-group liveness probe
+    /// (`killpg(pgid, 0)`), so a pid/pgid-reuse scenario — a recycled number that still probes alive —
+    /// can be driven deterministically without racing a real OS pid recycle. Production leaves it `None`
+    /// and runs the real probe.
+    let mutable processGroupAliveForTests: (int -> bool) option = None
+
+    /// Test seam (internal, not public API): overrides `readProcessIdentity`, so a test can present a
+    /// captured-then-changed start-time token deterministically (the recycled-number case) rather than a
+    /// real process whose start time it cannot control. Production leaves it `None`.
+    let mutable readProcessIdentityForTests: (int -> uint64 option) option = None
+
+    /// Test seam (internal, not public API): invoked with the target pgid by every process-group
+    /// delivery primitive (`killProcessGroup` / `terminateProcessGroup` / `signalProcessGroup` /
+    /// `suspendProcessGroup` / `resumeProcessGroup`) just before its syscall, so a test can record which
+    /// pgids a path actually delivered to — proving a recycled pgid is pruned and NEVER signalled, and a
+    /// matching one still is. Production leaves it `None`.
+    let mutable groupDeliveryObserverForTests: (int -> unit) option = None
+
+    // Fire the group-delivery test observer (if installed) with the target pgid BEFORE the syscall, so a
+    // test can record exactly which pgids a signal/kill path delivered to — and so it can never perturb
+    // the errno a delivery classification reads immediately after the call. A single `Option` check in
+    // production (observer `None`).
+    let private observeGroupDelivery (pgid: int) =
+        groupDeliveryObserverForTests |> Option.iter (fun observe -> observe pgid)
+
     /// Marshal a list of strings into a NULL-terminated `char* []`. Returns the array pointer and the
     /// individual string allocations to free afterwards (via `freeCStringArray`).
     ///
@@ -239,13 +264,139 @@ module internal Posix =
             Outcome.Unobserved $"unexpected wait status 0x{status:x} (neither exited nor signalled)"
 
     /// Kill an entire POSIX process group (teardown / cancellation).
-    let killProcessGroup (pgid: int) = killpg (pgid, SIGKILL) |> ignore
+    let killProcessGroup (pgid: int) =
+        observeGroupDelivery pgid
+        killpg (pgid, SIGKILL) |> ignore
 
     /// Ask an entire POSIX process group to terminate gracefully (SIGTERM).
-    let terminateProcessGroup (pgid: int) = killpg (pgid, SIGTERM) |> ignore
+    let terminateProcessGroup (pgid: int) =
+        observeGroupDelivery pgid
+        killpg (pgid, SIGTERM) |> ignore
 
-    /// True while any process remains in the group (signal 0 probes existence).
-    let processGroupAlive (pgid: int) = killpg (pgid, 0) = 0
+    /// True while any process remains in the group (signal 0 probes existence). The test seam overrides
+    /// the by-number verdict so a pid/pgid-reuse scenario can be driven deterministically.
+    let processGroupAlive (pgid: int) =
+        match processGroupAliveForTests with
+        | Some hook -> hook pgid
+        | None -> killpg (pgid, 0) = 0
+
+    // ----------------------------------------------------------------------------------
+    // Start-time identity token: pid/pgid-reuse safety (T-084)
+    // ----------------------------------------------------------------------------------
+    //
+    // `killpg(pgid, 0)` / `kill(pid, 0)` probe a NUMBER, not a specific process: once a tracked group
+    // drains (or a solo child is reaped) the OS can recycle the number for an unrelated process, and a
+    // by-number liveness probe then reports the recycled number "alive" with no intervening `ESRCH` to
+    // catch it. Signalling / killing on that verdict would deliver to the stranger — a wrong-target kill
+    // that breaks the kill-on-drop tree guarantee. Bind each tracked id to a stable start-time identity
+    // token captured at track time and re-read on every probe: a live number whose CURRENT identity
+    // differs from the captured one is a recycled stranger (`processGroupStillTracked` reports it gone,
+    // so callers prune it and never signal it). An unknown token on either side — a non-Linux/macOS
+    // POSIX with no reader, a process already gone, or a leader reaped while descendants keep the pgid
+    // alive — defers to the by-number liveness verdict, so no platform loses coverage.
+
+    // proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, buffer, buffersize) fills a `proc_bsdinfo` (macOS/Apple
+    // only) whose pbi_start_tvsec/pbi_start_tvusec is the process creation time (stable across `exec`,
+    // distinct for a recycled pid). Marshalled by raw offset (pbi_start_tvsec at 120, pbi_start_tvusec
+    // at 128 in the 136-byte struct) rather than a `[<StructLayout>]` type. Lives in libproc, not libc.
+    [<Literal>]
+    let private PROC_PIDTBSDINFO = 3
+
+    [<Literal>]
+    let private procBsdInfoSize = 136
+
+    [<DllImport("libproc", SetLastError = true)>]
+    extern int private proc_pidinfo(int pid, int flavor, uint64 arg, nativeint buffer, int buffersize)
+
+    /// Parse the start-time identity from a `/proc/<pid>/stat` line: field 22 (starttime, in clock ticks
+    /// since boot). The comm field (2) may contain spaces and ')', so parse AFTER the final ')' — past
+    /// it, the whitespace-split index 0 is field 3 (state), so starttime (field 22) is index 19.
+    /// Internal (not private) so the parsing is unit-testable with synthetic `stat` lines.
+    let parseLinuxStartTime (stat: string) : uint64 option =
+        let closeParen = stat.LastIndexOf ')'
+
+        if closeParen < 0 then
+            None
+        else
+            let fields =
+                stat.Substring(closeParen + 1).Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)
+
+            if fields.Length > 19 then
+                match UInt64.TryParse fields.[19] with
+                | true, value -> Some value
+                | _ -> None
+            else
+                None
+
+    let private readLinuxStartTime (pid: int) : uint64 option =
+        try
+            parseLinuxStartTime (File.ReadAllText $"/proc/{pid}/stat")
+        with
+        | :? IOException ->
+            // The /proc entry vanished (the process is gone) or could not be read — no usable token;
+            // the caller then defers to the by-number liveness verdict.
+            None
+        | :? UnauthorizedAccessException ->
+            // Denied by permissions — likewise no usable token; defer to the liveness verdict.
+            None
+
+    let private readMacStartTime (pid: int) : uint64 option =
+        let buffer = Marshal.AllocHGlobal procBsdInfoSize
+
+        try
+            let got = proc_pidinfo (pid, PROC_PIDTBSDINFO, 0UL, buffer, procBsdInfoSize)
+
+            if got = procBsdInfoSize then
+                // pbi_start_tvsec @120, pbi_start_tvusec @128; fold into microseconds since the epoch.
+                let tvsec = uint64 (Marshal.ReadInt64(buffer, 120))
+                let tvusec = uint64 (Marshal.ReadInt64(buffer, 128))
+                Some(tvsec * 1_000_000UL + tvusec)
+            else
+                // 0 / -1 (gone, EPERM) or a short read — not a usable identity; defer to liveness.
+                None
+        finally
+            Marshal.FreeHGlobal buffer
+
+    /// Read a stable start-time identity token for `pid`, or `None` when unreadable/unavailable (a
+    /// non-Linux/macOS POSIX with no reader, a process already gone, or a denied read). See the section
+    /// comment above: an unknown token is never proof of anything — the caller defers to the by-number
+    /// liveness verdict, so no platform is weakened.
+    let readProcessIdentity (pid: int) : uint64 option =
+        match readProcessIdentityForTests with
+        | Some hook -> hook pid
+        | None ->
+            if RuntimeInformation.IsOSPlatform OSPlatform.Linux then
+                readLinuxStartTime pid
+            elif isMacOs then
+                readMacStartTime pid
+            else
+                None
+
+    // Positive proof a tracked number was recycled: the identity captured at track time and the one read
+    // now are BOTH known and they differ. A `None` on either side is never proof (the caller then defers
+    // to the liveness verdict), so a target without an identity reader (the BSDs) is not weakened.
+    let private isRecycled (tracked: uint64 option) (current: uint64 option) : bool =
+        match tracked, current with
+        | Some a, Some b -> a <> b
+        | _ -> false
+
+    /// The single liveness + identity probe for a tracked pgid/pid: is `id` still the SAME live process
+    /// (group) the caller captured `identity` for? The by-number liveness probe (`processGroupAlive`)
+    /// decides existence; when the number still answers alive, the current identity is re-read and, ONLY
+    /// if both the captured and the current token are known AND they differ, the id is reported gone
+    /// (recycled by a stranger). A matching identity — or an unknown token on either side (a leader
+    /// reaped while descendants keep the pgid alive, or a platform without a reader) — falls back to the
+    /// by-number verdict, so no platform loses coverage. This is the one choke every probe/signal/kill
+    /// path funnels through, so the reuse check is never duplicated per call site.
+    let processGroupStillTracked (id: int) (identity: uint64 option) : bool =
+        if not (processGroupAlive id) then
+            false
+        elif identity.IsNone then
+            // No captured token to compare against — defer to the liveness verdict without an identity
+            // read (the BSDs, or a track-time read that failed).
+            true
+        else
+            not (isRecycled identity (readProcessIdentity id))
 
     // SIGSTOP / SIGCONT numbers differ between Linux and the BSD/macOS table (so do SIGUSR1/2);
     // resolve them per-platform.
@@ -267,13 +418,18 @@ module internal Posix =
     /// Broadcast a raw signal to a POSIX process group via `killpg`, classifying the outcome (see
     /// `SignalDelivery`) instead of collapsing every non-zero errno into "not delivered".
     let signalProcessGroup (pgid: int) (signalNum: int) : SignalDelivery =
+        observeGroupDelivery pgid
         classifySignalDelivery (killpg (pgid, signalNum))
 
     /// Freeze a POSIX process group (SIGSTOP).
-    let suspendProcessGroup (pgid: int) = killpg (pgid, sigStop) |> ignore
+    let suspendProcessGroup (pgid: int) =
+        observeGroupDelivery pgid
+        killpg (pgid, sigStop) |> ignore
 
     /// Thaw a POSIX process group (SIGCONT).
-    let resumeProcessGroup (pgid: int) = killpg (pgid, sigCont) |> ignore
+    let resumeProcessGroup (pgid: int) =
+        observeGroupDelivery pgid
+        killpg (pgid, sigCont) |> ignore
 
     /// Send a raw signal to a single POSIX pid via `kill`, classified the same way as
     /// `signalProcessGroup` (see `SignalDelivery`).

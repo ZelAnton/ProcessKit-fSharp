@@ -41,6 +41,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   atomic `cgroup.kill` hard kill — `Signal.Kill` (already `cgroup.kill`) and Suspend/Resume
   (already `cgroup.freeze`) are unchanged. The `killCgroup` per-pid sweep, reached only as the
   pre-5.14 kernel fallback, stays best-effort by pid number and is documented as such.
+- On the POSIX process-group backend (macOS/BSD, or Linux without cgroup delegation), every
+  `ProcessGroup.Signal`/`Suspend`/`Resume`/`Members`/`Stats` and kill/teardown path is now
+  identity-safe against pgid/pid recycling. Each tracked process group is bound at spawn time to its
+  leader's OS start-time (Linux `/proc/<pid>/stat` field 22; macOS `proc_pidinfo`), which is re-read
+  and compared right before every `killpg`/`kill`; a group that has drained and whose pgid — or a solo
+  child's pid — was then reused by an unrelated process (with no intervening `ESRCH` to catch it) is
+  detected as a stranger, pruned from tracking, and never signalled, suspended, or killed. Previously
+  such a recycled number could pass the bare `killpg(pgid, 0)` liveness probe and misdirect a
+  signal/SIGKILL — including from `Dispose`/`ShutdownAsync` teardown — to that stranger. Where the
+  start-time is unreadable (a BSD without a wired-up reader, or a leader reaped while its descendants
+  keep the pgid alive) the check degrades to the prior by-number liveness behaviour, so no platform
+  loses coverage and a group whose leader exited but whose children still hold the pgid is still
+  signalled. No public API change — an internal correctness/safety fix.
 
 ## [2.2.0] - 2026-07-10
 
