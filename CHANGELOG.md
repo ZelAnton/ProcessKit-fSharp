@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `ProcessKit.Testing` cassette writes (`RecordReplayRunner.Save`/dispose) now flush the recorded content to disk before the atomic rename swaps it into place, and best-effort fsync the cassette's parent directory on Unix afterwards, so a crash right after a save can no longer leave the cassette file or the rename itself unpersisted.
 
 ## [2.2.0] - 2026-07-10
 
