@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On Windows, `ProcessGroup.Suspend`/`Resume` now re-verify (`IsProcessInJob`) that a job member's process handle is still actually a member of the job right after opening it, closing a narrow pid-reuse race: previously, if a member (typically a handle-less grandchild) exited and its pid was immediately reused by an unrelated process between the member snapshot and `OpenProcess`, that unrelated process could be frozen/thawed instead. The re-check is fail-safe (any failure to open the process or query its membership leaves it untouched) and the fix touches only this internal handle-acquisition step — no public API change.
 - On Linux, a failed `cgroup.procs` read (e.g. EACCES/EIO racing teardown) is no longer folded into an empty member list. Graceful shutdown and the kill fallback for the cgroup v2 `limits` backend now treat a read failure as "membership unknown, not drained," so they keep escalating instead of concluding the tree already exited early; `ProcessGroup.Members`/`Stats` propagate the read failure as an honest `ProcessError.Io` rather than reporting a fabricated empty group / zero active processes.
 - A genuine OS-level read failure on the child's stdout/stderr pipe now surfaces as `ProcessError.Io` from `FinishAsync`/`WaitAsync`/`ProfileAsync`/`OutputStringAsync` (and faults the streaming enumerator for `StdoutLinesAsync`/`OutputEventsAsync`), instead of silently ending the capture as if the child had produced a short, complete output. The routine dispose/broken-pipe race this library's own teardown triggers by design (closing the pipe streams while a still-running background pump may be mid-read) is still swallowed exactly as before — only a fault raised before teardown began is now reported.
+- On Linux, per-member cgroup v2 signal delivery is now identity-safe against pid recycling.
+  `ProcessGroup.Signal(Signal.Term/Int/Hup/…)` — every non-`Kill` signal — and graceful teardown
+  (`ShutdownAsync`'s SIGTERM tier) on the cgroup v2 `limits` backend now pin each member with
+  `pidfd_open` and reconfirm its cgroup membership before delivering through `pidfd_send_signal`,
+  instead of a raw `kill(pid, sig)` against a pid snapshotted from `cgroup.procs`. This closes a
+  TOCTOU where a member could exit and its pid be recycled by an unrelated process between the
+  snapshot and the syscall, misdirecting the signal to that stranger. On a kernel without pidfd
+  (< 5.3, or a seccomp block) it fails safe rather than downgrading to the racy raw kill:
+  `ProcessGroup.Signal` returns an honest `ProcessError.Io` and graceful shutdown escalates to the
+  atomic `cgroup.kill` hard kill — `Signal.Kill` (already `cgroup.kill`) and Suspend/Resume
+  (already `cgroup.freeze`) are unchanged. The `killCgroup` per-pid sweep, reached only as the
+  pre-5.14 kernel fallback, stays best-effort by pid number and is documented as such.
 
 ## [2.2.0] - 2026-07-10
 

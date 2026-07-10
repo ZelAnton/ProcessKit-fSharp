@@ -447,6 +447,13 @@ module internal Posix =
     [<Literal>]
     let private SYS_pidfd_open = 434 // same syscall number on x86_64/arm64/x86/arm/riscv (Linux 5.3+)
 
+    // SYS_pidfd_send_signal — same syscall number on x86_64/arm64/x86/arm/riscv (Linux 5.1+). Delivers a
+    // signal to the exact task a pidfd PINS (not a pid number), so it can never reach a process that later
+    // recycled the number — the primitive the cgroup per-member signal path uses for pid-reuse-safe
+    // delivery (see `pidfdSendSignalChecked` below and `Native.Cgroup.deliverIdentitySafe`).
+    [<Literal>]
+    let private SYS_pidfd_send_signal = 424
+
     // waitid idtype: wait on the process a pidfd refers to (P_ALL=0, P_PID=1, P_PGID=2, P_PIDFD=3).
     [<Literal>]
     let private P_PIDFD = 3
@@ -508,6 +515,14 @@ module internal Posix =
     [<DllImport("libc", SetLastError = true, EntryPoint = "syscall")>]
     extern nativeint private syscall3(nativeint number, int arg1, uint arg2)
 
+    // pidfd_send_signal(pidfd, sig, siginfo*, flags) via syscall(2). A second fixed-signature P/Invoke
+    // into glibc's `syscall` (`syscall3` above is the pidfd_open one): `syscall`'s glibc stub reads its
+    // arguments from REGISTERS (hand-written asm, not a C variadic), so a fixed-signature P/Invoke passes
+    // them correctly even on AArch64 — the same reasoning that makes the pidfd_open path safe. Distinct
+    // managed name, same native `syscall` entry point, wider signature.
+    [<DllImport("libc", SetLastError = true, EntryPoint = "syscall")>]
+    extern nativeint private syscall5(nativeint number, int arg1, int arg2, nativeint arg3, uint arg4)
+
     // waitid(idtype, id, siginfo*, options). The libc wrapper is a fixed-signature function (not
     // variadic), so a plain P/Invoke is correct on every ABI including AArch64.
     [<DllImport("libc", SetLastError = true)>]
@@ -528,6 +543,13 @@ module internal Posix =
     // genuinely-variadic `fcntl` this file deliberately avoids for exactly that reason.
     let private pidfdOpen (pid: int) : int =
         int (syscall3 (nativeint SYS_pidfd_open, pid, 0u))
+
+    // pidfd_send_signal(pidfd, sig, NULL, 0): deliver `sig` to the exact task `pidfd` pins — never a
+    // process that later recycled the pid number. A NULL `siginfo` pointer with 0 flags is the documented
+    // "behave like kill(2)" form. Via `syscall` for the same register-passing reason as `pidfdOpen`. A
+    // negative return signals failure (errno in `Marshal.GetLastWin32Error`).
+    let private pidfdSendSignal (pidfd: int) (signalNum: int) : int =
+        int (syscall5 (nativeint SYS_pidfd_send_signal, pidfd, signalNum, IntPtr.Zero, 0u))
 
     // Decide ONCE whether the pidfd fast path is usable, for the whole process lifetime. `pidfd_open`
     // arrived in Linux 5.3 but `waitid(P_PIDFD)` only in 5.4, so we confirm BOTH: open a pidfd on our own
@@ -561,6 +583,31 @@ module internal Posix =
     /// Internal diagnostic (not public API): the POSIX exit-wait mechanism this process selected — `true`
     /// = the Linux pidfd fast path, `false` = the shared SIGCHLD fallback. For tests / observability.
     let pidfdActive = pidfdSupported
+
+    /// Pin the exact task currently running as `pid` via `pidfd_open(2)` (Linux >= 5.3), for the cgroup
+    /// per-member signal path (`Native.Cgroup.deliverIdentitySafe`). `Ok fd` owns a fresh pidfd the caller
+    /// MUST release with `closePidfd`; `Error errno` carries the raw errno — `ESRCH` if the target already
+    /// exited, `ENOSYS` on a kernel without the syscall (or a seccomp block). The fd never refers to a
+    /// later process that recycles the number, which is the identity anchor pid-reuse-safe delivery relies
+    /// on. Reuses the existing `pidfdOpen`; the errno is read immediately, before any other P/Invoke.
+    let pidfdOpenChecked (pid: int) : Result<int, int> =
+        let fd = pidfdOpen pid
+
+        if fd < 0 then Error(Marshal.GetLastWin32Error()) else Ok fd
+
+    /// Deliver `sig` to the task pinned by pidfd `fd` via `pidfd_send_signal(2)` (Linux >= 5.1). Because
+    /// the fd names a specific task, the signal can only ever reach it — never a process that later reused
+    /// its pid. `Ok ()` on delivery; `Error errno` carries the raw errno — `ESRCH` if the pinned task has
+    /// since exited (benign: its own exit, never a recycled pid), `ENOSYS` on a kernel without the syscall,
+    /// `EPERM` for a refused delivery. The errno is read immediately, before any other P/Invoke.
+    let pidfdSendSignalChecked (fd: int) (signalNum: int) : Result<unit, int> =
+        let rc = pidfdSendSignal fd signalNum
+
+        if rc < 0 then Error(Marshal.GetLastWin32Error()) else Ok()
+
+    /// Release a pidfd opened by `pidfdOpenChecked`. Best-effort — closing a pidfd cannot meaningfully
+    /// fail for the caller, and each is single-use per delivery.
+    let closePidfd (fd: int) : unit = close fd |> ignore
 
     /// Decode a `waitid` siginfo buffer into an `Outcome`. Unlike a `waitpid` status word, waitid hands
     /// back already-decoded fields: CLD_EXITED carries the exit code directly in si_status;
