@@ -292,6 +292,35 @@ type CassetteTests() =
             })
 
     [<Test>]
+    member _.``an inherited-stdin command records and strict-replays``() : Task =
+        withCassette (fun path ->
+            task {
+                // InheritStdin is a keyable, repeatable source (unlike the one-shot streaming sources it
+                // is NOT rejected at record time): recording spawns for real through the inner runner, and
+                // the same inherited-stdin command replays the recording by its stable "inherit" key.
+                let inheritCmd () =
+                    Command.create "prompt-tool" |> Command.inheritStdin
+
+                match! recordThenProbe path (inheritCmd ()) (inheritCmd ()) with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded-output")
+                | Error error -> Assert.Fail $"inherited-stdin replay should match: {error}"
+            })
+
+    [<Test>]
+    member _.``an inherited-stdin command keys distinctly from a no-stdin command``() : Task =
+        withCassette (fun path ->
+            task {
+                // Inherited stdin must not collapse onto the no-stdin key: a recording made with
+                // InheritStdin must NOT replay for the same command run without it (and vice versa).
+                let inheritCmd = Command.create "prompt-tool" |> Command.inheritStdin
+                let plainCmd = Command.create "prompt-tool"
+
+                match! recordThenProbe path inheritCmd plainCmd with
+                | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
+                | other -> Assert.Fail $"a no-stdin probe of an inherited-stdin recording should miss, got {other}"
+            })
+
+    [<Test>]
     member _.``by default cwd does not participate in the match key``() : Task =
         withCassette (fun path ->
             task {

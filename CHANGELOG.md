@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `Command.InheritStdin` (and the pipe-friendly `Command.inheritStdin`): hand the child the parent process's own standard input directly — inherited at the OS level, with no pipe and no feeder — for interactive/console programs (an editor launched by `git commit`, a tool that prompts on the terminal, a pipe from the parent's own stdin). The stdin analogue of `StdioMode.Inherit`. Incompatible with a feeder `Stdin` source and `KeepStdinOpen` (rejected at the builder boundary in either chaining order); `RunningProcess.TakeStdin` returns `None` for an inherited-stdin child. Repeatable under `Retry`/supervision and supported by the `ProcessKit.Testing` record/replay cassette (keyed by a stable "inherit" marker).
 
 ### Changed
 -

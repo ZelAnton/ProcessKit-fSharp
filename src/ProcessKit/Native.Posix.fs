@@ -1160,7 +1160,14 @@ module internal Posix =
     /// requests `Uid`/`Gid` here too, after rewriting it to run through the `setpriv` helper.
     let private spawnPosixViaSpawn (command: Command) : Result<Spawned, ProcessError> =
         let config = command.Config
-        let stdinWanted = config.StdinSource.IsSome || config.KeepStdinOpen
+        // `Command.InheritStdin` hands the child the PARENT's own standard input directly (no
+        // socketpair, no feeder) — the interactive/console case. Every other configuration goes
+        // through a socketpair; its parent-side write end is retained only for a feeder source or
+        // `KeepStdinOpen`.
+        let stdinInherit = Stdin.isInherit config.StdinSource
+
+        let stdinWanted =
+            (config.StdinSource.IsSome && not stdinInherit) || config.KeepStdinOpen
         // Child-side fds the parent closes after spawn (the child gets its own via dup2).
         let childSideFds = System.Collections.Generic.List<int>()
 
@@ -1203,7 +1210,15 @@ module internal Posix =
                 Some(fds[0], fds[1])
 
         // stdin
-        if stdinWanted then
+        if stdinInherit then
+            // `InheritStdin`: hand the child the PARENT's own standard input directly (no socketpair,
+            // no feeder). On macOS, POSIX_SPAWN_CLOEXEC_DEFAULT closes every fd not named by a file
+            // action at exec, so register a self-dup2 (0 -> 0) to keep fd 0 open in the child; on Linux
+            // fd 0 is inherited naturally, so no dup2 is needed. Symmetric to the stdout/stderr
+            // `StdioMode.Inherit` branches below. `stdinParentWrite` stays `None`, so `Spawned.Stdin` is
+            // `None` and no feeder is ever started.
+            stdinChildFd <- if isMacOs then 0 else -1
+        elif stdinWanted then
             match makeStdioChannel "stdin" with
             | Some(readFd, writeFd) ->
                 stdinChildFd <- readFd

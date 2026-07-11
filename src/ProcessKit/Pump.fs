@@ -919,6 +919,13 @@ module internal Pump =
             try
                 match source with
                 | StdinSource.Empty -> ()
+                | StdinSource.Inherit ->
+                    // Unreachable in practice: `Command.InheritStdin` creates no stdin pipe, so the
+                    // native spawn returns `Spawned.Stdin = None` and `feedStdinSource` never starts a
+                    // feed for it (there is no `stdinStream` to write into). Handled explicitly rather
+                    // than via a wildcard so this stays exhaustive if a new source is added; writing
+                    // nothing and reaching EOF is the only safe behaviour should it ever be reached.
+                    ()
                 | StdinSource.Bytes bytes -> do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                 | StdinSource.File path ->
                     // `File.OpenRead` through `sourceStep`, so ANY open failure (not just the three

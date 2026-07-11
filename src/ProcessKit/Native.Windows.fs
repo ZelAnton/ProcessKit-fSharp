@@ -844,7 +844,14 @@ module internal Windows =
     /// managed read streams for stdout/stderr.
     let private spawnWindowsCore (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
         let config = command.Config
-        let stdinWanted = config.StdinSource.IsSome || config.KeepStdinOpen
+        // `Command.InheritStdin` hands the child the PARENT's own standard-input handle directly (no
+        // pipe, no feeder) — the interactive/console case. Every other configuration goes through a
+        // pipe so we control EOF; its parent-side write end is retained only when there is a feeder
+        // source to pump or `KeepStdinOpen` kept it open for interactive writing.
+        let stdinInherit = Stdin.isInherit config.StdinSource
+
+        let stdinPipeKept =
+            (config.StdinSource.IsSome && not stdinInherit) || config.KeepStdinOpen
 
         // Every pipe end created so far, torn down (best-effort, reverse order) if pipe setup fails
         // partway through — before `CreateProcessW` is even reached, so nothing has been handed to a
@@ -864,10 +871,32 @@ module internal Windows =
                     ()
 
         try
-            // stdin is always a pipe so we control EOF; the write end is kept (interactive) or closed.
-            let inServer, inClient = createAsyncPipePair PipeDirection.Out
-            createdPipes.Add inServer
-            createdPipes.Add inClient
+            // stdin: with `InheritStdin` the child is handed a duplicated inheritable copy of the
+            // parent's own STD_INPUT_HANDLE directly (no pipe, no feeder). Otherwise it is always a
+            // pipe so we control EOF; the write end is kept (feeder/interactive) or closed. `stdinChild`
+            // is what goes to `STARTUPINFO.hStdInput`; `inStreams` is `Some (server, client)` only for
+            // the pipe path (the parent write end + the child read end); both paths register their
+            // handles in `createdPipes` for the exception unwind and drop the child's copy after spawn.
+            let stdinChild, inStreams =
+                if stdinInherit then
+                    let handle = inheritableStdHandle STD_INPUT_HANDLE
+
+                    if not (isValidHandle handle) then
+                        // Same rationale as `setupOut`'s Inherit branch: a failed `GetStdHandle`/
+                        // `DuplicateHandle` (e.g. no console and stdin not redirected) must fail the
+                        // spawn, not silently hand the child a broken std input handle.
+                        let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+
+                        failwith
+                            $"could not duplicate an inheritable copy of the parent's standard input handle: {message}"
+
+                    createdPipes.Add(disposableHandle handle)
+                    handle, None
+                else
+                    let inServer, inClient = createAsyncPipePair PipeDirection.Out
+                    createdPipes.Add inServer
+                    createdPipes.Add inClient
+                    inClient.SafePipeHandle.DangerousGetHandle(), Some(inServer, inClient)
 
             // For an output stream: the inheritable child-side handle, the parent read stream
             // (`Some` only when piped), and a cleanup that drops the parent's copy of the child handle
@@ -926,7 +955,7 @@ module internal Windows =
             let mutable startup = STARTUPINFO()
             startup.cb <- Marshal.SizeOf<STARTUPINFO>()
             startup.dwFlags <- STARTF_USESTDHANDLES
-            startup.hStdInput <- inClient.SafePipeHandle.DangerousGetHandle()
+            startup.hStdInput <- stdinChild
             startup.hStdOutput <- outChild
             startup.hStdError <- errChild
 
@@ -989,8 +1018,14 @@ module internal Windows =
                 errCleanup ()
                 outStream |> Option.iter (fun s -> s.Dispose())
                 errStream |> Option.iter (fun s -> s.Dispose())
-                inClient.Dispose()
-                inServer.Dispose()
+
+                match inStreams with
+                | Some(inServer, inClient) ->
+                    inClient.Dispose()
+                    inServer.Dispose()
+                | None ->
+                    // Inherit: no pipe — just close the inheritable duplicate of the parent's std input.
+                    closeHandleIfValid stdinChild
 
             if not created then
                 releaseStdio ()
@@ -1023,15 +1058,25 @@ module internal Windows =
                 CloseHandle info.hThread |> ignore
                 // Drop the parent's copies of the child-side handles now that the child has inherited
                 // them, so reads see EOF when the child exits.
-                inClient.Dispose()
                 outCleanup ()
                 errCleanup ()
 
                 let stdinStream =
-                    if stdinWanted then
-                        Some(inServer :> Stream)
-                    else
-                        inServer.Dispose() // close stdin write end -> child sees EOF
+                    match inStreams with
+                    | Some(inServer, inClient) ->
+                        // Drop the parent's copy of the child's read end, then keep the write end only
+                        // for a feeder/interactive stdin; otherwise close it so the child sees EOF.
+                        inClient.Dispose()
+
+                        if stdinPipeKept then
+                            Some(inServer :> Stream)
+                        else
+                            inServer.Dispose() // close stdin write end -> child sees EOF
+                            None
+                    | None ->
+                        // Inherit: the child now has its own inherited copy of the parent's std input, so
+                        // drop the parent's inheritable duplicate. There is no parent-side stdin stream.
+                        closeHandleIfValid stdinChild
                         None
 
                 Ok
