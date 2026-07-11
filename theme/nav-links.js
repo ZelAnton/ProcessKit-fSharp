@@ -9,22 +9,18 @@
 // upgrades them at render time:
 //
 //   * "Rust crate"     -> a live external link to the Rust implementation's site.
-//   * "Python wrapper" -> stays a marked, non-clickable placeholder (its docs
-//                         repository is not published yet); this only adds a
-//                         "coming soon" tooltip so a visitor sees it is reserved,
-//                         not broken. When its URL is known, give it an href here
-//                         and drop the TODO note in SUMMARY.md.
+//   * "Python wrapper" -> a live external link to the Python wrapper's docs site.
 //
-// Without JS the entries degrade to plain greyed draft items — never a broken or
-// misdirected link.
+// The `placeholder` branch below is kept as a general-purpose fallback for any
+// future reserved entry whose URL is not yet known; neither current entry uses
+// it. Without JS the entries degrade to plain greyed draft items — never a
+// broken or misdirected link.
 (function () {
   "use strict";
 
   var ENTRIES = {
     "Rust crate": { href: "https://zelanton.github.io/processkit-rs" },
-    "Python wrapper": {
-      placeholder: "Documentation coming soon — repository not published yet."
-    }
+    "Python wrapper": { href: "https://zelanton.github.io/processkit-py" }
   };
 
   function apply() {

@@ -22,10 +22,7 @@
      a SUMMARY.md entry at an external URL (a raw URL fails the build), so they are
      carried as DRAFT chapters — an empty () link, i.e. native non-clickable
      placeholders with no chapter file — and theme/nav-links.js upgrades them at
-     render time: "Rust crate" becomes a live link, "Python wrapper" stays a marked
-     "coming soon" placeholder.
-     TODO(Python wrapper): its documentation repository is not published yet; when
-     its GitHub Pages URL is known, replace the empty () below with that URL and
-     drop its branch from theme/nav-links.js. Do NOT point it at a guessed address. -->
+     render time into live external links: "Rust crate" and "Python wrapper" both
+     resolve to their respective docs sites. -->
 - [Rust crate]()
 - [Python wrapper]()
