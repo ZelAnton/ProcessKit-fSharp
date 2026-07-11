@@ -316,6 +316,57 @@ type CommandTests() =
         Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> Command("git").User(1, -1) |> ignore))
         |> ignore
 
+    // ---- Groups (Unix supplementary-group privilege drop) -------------------------------------
+
+    [<Test>]
+    member _.``Groups is unset by default``() =
+        Assert.That(Command.create("git").Config.Groups, Is.EqualTo(None: int list option))
+
+    [<Test>]
+    member _.``Groups records the list and the instance method matches the module function``() =
+        let viaModule = Command.create "git" |> Command.groups [ 27; 44 ]
+        let viaInstance = Command("git").Groups [ 27; 44 ]
+        Assert.That(viaModule.Config.Groups, Is.EqualTo(Some [ 27; 44 ]))
+        Assert.That(viaInstance.Config.Groups, Is.EqualTo(Some [ 27; 44 ]))
+
+    [<Test>]
+    member _.``Groups accepts an empty list, recording the explicit clear-all intent``() =
+        // An explicit `Groups []` is distinct from the unset default (`None`), though both clear the
+        // parent's supplementary groups on the wire (`setpriv --clear-groups`).
+        let cleared = Command.create "git" |> Command.groups []
+        Assert.That(cleared.Config.Groups, Is.EqualTo(Some([]: int list)))
+
+    [<Test>]
+    member _.``Groups accepts a gid of 0``() =
+        Assert.That((Command.create "git" |> Command.groups [ 0 ]).Config.Groups, Is.EqualTo(Some [ 0 ]))
+
+    [<Test>]
+    member _.``Groups is immutable - setting it returns a new command``() =
+        let baseCommand = Command.create "git"
+        let withGroups = baseCommand |> Command.groups [ 5; 6 ]
+        Assert.That(baseCommand.Config.Groups, Is.EqualTo(None: int list option))
+        Assert.That(withGroups.Config.Groups, Is.EqualTo(Some [ 5; 6 ]))
+
+    [<Test>]
+    member _.``Groups rejects a negative gid, naming the offending element by index``() =
+        let ex =
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () -> Command.create "git" |> Command.groups [ 10; -1; 20 ] |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail "expected an ArgumentOutOfRangeException"
+        | e -> Assert.That(e.ParamName, Is.EqualTo "Groups[1]")
+
+    [<Test>]
+    member _.``Groups composes with a User drop, leaving uid and gid intact``() =
+        let dropped =
+            Command.create "worker" |> Command.user 1000 1000 |> Command.groups [ 27; 44 ]
+
+        Assert.That(dropped.Config.Uid, Is.EqualTo(Some 1000))
+        Assert.That(dropped.Config.Gid, Is.EqualTo(Some 1000))
+        Assert.That(dropped.Config.Groups, Is.EqualTo(Some [ 27; 44 ]))
+
     // ---- LineTerminator -----------------------------------------------------------------------
 
     [<Test>]
