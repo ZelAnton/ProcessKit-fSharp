@@ -85,6 +85,13 @@ containment work is done through platform P/Invoke (Win32 for the Job Object, th
 filesystem and `libc` on Unix), so the supported runtime set is Windows, Linux, and macOS/BSD —
 the desktop and server platforms these target frameworks run on.
 
+The full test suite (minus the `Stress` category) runs in CI's `test` job matrix on
+`ubuntu-latest`, `ubuntu-24.04-arm`, `windows-latest`, and `macos-latest` — so the native syscall
+layer (direct `syscall(2)` invocations, `siginfo` struct layout, signal/epoll handling in
+`Native.Posix.fs`) is verified on Linux ARM64 as well as x64, not merely asserted correct by
+argument-passing convention. macOS's GitHub-hosted runner is Apple Silicon (arm64) already; Windows
+CI runs on x64 only.
+
 ## Trimming and NativeAOT
 
 CLI tools — a common consumer of a process library — increasingly ship as `PublishTrimmed` or
