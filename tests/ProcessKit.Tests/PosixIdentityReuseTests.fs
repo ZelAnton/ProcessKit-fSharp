@@ -2,6 +2,7 @@ namespace ProcessKit.Tests
 
 open System
 open System.Collections.Generic
+open System.IO
 open System.Runtime.InteropServices
 open NUnit.Framework
 open ProcessKit
@@ -290,3 +291,60 @@ type PosixIdentityReuseTests() =
                 Does.Contain pgid,
                 "a leader-reaped-but-descendants-hold pgid must still be signalled, not pruned as recycled"
             ))
+
+    // ---- the cgroup backend's per-child kill now funnels through the same identity choke ----
+
+    [<Test>]
+    member _.``the cgroup backend's KillChild never SIGKILLs a recycled pid but still kills a matching one``() =
+        if isWindows then
+            Assert.Ignore "the cgroup backend is Linux-only; its KillChild identity gate is POSIX-only"
+
+        // `CgroupBackend.KillChild` used to be a raw `kill(pid, SIGKILL)` with no identity gate — after a
+        // reap the pid could be recycled and the SIGKILL land on a stranger (the T-084 hole). It now
+        // funnels through the same start-time-identity choke (`processGroupStillTracked`) as the POSIX
+        // backend. Drive it against the deterministic identity/liveness/delivery seams. `Track` writes the
+        // pid into `cgroup.procs`, so back it with a writable temp file (a plain file the libc open/write
+        // accept) — the migrate confirmation then returns `Ok` and the identity token is captured.
+        let cgroupDir =
+            Path.Combine(Path.GetTempPath(), $"pk-cgroup-killchild-{Guid.NewGuid():N}")
+
+        Directory.CreateDirectory cgroupDir |> ignore
+        File.WriteAllText(Path.Combine(cgroupDir, "cgroup.procs"), "")
+
+        try
+            runWithReuseSeams (fun current delivered ->
+                let pidKept = 2_000_000_101
+                let pidRecycled = 2_000_000_102
+                current[pidKept] <- Some 1_100UL
+                current[pidRecycled] <- Some 1_200UL
+
+                let backend = CgroupBackend cgroupDir :> IContainmentBackend
+
+                match backend.Track(spawnedFor pidKept) with
+                | Ok() -> ()
+                | Error e -> Assert.Fail $"Track(kept) failed: {e.Message}"
+
+                match backend.Track(spawnedFor pidRecycled) with
+                | Ok() -> ()
+                | Error e -> Assert.Fail $"Track(recycled) failed: {e.Message}"
+
+                // Recycle the second pid number: still "alive" by number, but now a DIFFERENT process (its
+                // current identity changed). The first keeps its captured identity.
+                current[pidRecycled] <- Some 9_999UL
+
+                backend.KillChild(spawnedFor pidRecycled) // a stranger now — must NOT be SIGKILLed
+                backend.KillChild(spawnedFor pidKept) // still ours — must be SIGKILLed
+
+                Assert.That(delivered, Does.Contain pidKept, "a matching cgroup child must still be hard-killed")
+
+                Assert.That(
+                    delivered,
+                    Does.Not.Contain pidRecycled,
+                    "a recycled cgroup pid must never be hard-killed (wrong-target kill)"
+                ))
+        finally
+            try
+                Directory.Delete(cgroupDir, true)
+            with _ ->
+                // best-effort temp cleanup; a leftover temp dir must not fail the test.
+                ()
