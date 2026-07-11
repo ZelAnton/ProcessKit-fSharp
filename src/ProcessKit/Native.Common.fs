@@ -91,3 +91,141 @@ module internal Common =
                 SignalDelivery.TargetGone
             else
                 SignalDelivery.DeliveryFailed(errno, Win32Exception(errno).Message)
+
+    // ---------------------------------------------------------------------------
+    // PATH/PATHEXT resolution — one shared implementation backs BOTH the no-spawn preflight
+    // (`Exec.which` / `CliClient.EnsureAvailableAsync`) and the spawn path's own `ProcessError.NotFound`
+    // diagnostic enrichment (populating `Searched` after the OS itself reports a missing program), so
+    // the two can never disagree on "found vs not found" for the same program name. The actual spawn
+    // call still lets the OS do its own resolution (`CreateProcessW`/`posix_spawnp`) — this logic is
+    // never substituted into the real launch path, only used to resolve ahead of time (preflight) or to
+    // re-derive the searched-directories diagnostic after a genuine spawn failure.
+    // ---------------------------------------------------------------------------
+
+    /// Whether `program` is a bare name — a single path segment with no directory separator — that
+    /// should be looked up via `PATH`. A path-form program (`"./tool"`, `"C:\tools\tool.exe"`,
+    /// `"/usr/bin/tool"`) returns `false`: it is resolved directly (see `resolveProgram`), with no
+    /// `PATH` search, exactly like the OS itself resolves it. `/` is a separator on every platform;
+    /// `\` is a separator only on Windows (an ordinary filename character on POSIX).
+    let isBareName (program: string) : bool =
+        if String.IsNullOrEmpty program then
+            false
+        else
+            program.IndexOf '/' < 0
+            && (not (RuntimeInformation.IsOSPlatform OSPlatform.Windows)
+                || program.IndexOf '\\' < 0)
+
+    /// The default `PATHEXT` used when the environment variable itself is unset/empty — the same
+    /// fallback `cmd.exe` falls back to.
+    [<Literal>]
+    let private defaultPathExt = ".COM;.EXE;.BAT;.CMD"
+
+    /// Check whether `program` exists as a directly-executable file in `dir`, returning its full path.
+    /// Windows: `PATHEXT`-aware — the bare name is accepted as-is only when it already carries a
+    /// recognized executable extension (`git.exe`, `git.cmd`, …); otherwise each `PATHEXT` extension is
+    /// tried in order, appended to the bare name. POSIX: the plain file must exist and carry at least
+    /// one executable permission bit.
+    let probeDir (dir: string) (program: string) : string option =
+        if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+            let pathExt =
+                match Environment.GetEnvironmentVariable "PATHEXT" with
+                | null
+                | "" -> defaultPathExt
+                | value -> value
+
+            let extensions =
+                pathExt.Split ';'
+                |> Array.map (fun e -> e.Trim())
+                |> Array.filter (fun e -> e <> "")
+
+            let carriesExecExt (path: string) =
+                let ext = Path.GetExtension path
+
+                not (String.IsNullOrEmpty ext)
+                && extensions
+                   |> Array.exists (fun candidate -> String.Equals(candidate, ext, StringComparison.OrdinalIgnoreCase))
+
+            let candidate = Path.Combine(dir, program)
+
+            if carriesExecExt candidate && File.Exists candidate then
+                Some candidate
+            else
+                extensions
+                |> Array.tryPick (fun ext ->
+                    let named = candidate + ext
+                    if File.Exists named then Some named else None)
+        else
+            let candidate = Path.Combine(dir, program)
+
+            if File.Exists candidate then
+                let executableBits =
+                    UnixFileMode.UserExecute
+                    ||| UnixFileMode.GroupExecute
+                    ||| UnixFileMode.OtherExecute
+
+                if (File.GetUnixFileMode candidate &&& executableBits) <> UnixFileMode.None then
+                    Some candidate
+                else
+                    None
+            else
+                None
+
+    /// Search the current process's `PATH` for `program` (a bare name — see `isBareName`), reusing
+    /// `probeDir` for each directory in order. Returns `(found, searched)`: `found` is the first
+    /// matching directory's resolved path; `searched` is the raw `PATH` value, for the `NotFound`
+    /// diagnostic (`""` when `PATH` is unset/empty).
+    let findInPath (program: string) : string option * string =
+        match Environment.GetEnvironmentVariable "PATH" with
+        | null
+        | "" -> None, ""
+        | pathValue ->
+            let dirs = pathValue.Split Path.PathSeparator |> Array.filter (fun d -> d <> "")
+            (dirs |> Array.tryPick (fun dir -> probeDir dir program)), pathValue
+
+    /// Resolve `program` to a full path without spawning it. A bare name is looked up via `findInPath`
+    /// (typed `ProcessError.NotFound` with `Searched` naming the probed `PATH` value on a miss); a
+    /// path-form program is checked directly against its own directory component with the SAME
+    /// `probeDir` (so a missing extension is still resolved on Windows), never against `PATH`, and its
+    /// `NotFound` carries no `Searched` (nothing was searched — a single candidate location was
+    /// checked). This is the single resolution both `Exec.which`/`CliClient.EnsureAvailableAsync` and
+    /// the spawn path's `NotFound` enrichment (`notFoundFromSpawnFailure` below) go through, so
+    /// preflight and an actual spawn never disagree.
+    let resolveProgram (program: string) : Result<string, ProcessError> =
+        if String.IsNullOrWhiteSpace program then
+            Error(ProcessError.NotFound(program, None))
+        elif isBareName program then
+            match findInPath program with
+            | Some found, _ -> Ok found
+            | None, searched -> Error(ProcessError.NotFound(program, (if searched = "" then None else Some searched)))
+        else
+            let directory =
+                match Path.GetDirectoryName program with
+                | null
+                | "" -> "."
+                | d -> d
+
+            let fileName =
+                match Path.GetFileName program with
+                | null -> program
+                | name -> name
+
+            match probeDir directory fileName with
+            | Some found -> Ok found
+            | None -> Error(ProcessError.NotFound(program, None))
+
+    /// Enrich a spawn-time not-found failure with the `Searched` diagnostic, reusing `resolveProgram`
+    /// so the spawn path and the preflight helper can never disagree. The OS itself already reported
+    /// `program` as not found; if this redo unexpectedly resolves it anyway, that is an honest
+    /// `ProcessError.Spawn`, never a false `NotFound` — two known ways this can happen: a matching file
+    /// exists but is not directly executable (a permissions issue), or (Windows only) `resolveProgram`'s
+    /// full `PATHEXT` search matched a `.bat`/`.cmd` sibling that raw `CreateProcess` itself can never
+    /// launch without a shell (it only auto-appends `.exe`) — a real, if narrow, `which`-vs-spawn gap
+    /// this reports honestly rather than silently.
+    let notFoundFromSpawnFailure (program: string) : ProcessError =
+        match resolveProgram program with
+        | Ok resolved ->
+            ProcessError.Spawn(
+                program,
+                $"the OS reported the program as not found, but it resolves locally to '{resolved}' — check that it is directly executable (a .bat/.cmd match needs a shell to run; otherwise check its executable permissions)"
+            )
+        | Error error -> error

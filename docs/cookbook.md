@@ -26,6 +26,7 @@ methods.
 - [Supervision](#supervision)
 - [CliClient](#cliclient)
 - [Top-level Exec helpers](#top-level-exec-helpers)
+- [Preflight: is a program installed?](#preflight-is-a-program-installed)
 - [Logging, tracing & metrics](#logging-tracing--metrics)
 - [Dependency injection](#dependency-injection)
 - [Testing without subprocesses](#testing-without-subprocesses)
@@ -712,6 +713,55 @@ let! results = Exec.outputAll 4 runner commands CancellationToken.None // at mos
 var runner = new JobRunner();
 var commands = files.Select(f => new Command("gzip").Arg(f));
 var results = await Exec.outputAll(4, runner, commands, CancellationToken.None); // at most 4 live at once
+```
+
+## Preflight: is a program installed?
+
+`Exec.which` resolves a program to a full path without running it — a `doctor` check for an
+install wizard or a wrapper app's startup, cheaper than probing availability by actually launching
+the program. It shares the exact `PATH`/`PATHEXT`-aware lookup the spawn path itself falls back on,
+so it never disagrees with an actual spawn of the same program name (see
+[commands.md → Preflight](commands.md#preflight-is-a-program-installed) for the full contract,
+including Windows `PATHEXT` semantics).
+
+**F#**
+
+```fsharp
+match Exec.which "git" with
+| Ok path -> printfn $"git found at {path}"
+| Error err -> eprintfn $"git is not available: {err.Message}"
+```
+
+**C#**
+
+```csharp
+Console.WriteLine(Exec.which("git") switch
+{
+    { IsOk: true, ResultValue: var path } => $"git found at {path}",
+    { IsOk: false, ErrorValue: var err }  => $"git is not available: {err.Message}",
+});
+```
+
+The same check on a `CliClient` resolves the client's own program, and is always a **local** host
+check — never delegated to a runner injected via `WithRunner` (a `ScriptedRunner` used in the
+wrapper's own tests has no bearing on it):
+
+**F#**
+
+```fsharp
+match! git.EnsureAvailableAsync() with
+| Ok path -> printfn $"git found at {path}"
+| Error err -> eprintfn $"git is not available: {err.Message}"
+```
+
+**C#**
+
+```csharp
+Console.WriteLine(await git.EnsureAvailableAsync() switch
+{
+    { IsOk: true, ResultValue: var path } => $"git found at {path}",
+    { IsOk: false, ErrorValue: var err }  => $"git is not available: {err.Message}",
+});
 ```
 
 ## Logging, tracing & metrics
