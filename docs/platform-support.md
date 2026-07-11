@@ -208,6 +208,17 @@ can outlive the teardown. This is the genuine weakness of the process-group mech
 mechanisms have no such hole — membership is enforced by the kernel container, not by group
 bookkeeping. When this matters, check the active mechanism.
 
+**Unix privilege drop clears supplementary groups unless you set them.** A `Uid`/`Gid`/`User` drop
+runs through the `setpriv` helper (util-linux), which by default *clears* the parent's supplementary
+groups so the child never keeps root's — but a child dropped to a service user then lacks that user's
+group memberships (`docker`, `video`, `adm`, …). Pass `Command.Groups(gids)` to set the child's
+supplementary groups explicitly (mapped to `setpriv --groups`); it is honoured only alongside a
+`Uid`/`Gid` drop, so requesting it without one fails with `ProcessError.Spawn` rather than being
+silently ignored. The whole family is **Unix-only**: on Windows `Uid`/`Gid`/`Groups`/`Setsid`/`Umask`
+each fail the spawn with `ProcessError.Unsupported`, never a silent no-op. `setpriv` ships on mainstream
+Linux; where it is absent (macOS/BSD) a `Uid`/`Gid`/`Groups` drop fails with a typed `ProcessError.Spawn`
+naming the missing helper.
+
 **Windows delivers only `Signal.Kill`.** Windows has no general signal abstraction. `Signal.Kill`
 maps to the Job Object terminate; every other `Signal` value (`Term`, `Int`, `Hup`, `Quit`,
 `Usr1`, `Usr2`, `Other n`) returns `ProcessError.Unsupported` on Windows. Portable code that needs

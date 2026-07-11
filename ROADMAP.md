@@ -73,12 +73,6 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
 - **Pseudo-terminal (PTY).** ProcessKit wires pipes, not a tty, so a tool that *demands* a tty (an
   interactive `ssh` / `sudo` password prompt, some credential helpers) won't get one. Drive such
   tools non-interactively, or feed a known answer over interactive stdin.
-- **Supplementary-group *addition*.** A uid/gid drop (`Uid`/`Gid`/`User`) *clears* the parent's
-  supplementary groups (via `setpriv --clear-groups`) so the child never keeps them, but there is no
-  builder to *add* a target user's supplementary groups back. Privilege drop / session detach itself
-  (`Uid` / `Gid` / `User` / `Setsid`) is now supported on Unix — the uid/gid drop goes through the
-  `setpriv` helper (util-linux), so it needs `setpriv` on `PATH` (mainstream Linux; not macOS/BSD). See
-  [commands.md](docs/commands.md#unix-privilege-drop--session-detach).
 
 ## Versioning & stability
 

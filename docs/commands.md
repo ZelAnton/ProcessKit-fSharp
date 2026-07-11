@@ -629,26 +629,40 @@ await new Command("helper").CreateNoWindow().RunAsync();
 
 ### Unix privilege drop & session detach
 
-Four **Unix-only** builders drop the child's privileges or detach its session, for
+Five **Unix-only** builders drop the child's privileges or detach its session, for
 running a helper as a less-privileged user (daemons, CI runners, sandboxes):
 
 - **`Uid(uid)`** / **`Gid(gid)`** run the child under a different user / group id
   (`setuid` / `setgid`). **`User(uid, gid)`** is the common pair, equal to
   `.Gid(gid).Uid(uid)`.
+- **`Groups(gids)`** sets the child's **supplementary groups**, *replacing* the
+  inherited set — the third leg of a correct drop. A bare `Uid`/`Gid` drop *clears*
+  the parent's supplementary groups (so the child never keeps root's), so pass the
+  target user's groups here to grant them back (its `docker` / `video` / `adm`
+  membership), or `[]` to keep the cleared default. It rides the same helper as the
+  uid/gid drop, so it is honoured **only alongside a `Uid` or `Gid`** — set on its
+  own it fails the spawn with `ProcessError.Spawn` rather than being silently ignored.
 - **`Setsid()`** detaches the child into a **new session** (`setsid()`): its own
   session and process group, no controlling terminal.
 
 ```fsharp
 task {
-    // Drop to uid/gid 1000 and detach into a new session (needs privilege to run as another user).
-    let! _ = (Command.create "worker" |> Command.user 1000 1000 |> Command.setsid).RunAsync()
+    // Drop to uid/gid 1000, grant that user's docker+video groups, and detach into a new session
+    // (needs privilege to run as another user).
+    let worker =
+        Command.create "worker"
+        |> Command.user 1000 1000
+        |> Command.groups [ 998; 44 ]
+        |> Command.setsid
+
+    let! _ = worker.RunAsync()
     ()
 }
 ```
 
 ```csharp
-// Drop to uid/gid 1000 and detach into a new session.
-await new Command("worker").User(1000, 1000).Setsid().RunAsync();
+// Drop to uid/gid 1000, grant that user's docker+video groups, and detach into a new session.
+await new Command("worker").User(1000, 1000).Groups(new[] { 998, 44 }).Setsid().RunAsync();
 ```
 
 Honest by construction — never a silent downgrade:
@@ -662,8 +676,14 @@ Honest by construction — never a silent downgrade:
   `CAP_SETUID` / `CAP_SETGID` (a rootless container / sandbox), which is conservatively
   declined rather than probed (`setpriv` remains the real arbiter, so the guard stays a
   simple root gate rather than a partial reimplementation of the kernel's capability
-  model). The drop also *clears* the parent's supplementary groups and applies `setgid`
-  **before** `setuid`, so it composes into a correct drop.
+  model). The drop applies `setgid` **before** `setuid`, so it composes into a correct
+  drop, and by default *clears* the parent's supplementary groups; pass `Groups(gids)`
+  to set the child's supplementary groups explicitly instead.
+- **`Groups` is meaningful only as part of a drop.** It is applied by the same
+  `setpriv` helper as `Uid`/`Gid`, so setting it *without* a `Uid` or `Gid` fails the
+  spawn with `ProcessError.Spawn` — never a child whose groups were silently left
+  untouched. The gids are applied verbatim (numeric, no `/etc/group` lookup), and a
+  negative gid is rejected at the builder boundary with `ArgumentOutOfRangeException`.
 - **Containment is preserved under `Setsid`.** A new session still makes the child
   its own process-group leader, so the kill-on-drop group teardown reaches it. (The
   session detach replaces the group's default `POSIX_SPAWN_SETPGROUP` for that one
@@ -672,11 +692,12 @@ Honest by construction — never a silent downgrade:
 Because `posix_spawn` has no uid/gid attribute (and forking a managed .NET runtime
 to drop privileges in the child is unsafe), a command requesting `Uid`/`Gid` is
 rewritten to run through the **`setpriv`** helper (util-linux): it sets the gid/uid
-and clears the supplementary groups, then `exec`s the real program *in place* (same
-pid, so containment is unchanged). `setpriv` ships on mainstream Linux; where it is
-absent (macOS/BSD) a `Uid`/`Gid` drop fails with a typed `ProcessError.Spawn` naming
-the missing helper. `Setsid` alone needs no helper (it is a native `posix_spawn`
-attribute).
+and either clears the supplementary groups (`--clear-groups`, the default) or sets the
+`Groups(gids)` you asked for (`--groups`), then `exec`s the real program *in place*
+(same pid, so containment is unchanged). `setpriv` ships on mainstream Linux; where it
+is absent (macOS/BSD) a `Uid`/`Gid`/`Groups` drop fails with a typed
+`ProcessError.Spawn` naming the missing helper. `Setsid` alone needs no helper (it is a
+native `posix_spawn` attribute).
 
 ProcessKit wires **pipes**, not a pseudo-terminal, so a tool that *demands* a tty
 — an `ssh` / `sudo` **password** prompt, some credential helpers — won't get one.
