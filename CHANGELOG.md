@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `ProcessStdin.FinishAsync` no longer risks surfacing an `IOException` to the caller when the
+  child has already exited without reading stdin, or when the run's own teardown already closed
+  the same stream — it now goes through the same teardown-race-safe "quiet" close used everywhere
+  else a pipe stream is torn down, matching its documented idempotent/safe-after-teardown contract.
 
 ## [2.3.0] - 2026-07-11
 
