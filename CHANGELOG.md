@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pump-fault kill on a still-live group is unaffected. The Linux cgroup backend's per-child hard kill is
   additionally identity-gated (start-time token, like the POSIX process-group backend), so a recycled pid
   is never SIGKILLed.
+- `ProcessKit.Extensions.Hosting`'s internal `TrackingRunner` now honours `Command.CancelOn` and always
+  reports a cancelled hosted-process capture as `Error(ProcessError.Cancelled ...)`: it previously only
+  killed the child on the verb-level token (silently ignoring `Command.CancelOn`) and could surface a
+  cancelled run as `Ok` with the killed child's `Signalled`/non-zero result instead of a `Cancelled` error.
 
 ## [2.3.0] - 2026-07-11
 
