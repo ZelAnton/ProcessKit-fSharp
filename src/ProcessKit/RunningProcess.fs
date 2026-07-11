@@ -1134,9 +1134,13 @@ type RunningProcess internal (host: RunningHost) =
         else
 
             task {
-                // Clamp so an out-of-range timeout can't throw out of the CTS constructor (a negative
-                // value fires immediately → NotReady); the reported NotReady still carries the original.
-                use timeoutCts = new CancellationTokenSource(Timeouts.clampArmable timeout)
+                // Clamp so an out-of-range timeout can't throw out of the CTS constructor. The clamped
+                // value is also what gets reported in NotReady below — uniform with
+                // `ReadinessProbe.waitForPortUsing`/`waitForCore`: an over-long requested timeout is
+                // silently capped at ~24.8 days, so reporting the raw, un-clamped value would claim a
+                // budget longer than what was actually enforced.
+                let armedTimeout = Timeouts.clampArmable timeout
+                use timeoutCts = new CancellationTokenSource(armedTimeout)
 
                 use linked =
                     CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken)
@@ -1160,7 +1164,7 @@ type RunningProcess internal (host: RunningHost) =
                     if cancellationToken.IsCancellationRequested then
                         return Error(ProcessError.Cancelled config.Program)
                     else
-                        return Error(ProcessError.NotReady(config.Program, timeout))
+                        return Error(ProcessError.NotReady(config.Program, armedTimeout))
                 | :? ChannelClosedException as ex ->
                     // The stdout pump completed the channel. A clean EOF (stdout ended before a matching
                     // line) means the readiness condition was never met → NotReady. But a pump FAULT (a
@@ -1169,7 +1173,7 @@ type RunningProcess internal (host: RunningHost) =
                     // bug surfaces exactly as it does through `FinishAsync`/`StdoutLinesAsync`, rather than
                     // being masked as a spurious readiness timeout that also returns before the deadline.
                     match ex.InnerException with
-                    | null -> return Error(ProcessError.NotReady(config.Program, timeout))
+                    | null -> return Error(ProcessError.NotReady(config.Program, armedTimeout))
                     | inner ->
                         ExceptionDispatchInfo.Throw inner
                         return Unchecked.defaultof<_>

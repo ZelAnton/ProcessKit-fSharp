@@ -118,6 +118,28 @@ type ReadinessTests() =
         :> Task
 
     [<Test>]
+    member _.``WaitForLine reports the clamped (armable) timeout in NotReady, not an over-long raw one``() : Task =
+        task {
+            // An over-long timeout can't be armed on a BCL timer as-is; `WaitForLineAsync` arms the CTS
+            // with `Timeouts.clampArmable timeout` and must report that same clamped value in `NotReady`
+            // — uniform with `WaitForPortAsync`/`WaitForAsync` — never the raw, un-clamped request.
+            let config = (Command.create "test").Config
+            let running, stdoutWriter, _stderrWriter = syntheticBackpressureProcess config
+            use running = running
+
+            // Closing stdout with nothing written is a clean EOF: the predicate never matches, so this
+            // resolves to `NotReady` immediately via channel completion rather than actually waiting out
+            // the (unarmably long) requested timeout.
+            stdoutWriter.Close()
+
+            match! running.WaitForLineAsync((fun line -> line.Contains "never"), TimeSpan.MaxValue) with
+            | Error(ProcessError.NotReady(_, reportedTimeout)) ->
+                Assert.That(reportedTimeout, Is.EqualTo(Timeouts.maxArmable))
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``WaitForPort connects to a listening port``() : Task =
         let listener = new TcpListener(IPAddress.Loopback, 0)
         listener.Start()

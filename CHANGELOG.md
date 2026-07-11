@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pump-fault kill on a still-live group is unaffected. The Linux cgroup backend's per-child hard kill is
   additionally identity-gated (start-time token, like the POSIX process-group backend), so a recycled pid
   is never SIGKILLed.
+- `RunningProcess.WaitForLineAsync` now reports the clamped (armable) timeout in `ProcessError.NotReady`
+  for an over-long (>~24.8 days) requested timeout, instead of the raw, un-clamped value — uniform with
+  `WaitForPortAsync`/`WaitForAsync`, which already report the value actually enforced.
 
 ## [2.3.0] - 2026-07-11
 
