@@ -223,6 +223,85 @@ jobs:
                 --filter "FullyQualifiedName~LimitsTests"
             '
 
+  # NativeAOT/trimming smoke: publishes a minimal ProcessKit consumer (samples/FSharp.NativeAot) with
+  # PublishAot and RUNS the produced native binary, so the packages' IsTrimmable/IsAotCompatible claims
+  # are validated in a real ahead-of-time-compiled image rather than only asserted in metadata. The run
+  # exercises spawn + honest capture + containment (a child inside a kill-on-dispose ProcessGroup), so a
+  # trimmed-away code path that breaks at runtime fails the job. Both OS legs are covered because each
+  # AOT-compiles and runs a different containment backend: win-x64 the Windows Job Object (struct
+  # marshalling), linux-x64 the POSIX process group. FSharp.Core (the F# runtime, an immovable dependency)
+  # emits unavoidable trim/AOT baseline warnings, so ilc's treat-warnings-as-errors is off in the sample;
+  # the grep gate below re-imposes a hard failure if ilc ever attributes a warning to a ProcessKit* assembly
+  # (i.e. if our own code regresses its trim/AOT cleanliness). See docs/platform-support.md.
+  aot-smoke:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+          - os: windows-latest
+            rid: win-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # bash on both OSes (GitHub's bash uses `-eo pipefail`, so a failed publish in a `| tee` pipe still
+        # fails the step) so the publish/gate/run commands are written once.
+        shell: bash
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Directory.Packages.props', 'nuget.config', 'global.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      # NativeAOT on Linux links with clang against zlib; the Windows runner already has the MSVC C++
+      # toolchain the ilc link step needs.
+      - name: Install NativeAOT prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+
+      - name: Build the referenced libraries (Release, net10.0)
+        # The sample resolves ProcessKit and ProcessKit.Extensions.DependencyInjection as assembly
+        # <Reference>s from their src/**/bin/Release/net10.0 outputs (the ilc input IL for the native image).
+        # Core is built first so the DI project's assembly reference to it resolves. Building just these two
+        # for the single TFM the AOT sample targets is all this smoke needs — no test/benchmark projects,
+        # no net8.0 leg.
+        run: |
+          dotnet build src/ProcessKit/ProcessKit.fsproj --configuration Release --framework net10.0
+          dotnet build src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj \
+            --configuration Release --framework net10.0
+
+      - name: Publish the NativeAOT smoke consumer
+        run: >-
+          dotnet publish samples/FSharp.NativeAot/FSharp.NativeAot.fsproj
+          --configuration Release -r ${{ matrix.rid }}
+          -o "$PWD/samples/FSharp.NativeAot/publish-aot" 2>&1 | tee aot-publish.log
+
+      - name: Gate — no ProcessKit assembly may produce trim/AOT warnings
+        run: |
+          if grep -E "Assembly 'ProcessKit" aot-publish.log; then
+            echo "::error::A ProcessKit assembly produced trim/AOT warnings under NativeAOT publish (see log)."
+            exit 1
+          fi
+          echo "No ProcessKit trim/AOT warnings — the packages stayed AOT-clean."
+
+      - name: Run the NativeAOT smoke (spawn + capture + containment)
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ./samples/FSharp.NativeAot/publish-aot/FSharp.NativeAot.exe
+          else
+            ./samples/FSharp.NativeAot/publish-aot/FSharp.NativeAot
+          fi
+
   # Stress/soak suite (`[<Category("Stress")>]` in tests/ProcessKit.Tests/StressTests.fs): hundreds
   # of concurrent runs against thread-pool/managed-memory/handle baselines. Deliberately kept off the
   # ordinary PR/push `test` job (flaky-sensitive, adds real wall-clock time) and run instead on a

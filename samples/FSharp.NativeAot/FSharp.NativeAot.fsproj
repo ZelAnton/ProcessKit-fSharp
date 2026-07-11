@@ -1,0 +1,62 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<!-- Minimal NativeAOT/trimmed consumer of ProcessKit + ProcessKit.Extensions.DependencyInjection,
+	     published and run by the `aot-smoke` CI job (.github/workflows/ci.yml) to prove the published
+	     packages' IsTrimmable/IsAotCompatible claims are real: it spawns a child, captures its output as an
+	     honest result, runs a child inside a kill-on-dispose ProcessGroup, and runs a child through a
+	     DI-resolved IProcessRunner. A trimmed-away code path breaking at runtime makes the smoke exit
+	     non-zero; the CI grep gate fails if ilc attributes any warning to a ProcessKit* assembly. See
+	     docs/platform-support.md. -->
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<AssemblyName>FSharp.NativeAot</AssemblyName>
+		<!-- Single-target: NativeAOT publishes one TFM+RID. Clear the repo-wide multi-TFM default
+		     (Directory.Build.props sets TargetFrameworks=net8.0;net10.0) so this is an unambiguous
+		     single (inner) build. net10.0 is the current SDK band; NativeAOT needs net8.0+. -->
+		<TargetFrameworks></TargetFrameworks>
+		<TargetFramework>net10.0</TargetFramework>
+		<IsPackable>false</IsPackable>
+		<GenerateDocumentationFile>false</GenerateDocumentationFile>
+
+		<!-- Publish as NativeAOT. The CI job passes only the RID (-r linux-x64 / win-x64); everything else
+		     is here so a local `dotnet publish -r <rid>` reproduces the CI smoke exactly. InvariantGlobalization
+		     keeps the native image small and avoids pulling ICU. -->
+		<PublishAot>true</PublishAot>
+		<InvariantGlobalization>true</InvariantGlobalization>
+
+		<!-- FSharp.Core (the F# runtime, an immovable dependency) produces unavoidable trim/AOT analysis
+		     warnings (IL2104/IL3053) — its printf/quotation/reflection surface is not fully trim-annotated.
+		     `TreatWarningsAsErrors` is inherited repo-wide, so without this ilc treats that FSharp.Core
+		     baseline as errors and the publish fails on a warning we cannot fix. Turn OFF *ilc's*
+		     treat-warnings-as-errors so the FSharp.Core baseline does not fail the publish (F# source
+		     warnings-as-errors stay on). ProcessKit's own assemblies are trim/AOT-clean and are kept that
+		     way by the `aot-smoke` job's grep gate (it fails if ilc attributes any warning to a ProcessKit*
+		     assembly); the ultimate validation is the run — the native binary must exit 0. -->
+		<IlcTreatWarningsAsErrors>false</IlcTreatWarningsAsErrors>
+
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.DependencyInjection\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Compile Include="Program.fs" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- An assembly <Reference> carries no NuGet dependency graph, so this consumer names the referenced
+		     packages' own dependencies directly, same as the other samples. Microsoft.Extensions.DependencyInjection
+		     (the concrete container) plus Options is what the DI scenario resolves through. -->
+		<PackageReference Include="FSharp.Core" />
+		<PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+		<PackageReference Include="Microsoft.Extensions.Options" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- Both publishable runtime packages this smoke exercises are referenced so ilc scans them: the
+		     `aot-smoke` grep gate fails if ilc attributes any trim/AOT warning to a ProcessKit* assembly. -->
+		<Reference Include="ProcessKit" />
+		<Reference Include="ProcessKit.Extensions.DependencyInjection" />
+	</ItemGroup>
+
+</Project>

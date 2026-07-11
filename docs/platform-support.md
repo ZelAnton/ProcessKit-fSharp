@@ -11,6 +11,7 @@ mechanism, capability matrix, and caveat in one place.
 
 - [Containment mechanisms](#containment-mechanisms)
 - [Target frameworks](#target-frameworks)
+- [Trimming and NativeAOT](#trimming-and-nativeaot)
 - [Capability matrices](#capability-matrices)
 - [Caveats](#caveats)
 
@@ -83,6 +84,50 @@ ProcessKit targets **.NET 8.0** and **.NET 10.0**, and is usable from F# and C# 
 containment work is done through platform P/Invoke (Win32 for the Job Object, the cgroup
 filesystem and `libc` on Unix), so the supported runtime set is Windows, Linux, and macOS/BSD —
 the desktop and server platforms these target frameworks run on.
+
+## Trimming and NativeAOT
+
+CLI tools — a common consumer of a process library — increasingly ship as `PublishTrimmed` or
+NativeAOT images, so ProcessKit's runtime packages declare their compatibility explicitly and back the
+claim with a CI smoke that actually publishes and runs a NativeAOT consumer.
+
+| Package | `IsTrimmable` | `IsAotCompatible` | Notes |
+|---|:---:|:---:|---|
+| `ProcessKit` | ✅ | ✅ | Containment is platform P/Invoke with no reflection, dynamic codegen, or reflection-backed `printf`/`%A` on any path. |
+| `ProcessKit.Extensions.DependencyInjection` | ✅ | ✅ | Factory-based registration; the `AddProcessKit`/`AddProcessKitGroup` **`IConfiguration`** overloads are the one exception (see below). |
+| `ProcessKit.Extensions.Hosting` | ✅ | ✅ | Factory-based DI plus an `IHostedService` wrapper; options come from the AOT-safe `Activator.CreateInstance<T>()` path. |
+| `ProcessKit.Testing` | ❌ | ❌ | Not trim/AOT-safe by design — see the boundary below. This is a **test-only** package, referenced from test projects that are not themselves trimmed/AOT-published. |
+
+**The one annotated exception (DI).** `AddProcessKit(IConfiguration)` and `AddProcessKitGroup(IConfiguration)`
+bind `ProcessKitOptions` from configuration by reflection, which is not trim/AOT-safe. Both carry
+`[RequiresUnreferencedCode]` / `[RequiresDynamicCode]`, so a consumer that calls them from a trimmed/AOT app
+gets a precise warning pointing at the overload — exactly as Microsoft's own DI/options packages behave. Use
+the `Action<ProcessKitOptions>` overload (or bind configuration yourself and call `configure`) from an AOT app.
+
+**The `ProcessKit.Testing` boundary.** The record/replay cassette surface (`RecordReplayRunner`) serializes
+and deserializes with reflection-based `System.Text.Json`. F# cannot use the `System.Text.Json` source
+generator (it is a Roslyn/C# source generator that the F# compiler does not run), so the usual
+AOT remedy is unavailable. Rather than emit silent "assembly was not verified" warnings, the package is
+honestly **not** declared trimmable/AOT-compatible. Because it is meant to be referenced only from test
+projects — code never shipped inside a trimmed/AOT application — this is a boundary in practice, not a
+limitation of what you deploy.
+
+**F# runtime baseline.** `FSharp.Core` — the F# runtime every F# assembly depends on — is not fully
+trim/AOT-annotated (its `printf`/quotation/reflection surface), so a NativeAOT publish of *any* F#
+application surfaces `IL2104`/`IL3053` warnings **attributed to `FSharp.Core`**, independent of ProcessKit.
+Those are a known F# baseline, not a ProcessKit defect; warnings attributed to a `ProcessKit*` assembly would
+be. ProcessKit's own assemblies publish warning-free.
+
+**How this is validated.** [`samples/FSharp.NativeAot`](../samples/FSharp.NativeAot) is a minimal consumer of
+`ProcessKit` **and** `ProcessKit.Extensions.DependencyInjection`, published with `PublishAot=true` and run by
+the `aot-smoke` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) on both `linux-x64` (POSIX
+process-group backend) and `win-x64` (Windows Job Object backend). It spawns a child, captures a non-zero
+exit as an honest result, runs a child inside a kill-on-dispose `ProcessGroup`, and runs a child through a
+DI-resolved `IProcessRunner` (`AddProcessKit`); the job fails if ilc attributes any warning to a `ProcessKit*`
+assembly or if the native binary exits non-zero. So the compatibility above is exercised in a real
+ahead-of-time-compiled image, not merely declared in metadata. (`ProcessKit.Extensions.Hosting` shares the
+same factory-based, reflection-free pattern; its declaration rests on that analysis rather than a running
+hosted-service image in this smoke.)
 
 ## Capability matrices
 

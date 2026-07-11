@@ -1,5 +1,12 @@
 namespace ProcessKit.Native
 
+// FS3265 fires when the generic `Marshal.PtrToStructure<'T>` — the AOT-safe overload Microsoft recommends
+// over the `[<RequiresDynamicCode>]` non-generic `PtrToStructure(ptr, Type)` — is instantiated with a value
+// type: F# forms a `'T | null` return whose nullness it can't track precisely. A struct can never be null,
+// so the lost precision is harmless; suppress the false positive here (the only value-type reads via that
+// overload in this file are the Job-Object accounting/limit structs below).
+#nowarn "3265"
+
 open ProcessKit
 open System
 open System.ComponentModel
@@ -332,7 +339,9 @@ module internal Windows =
             let buffer = Marshal.AllocHGlobal size
 
             try
-                Marshal.StructureToPtr(info, buffer, false)
+                // Explicit generic overload — the non-generic `StructureToPtr(object, ...)` is
+                // `[<RequiresDynamicCode>]` (AOT-unfriendly). The concrete struct type keeps it trim/AOT-clean.
+                Marshal.StructureToPtr<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(info, buffer, false)
 
                 if SetInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, uint32 size) then
                     Ok job
@@ -643,13 +652,13 @@ module internal Windows =
                 )
 
             if okAcc && okExt then
-                let acc =
-                    Marshal.PtrToStructure(accBuffer, typeof<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>)
-                    :?> JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+                // Generic `PtrToStructure<'T>` (not the non-generic `PtrToStructure(ptr, Type)` overload,
+                // which is `[<RequiresDynamicCode>]` — its marshalling stub for an arbitrary runtime Type
+                // can't be generated ahead of time, so it warns under NativeAOT). The generic form has the
+                // concrete struct baked in at compile time and is trim/AOT-clean.
+                let acc = Marshal.PtrToStructure<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION> accBuffer
 
-                let ext =
-                    Marshal.PtrToStructure(extBuffer, typeof<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>)
-                    :?> JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+                let ext = Marshal.PtrToStructure<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> extBuffer
 
                 let cpu = TimeSpan.FromTicks(acc.TotalUserTime + acc.TotalKernelTime)
                 Some(int acc.ActiveProcesses, cpu, int64 ext.PeakJobMemoryUsed)
@@ -707,7 +716,7 @@ module internal Windows =
         let buffer = Marshal.AllocHGlobal size
 
         try
-            Marshal.StructureToPtr(info, buffer, false)
+            Marshal.StructureToPtr<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(info, buffer, false)
 
             if not (SetInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, uint32 size)) then
                 Error(Win32Exception(Marshal.GetLastWin32Error()).Message)
@@ -726,7 +735,7 @@ module internal Windows =
                     let cpuBuffer = Marshal.AllocHGlobal cpuSize
 
                     try
-                        Marshal.StructureToPtr(cpuInfo, cpuBuffer, false)
+                        Marshal.StructureToPtr<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>(cpuInfo, cpuBuffer, false)
 
                         if
                             SetInformationJobObject(job, JobObjectCpuRateControlInformation, cpuBuffer, uint32 cpuSize)

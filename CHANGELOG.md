@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- The `ProcessKit`, `ProcessKit.Extensions.DependencyInjection`, and `ProcessKit.Extensions.Hosting` packages now declare trimming/NativeAOT compatibility (`IsTrimmable`/`IsAotCompatible`), so a consumer that publishes a `PublishTrimmed`/NativeAOT app no longer gets "assembly was not verified" warnings for them; a CI smoke publishes and runs a NativeAOT consumer that spawns, captures, and contains a child on both Linux (`linux-x64`) and Windows (`win-x64`). See [docs/platform-support.md](docs/platform-support.md#trimming-and-nativeaot) — including the documented boundary that `ProcessKit.Testing` is not trim/AOT-safe (its reflection-based `System.Text.Json` cassettes), which is fine because it is a test-only dependency.
 
 ### Changed
--
+- `AddProcessKit(IConfiguration)` / `AddProcessKitGroup(IConfiguration)` are now annotated `[RequiresUnreferencedCode]`/`[RequiresDynamicCode]`: because they bind `ProcessKitOptions` from configuration by reflection, a trimmed/NativeAOT app that calls them now gets a precise warning pointing at the overload — use the `Action<ProcessKitOptions>` overload from an AOT app. No effect on a non-trimmed build.
 
 ### Fixed
 -
