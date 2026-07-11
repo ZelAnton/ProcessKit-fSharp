@@ -1329,8 +1329,9 @@ type RunningProcess internal (host: RunningHost) =
             // harmlessly (`Reset` after disposal is a no-op).
             idleTimer |> Option.iter (fun t -> (t :> IDisposable).Dispose())
             // Clear `runs.active` for a handle disposed without ever reaching a terminal verb — a no-op
-            // (guarded by `concludedFlag`) when `conclude` already ran, so a normal verb-then-dispose
-            // sequence, or a repeated dispose, cannot double-decrement.
+            // (guarded by `RunTelemetryScope`'s once-guard, `telemetry.Abandon()` racing `Conclude`)
+            // when a terminal verb already ran, so a normal verb-then-dispose sequence, or a repeated
+            // dispose, cannot double-decrement.
             markAbandoned ()
             host.Teardown()
 
