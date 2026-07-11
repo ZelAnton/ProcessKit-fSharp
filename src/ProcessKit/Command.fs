@@ -95,6 +95,15 @@ type internal CommandConfig =
       // `ProcessError.Spawn`.
       Uid: int option
       Gid: int option
+      // Unix privilege drop: the child's supplementary groups, REPLACING the inherited set — the third
+      // leg of a correct drop, next to `Uid`/`Gid`. `None` (the default) keeps the `setpriv` path's
+      // `--clear-groups` behaviour (a uid/gid drop clears the parent's supplementary groups so the child
+      // never keeps root's). `Some gids` sets EXACTLY those groups via `setpriv --groups` (an explicit
+      // `Some []` clears them, identical on the wire to the `None` default). Because it rides the same
+      // `setpriv` helper as the uid/gid drop, it takes effect only alongside one: a `Groups` request
+      // without `Uid`/`Gid` is refused up front with `ProcessError.Spawn` (never a silent no-op), and on
+      // Windows any set value fails the spawn with `ProcessError.Unsupported`, exactly like `Uid`/`Gid`.
+      Groups: int list option
       // Unix `setsid()`: detach the child into a brand-new session with no controlling terminal. `false`
       // (the default) leaves the child in the caller's session. Unix-only: `true` fails a Windows spawn
       // with `ProcessError.Unsupported`. `setsid()` also makes the child a new process-group leader
@@ -144,6 +153,7 @@ module internal CommandConfig =
           Umask = None
           Uid = None
           Gid = None
+          Groups = None
           Setsid = false
           Logger = None
           RunId = None }
@@ -698,6 +708,38 @@ type Command internal (config: CommandConfig) =
                 Gid = Some gid }
         )
 
+    /// Set the child's Unix **supplementary groups**, *replacing* the inherited set — the missing third
+    /// leg of a correct privilege drop, next to `Uid`/`Gid`. A bare `Uid`/`Gid`/`User` drop *clears* the
+    /// parent's supplementary groups (`setpriv --clear-groups`) so the child never keeps root's; pass the
+    /// target user's groups here to grant them back (e.g. a service user's `docker`/`video`/`adm`
+    /// membership), or `[]` to keep the cleared default explicitly. The gids are applied verbatim — they
+    /// need not name existing `/etc/group` entries. Because it rides the same `setpriv` helper as the
+    /// uid/gid drop (mapped to `setpriv --groups`), it is meaningful only **alongside a `Uid` or `Gid`
+    /// drop**: `Groups` set without either is refused at spawn with `ProcessError.Spawn` rather than
+    /// silently ignored (never a silent no-op). **Unix-only:** on Windows (no equivalent) a set value
+    /// fails the spawn with `ProcessError.Unsupported`, exactly like `Uid`/`Gid`. Every gid must be
+    /// non-negative — rejected with `ArgumentOutOfRangeException` at the builder boundary, naming the
+    /// offending element by index (`Groups[2]`).
+    member _.Groups(gids: seq<int>) =
+        ArgumentNullException.ThrowIfNull gids
+        let materialized = gids |> Seq.toArray
+
+        materialized
+        |> Array.iteri (fun index gid ->
+            if gid < 0 then
+                raise (
+                    ArgumentOutOfRangeException(
+                        $"Groups[{index}]",
+                        gid,
+                        "a supplementary group id must be non-negative"
+                    )
+                ))
+
+        Command(
+            { config with
+                Groups = Some(List.ofArray materialized) }
+        )
+
     /// Detach the child into a **new session** (`setsid()`): its own session and process group, with no
     /// controlling terminal. **Unix-only:** on Windows a requested detach fails the spawn with
     /// `ProcessError.Unsupported`. `setsid()` makes the child a new process-group leader (pgid == pid),
@@ -856,6 +898,11 @@ module Command =
 
     /// Run the child under this Unix user and group id (the privilege-drop pair). See `Command.User`.
     let user (uid: int) (gid: int) (command: Command) = command.User(uid, gid)
+
+    /// Set the child's Unix supplementary groups, replacing the inherited set — the third leg of a
+    /// privilege drop. Meaningful only alongside a `Uid`/`Gid` drop (else `ProcessError.Spawn`);
+    /// Unix-only (a set value fails a Windows spawn with `ProcessError.Unsupported`). See `Command.Groups`.
+    let groups (gids: seq<int>) (command: Command) = command.Groups gids
 
     /// Detach the child into a new session (`setsid()`). Unix-only: a set request fails a Windows spawn
     /// with `ProcessError.Unsupported`. Containment is preserved. See `Command.Setsid`.

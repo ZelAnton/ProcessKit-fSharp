@@ -1,9 +1,11 @@
 namespace ProcessKit
 
 open System
+open System.Diagnostics.CodeAnalysis
 open System.IO
 open System.Runtime.CompilerServices
 open System.Runtime.InteropServices
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 
@@ -394,6 +396,23 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         ArgumentNullException.ThrowIfNull parser
 
         CaptureVerbs.tryParse (List.last commands).Program (TryParser.toResult parser) (fun () ->
+            this.RunAsync cancellationToken)
+
+    /// Require a successful pipefail exit and deserialize the trimmed stdout as JSON into a `'T` via
+    /// `System.Text.Json` (`options` omitted uses the BCL defaults); invalid JSON becomes
+    /// `ProcessError.Parse`, just like `ParseAsync`. Give an explicit type argument — there is no parser
+    /// argument to infer `'T` from.
+    ///
+    /// **Trimming / AOT:** deserializes via reflection-based `System.Text.Json`
+    /// (`JsonSerializer.Deserialize(string, Type, JsonSerializerOptions)`), so it is not trim-/AOT-safe —
+    /// pass `options` with a source-generated `JsonSerializerContext`/`JsonTypeInfo&lt;'T&gt;` resolver, or
+    /// avoid this verb, in a trimmed/NativeAOT app.
+    [<RequiresUnreferencedCode "Deserializes stdout by reflection via System.Text.Json; give options a source-generated JsonSerializerContext, or avoid this verb, in a trimmed app.">]
+    [<RequiresDynamicCode "Deserializes stdout by reflection via System.Text.Json; give options a source-generated JsonSerializerContext, or avoid this verb, in a NativeAOT app.">]
+    member this.OutputJsonAsync<'T>
+        ([<Optional>] options: JsonSerializerOptions | null, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<'T, ProcessError>> =
+        CaptureVerbs.outputJson (List.last commands).Program (Option.ofObj options) (fun () ->
             this.RunAsync cancellationToken)
 
 /// `Command.Pipe` builds a two-stage `Pipeline`; further `Pipeline.Pipe` calls extend it.

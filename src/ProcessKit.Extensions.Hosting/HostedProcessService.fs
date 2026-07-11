@@ -56,37 +56,39 @@ type internal TrackingRunner(inner: IProcessRunner) =
             }
 
         member this.CaptureStringAsync(command, cancellationToken) =
-            task {
-                // Register a kill-on-cancel backstop: without it, cancelling `cancellationToken`
-                // (e.g. `lifetime.Cancel()` on host shutdown) would never reach an already-running child,
-                // since `OutputStringAsync` itself does not watch any token. This mirrors the pattern
-                // in `CaptureVerbs.runToCompletion` (src/ProcessKit/Runner.fs:123).
-                match! (this :> IProcessRunner).SpawnAsync(command, cancellationToken) with
-                | Error error -> return Error error
-                | Ok running ->
-                    use _registration = cancellationToken.Register(fun () -> running.Kill())
-
-                    try
-                        let! result = running.OutputStringAsync()
-                        return result
-                    finally
-                        clearCurrent running
-            }
+            // Reuse `CaptureVerbs.runToCompletion` rather than a hand-rolled spawn->consume->cancel-map
+            // loop, so hosted commands get the exact same contract every other runner gets: a `Command`
+            // `CancelOn` is linked into the effective token (not silently ignored), and a run cancelled
+            // through that effective token always resolves to `Error(ProcessError.Cancelled ...)` — never
+            // an `Ok` carrying the killed child's `Signalled`/non-zero result. `start` reuses this
+            // runner's own `SpawnAsync` so the active-child tracking (`setCurrent`) still registers the
+            // handle `StopActiveAsync`/`KillActive` rely on; `consume` clears it again in `finally`, once
+            // `OutputStringAsync` has actually finished, independent of the outcome.
+            CaptureVerbs.runToCompletion
+                command
+                cancellationToken
+                (fun () -> (this :> IProcessRunner).SpawnAsync(command, cancellationToken))
+                (fun running ->
+                    task {
+                        try
+                            return! running.OutputStringAsync()
+                        finally
+                            clearCurrent running
+                    })
 
         member this.CaptureBytesAsync(command, cancellationToken) =
-            task {
-                // See `CaptureStringAsync` above for why this registers a kill-on-cancel backstop.
-                match! (this :> IProcessRunner).SpawnAsync(command, cancellationToken) with
-                | Error error -> return Error error
-                | Ok running ->
-                    use _registration = cancellationToken.Register(fun () -> running.Kill())
-
-                    try
-                        let! result = running.OutputBytesAsync()
-                        return result
-                    finally
-                        clearCurrent running
-            }
+            // See `CaptureStringAsync` above for the rationale.
+            CaptureVerbs.runToCompletion
+                command
+                cancellationToken
+                (fun () -> (this :> IProcessRunner).SpawnAsync(command, cancellationToken))
+                (fun running ->
+                    task {
+                        try
+                            return! running.OutputBytesAsync()
+                        finally
+                            clearCurrent running
+                    })
 
 /// Options for a ProcessKit hosted process registered with `AddProcessKitHostedProcess`.
 [<Sealed>]
@@ -283,7 +285,19 @@ type HostedProcessService
 
                 let! stopped = trackingRunner.StopActiveAsync(options.ShutdownGracePeriod, cancellationToken)
                 lock gate (fun () -> lastStopOutcome <- stopped)
-                cancelLifetime ()
+
+                // Only cancel `lifetime` here when there was no active child to gracefully stop above
+                // (`stopped = None`): with an active child, `stopping` (set just above) already makes
+                // the combined `StopWhen` end the supervision loop on THAT child's own honest capture
+                // result once it returns (`CaptureVerbs.runToCompletion`'s post-consume check watches
+                // this very `lifetime.Token`) — cancelling it here as well would race that still-finishing
+                // capture and risk overwriting a legitimate graceful outcome with a bare `Cancelled`
+                // error, discarding the real exit/stdout/stderr the caller expects via `LastOutcome`.
+                // With no active child (e.g. supervision is mid-backoff-sleep, or hasn't spawned yet),
+                // there is nothing else to unblock the loop, so cancel `lifetime` to interrupt any
+                // in-flight backoff sleep and end supervision promptly.
+                if stopped.IsNone then
+                    cancelLifetime ()
 
                 let toAwait = lock gate (fun () -> supervisionTask)
 

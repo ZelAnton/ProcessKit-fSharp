@@ -3,6 +3,7 @@ class ProcessKit.CliClient
   member ExitCodeAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
   member FirstLineAsync(System.Collections.Generic.IEnumerable<System.String>, System.Func<System.String, System.Boolean>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
   member OutputBytesAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  member OutputJsonAsync<T>(System.Collections.Generic.IEnumerable<System.String>, System.Text.Json.JsonSerializerOptions, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   member OutputStringAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   member ParseAsync<T>(System.Collections.Generic.IEnumerable<System.String>, System.Func<System.String, T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   member ProbeAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
@@ -29,6 +30,7 @@ class ProcessKit.Command
   member EnvClear() : ProcessKit.Command
   member EnvRemove(System.String) : ProcessKit.Command
   member Gid(System.Int32) : ProcessKit.Command
+  member Groups(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.Command
   member IdleTimeout(System.TimeSpan) : ProcessKit.Command
   member InheritStdin() : ProcessKit.Command
   member KeepStdinOpen() : ProcessKit.Command
@@ -78,6 +80,7 @@ module ProcessKit.CommandModule
   static member envClear(ProcessKit.Command) : ProcessKit.Command
   static member envRemove(System.String, ProcessKit.Command) : ProcessKit.Command
   static member gid(System.Int32, ProcessKit.Command) : ProcessKit.Command
+  static member groups(System.Collections.Generic.IEnumerable<System.Int32>, ProcessKit.Command) : ProcessKit.Command
   static member idleTimeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member inheritStdin(ProcessKit.Command) : ProcessKit.Command
   static member keepStdinOpen(ProcessKit.Command) : ProcessKit.Command
@@ -114,6 +117,7 @@ class ProcessKit.CommandVerbs
   static member ExitCodeAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
   static member FirstLineAsync(ProcessKit.Command, System.Func<System.String, System.Boolean>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
   static member OutputBytesAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  static member OutputJsonAsync<T>(ProcessKit.Command, System.Text.Json.JsonSerializerOptions, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   static member OutputStringAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   static member ParseAsync<T>(ProcessKit.Command, System.Func<System.String, T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   static member ProbeAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
@@ -353,6 +357,7 @@ class ProcessKit.Pipeline
   member CancelOn(System.Threading.CancellationToken) : ProcessKit.Pipeline
   member ExitCodeAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
   member OutputBytesAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  member OutputJsonAsync<T>(System.Text.Json.JsonSerializerOptions, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   member OutputStringAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   member ParseAsync<T>(System.Func<System.String, T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   member Pipe(ProcessKit.Command) : ProcessKit.Pipeline
@@ -702,6 +707,7 @@ class ProcessKit.ProcessRunnerExtensions
   static member ExitCodeAsync(ProcessKit.IProcessRunner, ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
   static member FirstLineAsync(ProcessKit.IProcessRunner, ProcessKit.Command, System.Func<System.String, System.Boolean>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
   static member OutputBytesAsync(ProcessKit.IProcessRunner, ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  static member OutputJsonAsync<T>(ProcessKit.IProcessRunner, ProcessKit.Command, System.Text.Json.JsonSerializerOptions, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   static member OutputStringAsync(ProcessKit.IProcessRunner, ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   static member ParseAsync<T>(ProcessKit.IProcessRunner, ProcessKit.Command, System.Func<System.String, T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   static member ProbeAsync(ProcessKit.IProcessRunner, ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
@@ -776,6 +782,7 @@ module ProcessKit.Runner
   static member exitCode(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
   static member firstLine(ProcessKit.IProcessRunner, System.Threading.CancellationToken, Microsoft.FSharp.Core.FSharpFunc<System.String, System.Boolean>, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
   static member outputBytes(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  static member outputJson<T>(ProcessKit.IProcessRunner, System.Threading.CancellationToken, Microsoft.FSharp.Core.FSharpOption<System.Text.Json.JsonSerializerOptions>, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   static member outputString(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   static member parse<T>(ProcessKit.IProcessRunner, System.Threading.CancellationToken, Microsoft.FSharp.Core.FSharpFunc<System.String, T>, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   static member probe(ProcessKit.IProcessRunner, System.Threading.CancellationToken, ProcessKit.Command) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>

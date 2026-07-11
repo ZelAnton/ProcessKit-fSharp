@@ -265,12 +265,16 @@ above).
 .NET try-parse shape, so C# can pass `int.TryParse` (and friends) with an explicit type argument
 (`TryParseAsync<int>(int.TryParse)` — needed because the BCL parsers are overloaded) and a `false`
 return becomes `ProcessError.Parse` — F# reaches for the `Result`-returning `Runner.tryParse` instead;
-`FirstLineAsync` returns the first stdout line matching a predicate.
+`OutputJsonAsync<'T>` deserializes stdout as JSON via `System.Text.Json` (same explicit-type-argument
+need, since there is no parser argument to infer `'T` from — `OutputJsonAsync<int>()`), takes an
+optional `JsonSerializerOptions` overload, and turns invalid JSON into `ProcessError.Parse` just like
+a rejecting parser; `FirstLineAsync` returns the first stdout line matching a predicate.
 
 **F#**
 
 ```fsharp
 let! version = (Command.create "node" |> Command.arg "--version").ParseAsync(fun s -> s.TrimStart('v'))
+let! widget  = (Command.create "widget-cli" |> Command.arg "get").OutputJsonAsync<Widget>()
 let! port    = (Command.create "myserver").FirstLineAsync(fun line -> line.StartsWith "Listening on ")
 ```
 
@@ -279,8 +283,14 @@ let! port    = (Command.create "myserver").FirstLineAsync(fun line -> line.Start
 ```csharp
 var version = await new Command("node").Arg("--version").ParseAsync(s => s.TrimStart('v'));
 var count = await new Command("git").Args(["rev-list", "--count", "HEAD"]).TryParseAsync<int>(int.TryParse);
+var widget = await new Command("widget-cli").Arg("get").OutputJsonAsync<Widget>();
 var port = await new Command("myserver").FirstLineAsync(line => line.StartsWith("Listening on "));
 ```
+
+A plain F# record deserializes through STJ's constructor-based deserialization by default, matching
+JSON keys to the record's field names case-sensitively; mark the record `[<CLIMutable>]` for the
+classic default-constructor-plus-settable-properties shape, or pass `options` with
+`PropertyNameCaseInsensitive = true` for case-insensitive matching.
 
 ## Standard input
 

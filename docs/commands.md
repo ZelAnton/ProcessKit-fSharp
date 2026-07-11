@@ -629,26 +629,40 @@ await new Command("helper").CreateNoWindow().RunAsync();
 
 ### Unix privilege drop & session detach
 
-Four **Unix-only** builders drop the child's privileges or detach its session, for
+Five **Unix-only** builders drop the child's privileges or detach its session, for
 running a helper as a less-privileged user (daemons, CI runners, sandboxes):
 
 - **`Uid(uid)`** / **`Gid(gid)`** run the child under a different user / group id
   (`setuid` / `setgid`). **`User(uid, gid)`** is the common pair, equal to
   `.Gid(gid).Uid(uid)`.
+- **`Groups(gids)`** sets the child's **supplementary groups**, *replacing* the
+  inherited set — the third leg of a correct drop. A bare `Uid`/`Gid` drop *clears*
+  the parent's supplementary groups (so the child never keeps root's), so pass the
+  target user's groups here to grant them back (its `docker` / `video` / `adm`
+  membership), or `[]` to keep the cleared default. It rides the same helper as the
+  uid/gid drop, so it is honoured **only alongside a `Uid` or `Gid`** — set on its
+  own it fails the spawn with `ProcessError.Spawn` rather than being silently ignored.
 - **`Setsid()`** detaches the child into a **new session** (`setsid()`): its own
   session and process group, no controlling terminal.
 
 ```fsharp
 task {
-    // Drop to uid/gid 1000 and detach into a new session (needs privilege to run as another user).
-    let! _ = (Command.create "worker" |> Command.user 1000 1000 |> Command.setsid).RunAsync()
+    // Drop to uid/gid 1000, grant that user's docker+video groups, and detach into a new session
+    // (needs privilege to run as another user).
+    let worker =
+        Command.create "worker"
+        |> Command.user 1000 1000
+        |> Command.groups [ 998; 44 ]
+        |> Command.setsid
+
+    let! _ = worker.RunAsync()
     ()
 }
 ```
 
 ```csharp
-// Drop to uid/gid 1000 and detach into a new session.
-await new Command("worker").User(1000, 1000).Setsid().RunAsync();
+// Drop to uid/gid 1000, grant that user's docker+video groups, and detach into a new session.
+await new Command("worker").User(1000, 1000).Groups(new[] { 998, 44 }).Setsid().RunAsync();
 ```
 
 Honest by construction — never a silent downgrade:
@@ -662,8 +676,14 @@ Honest by construction — never a silent downgrade:
   `CAP_SETUID` / `CAP_SETGID` (a rootless container / sandbox), which is conservatively
   declined rather than probed (`setpriv` remains the real arbiter, so the guard stays a
   simple root gate rather than a partial reimplementation of the kernel's capability
-  model). The drop also *clears* the parent's supplementary groups and applies `setgid`
-  **before** `setuid`, so it composes into a correct drop.
+  model). The drop applies `setgid` **before** `setuid`, so it composes into a correct
+  drop, and by default *clears* the parent's supplementary groups; pass `Groups(gids)`
+  to set the child's supplementary groups explicitly instead.
+- **`Groups` is meaningful only as part of a drop.** It is applied by the same
+  `setpriv` helper as `Uid`/`Gid`, so setting it *without* a `Uid` or `Gid` fails the
+  spawn with `ProcessError.Spawn` — never a child whose groups were silently left
+  untouched. The gids are applied verbatim (numeric, no `/etc/group` lookup), and a
+  negative gid is rejected at the builder boundary with `ArgumentOutOfRangeException`.
 - **Containment is preserved under `Setsid`.** A new session still makes the child
   its own process-group leader, so the kill-on-drop group teardown reaches it. (The
   session detach replaces the group's default `POSIX_SPAWN_SETPGROUP` for that one
@@ -672,11 +692,12 @@ Honest by construction — never a silent downgrade:
 Because `posix_spawn` has no uid/gid attribute (and forking a managed .NET runtime
 to drop privileges in the child is unsafe), a command requesting `Uid`/`Gid` is
 rewritten to run through the **`setpriv`** helper (util-linux): it sets the gid/uid
-and clears the supplementary groups, then `exec`s the real program *in place* (same
-pid, so containment is unchanged). `setpriv` ships on mainstream Linux; where it is
-absent (macOS/BSD) a `Uid`/`Gid` drop fails with a typed `ProcessError.Spawn` naming
-the missing helper. `Setsid` alone needs no helper (it is a native `posix_spawn`
-attribute).
+and either clears the supplementary groups (`--clear-groups`, the default) or sets the
+`Groups(gids)` you asked for (`--groups`), then `exec`s the real program *in place*
+(same pid, so containment is unchanged). `setpriv` ships on mainstream Linux; where it
+is absent (macOS/BSD) a `Uid`/`Gid`/`Groups` drop fails with a typed
+`ProcessError.Spawn` naming the missing helper. `Setsid` alone needs no helper (it is a
+native `posix_spawn` attribute).
 
 ProcessKit wires **pipes**, not a pseudo-terminal, so a tool that *demands* a tty
 — an `ssh` / `sudo` **password** prompt, some credential helpers — won't get one.
@@ -699,6 +720,7 @@ Every verb returns `Task<Result<_, ProcessError>>`, and every verb takes an opti
 | `ExitCodeAsync()` | `int` | the code, as `Ok` | The code *is* the answer |
 | `ProbeAsync()` | `bool` | `0`→`true`, `1`→`false`, else error | Predicate commands: `git diff --quiet`, `grep -q` |
 | `ParseAsync(f)` / `TryParseAsync(f)` | `'T` | `ProcessError.Exit` | A typed value from stdout (success required) |
+| `OutputJsonAsync<'T>()` | `'T` | `ProcessError.Exit` | Deserialize stdout as JSON (success required) |
 | `FirstLineAsync(p)` | `string option` | — (stream-based) | Grab one matching line, kill the rest |
 | `StartAsync()` | `RunningProcess` | — | A live handle: [streaming, stdin, probes](streaming.md) |
 
@@ -711,6 +733,14 @@ pass a `bool TryX(string, out 'T)` such as `int.TryParse`, with an explicit type
 argument (`TryParseAsync<int>(int.TryParse)`, since the BCL parsers are overloaded) —
 and turns a `false` return into `ProcessError.Parse`. (From F#, `Runner.tryParse` keeps the
 `Result<'T, string>`-returning shape, so the parser can supply its own error message.)
+`OutputJsonAsync<'T>` is `ParseAsync` specialized to JSON: it deserializes the trimmed stdout via
+`System.Text.Json`, takes an optional `JsonSerializerOptions` overload, and turns invalid JSON into
+`ProcessError.Parse` exactly like a rejecting `ParseAsync` — give it an explicit type argument
+(`OutputJsonAsync<MyRecord>()`), since there is no parser argument to infer `'T` from. Mark an F#
+record `[<CLIMutable>]` for the classic default-constructor-plus-settable-properties shape, or pass
+`options` with `PropertyNameCaseInsensitive = true` — otherwise STJ's constructor-based
+deserialization matches JSON property names to the record's constructor parameter names
+case-sensitively.
 `FirstLineAsync` returns the first
 stdout line matching the predicate and kills the (private-group) child the moment
 it has its answer — you never wait out a long log for one line — and returns
@@ -728,6 +758,10 @@ task {
 
     // Parse: a typed value from stdout.
     let! version = (Command.create "node" |> Command.arg "--version").ParseAsync(fun s -> s.TrimStart('v'))
+
+    // OutputJson: deserialize stdout as JSON into a typed value (`Widget` here is
+    // `type Widget = { Name: string; Count: int }`; its JSON keys match the record's field names).
+    let! widget = (Command.create "widget-cli" |> Command.arg "get").OutputJsonAsync<Widget>()
 
     // FirstLine: stop as soon as the interesting line appears.
     match! (Command.create "git" |> Command.args [ "log"; "--oneline" ]).FirstLineAsync(fun l -> l.Contains "fix:") with
@@ -750,6 +784,10 @@ Console.WriteLine(await new Command("git").Args(["diff", "--quiet"]).ProbeAsync(
 
 // Parse: a typed value from stdout.
 var version = await new Command("node").Arg("--version").ParseAsync(s => s.TrimStart('v'));
+
+// OutputJson: deserialize stdout as JSON into a typed value (`Widget` is a
+// `record Widget(string Name, int Count)` here; its JSON keys match the record's properties).
+var widget = await new Command("widget-cli").Arg("get").OutputJsonAsync<Widget>();
 
 // FirstLine: stop as soon as the interesting line appears.
 Console.WriteLine(await new Command("git").Args(["log", "--oneline"]).FirstLineAsync(l => l.Contains("fix:")) switch
@@ -950,7 +988,7 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 | `ProcessError.Signalled` | `program, signal: int option, stdout, stderr` | Killed by a signal with no exit code; `signal` carries the number on Unix, `None` elsewhere; the partial streams captured before the kill are attached. |
 | `ProcessError.Timeout` | `program, timeout, stdout, stderr` | The run's own deadline killed it; whatever it captured before the kill is attached. |
 | `ProcessError.NotReady` | `program, timeout` | A [readiness probe](streaming.md) gave up — distinct from a timeout. |
-| `ProcessError.Parse` | `program, detail` | A `ParseAsync` / `TryParseAsync` parser rejected the output. |
+| `ProcessError.Parse` | `program, detail` | A `ParseAsync` / `TryParseAsync` parser rejected the output, or `OutputJsonAsync<'T>` couldn't deserialize it as valid JSON. |
 | `ProcessError.OutputTooLarge` | `program, lineLimit, byteLimit, totalLines, totalBytes` | A `FailLoud` (`OverflowMode.Error`) buffer ceiling was exceeded. |
 | `ProcessError.Stdin` | `program, detail` | The child's stdin source could not be read — a missing/unreadable `FromFile` path, say — on an otherwise-successful run. A routine broken pipe (the child closed stdin early, as `head` does) is never reported, and a louder exit/signal/timeout failure wins instead. Also surfaces for a pipeline's first stage. |
 | `ProcessError.CassetteMiss` | `program` | A record/replay cassette found no matching recording — kept distinct from not-found, so `isNotFound` is `false`. |
