@@ -1,15 +1,33 @@
 name: Docs
 
-# Publish the browsable API reference to GitHub Pages.
+# Publishes the whole documentation site for this repository to GitHub Pages, as
+# a SINGLE combined site made of two halves that live at non-overlapping paths:
 #
-# TRIGGER CHOICE: on a published GitHub Release, not on every push to main. The
+#   /ProcessKit-fSharp/       -> the mdBook GUIDES book (docs/**, theme/**, book.toml)
+#   /ProcessKit-fSharp/api/   -> the fsdocs API REFERENCE (generated from XML docs)
+#
+# WHY ONE WORKFLOW (not two): GitHub Pages serves one site per repository, and
+# `actions/deploy-pages` publishes a single artifact that REPLACES the entire
+# site. Two independent workflows each deploying only their own half would clobber
+# the other half on every run. So every run of this one workflow builds BOTH
+# halves and deploys their union — neither trigger can wipe the other's output.
+#
+# TRIGGERS:
+#   * release: published  -> a new release ships; refresh the API reference (and
+#                            rebuild the book from the tag).
+#   * push to docs/**, theme/**, book.toml -> a guides edit; rebuild the book.
+#   * workflow_dispatch   -> manual rebuild (e.g. after editing this workflow).
+#
+# API-REFERENCE SOURCE = LATEST PUBLISHED RELEASE (not the pushed commit). The
 # reference is generated from the XML doc comments of the two SHIPPING packages
-# (ProcessKit, ProcessKit.Extensions.DependencyInjection), so it is meant to track
-# what a consumer actually installed from NuGet — a release-triggered site never
-# shows an API surface that has not shipped yet, and it does not rebuild/redeploy
-# on every ordinary commit to main (docs-only edits, internal refactors, work in
-# progress between releases). workflow_dispatch is kept for a manual rebuild (e.g.
-# after editing this workflow, or apidocs/index.md, without cutting a release).
+# (ProcessKit, ProcessKit.Extensions.DependencyInjection) and is meant to track
+# what a consumer actually installed from NuGet. Building it from the latest
+# release tag — even when this run was triggered by an ordinary docs push to main
+# — keeps that invariant: the published reference never shows an API surface that
+# has not shipped yet. The book, by contrast, is built from the triggering ref so
+# guide edits go live immediately on push. (Rebuilding the reference on a docs
+# push is deliberately un-optimised: it is cheap insurance against clobbering, and
+# docs pushes are infrequent.)
 #
 # GENERATOR CHOICE: fsdocs (FSharp.Formatting), not docfx. This repository's public
 # surface is F#-authored (curried module functions, discriminated unions, `'T`
@@ -21,12 +39,19 @@ name: Docs
 # extension methods) where the F#-native rendering looks like a static call instead
 # of C#'s dot-syntax — documented on the generated front page.
 #
-# This workflow does not modify ci.yml/release.yml — it only adds a new,
-# independent publishing pipeline scoped to the doc site.
+# This workflow does not modify ci.yml/release.yml — it is the single, independent
+# publishing pipeline scoped to the doc site.
 
 on:
   release:
     types: [published]
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'theme/**'
+      - 'book.toml'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 # Only one Pages deployment may be in flight at a time; never cancel one that is
@@ -49,10 +74,54 @@ jobs:
       # trailing comment records the human-readable version. Dependabot bumps the
       # SHA and updates the comment on its weekly run.
       #
-      # No explicit `ref:` — the default checkout ref is already correct for both
-      # triggers: a `release: published` event's ref is the release's tag, and
-      # workflow_dispatch defaults to whatever ref is chosen in the UI (main).
+      # First checkout = the triggering ref (main HEAD on a push, the tag on a
+      # release). This is what the mdBook GUIDES are built from, so a docs edit
+      # goes live as soon as it lands.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # ── Guides book (mdBook) → site root ────────────────────────────────────
+      # Pinned to the same mdBook version used by the sibling ProcessKit-rs docs
+      # workflow so both repositories render their books identically.
+      - name: Install mdBook
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /usr/local/bin
+
+      - name: Build guides (mdBook)
+        run: mdbook build
+
+      # docs/internals/** and docs/planning/** are internal, non-public project
+      # notes. They are absent from docs/SUMMARY.md so they never appear in the
+      # book's navigation, but mdBook copies any non-chapter source file to the
+      # output verbatim — so drop them from the built site to guarantee they are
+      # not reachable at a guessed URL either.
+      - name: Prune internal docs from the built book
+        run: rm -rf book/internals book/planning
+
+      # ── API reference (fsdocs) → /api/ subpath, built from the latest release ─
+      # Resolve which release the reference should reflect: the just-published tag
+      # on a release event, otherwise the latest published release (so an ordinary
+      # docs push never surfaces an unreleased API surface).
+      - name: Resolve the API-reference source (latest published release)
+        id: apiref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag="${{ github.event.release.tag_name }}"
+          else
+            tag="$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName)"
+          fi
+          echo "Building the API reference from release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Second checkout, into ./_released, pinned to that release tag. The fsdocs
+      # build below runs entirely inside this tree so the reference reflects the
+      # released source, independent of what is on main.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.apiref.outputs.tag }}
+          path: _released
 
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
@@ -65,14 +134,16 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('Directory.Packages.props', 'nuget.config', 'global.json') }}
+          key: ${{ runner.os }}-nuget-${{ hashFiles('_released/Directory.Packages.props', '_released/nuget.config', '_released/global.json') }}
           restore-keys: ${{ runner.os }}-nuget-
 
       # Restores fsdocs-tool alongside Fantomas (.config/dotnet-tools.json).
       - name: Restore local tools
+        working-directory: _released
         run: dotnet tool restore
 
       - name: Restore
+        working-directory: _released
         run: dotnet restore
 
       # fsdocs reads each project's built DLL + XML doc file. ProcessKit.Extensions.DependencyInjection
@@ -81,9 +152,10 @@ jobs:
       # Configuration for that path to exist — building the whole solution up front
       # (build order comes from ProcessKit.slnx's BuildDependency entries) guarantees it.
       - name: Build
+        working-directory: _released
         run: dotnet build ProcessKit.slnx --no-restore --configuration Release
 
-      # Resolves the real Pages base URL (e.g. https://zelanton.github.io/ProcessKit-fSharp/)
+      # Resolves the real Pages base URL (e.g. https://zelanton.github.io/ProcessKit-fSharp)
       # so generated absolute links/assets are correct without hardcoding it here —
       # also works unchanged if a custom domain is ever configured for Pages.
       - name: Configure Pages
@@ -95,10 +167,15 @@ jobs:
       # (test doubles, not part of the runtime surface a consumer builds against) and
       # the benchmarks project are intentionally excluded.
       #
+      # `root` is the API reference's own base URL — the /api/ SUBPATH of the Pages
+      # site, since the mdBook guides occupy the root. fsdocs uses it to emit correct
+      # absolute links/asset URLs for the reference.
+      #
       # --sourcerepo / fsdocs-license-link / fsdocs-release-notes-link override
       # fsdocs' own defaults, which point at a `master` branch and a RELEASE_NOTES.md
       # file this repo does not have (it uses `main` and CHANGELOG.md instead).
       - name: Build API reference (fsdocs)
+        working-directory: _released
         run: >-
           dotnet fsdocs build
           --input apidocs
@@ -107,15 +184,23 @@ jobs:
           --properties Configuration=Release
           --sourcerepo https://github.com/${{ github.repository }}/tree/main
           --parameters
-          root "${{ steps.pages.outputs.base_url }}/"
+          root "${{ steps.pages.outputs.base_url }}/api/"
           fsdocs-collection-name "ProcessKit API Reference"
           fsdocs-license-link "https://github.com/${{ github.repository }}/blob/main/LICENSE"
           fsdocs-release-notes-link "https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md"
           --clean
 
+      # ── Assemble the combined site: book at the root, API reference under /api/ ─
+      - name: Assemble the combined Pages site
+        run: |
+          mkdir -p _site
+          cp -r book/. _site/
+          mkdir -p _site/api
+          cp -r _released/apidocs/output/. _site/api/
+
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: apidocs/output
+          path: _site
 
   deploy:
     needs: build

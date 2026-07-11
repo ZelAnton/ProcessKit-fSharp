@@ -125,5 +125,6 @@ The XML documentation shipped in the package powers IntelliSense / quick-info in
 every public type and member; these guides are the narrative layer on top — they explain how the
 pieces compose, with the platform fine print collected in [Platform support](platform-support.md).
 The same XML docs also power a browsable, generated
-**[API reference](https://zelanton.github.io/ProcessKit-fSharp/)** — reach for it when you want a
-member-by-member lookup instead of a task-oriented guide.
+**[API reference](https://zelanton.github.io/ProcessKit-fSharp/api/)** — published alongside these
+guides on the same site — reach for it when you want a member-by-member lookup instead of a
+task-oriented guide.

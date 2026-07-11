@@ -74,7 +74,7 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
 
 ## API reference site
 
-The browsable [API reference](https://zelanton.github.io/ProcessKit-fSharp/) is generated from the
+The browsable [API reference](https://zelanton.github.io/ProcessKit-fSharp/api/) is generated from the
 XML doc comments on `ProcessKit` and `ProcessKit.Extensions.DependencyInjection` with
 [fsdocs](https://fsprojects.github.io/FSharp.Formatting/) (restored as a local tool alongside
 Fantomas). `apidocs/index.md` is the site's hand-written landing page; everything else under
@@ -95,8 +95,11 @@ dotnet fsdocs build --input apidocs --output apidocs/output \
 
 Then open `apidocs/output/index.html` (or serve the folder with any static file server — `root "/"`
 keeps the generated links relative for local browsing). `apidocs/output/` is git-ignored; the real
-site is built and published by [`.github/workflows/docs.yml`](.github/workflows/docs.yml) on every
-published GitHub Release, with `root` pointed at the actual GitHub Pages URL.
+site is built and published by [`.github/workflows/docs.yml`](.github/workflows/docs.yml), which
+deploys one combined GitHub Pages site: the mdBook **guides** book at the root and this API reference
+under the `/api/` subpath (so `root` is pointed at `…/ProcessKit-fSharp/api/`). The reference is
+rebuilt from the latest published GitHub Release; the guides are rebuilt on pushes to
+`docs/**`/`theme/**`/`book.toml`.
 
 ## Changelog
 

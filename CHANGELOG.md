@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- A published **guides site**: the `docs/` guide set is now built with mdBook and published to GitHub Pages at <https://zelanton.github.io/ProcessKit-fSharp/>, with the generated fsdocs API reference served alongside it under <https://zelanton.github.io/ProcessKit-fSharp/api/>. The book is rebuilt on pushes to `docs/**`/`theme/**`/`book.toml`; the API reference still tracks the latest published release. (`docs/internals/` and `docs/planning/` remain internal — they are not part of the published site.)
 
 ### Changed
 -

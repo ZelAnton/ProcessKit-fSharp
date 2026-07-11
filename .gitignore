@@ -27,6 +27,9 @@ release-notes.md
 apidocs/output/
 .fsdocs/
 
+# mdBook build output (docs.yml renders this from docs/ + theme/ + book.toml).
+/book/
+
 # Build results
 [Dd]ebug/
 [Rr]elease/
