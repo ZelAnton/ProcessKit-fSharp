@@ -1,4 +1,4 @@
-![ProcessKit](../cover.png)
+![ProcessKit](https://raw.githubusercontent.com/ZelAnton/ProcessKit-fSharp/main/cover.png)
 
 [![CI](https://github.com/ZelAnton/ProcessKit-fSharp/actions/workflows/ci.yml/badge.svg)](https://github.com/ZelAnton/ProcessKit-fSharp/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/ProcessKit.svg)](https://www.nuget.org/packages/ProcessKit)
