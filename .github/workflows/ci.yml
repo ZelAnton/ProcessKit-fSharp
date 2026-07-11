@@ -223,6 +223,48 @@ jobs:
                 --filter "FullyQualifiedName~LimitsTests"
             '
 
+  # musl/Alpine smoke: the native layer (posix_spawn, AF_UNIX socketpair stdio, direct pidfd/epoll
+  # syscalls via `syscall(2)`, setpriv privilege drop) is otherwise exercised only against glibc (the
+  # `test` job's ubuntu-latest leg). Alpine is the de facto standard base for containerized .NET
+  # deployments and differs in libc (musl) and available utilities, so it gets its own leg — by the
+  # same raw `docker run` pattern as `test-cgroup-limits` above, rather than the matrix in `test`,
+  # because it needs a pre-test package install step the matrix legs don't. Runs the full suite
+  # (minus Stress, same filter as `test`) at net10.0 only: the sdk:10.0-alpine image, like sdk:10.0,
+  # carries just the net10 runtime. BusyBox (Alpine's base) ships its own `setpriv` applet — same
+  # name as util-linux's, but missing the --reuid/--regid/--clear-groups flags Native.Posix.fs's
+  # setprivCommand relies on for the Uid/Gid privilege-drop path — so the real util-linux package is
+  # installed first to shadow it; everything else in the suite runs unmodified (musl needed no other
+  # accommodation — confirmed green against this exact leg definition before it was added here).
+  test-alpine:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Run full test suite on musl/Alpine (excluding Stress)
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" -w /src \
+            -e DOTNET_CLI_TELEMETRY_OPTOUT=1 -e DOTNET_NOLOGO=1 \
+            mcr.microsoft.com/dotnet/sdk:10.0-alpine \
+            sh -c '
+              set -e
+              apk add --no-cache util-linux
+              dotnet build --configuration Release -p:TargetFrameworks=net10.0
+              dotnet test --no-build --configuration Release --framework net10.0 \
+                tests/ProcessKit.Tests/ProcessKit.Tests.fsproj \
+                --filter "Category!=Stress" \
+                --logger "trx;LogFileName=test-results-alpine.trx" --results-directory ./TestResults
+            '
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results-alpine
+          path: ./TestResults/*.trx
+          if-no-files-found: ignore
+
   # NativeAOT/trimming smoke: publishes a minimal ProcessKit consumer (samples/FSharp.NativeAot) with
   # PublishAot and RUNS the produced native binary, so the packages' IsTrimmable/IsAotCompatible claims
   # are validated in a real ahead-of-time-compiled image rather than only asserted in metadata. The run
