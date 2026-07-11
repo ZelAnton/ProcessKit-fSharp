@@ -15,6 +15,16 @@
 
 		<!-- The referenced ProcessKit.dll resolves from the main project's build output. -->
 		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+
+		<!-- Trimming / NativeAOT: deliberately NOT declared trimmable/AOT-compatible (the documented
+		     exclusion). The record/replay cassette surface (RecordReplayRunner) serializes/deserializes
+		     with reflection-based System.Text.Json (JsonSerializer.Serialize/Deserialize<T>), which is not
+		     trim-/AOT-safe; F# cannot use the System.Text.Json source generator (a Roslyn/C#-only source
+		     generator the F# compiler does not run), so the usual AOT remedy is unavailable here. This is a
+		     test-double package meant to be referenced only from test projects (see the Description) — code
+		     that is never shipped inside a trimmed/NativeAOT application — so leaving it without trim
+		     metadata (ILLink keeps it whole rather than risking a silent runtime break) is the honest
+		     choice. See docs/platform-support.md. -->
 	</PropertyGroup>
 
 	<!-- F# COMPILE ORDER IS SIGNIFICANT. Files are compiled top-to-bottom; a type or

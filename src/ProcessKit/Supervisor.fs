@@ -397,6 +397,14 @@ type Supervisor internal (config: SupervisorConfig) =
     member internal _.WithClock(now: unit -> float, sleep: TimeSpan -> CancellationToken -> Task) =
         Supervisor({ config with Now = now; Sleep = sleep })
 
+    /// Internal seam for hosting-style wrappers (e.g. `ProcessKit.Extensions.Hosting`) that need to
+    /// combine an already-configured `StopWhen` with their own host-driven stop condition, without
+    /// silently dropping whichever predicate the caller supplied via `StopWhen` before the wrapper
+    /// ran. `Supervisor.StopWhen` itself *replaces* `config.StopWhen`, so a wrapper cannot safely
+    /// call it again without first reading whatever predicate (if any) is already there.
+    member internal _.CurrentStopWhen: (ProcessResult<string> -> bool) option =
+        config.StopWhen
+
     /// Supervise until the policy, the predicate, or the restart budget ends it, and report the
     /// `SupervisionOutcome`.
     ///

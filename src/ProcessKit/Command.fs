@@ -204,6 +204,34 @@ module internal CommandConfig =
         if config.MergeStderr then
             raise (mergeStderrConflict knob)
 
+    /// The `ArgumentException` for combining `InheritStdin` with an incompatible stdin knob. `InheritStdin`
+    /// hands the child the parent's own standard input directly, with no pipe — so there is nothing for a
+    /// feeder source, `KeepStdinOpen`, or the interactive `TakeStdin` to attach to. Named after the
+    /// offending knob (the check is bidirectional, mirroring `mergeStderrConflict`), the project's "no
+    /// silent downgrade / reject conflicts at the builder boundary" rule.
+    let private stdinInheritConflict (knob: string) =
+        ArgumentException(
+            $"{knob} cannot be combined with InheritStdin: InheritStdin hands the child the parent's own standard input directly, with no stdin pipe for a feeder source, KeepStdinOpen, or interactive TakeStdin writing to attach to. Drop one of the two.",
+            knob
+        )
+
+    /// Guard `Stdin`/`KeepStdinOpen`: reject them when `InheritStdin` is already set. There is no stdin
+    /// pipe under inherit for a feeder source or a kept-open interactive stream to use.
+    let ensureNoStdinInherit (config: CommandConfig) (knob: string) =
+        match config.StdinSource with
+        | Some source when Stdin.isInherit (Some source) -> raise (stdinInheritConflict knob)
+        | _ -> ()
+
+    /// Guard `InheritStdin`: reject it when a feeder source (`Stdin`) or `KeepStdinOpen` is already set —
+    /// the mirror of `ensureNoStdinInherit`, so the conflict is caught in either chaining order.
+    let ensureInheritStdinCompatible (config: CommandConfig) =
+        if config.KeepStdinOpen then
+            raise (stdinInheritConflict "KeepStdinOpen")
+
+        match config.StdinSource with
+        | Some source when not (Stdin.isInherit (Some source)) -> raise (stdinInheritConflict "Stdin")
+        | _ -> ()
+
 /// An immutable description of a process to run.
 ///
 /// Build it fluently — each method returns a new `Command`. The value is the *cold* description
@@ -311,18 +339,40 @@ type Command internal (config: CommandConfig) =
     member _.EnvClear() =
         Command({ config with ClearEnv = true })
 
-    /// Feed the child's standard input from `source`.
+    /// Feed the child's standard input from `source`. Rejected (`ArgumentException`) when `InheritStdin`
+    /// is already set — the inherited stdin has no pipe for a feeder source to write into.
     member _.Stdin(source: Stdin) =
         ArgumentNullException.ThrowIfNull source
+        CommandConfig.ensureNoStdinInherit config "Stdin"
 
         Command(
             { config with
                 StdinSource = Some source }
         )
 
+    /// Hand the child the parent process's **own standard input** directly — inherited, with no pipe and
+    /// no feeder — for interactive/console programs that read from the terminal (an editor launched by
+    /// `git commit`, a tool that prompts the user, a pipe from the parent's own stdin). This is the stdin
+    /// analogue of `StdioMode.Inherit` for stdout/stderr. Because there is no stdin pipe, it is
+    /// incompatible with the pipe-based stdin knobs and rejected together with them at the builder
+    /// boundary (`ArgumentException`, in either chaining order): a feeder source (`Stdin`) and
+    /// `KeepStdinOpen`. For the same reason `RunningProcess.TakeStdin` yields `None` for an inherited-stdin
+    /// child (there is no interactive pipe to hand out). The capture/streaming verbs are unaffected — only
+    /// the child's stdin wiring changes. Repeatable: a retry or a supervisor restart re-inherits the
+    /// parent's stdin, so `InheritStdin` is never refused by the one-shot-source retry guard.
+    member _.InheritStdin() =
+        CommandConfig.ensureInheritStdinCompatible config
+
+        Command(
+            { config with
+                StdinSource = Some Stdin.Inherit }
+        )
+
     /// Keep the child's stdin pipe open after the source is exhausted (for interactive writing
-    /// via `RunningProcess.TakeStdin`).
+    /// via `RunningProcess.TakeStdin`). Rejected (`ArgumentException`) when `InheritStdin` is already set —
+    /// an inherited stdin has no pipe to keep open.
     member _.KeepStdinOpen() =
+        CommandConfig.ensureNoStdinInherit config "KeepStdinOpen"
         Command({ config with KeepStdinOpen = true })
 
     /// Set how the child's standard output is connected (default `Piped`).
@@ -696,6 +746,10 @@ module Command =
 
     /// Feed the child's standard input from `source`.
     let stdin (source: Stdin) (command: Command) = command.Stdin source
+
+    /// Hand the child the parent process's own standard input directly (inherited, no pipe/feeder), for
+    /// interactive/console programs. See `Command.InheritStdin`.
+    let inheritStdin (command: Command) = command.InheritStdin()
 
     /// Keep the child's stdin pipe open after the source is exhausted.
     let keepStdinOpen (command: Command) = command.KeepStdinOpen()

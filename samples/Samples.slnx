@@ -4,6 +4,10 @@
 			<BuildDependency Project="../src/ProcessKit/ProcessKit.fsproj" />
 			<BuildDependency Project="../src/ProcessKit.Testing/ProcessKit.Testing.fsproj" />
 		</Project>
+		<Project Path="FSharp.NativeAot/FSharp.NativeAot.fsproj">
+			<BuildDependency Project="../src/ProcessKit/ProcessKit.fsproj" />
+			<BuildDependency Project="../src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj" />
+		</Project>
 		<Project Path="CSharp.DependencyInjection/CSharp.DependencyInjection.csproj">
 			<BuildDependency Project="../src/ProcessKit/ProcessKit.fsproj" />
 			<BuildDependency Project="../src/ProcessKit.Testing/ProcessKit.Testing.fsproj" />

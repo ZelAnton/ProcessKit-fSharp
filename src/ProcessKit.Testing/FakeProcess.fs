@@ -66,6 +66,10 @@ type FakeProcess private (template: Command, stdout: string, stderr: string, out
               Stdin = None
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
+              // No real process backs a fake's pid (arbitrary via `WithPid`, or none), so there is no
+              // genuine identity to capture — `None` defers `processMetrics`'s gate (T-097) to the raw
+              // read, leaving this fake's existing behaviour unchanged.
+              StartTimeIdentity = None
               Wait = fun () -> Task.FromResult outcome
               // A fake process feeds no stdin, so it never has a source failure to surface.
               StdinError = fun () -> None

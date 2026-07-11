@@ -13,6 +13,12 @@ type internal StdinSource =
     | Reader of Stream
     | Lines of seq<string>
     | AsyncLines of IAsyncEnumerable<string>
+    /// The child is handed the PARENT's own standard input directly (inherited), with no pipe and no
+    /// feeder — for interactive/console programs (an editor from `git commit`, a tool that prompts on
+    /// the terminal, a pipe from the parent's stdin). Set via `Command.InheritStdin`; incompatible with
+    /// `KeepStdinOpen`, `RunningProcess.TakeStdin`, and any feeder source (there is no pipe for them to
+    /// use), rejected at the builder boundary.
+    | Inherit
 
 /// A source for a child process's standard input, attached with `Command.Stdin`.
 ///
@@ -60,6 +66,12 @@ type Stdin internal (source: StdinSource) =
         ArgumentNullException.ThrowIfNull lines
         Stdin(StdinSource.AsyncLines lines)
 
+    /// Inherit the parent process's own standard input directly (no pipe, no feeder). Internal — set
+    /// through `Command.InheritStdin`, which validates it against the incompatible stdin knobs at the
+    /// builder boundary; it is deliberately not a public `Stdin.From*` factory (the single builder
+    /// method keeps the inherit mode from being combined with a feeder source through the same field).
+    static member internal Inherit = Stdin(StdinSource.Inherit)
+
 [<RequireQualifiedAccess>]
 module internal StdinSource =
 
@@ -69,7 +81,9 @@ module internal StdinSource =
     /// second attempt silently feeds the child empty/truncated input instead of replaying the
     /// original one — see T-088 (ports ProcessKit-rs `c1f39c7`/`8472007`). The repeatable sources are
     /// unaffected: `Empty` has nothing to exhaust, `Bytes` is an immutable in-memory array pumped
-    /// fresh from the start on every attempt, and `File` reopens its path fresh on every attempt.
+    /// fresh from the start on every attempt, `File` reopens its path fresh on every attempt, and
+    /// `Inherit` runs no feeder at all — the child reads the parent's stdin directly, so there is
+    /// nothing for a second attempt to have exhausted.
     let isOneShot (source: StdinSource) : bool =
         match source with
         | StdinSource.Reader _
@@ -77,7 +91,20 @@ module internal StdinSource =
         | StdinSource.AsyncLines _ -> true
         | StdinSource.Empty
         | StdinSource.Bytes _
-        | StdinSource.File _ -> false
+        | StdinSource.File _
+        | StdinSource.Inherit -> false
+
+    /// True for the inherited-stdin source (`Command.InheritStdin`): the child reads the parent's own
+    /// standard input directly, so the native spawn creates no pipe and runs no feeder for it.
+    let isInherit (source: StdinSource) : bool =
+        match source with
+        | StdinSource.Inherit -> true
+        | StdinSource.Empty
+        | StdinSource.Bytes _
+        | StdinSource.File _
+        | StdinSource.Reader _
+        | StdinSource.Lines _
+        | StdinSource.AsyncLines _ -> false
 
 [<RequireQualifiedAccess>]
 module internal Stdin =
@@ -88,3 +115,9 @@ module internal Stdin =
         stdin
         |> Option.map (fun s -> StdinSource.isOneShot s.Source)
         |> Option.defaultValue false
+
+    /// True when `stdin` is the inherited-stdin source (`Command.InheritStdin`); `false` for `None` or
+    /// any feeder source. The native spawn keys off this to hand the child the parent's own standard
+    /// input directly instead of creating a pipe.
+    let isInherit (stdin: Stdin option) : bool =
+        stdin |> Option.exists (fun s -> StdinSource.isInherit s.Source)
