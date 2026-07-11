@@ -22,6 +22,15 @@ type internal RunningHost =
         Stdin: Stream option
         StartTime: DateTime
         StartedTimestamp: int64
+        /// The child's own OS-reported creation time (`Process.GetProcessById(pid).StartTime`),
+        /// captured once right after spawn — the identity token `processMetrics` (T-097) re-checks
+        /// before trusting a later `Process.GetProcessById pid` read, so a pid the OS recycled for an
+        /// unrelated process after the child was reaped can't be mistaken for it. `None` when the pid
+        /// is unknown, the identity read failed at spawn time (the child already exited, or the
+        /// platform/timing raced it), or a synthetic host (tests/fakes) has no real process behind the
+        /// pid — an unknown token is never proof either way, so the gate defers to the raw read exactly
+        /// like the POSIX pgid identity check (`Native.Posix.processGroupStillTracked`) already does.
+        StartTimeIdentity: DateTime option
         /// Wait for the process to exit and report how it concluded.
         Wait: unit -> Task<Outcome>
         /// Observe a genuine stdin-source failure stashed by the background feeder, but only once the
@@ -251,26 +260,54 @@ type RunningProcess internal (host: RunningHost) =
 
     // Per-process CPU / peak-memory via the BCL `Process` (reads /proc on Linux, the OS APIs
     // elsewhere) — no metrics once the child has exited or where the platform does not report them.
+    //
+    // Gated by pid identity (T-097): `waitPosix` reaps the child as soon as it exits, before a verb
+    // that later reads `CpuTime`/`PeakMemoryBytes`/`ProfileAsync`'s sampler necessarily observes that —
+    // the OS is then free to recycle the pid for an unrelated process, and a raw `Process.GetProcessById
+    // pid` read would silently hand back THAT stranger's metrics. `host.StartTimeIdentity` is this
+    // child's own OS-reported creation time, captured once right after spawn; re-reading `proc.StartTime`
+    // here and comparing catches a recycled pid (its own process, by definition, was created at a
+    // different time) before any metric is read. An unknown identity on either side (no captured token,
+    // or this platform's `Process.StartTime` throws) is never proof of a mismatch — the gate then defers
+    // to the raw read, exactly like the POSIX pgid identity check already does for the tree-level
+    // liveness probes.
     let processMetrics (pid: int) : TimeSpan option * int64 option =
         try
             use proc = Process.GetProcessById pid
 
-            let cpu =
-                try
-                    Some proc.TotalProcessorTime
-                with _ ->
-                    // Not reported on this platform (e.g. denied / unsupported); omit it.
-                    None
+            let identityMatches =
+                match host.StartTimeIdentity with
+                | Some captured ->
+                    try
+                        proc.StartTime = captured
+                    with _ ->
+                        // `StartTime` unreadable on this platform/timing — no current token to compare
+                        // against; defer to the raw read rather than spuriously withholding real metrics.
+                        true
+                | None -> true
 
-            let memory =
-                try
-                    let peak = proc.PeakWorkingSet64
-                    if peak > 0L then Some peak else None
-                with _ ->
-                    // Peak working set unavailable (some platforms report 0 / throw); omit it.
-                    None
+            if not identityMatches then
+                // The pid answers, but it is not our child anymore — a recycled pid. Withhold the
+                // stranger's metrics rather than silently misattributing them to this run.
+                None, None
+            else
 
-            cpu, memory
+                let cpu =
+                    try
+                        Some proc.TotalProcessorTime
+                    with _ ->
+                        // Not reported on this platform (e.g. denied / unsupported); omit it.
+                        None
+
+                let memory =
+                    try
+                        let peak = proc.PeakWorkingSet64
+                        if peak > 0L then Some peak else None
+                    with _ ->
+                        // Peak working set unavailable (some platforms report 0 / throw); omit it.
+                        None
+
+                cpu, memory
         with _ ->
             // The process has already exited or is inaccessible — no metrics to read.
             None, None

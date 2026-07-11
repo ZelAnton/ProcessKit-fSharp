@@ -194,6 +194,21 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                 // Close the pipe streams (OS handles/fds) before releasing/detaching.
                 Pump.closeSpawned spawned
 
+            // Capture this child's OS-reported creation time once, right here at spawn — the identity
+            // token `RunningProcess.processMetrics` (T-097) later re-checks before trusting a
+            // `Process.GetProcessById pid` read, so a pid recycled for an unrelated process after this
+            // child is reaped can't be mistaken for it. `None` when there is no pid, or the read raced a
+            // child that had already exited (or is otherwise inaccessible) by the time we asked — the
+            // gate then defers to the raw read rather than treating that as proof of anything.
+            let startTimeIdentity =
+                pid
+                |> Option.bind (fun p ->
+                    try
+                        use proc = Process.GetProcessById p
+                        Some proc.StartTime
+                    with _ ->
+                        None)
+
             { Config = command.Config
               Pid = pid
               Stdout = spawned.Stdout
@@ -205,6 +220,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                      spawned.Stdin)
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = startTimeIdentity
               Wait = (fun () -> waitOutcome spawned.Handle)
               // Observe the stashed source failure without blocking: `StdinFeeder.Fault` reads it only
               // once the feed has finished, else `None`. Race-free — `feedStdin` never faults, so

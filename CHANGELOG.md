@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `RunningProcess.CpuTime` / `PeakMemoryBytes` / `ProfileAsync` no longer report a pid-reused stranger's metrics: each child's pid identity (OS-reported creation time) is captured once at spawn and re-checked before every metrics read, so a pid the OS recycled for an unrelated process after the original child was reaped now yields `None` instead of that stranger's CPU/memory.
 
 ## [2.3.0] - 2026-07-11
 

@@ -55,6 +55,7 @@ type private BlockingRunner() =
                       Stdin = None
                       StartTime = DateTime.UtcNow
                       StartedTimestamp = Stopwatch.GetTimestamp()
+                      StartTimeIdentity = None
                       Wait = fun () -> finished.Task
                       StdinError = fun () -> None
                       StartKill =
