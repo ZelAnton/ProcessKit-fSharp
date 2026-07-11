@@ -9,12 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - The `ProcessKit`, `ProcessKit.Extensions.DependencyInjection`, and `ProcessKit.Extensions.Hosting` packages now declare trimming/NativeAOT compatibility (`IsTrimmable`/`IsAotCompatible`), so a consumer that publishes a `PublishTrimmed`/NativeAOT app no longer gets "assembly was not verified" warnings for them; a CI smoke publishes and runs a NativeAOT consumer that spawns, captures, and contains a child on both Linux (`linux-x64`) and Windows (`win-x64`). See [docs/platform-support.md](docs/platform-support.md#trimming-and-nativeaot) — including the documented boundary that `ProcessKit.Testing` is not trim/AOT-safe (its reflection-based `System.Text.Json` cassettes), which is fine because it is a test-only dependency.
+- `Command.InheritStdin` (and the pipe-friendly `Command.inheritStdin`): hand the child the parent process's own standard input directly — inherited at the OS level, with no pipe and no feeder — for interactive/console programs (an editor launched by `git commit`, a tool that prompts on the terminal, a pipe from the parent's own stdin). The stdin analogue of `StdioMode.Inherit`. Incompatible with a feeder `Stdin` source and `KeepStdinOpen` (rejected at the builder boundary in either chaining order); `RunningProcess.TakeStdin` returns `None` for an inherited-stdin child. Repeatable under `Retry`/supervision and supported by the `ProcessKit.Testing` record/replay cassette (keyed by a stable "inherit" marker).
 
 ### Changed
 - `AddProcessKit(IConfiguration)` / `AddProcessKitGroup(IConfiguration)` are now annotated `[RequiresUnreferencedCode]`/`[RequiresDynamicCode]`: because they bind `ProcessKitOptions` from configuration by reflection, a trimmed/NativeAOT app that calls them now gets a precise warning pointing at the overload — use the `Action<ProcessKitOptions>` overload from an AOT app. No effect on a non-trimmed build.
 
 ### Fixed
--
+- `RunningProcess.CpuTime` / `PeakMemoryBytes` / `ProfileAsync` no longer report a pid-reused stranger's metrics: each child's pid identity (OS-reported creation time) is captured once at spawn and re-checked before every metrics read, so a pid the OS recycled for an unrelated process after the original child was reaped now yields `None` instead of that stranger's CPU/memory.
+- `ProcessStdin.FinishAsync` no longer risks surfacing an `IOException` to the caller when the
+  child has already exited without reading stdin, or when the run's own teardown already closed
+  the same stream — it now goes through the same teardown-race-safe "quiet" close used everywhere
+  else a pipe stream is torn down, matching its documented idempotent/safe-after-teardown contract.
+- `HostedProcessService` no longer silently discards a user-configured `Supervisor.StopWhen` (set via `AddProcessKitHostedProcess`'s `configureSupervisor` callback): it now combines the caller's predicate with its own host-shutdown stop condition instead of overwriting it, so a predicate like "stop once the child exits 0 with a marker in stdout" still ends supervision as configured.
+- `RunningProcess.Kill()`/`StopAsync()` (and the per-run timeout/pump-fault kills) no longer touch the
+  native kill primitives after the containing `ProcessGroup` has been released or the handle's own
+  teardown has run. The kill closures used to call the backend directly, bypassing the group's lifecycle
+  gate, so a `Kill()`/`StopAsync()` invoked after a shared `ProcessGroup.Dispose()`/`ShutdownAsync()`, or
+  after the handle was disposed, could `TerminateProcess`/`TerminateJobObject` a Windows Job/handle
+  teardown had already closed (a use-after-close whose value the OS may have recycled to an unrelated
+  object) or `kill`/`killpg` a POSIX/cgroup pid/pgid the OS had since recycled (a wrong-target kill).
+  Every such kill now runs through the same lifecycle gate as the other tree-control verbs plus a per-run
+  teardown flag, so it either fires on the live group or no-ops before reaching native — a timeout or
+  pump-fault kill on a still-live group is unaffected. The Linux cgroup backend's per-child hard kill is
+  additionally identity-gated (start-time token, like the POSIX process-group backend), so a recycled pid
+  is never SIGKILLed.
 
 ## [2.3.0] - 2026-07-11
 

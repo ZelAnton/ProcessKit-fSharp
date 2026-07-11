@@ -56,6 +56,7 @@ type ReadinessTests() =
               Stdin = None
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = None
               Wait = fun () -> Task.FromResult(Outcome.Exited 0)
               StdinError = fun () -> None
               StartKill = ignore

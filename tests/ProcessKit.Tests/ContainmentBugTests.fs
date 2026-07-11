@@ -24,6 +24,9 @@ type internal SyntheticBackend() =
     let mutable hardReleaseCount = 0
     let mutable spawnCount = 0
     let mutable nextHandle = 0
+    let mutable killChildCount = 0
+    let mutable killTreeCount = 0
+    let mutable gracefulKillTreeCount = 0
 
     let note (message: string) =
         lock gate (fun () -> violations.Add message)
@@ -60,6 +63,14 @@ type internal SyntheticBackend() =
     /// Every use-after-teardown the guard let through — must stay empty.
     member _.Violations = lock gate (fun () -> List.ofSeq violations)
 
+    /// How many times a native single-child hard kill actually reached the backend (a gated kill that
+    /// no-ops on a released/torn-down run never increments this).
+    member _.KillChildCount = lock gate (fun () -> killChildCount)
+    /// How many times a native whole-tree hard kill actually reached the backend.
+    member _.KillTreeCount = lock gate (fun () -> killTreeCount)
+    /// How many times a native graceful tree kill actually reached the backend.
+    member _.GracefulKillTreeCount = lock gate (fun () -> gracefulKillTreeCount)
+
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.ProcessGroup
 
@@ -85,9 +96,21 @@ type internal SyntheticBackend() =
 
         member _.Wait(_handle) = task { return Outcome.Exited 0 }
         member _.PidOf(spawned) = Some(int spawned.Handle)
-        member _.KillChild(_spawned) = ()
-        member _.KillTree() = requireLive "KillTree"
-        member _.GracefulKillTree(_grace) = Task.CompletedTask
+
+        member _.KillChild(_spawned) =
+            // A native kill must never reach the backend after teardown; count the ones that do so a live
+            // kill is still observable and a post-release/post-teardown one is a flagged violation.
+            requireLive "KillChild"
+            lock gate (fun () -> killChildCount <- killChildCount + 1)
+
+        member _.KillTree() =
+            requireLive "KillTree"
+            lock gate (fun () -> killTreeCount <- killTreeCount + 1)
+
+        member _.GracefulKillTree(_grace) =
+            requireLive "GracefulKillTree"
+            lock gate (fun () -> gracefulKillTreeCount <- gracefulKillTreeCount + 1)
+            Task.CompletedTask
 
         member _.Members() =
             requireLive "Members"
@@ -378,4 +401,134 @@ type ContainmentBugTests() =
                 Assert.That(backend.HardReleaseCount, Is.EqualTo 1, "teardown ran more than once")
                 Assert.That(backend.ReapedCount, Is.EqualTo 1, "the seeded child was not reaped exactly once")
                 Assert.That(backend.DistinctReapedCount, Is.EqualTo backend.ReapedCount, "a child was reaped twice")
+        }
+
+    [<Test>]
+    member _.``Kill and StopAsync after the group is released never touch the backend (shared path)``() : Task =
+        task {
+            // A shared-group handle whose GROUP is released out from under it (an external
+            // `ProcessGroup.Dispose()`), then `Kill()`/`StopAsync()` are still called on the live handle.
+            // The kill closures route through the lifecycle gate, so neither reaches the backend — no
+            // `KillChild` on a Job handle/pid the teardown already closed/recycled (use-after-close /
+            // wrong-target kill). The synthetic backend flags any native kill that slips through.
+            let backend = SyntheticBackend()
+            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+            let! started = group.StartAsync(Command.create "synthetic")
+
+            let running =
+                match started with
+                | Ok r -> r
+                | Error e -> failwith $"shared start failed: {e}"
+
+            (group :> IDisposable).Dispose() // release the shared group under the live handle
+
+            running.Kill() // fire-and-forget hard kill — must observe the released group and no-op
+            let! _ = running.StopAsync() // graceful stop — likewise a no-op on the released group
+
+            Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+
+            Assert.That(
+                backend.KillChildCount,
+                Is.EqualTo 0,
+                "a native child kill reached the backend after the group was released"
+            )
+
+            Assert.That(backend.GracefulKillTreeCount, Is.EqualTo 0)
+            Assert.That(backend.HardReleaseCount, Is.EqualTo 1)
+            GC.KeepAlive running
+        }
+
+    [<Test>]
+    member _.``Kill and StopAsync after the owned handle is disposed never touch the backend (owned path)``() : Task =
+        task {
+            // The owned path (a private per-run group, as `JobRunner` builds): disposing the handle reaps
+            // and releases the group. A `Kill()`/`StopAsync()` afterward must not `KillTree`/graceful-kill a
+            // container whose handle teardown already closed — the gate no-ops both, and teardown still ran
+            // exactly once.
+            let backend = SyntheticBackend()
+            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+            let host =
+                match group.StartInternal(Command.create "synthetic") with
+                | Ok h -> h
+                | Error e -> failwith $"owned start failed: {e}"
+
+            let running = RunningProcess host
+            do! (running :> IAsyncDisposable).DisposeAsync() // owned teardown reaps + releases the group
+
+            running.Kill() // StartKill = KillTree — must no-op on the released group
+            let! _ = running.StopAsync() // GracefulKill = GracefulKillTree — must no-op too
+
+            Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+            Assert.That(backend.KillTreeCount, Is.EqualTo 0, "a native tree kill reached a released owned group")
+            Assert.That(backend.GracefulKillTreeCount, Is.EqualTo 0)
+            Assert.That(backend.HardReleaseCount, Is.EqualTo 1, "owned teardown must run exactly once")
+        }
+
+    [<Test>]
+    member _.``a live shared Kill reaches the backend but a torn-down run's Kill does not``() : Task =
+        task {
+            // Two halves of the same guarantee. (1) No over-gating: a `Kill()` on a LIVE shared group must
+            // still reach the backend — the timeout/pump-fault kills reuse the same closure and must keep
+            // working. (2) The per-run flag: once THIS handle's own teardown has detached it (a shared group
+            // stays live for other runs), its `Kill()` must no longer touch native — the recycled-pid /
+            // closed-handle window after its own `Release`.
+            let backend = SyntheticBackend()
+            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+            let! firstStart = group.StartAsync(Command.create "synthetic")
+
+            let liveRun =
+                match firstStart with
+                | Ok r -> r
+                | Error e -> failwith $"first shared start failed: {e}"
+
+            liveRun.Kill() // live group + live run: the native child kill must land
+            Assert.That(backend.KillChildCount, Is.EqualTo 1, "a live shared Kill must reach the backend")
+
+            let! secondStart = group.StartAsync(Command.create "synthetic")
+
+            let tornDownRun =
+                match secondStart with
+                | Ok r -> r
+                | Error e -> failwith $"second shared start failed: {e}"
+
+            do! (tornDownRun :> IAsyncDisposable).DisposeAsync() // detach THIS run; the group stays live
+            tornDownRun.Kill() // its own teardown ran — must no-op even though the group is live
+
+            Assert.That(
+                backend.KillChildCount,
+                Is.EqualTo 1,
+                "a torn-down run's Kill reached the backend while the group was still live"
+            )
+
+            Assert.That(backend.HardReleaseCount, Is.EqualTo 0, "the shared group must still be live here")
+            Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+            GC.KeepAlive liveRun
+            (group :> IDisposable).Dispose()
+        }
+
+    [<Test>]
+    member _.``StopAsync on a live owned group graceful-kills the tree (no regression)``() : Task =
+        task {
+            // The timeout/StopAsync graceful path must keep working on a live group: the gate lets it
+            // through, and it reaches the backend's graceful tree kill exactly once, then reaps.
+            let backend = SyntheticBackend()
+            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+            let host =
+                match group.StartInternal(Command.create "synthetic") with
+                | Ok h -> h
+                | Error e -> failwith $"owned start failed: {e}"
+
+            let running = RunningProcess host
+            let! _ = running.StopAsync(TimeSpan.Zero)
+
+            Assert.That(
+                backend.GracefulKillTreeCount,
+                Is.EqualTo 1,
+                "a live-group StopAsync must graceful-kill the tree"
+            )
+
+            Assert.That(backend.HardReleaseCount, Is.EqualTo 1, "StopAsync must reap the owned group once")
+            Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
         }

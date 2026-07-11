@@ -545,6 +545,13 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         | Some stdin ->
             match stdin.Source with
             | StdinSource.Empty -> Ok None
+            | StdinSource.Inherit ->
+                // `Command.InheritStdin`: the child reads the PARENT's own standard input, whose bytes
+                // are external to the command and unknowable here. Key it by a fixed sentinel — a stable
+                // "inherit" marker, distinct from `Empty`/`None` (no stdin) so two inherited-stdin
+                // invocations match each other but not a no-stdin one. Recording still spawns for real
+                // (the inner runner inherits the parent's stdin); replay just returns the recorded result.
+                Ok(Some(hashBytes (Encoding.UTF8.GetBytes "inherit-stdin")))
             | StdinSource.Bytes bytes -> Ok(Some(hashBytes bytes))
             | StdinSource.File filePath ->
                 if options.HashFileStdinContents then

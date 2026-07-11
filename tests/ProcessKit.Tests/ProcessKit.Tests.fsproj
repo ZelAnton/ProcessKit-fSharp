@@ -35,6 +35,7 @@
 		<Compile Include="PosixSpawnCleanupTests.fs" />
 		<Compile Include="PosixIdentityReuseTests.fs" />
 		<Compile Include="MergeStderrTests.fs" />
+		<Compile Include="StdinInheritTests.fs" />
 		<Compile Include="CorrectnessBugTests.fs" />
 		<Compile Include="ApiParityTests.fs" />
 		<Compile Include="TestabilityTests.fs" />

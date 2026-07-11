@@ -264,6 +264,21 @@ type internal CgroupBackend(cgroupPath: string) =
         | true, token -> token
         | false, _ -> None
 
+    // Is `pid` still the SAME tracked child, not a recycled number? Mirrors `ProcessGroupBackend.stillOurs`
+    // (a cgroup child is its own process-group leader — spawned with POSIX_SPAWN_SETPGROUP, pgid == pid —
+    // so the pgid choke applies): gate the by-number liveness probe through the captured start-time
+    // identity so a pid recycled since it was tracked is reported gone and never SIGKILLed (the
+    // wrong-target kill T-084 closes). A matching identity, or an unknown token on either side, defers to
+    // the by-number verdict, so no coverage is lost. Used by `KillChild`, the one remaining per-child raw
+    // kill path (the per-member signal path is already pidfd-pinned via `Native.Cgroup.deliverIdentitySafe`).
+    let stillOurs (pid: int) : bool =
+        let captured =
+            match identities.TryGetValue pid with
+            | true, token -> token
+            | false, _ -> None
+
+        Native.Posix.processGroupStillTracked pid captured
+
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.CgroupV2
 
@@ -323,7 +338,16 @@ type internal CgroupBackend(cgroupPath: string) =
         member _.PidOf(spawned) = Some(int spawned.Handle)
 
         member _.KillChild(spawned) =
-            Native.Posix.killProcess (int spawned.Handle)
+            // Hard-kill this one child — but only while it is still OURS. A recycled pid (identity differs)
+            // must never be SIGKILLed (wrong-target kill); gate it through the choke and prune it instead,
+            // keeping `identities` in lockstep with `children`.
+            let pid = int spawned.Handle
+
+            if stillOurs pid then
+                Native.Posix.killProcess pid
+            else
+                identities.TryRemove pid |> ignore
+                children.Remove pid |> ignore
 
         member _.KillTree() = Native.Cgroup.killCgroup cgroupPath
 
