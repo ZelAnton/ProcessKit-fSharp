@@ -40,6 +40,7 @@ and C# users who want compiled examples instead of Markdown snippets.
 
 | Guide | Covers |
 |---|---|
+| [Comparison and migration guide](comparison.md) | How ProcessKit compares to `System.Diagnostics.Process`, CliWrap, Medallion.Shell, and SimpleExec, plus "was → now" migration snippets |
 | [Cookbook](cookbook.md) | "I want to …" → working snippet, for every capability; each recipe links to its deep guide |
 | [Running commands](commands.md) | The `Command` builder end to end: args, env, stdin sources, encodings, buffer policies, line handlers, timeouts, retry — and every consuming verb (`RunAsync`, `OutputStringAsync`, `ProbeAsync`, …) with its error semantics |
 | [Process groups](process-groups.md) | Kill-on-dispose containment: creating groups, spawning, teardown verbs, whole-tree signals, suspend/resume, member listing, resource limits, stats sampling |

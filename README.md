@@ -74,6 +74,10 @@ signal to one pid:
 The first column is the differentiator: a child's *descendants* are contained and reaped as a
 unit (Job Object / cgroup v2 / process group), not just the direct child.
 
+For a fuller, axis-by-axis comparison against `System.Diagnostics.Process`, CliWrap,
+Medallion.Shell, and SimpleExec — plus "was → now" migration snippets for the most common
+patterns — see **[Comparison and migration guide](docs/comparison.md)**.
+
 > **Status: 2.0 — F# rewrite.** ProcessKit 2.x is a ground-up F# library that supersedes the
 > author's earlier C# `ProcessKit` package (published through 1.3.2); its first release is
 > **2.0.0**. The public API targets [Semantic Versioning](https://semver.org/): breaking changes
