@@ -219,7 +219,8 @@ delivered.
 a Windows Job Object or a Linux cgroup v2; the POSIX process-group mechanism has no primitive to
 cap a tree's memory, process count, or CPU. Requesting any limit there makes `ProcessGroup.Create`
 return `ProcessError.ResourceLimit` immediately — an unapplied cap is no protection, so the group
-is never created unbounded.
+is never created unbounded. See [Running in containers](containers.md#which-mechanism-you-actually-get-in-a-container)
+for what this means in practice inside Docker/Kubernetes.
 
 **cgroup v2 needs the *real* cgroup root.** The cgroup v2 mechanism is selected on Linux only when
 limits are requested *and* a usable cgroup v2 hierarchy is available. Enabling the controllers a
@@ -229,7 +230,8 @@ ordinary container or a systemd session/scope/service sees — does not qualify 
 refused (surfacing as `ProcessError.ResourceLimit`). In practice real cgroup limit enforcement
 needs a minimal init sitting at the true root; elsewhere a limit-free group simply uses the POSIX
 process-group mechanism. Check `ProcessGroup.Mechanism` when the limit must not silently fail to
-apply.
+apply. See [Running in containers](containers.md) for the container-specific consequences —
+`PID 1`, minimal/shell-less images, and container-level limits vs `ProcessGroupOptions` limits.
 
 **Output is decoded as UTF-8 by default.** Captured stdout/stderr text is decoded as UTF-8 unless
 you say otherwise. A Windows console program that emits a legacy OEM code page will mis-decode;
@@ -274,4 +276,4 @@ an internal characteristic only — the `Task`-based public API is unchanged.
 
 ---
 
-Next: [Process groups](process-groups.md) · [Running commands](commands.md) · [Streaming & interactive I/O](streaming.md) · [docs index](README.md)
+Next: [Running in containers](containers.md) · [Process groups](process-groups.md) · [Running commands](commands.md) · [Streaming & interactive I/O](streaming.md) · [docs index](README.md)

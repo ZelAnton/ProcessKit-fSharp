@@ -33,7 +33,9 @@ spawn yourself, and the runner's test doubles never touch the OS at all.
 everything the library does — then read [Running commands](commands.md) end to end (it's the
 vocabulary every other guide builds on). Reach for the rest as the need arises, and keep
 [Platform support](platform-support.md) handy before you ship: it collects every per-OS caveat in
-one place.
+one place. Deploying to Docker/Kubernetes? [Running in containers](containers.md) collects the
+container-specific consequences of that fine print — mechanism selection, `PID 1`, graceful
+shutdown, and minimal images.
 
 The repository also includes runnable sample projects under [`../samples/`](../samples/) for F#
 and C# users who want compiled examples instead of Markdown snippets.
@@ -52,6 +54,7 @@ and C# users who want compiled examples instead of Markdown snippets.
 | [Observability](observability.md) | Logging, tracing & metrics: the `ILogger` lifecycle events (EventIds + per-run correlation), the `ProcessKit` `ActivitySource` span, and the `ProcessKit` `Meter` instruments — all secret-safe and OpenTelemetry-ready |
 | [Dependency injection](dependency-injection.md) | The `ProcessKit.Extensions.DependencyInjection` and `ProcessKit.Extensions.Hosting` packages: `AddProcessKit` (options / `IConfiguration` defaults), keyed per-tool `CliClient`s, shared `ProcessGroup`s, and supervised hosted processes |
 | [Platform support](platform-support.md) | The containment mechanisms, every per-capability support matrix in one place, and the platform caveats worth knowing before you ship |
+| [Running in containers](containers.md) | Which `Mechanism` you actually get inside Docker/Kubernetes, running as `PID 1` (signals, reparenting, zombies), graceful shutdown on orchestrator `SIGTERM`, minimal/musl/shell-less images, and container-level limits vs `ProcessGroupOptions` limits |
 
 ## The 60-second tour
 
