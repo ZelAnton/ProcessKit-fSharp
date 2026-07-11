@@ -418,3 +418,71 @@ type VerbTests() =
                 | other -> Assert.Fail $"expected Unsupported for gid on Windows, got {other}"
         }
         :> Task
+
+    // ---- Groups (supplementary-group privilege drop, platform-guarded) -------------------------
+
+    [<Test>]
+    member _.``Groups restores the target user's supplementary groups on the dropped child (Unix, root)``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore
+                    "Supplementary-group drop is Unix-only; the Windows behaviour is the Unsupported gate below."
+            elif NativePrivilege.geteuid () <> 0 then
+                // setgroups needs privilege (CAP_SETGID); without root the setpriv --groups step would
+                // EPERM, so the real membership change is not exercisable here. Skipped explicitly.
+                Assert.Ignore
+                    "Setting supplementary groups requires root (CAP_SETGID); skipping as an unprivileged user."
+            else
+                // As root, drop to uid/gid 1 AND set two supplementary groups, then have the child report
+                // its full group set via `id -G`. setpriv applies the numeric gids verbatim (no /etc/group
+                // lookup needed), so arbitrary high gids exercise the mechanism without depending on the
+                // host's group database. A correct `setpriv --reuid=1 --regid=1 --groups=4242,4243` makes
+                // the child's supplementary set exactly {4242, 4243}.
+                let dropped =
+                    Command.create "id"
+                    |> Command.args [ "-G" ]
+                    |> Command.user 1 1
+                    |> Command.groups [ 4242; 4243 ]
+
+                match! runner.RunAsync dropped with
+                | Ok out ->
+                    let reported = out.Trim().Split(' ')
+
+                    Assert.That(reported, Does.Contain "4242", "the child should carry the first supplementary group")
+                    Assert.That(reported, Does.Contain "4243", "the child should carry the second supplementary group")
+                | Error error -> Assert.Fail $"a groups drop as root should succeed, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Groups without a uid or gid drop fails honestly, never a silent no-op (Unix)``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "Groups is Unix-only; the Windows behaviour is the Unsupported gate below."
+            else
+                // Supplementary groups ride the setpriv privilege-drop helper, which is engaged only by a
+                // Uid/Gid drop. Requested WITHOUT one, the option would otherwise be silently ignored — so
+                // it must be refused up front with ProcessError.Spawn rather than run the child with its
+                // groups left untouched. (Independent of privilege, so it runs as any user.)
+                let orphanGroups = shell "echo hi" |> Command.groups [ 4242 ]
+
+                match! runner.RunAsync orphanGroups with
+                | Error(ProcessError.Spawn _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected a Spawn error for Groups without a uid/gid drop, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Groups is honestly Unsupported on Windows (no silent drop)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore
+                    "The groups Unsupported gate is Windows-only; Unix applies it via setpriv (observed above)."
+            else
+                let withGroups = shell "echo hi" |> Command.groups [ 1000 ]
+
+                match! runner.RunAsync withGroups with
+                | Error(ProcessError.Unsupported _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected Unsupported for groups on Windows, got {other}"
+        }
+        :> Task

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `Command.Groups(gids)` (and the pipe-friendly `Command.groups`): set the child's Unix **supplementary groups**, replacing the inherited set — the missing third leg of a privilege drop next to `Uid`/`Gid`. A bare `Uid`/`Gid`/`User` drop clears the parent's supplementary groups (so a child dropped to a service user loses that user's `docker`/`video`/`adm` membership); pass the target user's gids here to grant them back, or `[]` to keep the cleared default. Applied by the same `setpriv` helper (mapped to `setpriv --groups`), so it is honoured only alongside a `Uid`/`Gid` drop — set without one it fails the spawn with `ProcessError.Spawn` rather than being silently ignored. Unix-only: on Windows it fails with `ProcessError.Unsupported`, exactly like `Uid`/`Gid`. Each gid must be non-negative (rejected at the builder boundary with `ArgumentOutOfRangeException`, naming the offending index).
 - The `ProcessKit`, `ProcessKit.Extensions.DependencyInjection`, and `ProcessKit.Extensions.Hosting` packages now declare trimming/NativeAOT compatibility (`IsTrimmable`/`IsAotCompatible`), so a consumer that publishes a `PublishTrimmed`/NativeAOT app no longer gets "assembly was not verified" warnings for them; a CI smoke publishes and runs a NativeAOT consumer that spawns, captures, and contains a child on both Linux (`linux-x64`) and Windows (`win-x64`). See [docs/platform-support.md](docs/platform-support.md#trimming-and-nativeaot) — including the documented boundary that `ProcessKit.Testing` is not trim/AOT-safe (its reflection-based `System.Text.Json` cassettes), which is fine because it is a test-only dependency.
 - `Command.InheritStdin` (and the pipe-friendly `Command.inheritStdin`): hand the child the parent process's own standard input directly — inherited at the OS level, with no pipe and no feeder — for interactive/console programs (an editor launched by `git commit`, a tool that prompts on the terminal, a pipe from the parent's own stdin). The stdin analogue of `StdioMode.Inherit`. Incompatible with a feeder `Stdin` source and `KeepStdinOpen` (rejected at the builder boundary in either chaining order); `RunningProcess.TakeStdin` returns `None` for an inherited-stdin child. Repeatable under `Retry`/supervision and supported by the `ProcessKit.Testing` record/replay cassette (keyed by a stable "inherit" marker).
 - `OutputJsonAsync<'T>`: a typed JSON verb alongside `ParseAsync`/`TryParseAsync`, available on `Command`, any `IProcessRunner` (via the `ProcessRunnerExtensions` seam, so `ScriptedRunner` and other test doubles get it for free), `CliClient`, and `Pipeline`. Deserializes the captured stdout via the in-box `System.Text.Json` (no new package dependency), with an overload accepting a `JsonSerializerOptions`; invalid JSON becomes `ProcessError.Parse` and a non-zero exit becomes `ProcessError.Exit`, never a raised exception. From F#, `Runner.outputJson` is the module-function form.
@@ -34,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pump-fault kill on a still-live group is unaffected. The Linux cgroup backend's per-child hard kill is
   additionally identity-gated (start-time token, like the POSIX process-group backend), so a recycled pid
   is never SIGKILLed.
+- `RunningProcess.WaitForLineAsync` now reports the clamped (armable) timeout in `ProcessError.NotReady`
+  for an over-long (>~24.8 days) requested timeout, instead of the raw, un-clamped value — uniform with
+  `WaitForPortAsync`/`WaitForAsync`, which already report the value actually enforced.
+- `ProcessGroup.StartAsync` now guards the shared-group `RunningProcess` handle construction exactly like
+  `JobRunner.start`: on a constructor fault it reaps the tree via `host.Teardown()` before re-raising,
+  instead of leaving an already-spawned tree without a deterministic owner. Both runners now share this
+  guarded construction through one helper.
+- `ProcessKit.Extensions.Hosting`'s internal `TrackingRunner` now honours `Command.CancelOn` and always
+  reports a cancelled hosted-process capture as `Error(ProcessError.Cancelled ...)`: it previously only
+  killed the child on the verb-level token (silently ignoring `Command.CancelOn`) and could surface a
+  cancelled run as `Ok` with the killed child's `Signalled`/non-zero result instead of a `Cancelled` error.
 
 ## [2.3.0] - 2026-07-11
 

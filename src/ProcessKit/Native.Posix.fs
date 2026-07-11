@@ -1129,7 +1129,13 @@ module internal Posix =
                 None
 
     // The `setpriv` flags for the requested drop: set the gid and the uid (setpriv sequences them
-    // correctly), and clear the parent's supplementary groups so the child never keeps them.
+    // correctly), and handle the child's supplementary groups. By default (or an explicit empty
+    // `Command.Groups []`) the parent's set is cleared with `--clear-groups` so the child never keeps
+    // root's; a non-empty `Command.Groups gids` instead sets EXACTLY those groups with `--groups`
+    // (a comma-separated numeric list — `setpriv` applies them verbatim, no `/etc/group` lookup). The
+    // group flag is mutually exclusive on the wire, so at most one of `--clear-groups`/`--groups` is
+    // emitted. `Command.Groups` only reaches here alongside a uid/gid drop (`spawnPosix`'s up-front
+    // `groupsRequireDropError` guard refuses it without one), so it always composes with a real drop.
     let private setprivFlags (config: CommandConfig) : string list =
         let regid =
             match config.Gid with
@@ -1141,12 +1147,36 @@ module internal Posix =
             | Some u -> [ $"--reuid={u}" ]
             | None -> []
 
-        regid @ reuid @ [ "--clear-groups" ]
+        let groups =
+            match config.Groups with
+            | Some(_ :: _ as gids) -> [ "--groups=" + String.concat "," (gids |> List.map string) ]
+            | _ -> [ "--clear-groups" ]
+
+        regid @ reuid @ groups
+
+    /// A `Command.Groups` (supplementary groups) request is applied only along the `setpriv`
+    /// privilege-drop path, which is entered exclusively by a `Uid`/`Gid` drop. Set WITHOUT either it
+    /// would otherwise fall through to a plain `posix_spawn` and be silently dropped — the very silent
+    /// downgrade the project forbids. Refuse it up front with a typed `ProcessError.Spawn`, mirroring the
+    /// honest-failure contract of the uid/gid drop itself. `None` = clear to go.
+    let private groupsRequireDropError (command: Command) : ProcessError option =
+        let config = command.Config
+
+        if config.Groups.IsSome && config.Uid.IsNone && config.Gid.IsNone then
+            Some(
+                ProcessError.Spawn(
+                    command.Program,
+                    "Command.Groups (supplementary groups) is applied by the setpriv privilege-drop helper and needs a Uid or Gid drop to take effect; it was set without either"
+                )
+            )
+        else
+            None
 
     /// Rewrite `command` to run through the `setpriv` helper: `setpriv <flags> <program> <args...>`. The
-    /// uid/gid are cleared on the rewritten command (so the `spawnPosix` dispatcher does not recurse), and
-    /// every other knob — stdio, env, CurrentDir, Priority, Umask, Setsid — is preserved and applied by
-    /// `posix_spawn` to the `setpriv` process, which inherits them across its `exec` of the real program.
+    /// uid/gid/groups are cleared on the rewritten command (so the `spawnPosix` dispatcher does not
+    /// recurse), and every other knob — stdio, env, CurrentDir, Priority, Umask, Setsid — is preserved and
+    /// applied by `posix_spawn` to the `setpriv` process, which inherits them across its `exec` of the
+    /// real program.
     let private setprivCommand (command: Command) : Command =
         let config = command.Config
         let prefix = setprivFlags config @ [ config.Program ]
@@ -1156,7 +1186,8 @@ module internal Posix =
                 Program = "setpriv"
                 Args = config.Args.InsertRange(0, prefix)
                 Uid = None
-                Gid = None }
+                Gid = None
+                Groups = None }
         )
 
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
@@ -1683,24 +1714,27 @@ module internal Posix =
     let spawnPosix (command: Command) : Result<Spawned, ProcessError> =
         let config = command.Config
 
-        if config.Uid.IsSome || config.Gid.IsSome then
-            match privilegeDropPrecheck command with
-            | Some error -> Error error
-            | None ->
-                match spawnPosixViaSpawn (setprivCommand command) with
-                | Error(ProcessError.NotFound _) ->
-                    // `posix_spawn` could not find `setpriv` on PATH — report it against the ORIGINAL
-                    // program (not the helper), so a caller who never mentioned `setpriv` gets a message
-                    // that explains what a `Uid`/`Gid` drop needs on this host.
-                    Error(
-                        ProcessError.Spawn(
-                            command.Program,
-                            "a Uid/Gid privilege drop needs the 'setpriv' helper (util-linux) on PATH; it was not found (available on mainstream Linux; absent on macOS/BSD)"
+        match groupsRequireDropError command with
+        | Some error -> Error error
+        | None ->
+            if config.Uid.IsSome || config.Gid.IsSome then
+                match privilegeDropPrecheck command with
+                | Some error -> Error error
+                | None ->
+                    match spawnPosixViaSpawn (setprivCommand command) with
+                    | Error(ProcessError.NotFound _) ->
+                        // `posix_spawn` could not find `setpriv` on PATH — report it against the ORIGINAL
+                        // program (not the helper), so a caller who never mentioned `setpriv` gets a
+                        // message that explains what a `Uid`/`Gid` drop needs on this host.
+                        Error(
+                            ProcessError.Spawn(
+                                command.Program,
+                                "a Uid/Gid privilege drop needs the 'setpriv' helper (util-linux) on PATH; it was not found (available on mainstream Linux; absent on macOS/BSD)"
+                            )
                         )
-                    )
-                | other -> other
-        else
-            spawnPosixViaSpawn command
+                    | other -> other
+            else
+                spawnPosixViaSpawn command
 
     // ----------------------------------------------------------------------------------
     // Linux cgroup v2: place the child INSIDE its cgroup atomically with its own execution
@@ -1762,14 +1796,16 @@ module internal Posix =
             let launcherArgs = "-c" :: cgroupLauncherScript :: "sh" :: cgroupProcs :: innerArgv
 
             // Every other knob (stdio, cwd, env, Priority, Umask, Setsid) is preserved and applied by
-            // posix_spawn to the launcher, then inherited across its `exec`(s). `Uid`/`Gid` are cleared so
-            // `spawnPosixViaSpawn` does not ALSO wrap the launcher in a second `setpriv` layer.
+            // posix_spawn to the launcher, then inherited across its `exec`(s). `Uid`/`Gid`/`Groups` are
+            // cleared so `spawnPosixViaSpawn` does not ALSO wrap the launcher in a second `setpriv` layer
+            // (the drop, and its `--groups`/`--clear-groups`, is already nested in `innerArgv` above).
             let launcherConfig =
                 { config with
                     Program = "/bin/sh"
                     Args = System.Collections.Immutable.ImmutableList.CreateRange launcherArgs
                     Uid = None
-                    Gid = None }
+                    Gid = None
+                    Groups = None }
 
             match spawnPosixViaSpawn (Command launcherConfig) with
             | Error(ProcessError.NotFound _) ->
@@ -1783,9 +1819,12 @@ module internal Posix =
                 )
             | other -> other
 
-        if config.Uid.IsSome || config.Gid.IsSome then
-            match privilegeDropPrecheck command with
-            | Some error -> Error error
-            | None -> launch ()
-        else
-            launch ()
+        match groupsRequireDropError command with
+        | Some error -> Error error
+        | None ->
+            if config.Uid.IsSome || config.Gid.IsSome then
+                match privilegeDropPrecheck command with
+                | Some error -> Error error
+                | None -> launch ()
+            else
+                launch ()
