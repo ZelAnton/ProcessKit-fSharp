@@ -1,6 +1,7 @@
 namespace ProcessKit.Tests
 
 open System
+open System.Diagnostics
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
@@ -29,6 +30,25 @@ type StatsTests() =
         match ProcessGroup.Create() with
         | Ok group -> group
         | Error error -> failwith $"ProcessGroup.Create failed: {error}"
+
+    // A synthetic `RunningHost` whose pid is THIS test process's own (so `Process.GetProcessById`
+    // genuinely succeeds and reports real metrics), with a caller-supplied `StartTimeIdentity` — the
+    // T-097 seam: a mismatched identity models a recycled pid the OS handed to an unrelated process
+    // after the original child was reaped, without needing a real pid-reuse race on CI.
+    let hostOverCurrentProcess (startTimeIdentity: DateTime option) : RunningHost =
+        { Config = (Command.create "test").Config
+          Pid = Some(Process.GetCurrentProcess().Id)
+          Stdout = None
+          Stderr = None
+          Stdin = None
+          StartTime = DateTime.UtcNow
+          StartedTimestamp = Stopwatch.GetTimestamp()
+          StartTimeIdentity = startTimeIdentity
+          Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+          StdinError = fun () -> None
+          StartKill = ignore
+          GracefulKill = fun _ -> Task.CompletedTask
+          Teardown = fun () -> ValueTask() }
 
     [<Test>]
     member _.``Profile returns timing and sample counts``() : Task =
@@ -122,6 +142,66 @@ type StatsTests() =
                 running.Kill()
                 let! _ = running.WaitAsync()
                 ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``CpuTime/PeakMemoryBytes withhold metrics when the pid's identity no longer matches the child``() : Task =
+        task {
+            // A start time that cannot possibly be this (long-running test) process's real one — models
+            // an OS-recycled pid whose current occupant is a stranger, not our reaped child.
+            let host = hostOverCurrentProcess (Some(DateTime.UtcNow.AddDays -1.0))
+            use running = new RunningProcess(host)
+
+            Assert.That(running.CpuTime.IsNone, Is.True, "CpuTime must not report a mismatched pid's metrics")
+
+            Assert.That(
+                running.PeakMemoryBytes.IsNone,
+                Is.True,
+                "PeakMemoryBytes must not report a mismatched pid's metrics"
+            )
+
+            do! (running :> IAsyncDisposable).DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``CpuTime/PeakMemoryBytes still report metrics when the identity matches``() : Task =
+        task {
+            let actualStartTime = Process.GetCurrentProcess().StartTime
+            let host = hostOverCurrentProcess (Some actualStartTime)
+            use running = new RunningProcess(host)
+
+            if not isMacOs then
+                // CPU time and peak working set are reported on Windows and Linux; macOS BCL coverage is
+                // less certain (see the equivalent skip in "per-process metrics are available...").
+                Assert.That(running.CpuTime.IsSome, Is.True)
+                Assert.That(running.PeakMemoryBytes.IsSome, Is.True)
+            else
+                running.CpuTime |> ignore
+                running.PeakMemoryBytes |> ignore
+
+            do! (running :> IAsyncDisposable).DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``CpuTime/PeakMemoryBytes fall back to a raw read when no identity was captured``() : Task =
+        task {
+            // `StartTimeIdentity = None` (e.g. a synthetic host/fake, or a spawn-time identity read that
+            // failed) must not spuriously withhold metrics — the gate defers to the raw read exactly as
+            // before T-097.
+            let host = hostOverCurrentProcess None
+            use running = new RunningProcess(host)
+
+            if not isMacOs then
+                Assert.That(running.CpuTime.IsSome, Is.True)
+                Assert.That(running.PeakMemoryBytes.IsSome, Is.True)
+            else
+                running.CpuTime |> ignore
+                running.PeakMemoryBytes |> ignore
+
+            do! (running :> IAsyncDisposable).DisposeAsync()
         }
         :> Task
 

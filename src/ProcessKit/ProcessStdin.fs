@@ -41,4 +41,4 @@ type ProcessStdin internal (stream: Stream) =
     /// Uncancellable by the same convention: closing flushes any buffered input, which a full pipe can
     /// block — to bound an interactive session, cancel the `WriteAsync`/`WriteLineAsync`/`FlushAsync`
     /// calls above before closing rather than the close itself.
-    member _.FinishAsync() : Task = stream.DisposeAsync().AsTask()
+    member _.FinishAsync() : Task = Pump.disposeQuietlyAsync stream

@@ -198,8 +198,20 @@ type HostedProcessService
 
                     publishOutcome (Error err)
                 | Ok supervisor ->
+                    // Combine the host's own stop flag with whatever `StopWhen` predicate the caller
+                    // already configured via `configureSupervisor` — `Supervisor.StopWhen` *replaces*
+                    // `config.StopWhen`, so calling it again here without reading `CurrentStopWhen`
+                    // first would silently drop the caller's predicate.
+                    let userStopWhen = supervisor.CurrentStopWhen
+
                     let supervisor =
-                        supervisor.StopWhen(Func<ProcessResult<string>, bool>(fun _ -> Volatile.Read(&stopping) <> 0))
+                        supervisor.StopWhen(
+                            Func<ProcessResult<string>, bool>(fun result ->
+                                Volatile.Read(&stopping) <> 0
+                                || (match userStopWhen with
+                                    | Some predicate -> predicate result
+                                    | None -> false))
+                        )
 
                     let! outcome = supervisor.RunAsync(lifetime.Token)
                     publishOutcome outcome
