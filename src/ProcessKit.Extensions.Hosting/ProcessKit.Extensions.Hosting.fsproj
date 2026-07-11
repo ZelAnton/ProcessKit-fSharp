@@ -26,12 +26,19 @@
 
 	<ItemGroup>
 		<Compile Include="HostedProcessService.fs" />
+		<Compile Include="HostedProcessHealthCheck.fs" />
 		<Compile Include="HostedServiceCollectionExtensions.fs" />
 	</ItemGroup>
 
 	<ItemGroup>
 		<PackageReference Include="FSharp.Core" />
 		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+		<!-- Abstractions only (IHealthCheck / HealthCheckResult / HealthCheckRegistration) — never the
+		     full Microsoft.Extensions.Diagnostics.HealthChecks package, which supplies AddHealthChecks()
+		     / IHealthChecksBuilder / the concrete polling HealthCheckService. See HostedProcessHealthCheck's
+		     doc comment for the placement rationale and how a consumer wires the registered keyed check
+		     into their own health-checks pipeline. -->
+		<PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Options" />

@@ -5,6 +5,7 @@ open System.Diagnostics.CodeAnalysis
 open System.Runtime.InteropServices
 open System.Text.Json
 open System.Threading
+open System.Threading.Tasks
 
 /// The immutable configuration behind a `CliClient`: the runner, and a *template* `Command` carrying
 /// the program plus any shared defaults. Internal — built through the builder.
@@ -136,6 +137,24 @@ type CliClient internal (config: CliClientConfig) =
         =
         ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine config.Runner cancellationToken predicate.Invoke (this.Command args)
+
+    /// Preflight-check that this client's program can be resolved to a real executable on this host,
+    /// WITHOUT spawning it — the `doctor`/install-wizard use case ("is this tool installed?"), cheaper
+    /// and side-effect-free next to probing availability by actually running the program
+    /// (`ProbeAsync`). A thin wrapper over `Exec.which`/`Native.Common.resolveProgram` (the same
+    /// PATH/PATHEXT-aware logic the spawn path itself falls back on for its own `NotFound`
+    /// diagnostic), so this check and an actual run of the client's program never disagree on
+    /// found-vs-not-found.
+    ///
+    /// **Resolution is always LOCAL — never delegated to `Runner`.** Availability is a fact about the
+    /// host's `PATH`/filesystem, independent of which `IProcessRunner` a command is eventually run
+    /// through, so a test double/mock injected via `WithRunner` (e.g. a `ScriptedRunner`) has no
+    /// bearing on this result: it always probes the real host, even when `Runner` is a double. A
+    /// caller unit-testing wrapper-app logic around this check should stub around
+    /// `EnsureAvailableAsync` itself (branch on an injected flag, or skip calling it), rather than
+    /// expect a mocked `Runner` to control it.
+    member _.EnsureAvailableAsync() : Task<Result<string, ProcessError>> =
+        Task.FromResult(Native.Common.resolveProgram config.Template.Program)
 
 /// Pipe-friendly entry point for `CliClient`.
 [<RequireQualifiedAccess>]

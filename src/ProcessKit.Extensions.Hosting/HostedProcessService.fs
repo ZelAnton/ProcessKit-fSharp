@@ -128,6 +128,14 @@ type HostedProcessService
     let mutable supervisionTask: Task = Task.CompletedTask
     let mutable lastOutcome: Result<SupervisionOutcome, ProcessError> option = None
     let mutable lastStopOutcome: Outcome option = None
+    // Live supervision telemetry, mirrored from `Supervisor.OnRestart`/`OnStormPause` (see
+    // `runSupervision` below) so a health check (or any other observer) can read "is it storm-paused
+    // right now" / "how many restarts so far" without waiting for the final `SupervisionOutcome` —
+    // which, for a long-lived service, may never arrive. Reset at the start of each fresh supervision
+    // run (see `StartAsync`), same as `stopping`, so a restarted hosted service does not carry over a
+    // prior run's counts.
+    let mutable restartCount = 0
+    let mutable stormPaused = false
 
     let logError (ex: exn) =
         logger.LogError(ex, "ProcessKit hosted process {Name} supervision failed.", name)
@@ -215,6 +223,38 @@ type HostedProcessService
                                     | None -> false))
                         )
 
+                    // Same combine-don't-replace treatment for `OnRestart`/`OnStormPause`: track the
+                    // live restart count and storm-pause flag for `RestartCount`/`IsStormPaused`
+                    // without dropping whatever handler the caller already installed via
+                    // `configureSupervisor`. `OnStormPause` is always immediately followed — in the
+                    // same loop iteration, before the next incarnation — by an `OnRestart` call (a
+                    // storm pause only ever precedes that restart's own backoff), so clearing
+                    // `stormPaused` from the `OnRestart` handler exactly brackets the real pause
+                    // window without needing a dedicated "pause ended" event.
+                    let userOnRestart = supervisor.CurrentOnRestart
+                    let userOnStormPause = supervisor.CurrentOnStormPause
+
+                    let supervisor =
+                        supervisor
+                            .OnRestart(
+                                Action<SupervisorRestartEvent>(fun event ->
+                                    lock gate (fun () ->
+                                        restartCount <- event.Restart
+                                        stormPaused <- false)
+
+                                    match userOnRestart with
+                                    | Some handler -> handler event
+                                    | None -> ())
+                            )
+                            .OnStormPause(
+                                Action<SupervisorStormPauseEvent>(fun event ->
+                                    lock gate (fun () -> stormPaused <- true)
+
+                                    match userOnStormPause with
+                                    | Some handler -> handler event
+                                    | None -> ())
+                            )
+
                     let! outcome = supervisor.RunAsync(lifetime.Token)
                     publishOutcome outcome
             with
@@ -253,6 +293,28 @@ type HostedProcessService
     /// The outcome returned by the child process stop operation during host shutdown, when one ran.
     member _.LastStopOutcome = lock gate (fun () -> lastStopOutcome)
 
+    /// Whether the background supervision loop is currently running: `true` from a successful
+    /// `StartAsync` until supervision ends (naturally, via `StopAsync`, or via `Dispose`/`DisposeAsync`)
+    /// — i.e. `LastOutcome` is still `None` and teardown has not begun. `false` before the first
+    /// `StartAsync`, once supervision has ended (`LastOutcome` is `Some`), or once `Dispose`/
+    /// `DisposeAsync` has claimed teardown (even if the loop has not quite finished unwinding yet — see
+    /// `IDisposable.Dispose`). The primary "is it alive" signal for a health check.
+    member _.IsSupervisionActive =
+        lock gate (fun () -> not disposed && not supervisionTask.IsCompleted)
+
+    /// How many restarts the current (or most recent) supervision run has made so far, live —
+    /// mirrors `SupervisionOutcome.Restarts` but updates as each restart happens (via
+    /// `Supervisor.OnRestart`), rather than only once supervision ends. Reset to `0` at the start of
+    /// each fresh `StartAsync`.
+    member _.RestartCount = lock gate (fun () -> restartCount)
+
+    /// Whether the supervised child is currently paused by the failure-storm guard
+    /// (`Supervisor.StormPause`), live — set from `Supervisor.OnStormPause` and cleared once the
+    /// paused restart actually happens (`Supervisor.OnRestart`). Always `false` when `StormPause` was
+    /// never configured. A reasonable "Degraded" signal for a health check: supervision is still
+    /// alive, but restarts are being throttled because failures are clustering.
+    member _.IsStormPaused = lock gate (fun () -> stormPaused)
+
     interface IHostedService with
         /// Starts (or restarts, once a prior supervision has ended) the background supervision loop.
         /// Idempotent while supervision is already running — a concurrent or repeated call never starts
@@ -270,6 +332,10 @@ type HostedProcessService
                         // otherwise the fresh supervision loop's `StopWhen` predicate would be true from
                         // its very first run and it would immediately end supervision again.
                         Interlocked.Exchange(&stopping, 0) |> ignore
+                        // Likewise, a fresh supervision run must not carry over a prior run's restart
+                        // count / storm-pause flag — this is a new lifetime, not a continuation.
+                        restartCount <- 0
+                        stormPaused <- false
                         supervisionTask <- runSupervision ()
 
                     Task.CompletedTask)

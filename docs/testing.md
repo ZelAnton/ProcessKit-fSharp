@@ -500,7 +500,11 @@ each call returning a new client:
 
 `.Command(args)` builds a configured `Command` without running it (the template's
 defaults applied), and `.RunAsync(args)` / `.OutputStringAsync(args)` / `.OutputBytesAsync(args)`
-(plus `ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/…) build and run through the client's runner:
+(plus `ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/…) build and run through the client's runner.
+`.EnsureAvailableAsync()` is a preflight check — "is the client's program installed?" — with no
+spawn (see [Preflight: is a program installed?](commands.md#preflight-is-a-program-installed)); it
+is always **local**, never delegated to `.WithRunner`'s runner, so a `ScriptedRunner` injected for
+the wrapper's own tests has no bearing on it.
 
 **F#**
 

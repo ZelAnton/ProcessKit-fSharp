@@ -1,3 +1,7 @@
+class ProcessKit.Extensions.Hosting.HostedProcessHealthCheck
+  :> Microsoft.Extensions.Diagnostics.HealthChecks.IHealthCheck
+  new(ProcessKit.Extensions.Hosting.HostedProcessService)
+
 class ProcessKit.Extensions.Hosting.HostedProcessOptions
   new()
   property ShutdownGracePeriod : System.TimeSpan { get; set }
@@ -7,12 +11,16 @@ class ProcessKit.Extensions.Hosting.HostedProcessService
   :> System.IAsyncDisposable
   :> System.IDisposable
   new(System.String, ProcessKit.Command, System.Func<ProcessKit.Supervisor, ProcessKit.Supervisor>, ProcessKit.IProcessRunner, ProcessKit.Extensions.Hosting.HostedProcessOptions)
+  property IsStormPaused : System.Boolean { get }
+  property IsSupervisionActive : System.Boolean { get }
   property LastOutcome : Microsoft.FSharp.Core.FSharpOption<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>> { get }
   property LastStopOutcome : Microsoft.FSharp.Core.FSharpOption<ProcessKit.Outcome> { get }
   property Name : System.String { get }
+  property RestartCount : System.Int32 { get }
 
 class ProcessKit.Extensions.Hosting.HostedServiceCollectionExtensions
   static member AddProcessKitHostedProcess(Microsoft.Extensions.DependencyInjection.IServiceCollection, System.String, ProcessKit.Command) : Microsoft.Extensions.DependencyInjection.IServiceCollection
   static member AddProcessKitHostedProcess(Microsoft.Extensions.DependencyInjection.IServiceCollection, System.String, ProcessKit.Command, System.Func<ProcessKit.Supervisor, ProcessKit.Supervisor>) : Microsoft.Extensions.DependencyInjection.IServiceCollection
+  static member AddProcessKitHostedProcessHealthCheck(Microsoft.Extensions.DependencyInjection.IServiceCollection, System.String) : Microsoft.Extensions.DependencyInjection.IServiceCollection
   static member ConfigureProcessKitHostedProcess(Microsoft.Extensions.DependencyInjection.IServiceCollection, System.String, System.Action<ProcessKit.Extensions.Hosting.HostedProcessOptions>) : Microsoft.Extensions.DependencyInjection.IServiceCollection
 
