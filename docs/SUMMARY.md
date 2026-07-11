@@ -18,9 +18,6 @@
 - [Platform support](platform-support.md)
 - [Running in containers](containers.md)
 
----
-
-- [What's next](whats-next.md)
 <!-- The two entries below are reserved external "menu items". mdBook cannot point
      a SUMMARY.md entry at an external URL (a raw URL fails the build), so they are
      carried as DRAFT chapters — an empty () link, i.e. native non-clickable
