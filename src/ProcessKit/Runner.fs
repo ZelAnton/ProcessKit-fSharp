@@ -1,5 +1,6 @@
 namespace ProcessKit
 
+open System.Diagnostics.CodeAnalysis
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
@@ -335,6 +336,13 @@ module Runner =
     /// `System.Text.Json` (`options = None` uses the BCL defaults); invalid JSON becomes
     /// `ProcessError.Parse`, exactly like `parse`/`tryParse` — never a raised exception. Applied once,
     /// outside any retry (see `parse`'s doc for why).
+    ///
+    /// **Trimming / AOT:** deserializes via reflection-based `System.Text.Json`
+    /// (`JsonSerializer.Deserialize(string, Type, JsonSerializerOptions)`), so it is not trim-/AOT-safe —
+    /// pass `options` with a source-generated `JsonSerializerContext`/`JsonTypeInfo<'T>` resolver, or
+    /// avoid this verb, in a trimmed/NativeAOT app.
+    [<RequiresUnreferencedCode "Deserializes stdout by reflection via System.Text.Json; give options a source-generated JsonSerializerContext, or avoid this verb, in a trimmed app.">]
+    [<RequiresDynamicCode "Deserializes stdout by reflection via System.Text.Json; give options a source-generated JsonSerializerContext, or avoid this verb, in a NativeAOT app.">]
     let outputJson<'T>
         (runner: IProcessRunner)
         (cancellationToken: CancellationToken)

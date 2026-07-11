@@ -93,7 +93,7 @@ claim with a CI smoke that actually publishes and runs a NativeAOT consumer.
 
 | Package | `IsTrimmable` | `IsAotCompatible` | Notes |
 |---|:---:|:---:|---|
-| `ProcessKit` | ✅ | ✅ | Containment is platform P/Invoke with no reflection, dynamic codegen, or reflection-backed `printf`/`%A` on any path. |
+| `ProcessKit` | ✅ | ✅ | Containment is platform P/Invoke with no reflection, dynamic codegen, or reflection-backed `printf`/`%A` on any path except the annotated `OutputJsonAsync` verb (see below). |
 | `ProcessKit.Extensions.DependencyInjection` | ✅ | ✅ | Factory-based registration; the `AddProcessKit`/`AddProcessKitGroup` **`IConfiguration`** overloads are the one exception (see below). |
 | `ProcessKit.Extensions.Hosting` | ✅ | ✅ | Factory-based DI plus an `IHostedService` wrapper; options come from the AOT-safe `Activator.CreateInstance<T>()` path. |
 | `ProcessKit.Testing` | ❌ | ❌ | Not trim/AOT-safe by design — see the boundary below. This is a **test-only** package, referenced from test projects that are not themselves trimmed/AOT-published. |
@@ -103,6 +103,20 @@ bind `ProcessKitOptions` from configuration by reflection, which is not trim/AOT
 `[RequiresUnreferencedCode]` / `[RequiresDynamicCode]`, so a consumer that calls them from a trimmed/AOT app
 gets a precise warning pointing at the overload — exactly as Microsoft's own DI/options packages behave. Use
 the `Action<ProcessKitOptions>` overload (or bind configuration yourself and call `configure`) from an AOT app.
+
+**The `OutputJsonAsync` boundary (core).** The typed JSON verb (`Command.OutputJsonAsync<'T>`,
+`IProcessRunner.OutputJsonAsync<'T>`, `CliClient.OutputJsonAsync<'T>`, `Pipeline.OutputJsonAsync<'T>`, and the
+underlying `Runner.outputJson`) deserializes stdout with the reflection-based
+`JsonSerializer.Deserialize(string, Type, JsonSerializerOptions)` overload, so — like the DI `IConfiguration`
+overloads above — all five surfaces carry `[RequiresUnreferencedCode]` / `[RequiresDynamicCode]`. Under
+NativeAOT, reflection-based `System.Text.Json` deserialization of an arbitrary caller-supplied `'T` is not
+supported by default (`JsonSerializer.IsReflectionEnabledByDefault = false`), so calling this verb from a
+NativeAOT app without a source-generated resolver fails at run time rather than silently misbehaving. To use
+it from a trimmed/AOT app, pass a `JsonSerializerOptions` whose `TypeInfoResolver` comes from a
+source-generated `JsonSerializerContext` for `'T` (F# cannot itself author the `System.Text.Json` source
+generator — it is a Roslyn/C# generator the F# compiler does not run — but a C# project's generated context
+can be passed in from F# or C# alike); otherwise avoid the verb in an AOT-published app. The `aot-smoke` CI
+job (below) does not call this verb, so it stays unaffected by this boundary.
 
 **The `ProcessKit.Testing` boundary.** The record/replay cassette surface (`RecordReplayRunner`) serializes
 and deserializes with reflection-based `System.Text.Json`. F# cannot use the `System.Text.Json` source
