@@ -214,6 +214,33 @@ sequence that the first run drains, so they are one-shot — prefer a reusable
 source whenever a command may run more than once (under [`Retry`](#timeouts-and-retries)
 or [record/replay](testing.md)).
 
+### Inheriting the parent's standard input (`InheritStdin`)
+
+`Command.InheritStdin` hands the child the **parent process's own standard
+input** directly — inherited at the OS level, with no pipe and no feeder. It is
+the stdin analogue of `StdioMode.Inherit` for stdout/stderr, and it is what an
+interactive/console program needs: an editor launched by `git commit`, a tool
+that prompts the user on the terminal, or a straight pipe from the parent's own
+stdin. The native spawn wires the child's stdin to the parent's real standard
+input (a duplicated `STD_INPUT_HANDLE` on Windows, an inherited fd 0 on POSIX)
+rather than creating a pipe.
+
+```fsharp
+// Let `git commit` open the user's editor on the parent's terminal.
+let commit = Command.create "git" |> Command.args [ "commit" ] |> Command.inheritStdin
+```
+
+Because there is no stdin pipe under inherit, it is **incompatible** with the
+pipe-based stdin knobs and rejects them at the builder boundary (an
+`ArgumentException`, in either chaining order): a feeder source (`Stdin`) and
+`KeepStdinOpen`. For the same reason `RunningProcess.TakeStdin` returns `None`
+for an inherited-stdin child — there is no interactive pipe to hand out. The
+capture and streaming verbs are unaffected; only the child's stdin wiring
+changes. Inherit is **repeatable**: a [`Retry`](#timeouts-and-retries) or a
+supervisor restart simply re-inherits the parent's stdin, so it is never refused
+by the one-shot-source retry guard, and a [record/replay](testing.md) cassette
+keys it by a stable "inherit" marker (distinct from a no-stdin command).
+
 For conversational, request/response stdin — write a line, read the answer,
 repeat — use `KeepStdinOpen` with the streaming API instead: see
 [Streaming & interactive I/O](streaming.md).

@@ -193,6 +193,7 @@ type StreamingTests() =
               Stdin = None
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = None
               Wait = fun () -> Task.FromResult(Outcome.Exited 0)
               StdinError = fun () -> None
               StartKill = ignore
@@ -217,6 +218,7 @@ type StreamingTests() =
               Stdin = None
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = None
               Wait = fun () -> Task.FromResult(Outcome.Exited 0)
               StdinError = fun () -> None
               StartKill = ignore
@@ -395,6 +397,27 @@ type StreamingTests() =
                     match! running.OutputStringAsync() with
                     | Ok _ -> ()
                     | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ProcessStdin FinishAsync does not throw against an already-broken pipe``() : Task =
+        task {
+            // The child exits immediately without ever reading stdin, so by the time we close our
+            // end its read side is long gone — a torn-down/broken-pipe close, the same race
+            // `Pump.disposeQuietly`/`disposeQuietlyAsync` swallow for every other pipe stream in the
+            // project. `FinishAsync` must not surface an `IOException` to the caller here.
+            let command = shell "exit 0" |> Command.keepStdinOpen
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match running.TakeStdin() with
+                | None -> Assert.Fail "expected an interactive stdin handle"
+                | Some stdin ->
+                    let! _ = running.WaitAsync()
+                    do! stdin.FinishAsync() // must not throw despite the child's read end being gone
+                    ()
         }
         :> Task
 
@@ -597,6 +620,7 @@ type StreamingTests() =
                   Stdin = None
                   StartTime = DateTime.UtcNow
                   StartedTimestamp = Stopwatch.GetTimestamp()
+                  StartTimeIdentity = None
                   Wait = fun () -> Task.FromResult(Outcome.Exited 0)
                   StdinError = fun () -> None
                   StartKill = ignore
@@ -679,6 +703,7 @@ type StreamingTests() =
                   Stdin = None
                   StartTime = DateTime.UtcNow
                   StartedTimestamp = Stopwatch.GetTimestamp()
+                  StartTimeIdentity = None
                   Wait = fun () -> Task.FromException<Outcome>(InvalidOperationException "boom")
                   StdinError = fun () -> None
                   StartKill = ignore
@@ -1245,6 +1270,7 @@ type StreamingTests() =
                   Stdin = None
                   StartTime = DateTime.UtcNow
                   StartedTimestamp = Stopwatch.GetTimestamp()
+                  StartTimeIdentity = None
                   Wait = fun () -> Task.FromResult(Outcome.Exited 0)
                   StdinError = fun () -> None
                   StartKill = ignore

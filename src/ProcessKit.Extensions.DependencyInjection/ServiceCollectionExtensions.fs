@@ -1,6 +1,7 @@
 namespace ProcessKit.Extensions.DependencyInjection
 
 open System
+open System.Diagnostics.CodeAnalysis
 open System.Runtime.CompilerServices
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
@@ -110,7 +111,12 @@ type ServiceCollectionExtensions =
 
     /// Register the runner (see `AddProcessKit`) and bind the `ProcessKitOptions` defaults from a
     /// configuration section (e.g. `configuration.GetSection("ProcessKit")`).
+    ///
+    /// **Trimming / AOT:** this overload binds options by reflection (`Configure&lt;TOptions&gt;(IConfiguration)`),
+    /// so it is not trim-/AOT-safe — use the `Action&lt;ProcessKitOptions&gt;` overload from a trimmed/AOT app.
     [<Extension>]
+    [<RequiresUnreferencedCode "Binds ProcessKitOptions from IConfiguration by reflection; use the Action<ProcessKitOptions> overload in a trimmed app.">]
+    [<RequiresDynamicCode "Binds ProcessKitOptions from IConfiguration by reflection; use the Action<ProcessKitOptions> overload in a NativeAOT app.">]
     static member AddProcessKit(services: IServiceCollection, configuration: IConfiguration) : IServiceCollection =
         ArgumentNullException.ThrowIfNull configuration
         services.Configure<ProcessKitOptions> configuration |> ignore
@@ -181,7 +187,12 @@ type ServiceCollectionExtensions =
 
     /// A shared container-managed group (see `AddProcessKitGroup`) that also binds the `ProcessKitOptions`
     /// defaults from a configuration section.
+    ///
+    /// **Trimming / AOT:** this overload binds options by reflection (`Configure&lt;TOptions&gt;(IConfiguration)`),
+    /// so it is not trim-/AOT-safe — use the `Action&lt;ProcessKitOptions&gt;` overload from a trimmed/AOT app.
     [<Extension>]
+    [<RequiresUnreferencedCode "Binds ProcessKitOptions from IConfiguration by reflection; use the Action<ProcessKitOptions> overload in a trimmed app.">]
+    [<RequiresDynamicCode "Binds ProcessKitOptions from IConfiguration by reflection; use the Action<ProcessKitOptions> overload in a NativeAOT app.">]
     static member AddProcessKitGroup(services: IServiceCollection, configuration: IConfiguration) : IServiceCollection =
         ArgumentNullException.ThrowIfNull configuration
         services.Configure<ProcessKitOptions> configuration |> ignore

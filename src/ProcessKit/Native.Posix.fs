@@ -190,10 +190,11 @@ module internal Posix =
     /// real process whose start time it cannot control. Production leaves it `None`.
     let mutable readProcessIdentityForTests: (int -> uint64 option) option = None
 
-    /// Test seam (internal, not public API): invoked with the target pgid by every process-group
+    /// Test seam (internal, not public API): invoked with the target pgid/pid by every process-group
     /// delivery primitive (`killProcessGroup` / `terminateProcessGroup` / `signalProcessGroup` /
-    /// `suspendProcessGroup` / `resumeProcessGroup`) just before its syscall, so a test can record which
-    /// pgids a path actually delivered to — proving a recycled pgid is pruned and NEVER signalled, and a
+    /// `suspendProcessGroup` / `resumeProcessGroup`) and the per-child raw kill (`killProcess`, the cgroup
+    /// backend's `KillChild`) just before its syscall, so a test can record which pgids/pids a path
+    /// actually delivered to — proving a recycled number is pruned and NEVER signalled/killed, and a
     /// matching one still is. Production leaves it `None`.
     let mutable groupDeliveryObserverForTests: (int -> unit) option = None
 
@@ -436,8 +437,12 @@ module internal Posix =
     let signalPid (pid: int) (signalNum: int) : SignalDelivery =
         classifySignalDelivery (kill (pid, signalNum))
 
-    /// Hard-kill a single POSIX process by pid (SIGKILL).
-    let killProcess (pid: int) = kill (pid, SIGKILL) |> ignore
+    /// Hard-kill a single POSIX process by pid (SIGKILL). Fires the delivery observer first (like the
+    /// group primitives) so a test can confirm the cgroup backend's identity-gated `KillChild` delivers to
+    /// a matching pid and prunes — never SIGKILLs — a recycled one.
+    let killProcess (pid: int) =
+        observeGroupDelivery pid
+        kill (pid, SIGKILL) |> ignore
 
     // A connected AF_UNIX SOCK_STREAM socket pair for one piped stdio channel, used instead of a bare
     // pipe: its parent-kept end can be wrapped in a .NET `Socket`/`NetworkStream`, whose async reads and
@@ -1160,7 +1165,14 @@ module internal Posix =
     /// requests `Uid`/`Gid` here too, after rewriting it to run through the `setpriv` helper.
     let private spawnPosixViaSpawn (command: Command) : Result<Spawned, ProcessError> =
         let config = command.Config
-        let stdinWanted = config.StdinSource.IsSome || config.KeepStdinOpen
+        // `Command.InheritStdin` hands the child the PARENT's own standard input directly (no
+        // socketpair, no feeder) — the interactive/console case. Every other configuration goes
+        // through a socketpair; its parent-side write end is retained only for a feeder source or
+        // `KeepStdinOpen`.
+        let stdinInherit = Stdin.isInherit config.StdinSource
+
+        let stdinWanted =
+            (config.StdinSource.IsSome && not stdinInherit) || config.KeepStdinOpen
         // Child-side fds the parent closes after spawn (the child gets its own via dup2).
         let childSideFds = System.Collections.Generic.List<int>()
 
@@ -1203,7 +1215,15 @@ module internal Posix =
                 Some(fds[0], fds[1])
 
         // stdin
-        if stdinWanted then
+        if stdinInherit then
+            // `InheritStdin`: hand the child the PARENT's own standard input directly (no socketpair,
+            // no feeder). On macOS, POSIX_SPAWN_CLOEXEC_DEFAULT closes every fd not named by a file
+            // action at exec, so register a self-dup2 (0 -> 0) to keep fd 0 open in the child; on Linux
+            // fd 0 is inherited naturally, so no dup2 is needed. Symmetric to the stdout/stderr
+            // `StdioMode.Inherit` branches below. `stdinParentWrite` stays `None`, so `Spawned.Stdin` is
+            // `None` and no feeder is ever started.
+            stdinChildFd <- if isMacOs then 0 else -1
+        elif stdinWanted then
             match makeStdioChannel "stdin" with
             | Some(readFd, writeFd) ->
                 stdinChildFd <- readFd

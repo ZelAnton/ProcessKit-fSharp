@@ -1,0 +1,75 @@
+name: Benchmarks
+
+# Tracks perf regressions in the library's hot paths (Pump.readLines line/raw framing, the
+# spawn+capture fan-out, lifecycle logging) via BenchmarkDotNet, on its own schedule/manual
+# trigger — deliberately never on `pull_request`/`push`, so it never sits on the required PR path
+# or adds to its wall-clock time (see ci.yml's own `stress` job for the same pattern, applied here
+# to a separate workflow file instead of a job in ci.yml, to avoid touching that file at all).
+#
+# Runs `benchmarks/ProcessKit.Benchmarks` with its `--ci` flag (see Program.fs), which swaps in
+# BenchmarkDotNet's reduced-iteration `Job.ShortRun` instead of the statistically-rigorous default
+# job and attaches the full JSON exporter. GitHub-hosted runners are shared, noisy machines —
+# absolute numbers from this job are not comparable run-to-run with lab-grade precision, only
+# useful as a coarse trend/anomaly signal; see docs/internals/architecture.md for how to read
+# them. The only required output is the uploaded JSON artifact; there is intentionally no
+# trend-history page or automated regression alert (see the doc section above for why: this repo's
+# GitHub Pages deployment already uses the artifact-based `actions/deploy-pages` mechanism for the
+# API reference in docs.yml, and github-action-benchmark's usual gh-pages-branch publishing model
+# does not compose with that cleanly; a human skims the artifact instead).
+
+on:
+  workflow_dispatch:
+  # Weekly, off any PR/push path — staggered an hour after ci.yml's own Monday `stress` schedule so
+  # the two long-running scheduled jobs don't contend for hosted-runner capacity at the same minute.
+  schedule:
+    - cron: '0 7 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to a full commit SHA (supply-chain hardening); the
+      # trailing comment records the human-readable version. Dependabot bumps the
+      # SHA and updates the comment on its weekly run.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          # Only the SDK band matters (pinned by global.json) — the benchmark harness runs
+          # in-process against one already-built target framework (net10.0), not both like
+          # ci.yml's test matrix.
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Directory.Packages.props', 'nuget.config', 'global.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: dotnet restore ProcessKit.slnx
+
+      - name: Build
+        run: dotnet build ProcessKit.slnx --no-restore --configuration Release
+
+      # `--ci` (consumed by Program.fs, not forwarded to BenchmarkDotNet) selects the reduced
+      # `Job.ShortRun` configuration with the full JSON exporter attached. BenchmarkDotNet writes
+      # its `BenchmarkDotNet.Artifacts/` output relative to the process's working directory, which
+      # for `dotnet run --project` is the repository root, not the project directory.
+      - name: Run benchmarks (short/CI configuration)
+        run: >-
+          dotnet run --no-build --configuration Release --framework net10.0
+          --project benchmarks/ProcessKit.Benchmarks/ProcessKit.Benchmarks.fsproj
+          -- --ci
+
+      - name: Upload benchmark results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-results
+          path: BenchmarkDotNet.Artifacts/results/*
+          if-no-files-found: error

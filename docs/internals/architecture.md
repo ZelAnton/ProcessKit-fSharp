@@ -255,6 +255,18 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 
 On macOS, the POSIX backend is the only mechanism: whole-tree limits are rejected rather than approximated. `Native.Posix` also accounts for macOS `POSIX_SPAWN_CLOEXEC_DEFAULT` when preserving inherited standard descriptors, and current-directory support requires `posix_spawn_file_actions_addchdir_np` (macOS 10.15+). Signal and zombie-reaping semantics remain POSIX: `killpg` sends signals but never substitutes for reaping ProcessKit's direct child.
 
+## Benchmarking hot paths
+
+`benchmarks/ProcessKit.Benchmarks` (BenchmarkDotNet) covers the pump's decode/frame loop (`Pump.readLines`, all four `LineTerminator` modes, with and without a `MaxLineLength` force-flush cap), the no-op cost of a disabled lifecycle log call, and concurrent spawn/capture fan-out (`OutputStringAsync`, `StartAsync` + `WaitAllAsync`). It runs BenchmarkDotNet's default, statistically-rigorous job in-process against the already-built `ProcessKit` assembly — see `Program.fs`'s doc comment for why in-process, not BenchmarkDotNet's usual out-of-process toolchain, is required here (this repo's `Reference` + `AssemblySearchPaths` convention has no equivalent in a regenerated isolated project).
+
+Run it locally with `dotnet run -c Release --project benchmarks/ProcessKit.Benchmarks -- --filter *Pump*` (or any BenchmarkDotNet `--filter` glob; omit it to run every benchmark class). Results land under `BenchmarkDotNet.Artifacts/results/` relative to the working directory the command was run from.
+
+### Scheduled/manual CI run
+
+`.github/workflows/benchmarks.yml` runs the same project on a weekly schedule and on `workflow_dispatch`, deliberately outside `ci.yml` and off the `pull_request`/`push` path entirely — a benchmark run adds real wall-clock time and its numbers are not something a PR gate should block on. It invokes the harness with `--ci`, which swaps in BenchmarkDotNet's reduced-iteration `Job.ShortRun` (see `Program.fs`) instead of the default job and attaches BenchmarkDotNet's full JSON exporter; the workflow uploads the whole `BenchmarkDotNet.Artifacts/results/` directory (JSON, Markdown, HTML, CSV reports) as the `benchmark-results` artifact.
+
+**Reading the results honestly matters more than the numbers themselves.** GitHub-hosted runners are shared, variable-noise virtual machines, not dedicated benchmarking hardware — treat any single scheduled run's absolute numbers (ns/op, allocated bytes) as noisy, and never compare one run's mean directly against another run's mean as if it were a lab-grade measurement. What is worth eyeballing is a large, repeated shift in relative shape between benchmark methods/parameters across several runs (a hot path suddenly several times slower, or a benchmark that previously allocated nothing now allocating), not single-run deltas of a few percent. There is intentionally no automated trend-history page or regression alert (e.g. `github-action-benchmark` publishing to `gh-pages`): this repo's GitHub Pages deployment (`docs.yml`) already uses the artifact-based `actions/deploy-pages` mechanism for the API reference, and that tool's usual model of committing a running history to a `gh-pages` branch does not compose cleanly with it. The uploaded JSON artifact is the whole mechanism — download and diff it by hand (or feed it into a local trend tool) when investigating a suspected regression.
+
 ## Invariants to preserve when changing the stack
 
 - Never expose a spawned child before successful tracking.

@@ -30,6 +30,7 @@ class ProcessKit.Command
   member EnvRemove(System.String) : ProcessKit.Command
   member Gid(System.Int32) : ProcessKit.Command
   member IdleTimeout(System.TimeSpan) : ProcessKit.Command
+  member InheritStdin() : ProcessKit.Command
   member KeepStdinOpen() : ProcessKit.Command
   member LineTerminator(ProcessKit.LineTerminator) : ProcessKit.Command
   member Logger(Microsoft.Extensions.Logging.ILogger) : ProcessKit.Command
@@ -78,6 +79,7 @@ module ProcessKit.CommandModule
   static member envRemove(System.String, ProcessKit.Command) : ProcessKit.Command
   static member gid(System.Int32, ProcessKit.Command) : ProcessKit.Command
   static member idleTimeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
+  static member inheritStdin(ProcessKit.Command) : ProcessKit.Command
   static member keepStdinOpen(ProcessKit.Command) : ProcessKit.Command
   static member lineTerminator(ProcessKit.LineTerminator, ProcessKit.Command) : ProcessKit.Command
   static member logger(Microsoft.Extensions.Logging.ILogger, ProcessKit.Command) : ProcessKit.Command

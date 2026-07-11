@@ -15,6 +15,19 @@
 
 		<!-- The referenced ProcessKit.dll resolves from the main project's build output. -->
 		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+
+		<!-- Trimming / NativeAOT compatibility. Registration is factory-based (no `ActivatorUtilities`
+		     type-activation reflection) and options come from the AOT-safe `Activator.CreateInstance<T>()`
+		     path, so the assembly is trim/AOT-compatible. The two `IConfiguration`-binding overloads
+		     (`AddProcessKit`/`AddProcessKitGroup` taking an `IConfiguration`) are the one exception —
+		     `IConfiguration.Configure<TOptions>` binds by reflection — so they carry explicit
+		     `[<RequiresUnreferencedCode>]`/`[<RequiresDynamicCode>]` annotations (see ServiceCollectionExtensions.fs)
+		     that surface a precise warning to a consumer that calls them from a trimmed/AOT app, exactly as
+		     Microsoft's own DI/options packages do. See docs/platform-support.md. -->
+		<IsTrimmable>true</IsTrimmable>
+		<IsAotCompatible>true</IsAotCompatible>
+		<EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+		<EnableAotAnalyzer>true</EnableAotAnalyzer>
 	</PropertyGroup>
 
 	<ItemGroup>

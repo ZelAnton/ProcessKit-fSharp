@@ -12,6 +12,16 @@
 
 		<!-- The referenced ProcessKit.dll resolves from the main project's build output. -->
 		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+
+		<!-- Trimming / NativeAOT compatibility. The hosting glue is factory-based DI registration plus an
+		     `IHostedService`/`IAsyncDisposable` wrapper over `Supervisor`; options are created through the
+		     options infrastructure's AOT-safe `Activator.CreateInstance<T>()` (both option types have a
+		     public parameterless ctor) and there is no `IConfiguration` reflection binding, so the whole
+		     surface is trim/AOT-clean. See docs/platform-support.md. -->
+		<IsTrimmable>true</IsTrimmable>
+		<IsAotCompatible>true</IsAotCompatible>
+		<EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+		<EnableAotAnalyzer>true</EnableAotAnalyzer>
 	</PropertyGroup>
 
 	<ItemGroup>

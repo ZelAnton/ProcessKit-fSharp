@@ -814,6 +814,23 @@ module internal Pump =
             // The pipe broke while flushing on dispose (peer end already gone); best-effort teardown.
             ()
 
+    /// Asynchronously dispose a stream, swallowing the same teardown-race exceptions as
+    /// `disposeQuietly` — a double-close, or a broken pipe surfaced while flushing on dispose
+    /// because the peer is already gone. The async counterpart, for callers that would otherwise
+    /// block a thread on a synchronous `Dispose` where a `DisposeAsync` is available.
+    let disposeQuietlyAsync (stream: Stream) : Task =
+        task {
+            try
+                do! stream.DisposeAsync().AsTask()
+            with
+            | :? ObjectDisposedException ->
+                // Already disposed (double close during teardown); nothing to do.
+                ()
+            | :? IOException ->
+                // The pipe broke while flushing on dispose (peer end already gone); best-effort teardown.
+                ()
+        }
+
     /// Quietly dispose all three of a spawned child's parent-side pipe streams (teardown-race-safe).
     let closeSpawned (spawned: Native.Common.Spawned) =
         spawned.Stdout |> Option.iter disposeQuietly
@@ -919,6 +936,13 @@ module internal Pump =
             try
                 match source with
                 | StdinSource.Empty -> ()
+                | StdinSource.Inherit ->
+                    // Unreachable in practice: `Command.InheritStdin` creates no stdin pipe, so the
+                    // native spawn returns `Spawned.Stdin = None` and `feedStdinSource` never starts a
+                    // feed for it (there is no `stdinStream` to write into). Handled explicitly rather
+                    // than via a wildcard so this stays exhaustive if a new source is added; writing
+                    // nothing and reaching EOF is the only safe behaviour should it ever be reached.
+                    ()
                 | StdinSource.Bytes bytes -> do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                 | StdinSource.File path ->
                     // `File.OpenRead` through `sourceStep`, so ANY open failure (not just the three
