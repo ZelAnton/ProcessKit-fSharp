@@ -190,10 +190,11 @@ module internal Posix =
     /// real process whose start time it cannot control. Production leaves it `None`.
     let mutable readProcessIdentityForTests: (int -> uint64 option) option = None
 
-    /// Test seam (internal, not public API): invoked with the target pgid by every process-group
+    /// Test seam (internal, not public API): invoked with the target pgid/pid by every process-group
     /// delivery primitive (`killProcessGroup` / `terminateProcessGroup` / `signalProcessGroup` /
-    /// `suspendProcessGroup` / `resumeProcessGroup`) just before its syscall, so a test can record which
-    /// pgids a path actually delivered to — proving a recycled pgid is pruned and NEVER signalled, and a
+    /// `suspendProcessGroup` / `resumeProcessGroup`) and the per-child raw kill (`killProcess`, the cgroup
+    /// backend's `KillChild`) just before its syscall, so a test can record which pgids/pids a path
+    /// actually delivered to — proving a recycled number is pruned and NEVER signalled/killed, and a
     /// matching one still is. Production leaves it `None`.
     let mutable groupDeliveryObserverForTests: (int -> unit) option = None
 
@@ -436,8 +437,12 @@ module internal Posix =
     let signalPid (pid: int) (signalNum: int) : SignalDelivery =
         classifySignalDelivery (kill (pid, signalNum))
 
-    /// Hard-kill a single POSIX process by pid (SIGKILL).
-    let killProcess (pid: int) = kill (pid, SIGKILL) |> ignore
+    /// Hard-kill a single POSIX process by pid (SIGKILL). Fires the delivery observer first (like the
+    /// group primitives) so a test can confirm the cgroup backend's identity-gated `KillChild` delivers to
+    /// a matching pid and prunes — never SIGKILLs — a recycled one.
+    let killProcess (pid: int) =
+        observeGroupDelivery pid
+        kill (pid, SIGKILL) |> ignore
 
     // A connected AF_UNIX SOCK_STREAM socket pair for one piped stdio channel, used instead of a bare
     // pipe: its parent-kept end can be wrapped in a .NET `Socket`/`NetworkStream`, whose async reads and
