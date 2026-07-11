@@ -14,7 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `RunningProcess.Kill()`/`StopAsync()` (and the per-run timeout/pump-fault kills) no longer touch the
+  native kill primitives after the containing `ProcessGroup` has been released or the handle's own
+  teardown has run. The kill closures used to call the backend directly, bypassing the group's lifecycle
+  gate, so a `Kill()`/`StopAsync()` invoked after a shared `ProcessGroup.Dispose()`/`ShutdownAsync()`, or
+  after the handle was disposed, could `TerminateProcess`/`TerminateJobObject` a Windows Job/handle
+  teardown had already closed (a use-after-close whose value the OS may have recycled to an unrelated
+  object) or `kill`/`killpg` a POSIX/cgroup pid/pgid the OS had since recycled (a wrong-target kill).
+  Every such kill now runs through the same lifecycle gate as the other tree-control verbs plus a per-run
+  teardown flag, so it either fires on the live group or no-ops before reaching native — a timeout or
+  pump-fault kill on a still-live group is unaffected. The Linux cgroup backend's per-child hard kill is
+  additionally identity-gated (start-time token, like the POSIX process-group backend), so a recycled pid
+  is never SIGKILLed.
 
 ## [2.3.0] - 2026-07-11
 
