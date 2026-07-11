@@ -6,7 +6,7 @@
 
 		<!-- Package identity only; shared metadata is hoisted to Directory.Build.props. -->
 		<PackageId>ProcessKit.Extensions.Hosting</PackageId>
-		<Version>2.2.0</Version>
+		<Version>2.3.0</Version>
 		<Description>Microsoft.Extensions.Hosting integration for ProcessKit: register supervised child processes as lifecycle-managed hosted services.</Description>
 		<PackageTags>fsharp;dotnet;process;subprocess;hosting;hosted-service;supervision;processkit</PackageTags>
 
