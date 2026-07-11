@@ -318,6 +318,74 @@ type HostedProcessTests() =
         :> Task
 
     [<Test>]
+    member _.``Dispose while a capture is in flight surfaces the run as Cancelled, not the killed child's own result``
+        ()
+        : Task =
+        task {
+            let runner = BlockingRunner()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+            do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            (service :> IDisposable).Dispose()
+
+            do! runner.Killed.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            let! outcomeSettled = waitUntil (fun () -> service.LastOutcome.IsSome)
+            Assert.That(outcomeSettled, Is.True)
+
+            match service.LastOutcome with
+            | Some(Error(ProcessError.Cancelled program)) -> Assert.That(program, Is.EqualTo "worker")
+            | other ->
+                Assert.Fail
+                    $"expected the cancelled-during-teardown capture to surface as Error(Cancelled ...), got %A{other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Command.CancelOn on a hosted command kills the child and ends supervision with Cancelled``() : Task =
+        task {
+            let runner = BlockingRunner()
+            use cancelOnCts = new CancellationTokenSource()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    ((Command.create "worker").CancelOn(cancelOnCts.Token))
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+            do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            // Cancel only the command's own `CancelOn` token — never the host's lifetime/stop/dispose
+            // path — so the kill can only have come from `Command.CancelOn` being honoured.
+            cancelOnCts.Cancel()
+
+            do! runner.Killed.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            let! outcomeSettled = waitUntil (fun () -> service.LastOutcome.IsSome)
+            Assert.That(outcomeSettled, Is.True, "Command.CancelOn should end supervision once it fires")
+
+            match service.LastOutcome with
+            | Some(Error(ProcessError.Cancelled program)) -> Assert.That(program, Is.EqualTo "worker")
+            | other ->
+                Assert.Fail $"expected Command.CancelOn to surface the run as Error(Cancelled ...), got %A{other}"
+
+            do! hosted.StopAsync(CancellationToken.None)
+        }
+        :> Task
+
+    [<Test>]
     member _.``StartAsync with an already-cancelled token starts no supervision or child``() : Task =
         task {
             let runner = BlockingRunner()
