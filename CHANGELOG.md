@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RunningProcess.WaitForLineAsync` now reports the clamped (armable) timeout in `ProcessError.NotReady`
   for an over-long (>~24.8 days) requested timeout, instead of the raw, un-clamped value — uniform with
   `WaitForPortAsync`/`WaitForAsync`, which already report the value actually enforced.
+- `ProcessGroup.StartAsync` now guards the shared-group `RunningProcess` handle construction exactly like
+  `JobRunner.start`: on a constructor fault it reaps the tree via `host.Teardown()` before re-raising,
+  instead of leaving an already-spawned tree without a deterministic owner. Both runners now share this
+  guarded construction through one helper.
+- `ProcessKit.Extensions.Hosting`'s internal `TrackingRunner` now honours `Command.CancelOn` and always
+  reports a cancelled hosted-process capture as `Error(ProcessError.Cancelled ...)`: it previously only
+  killed the child on the verb-level token (silently ignoring `Command.CancelOn`) and could surface a
+  cancelled run as `Ok` with the killed child's `Signalled`/non-zero result instead of a `Cancelled` error.
 
 ## [2.3.0] - 2026-07-11
 
