@@ -21,7 +21,7 @@
   "use strict";
 
   var ENTRIES = {
-    "Rust crate": { href: "https://zelanton.github.io/ProcessKit-rs/" },
+    "Rust crate": { href: "https://zelanton.github.io/processkit-rs" },
     "Python wrapper": {
       placeholder: "Documentation coming soon — repository not published yet."
     }
