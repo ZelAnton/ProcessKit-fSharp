@@ -175,6 +175,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// the child's lifetime and reaps it on `ShutdownAsync`/`Dispose`. That ownership choice is the only
     /// difference between the two start paths, so it lives here as one branch each on `StartKill`,
     /// `GracefulKill`, and `Teardown`.
+    ///
+    /// The run's kill verbs (`StartKill`/`GracefulKill`, driving `RunningProcess.Kill()`/`StopAsync()`
+    /// and the timeout/pump-fault kills) route every native kill through the same `sync`/`releasedFlag`
+    /// lifecycle gate the tree-control/stat verbs use, plus a per-run `runTornDown` flag — see the
+    /// `killWhenLive` comment below for why they must not reach the backend directly.
     member private this.BuildHost(command: Command, ownsGroup: bool) : Result<RunningHost, ProcessError> =
         // Spawn+track AND read the child's pid atomically with the release transition, all under `sync`
         // (via `SpawnInto`/`WhenLive`): a `RunningProcess` is therefore never built over a backend whose
@@ -185,9 +190,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             | Error error -> Error error
             | Ok spawned -> Ok(spawned, backend.PidOf spawned))
         |> Result.map (fun (spawned, pid) ->
-            // The rest of the host is closures and stream references that do not touch the container's
-            // release state, so it is built outside the lock. The background stdin feed writes to the
-            // child's own stdin pipe (not the container), so kicking it off here is race-free.
+            // The rest of the host is closures and stream references, built outside the lock. They do not
+            // touch the container's release state at construction; the kill closures below route each LATER
+            // native kill through the lifecycle gate (see `killWhenLive`). The background stdin feed writes
+            // to the child's own stdin pipe (not the container), so kicking it off here is race-free.
             let stdinFeeder = Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
 
             let closeStreams () =
@@ -208,6 +214,47 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                         Some proc.StartTime
                     with _ ->
                         None)
+
+            // The lifecycle gate for THIS run's kill verbs. `RunningProcess.Kill()`/`StopAsync()` — and the
+            // timeout/pump-fault kills that reuse the same closures — are fire-and-forget entry points a
+            // caller can invoke at ANY time: after the (shared) group was released underneath us, or after
+            // this run's own teardown. The closures used to call `backend.KillTree`/`backend.KillChild`
+            // DIRECTLY, bypassing `sync`/`releasedFlag` — the single lifecycle gate every OTHER mutating
+            // verb funnels through. That let a post-release kill `TerminateProcess`/`TerminateJobObject` a
+            // Job handle `Release`/`HardRelease` had already closed (use-after-close: the value can be
+            // recycled to an unrelated object), or `kill`/`killpg` a pid/pgid the OS has since recycled
+            // (wrong-target kill). Routing them through `killWhenLive` runs the released/torn-down check AND
+            // the native call in ONE critical section: the kill either fires fully on the live backend or
+            // observes the flag and no-ops BEFORE touching native — never half of each.
+            //
+            // `runTornDown` is this run's per-host analogue of the group's `releasedFlag`: set by `Teardown`
+            // under `sync`, it stops the closures touching native after THIS handle is torn down even while a
+            // SHARED group stays live for other runs (the wrong-target/use-after-close window when `Kill()`/
+            // `StopAsync()` is called after this run's own `Release` dropped its identity token / closed its
+            // handle). The group's `releasedFlag` covers the other direction — the shared group released
+            // out from under a still-undisposed handle.
+            let mutable runTornDown = false
+
+            // A bounded, fire-and-forget native kill (`StartKill`, or a shared run's soft-kill), gated: it
+            // reaches the backend only while the group is live AND this run has not been torn down. Bounded
+            // native work (terminate / SIGKILL / handle close), so holding the monitor across it is fine —
+            // exactly like `KillAll`/`Signal`.
+            let killWhenLive (nativeKill: unit -> unit) : unit =
+                lock sync (fun () ->
+                    if releasedFlag = 0 && not runTornDown then
+                        nativeKill ())
+
+            // The graceful analogue for the owned tree kill (`StopAsync`/timeout-grace): begin the
+            // bounded-by-grace graceful kill only on a live, not-torn-down run; otherwise a no-op. Its
+            // SIGTERM prefix runs under `sync` (safe against the release transition); the bounded
+            // poll+SIGKILL that follow run off the lock, exactly as `ShutdownAsync`'s own graceful wait is
+            // deliberately kept off it.
+            let gracefulKillWhenLive (nativeGracefulKill: unit -> Task) : Task =
+                lock sync (fun () ->
+                    if releasedFlag = 0 && not runTornDown then
+                        nativeGracefulKill ()
+                    else
+                        Task.CompletedTask)
 
             { Config = command.Config
               Pid = pid
@@ -232,14 +279,18 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
               StdinError = (fun () -> stdinFeeder.Fault)
               StartKill =
                 (if ownsGroup then
-                     backend.KillTree
+                     (fun () -> killWhenLive backend.KillTree)
                  else
-                     (fun () -> backend.KillChild spawned))
+                     (fun () -> killWhenLive (fun () -> backend.KillChild spawned)))
               GracefulKill =
                 (if ownsGroup then
-                     (fun grace -> this.GracefulKillTree grace)
+                     (fun grace -> gracefulKillWhenLive (fun () -> this.GracefulKillTree grace))
                  else
-                     (fun _ -> task { backend.KillChild spawned } :> Task))
+                     (fun _ ->
+                         // Shared group: no per-child graceful signal, so this is the immediate child kill
+                         // (documented `StopAsync`/`TimeoutGrace` degradation), gated the same way.
+                         killWhenLive (fun () -> backend.KillChild spawned)
+                         Task.CompletedTask))
               Teardown =
                 fun () ->
                     // Stop the stdin feeder first: cancelling its lifecycle token unblocks a feed parked
@@ -249,6 +300,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     // harmless. Closing the stdin stream below still covers a write-parked feed.
                     stdinFeeder.Stop()
                     closeStreams ()
+
+                    // Mark this run torn down (under `sync`) BEFORE detaching/reaping, so a `Kill()`/
+                    // `StopAsync()` that races or follows this teardown observes the flag and no-ops rather
+                    // than signalling a child this run no longer owns (see `runTornDown`).
+                    lock sync (fun () -> runTornDown <- true)
 
                     if ownsGroup then
                         // Owned group: closing the run reaps the whole tree.
