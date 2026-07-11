@@ -3,6 +3,7 @@ namespace ProcessKit
 open System
 open System.Runtime.CompilerServices
 open System.Runtime.InteropServices
+open System.Text.Json
 open System.Threading
 
 /// Default-runner convenience verbs on `Command`, callable from F# and C# as
@@ -68,6 +69,19 @@ type CommandVerbs =
         =
         ArgumentNullException.ThrowIfNull parser
         Runner.tryParse CommandVerbs.DefaultRunner cancellationToken (TryParser.toResult parser) command
+
+    /// Require a zero/accepted exit and deserialize the trimmed stdout as JSON into a `'T` via
+    /// `System.Text.Json` (`options` omitted uses the BCL defaults); invalid JSON becomes
+    /// `ProcessError.Parse`, just like `ParseAsync`. Give an explicit type argument, e.g.
+    /// `cmd.OutputJsonAsync&lt;MyRecord&gt;()` — there is no parser argument to infer `'T` from.
+    [<Extension>]
+    static member OutputJsonAsync<'T>
+        (
+            command: Command,
+            [<Optional>] options: JsonSerializerOptions | null,
+            [<Optional>] cancellationToken: CancellationToken
+        ) =
+        Runner.outputJson<'T> CommandVerbs.DefaultRunner cancellationToken (Option.ofObj options) command
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     [<Extension>]

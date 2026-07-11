@@ -3,6 +3,7 @@ namespace ProcessKit
 open System
 open System.Runtime.CompilerServices
 open System.Runtime.InteropServices
+open System.Text.Json
 open System.Threading
 
 /// The full run-verb vocabulary on *any* `IProcessRunner`, layered over the three-method seam
@@ -103,6 +104,20 @@ type ProcessRunnerExtensions =
         ) =
         ArgumentNullException.ThrowIfNull parser
         Runner.tryParse runner cancellationToken (TryParser.toResult parser) command
+
+    /// Require a zero/accepted exit and deserialize the trimmed stdout as JSON into a `'T` via
+    /// `System.Text.Json` (`options` omitted uses the BCL defaults); invalid JSON becomes
+    /// `ProcessError.Parse`, just like `ParseAsync`. Give an explicit type argument — there is no parser
+    /// argument to infer `'T` from.
+    [<Extension>]
+    static member OutputJsonAsync<'T>
+        (
+            runner: IProcessRunner,
+            command: Command,
+            [<Optional>] options: JsonSerializerOptions | null,
+            [<Optional>] cancellationToken: CancellationToken
+        ) =
+        Runner.outputJson<'T> runner cancellationToken (Option.ofObj options) command
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     [<Extension>]

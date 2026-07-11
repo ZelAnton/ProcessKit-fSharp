@@ -1,5 +1,6 @@
 namespace ProcessKit
 
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 
@@ -92,6 +93,35 @@ module internal CaptureVerbs =
                     // wraps int.Parse) is still a parse failure: surface it as a typed ProcessError.Parse.
                     return Error(ProcessError.Parse(program, ex.Message))
         }
+
+    /// Deserialize the trimmed stdout from `runText` as JSON into a `'T` via `System.Text.Json`
+    /// (`options = None` uses the BCL defaults); invalid JSON becomes `ProcessError.Parse`, exactly like
+    /// `parse` (it delegates to `parse`, so the exception-to-`ProcessError` wrapping can't drift between
+    /// the two). F# records deserialize through their generated constructor by default — either give
+    /// `options` with `PropertyNameCaseInsensitive = true` (STJ's constructor-based deserialization
+    /// matches JSON property names to constructor parameter names case-sensitively otherwise), or mark
+    /// the record `[<CLIMutable>]` for the classic default-constructor-plus-settable-properties shape.
+    let outputJson<'T>
+        (program: string)
+        (options: JsonSerializerOptions option)
+        (runText: unit -> Task<Result<string, ProcessError>>)
+        : Task<Result<'T, ProcessError>> =
+        // The GENERIC `JsonSerializer.Deserialize<'T>` instantiates the BCL's own `TValue?`-annotated
+        // return against our ambient, unconstrained `'T` — a combination the F# nullness checker can't
+        // reconcile (an unconstrained caller-supplied `'T` has no fixed nullability of its own to unify
+        // against). Going through the non-generic, `Type`-based overload sidesteps that entirely: its
+        // return is the concrete, ordinarily-nullable `obj`, so `'T` itself never has to carry a
+        // nullability annotation, and it works uniformly whether `'T` is instantiated with a reference or
+        // a value type (only reference types can ever come back null). A genuine JSON `null` raises here,
+        // which `parse`'s try/with below turns into the same `ProcessError.Parse` a malformed document would.
+        let deserialize (text: string) : 'T =
+            let optionsArg = options |> Option.toObj
+
+            match JsonSerializer.Deserialize(text, typeof<'T>, optionsArg) with
+            | null -> raise (JsonException "the JSON document deserialized to null")
+            | value -> unbox<'T> value
+
+        parse program deserialize runText
 
     /// Run a *started* process to a completion result under the command's `CancelOn`-linked token: kill
     /// the tree if the token fires and report the cancellation as an error. The `start` thunk absorbs the
@@ -300,6 +330,18 @@ module Runner =
         (command: Command)
         : Task<Result<'T, ProcessError>> =
         CaptureVerbs.tryParse command.Program parser (fun () -> run runner cancellationToken command)
+
+    /// Require a zero/accepted exit and deserialize the trimmed stdout as JSON into a `'T` via
+    /// `System.Text.Json` (`options = None` uses the BCL defaults); invalid JSON becomes
+    /// `ProcessError.Parse`, exactly like `parse`/`tryParse` — never a raised exception. Applied once,
+    /// outside any retry (see `parse`'s doc for why).
+    let outputJson<'T>
+        (runner: IProcessRunner)
+        (cancellationToken: CancellationToken)
+        (options: JsonSerializerOptions option)
+        (command: Command)
+        : Task<Result<'T, ProcessError>> =
+        CaptureVerbs.outputJson command.Program options (fun () -> run runner cancellationToken command)
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     let firstLine

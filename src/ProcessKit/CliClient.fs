@@ -2,6 +2,7 @@ namespace ProcessKit
 
 open System
 open System.Runtime.InteropServices
+open System.Text.Json
 open System.Threading
 
 /// The immutable configuration behind a `CliClient`: the runner, and a *template* `Command` carrying
@@ -108,6 +109,18 @@ type CliClient internal (config: CliClientConfig) =
         =
         ArgumentNullException.ThrowIfNull parser
         Runner.tryParse config.Runner cancellationToken (TryParser.toResult parser) (this.Command args)
+
+    /// Build the command for `args`, require a zero/accepted exit, and deserialize the trimmed stdout
+    /// as JSON into a `'T` via `System.Text.Json` (`options` omitted uses the BCL defaults); invalid
+    /// JSON becomes `ProcessError.Parse`, just like `ParseAsync`. Give an explicit type argument — there
+    /// is no parser argument to infer `'T` from.
+    member this.OutputJsonAsync<'T>
+        (
+            args: seq<string>,
+            [<Optional>] options: JsonSerializerOptions | null,
+            [<Optional>] cancellationToken: CancellationToken
+        ) =
+        Runner.outputJson<'T> config.Runner cancellationToken (Option.ofObj options) (this.Command args)
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     member this.FirstLineAsync

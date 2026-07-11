@@ -699,6 +699,7 @@ Every verb returns `Task<Result<_, ProcessError>>`, and every verb takes an opti
 | `ExitCodeAsync()` | `int` | the code, as `Ok` | The code *is* the answer |
 | `ProbeAsync()` | `bool` | `0`→`true`, `1`→`false`, else error | Predicate commands: `git diff --quiet`, `grep -q` |
 | `ParseAsync(f)` / `TryParseAsync(f)` | `'T` | `ProcessError.Exit` | A typed value from stdout (success required) |
+| `OutputJsonAsync<'T>()` | `'T` | `ProcessError.Exit` | Deserialize stdout as JSON (success required) |
 | `FirstLineAsync(p)` | `string option` | — (stream-based) | Grab one matching line, kill the rest |
 | `StartAsync()` | `RunningProcess` | — | A live handle: [streaming, stdin, probes](streaming.md) |
 
@@ -711,6 +712,14 @@ pass a `bool TryX(string, out 'T)` such as `int.TryParse`, with an explicit type
 argument (`TryParseAsync<int>(int.TryParse)`, since the BCL parsers are overloaded) —
 and turns a `false` return into `ProcessError.Parse`. (From F#, `Runner.tryParse` keeps the
 `Result<'T, string>`-returning shape, so the parser can supply its own error message.)
+`OutputJsonAsync<'T>` is `ParseAsync` specialized to JSON: it deserializes the trimmed stdout via
+`System.Text.Json`, takes an optional `JsonSerializerOptions` overload, and turns invalid JSON into
+`ProcessError.Parse` exactly like a rejecting `ParseAsync` — give it an explicit type argument
+(`OutputJsonAsync<MyRecord>()`), since there is no parser argument to infer `'T` from. Mark an F#
+record `[<CLIMutable>]` for the classic default-constructor-plus-settable-properties shape, or pass
+`options` with `PropertyNameCaseInsensitive = true` — otherwise STJ's constructor-based
+deserialization matches JSON property names to the record's constructor parameter names
+case-sensitively.
 `FirstLineAsync` returns the first
 stdout line matching the predicate and kills the (private-group) child the moment
 it has its answer — you never wait out a long log for one line — and returns
@@ -728,6 +737,10 @@ task {
 
     // Parse: a typed value from stdout.
     let! version = (Command.create "node" |> Command.arg "--version").ParseAsync(fun s -> s.TrimStart('v'))
+
+    // OutputJson: deserialize stdout as JSON into a typed value (`Widget` here is
+    // `type Widget = { Name: string; Count: int }`; its JSON keys match the record's field names).
+    let! widget = (Command.create "widget-cli" |> Command.arg "get").OutputJsonAsync<Widget>()
 
     // FirstLine: stop as soon as the interesting line appears.
     match! (Command.create "git" |> Command.args [ "log"; "--oneline" ]).FirstLineAsync(fun l -> l.Contains "fix:") with
@@ -750,6 +763,10 @@ Console.WriteLine(await new Command("git").Args(["diff", "--quiet"]).ProbeAsync(
 
 // Parse: a typed value from stdout.
 var version = await new Command("node").Arg("--version").ParseAsync(s => s.TrimStart('v'));
+
+// OutputJson: deserialize stdout as JSON into a typed value (`Widget` is a
+// `record Widget(string Name, int Count)` here; its JSON keys match the record's properties).
+var widget = await new Command("widget-cli").Arg("get").OutputJsonAsync<Widget>();
 
 // FirstLine: stop as soon as the interesting line appears.
 Console.WriteLine(await new Command("git").Args(["log", "--oneline"]).FirstLineAsync(l => l.Contains("fix:")) switch
@@ -950,7 +967,7 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 | `ProcessError.Signalled` | `program, signal: int option, stdout, stderr` | Killed by a signal with no exit code; `signal` carries the number on Unix, `None` elsewhere; the partial streams captured before the kill are attached. |
 | `ProcessError.Timeout` | `program, timeout, stdout, stderr` | The run's own deadline killed it; whatever it captured before the kill is attached. |
 | `ProcessError.NotReady` | `program, timeout` | A [readiness probe](streaming.md) gave up — distinct from a timeout. |
-| `ProcessError.Parse` | `program, detail` | A `ParseAsync` / `TryParseAsync` parser rejected the output. |
+| `ProcessError.Parse` | `program, detail` | A `ParseAsync` / `TryParseAsync` parser rejected the output, or `OutputJsonAsync<'T>` couldn't deserialize it as valid JSON. |
 | `ProcessError.OutputTooLarge` | `program, lineLimit, byteLimit, totalLines, totalBytes` | A `FailLoud` (`OverflowMode.Error`) buffer ceiling was exceeded. |
 | `ProcessError.Stdin` | `program, detail` | The child's stdin source could not be read — a missing/unreadable `FromFile` path, say — on an otherwise-successful run. A routine broken pipe (the child closed stdin early, as `head` does) is never reported, and a louder exit/signal/timeout failure wins instead. Also surfaces for a pipeline's first stage. |
 | `ProcessError.CassetteMiss` | `program` | A record/replay cassette found no matching recording — kept distinct from not-found, so `isNotFound` is `false`. |
