@@ -75,3 +75,25 @@ type HostedServiceCollectionExtensions =
 
         services.Configure(name, configure) |> ignore
         services
+
+    /// Opt-in health check for a named ProcessKit hosted process: registers `HostedProcessHealthCheck`
+    /// as a keyed `IHealthCheck` (keyed by `name`, same key as `AddProcessKitHostedProcess`), reporting
+    /// Healthy/Degraded/Unhealthy from the hosted process's supervision state. Never registered unless
+    /// you call this — the base `AddProcessKitHostedProcess` registration is unaffected either way.
+    /// This package depends only on `Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions`, so
+    /// this method cannot call `AddHealthChecks()` on your behalf; see `HostedProcessHealthCheck`'s doc
+    /// comment for how to wire the registered keyed check into your own health-checks pipeline.
+    [<Extension>]
+    static member AddProcessKitHostedProcessHealthCheck
+        (services: IServiceCollection, name: string)
+        : IServiceCollection =
+        ArgumentNullException.ThrowIfNull services
+        ArgumentNullException.ThrowIfNull name
+
+        services.TryAddKeyedSingleton<HostedProcessHealthCheck>(
+            name,
+            Func<IServiceProvider, obj | null, HostedProcessHealthCheck>(fun provider _key ->
+                HostedProcessHealthCheck(provider.GetRequiredKeyedService<HostedProcessService> name))
+        )
+
+        services

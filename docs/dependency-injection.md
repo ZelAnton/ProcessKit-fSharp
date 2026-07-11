@@ -112,4 +112,39 @@ services.ConfigureProcessKitHostedProcess("worker", o =>
 ```
 
 Resolve `HostedProcessService` by the same key when you need the last `SupervisionOutcome` or stop
-outcome for health reporting.
+outcome for health reporting. It also exposes live supervision telemetry — `IsSupervisionActive`,
+`RestartCount`, `IsStormPaused` — for anything that wants to observe the child without waiting for
+supervision to end (e.g. metrics, or the health check below).
+
+## Health-checking a hosted process
+
+`AddProcessKitHostedProcessHealthCheck(name)` registers a keyed `IHealthCheck`
+(`HostedProcessHealthCheck`, same key as `AddProcessKitHostedProcess`) that maps the named hosted
+process's supervision state: **Healthy** while it is running (including restarting within policy),
+**Degraded** while the failure-storm guard (`Supervisor.StormPause`) is throttling restarts, and
+**Unhealthy** once supervision is not active (not started yet, or ended — an error, an exhausted
+restart budget, a permanent-failure give-up, or a stop-predicate match).
+
+This is opt-in and stays in `ProcessKit.Extensions.Hosting` (not a separate package): its only extra
+dependency, `Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions`, is Abstractions-only —
+`IHealthCheck` / `HealthCheckResult` / `HealthCheckRegistration`, never the full
+`Microsoft.Extensions.Diagnostics.HealthChecks` package that supplies `AddHealthChecks()` /
+`IHealthChecksBuilder` / the concrete polling `HealthCheckService`. That package stays out of this
+one's dependency graph, so a consumer who never calls `AddProcessKitHostedProcessHealthCheck` never
+pulls it in either — but it also means this method cannot call `AddHealthChecks()` on your behalf.
+Wire the registered keyed check into your own health-checks pipeline (already referenced
+transitively via the ASP.NET Core shared framework in a web host; add
+`Microsoft.Extensions.Diagnostics.HealthChecks` explicitly in a Worker Service) with
+`HealthCheckRegistration`'s factory overload:
+
+```csharp
+services.AddProcessKitHostedProcess("worker", new Command("worker").Arg("--serve"));
+services.AddProcessKitHostedProcessHealthCheck("worker");
+
+services.AddHealthChecks().Add(
+    new HealthCheckRegistration(
+        "worker",
+        sp => sp.GetRequiredKeyedService<HostedProcessHealthCheck>("worker"),
+        failureStatus: null,
+        tags: null));
+```

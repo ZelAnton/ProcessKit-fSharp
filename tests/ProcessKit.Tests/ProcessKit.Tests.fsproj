@@ -45,6 +45,7 @@
 		<Compile Include="ApiSurfaceTests.fs" />
 		<Compile Include="StressTests.fs" />
 		<Compile Include="HostedProcessTests.fs" />
+		<Compile Include="HostedProcessHealthCheckTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>
@@ -66,6 +67,7 @@
 		<PackageReference Include="FsCheck" />
 		<PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+		<PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Options" />
