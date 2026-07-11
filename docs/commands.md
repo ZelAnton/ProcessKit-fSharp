@@ -95,6 +95,42 @@ program path against it (a relative path resolves against the current platform's
 rules — on Windows the parent's directory may win). Pass an absolute program
 path when you combine a relative tool with `currentDir`.
 
+### Preflight: is a program installed?
+
+`Exec.which` resolves a program to a full path **without running it** — a
+`doctor`/install-wizard check ("is `git` even installed?") that's cheaper and
+side-effect-free next to probing availability by actually launching the program
+(`ProbeAsync`, which needs a harmless invocation to make up). It reuses the exact
+`PATH`/`PATHEXT`-aware lookup the spawn path itself falls back on to name the
+directories it searched, so `which` and an actual spawn of the same program name
+never disagree on found-vs-not-found.
+
+**F#**
+
+```fsharp
+match Exec.which "git" with
+| Ok path -> printfn $"found at {path}"
+| Error(ProcessError.NotFound(program, Some searched)) -> eprintfn $"'{program}' not on PATH ({searched})"
+| Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+Console.WriteLine(Exec.which("git") switch
+{
+    { IsOk: true, ResultValue: var path }                                       => $"found at {path}",
+    { IsOk: false, ErrorValue: ProcessError.NotFound { Searched.Value: var searched } } => $"not on PATH ({searched})",
+    { IsOk: false, ErrorValue: var err }                                       => err.Message,
+});
+```
+
+`CliClient.EnsureAvailableAsync()` is the same check for a [`CliClient`](testing.md#cliclient)
+wrapper, resolving the client's own program name. It is always a **local** check —
+never delegated to the client's `Runner` — since availability is a fact about the
+host's `PATH`/filesystem, not about how a command eventually runs; a test double
+injected via `WithRunner` has no bearing on the result.
+
 For one-liners the top-level helpers skip the builder entirely:
 
 **F#**

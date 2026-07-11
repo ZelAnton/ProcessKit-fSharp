@@ -1040,7 +1040,7 @@ module internal Windows =
                 releaseStdio ()
 
                 if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
-                    Error(ProcessError.NotFound(command.Program, None))
+                    Error(notFoundFromSpawnFailure command.Program)
                 else
                     Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
             elif not (AssignProcessToJobObject(job, info.hProcess)) then

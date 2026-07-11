@@ -1,5 +1,6 @@
 namespace ProcessKit
 
+open System
 open System.Threading
 open System.Threading.Tasks
 
@@ -9,6 +10,19 @@ open System.Threading.Tasks
 /// batch verbs take an explicit `CancellationToken` so a long fan-out can be cancelled.
 [<RequireQualifiedAccess>]
 module Exec =
+
+    /// Resolve `program` to a full path without spawning it — a preflight/`doctor`-style check
+    /// ("is this tool installed?") with no side effects, unlike probing availability by actually
+    /// running the program (`ProbeAsync`). Reuses the exact PATH/PATHEXT-aware logic the spawn path
+    /// itself falls back on to name the directories it searched (`Native.Common.resolveProgram`), so
+    /// `which` and an actual spawn of the same `program` never disagree on found-vs-not-found. Returns
+    /// the resolved full path on success, or a typed `ProcessError.NotFound` — `Searched` names the
+    /// `PATH` value that was probed when `program` is a bare name (e.g. `"git"`), and is `None` when
+    /// `program` already names a path (e.g. `"./tool"`, `"/usr/bin/tool"`), since a path-form program
+    /// is checked directly and never searched.
+    let which (program: string) : Result<string, ProcessError> =
+        ArgumentNullException.ThrowIfNull program
+        Native.Common.resolveProgram program
 
     /// Run `program` with `args` in a private kill-on-dispose group, require a zero/accepted exit,
     /// and return stdout with trailing whitespace trimmed.
