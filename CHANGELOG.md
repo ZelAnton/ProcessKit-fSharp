@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [2.4.0] - 2026-07-11
+
+### Added
 - `Command.Groups(gids)` (and the pipe-friendly `Command.groups`): set the child's Unix **supplementary groups**, replacing the inherited set — the missing third leg of a privilege drop next to `Uid`/`Gid`. A bare `Uid`/`Gid`/`User` drop clears the parent's supplementary groups (so a child dropped to a service user loses that user's `docker`/`video`/`adm` membership); pass the target user's gids here to grant them back, or `[]` to keep the cleared default. Applied by the same `setpriv` helper (mapped to `setpriv --groups`), so it is honoured only alongside a `Uid`/`Gid` drop — set without one it fails the spawn with `ProcessError.Spawn` rather than being silently ignored. Unix-only: on Windows it fails with `ProcessError.Unsupported`, exactly like `Uid`/`Gid`. Each gid must be non-negative (rejected at the builder boundary with `ArgumentOutOfRangeException`, naming the offending index).
 - The `ProcessKit`, `ProcessKit.Extensions.DependencyInjection`, and `ProcessKit.Extensions.Hosting` packages now declare trimming/NativeAOT compatibility (`IsTrimmable`/`IsAotCompatible`), so a consumer that publishes a `PublishTrimmed`/NativeAOT app no longer gets "assembly was not verified" warnings for them; a CI smoke publishes and runs a NativeAOT consumer that spawns, captures, and contains a child on both Linux (`linux-x64`) and Windows (`win-x64`). See [docs/platform-support.md](docs/platform-support.md#trimming-and-nativeaot) — including the documented boundary that `ProcessKit.Testing` is not trim/AOT-safe (its reflection-based `System.Text.Json` cassettes), which is fine because it is a test-only dependency.
 - `Command.InheritStdin` (and the pipe-friendly `Command.inheritStdin`): hand the child the parent process's own standard input directly — inherited at the OS level, with no pipe and no feeder — for interactive/console programs (an editor launched by `git commit`, a tool that prompts on the terminal, a pipe from the parent's own stdin). The stdin analogue of `StdioMode.Inherit`. Incompatible with a feeder `Stdin` source and `KeepStdinOpen` (rejected at the builder boundary in either chaining order); `RunningProcess.TakeStdin` returns `None` for an inherited-stdin child. Repeatable under `Retry`/supervision and supported by the `ProcessKit.Testing` record/replay cassette (keyed by a stable "inherit" marker).
@@ -290,7 +301,8 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - POSIX: the SIGCHLD dispatch callback no longer blocks on a `Thread.Sleep` spin while resolving a reap race against a concurrent `reapLeader` (group teardown) — the same bounded grace period now runs on the thread pool instead of the shared signal-dispatch thread, so it can no longer delay reaping every other pending child. A race that genuinely can't be resolved within the grace period now reports `Outcome.Unobserved` rather than a fabricated clean exit; the far more common case — the concurrent reap actually landing the real status — is unaffected.
 - Linux cgroup v2: a child that cannot be migrated into the cgroup (the write to `cgroup.procs` fails) is now killed and reaped, and the spawn fails with `ProcessError.ResourceLimit`, instead of being silently left to run in the parent cgroup entirely outside the requested resource limits. The `Mechanism.CgroupV2` / `ProcessGroup.Create` docs now also state the spawn→migrate window honestly: the limits apply to the child and every descendant it forks *after* migration, while a grandchild forked in the brief window before the migration write completes stays in the parent cgroup — still reaped by kill-on-drop teardown, but outside the resource limits.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.4.0...HEAD
+[2.4.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.0.0...v2.1.0
