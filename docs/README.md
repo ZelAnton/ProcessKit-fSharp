@@ -1,6 +1,19 @@
+![ProcessKit](../cover.png)
+
+[![CI](https://github.com/ZelAnton/ProcessKit-fSharp/actions/workflows/ci.yml/badge.svg)](https://github.com/ZelAnton/ProcessKit-fSharp/actions/workflows/ci.yml)
+[![NuGet](https://img.shields.io/nuget/v/ProcessKit.svg)](https://www.nuget.org/packages/ProcessKit)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![.NET](https://img.shields.io/badge/.NET-8.0%20%7C%2010.0-512BD4.svg)](https://dotnet.microsoft.com/)
+
 # ProcessKit — documentation
 
 ProcessKit is a child-process toolkit for .NET in two layers:
+
+<div style="display:flex; gap:0.6em; flex-wrap:wrap; margin-bottom:2em;">
+  <a href="https://www.nuget.org/packages/ProcessKit" style="display:inline-block; padding:0.35em 0.8em; border:1px solid var(--table-border-color); border-radius:4px; font-size:0.88em; text-decoration:none; color:var(--links);">NuGet ↗</a>
+  <a href="https://zelanton.github.io/ProcessKit-fSharp/api/" style="display:inline-block; padding:0.35em 0.8em; border:1px solid var(--table-border-color); border-radius:4px; font-size:0.88em; text-decoration:none; color:var(--links);">API Reference ↗</a>
+  <a href="https://github.com/ZelAnton/ProcessKit-fSharp" style="display:inline-block; padding:0.35em 0.8em; border:1px solid var(--table-border-color); border-radius:4px; font-size:0.88em; text-decoration:none; color:var(--links);">GitHub ↗</a>
+</div>
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐

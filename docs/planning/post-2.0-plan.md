@@ -32,7 +32,7 @@ already had a shipped baseline when this document was written; those sections pl
 ## Cross-cutting rules (apply to every item)
 
 These come from the repository's [`CONTRIBUTING.md`](../../CONTRIBUTING.md), the porting
-methodology in [`ROADMAP.md`](../../ROADMAP.md), and the repo's agent-instruction docs; every
+methodology in [`ROADMAP.md`](../../ROADMAP.md), and the repository contribution guidance; every
 item's "definition of done" includes them, so they are stated once here rather than repeated:
 
 - **One feature at a time, then stop.** Take a stage to green build + tests + Fantomas +
