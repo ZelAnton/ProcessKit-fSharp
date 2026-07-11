@@ -474,3 +474,77 @@ type HostedProcessTests() =
             | other -> Assert.Fail $"expected an Error outcome, got %A{other}"
         }
         :> Task
+
+    [<Test>]
+    member _.``A user StopWhen configured via configureSupervisor still ends supervision without any host stop request``
+        ()
+        : Task =
+        task {
+            let configure =
+                Func<Supervisor, Supervisor>(fun supervisor ->
+                    supervisor
+                        .Restart(RestartPolicy.Always)
+                        .Backoff(TimeSpan.Zero, 1.0)
+                        .StopWhen(
+                            Func<ProcessResult<string>, bool>(fun result -> result.Stdout.Contains "combo-marker")
+                        ))
+
+            let provider, hosted, service =
+                startRegisteredService "combo-predicate" (shell "echo combo-marker") configure
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+
+            let serviceForWait = service
+            let! completed = waitUntil (fun () -> serviceForWait.LastOutcome.IsSome)
+            Assert.That(completed, Is.True, "the user's own StopWhen predicate should end supervision on its own")
+
+            match service.LastOutcome with
+            | Some(Ok outcome) -> Assert.That(outcome.Stopped, Is.EqualTo StopReason.Predicate)
+            | other -> Assert.Fail $"expected a predicate-matched outcome, got %A{other}"
+
+            // No host stop was ever requested, so the combined predicate must not have relied on it.
+            Assert.That(service.LastStopOutcome.IsNone, Is.True)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``The host stop flag still ends supervision when the user's own StopWhen never matches``() : Task =
+        task {
+            let runner = BlockingRunner()
+
+            let configure =
+                Func<Supervisor, Supervisor>(fun supervisor ->
+                    supervisor.StopWhen(Func<ProcessResult<string>, bool>(fun _ -> false)))
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    configure
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+            do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            do! hosted.StopAsync(CancellationToken.None)
+            do! runner.StopRequested.WaitAsync(TimeSpan.FromSeconds 2.0)
+            Assert.That(service.LastStopOutcome.IsSome, Is.True)
+
+            let serviceForWait = service
+            let! completed = waitUntil (fun () -> serviceForWait.LastOutcome.IsSome)
+
+            Assert.That(
+                completed,
+                Is.True,
+                "the host stop flag should end supervision even though the user's own StopWhen never matches"
+            )
+
+            match service.LastOutcome with
+            | Some(Ok outcome) -> Assert.That(outcome.Stopped, Is.EqualTo StopReason.Predicate)
+            | other ->
+                Assert.Fail
+                    $"expected a predicate-matched outcome (from the combined host-stop predicate), got %A{other}"
+        }
+        :> Task

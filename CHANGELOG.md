@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `HostedProcessService` no longer silently discards a user-configured `Supervisor.StopWhen` (set via `AddProcessKitHostedProcess`'s `configureSupervisor` callback): it now combines the caller's predicate with its own host-shutdown stop condition instead of overwriting it, so a predicate like "stop once the child exits 0 with a marker in stdout" still ends supervision as configured.
 
 ## [2.3.0] - 2026-07-11
 
