@@ -346,7 +346,12 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             else
                 match this.StartShared command with
                 | Error error -> return Error error
-                | Ok host -> return Ok(RunningProcess host)
+                | Ok host ->
+                    // `RunningProcess.buildGuarded` (shared with `JobRunner.start`) reaps the tree via
+                    // `host.Teardown()` and re-raises should the constructor ever fault, so a shared
+                    // group's spawn gets the same defence-in-depth as a private, per-run group.
+                    let! running = RunningProcess.buildGuarded host
+                    return Ok running
         }
 
     /// Immediately hard-kill every process currently in the group (the honest name for the tree kill —

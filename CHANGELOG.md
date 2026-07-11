@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pump-fault kill on a still-live group is unaffected. The Linux cgroup backend's per-child hard kill is
   additionally identity-gated (start-time token, like the POSIX process-group backend), so a recycled pid
   is never SIGKILLed.
+- `ProcessGroup.StartAsync` now guards the shared-group `RunningProcess` handle construction exactly like
+  `JobRunner.start`: on a constructor fault it reaps the tree via `host.Teardown()` before re-raising,
+  instead of leaving an already-spawned tree without a deterministic owner. Both runners now share this
+  guarded construction through one helper.
 
 ## [2.3.0] - 2026-07-11
 

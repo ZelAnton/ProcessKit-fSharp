@@ -1329,3 +1329,31 @@ type RunningProcess internal (host: RunningHost) =
             // sequence, or a repeated dispose, cannot double-decrement.
             markAbandoned ()
             host.Teardown()
+
+/// Guarded construction of the handle handed back to a caller once a tree has been spawned. Shared
+/// by the two sites that turn an already-spawned `RunningHost` into the returned `RunningProcess`:
+/// `JobRunner.start` (a private, per-run group) and `ProcessGroup.StartAsync` (a shared group).
+module internal RunningProcess =
+
+    /// Build `RunningProcess host` in try/with. Constructing the handle is non-throwing in practice
+    /// — its observability (`Log.spawn` / `RunTelemetryScope.Start`) swallows any sink fault, see the
+    /// comment on those calls in the type above — but guard it anyway: should the constructor ever
+    /// fault after the native spawn, reap the tree and release the container via `host.Teardown()`
+    /// here so the child is deterministically killed/reaped instead of being orphaned to GC-time
+    /// kill-on-close, then re-raise the original fault (never a silent swallow of a genuine
+    /// construction bug — the caller still sees it, just without a leaked process tree).
+    let buildGuarded (host: RunningHost) : Task<RunningProcess> =
+        task {
+            let constructed =
+                try
+                    Ok(RunningProcess host)
+                with ex ->
+                    Error ex
+
+            match constructed with
+            | Ok running -> return running
+            | Error ex ->
+                do! host.Teardown()
+                ExceptionDispatchInfo.Throw ex
+                return Unchecked.defaultof<_>
+        }
