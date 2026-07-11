@@ -27,6 +27,58 @@ spawn yourself, and the runner's test doubles never touch the OS at all.
 > for first-class, idiomatic use from **both F# and C#** — every public API is meant to be called
 > naturally from either language, and every example in these guides is shown in both.
 
+## The orphan process problem
+
+`Process.Start()` gives you a handle to the direct child, and a bare `Process.Kill()` ends that
+child — not a durable containment boundary for its descendants. If a build tool starts compiler
+workers, or a shell wrapper such as `cmd /c <command>` starts the real payload, those grandchildren
+can outlive a timeout, exception, or early return. They become orphans that keep holding ports,
+temporary files, handles, and other resources after the code that started them has moved on.
+
+```csharp
+using var process = Process.Start(new ProcessStartInfo("cmd", "/c build.cmd")
+{
+    UseShellExecute = false,
+})!;
+
+await Task.Delay(TimeSpan.FromSeconds(5));
+process.Kill(); // stops cmd.exe; a compiler worker started by build.cmd can keep running
+```
+
+Cleaning that up correctly means tracking every descendant and handling races while the tree is
+still spawning. ProcessKit makes that ownership explicit: a `ProcessGroup` contains the whole tree,
+and disposing it reaps the group. The one-shot `Command` verbs create and dispose a private group
+for each run, so the same guarantee applies without extra plumbing.
+
+## OS-level containment mechanisms
+
+ProcessKit uses the operating system's own kernel containment mechanism rather than app-level
+bookkeeping or best-effort signals to individual PIDs:
+
+- **Windows:** a Job Object.
+- **Linux:** cgroup v2 when resource limits are requested and available; otherwise a POSIX process
+  group.
+- **macOS / BSD:** a POSIX process group.
+
+`ProcessGroup.Mechanism` reports which primitive was selected, so code can verify its containment
+environment instead of assuming one. See [Process groups](process-groups.md) and
+[Platform support](platform-support.md) for the mechanism details and platform caveats.
+
+## How it compares
+
+| Capability | `System.Diagnostics.Process` | CliWrap | Medallion.Shell | SimpleExec | **ProcessKit** |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Whole-tree kill-on-dispose containment | — | partial | — | — | **✓** |
+| Honest results (non-zero exit is not an exception by default) | partial | partial | partial | — | **✓** |
+| Typed, pattern-matchable errors | — | — | — | — | **✓** |
+| Line streaming + readiness probes | partial | partial | partial | — | **✓** |
+| Shell-free pipelines | — | ✓ | ✓ | — | **✓** |
+| Supervision (restart, backoff, jitter) | — | — | — | — | **✓** |
+| Mockable test seam (`IProcessRunner`) | — | — | — | — | **✓** |
+| Built-in observability (logging, tracing, metrics) | — | — | — | — | **✓** |
+
+See the [Comparison and migration guide](comparison.md) for details and migration recipes.
+
 ## Guides
 
 **New here?** Start with the [Cookbook](cookbook.md) — short task-to-snippet recipes for
