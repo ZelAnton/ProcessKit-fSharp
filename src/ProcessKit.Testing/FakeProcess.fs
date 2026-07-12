@@ -71,8 +71,10 @@ type FakeProcess private (template: Command, stdout: string, stderr: string, out
               // read, leaving this fake's existing behaviour unchanged.
               StartTimeIdentity = None
               Wait = fun () -> Task.FromResult outcome
-              // A fake process feeds no stdin, so it never has a source failure to surface.
+              // A fake process feeds no stdin, so it never has a source failure to surface, and there is
+              // no source feeder for `TakeStdin` to wait on.
               StdinError = fun () -> None
+              StdinFeedComplete = ignore
               StartKill = fun () -> ()
               GracefulKill = fun _ -> Task.CompletedTask
               Teardown =

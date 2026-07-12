@@ -59,6 +59,7 @@ type ReadinessTests() =
               StartTimeIdentity = None
               Wait = fun () -> Task.FromResult(Outcome.Exited 0)
               StdinError = fun () -> None
+              StdinFeedComplete = ignore
               StartKill = ignore
               GracefulKill = fun _ -> Task.CompletedTask
               Teardown = fun () -> ValueTask() }

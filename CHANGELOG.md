@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `Command.Stdin(source)` combined with `Command.KeepStdinOpen()` now works as documented instead of being a silent no-op. The stdin pipe is no longer force-closed once the source is exhausted: the source is fed first and the pipe is left open, and `RunningProcess.TakeStdin` then hands back a writable handle so the caller can keep writing to the same child interactively. The handle becomes available only after the background feeder has finished draining the source, so the source and the interactive writer never write the pipe at the same time. Both spawn paths (`Command.StartAsync`/`ProcessGroup` and the pipeline runner) close stdin after the source exactly as before when `KeepStdinOpen` is not set.
 
 ## [2.4.0] - 2026-07-11
 

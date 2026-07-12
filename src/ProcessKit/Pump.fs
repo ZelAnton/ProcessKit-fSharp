@@ -1073,18 +1073,26 @@ module internal Pump =
                             ())
             | None -> ()
 
-    /// Feed a stdin `source` (if any) into the child's `stdin` (if piped) in the background, then EOF.
-    /// A source is the child's complete input, so stdin is closed after. Returns a `StdinFeeder` — the
-    /// feed task plus its lifecycle token — so the run can observe a genuine source failure once the
-    /// feed has finished AND stop the feed at teardown. When there is nothing to feed the feeder is an
-    /// inert no-op (no token, `Stop` does nothing, `Fault` is always `None`). (The no-source
-    /// interactive case keeps the stream for `TakeStdin`.)
-    let feedStdinSource (stdin: Stream option) (source: Stdin option) : StdinFeeder =
+    /// Feed a stdin `source` (if any) into the child's `stdin` (if piped) in the background. Whether the
+    /// pipe is closed (EOF) once the source is drained is decided by `keepStdinOpen`: normally a source is
+    /// the child's complete input, so stdin is closed after (`keepStdinOpen = false`); but when the command
+    /// set `KeepStdinOpen` the pipe is left open so the caller can keep writing to it interactively via
+    /// `RunningProcess.TakeStdin` after the source is exhausted (`keepStdinOpen = true`). Returns a
+    /// `StdinFeeder` — the feed task plus its lifecycle token — so the run can observe a genuine source
+    /// failure once the feed has finished, stop the feed at teardown, AND (via `StdinFeeder.Task`) know when
+    /// the source is fully drained so a kept-open pipe is handed to the caller with no second writer racing
+    /// it. When there is nothing to feed the feeder is an inert no-op (no token, `Stop` does nothing,
+    /// `Fault` is always `None`). (The no-source interactive case keeps the stream for `TakeStdin`.)
+    let feedStdinSource (stdin: Stream option) (source: Stdin option) (keepStdinOpen: bool) : StdinFeeder =
         match stdin, source with
         | Some stdinStream, Some src ->
             // The lifecycle token: cancelling it stops the feed (unblocking a parked source read),
             // disposed by the feeder once the feed has finished.
             let cts = new CancellationTokenSource()
-            let feed = feedStdin src.Source stdinStream true cts.Token
+            // Close the pipe (EOF) after the source UNLESS `KeepStdinOpen` kept it open for interactive
+            // writing: then the feed just drains + flushes the source and leaves the stream open, and its
+            // completion (`StdinFeeder.Task`) is the point after which `TakeStdin` may hand the stream to
+            // the caller — never while the feed is still writing (two writers on one pipe is forbidden).
+            let feed = feedStdin src.Source stdinStream (not keepStdinOpen) cts.Token
             StdinFeeder(feed, Some cts)
         | _ -> StdinFeeder(Task.FromResult(None: exn option), None)

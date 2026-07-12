@@ -118,6 +118,7 @@ type CorrectnessBugTests() =
           StartTimeIdentity = None
           Wait = fun () -> Task.FromResult(Outcome.Exited 0)
           StdinError = fun () -> None
+          StdinFeedComplete = ignore
           StartKill = ignore
           GracefulKill = fun _ -> Task.CompletedTask
           Teardown = fun () -> ValueTask() }
@@ -258,6 +259,7 @@ type CorrectnessBugTests() =
                   StartTimeIdentity = None
                   Wait = fun () -> Task.FromResult(Outcome.Exited 0)
                   StdinError = fun () -> None
+                  StdinFeedComplete = ignore
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
                   Teardown = fun () -> ValueTask() }
@@ -316,6 +318,7 @@ type CorrectnessBugTests() =
                   StartTimeIdentity = None
                   Wait = fun () -> waitTcs.Task
                   StdinError = fun () -> None
+                  StdinFeedComplete = ignore
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
                   Teardown = fun () -> ValueTask() }
@@ -684,6 +687,88 @@ type CorrectnessBugTests() =
                 granted |> Array.filter id |> Array.length,
                 Is.EqualTo 1,
                 "TakeStdin must hand out the stdin stream to exactly one concurrent caller"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``TakeStdin waits for the source feeder before handing over a KeepStdinOpen pipe``() : Task =
+        task {
+            // T-123: with `Stdin(source)` + `KeepStdinOpen`, `TakeStdin` must not hand the caller the pipe
+            // until the background feeder has finished draining the source — otherwise the feeder and the
+            // caller would both write the same pipe. Deterministic ORDER proof (no timing guesswork): the
+            // gated source parks BEFORE writing, so `TakeStdin` must block until we release it and the feed
+            // completes. Then (a) the feed is provably complete the instant `TakeStdin` returns, and (b) the
+            // caller's bytes land strictly AFTER the source's on the shared pipe.
+            let gated = GatedStdinAsyncLines "SRC"
+
+            // A source + `KeepStdinOpen` config. The `Stdin` metadata only marks the run as source-fed (this
+            // synthetic host never spawns, so it is never enumerated); the real feed below is what
+            // `StdinFeedComplete` waits on.
+            let config =
+                (Command.create "test"
+                 |> Command.stdin (Stdin.FromString "x")
+                 |> Command.keepStdinOpen)
+                    .Config
+
+            let pipe = new MemoryStream()
+
+            let feeder =
+                Pump.feedStdinSource (Some(pipe :> Stream)) (Some(Stdin.FromAsyncLines gated)) true
+
+            let host =
+                { baseHost config with
+                    Stdin = Some(pipe :> Stream)
+                    // Exactly how `ProcessGroup` wires it: block on the feed task (which never faults).
+                    StdinFeedComplete = fun () -> feeder.Task.GetAwaiter().GetResult() |> ignore }
+
+            use running = new RunningProcess(host)
+
+            let mutable takenIsSome = false
+            let mutable feedCompleteAtReturn = false
+
+            let taker =
+                Thread(
+                    ThreadStart(fun () ->
+                        match running.TakeStdin() with
+                        | Some stdin ->
+                            takenIsSome <- true
+                            // Recorded the instant TakeStdin returns: for the wait to hold, the feed MUST be
+                            // complete here.
+                            feedCompleteAtReturn <- feeder.Task.IsCompleted
+                            (stdin.WriteAsync(Encoding.UTF8.GetBytes "CALLER")).GetAwaiter().GetResult()
+                        | None -> ())
+                )
+
+            taker.IsBackground <- true
+            taker.Start()
+
+            // Wait — on the source's own `Parked` signal, not a delay — until the feed is parked mid-source.
+            // `TakeStdin` is now blocked in `StdinFeedComplete`, and the feed is provably NOT complete.
+            let! parked = Task.WhenAny(gated.Parked, Task.Delay 5000)
+            Assert.That(parked, Is.SameAs gated.Parked, "the feed never parked in the source")
+            Assert.That(feeder.Task.IsCompleted, Is.False, "the feed must not complete while the source is parked")
+
+            // Release the source: the feed writes "SRC\n" and completes -> TakeStdin unblocks and returns.
+            gated.Release()
+            taker.Join()
+
+            Assert.That(
+                takenIsSome,
+                Is.True,
+                "TakeStdin must hand out the interactive pipe for a Stdin(source) + KeepStdinOpen run"
+            )
+
+            Assert.That(
+                feedCompleteAtReturn,
+                Is.True,
+                "TakeStdin must not return until the source feed has finished (single writer at a time)"
+            )
+
+            Assert.That(
+                Encoding.UTF8.GetString(pipe.ToArray()),
+                Is.EqualTo "SRC\nCALLER",
+                "the source's bytes must precede the caller's on the shared pipe"
             )
         }
         :> Task

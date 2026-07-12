@@ -196,6 +196,7 @@ type StreamingTests() =
               StartTimeIdentity = None
               Wait = fun () -> Task.FromResult(Outcome.Exited 0)
               StdinError = fun () -> None
+              StdinFeedComplete = ignore
               StartKill = ignore
               GracefulKill = fun _ -> Task.CompletedTask
               Teardown = fun () -> ValueTask() }
@@ -221,6 +222,7 @@ type StreamingTests() =
               StartTimeIdentity = None
               Wait = fun () -> Task.FromResult(Outcome.Exited 0)
               StdinError = fun () -> None
+              StdinFeedComplete = ignore
               StartKill = ignore
               GracefulKill = fun _ -> Task.CompletedTask
               Teardown = fun () -> ValueTask() }
@@ -346,6 +348,37 @@ type StreamingTests() =
                     | Ok result ->
                         Assert.That(result.Stdout, Does.Contain "apple")
                         Assert.That(result.Stdout, Does.Contain "banana")
+                    | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Stdin source plus KeepStdinOpen feeds the source then accepts interactive writes``() : Task =
+        task {
+            // T-123: `Command.Stdin(source)` + `Command.KeepStdinOpen()` must feed the source first and then
+            // leave the pipe open, so `TakeStdin` hands back a writable handle whose bytes ALSO reach the
+            // child. `sort` reads every line then emits them sorted on EOF — so the sorted output containing
+            // BOTH the source lines and the interactively-written line proves both halves were delivered
+            // (and, since `TakeStdin` returns only after the feed finished, delivered without a write race).
+            let command =
+                shell "sort"
+                |> Command.stdin (Stdin.FromLines [ "banana"; "cherry" ])
+                |> Command.keepStdinOpen
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match running.TakeStdin() with
+                | None -> Assert.Fail "expected an interactive stdin handle after the source was fed"
+                | Some stdin ->
+                    do! stdin.WriteLineAsync "apple"
+                    do! stdin.FinishAsync() // close stdin -> sort emits the merged, sorted input and exits
+
+                    match! running.OutputStringAsync() with
+                    | Ok result ->
+                        Assert.That(result.Stdout, Does.Contain "apple", "the interactive write must reach the child")
+                        Assert.That(result.Stdout, Does.Contain "banana", "the source input must reach the child")
+                        Assert.That(result.Stdout, Does.Contain "cherry", "the source input must reach the child")
                     | Error error -> Assert.Fail $"{error}"
         }
         :> Task
@@ -623,6 +656,7 @@ type StreamingTests() =
                   StartTimeIdentity = None
                   Wait = fun () -> Task.FromResult(Outcome.Exited 0)
                   StdinError = fun () -> None
+                  StdinFeedComplete = ignore
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
                   Teardown =
@@ -706,6 +740,7 @@ type StreamingTests() =
                   StartTimeIdentity = None
                   Wait = fun () -> Task.FromException<Outcome>(InvalidOperationException "boom")
                   StdinError = fun () -> None
+                  StdinFeedComplete = ignore
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
                   Teardown = fun () -> ValueTask() }
@@ -1273,6 +1308,7 @@ type StreamingTests() =
                   StartTimeIdentity = None
                   Wait = fun () -> Task.FromResult(Outcome.Exited 0)
                   StdinError = fun () -> None
+                  StdinFeedComplete = ignore
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
                   Teardown = fun () -> ValueTask() }

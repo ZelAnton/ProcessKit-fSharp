@@ -176,6 +176,49 @@ type HangingStdinAsyncLines() =
                       disposed.TrySetResult() |> ignore
                       ValueTask() }
 
+/// A `FromAsyncLines` source that parks in its FIRST `MoveNextAsync` — before yielding anything — until a
+/// test calls `Release`, then yields a single line and ends. It signals `Parked` the moment the feed is
+/// parked (nothing written yet), so a test can prove, without timing guesswork, that a `KeepStdinOpen`
+/// source feed has NOT finished — and therefore `RunningProcess.TakeStdin` has NOT yet handed the pipe to
+/// the caller — until the source is fully drained (T-123: `Stdin(source)` + `KeepStdinOpen`).
+type GatedStdinAsyncLines(line: string) =
+    let parked =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let release =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable yielded = false
+
+    /// Completes once the feed has entered `MoveNextAsync` and is parked, before writing anything.
+    member _.Parked: Task = parked.Task
+
+    /// Let the parked feed proceed: it yields the single line, then ends.
+    member _.Release() = release.TrySetResult() |> ignore
+
+    interface System.Collections.Generic.IAsyncEnumerable<string> with
+        member _.GetAsyncEnumerator(_: CancellationToken) : System.Collections.Generic.IAsyncEnumerator<string> =
+            { new System.Collections.Generic.IAsyncEnumerator<string> with
+                member _.Current = line
+
+                member _.MoveNextAsync() : ValueTask<bool> =
+                    if yielded then
+                        ValueTask<bool>(false)
+                    else
+                        yielded <- true
+                        parked.TrySetResult() |> ignore
+
+                        ValueTask<bool>(
+                            task {
+                                // Park until the test releases the source; only then is the line yielded and
+                                // the feed allowed to complete.
+                                do! release.Task
+                                return true
+                            }
+                        )
+              interface IAsyncDisposable with
+                  member _.DisposeAsync() : ValueTask = ValueTask() }
+
 [<TestFixture>]
 type PipelineTests() =
 

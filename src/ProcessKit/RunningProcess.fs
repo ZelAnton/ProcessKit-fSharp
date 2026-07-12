@@ -37,6 +37,12 @@ type internal RunningHost =
         /// feed has finished — a still-running feed yields `None` and never blocks. A Result-producing
         /// verb surfaces it as `ProcessError.Stdin`, but only on an otherwise-successful run.
         StdinError: unit -> exn option
+        /// Block until the background stdin feeder has finished draining the source, so `TakeStdin` never
+        /// hands the caller a stream the feeder is still writing to (two concurrent writers on one pipe is
+        /// forbidden). A no-op — returns immediately — when the command kept stdin open with **no** source
+        /// (interactive from the start) or when there is nothing to feed, so only a `Stdin(source)` +
+        /// `KeepStdinOpen` run actually waits. `TakeStdin` calls this OUTSIDE `stateLock`.
+        StdinFeedComplete: unit -> unit
         /// Signal the tree to die without waiting (start_kill).
         StartKill: unit -> unit
         /// Gracefully kill the tree (SIGTERM, then SIGKILL after the grace period) without
@@ -584,17 +590,33 @@ type RunningProcess internal (host: RunningHost) =
     /// streaming analogue of a buffered verb's `ProcessResult.Truncated`.
     member _.DroppedStreamLineCount = Volatile.Read(&droppedStreamLineCount)
 
-    /// Take the interactive stdin handle — `Some` only when the command kept stdin open without a
-    /// source attached, and only once.
+    /// Take the interactive stdin handle — `Some` only when the command kept stdin open
+    /// (`Command.KeepStdinOpen`), and only once. With **no** source it is available immediately; with a
+    /// `Command.Stdin(source)` it is available once the background feeder has finished draining that source
+    /// (this call blocks until then), so the caller never writes to the pipe while the feeder still is.
     member _.TakeStdin() : ProcessStdin option =
-        // Under `stateLock` so two concurrent `TakeStdin` calls can't both observe `not stdinTaken`
-        // and hand out the same interactive stdin stream twice.
-        lock stateLock (fun () ->
-            match host.Stdin with
-            | Some stream when config.KeepStdinOpen && config.StdinSource.IsNone && not stdinTaken ->
-                stdinTaken <- true
-                Some(ProcessStdin stream)
-            | _ -> None)
+        // Claim the interactive stdin under `stateLock` so two concurrent `TakeStdin` calls can't both
+        // observe `not stdinTaken` and hand out the same stream twice. `host.Stdin` is `Some` exactly when
+        // the pipe is kept open: `KeepStdinOpen` with no source, or `KeepStdinOpen` WITH a source (a source
+        // WITHOUT `KeepStdinOpen` closes the pipe after draining, so its `host.Stdin` is `None`).
+        let claimed =
+            lock stateLock (fun () ->
+                match host.Stdin with
+                | Some stream when config.KeepStdinOpen && not stdinTaken ->
+                    stdinTaken <- true
+                    Some stream
+                | _ -> None)
+
+        match claimed with
+        | Some stream ->
+            // Wait — OUTSIDE `stateLock`, so it never blocks other verbs — for the source feeder to finish
+            // before handing the stream over. A no-op when there is no source (interactive-only) or nothing
+            // to feed; only a `Stdin(source)` + `KeepStdinOpen` run actually waits here. This is what makes
+            // the interactive writer and the source feeder single-writer: the feeder drains the source
+            // first, then the caller writes.
+            host.StdinFeedComplete()
+            Some(ProcessStdin stream)
+        | None -> None
 
     /// Signal the process tree to die without waiting (fire-and-forget, like `Process.Kill()`); the
     /// tree is fully reaped when the handle is disposed. For a blocking kill, dispose the handle.

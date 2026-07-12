@@ -139,7 +139,7 @@ type PumpTests() =
     // Run `source` to completion against `stdin` via the real `feedStdinSource` entry point (its own
     // lifecycle CTS, close-when-done) and return the genuine fault it stashed, or `None`. (T-069)
     let feederFault (source: Stdin) (stdin: Stream) : exn option =
-        let feeder = Pump.feedStdinSource (Some stdin) (Some source)
+        let feeder = Pump.feedStdinSource (Some stdin) (Some source) false
         feeder.Task.Result
 
     [<Test>]
@@ -834,7 +834,7 @@ type PumpTests() =
             use stdin = new MemoryStream()
 
             let feeder =
-                Pump.feedStdinSource (Some(stdin :> Stream)) (Some(Stdin.FromAsyncLines source))
+                Pump.feedStdinSource (Some(stdin :> Stream)) (Some(Stdin.FromAsyncLines source)) false
 
             // Wait until the feed is genuinely parked in `MoveNextAsync`.
             let! started = Task.WhenAny(source.Started, Task.Delay 5000)
@@ -859,7 +859,7 @@ type PumpTests() =
     member _.``StdinFeeder Stop is idempotent and the nothing-to-feed feeder is inert``() : Task =
         task {
             // Nothing to feed (no child stdin pipe): no token, `Stop` is a no-op, `Fault` is always None.
-            let noop = Pump.feedStdinSource None (Some(Stdin.FromString "ignored"))
+            let noop = Pump.feedStdinSource None (Some(Stdin.FromString "ignored")) false
             noop.Stop()
             noop.Stop()
             let! noopFault = noop.Task
@@ -871,7 +871,7 @@ type PumpTests() =
             use stdin = new MemoryStream()
 
             let feeder =
-                Pump.feedStdinSource (Some(stdin :> Stream)) (Some(Stdin.FromAsyncLines source))
+                Pump.feedStdinSource (Some(stdin :> Stream)) (Some(Stdin.FromAsyncLines source)) false
 
             let! _ = source.Started
             feeder.Stop()
@@ -879,5 +879,71 @@ type PumpTests() =
             feeder.Stop()
             feeder.Stop()
             Assert.That(Option.isNone feeder.Fault, Is.True)
+        }
+        :> Task
+
+    // --- T-123: `Stdin(source)` + `KeepStdinOpen` — the source feeds first, then the pipe is left open
+    // for interactive writing via `RunningProcess.TakeStdin`, with the source and the writer never on the
+    // pipe at once. Deterministic, over in-memory streams and the `GatedStdinAsyncLines` double. ---
+
+    [<Test>]
+    member _.``feedStdinSource with KeepStdinOpen leaves the stdin pipe open after the source is drained``() : Task =
+        task {
+            // `KeepStdinOpen = true`: the feed drains the source and flushes, but must NOT close (EOF) the
+            // pipe — it stays open (writable) so `TakeStdin` can keep writing to it.
+            let kept = new MemoryStream()
+
+            let keptFeeder =
+                Pump.feedStdinSource (Some(kept :> Stream)) (Some(Stdin.FromString "hello")) true
+
+            let! keptFault = keptFeeder.Task
+            Assert.That(Option.isNone keptFault, Is.True)
+            Assert.That(kept.CanWrite, Is.True, "KeepStdinOpen must leave the stdin pipe open after the source")
+            Assert.That(Encoding.UTF8.GetString(kept.ToArray()), Is.EqualTo "hello")
+
+            // The default (`KeepStdinOpen = false`) still closes the pipe once the source is drained, so the
+            // child sees EOF — the pre-existing behaviour must not regress.
+            let closed = new MemoryStream()
+
+            let closedFeeder =
+                Pump.feedStdinSource (Some(closed :> Stream)) (Some(Stdin.FromString "hello")) false
+
+            let! _ = closedFeeder.Task
+            Assert.That(closed.CanWrite, Is.False, "without KeepStdinOpen the source must close (EOF) the pipe")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``feedStdinSource for a KeepStdinOpen source completes only once the source is drained``() : Task =
+        task {
+            // The single-writer invariant, deterministically (no timing guesswork): while the source is
+            // still feeding, the feed task is NOT complete and nothing is on the pipe — so `TakeStdin`,
+            // which blocks on this task (`StdinFeedComplete`), cannot hand the pipe to a second writer
+            // mid-feed. Only once the source is drained does the feed complete, leaving the pipe OPEN.
+            let gated = GatedStdinAsyncLines "SRC"
+            let pipe = new MemoryStream()
+
+            let feeder =
+                Pump.feedStdinSource (Some(pipe :> Stream)) (Some(Stdin.FromAsyncLines gated)) true
+
+            // Wait (via the source's own `Parked` signal, not a delay) until the feed is genuinely parked in
+            // the source, before it has written anything.
+            let! parked = Task.WhenAny(gated.Parked, Task.Delay 5000)
+            Assert.That(parked, Is.SameAs gated.Parked, "the feed never parked in the source")
+
+            Assert.That(
+                feeder.Task.IsCompleted,
+                Is.False,
+                "the feed must not complete while the source is still feeding"
+            )
+
+            Assert.That(pipe.Length, Is.EqualTo 0L, "nothing must reach the pipe while the source is parked")
+
+            // Drain the source: the feed writes the line, flushes, and completes WITHOUT closing the pipe.
+            gated.Release()
+            let! fault = feeder.Task
+            Assert.That(Option.isNone fault, Is.True)
+            Assert.That(pipe.CanWrite, Is.True, "the kept-open pipe must stay open after the source is drained")
+            Assert.That(Encoding.UTF8.GetString(pipe.ToArray()), Is.EqualTo "SRC\n")
         }
         :> Task
