@@ -63,6 +63,33 @@ type PosixIdentityReuseTests() =
             Native.Posix.readProcessIdentityForTests <- None
             Native.Posix.groupDeliveryObserverForTests <- None
 
+    [<Test>]
+    member _.``liveness seam keeps permission-denied groups tracked and prunes missing groups``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group liveness probe is POSIX-only"
+
+        // The hook keeps its existing bool signature: true models killpg(..., 0) failing with EPERM
+        // (the group exists but is not signalable), while false models ESRCH (the group is gone).
+        let permissionDeniedPgid = 2_000_000_201
+        let missingPgid = 2_000_000_202
+
+        Native.Posix.processGroupAliveForTests <- Some(fun pgid -> pgid = permissionDeniedPgid)
+
+        try
+            Assert.That(
+                Native.Posix.processGroupStillTracked permissionDeniedPgid None,
+                Is.True,
+                "EPERM must keep an existing process group tracked"
+            )
+
+            Assert.That(
+                Native.Posix.processGroupStillTracked missingPgid None,
+                Is.False,
+                "ESRCH must prune a missing process group"
+            )
+        finally
+            Native.Posix.processGroupAliveForTests <- None
+
     // ---- Etape 1: the /proc/<pid>/stat field-22 parser ----
 
     [<Test>]

@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- On POSIX, process groups that reject a signal-0 liveness probe with `EPERM` are no longer treated as gone: they remain tracked for later control and teardown, while only `ESRCH` proves that a group no longer exists.
 
 ## [2.4.1] - 2026-07-12
 
