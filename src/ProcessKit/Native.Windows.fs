@@ -316,7 +316,13 @@ module internal Windows =
         let mutable duplicate = IntPtr.Zero
 
         if
-            source <> IntPtr.Zero
+            // `GetStdHandle` returns `INVALID_HANDLE_VALUE` (`-1`) on failure and `NULL` for "no such
+            // handle"; both must be rejected here. A bare `source <> IntPtr.Zero` lets `-1` through, and
+            // for `DuplicateHandle` the pseudo-handle `-1` means "the current process" — it would happily
+            // duplicate the parent's own process handle (full access) and hand it to the child as a std
+            // handle, instead of failing. `isValidHandle` rejects both sentinels, so a broken `GetStdHandle`
+            // reaches the honest `ProcessError.Spawn` path in `spawnWindowsCore` rather than being masked.
+            isValidHandle source
             && DuplicateHandle(current, source, current, &duplicate, 0u, true, DUPLICATE_SAME_ACCESS)
         then
             duplicate

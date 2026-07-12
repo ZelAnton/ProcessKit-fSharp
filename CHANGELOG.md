@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- A Windows child spawned with `StdioMode.Inherit` (or `Command.InheritStdin`) no longer silently receives a handle to the **parent process itself** as its std input/output/error when the corresponding `GetStdHandle` fails. `GetStdHandle` returns `INVALID_HANDLE_VALUE` (`-1`) on failure, and to `DuplicateHandle` that `-1` is the current-process pseudo-handle — the old check rejected only `NULL`, so `-1` slipped through and duplicated the parent's full-access process handle into the child. Both failure sentinels are now rejected, so a broken `GetStdHandle` produces an honest `ProcessError.Spawn` instead.
 
 ## [2.4.0] - 2026-07-11
 
