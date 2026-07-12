@@ -3,13 +3,16 @@
 // mdBook's SUMMARY.md cannot express a sidebar entry that points at an external
 // URL: a list item's link target must be a chapter file in `src`, and a raw URL
 // makes the build fail ("failed to read chapter https://..."). The three
-// implementation entries are therefore carried in SUMMARY.md as *draft chapters*
-// (empty `()` links) without chapter files. mdBook v0.4.40 renders them as
-// <li class="chapter-item"><div>...</div></li>, with no wrapper element.
+// implementation entries are therefore carried in SUMMARY.md as *draft prefix
+// chapters* (bare `[Title]()` links, no chapter files) pinned above
+// `[Overview](README.md)` in the same un-numbered prefix block. mdBook v0.4.40
+// renders them as <li class="chapter-item expanded affix "><div>...</div></li>,
+// with no wrapper element and, because prefix/affix chapters are never
+// numbered, no leading "N." in the text.
 // This script upgrades the two external entries to live links and marks the local
 // implementation as a non-clickable indicator:
 //
-//   * "Rust crate"     -> a live external link to the Rust implementation's site.
+//   * "Rust version"   -> a live external link to the Rust implementation's site.
 //   * "Python wrapper" -> a live external link to the Python wrapper's docs site.
 //   * ".NET version"   -> a non-clickable indicator for this implementation.
 //
@@ -19,15 +22,16 @@
   "use strict";
 
   var ENTRIES = {
-    "Rust crate": { href: "https://zelanton.github.io/processkit-rs" },
+    "Rust version": { href: "https://zelanton.github.io/processkit-rs" },
     "Python wrapper": { href: "https://zelanton.github.io/processkit-py" },
     ".NET version": { placeholder: "Current implementation" }
   };
 
   function apply() {
-    // mdBook v0.4.40 renders draft chapters as:
-    // <li class="chapter-item expanded "><div><strong>1.</strong> Rust crate</div></li>
-    // (no nested wrapper or <span>)
+    // mdBook v0.4.40 renders draft prefix chapters as:
+    // <li class="chapter-item expanded affix "><div>Rust version</div></li>
+    // (no nested wrapper or <span>; no leading "N." since prefix chapters are
+    // never numbered — the digit-stripping regex below is just defensive)
     var drafts = document.querySelectorAll(
       ".sidebar .chapter li.chapter-item > div"
     );
