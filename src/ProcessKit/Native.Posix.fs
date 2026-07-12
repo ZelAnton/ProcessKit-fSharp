@@ -65,6 +65,11 @@ module internal Posix =
     [<Literal>]
     let private ENOENT = 2
 
+    // `killpg(pgid, 0)` reports this only when the target process group no longer exists. A failed
+    // probe with EPERM instead proves that the group exists but the caller may not signal it.
+    [<Literal>]
+    let private ESRCH = 3
+
     let private isMacOs = RuntimeInformation.IsOSPlatform OSPlatform.OSX
 
     [<DllImport("libc", SetLastError = true)>]
@@ -274,12 +279,22 @@ module internal Posix =
         observeGroupDelivery pgid
         killpg (pgid, SIGTERM) |> ignore
 
-    /// True while any process remains in the group (signal 0 probes existence). The test seam overrides
-    /// the by-number verdict so a pid/pgid-reuse scenario can be driven deterministically.
+    /// True while any process remains in the group (signal 0 probes existence). `ESRCH` means the group
+    /// is gone; `EPERM` and unknown probe failures conservatively keep it tracked because they do not
+    /// prove its absence. The test seam overrides the by-number verdict so liveness outcomes can be
+    /// driven deterministically.
     let processGroupAlive (pgid: int) =
         match processGroupAliveForTests with
         | Some hook -> hook pgid
-        | None -> killpg (pgid, 0) = 0
+        | None ->
+            let returnCode = killpg (pgid, 0)
+
+            if returnCode = 0 then
+                true
+            else
+                // Read errno before another P/Invoke can overwrite the per-thread value. Unlike ESRCH,
+                // EPERM proves the group exists; unknown failures are likewise not evidence it is gone.
+                Marshal.GetLastWin32Error() <> ESRCH
 
     // ----------------------------------------------------------------------------------
     // Start-time identity token: pid/pgid-reuse safety (T-084)
