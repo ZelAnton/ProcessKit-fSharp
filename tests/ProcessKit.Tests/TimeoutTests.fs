@@ -3,7 +3,6 @@ namespace ProcessKit.Tests
 open System
 open System.Diagnostics
 open System.IO
-open System.Reflection
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
@@ -43,32 +42,6 @@ type TimeoutTests() =
             Assert.That(actual, Is.EqualTo expected, "the error must carry the configured deadline that fired")
             Assert.That(error.Message, Is.EqualTo($"'{program}' timed out after {expected.TotalSeconds}s"))
         | other -> Assert.Fail $"expected Timeout, got {other}"
-
-    let timeoutCtsFromRaceTask (race: Task) =
-        let flags = BindingFlags.Instance ||| BindingFlags.NonPublic ||| BindingFlags.Public
-
-        let stateMachineField =
-            race.GetType().GetField("StateMachine", flags)
-            |> Option.ofObj
-            |> Option.defaultWith (fun () -> invalidOp "the race task must retain its state machine while waiting")
-
-        let stateMachine =
-            stateMachineField.GetValue race
-            |> Option.ofObj
-            |> Option.defaultWith (fun () -> invalidOp "the race state machine must be available while waiting")
-
-        let ctsField =
-            stateMachine.GetType().GetFields(flags)
-            |> Array.tryFind (fun field -> field.FieldType = typeof<CancellationTokenSource>)
-
-        let ctsField =
-            ctsField
-            |> Option.defaultWith (fun () -> invalidOp "the race state machine must retain the total-timeout CTS")
-
-        match ctsField.GetValue stateMachine with
-        | :? CancellationTokenSource as cts -> cts
-        | null -> invalidOp "the race state machine must retain a non-null total-timeout CTS"
-        | _ -> invalidOp "the race state machine retained an unexpected total-timeout field type"
 
     [<Test>]
     member _.``Timeout kills the run promptly and reports Timeout``() : Task =
@@ -154,6 +127,7 @@ type TimeoutTests() =
     member _.``idle deadline cancels the losing total-timeout timer``() : Task =
         task {
             use idle = new Timeouts.IdleTimer(TimeSpan.FromMilliseconds 25.0)
+            use timeoutCts = new CancellationTokenSource()
 
             let wait =
                 TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -172,7 +146,8 @@ type TimeoutTests() =
                 :> Task
 
             let race =
-                Timeouts.raceTimeout
+                Timeouts.raceTimeoutWithCts
+                    timeoutCts
                     None
                     "test"
                     "idle-cancels-total"
@@ -184,7 +159,6 @@ type TimeoutTests() =
             try
                 do! timeoutEntered.Task
 
-                let timeoutCts = timeoutCtsFromRaceTask race
                 releaseTimeout.TrySetResult() |> ignore
 
                 let deadline = Stopwatch.StartNew()
