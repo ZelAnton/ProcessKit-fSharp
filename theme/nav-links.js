@@ -22,7 +22,7 @@
   "use strict";
 
   var ENTRIES = {
-    "Rust version": { href: "https://zelanton.github.io/processkit-rs" },
+    "Rust version": { href: "https://zelanton.github.io/ProcessKit-rs/" },
     "Python wrapper": { href: "https://zelanton.github.io/processkit-py" },
     ".NET version": { placeholder: "Current implementation" }
   };
