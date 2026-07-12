@@ -24,12 +24,16 @@
   };
 
   function apply() {
+    // mdBook v0.4.40 renders draft chapters as:
+    // <li class="chapter-item expanded "><div><strong>1.</strong> Rust crate</div></li>
+    // (no .chapter-link-wrapper or nested <span>)
     var drafts = document.querySelectorAll(
-      ".sidebar .chapter li.chapter-item > .chapter-link-wrapper > span"
+      ".sidebar .chapter li.chapter-item > div"
     );
 
-    Array.prototype.forEach.call(drafts, function (entry) {
-      var title = entry.textContent.replace(/^\s*\d+\.\s*/, "").trim();
+    Array.prototype.forEach.call(drafts, function (divEntry) {
+      var textContent = divEntry.textContent || "";
+      var title = textContent.replace(/^\s*\d+\.\s*/, "").trim();
       var spec = ENTRIES[title];
       if (!spec) {
         return;
@@ -39,14 +43,14 @@
         var link = document.createElement("a");
         link.href = spec.href;
         link.rel = "noopener";
-        while (entry.firstChild) {
-          link.appendChild(entry.firstChild);
+        while (divEntry.firstChild) {
+          link.appendChild(divEntry.firstChild);
         }
-        entry.replaceWith(link);
+        divEntry.replaceWith(link);
       } else if (spec.placeholder) {
-        entry.classList.add("current-implementation");
-        entry.title = spec.placeholder;
-        entry.setAttribute("aria-label", title + " — " + spec.placeholder);
+        divEntry.classList.add("current-implementation");
+        divEntry.title = spec.placeholder;
+        divEntry.setAttribute("aria-label", title + " — " + spec.placeholder);
       }
     });
   }

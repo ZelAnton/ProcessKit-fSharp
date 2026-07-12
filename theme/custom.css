@@ -52,7 +52,8 @@
 }
 
 /* Current implementation marker (not a navigation target) */
-.sidebar .chapter li.chapter-item > .chapter-link-wrapper > span.current-implementation {
+.sidebar .chapter li.chapter-item > div.current-implementation {
+    display: block;
     padding: 0.38em 1em 0.38em 1.1em;
     border-left: 3px solid var(--links);
     border-radius: 0 4px 4px 0;
