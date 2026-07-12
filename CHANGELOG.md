@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Timeouts.raceTimeout` now cancels the unused total-timeout timer as soon as an idle timeout wins, so long configured total deadlines no longer remain scheduled after the process has been timed out.
 - `Exec.outputAll` / `Exec.outputAllBytes` now cancel commands still waiting for a batch-concurrency slot immediately, while preserving results already completed before cancellation.
 - `Command.Stdin(source)` combined with `Command.KeepStdinOpen()` now works as documented instead of being a silent no-op. The stdin pipe is no longer force-closed once the source is exhausted: the source is fed first and the pipe is left open, and `RunningProcess.TakeStdin` then hands back a writable handle so the caller can keep writing to the same child interactively. The handle becomes available only after the background feeder has finished draining the source, so the source and the interactive writer never write the pipe at the same time. `TakeStdin`'s wait for that feeder is deadlock-safe even when called from a single-threaded `SynchronizationContext` (a WPF/WinForms UI thread, classic ASP.NET): the feeder runs on the thread pool and never needs the caller's context to make progress. Both spawn paths (`Command.StartAsync`/`ProcessGroup` and the pipeline runner) close stdin after the source exactly as before when `KeepStdinOpen` is not set.
+- `ProcessKit.Extensions.Hosting`: a `HostedProcessService.StopAsync` call that found no active child to stop (supervision mid-backoff-sleep, or already ended) no longer resets `LastStopOutcome` to `None`, discarding a previous real stop's outcome; and a `StopAsync` whose internal stop wait was abandoned because the caller's `cancellationToken` expired first no longer risks an unobserved task exception if that abandoned stop later completes with a fault.
 
 ## [2.4.1] - 2026-07-12
 
@@ -29,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
-- `ProcessKit.Extensions.Hosting`: a `HostedProcessService.StopAsync` call that found no active child to stop (supervision mid-backoff-sleep, or already ended) no longer resets `LastStopOutcome` to `None`, discarding a previous real stop's outcome; and a `StopAsync` whose internal stop wait was abandoned because the caller's `cancellationToken` expired first no longer risks an unobserved task exception if that abandoned stop later completes with a fault.
+-
 
 ## [2.4.0] - 2026-07-11
 

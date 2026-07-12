@@ -116,6 +116,7 @@ type private LateFaultingStopRunner() =
                       StartTimeIdentity = None
                       Wait = fun () -> finished.Task
                       StdinError = fun () -> None
+                      StdinFeedComplete = ignore
                       StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
                       GracefulKill =
                         fun _ ->
