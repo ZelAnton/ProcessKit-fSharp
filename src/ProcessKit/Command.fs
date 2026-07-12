@@ -378,9 +378,12 @@ type Command internal (config: CommandConfig) =
                 StdinSource = Some Stdin.Inherit }
         )
 
-    /// Keep the child's stdin pipe open after the source is exhausted (for interactive writing
-    /// via `RunningProcess.TakeStdin`). Rejected (`ArgumentException`) when `InheritStdin` is already set —
-    /// an inherited stdin has no pipe to keep open.
+    /// Keep the child's stdin pipe open after the source (if any) is exhausted, for interactive writing via
+    /// `RunningProcess.TakeStdin`. Works both with **no** source (the pipe is interactive from the start —
+    /// `TakeStdin` is available immediately) and **with** a `Command.Stdin(source)` (the source is fed
+    /// first, the pipe is left open afterwards, and `TakeStdin` becomes available once that feed has
+    /// finished — so the source and the interactive writer never write the pipe concurrently). Rejected
+    /// (`ArgumentException`) when `InheritStdin` is already set — an inherited stdin has no pipe to keep open.
     member _.KeepStdinOpen() =
         CommandConfig.ensureNoStdinInherit config "KeepStdinOpen"
         Command({ config with KeepStdinOpen = true })

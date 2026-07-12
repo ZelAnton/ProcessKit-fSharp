@@ -22,8 +22,11 @@ type internal StdinSource =
 
 /// A source for a child process's standard input, attached with `Command.Stdin`.
 ///
-/// When set, the child's stdin is a pipe fed from this source; the pipe is closed (EOF) once
-/// the source is exhausted, unless `Command.KeepStdinOpen` is also set.
+/// When set, the child's stdin is a pipe fed from this source; the pipe is closed (EOF) once the source
+/// is exhausted — unless `Command.KeepStdinOpen` is also set, in which case the pipe is left open after
+/// the source is drained so the caller can keep writing to it interactively via
+/// `RunningProcess.TakeStdin` (which becomes available once the source feed has finished, so the source
+/// and the interactive writer never write the pipe at the same time).
 [<Sealed>]
 type Stdin internal (source: StdinSource) =
 

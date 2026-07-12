@@ -58,6 +58,7 @@ type private BlockingRunner() =
                       StartTimeIdentity = None
                       Wait = fun () -> finished.Task
                       StdinError = fun () -> None
+                      StdinFeedComplete = ignore
                       StartKill =
                         fun () ->
                             killed.TrySetResult() |> ignore

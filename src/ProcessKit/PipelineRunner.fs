@@ -295,7 +295,15 @@ module internal PipelineRunner =
                                 // path, say) can surface as `ProcessError.Stdin` on an otherwise-successful
                                 // pipeline — uniformly with a single command — instead of silently feeding
                                 // the stage empty input, and so the feed can be stopped on teardown.
-                                stage0Feed <- Some(Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource)
+                                // Always close stage 0's stdin after its source (`keepStdinOpen = false`): a
+                                // pipeline exposes no live handle, so `KeepStdinOpen`/`TakeStdin` are inert
+                                // here (see `Pipeline`'s doc — "has no effect" on a stage), and leaving the
+                                // pipe open would instead just deny stage 0 its EOF and hang the chain. This
+                                // is the pipeline-equivalent of the single-command path's
+                                // `command.Config.KeepStdinOpen`, which for stage 0 is always `false` in
+                                // practice — plumbed as a literal so the "no interactive writer" invariant
+                                // is explicit and cannot regress into a hang.
+                                stage0Feed <- Some(Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource false)
                             else
                                 match prevStdout, sp.Stdin with
                                 | Some upstream, Some downstream ->

@@ -194,7 +194,8 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // touch the container's release state at construction; the kill closures below route each LATER
             // native kill through the lifecycle gate (see `killWhenLive`). The background stdin feed writes
             // to the child's own stdin pipe (not the container), so kicking it off here is race-free.
-            let stdinFeeder = Pump.feedStdinSource spawned.Stdin command.Config.StdinSource
+            let stdinFeeder =
+                Pump.feedStdinSource spawned.Stdin command.Config.StdinSource command.Config.KeepStdinOpen
 
             let closeStreams () =
                 // Close the pipe streams (OS handles/fds) before releasing/detaching.
@@ -261,10 +262,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
               Stdout = spawned.Stdout
               Stderr = spawned.Stderr
               Stdin =
-                (if command.Config.StdinSource.IsSome then
-                     None
-                 else
-                     spawned.Stdin)
+                // Hand `TakeStdin` a live pipe only when one is kept open past the feeder: `KeepStdinOpen`
+                // (with or without a source) leaves the parent write-end open for interactive writing. A
+                // source WITHOUT `KeepStdinOpen` is the child's complete input — the feeder closes the pipe
+                // once it is drained — so there is no interactive stream to hand out (`None`). No source and
+                // no `KeepStdinOpen` keeps no pipe at all, so `spawned.Stdin` is already `None` there.
+                (match command.Config.StdinSource with
+                 | Some _ when not command.Config.KeepStdinOpen -> None
+                 | _ -> spawned.Stdin)
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
               StartTimeIdentity = startTimeIdentity
@@ -277,6 +282,17 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
               // ProcessKit-rs. The common case, a missing `FromFile`, faults synchronously at spawn
               // (`File.OpenRead`), so it is always observed.
               StdinError = (fun () -> stdinFeeder.Fault)
+              // Block until the background feeder has drained the source, so `TakeStdin` (on a
+              // `Stdin(source)` + `KeepStdinOpen` run) never hands the caller a pipe the feeder is still
+              // writing to. `feedStdin` never faults (every exception is swallowed into a stashed fault) and
+              // never leaves its returned task faulted/cancelled, so awaiting it can't throw; a stopped feed
+              // (teardown) also completes, so this can never hang past teardown. The no-source /
+              // nothing-to-feed feeder's task is already completed, so this returns immediately there.
+              // The blocking `GetResult` is deadlock-safe even when `TakeStdin` is called from a
+              // single-threaded `SynchronizationContext` (WPF/WinForms/classic ASP.NET): the feed runs
+              // detached on the thread pool (`feedStdin` is a `backgroundTask`), so it keeps making progress
+              // while this thread is parked here rather than waiting to post a continuation back to it.
+              StdinFeedComplete = (fun () -> stdinFeeder.Task.GetAwaiter().GetResult() |> ignore)
               StartKill =
                 (if ownsGroup then
                      (fun () -> killWhenLive backend.KillTree)
