@@ -124,6 +124,65 @@ type TimeoutTests() =
         :> Task
 
     [<Test>]
+    member _.``idle deadline cancels the losing total-timeout timer``() : Task =
+        task {
+            use idle = new Timeouts.IdleTimer(TimeSpan.FromMilliseconds 25.0)
+            use timeoutCts = new CancellationTokenSource()
+
+            let wait =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let timeoutEntered =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let releaseTimeout =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let onTimeout (_: TimeSpan) : Task =
+                task {
+                    timeoutEntered.TrySetResult() |> ignore
+                    do! releaseTimeout.Task
+                }
+                :> Task
+
+            let race =
+                Timeouts.raceTimeoutWithCts
+                    timeoutCts
+                    None
+                    "test"
+                    "idle-cancels-total"
+                    (Some(TimeSpan.FromMinutes 1.0))
+                    (Some idle)
+                    onTimeout
+                    wait.Task
+
+            try
+                do! timeoutEntered.Task
+
+                releaseTimeout.TrySetResult() |> ignore
+
+                let deadline = Stopwatch.StartNew()
+
+                while not timeoutCts.IsCancellationRequested
+                      && deadline.Elapsed < TimeSpan.FromSeconds 1.0 do
+                    do! Task.Delay 10
+
+                Assert.That(
+                    timeoutCts.IsCancellationRequested,
+                    Is.True,
+                    "the losing total-timeout timer must be cancelled"
+                )
+
+                wait.TrySetResult(Outcome.Exited 0) |> ignore
+                let! outcome = race
+                Assert.That(outcome, Is.EqualTo Outcome.TimedOut)
+            finally
+                releaseTimeout.TrySetResult() |> ignore
+                wait.TrySetResult(Outcome.Exited 0) |> ignore
+        }
+        :> Task
+
+    [<Test>]
     member _.``Retry re-runs a failing command the configured number of times``() : Task =
         let id = Guid.NewGuid().ToString("N")
         let marker = Path.Combine(Path.GetTempPath(), $"pk-retry-{id}.txt")

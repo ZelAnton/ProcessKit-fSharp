@@ -118,15 +118,19 @@ module internal Timeouts =
                 inner.Dispose()
 
     /// Race a process `wait` against a total deadline (`timeout`) and/or a resettable idle deadline
-    /// (`idle`, armed here as the exit wait begins). With neither armed, just returns `wait`. Otherwise:
-    /// if the wait wins, cancel the total-timeout timer and return its outcome; on whichever deadline
-    /// fires first, pass its configured duration to `onTimeout` (the kill — shared by both, so there is
-    /// never a double kill), await `wait` so the child is reaped, log the cause that fired (total vs
-    /// idle), and report `TimedOut`.
-    /// One home for the subtle CTS-cancel + reference-equality-winner logic shared by the run verbs and
-    /// the group runner. (Negatives are rejected by the builder; `isArmable` screens the total defensively,
-    /// so `Task.Delay` here can never throw synchronously; the idle timer was screened at construction.)
-    let raceTimeout
+    /// (`idle`, armed here as the exit wait begins), using an externally supplied `timeoutCts` to arm
+    /// the total-timeout timer. With neither deadline armed, just returns `wait`. Otherwise: if the
+    /// wait wins, cancel `timeoutCts` and return its outcome; on whichever deadline fires first, cancel
+    /// `timeoutCts` immediately (so the losing `Task.Delay` never outlives the race, including through
+    /// a grace-period-bounded kill), pass its configured duration to `onTimeout` (the kill — shared by
+    /// both, so there is never a double kill), await `wait` so the child is reaped, log the cause that
+    /// fired (total vs idle), and report `TimedOut`.
+    /// Split out from `raceTimeout` as a test seam: it lets `ProcessKit.Tests` (via
+    /// `InternalsVisibleTo`) observe the total-timeout CTS directly instead of reflecting into the
+    /// `task {}` state machine's private fields. Ownership/disposal of `timeoutCts` stays with the
+    /// caller — this function only cancels it, never disposes it.
+    let raceTimeoutWithCts
+        (timeoutCts: CancellationTokenSource)
         (logger: ILogger option)
         (program: string)
         (runId: string)
@@ -144,7 +148,6 @@ module internal Timeouts =
         | None, None -> wait
         | _ ->
             task {
-                use timeoutCts = new CancellationTokenSource()
                 let waitBase = wait :> Task
 
                 // Each deadline task is paired with the log to emit if it is the one that fired, so a
@@ -179,6 +182,10 @@ module internal Timeouts =
                         deadlines
                         |> List.find (fun (deadline, _, _) -> obj.ReferenceEquals(deadline, winner))
 
+                    // Cancel the total-timeout timer immediately once the winner is decided — before
+                    // the (possibly grace-period-bounded) kill — so the losing Task.Delay never outlives
+                    // the race resolution, including on the graceful-teardown path.
+                    timeoutCts.Cancel()
                     do! onTimeout configuredDuration
                     let! _ = wait
 
@@ -186,3 +193,23 @@ module internal Timeouts =
 
                     return Outcome.TimedOut
             }
+
+    /// Race a process `wait` against a total deadline (`timeout`) and/or a resettable idle deadline
+    /// (`idle`). Owns the total-timeout `CancellationTokenSource` for the duration of the race and
+    /// disposes it on the way out. See `raceTimeoutWithCts` for the shared behaviour.
+    /// One home for the subtle CTS-cancel + reference-equality-winner logic shared by the run verbs and
+    /// the group runner. (Negatives are rejected by the builder; `isArmable` screens the total defensively,
+    /// so `Task.Delay` here can never throw synchronously; the idle timer was screened at construction.)
+    let raceTimeout
+        (logger: ILogger option)
+        (program: string)
+        (runId: string)
+        (timeout: TimeSpan option)
+        (idle: IdleTimer option)
+        (onTimeout: TimeSpan -> Task)
+        (wait: Task<Outcome>)
+        : Task<Outcome> =
+        task {
+            use timeoutCts = new CancellationTokenSource()
+            return! raceTimeoutWithCts timeoutCts logger program runId timeout idle onTimeout wait
+        }
