@@ -94,6 +94,23 @@ type ShutdownTests() =
         :> Task
 
     [<Test>]
+    member _.``ShutdownAsync rejects negative grace and accepts zero and positive grace``() : Task =
+        task {
+            use zeroGraceGroup = createGroup ()
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () -> zeroGraceGroup.ShutdownAsync(TimeSpan.FromMilliseconds -1.0) |> ignore)
+            )
+            |> ignore
+
+            do! zeroGraceGroup.ShutdownAsync(TimeSpan.Zero)
+
+            use positiveGraceGroup = createGroup ()
+            do! positiveGraceGroup.ShutdownAsync(TimeSpan.FromMilliseconds 1.0)
+        }
+        :> Task
+
+    [<Test>]
     member _.``Shutdown reaps a lingering grandchild``() : Task =
         if isWindows then
             Assert.Ignore "Deep-tree reaping uses POSIX shell job control; exercised on Unix."
@@ -170,6 +187,25 @@ type ShutdownTests() =
             // killed/non-zero exit is returned as data, not raised.
             assertTerminal outcome
             Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 15.0), "StopAsync did not return promptly")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync rejects negative grace and accepts zero and positive grace``() : Task =
+        task {
+            let! zeroGraceProcess = startProc longSleeper
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () -> zeroGraceProcess.StopAsync(TimeSpan.FromMilliseconds -1.0) |> ignore)
+            )
+            |> ignore
+
+            let! zeroGraceOutcome = zeroGraceProcess.StopAsync(TimeSpan.Zero)
+            assertTerminal zeroGraceOutcome
+
+            let! positiveGraceProcess = startProc longSleeper
+            let! positiveGraceOutcome = positiveGraceProcess.StopAsync(TimeSpan.FromMilliseconds 1.0)
+            assertTerminal positiveGraceOutcome
         }
         :> Task
 

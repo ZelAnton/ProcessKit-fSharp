@@ -465,8 +465,12 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // immediate+terminal = `Dispose`; immediate+keep-usable = `KillAll`; graceful+terminal = `ShutdownAsync`.
 
     /// Tear the group down gracefully, then release it. On Unix: SIGTERM, then SIGKILL if still
-    /// alive after `gracePeriod`. On Windows: an atomic Job kill. Idempotent with `Dispose`.
+    /// alive after `gracePeriod`. On Windows: an atomic Job kill. A negative `gracePeriod` is
+    /// rejected with `ArgumentOutOfRangeException`; `TimeSpan.Zero` escalates immediately.
+    /// Idempotent with `Dispose`.
     member this.ShutdownAsync(gracePeriod: TimeSpan) : Task =
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
+
         task {
             // Win the transition first (flag flipped under `sync`), so from here no StartAsync/Signal/
             // Stats/... touches the backend. The graceful wait is UNBOUNDED (up to `gracePeriod`), so it

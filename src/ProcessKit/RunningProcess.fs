@@ -639,6 +639,8 @@ type RunningProcess internal (host: RunningHost) =
     /// obeyed the signal, otherwise a `Signalled`/`Exited` from the escalated kill); a non-zero or
     /// killed exit is data, never a raised error. Unlike the fire-and-forget `Kill()`, this awaits the
     /// stop and tears the tree down before returning, so it is a terminal verb like `WaitAsync`.
+    /// A negative `gracePeriod` is rejected with `ArgumentOutOfRangeException`; `TimeSpan.Zero`
+    /// skips the grace window and escalates immediately.
     ///
     /// This drains the child's stdout/stderr while it shuts down (a child blocked writing to a full
     /// pipe would otherwise ignore the soft signal until it could flush). If a streaming or capturing
@@ -658,6 +660,8 @@ type RunningProcess internal (host: RunningHost) =
     /// from the default runner (`Command.StartAsync()` / `IProcessRunner.SpawnAsync`) owns a private
     /// group and gets the full SIGTERM → grace → SIGKILL on Unix.
     member this.StopAsync(gracePeriod: TimeSpan) : Task<Outcome> =
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
+
         task {
             use _reap = reapGuard ()
             // Begin (or reuse) the exit wait BEFORE signalling, so the pipes are drained while the
