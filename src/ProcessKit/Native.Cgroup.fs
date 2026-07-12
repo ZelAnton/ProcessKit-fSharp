@@ -57,9 +57,8 @@ module internal Cgroup =
 
     // Format a per-core CPU fraction as a cgroup v2 `cpu.max` value ("quota period", microseconds).
     let private cpuMaxValue (cores: float) =
-        let period = 100000.0
-        let quota = max 1.0 (Math.Round(cores * period))
-        $"{int64 quota} {int64 period}"
+        let quota = CgroupCpuMax.calculateQuota cores
+        CgroupCpuMax.formatCpuMax quota
 
     // Enable the controllers the requested limits need (only the missing ones) in the parent's
     // `cgroup.subtree_control`, then write the caps into the child cgroup. Raises on failure (notably
