@@ -200,3 +200,75 @@ type WhichResolutionTests() =
                     Directory.Delete(dir, true)
         }
         :> Task
+
+    [<Test>]
+    member _.``which and a real spawn agree: a program reachable only via a quoted PATH entry is NotFound on both``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Quoting individual PATH entries is a Windows-only convention."
+            else
+                // A directory named with a space AND an embedded ';' — the two reasons a Windows PATH entry
+                // gets wrapped in double quotes. Copy a genuine, directly-launchable PE (`cmd.exe`) into it,
+                // so the tool itself is unimpeachably valid and the only thing making it unreachable below is
+                // the quoting of its PATH entry, not a bad file.
+                let dir =
+                    Path.Combine(Path.GetTempPath(), "processkit quoted;path-" + Guid.NewGuid().ToString "N")
+
+                Directory.CreateDirectory dir |> ignore
+                let toolName = "pk127-quoted-path-tool"
+                let exePath = Path.Combine(dir, toolName + ".exe")
+
+                let systemCmdExe =
+                    Path.Combine(Environment.GetFolderPath Environment.SpecialFolder.System, "cmd.exe")
+
+                File.Copy(systemCmdExe, exePath)
+
+                let originalPath = Environment.GetEnvironmentVariable "PATH"
+
+                try
+                    // Control: addressed by its full path (path-form, no PATH search), the copied exe is a
+                    // real, launchable program — so the NotFound verdicts below are about the quoting, not a
+                    // broken tool. A quoted executable path in the command line IS honoured by CreateProcessW
+                    // (that is command-line parsing, distinct from PATH-entry quoting, which is not).
+                    let! byFullPath = (Command.create exePath |> Command.args [ "/c"; "exit 0" ]).OutputStringAsync()
+
+                    match byFullPath with
+                    | Error error -> Assert.Fail $"expected the tool to launch by full path, got {error}"
+                    | Ok result -> Assert.That(result.Code, Is.EqualTo(Some 0))
+
+                    // Now expose the tool ONLY through a double-quoted PATH entry. Neither CreateProcessW
+                    // (lpApplicationName = NULL, the real bare-name launch) nor SearchPathW strips the
+                    // surrounding quotes, so the actual spawn cannot reach the tool this way. `Exec.which`
+                    // shares `findInPath`, so it MUST reach the same verdict — a `which` "found" here would be
+                    // exactly the preflight/spawn divergence this resolver exists to prevent, inverted.
+                    let quotedDirectory = $"\"{dir}\""
+
+                    let updatedPath =
+                        if String.IsNullOrEmpty originalPath then
+                            quotedDirectory
+                        else
+                            quotedDirectory + ";" + originalPath
+
+                    Environment.SetEnvironmentVariable("PATH", updatedPath)
+
+                    let whichResult = Exec.which toolName
+
+                    let! spawnResult = (Command.create toolName |> Command.args [ "/c"; "exit 0" ]).OutputStringAsync()
+
+                    match whichResult, spawnResult with
+                    | Error whichError, Error spawnError ->
+                        Assert.That(whichError.IsNotFound, Is.True, $"which should be NotFound, got {whichError}")
+                        Assert.That(spawnError.IsNotFound, Is.True, $"spawn should be NotFound, got {spawnError}")
+                    | Ok resolved, _ ->
+                        Assert.Fail
+                            $"which resolved '{toolName}' to '{resolved}' via a quoted PATH entry, but the real spawn cannot launch it that way — a preflight/spawn divergence"
+                    | _, Ok _ ->
+                        Assert.Fail
+                            "the real spawn unexpectedly launched a tool reachable only through a quoted PATH entry"
+                finally
+                    Environment.SetEnvironmentVariable("PATH", originalPath)
+                    Directory.Delete(dir, true)
+        }
+        :> Task
