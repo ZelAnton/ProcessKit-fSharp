@@ -174,6 +174,17 @@ module internal Common =
     /// `probeDir` for each directory in order. Returns `(found, searched)`: `found` is the first
     /// matching directory's resolved path; `searched` is the raw `PATH` value, for the `NotFound`
     /// diagnostic (`""` when `PATH` is unset/empty).
+    ///
+    /// `PATH` is split on the raw `Path.PathSeparator` with NO quote handling, on Windows as on POSIX —
+    /// deliberate and verified. The real bare-name launch is `CreateProcessW` with
+    /// `lpApplicationName = NULL` (see `spawnWindowsCore`), which lets the OS resolve the program, and
+    /// neither that search nor `SearchPathW` strips surrounding double quotes from a `PATH` entry: a
+    /// quoted directory (`"C:\Program Files\Foo"`) is a literal, non-existent path to them, so a program
+    /// inside it is unreachable to the actual spawn. Stripping quotes HERE would make this shared
+    /// preflight/diagnostic resolver report `found` for a program the real spawn can never launch — the
+    /// exact `which`-vs-spawn divergence this resolver exists to prevent, merely inverted. So mirror the
+    /// OS: a quoted entry is treated as the (invalid) directory name it literally is and simply matches
+    /// nothing, exactly as the spawn finds nothing.
     let findInPath (program: string) : string option * string =
         match Environment.GetEnvironmentVariable "PATH" with
         | null
