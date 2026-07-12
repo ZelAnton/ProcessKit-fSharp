@@ -3,6 +3,7 @@ namespace ProcessKit.Tests
 open System
 open System.Diagnostics
 open System.IO
+open System.Reflection
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
@@ -42,6 +43,32 @@ type TimeoutTests() =
             Assert.That(actual, Is.EqualTo expected, "the error must carry the configured deadline that fired")
             Assert.That(error.Message, Is.EqualTo($"'{program}' timed out after {expected.TotalSeconds}s"))
         | other -> Assert.Fail $"expected Timeout, got {other}"
+
+    let timeoutCtsFromRaceTask (race: Task) =
+        let flags = BindingFlags.Instance ||| BindingFlags.NonPublic ||| BindingFlags.Public
+
+        let stateMachineField =
+            race.GetType().GetField("StateMachine", flags)
+            |> Option.ofObj
+            |> Option.defaultWith (fun () -> invalidOp "the race task must retain its state machine while waiting")
+
+        let stateMachine =
+            stateMachineField.GetValue race
+            |> Option.ofObj
+            |> Option.defaultWith (fun () -> invalidOp "the race state machine must be available while waiting")
+
+        let ctsField =
+            stateMachine.GetType().GetFields(flags)
+            |> Array.tryFind (fun field -> field.FieldType = typeof<CancellationTokenSource>)
+
+        let ctsField =
+            ctsField
+            |> Option.defaultWith (fun () -> invalidOp "the race state machine must retain the total-timeout CTS")
+
+        match ctsField.GetValue stateMachine with
+        | :? CancellationTokenSource as cts -> cts
+        | null -> invalidOp "the race state machine must retain a non-null total-timeout CTS"
+        | _ -> invalidOp "the race state machine retained an unexpected total-timeout field type"
 
     [<Test>]
     member _.``Timeout kills the run promptly and reports Timeout``() : Task =
@@ -120,6 +147,64 @@ type TimeoutTests() =
                         "the artificial grace delay should make elapsed time differ from the configured idle window"
                     )
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``idle deadline cancels the losing total-timeout timer``() : Task =
+        task {
+            use idle = new Timeouts.IdleTimer(TimeSpan.FromMilliseconds 25.0)
+
+            let wait =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let timeoutEntered =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let releaseTimeout =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let onTimeout (_: TimeSpan) : Task =
+                task {
+                    timeoutEntered.TrySetResult() |> ignore
+                    do! releaseTimeout.Task
+                }
+                :> Task
+
+            let race =
+                Timeouts.raceTimeout
+                    None
+                    "test"
+                    "idle-cancels-total"
+                    (Some(TimeSpan.FromMinutes 1.0))
+                    (Some idle)
+                    onTimeout
+                    wait.Task
+
+            try
+                do! timeoutEntered.Task
+
+                let timeoutCts = timeoutCtsFromRaceTask race
+                releaseTimeout.TrySetResult() |> ignore
+
+                let deadline = Stopwatch.StartNew()
+
+                while not timeoutCts.IsCancellationRequested
+                      && deadline.Elapsed < TimeSpan.FromSeconds 1.0 do
+                    do! Task.Delay 10
+
+                Assert.That(
+                    timeoutCts.IsCancellationRequested,
+                    Is.True,
+                    "the losing total-timeout timer must be cancelled"
+                )
+
+                wait.TrySetResult(Outcome.Exited 0) |> ignore
+                let! outcome = race
+                Assert.That(outcome, Is.EqualTo Outcome.TimedOut)
+            finally
+                releaseTimeout.TrySetResult() |> ignore
+                wait.TrySetResult(Outcome.Exited 0) |> ignore
         }
         :> Task
 

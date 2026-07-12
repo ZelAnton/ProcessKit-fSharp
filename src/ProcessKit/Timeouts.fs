@@ -180,6 +180,7 @@ module internal Timeouts =
                         |> List.find (fun (deadline, _, _) -> obj.ReferenceEquals(deadline, winner))
 
                     do! onTimeout configuredDuration
+                    timeoutCts.Cancel()
                     let! _ = wait
 
                     emit ()

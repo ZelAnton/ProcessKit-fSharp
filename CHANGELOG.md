@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `Timeouts.raceTimeout` now cancels the unused total-timeout timer as soon as an idle timeout wins, so long configured total deadlines no longer remain scheduled after the process has been timed out.
 
 ## [2.4.0] - 2026-07-11
 
