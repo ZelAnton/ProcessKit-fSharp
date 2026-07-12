@@ -163,6 +163,45 @@ type StdinInheritTests() =
         :> Task
 
     [<Test>]
+    member _.``inherited stdin honestly fails the spawn when GetStdHandle returns INVALID_HANDLE_VALUE``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: exercises GetStdHandle/SetStdHandle fault injection"
+
+            // Force `GetStdHandle(STD_INPUT_HANDLE)` to return `INVALID_HANDLE_VALUE` (`-1`) — the Win32
+            // error sentinel `GetStdHandle` yields on failure — for the duration of the spawn. This is the
+            // regression the fix closes: `inheritableStdHandle` used to reject only `NULL`, so `-1` slipped
+            // through into `DuplicateHandle`, where `-1` is the *current-process pseudo-handle* —
+            // `DuplicateHandle` would then duplicate the PARENT'S OWN PROCESS HANDLE (full access) and hand
+            // it to the child as its inherited stdin. After the fix `isValidHandle` rejects `-1` too, so the
+            // spawn fails honestly with `ProcessError.Spawn` and `DuplicateHandle` is never called with the
+            // bogus `-1` source.
+            let saved = WindowsStdinRedirect.GetStdHandle WindowsStdinRedirect.STD_INPUT_HANDLE
+
+            try
+                WindowsStdinRedirect.SetStdHandle(WindowsStdinRedirect.STD_INPUT_HANDLE, IntPtr(-1))
+                |> ignore
+
+                let command =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/c"; "echo hi" ]
+                    |> Command.inheritStdin
+
+                match! command.OutputStringAsync() with
+                | Ok result ->
+                    Assert.Fail
+                        $"expected an honest ProcessError.Spawn with an INVALID_HANDLE_VALUE stdin std \
+                          handle, got a successful run instead (stdout: {result.Stdout})"
+                | Error(ProcessError.Spawn _) -> ()
+                | Error other -> Assert.Fail $"expected ProcessError.Spawn, got {other}"
+            finally
+                // Restore the real standard input regardless of outcome.
+                WindowsStdinRedirect.SetStdHandle(WindowsStdinRedirect.STD_INPUT_HANDLE, saved)
+                |> ignore
+        }
+        :> Task
+
+    [<Test>]
     member _.``InheritStdin alone builds without throwing``() =
         // The lone InheritStdin, and re-applying it, are both fine (idempotent on the source field).
         Assert.DoesNotThrow(
