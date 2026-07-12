@@ -21,6 +21,7 @@
 		<Compile Include="ReadinessTests.fs" />
 		<Compile Include="TimeoutTests.fs" />
 		<Compile Include="VerbTests.fs" />
+		<Compile Include="ExecBatchTests.fs" />
 		<Compile Include="WhichResolutionTests.fs" />
 		<Compile Include="JsonVerbTests.fs" />
 		<Compile Include="PipelineTests.fs" />

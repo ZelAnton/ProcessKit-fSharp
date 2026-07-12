@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `Exec.outputAll` / `Exec.outputAllBytes` now cancel commands still waiting for a batch-concurrency slot immediately, while preserving results already completed before cancellation.
 
 ## [2.4.0] - 2026-07-11
 

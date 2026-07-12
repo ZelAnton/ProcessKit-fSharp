@@ -44,6 +44,7 @@ module Exec =
         (concurrency: int)
         (runner: IProcessRunner)
         (commands: seq<Command>)
+        (cancellationToken: CancellationToken)
         (capture: IProcessRunner -> Command -> Task<Result<ProcessResult<'T>, ProcessError>>)
         : Task<Result<ProcessResult<'T>, ProcessError>[]> =
         task {
@@ -53,18 +54,30 @@ module Exec =
 
             let runOne (command: Command) =
                 task {
-                    do! gate.WaitAsync()
+                    let! acquired =
+                        task {
+                            try
+                                do! gate.WaitAsync(cancellationToken)
+                                return true
+                            with :? OperationCanceledException ->
+                                return false
+                        }
 
-                    try
+                    if not acquired then
+                        return Error(ProcessError.Cancelled command.Program)
+                    else
                         try
-                            return! capture runner command
-                        with ex ->
-                            // Keep the batch collect-all: a command whose run *throws* (e.g. a throwing
-                            // OnStdoutLine handler faults the capture) becomes this element's Error rather
-                            // than faulting Task.WhenAll and discarding every other command's result.
-                            return Error(ProcessError.Io ex.Message)
-                    finally
-                        gate.Release() |> ignore
+                            try
+                                return! capture runner command
+                            with
+                            | :? OperationCanceledException -> return Error(ProcessError.Cancelled command.Program)
+                            | ex ->
+                                // Keep the batch collect-all: a command whose run *throws* (e.g. a throwing
+                                // OnStdoutLine handler faults the capture) becomes this element's Error rather
+                                // than faulting Task.WhenAll and discarding every other command's result.
+                                return Error(ProcessError.Io ex.Message)
+                        finally
+                            gate.Release() |> ignore
                 }
 
             // Array.map preserves order, and Task.WhenAll returns results in task order.
@@ -83,7 +96,7 @@ module Exec =
         // Route through the verb layer (not the raw seam) so each command's own `Retry` policy applies,
         // matching `cmd.OutputStringAsync()` / `CliClient.OutputStringAsync` — retry still fires only on a genuine
         // error, never on a non-zero exit (which stays data).
-        runAll concurrency runner commands (fun r c -> Runner.outputString r cancellationToken c)
+        runAll concurrency runner commands cancellationToken (fun r c -> Runner.outputString r cancellationToken c)
 
     /// The raw-bytes companion to `outputAll` — captures each command's stdout as bytes.
     let outputAllBytes
@@ -92,4 +105,4 @@ module Exec =
         (commands: seq<Command>)
         (cancellationToken: CancellationToken)
         =
-        runAll concurrency runner commands (fun r c -> Runner.outputBytes r cancellationToken c)
+        runAll concurrency runner commands cancellationToken (fun r c -> Runner.outputBytes r cancellationToken c)
