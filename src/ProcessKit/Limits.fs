@@ -46,28 +46,18 @@ type ResourceLimits internal (memoryMax: int64 option, maxProcesses: int option,
     /// zero, negative, `NaN`, or `PositiveInfinity`/`NegativeInfinity` is rejected
     /// (`ArgumentOutOfRangeException`): a non-positive quota could never let anything run, and an
     /// infinite one has no meaningful cgroup encoding. Also rejected: a value whose conversion into a
-    /// cgroup v2 `cpu.max` "quota period" string (see `Native.Cgroup.cpuMaxValue`) would overflow
-    /// `int64` once rounded to microseconds — the same math is mirrored here (rather than called into
-    /// `Native.Cgroup`, which compiles after `Limits.fs`) so the rejection is identical on every
-    /// platform, before a `ProcessGroup` is even created, instead of only surfacing later and only on
-    /// the Linux backend.
+    /// cgroup v2 `cpu.max` "quota period" string would overflow `int64` once rounded to microseconds.
+    /// The shared conversion validates this before a `ProcessGroup` is even created, rather than only
+    /// surfacing later and only on the Linux backend.
     member _.WithCpuQuota(cores: float) =
         if Double.IsNaN cores || Double.IsInfinity cores || cores <= 0.0 then
             raise (
                 ArgumentOutOfRangeException(nameof cores, cores, "CPU quota must be a finite, positive number of cores")
             )
 
-        // Mirror of Native.Cgroup.cpuMaxValue's "quota period" microsecond conversion: period is
-        // 100_000 microseconds (100ms), quota = round(cores * period). Reject any `cores` that would
-        // make that rounded quota reach or exceed Int64.MaxValue (which `int64 quota` cannot represent).
-        let cgroupPeriodMicroseconds = 100_000.0
-        let cgroupQuotaMicroseconds = Math.Round(cores * cgroupPeriodMicroseconds)
+        let cgroupQuotaMicroseconds = CgroupCpuMax.calculateQuota cores
 
-        if
-            Double.IsNaN cgroupQuotaMicroseconds
-            || Double.IsInfinity cgroupQuotaMicroseconds
-            || cgroupQuotaMicroseconds >= float Int64.MaxValue
-        then
+        if CgroupCpuMax.isQuotaOverflow cgroupQuotaMicroseconds then
             raise (
                 ArgumentOutOfRangeException(
                     nameof cores,
