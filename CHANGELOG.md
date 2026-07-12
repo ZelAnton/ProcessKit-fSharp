@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `ProcessKit.Extensions.Hosting`: a `HostedProcessService.StopAsync` call that found no active child to stop (supervision mid-backoff-sleep, or already ended) no longer resets `LastStopOutcome` to `None`, discarding a previous real stop's outcome; and a `StopAsync` whose internal stop wait was abandoned because the caller's `cancellationToken` expired first no longer risks an unobserved task exception if that abandoned stop later completes with a fault.
 
 ## [2.4.0] - 2026-07-11
 

@@ -83,6 +83,66 @@ type private BlockingRunner() =
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "not used"))
 
+/// An `IProcessRunner` whose spawned child's graceful stop (the internal `RunningProcess.StopAsync`'s
+/// underlying `host.GracefulKill`) resolves the process exit promptly but THEN faults on a delay —
+/// simulating a pump fault while finishing off the child, arriving well after the external caller's own
+/// wait on that stop has already been abandoned by an expired token (T-128 regression coverage for
+/// `TrackingRunner.StopActiveAsync` observing the abandoned internal stop task's late fault).
+type private LateFaultingStopRunner() =
+    let started =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    member _.Started = started.Task
+
+    interface IProcessRunner with
+        member _.SpawnAsync(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                let stdout = new MemoryStream()
+                let stderr = new MemoryStream()
+
+                let finished =
+                    new TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                let host: RunningHost =
+                    { Config = command.Config
+                      Pid = Some 12345
+                      Stdout = Some(stdout :> Stream)
+                      Stderr = Some(stderr :> Stream)
+                      Stdin = None
+                      StartTime = DateTime.UtcNow
+                      StartedTimestamp = Stopwatch.GetTimestamp()
+                      StartTimeIdentity = None
+                      Wait = fun () -> finished.Task
+                      StdinError = fun () -> None
+                      StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
+                      GracefulKill =
+                        fun _ ->
+                            task {
+                                do! Task.Delay 400
+                                // The child has actually exited (an escalated hard-kill elsewhere would
+                                // have reaped it around here too) but the grace machinery itself then
+                                // faults — e.g. a pump fault while finishing off the child.
+                                finished.TrySetResult(Outcome.Signalled None) |> ignore
+                                failwith "late graceful-kill fault"
+                            }
+                            :> Task
+                      Teardown =
+                        fun () ->
+                            stdout.Dispose()
+                            stderr.Dispose()
+                            ValueTask.CompletedTask }
+
+                started.TrySetResult() |> ignore
+                Task.FromResult(Ok(new RunningProcess(host)))
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used"))
+
 /// An `IProcessRunner` whose `SpawnAsync` throws instead of returning a `Result` error — simulating a
 /// failure that escapes an already-built `Supervisor.RunAsync` rather than one it classifies itself.
 type private ThrowingRunner() =
@@ -196,6 +256,89 @@ type HostedProcessTests() =
             do! hosted.StopAsync(CancellationToken.None)
             do! runner.StopRequested.WaitAsync(TimeSpan.FromSeconds 2.0)
             Assert.That(service.LastStopOutcome.IsSome, Is.True)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``A repeat StopAsync that finds no active child does not erase a previously published LastStopOutcome``
+        ()
+        : Task =
+        task {
+            let runner = BlockingRunner()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+            do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            do! hosted.StopAsync(CancellationToken.None)
+            do! runner.StopRequested.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            let firstStopOutcome = service.LastStopOutcome
+            Assert.That(firstStopOutcome.IsSome, Is.True)
+
+            // By the time the first StopAsync returned, the capture that owned the active child had
+            // already cleared it (its `finally` ran as part of awaiting the same supervision task), so
+            // this repeat StopAsync finds no active child — it must not stomp the outcome above.
+            do! hosted.StopAsync(CancellationToken.None)
+            Assert.That(service.LastStopOutcome, Is.EqualTo firstStopOutcome)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync observes a StopActiveAsync fault that arrives after the external token already expired``
+        ()
+        : Task =
+        task {
+            let runner = LateFaultingStopRunner()
+            let mutable unobserved = false
+
+            let handler =
+                EventHandler<UnobservedTaskExceptionEventArgs>(fun _ args ->
+                    unobserved <- true
+                    args.SetObserved())
+
+            TaskScheduler.UnobservedTaskException.AddHandler handler
+
+            try
+                let provider, hosted, _service =
+                    startRegisteredServiceWithRunner
+                        "worker"
+                        (Command.create "worker")
+                        (Func<Supervisor, Supervisor>(id))
+                        (Some(runner :> IProcessRunner))
+
+                use _provider = provider
+                do! hosted.StartAsync(CancellationToken.None)
+                do! runner.Started.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+                // Expires well before the fake `GracefulKill`'s 400ms-delayed fault, so
+                // `StopActiveAsync` takes the `OperationCanceledException` branch and abandons the
+                // still-running internal `RunningProcess.StopAsync` task.
+                use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 100.0)
+                do! hosted.StopAsync(cts.Token)
+
+                // Give the abandoned internal stop task time to actually fault, then force a GC pass:
+                // the CLR reports a still-unobserved task fault from the finalizer once the task is
+                // collected.
+                do! Task.Delay(TimeSpan.FromMilliseconds 800.0)
+                GC.Collect()
+                GC.WaitForPendingFinalizers()
+                GC.Collect()
+
+                Assert.That(
+                    unobserved,
+                    Is.False,
+                    "the abandoned internal StopAsync task's late fault should be observed, not left unobserved"
+                )
+            finally
+                TaskScheduler.UnobservedTaskException.RemoveHandler handler
         }
         :> Task
 
