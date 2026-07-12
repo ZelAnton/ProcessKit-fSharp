@@ -27,10 +27,26 @@ type internal TrackingRunner(inner: IProcessRunner) =
         | None -> Task.FromResult None
         | Some running ->
             task {
+                let stopTask = running.StopAsync(gracePeriod)
+
                 try
-                    let! outcome = running.StopAsync(gracePeriod).WaitAsync(cancellationToken)
+                    let! outcome = stopTask.WaitAsync(cancellationToken)
                     return Some outcome
                 with :? OperationCanceledException ->
+                    // The external `cancellationToken` (observed via `WaitAsync`) fired before
+                    // `stopTask` itself completed; `stopTask` is abandoned but keeps running in the
+                    // background (there is no way to force it to stop). Observe its eventual fault so
+                    // it never surfaces as an unobserved task exception at finalization if it later
+                    // completes faulted (e.g. a pump fault while finishing off the child) — mirrors
+                    // `observeFault` in `RunningProcess` / the `OnlyOnFaulted` continuation in
+                    // `ReadinessProbe`.
+                    stopTask.ContinueWith(
+                        Action<Task<Outcome>>(fun t -> t.Exception |> ignore),
+                        TaskContinuationOptions.OnlyOnFaulted
+                        ||| TaskContinuationOptions.ExecuteSynchronously
+                    )
+                    |> ignore
+
                     return None
             }
 
@@ -291,6 +307,9 @@ type HostedProcessService
     member _.LastOutcome = lock gate (fun () -> lastOutcome)
 
     /// The outcome returned by the child process stop operation during host shutdown, when one ran.
+    /// Only overwritten when a `StopAsync` call actually stopped an active child — a `StopAsync`
+    /// call that finds no active child (supervision mid-backoff-sleep, or already ended) leaves the
+    /// previously published value untouched, rather than resetting it to `None`.
     member _.LastStopOutcome = lock gate (fun () -> lastStopOutcome)
 
     /// Whether the background supervision loop is currently running: `true` from a successful
@@ -350,7 +369,12 @@ type HostedProcessService
                 Volatile.Write(&stopping, 1)
 
                 let! stopped = trackingRunner.StopActiveAsync(options.ShutdownGracePeriod, cancellationToken)
-                lock gate (fun () -> lastStopOutcome <- stopped)
+
+                // Only publish when a stop actually ran (`stopped.IsSome`) — see `LastStopOutcome`'s
+                // doc-comment. A repeat or lone `StopAsync` that finds no active child (`stopped =
+                // None`) must not stomp a previously published real outcome.
+                if stopped.IsSome then
+                    lock gate (fun () -> lastStopOutcome <- stopped)
 
                 // Only cancel `lifetime` here when there was no active child to gracefully stop above
                 // (`stopped = None`): with an active child, `stopping` (set just above) already makes
