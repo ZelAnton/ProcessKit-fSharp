@@ -9,7 +9,7 @@
 		     versioned, and published together by .github/workflows/release.yml. The release
 		     packs with -p:Version=<computed>, so this value is the pre-release seed/default. -->
 		<PackageId>ProcessKit.Extensions.DependencyInjection</PackageId>
-		<Version>2.4.0</Version>
+		<Version>2.4.1</Version>
 		<Description>Microsoft.Extensions.DependencyInjection integration for ProcessKit: AddProcessKit registers an IProcessRunner (ILogger-aware when a logger factory is present).</Description>
 		<PackageTags>fsharp;dotnet;process;subprocess;dependency-injection;microsoft-extensions-dependencyinjection;iprocessrunner;processkit</PackageTags>
 
