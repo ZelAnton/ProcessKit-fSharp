@@ -924,13 +924,24 @@ module internal Pump =
     /// source failure — a source-acquisition failure (per `genuineStdinFault`) on the write side, or
     /// (per `StdinSourceFault`, unconditionally) any fault reading/iterating the source itself — for
     /// the caller to surface, or `None`.
+    ///
+    /// Runs as a `backgroundTask` — detached onto the thread pool — so it never captures the
+    /// `SynchronizationContext` of the thread that started the run. The feed is kicked off
+    /// synchronously from the caller of `command.StartAsync` (via `feedStdinSource` inside
+    /// `ProcessGroup.BuildHost`), so a plain `task { }` would post its post-`await` continuations back
+    /// to that caller's context. On a single-threaded context (a WPF/WinForms UI thread, classic
+    /// ASP.NET) that would deadlock `RunningProcess.TakeStdin`, which blocks that same thread on this
+    /// feed's completion: the feed's continuation could never run because the one thread is parked in
+    /// `TakeStdin`. `backgroundTask` keeps the whole feed on the pool, so that blocking wait is safe.
+    /// (Off any such context — a pool or background thread, as in the tests and CI — `backgroundTask`
+    /// is identical to `task`, so nothing else changes.)
     let feedStdin
         (source: StdinSource)
         (stdinStream: Stream)
         (closeWhenDone: bool)
         (cancellationToken: CancellationToken)
         : Task<exn option> =
-        task {
+        backgroundTask {
             let mutable fault = None
 
             try

@@ -94,6 +94,27 @@ type private ThrowingTeeStream() =
     override _.WriteAsync(_buffer: ReadOnlyMemory<byte>, _cancellationToken: CancellationToken) : ValueTask =
         raise (InvalidOperationException "tee-boom")
 
+/// A single-threaded `SynchronizationContext` standing in for a WPF/WinForms UI thread or classic
+/// ASP.NET request context: `Post` merely *queues* the continuation (recording the count) rather than
+/// running it, because a real UI thread runs it only when it next pumps its message loop. In the
+/// T-123 deadlock test the sole thread that owns this context is blocked inside `TakeStdin` and never
+/// pumps, so anything the stdin feed posted here would never run — the deadlock the fix (running the
+/// feed on the thread pool via `backgroundTask`) must avoid. `Posted` staying `0` is direct evidence
+/// the feed never captured this context.
+type private QueueingSyncContext() =
+    inherit SynchronizationContext()
+    let mutable posted = 0
+
+    /// How many continuations were posted to this context (0 proves nothing captured it).
+    member _.Posted = Volatile.Read(&posted)
+
+    override _.Post(_callback, _state) =
+        Interlocked.Increment(&posted) |> ignore
+
+    override _.Send(callback, state) = callback.Invoke state
+
+    override this.CreateCopy() = this :> SynchronizationContext
+
 /// Regression tests for the correctness & robustness fixes: timeout validation/clamping, the
 /// single-consumption guard on `RunningProcess`, pipeline per-stage `OkCodes`, and pipeline wiring
 /// of a stage whose stdout was set non-piped.
@@ -769,6 +790,105 @@ type CorrectnessBugTests() =
                 Encoding.UTF8.GetString(pipe.ToArray()),
                 Is.EqualTo "SRC\nCALLER",
                 "the source's bytes must precede the caller's on the shared pipe"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``TakeStdin does not deadlock when called from a single-threaded SynchronizationContext``() : Task =
+        task {
+            // T-123 / R-01: `TakeStdin` blocks the caller on the background stdin feed
+            // (`StdinFeedComplete` -> `feeder.Task.GetAwaiter().GetResult()`). That feed MUST run on the
+            // thread pool (`Pump.feedStdin` is a `backgroundTask`) and never capture the caller's
+            // `SynchronizationContext`. Otherwise a consumer on a single-threaded UI context (WPF/WinForms/
+            // classic ASP.NET) that calls `TakeStdin` from that same thread — while a still-feeding source
+            // is parked — deadlocks: the feed's post-`await` continuation would be posted to the one thread
+            // already blocked in `GetResult`, and could never run.
+            //
+            // Deterministic order proof (no timing guesswork): park the source, block `TakeStdin` on the UI
+            // thread, then release the source from a POOL thread. The feed must complete on the pool and
+            // `TakeStdin` must return; on the regression it would sit forever. A bounded wait converts that
+            // hang into a clean failure rather than stalling the whole suite.
+            let gated = GatedStdinAsyncLines "SRC"
+            let syncContext = QueueingSyncContext()
+            let pipe = new MemoryStream()
+
+            let config =
+                (Command.create "test"
+                 |> Command.stdin (Stdin.FromString "x")
+                 |> Command.keepStdinOpen)
+                    .Config
+
+            use returned = new ManualResetEventSlim(false)
+            let mutable takenIsSome = false
+            let mutable startupError: exn option = None
+            let mutable running: RunningProcess = Unchecked.defaultof<_>
+
+            // The "UI thread": it installs the single-threaded context, starts the feed UNDER that context
+            // (so a regression would capture it), builds the run, and blocks in `TakeStdin` from the SAME
+            // thread. It never pumps the context (a blocked UI thread cannot), so any continuation the feed
+            // posted there would never run.
+            let uiThread =
+                Thread(
+                    ThreadStart(fun () ->
+                        try
+                            SynchronizationContext.SetSynchronizationContext syncContext
+
+                            let feeder =
+                                Pump.feedStdinSource (Some(pipe :> Stream)) (Some(Stdin.FromAsyncLines gated)) true
+
+                            let host =
+                                { baseHost config with
+                                    Stdin = Some(pipe :> Stream)
+                                    StdinFeedComplete = fun () -> feeder.Task.GetAwaiter().GetResult() |> ignore }
+
+                            let rp = new RunningProcess(host)
+                            running <- rp
+                            takenIsSome <- (rp.TakeStdin()).IsSome
+                        with ex ->
+                            startupError <- Some ex
+
+                        returned.Set())
+                )
+
+            uiThread.IsBackground <- true
+            uiThread.Start()
+
+            // Wait — on the source's own `Parked` signal, not a delay — until the feed is parked mid-source.
+            // `TakeStdin` is now blocked on the UI thread; the feed (fixed) is running on the pool.
+            let! parked = Task.WhenAny(gated.Parked, Task.Delay 5000)
+            Assert.That(parked, Is.SameAs gated.Parked, "the feed never parked in the source")
+
+            // Release from THIS (pool) thread: the fixed feed completes on the pool and `TakeStdin` returns.
+            gated.Release()
+
+            let signalled = returned.Wait(TimeSpan.FromSeconds 15.0)
+            uiThread.Join(TimeSpan.FromSeconds 5.0) |> ignore
+
+            // Dispose off the (test-blocked) UI thread, from the pool — `RunningProcess` is `IAsyncDisposable`.
+            if not (obj.ReferenceEquals(running, null)) then
+                do! (running :> IAsyncDisposable).DisposeAsync().AsTask()
+
+            match startupError with
+            | Some ex -> raise ex
+            | None -> ()
+
+            Assert.That(
+                signalled,
+                Is.True,
+                "TakeStdin deadlocked: the stdin feed captured the caller's single-threaded SynchronizationContext instead of running on the thread pool"
+            )
+
+            Assert.That(
+                takenIsSome,
+                Is.True,
+                "TakeStdin must hand out the interactive pipe once the source feed completes"
+            )
+
+            Assert.That(
+                syncContext.Posted,
+                Is.EqualTo 0,
+                "the stdin feed must not post any continuation to the caller's SynchronizationContext"
             )
         }
         :> Task

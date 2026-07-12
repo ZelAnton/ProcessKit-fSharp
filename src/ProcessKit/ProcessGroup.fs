@@ -288,6 +288,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
               // never leaves its returned task faulted/cancelled, so awaiting it can't throw; a stopped feed
               // (teardown) also completes, so this can never hang past teardown. The no-source /
               // nothing-to-feed feeder's task is already completed, so this returns immediately there.
+              // The blocking `GetResult` is deadlock-safe even when `TakeStdin` is called from a
+              // single-threaded `SynchronizationContext` (WPF/WinForms/classic ASP.NET): the feed runs
+              // detached on the thread pool (`feedStdin` is a `backgroundTask`), so it keeps making progress
+              // while this thread is parked here rather than waiting to post a continuation back to it.
               StdinFeedComplete = (fun () -> stdinFeeder.Task.GetAwaiter().GetResult() |> ignore)
               StartKill =
                 (if ownsGroup then

@@ -594,6 +594,10 @@ type RunningProcess internal (host: RunningHost) =
     /// (`Command.KeepStdinOpen`), and only once. With **no** source it is available immediately; with a
     /// `Command.Stdin(source)` it is available once the background feeder has finished draining that source
     /// (this call blocks until then), so the caller never writes to the pipe while the feeder still is.
+    /// That wait is deadlock-safe even on a single-threaded `SynchronizationContext` (a WPF/WinForms UI
+    /// thread, classic ASP.NET): the source feeder runs detached on the thread pool (see
+    /// `Pump.feedStdin`'s `backgroundTask`), so it always makes progress while this thread is blocked here
+    /// and is never waiting to post a continuation back to it.
     member _.TakeStdin() : ProcessStdin option =
         // Claim the interactive stdin under `stateLock` so two concurrent `TakeStdin` calls can't both
         // observe `not stdinTaken` and hand out the same stream twice. `host.Stdin` is `Some` exactly when
