@@ -4,9 +4,10 @@
 // URL: a list item's link target must be a chapter file in `src`, and a raw URL
 // makes the build fail ("failed to read chapter https://..."). The three
 // implementation entries are therefore carried in SUMMARY.md as *draft chapters*
-// (empty `()` links) without chapter files. mdBook renders each draft title in a
-// <span> inside `.chapter-link-wrapper`; this script upgrades the two external
-// entries at render time and marks the local implementation:
+// (empty `()` links) without chapter files. mdBook v0.4.40 renders them as
+// <li class="chapter-item"><div>...</div></li>, with no wrapper element.
+// This script upgrades the two external entries to live links and marks the local
+// implementation as a non-clickable indicator:
 //
 //   * "Rust crate"     -> a live external link to the Rust implementation's site.
 //   * "Python wrapper" -> a live external link to the Python wrapper's docs site.
@@ -26,7 +27,7 @@
   function apply() {
     // mdBook v0.4.40 renders draft chapters as:
     // <li class="chapter-item expanded "><div><strong>1.</strong> Rust crate</div></li>
-    // (no .chapter-link-wrapper or nested <span>)
+    // (no nested wrapper or <span>)
     var drafts = document.querySelectorAll(
       ".sidebar .chapter li.chapter-item > div"
     );

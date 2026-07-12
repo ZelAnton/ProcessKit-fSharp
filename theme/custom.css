@@ -26,7 +26,7 @@
 }
 
 /* Left-border track on every item */
-.sidebar .chapter li.chapter-item > .chapter-link-wrapper > a {
+.sidebar .chapter li.chapter-item > a {
     display: block;
     padding: 0.38em 1em 0.38em 1.1em;
     border-left: 3px solid transparent;
@@ -38,7 +38,7 @@
 }
 
 /* Hover */
-.sidebar .chapter li.chapter-item > .chapter-link-wrapper > a:hover {
+.sidebar .chapter li.chapter-item > a:hover {
     background: rgba(128, 128, 128, 0.12);
     border-left-color: rgba(128, 128, 128, 0.45);
     text-decoration: none;
