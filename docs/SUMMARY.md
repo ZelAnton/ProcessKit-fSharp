@@ -4,6 +4,18 @@
 
 ---
 
+<!-- The three entries below form the implementation switcher immediately after
+     Overview. mdBook cannot point a SUMMARY.md entry at an external URL (a raw
+     URL fails the build), so they are carried as DRAFT chapters — empty () links
+     with no chapter files. theme/nav-links.js upgrades "Rust crate" and "Python
+     wrapper" into live external links; ".NET version" remains a labelled,
+     non-clickable indicator for this current implementation. -->
+- [Rust crate]()
+- [Python wrapper]()
+- [.NET version]()
+
+---
+
 - [Comparison and migration guide](comparison.md)
 - [Cookbook](cookbook.md)
 - [Running commands](commands.md)
@@ -18,11 +30,3 @@
 - [Platform support](platform-support.md)
 - [Running in containers](containers.md)
 
-<!-- The two entries below are reserved external "menu items". mdBook cannot point
-     a SUMMARY.md entry at an external URL (a raw URL fails the build), so they are
-     carried as DRAFT chapters — an empty () link, i.e. native non-clickable
-     placeholders with no chapter file — and theme/nav-links.js upgrades them at
-     render time into live external links: "Rust crate" and "Python wrapper" both
-     resolve to their respective docs sites. -->
-- [Rust crate]()
-- [Python wrapper]()

@@ -1,49 +1,52 @@
-// Reserved external "menu items" for the guides sidebar.
+// Reserved implementation links and indicator for the guides sidebar.
 //
 // mdBook's SUMMARY.md cannot express a sidebar entry that points at an external
 // URL: a list item's link target must be a chapter file in `src`, and a raw URL
-// makes the build fail ("failed to read chapter https://..."). So the two
-// reserved entries are carried in SUMMARY.md as *draft chapters* (an empty `()`
-// link) — native, non-clickable placeholders that appear in the sidebar in the
-// right order and position without a chapter file of their own — and this script
-// upgrades them at render time:
+// makes the build fail ("failed to read chapter https://..."). The three
+// implementation entries are therefore carried in SUMMARY.md as *draft chapters*
+// (empty `()` links) without chapter files. mdBook renders each draft title in a
+// <span> inside `.chapter-link-wrapper`; this script upgrades the two external
+// entries at render time and marks the local implementation:
 //
 //   * "Rust crate"     -> a live external link to the Rust implementation's site.
 //   * "Python wrapper" -> a live external link to the Python wrapper's docs site.
+//   * ".NET version"   -> a non-clickable indicator for this implementation.
 //
-// The `placeholder` branch below is kept as a general-purpose fallback for any
-// future reserved entry whose URL is not yet known; neither current entry uses
-// it. Without JS the entries degrade to plain greyed draft items — never a
-// broken or misdirected link.
+// Without JS the entries degrade to plain greyed draft items — never a broken or
+// misdirected link.
 (function () {
   "use strict";
 
   var ENTRIES = {
     "Rust crate": { href: "https://zelanton.github.io/processkit-rs" },
-    "Python wrapper": { href: "https://zelanton.github.io/processkit-py" }
+    "Python wrapper": { href: "https://zelanton.github.io/processkit-py" },
+    ".NET version": { placeholder: "Current implementation" }
   };
 
   function apply() {
-    // A draft chapter renders its title inside a <div> (real chapters use <a>),
-    // so this selects exactly the reserved placeholder items and nothing else.
-    var drafts = document.querySelectorAll(".sidebar .chapter li.chapter-item > div");
-    Array.prototype.forEach.call(drafts, function (div) {
-      var title = div.textContent.replace(/^\s*\d+\.\s*/, "").trim();
+    var drafts = document.querySelectorAll(
+      ".sidebar .chapter li.chapter-item > .chapter-link-wrapper > span"
+    );
+
+    Array.prototype.forEach.call(drafts, function (entry) {
+      var title = entry.textContent.replace(/^\s*\d+\.\s*/, "").trim();
       var spec = ENTRIES[title];
       if (!spec) {
         return;
       }
+
       if (spec.href) {
-        var a = document.createElement("a");
-        a.href = spec.href;
-        a.rel = "noopener";
-        while (div.firstChild) {
-          a.appendChild(div.firstChild);
+        var link = document.createElement("a");
+        link.href = spec.href;
+        link.rel = "noopener";
+        while (entry.firstChild) {
+          link.appendChild(entry.firstChild);
         }
-        div.replaceWith(a);
+        entry.replaceWith(link);
       } else if (spec.placeholder) {
-        div.title = spec.placeholder;
-        div.setAttribute("aria-label", title + " — " + spec.placeholder);
+        entry.classList.add("current-implementation");
+        entry.title = spec.placeholder;
+        entry.setAttribute("aria-label", title + " — " + spec.placeholder);
       }
     });
   }

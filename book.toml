@@ -9,7 +9,7 @@ git-repository-url = "https://github.com/ZelAnton/ProcessKit-fSharp"
 edit-url-template = "https://github.com/ZelAnton/ProcessKit-fSharp/edit/main/docs/{path}"
 site-url = "/ProcessKit-fSharp/"
 additional-css = ["theme/custom.css"]
-# nav-links.js upgrades the two reserved draft chapters at the end of SUMMARY.md
-# (Rust crate / Python wrapper) into their external links — mdBook has no native
-# way to point a sidebar entry at an external URL.
+# nav-links.js upgrades the Rust/Python reserved draft chapters immediately after
+# Overview into external links and marks the .NET entry as the current implementation.
+# mdBook has no native way to point a sidebar entry at an external URL.
 additional-js = ["theme/nav-links.js"]
