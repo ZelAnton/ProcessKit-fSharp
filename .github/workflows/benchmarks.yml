@@ -66,10 +66,13 @@ jobs:
           --project benchmarks/ProcessKit.Benchmarks/ProcessKit.Benchmarks.fsproj
           -- --ci
 
-      - name: Upload benchmark results
+      # Upload the complete artifact directory even after a failed run: the top-level log explains
+      # failures that occur before BenchmarkDotNet has produced a report. A missing directory must
+      # not replace the benchmark step's real error with an artifact-upload error.
+      - name: Upload benchmark artifacts
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: benchmark-results
-          path: BenchmarkDotNet.Artifacts/results/*
-          if-no-files-found: error
+          path: BenchmarkDotNet.Artifacts
+          if-no-files-found: warn
