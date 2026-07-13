@@ -16,34 +16,44 @@ was written, treat this page as possibly stale on that one row rather than autho
 
 ## At a glance
 
-| | `System.Diagnostics.Process` | CliWrap | Medallion.Shell | SimpleExec | **ProcessKit** |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Whole-tree kill-on-dispose containment | — | partial¹ | — | — | **✓** |
-| Honest results (non-zero exit ≠ exception) | partial² | partial³ | partial⁴ | — | **✓** |
-| Typed, pattern-matchable error | — | — | — | — | **✓** |
-| Line streaming | partial⁵ | ✓ | ✓ | — | **✓** |
-| Readiness probes (wait for line / port / condition) | — | — | — | — | **✓** |
-| Shell-free pipelines (`a → b → c`) | — | ✓ | ✓ | — | **✓** |
-| Supervision (restart on crash, backoff) | — | — | — | — | **✓** |
-| Mockable runner seam (`IProcessRunner`-style) | — | — | — | — | **✓** |
-| Secret-safe built-in observability (logging/tracing/metrics) | — | — | — | — | **✓** |
+Choose the library by the guarantee you need, rather than trying to scan a six-column feature
+matrix:
 
-¹ CliWrap kills the whole process tree it started on *cancellation* (cross-platform, since it
-added tree-aware forceful/graceful cancellation), but it has no persistent, disposable container
-you can hold across several commands — each `Cli.Wrap(...)` run is a standalone execution, not a
-member of a shared kill-on-dispose group.
-² `Process.ExitCode` is available without throwing, but `Process` throws on failure to start
-(`Win32Exception`) and offers no structured distinction between "exited non-zero," "timed out,"
-and "killed by signal" — the caller reconstructs that from `ExitCode`/`HasExited` by hand.
-³ `CommandResult`/`BufferedCommandResult` carry `ExitCode` without throwing, but CliWrap validates
-the exit code by default and throws `CommandExecutionException` unless the caller opts out with
-`WithValidation(CommandResultValidation.None)`.
-⁴ `Command.Result` exposes `ExitCode`/`Success` without throwing by default, which is honest; the
-gap on this row is the *typed error* below it, not this one.
-⁵ `Process.OutputDataReceived`/`ErrorDataReceived` deliver lines via events the caller wires up
-manually (`BeginOutputReadLine()`, subscribe, unsubscribe, watch for null-line-means-EOF); there is
-no async-enumerable line stream and no built-in readiness helper.
+### `System.Diagnostics.Process`
 
+- **Best at:** zero-dependency, low-level access to every `ProcessStartInfo` option.
+- **Compared with ProcessKit:** it tracks only the direct child. `ExitCode` is available as data,
+  but start failures throw and timeout/signal/non-zero cases are not one typed result. Its output
+  callbacks require manual event lifecycle management; there are no built-in readiness probes,
+  pipelines, supervision, runner seam, or observability.
+
+### CliWrap
+
+- **Best at:** fluent command construction, shell-free pipelines, and streaming output.
+- **Compared with ProcessKit:** cancellation can terminate the tree for one invocation, but there
+  is no persistent disposable group shared by several commands. Non-zero exits throw by default
+  unless validation is disabled, and it has no readiness probes, supervision, formal runner seam,
+  or built-in secret-safe telemetry.
+
+### Medallion.Shell
+
+- **Best at:** straightforward synchronous or asynchronous commands and shell-free pipelines.
+- **Compared with ProcessKit:** `Command.Result` exposes `ExitCode`/`Success` without throwing,
+  but it does not provide whole-tree containment or a closed typed error model for start, timeout,
+  and signal failures. Readiness probes, supervision, a runner seam, and observability are absent.
+
+### SimpleExec
+
+- **Best at:** deliberately small build-script and CLI glue, with convenient console echoing.
+- **Compared with ProcessKit:** it is exception-first for non-zero exits (unless `noThrow` is set)
+  and has no line streaming, pipeline model, whole-tree containment, readiness probes,
+  supervision, runner substitution, or built-in telemetry. Disable command echo before passing
+  sensitive arguments.
+
+> **What ProcessKit combines:** kernel-backed kill-on-dispose containment for the whole process
+> tree, honest typed outcomes, async line streaming and readiness probes, shell-free pipelines,
+> restart supervision, the `IProcessRunner` testing seam, and secret-safe logging, tracing, and
+> metrics.
 ## `System.Diagnostics.Process`
 
 The BCL type every .NET process library — including ProcessKit — is ultimately built on. Its
@@ -315,7 +325,7 @@ equivalent to CliWrap's event-stream callback style, without giving up buffered 
 
 ## See also
 
-- [Overview → Why ProcessKit?](README.md#why-processkit) — the elevator pitch and the
+- [Overview → Why ProcessKit?](./#why-processkit) — the elevator pitch and the
   core differentiators.
 - [Running commands](commands.md), [Streaming & interactive I/O](streaming.md),
   [Pipelines](pipelines.md), [Supervision](supervision.md),
