@@ -577,11 +577,4 @@ supervisor when you want a process to stay up. See
 
 ---
 
-Next: [Timeouts, retries & cancellation](timeouts-and-cancellation.md) ·
-[Testing your code](testing.md) ·
-[Process groups](process-groups.md) ·
-[Running commands](commands.md) ·
-[Streaming & interactive I/O](streaming.md) ·
-[Pipelines](pipelines.md) ·
-[Platform support](platform-support.md) ·
-[Cookbook](cookbook.md)
+Next: [Testing your code](testing.md)

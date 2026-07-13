@@ -148,3 +148,7 @@ services.AddHealthChecks().Add(
         failureStatus: null,
         tags: null));
 ```
+
+---
+
+Next: [Platform support](platform-support.md)

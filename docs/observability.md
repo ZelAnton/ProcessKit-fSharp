@@ -98,3 +98,7 @@ and disposed. Only the first of those two events counts toward `runs.completed`/
 span: a handle disposed without a terminal verb is still not counted as completed ("an abandoned run
 simply isn't counted as completed"), so `runs.started`/`runs.completed` can legitimately diverge even
 though `runs.active` is exact.
+
+---
+
+Next: [Dependency injection](dependency-injection.md)

@@ -90,3 +90,18 @@
     text-transform: uppercase;
     padding-left: 1.1em;
 }
+/* Keep inline code in table cells aligned with the table's theme. mdBook's
+   highlight stylesheet otherwise gives code-like headers a light block. */
+.content table th code,
+.content table td code,
+.content table th .hljs,
+.content table td .hljs {
+    background-color: transparent;
+    color: inherit;
+    padding: 0;
+}
+
+.content table thead th {
+    background-color: var(--table-header-bg);
+    color: inherit;
+}

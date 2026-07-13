@@ -5,63 +5,58 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![.NET](https://img.shields.io/badge/.NET-8.0%20%7C%2010.0-512BD4.svg)](https://dotnet.microsoft.com/)
 
-# ProcessKit — documentation
+Async child-process management for .NET with a kernel-backed **no-orphan guarantee**: every
+process you start — and everything *it* spawns — lives in a kill-on-dispose container (a
+**Windows Job Object**, a **Linux cgroup v2**, or a **POSIX process group**), so no descendant
+ever outlives your program.
 
-ProcessKit is a child-process toolkit for .NET in two layers:
+Beyond spawning a subprocess: run-and-capture, line streaming, interactive stdin, shell-free
+pipelines, readiness probes, timeouts & cancellation, supervision with restart/backoff, and a
+mockable runner seam for subprocess-free tests.
 
-<div style="display:flex; gap:0.6em; flex-wrap:wrap; margin-bottom:2em;">
-  <a href="https://www.nuget.org/packages/ProcessKit" style="display:inline-block; padding:0.35em 0.8em; border:1px solid var(--table-border-color); border-radius:4px; font-size:0.88em; text-decoration:none; color:var(--links);">NuGet ↗</a>
-  <a href="https://zelanton.github.io/ProcessKit-fSharp/api/" style="display:inline-block; padding:0.35em 0.8em; border:1px solid var(--table-border-color); border-radius:4px; font-size:0.88em; text-decoration:none; color:var(--links);">API Reference ↗</a>
-  <a href="https://github.com/ZelAnton/ProcessKit-fSharp" style="display:inline-block; padding:0.35em 0.8em; border:1px solid var(--table-border-color); border-radius:4px; font-size:0.88em; text-decoration:none; color:var(--links);">GitHub ↗</a>
-</div>
+**F#**
 
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│  Runner layer (async, Task)                                      │
-│  Command · RunningProcess · Pipeline · Supervisor · CliClient    │
-│  capture / streaming / interactive stdin / readiness probes      │
-│  testing seam: IProcessRunner → ScriptedRunner / RecordReplay…   │
-├─────────────────────────────────────────────────────────────────┤
-│  Group layer (kill-on-dispose containment)                       │
-│  ProcessGroup: spawn / signal / suspend / members / stats /      │
-│  limits / shutdown                                               │
-├─────────────────────────────────────────────────────────────────┤
-│  OS mechanisms                                                   │
-│  Windows Job Object · Linux cgroup v2 · POSIX process group      │
-└─────────────────────────────────────────────────────────────────┘
+```fsharp
+task {
+    match! (Command.create "dotnet" |> Command.arg "--version").RunAsync() with
+    | Ok version -> printfn $"{version}"
+    | Error err -> eprintfn $"{err.Message}"
+}
 ```
 
-Every `Command` run gets containment for free: the one-shot verbs spawn into a fresh private
-group that dies with the run, so an early return or an unhandled exception never leaks a process
-tree. The layers are also usable independently — a raw `ProcessGroup` can contain children you
-spawn yourself, and the runner's test doubles never touch the OS at all.
-
-> **Written in F#, built for both F# and C#.** ProcessKit is implemented in F#, but it is designed
-> for first-class, idiomatic use from **both F# and C#** — every public API is meant to be called
-> naturally from either language, and every example in these guides is shown in both.
-
-## The orphan process problem
-
-`Process.Start()` gives you a handle to the direct child, and a bare `Process.Kill()` ends that
-child — not a durable containment boundary for its descendants. If a build tool starts compiler
-workers, or a shell wrapper such as `cmd /c <command>` starts the real payload, those grandchildren
-can outlive a timeout, exception, or early return. They become orphans that keep holding ports,
-temporary files, handles, and other resources after the code that started them has moved on.
+**C#**
 
 ```csharp
-using var process = Process.Start(new ProcessStartInfo("cmd", "/c build.cmd")
+Console.WriteLine(await new Command("dotnet").Arg("--version").RunAsync() switch
 {
-    UseShellExecute = false,
-})!;
-
-await Task.Delay(TimeSpan.FromSeconds(5));
-process.Kill(); // stops cmd.exe; a compiler worker started by build.cmd can keep running
+    { IsOk: true, ResultValue: var version } => version,
+    { IsOk: false, ErrorValue: var err }    => $"error: {err.Message}",
+});
 ```
 
-Cleaning that up correctly means tracking every descendant and handling races while the tree is
-still spawning. ProcessKit makes that ownership explicit: a `ProcessGroup` contains the whole tree,
-and disposing it reaps the group. The one-shot `Command` verbs create and dispose a private group
-for each run, so the same guarantee applies without extra plumbing.
+## Why ProcessKit?
+
+`System.Diagnostics.Process` reaches (at most) the direct child. The processes *it* spawned — a
+build tool's compiler children, the real payload behind a wrapper (`cmd /c …`, `sh -c …`), a
+test's helper servers — survive a timeout, an exception, or a dropped task, and keep running as
+orphans.
+
+ProcessKit spawns every child into the operating system's own containment primitive — a **Job
+Object** on Windows, a **cgroup v2** on Linux (with a process-group fallback), a **POSIX process
+group** on macOS/BSD — so teardown is a kernel operation over the whole tree, not a best-effort
+signal to one pid:
+
+- **Nothing escapes silently.** Disposing the handle or group reaps every descendant,
+  grandchildren included. Where a mechanism has a genuine weakness (a `setsid` child escapes a
+  POSIX process group), the active `Mechanism` is reported instead of pretending — never a silent
+  downgrade.
+- **Async-first.** Run-and-capture, line streaming, interactive stdin, readiness probes,
+  shell-free pipelines, supervision — all return `Task<…>` and stream as `IAsyncEnumerable<…>`.
+- **Honest results.** A non-zero exit is data (`ProcessResult`) until you ask for success; a
+  timeout is *captured* in the result; a cancellation is always an error; every platform
+  divergence is typed or documented.
+- **Testable.** One interface seam (`IProcessRunner`) swaps the real spawner for scripted doubles
+  or record/replay cassettes — no subprocess in your tests.
 
 ## OS-level containment mechanisms
 
@@ -79,16 +74,22 @@ environment instead of assuming one. See [Process groups](process-groups.md) and
 
 ## How it compares
 
-| Capability | `System.Diagnostics.Process` | CliWrap | Medallion.Shell | SimpleExec | **ProcessKit** |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Whole-tree kill-on-dispose containment | — | partial | — | — | **✓** |
-| Honest results (non-zero exit is not an exception by default) | partial | partial | partial | — | **✓** |
-| Typed, pattern-matchable errors | — | — | — | — | **✓** |
-| Line streaming + readiness probes | partial | partial | partial | — | **✓** |
-| Shell-free pipelines | — | ✓ | ✓ | — | **✓** |
-| Supervision (restart, backoff, jitter) | — | — | — | — | **✓** |
-| Mockable test seam (`IProcessRunner`) | — | — | — | — | **✓** |
-| Built-in observability (logging, tracing, metrics) | — | — | — | — | **✓** |
+The comparison is easier to scan as short capability cards than as a table that forces five
+columns onto a narrow screen:
+
+- **`System.Diagnostics.Process`** tracks only the direct child. It has no durable whole-tree
+  containment, readiness probes, supervision, or injectable runner seam.
+- **CliWrap** has an excellent fluent pipeline API and tree-aware cancellation, but no persistent
+  `ProcessGroup` for several commands, resource limits, readiness probes, supervision, or runner
+  seam.
+- **Medallion.Shell** offers straightforward synchronous/async commands and pipelines, but does
+  not provide whole-tree containment, typed errors, readiness probes, supervision, or a formal test
+  seam.
+- **SimpleExec** is intentionally minimal and exception-first: useful for build-script glue, but
+  without streaming, pipelines, containment, supervision, or runner substitution.
+- **ProcessKit** combines kernel-backed whole-tree containment with honest typed outcomes, async
+  streaming, readiness probes, shell-free pipelines, supervision, secret-safe observability, and
+  the `IProcessRunner` seam.
 
 See the [Comparison and migration guide](comparison.md) for details and migration recipes.
 
@@ -193,3 +194,7 @@ The same XML docs also power a browsable, generated
 **[API reference](https://zelanton.github.io/ProcessKit-fSharp/api/)** — published alongside these
 guides on the same site — reach for it when you want a member-by-member lookup instead of a
 task-oriented guide.
+
+---
+
+Next: [Comparison and migration guide](comparison.md)

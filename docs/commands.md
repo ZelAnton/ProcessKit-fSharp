@@ -1077,6 +1077,4 @@ carry that field (e.g. `.Code` is set only on `Exit`, `.Stdout`/`.Stderr`/`.Comb
 
 ---
 
-Next: [Streaming & interactive I/O](streaming.md) ·
-[Timeouts, retries & cancellation](timeouts-and-cancellation.md) ·
-[Process groups](process-groups.md)
+Next: [Process groups](process-groups.md)

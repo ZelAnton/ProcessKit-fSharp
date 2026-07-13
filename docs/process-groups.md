@@ -630,6 +630,4 @@ rather than a live group series, use `RunningProcess.Profile` — see
 
 ---
 
-Next: [Streaming & interactive I/O](streaming.md) ·
-[Platform support](platform-support.md) ·
-[Supervision](supervision.md)
+Next: [Streaming & interactive I/O](streaming.md)

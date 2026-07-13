@@ -548,8 +548,4 @@ returned an `IsTimedOut` result.
 
 ---
 
-Next: [supervision.md](supervision.md) ·
-[streaming.md](streaming.md) ·
-[pipelines.md](pipelines.md) ·
-[commands.md](commands.md) ·
-[testing.md](testing.md)
+Next: [Supervision](supervision.md)

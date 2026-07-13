@@ -686,6 +686,4 @@ cgroup backend, and `None` where the kernel doesn't account per-process cheaply 
 
 ---
 
-Next: [Pipelines](pipelines.md) ·
-[Timeouts, retries & cancellation](timeouts-and-cancellation.md) ·
-[Supervision](supervision.md)
+Next: [Pipelines](pipelines.md)

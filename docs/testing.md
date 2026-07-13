@@ -641,6 +641,4 @@ point of depending on the interface.
 
 ---
 
-Next: [Platform support](platform-support.md) ·
-[Supervision](supervision.md) ·
-[Running commands](commands.md)
+Next: [Observability](observability.md)

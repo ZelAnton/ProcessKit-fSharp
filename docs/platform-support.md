@@ -308,4 +308,4 @@ an internal characteristic only — the `Task`-based public API is unchanged.
 
 ---
 
-Next: [Running in containers](containers.md) · [Process groups](process-groups.md) · [Running commands](commands.md) · [Streaming & interactive I/O](streaming.md) · [docs index](README.md)
+Next: [Running in containers](containers.md)

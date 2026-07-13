@@ -257,8 +257,3 @@ matters, and `ProcessGroupOptions` limits are for the narrower case of bounding 
 *within* a container's broader budget — a build step's compiler, an untrusted subprocess, a fork
 bomb guard on a supervised worker — where the container-level cap alone can't distinguish between
 that one process and the rest of the workload sharing the container.
-
----
-
-Next: [Platform support](platform-support.md) · [Process groups](process-groups.md) ·
-[Dependency injection](dependency-injection.md) · [docs index](README.md)

@@ -315,8 +315,12 @@ equivalent to CliWrap's event-stream callback style, without giving up buffered 
 
 ## See also
 
-- [README → Why ProcessKit?](../README.md#why-processkit) — the elevator pitch and the
-  single-column differentiator table.
+- [Overview → Why ProcessKit?](README.md#why-processkit) — the elevator pitch and the
+  core differentiators.
 - [Running commands](commands.md), [Streaming & interactive I/O](streaming.md),
   [Pipelines](pipelines.md), [Supervision](supervision.md),
   [Testing your code](testing.md) — the full guide set each recipe above links into.
+
+---
+
+Next: [Cookbook](cookbook.md)

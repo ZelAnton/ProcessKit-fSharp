@@ -419,10 +419,4 @@ set of stdin sources and their semantics.
 
 ---
 
-Next: [Timeouts, retries & cancellation](timeouts-and-cancellation.md) ·
-[Running commands](commands.md) ·
-[Process groups](process-groups.md) ·
-[Streaming & interactive I/O](streaming.md) ·
-[Testing your code](testing.md) ·
-[Platform support](platform-support.md) ·
-[Cookbook](cookbook.md)
+Next: [Timeouts, retries & cancellation](timeouts-and-cancellation.md)
