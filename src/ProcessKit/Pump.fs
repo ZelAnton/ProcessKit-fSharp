@@ -1097,13 +1097,40 @@ module internal Pump =
     let feedStdinSource (stdin: Stream option) (source: Stdin option) (keepStdinOpen: bool) : StdinFeeder =
         match stdin, source with
         | Some stdinStream, Some src ->
-            // The lifecycle token: cancelling it stops the feed (unblocking a parked source read),
-            // disposed by the feeder once the feed has finished.
-            let cts = new CancellationTokenSource()
-            // Close the pipe (EOF) after the source UNLESS `KeepStdinOpen` kept it open for interactive
-            // writing: then the feed just drains + flushes the source and leaves the stream open, and its
-            // completion (`StdinFeeder.Task`) is the point after which `TakeStdin` may hand the stream to
-            // the caller — never while the feed is still writing (two writers on one pipe is forbidden).
-            let feed = feedStdin src.Source stdinStream (not keepStdinOpen) cts.Token
-            StdinFeeder(feed, Some cts)
+            // Open a file source before returning the spawned handle. A fast child can otherwise exit
+            // before the background feed gets scheduled, making a missing file nondeterministically
+            // disappear behind an otherwise-successful outcome.
+            match src.Source with
+            | StdinSource.File path ->
+                try
+                    let file = File.OpenRead path
+                    let cts = new CancellationTokenSource()
+
+                    let feed =
+                        feedStdin (StdinSource.Reader file) stdinStream (not keepStdinOpen) cts.Token
+
+                    feed.ContinueWith(
+                        (fun (_: Task<exn option>) -> file.Dispose()),
+                        CancellationToken.None,
+                        TaskContinuationOptions.None,
+                        TaskScheduler.Default
+                    )
+                    |> ignore
+
+                    StdinFeeder(feed, Some cts)
+                with ex ->
+                    // No source bytes can be written, so close stdin just as a failed background feed
+                    // would; the completed feeder makes the source error visible to the terminal verb.
+                    disposeQuietly stdinStream
+                    StdinFeeder(Task.FromResult(Some ex), None)
+            | _ ->
+                // The lifecycle token: cancelling it stops the feed (unblocking a parked source read),
+                // disposed by the feeder once the feed has finished.
+                let cts = new CancellationTokenSource()
+                // Close the pipe (EOF) after the source UNLESS `KeepStdinOpen` kept it open for interactive
+                // writing: then the feed just drains + flushes the source and leaves the stream open, and its
+                // completion (`StdinFeeder.Task`) is the point after which `TakeStdin` may hand the stream to
+                // the caller — never while the feed is still writing (two writers on one pipe is forbidden).
+                let feed = feedStdin src.Source stdinStream (not keepStdinOpen) cts.Token
+                StdinFeeder(feed, Some cts)
         | _ -> StdinFeeder(Task.FromResult(None: exn option), None)

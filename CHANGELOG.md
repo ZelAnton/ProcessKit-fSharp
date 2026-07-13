@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
+- Made missing `Stdin.FromFile` sources reliably report `ProcessError.Stdin` when a child exits successfully.
+- Restored XPlat code-coverage collection for the C# test project in CI.
 - `RunningProcess.StopAsync(gracePeriod)` and `ProcessGroup.ShutdownAsync(gracePeriod)` now reject negative grace periods with `ArgumentOutOfRangeException` instead of silently treating them as an immediate kill.
 - On POSIX, process groups that reject a signal-0 liveness probe with `EPERM` are no longer treated as gone: they remain tracked for later control and teardown, while only `ESRCH` proves that a group no longer exists.
 - A Windows child spawned with `StdioMode.Inherit` (or `Command.InheritStdin`) no longer silently receives a handle to the **parent process itself** as its std input/output/error when the corresponding `GetStdHandle` fails. `GetStdHandle` returns `INVALID_HANDLE_VALUE` (`-1`) on failure, and to `DuplicateHandle` that `-1` is the current-process pseudo-handle — the old check rejected only `NULL`, so `-1` slipped through and duplicated the parent's full-access process handle into the child. Both failure sentinels are now rejected, so a broken `GetStdHandle` produces an honest `ProcessError.Spawn` instead.
