@@ -9,7 +9,7 @@
 		     versioned, and published together by .github/workflows/release.yml. The release
 		     packs with -p:Version=<computed>, so this value is the pre-release seed/default. -->
 		<PackageId>ProcessKit.Testing</PackageId>
-		<Version>2.4.1</Version>
+		<Version>2.4.2</Version>
 		<Description>Test doubles for ProcessKit — a subprocess-free ScriptedRunner (with Reply), an in-memory FakeProcess handle, and a record/replay IProcessRunner (RecordReplayRunner + cassettes). Shipped as a separate package so the disk/JSON record-replay surface stays out of a consumer's production dependency; reference it only from test projects.</Description>
 		<PackageTags>fsharp;dotnet;process;subprocess;testing;test-double;fake;mock;scripted-runner;record-replay;cassette;iprocessrunner;processkit</PackageTags>
 
