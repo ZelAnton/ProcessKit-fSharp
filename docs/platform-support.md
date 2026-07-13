@@ -1,6 +1,6 @@
 # Platform support
 
-[‹ docs index](README.md)
+[Previous: Overview](./)
 
 ProcessKit treats platform behaviour as first-class. Every child you start lives inside the
 operating system's own containment primitive, so the kill-on-dispose tree guarantee holds on

@@ -1,6 +1,6 @@
 # Testing your code
 
-[‹ docs index](README.md)
+[Previous: Overview](./)
 
 Code that shells out is miserable to test — unless the subprocess sits behind a
 seam. In ProcessKit that seam is one small interface, `IProcessRunner`. It is

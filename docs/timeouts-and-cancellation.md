@@ -1,6 +1,6 @@
 # Timeouts, retries & cancellation
 
-[‹ docs index](README.md)
+[Previous: Overview](./)
 
 Three ways a run can end early, with three different philosophies:
 

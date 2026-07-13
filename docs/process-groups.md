@@ -1,6 +1,6 @@
 # Process groups
 
-[‹ docs index](README.md)
+[Previous: Overview](./)
 
 A `ProcessGroup` ties the lifetime of a whole child-process **tree** to a single
 disposable value: every process you start into the group — and everything *those*

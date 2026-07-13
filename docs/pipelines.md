@@ -1,6 +1,6 @@
 # Pipelines
 
-[‹ docs index](README.md)
+[Previous: Overview](./)
 
 Build `a → b → c` **without a shell**. Each stage's stdout is wired straight into the
 next stage's stdin by an in-process relay — there is no shell string anywhere, so there

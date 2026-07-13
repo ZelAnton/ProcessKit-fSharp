@@ -1,6 +1,6 @@
 # Running in containers
 
-[‹ docs index](README.md)
+[Previous: Overview](./)
 
 Containers are the default deployment target for server .NET, and they are also where the
 platform fine print in [Platform support](platform-support.md) matters most: which containment

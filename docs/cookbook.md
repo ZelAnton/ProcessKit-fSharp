@@ -1,6 +1,6 @@
 # ProcessKit cookbook
 
-[‹ docs index](README.md)
+[Previous: Overview](./)
 
 Task-oriented, idiomatic examples for every part of the public API. The run and capture
 verbs return `Task<Result<_, ProcessError>>`, so the F# samples below run inside a `task { }`

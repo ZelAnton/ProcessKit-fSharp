@@ -1,6 +1,6 @@
 # Supervision
 
-[‹ docs index](README.md)
+[Previous: Overview](./)
 
 A `Supervisor` answers a different question from [`retry`](timeouts-and-cancellation.md).
 Retry replays *one* run until it succeeds and then hands you that single result; a supervisor

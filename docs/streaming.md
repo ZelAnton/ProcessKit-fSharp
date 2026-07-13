@@ -1,6 +1,6 @@
 # Streaming & interactive I/O
 
-[‹ docs index](README.md)
+[Previous: Overview](./)
 
 The one-shot verbs in [Running commands](commands.md) buffer the whole output and
 hand it back when the child exits. For a long-running or conversational child you
