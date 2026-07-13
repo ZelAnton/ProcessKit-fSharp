@@ -25,6 +25,12 @@ type HostedProcessHealthCheckTests() =
         else
             Command.create "/bin/sh" |> Command.args [ "-c"; script ]
 
+    let sleeper =
+        if isWindows then
+            shell "ping 127.0.0.1 -n 30 >nul"
+        else
+            shell "sleep 30"
+
     let waitUntil (predicate: unit -> bool) : Task<bool> =
         task {
             let deadline = DateTime.UtcNow + TimeSpan.FromSeconds 6.0
@@ -73,7 +79,7 @@ type HostedProcessHealthCheckTests() =
     member _.``Health check reports Healthy while the child is running``() : Task =
         task {
             let provider, hosted, service, healthCheck =
-                startRegisteredService "worker" (shell "echo hi") (Func<Supervisor, Supervisor>(id)) None
+                startRegisteredService "worker" sleeper (Func<Supervisor, Supervisor>(id)) None
 
             use _provider = provider
             do! hosted.StartAsync(CancellationToken.None)
@@ -172,9 +178,19 @@ type HostedProcessHealthCheckTests() =
     [<Test>]
     member _.``RestartCount resets to 0 on a fresh StartAsync after supervision ended``() : Task =
         task {
+            let mutable configuredRuns = 0
+
             let configure =
                 Func<Supervisor, Supervisor>(fun supervisor ->
-                    supervisor.Restart(RestartPolicy.OnCrash).MaxRestarts(1).Backoff(TimeSpan.Zero, 1.0))
+                    let run = Interlocked.Increment(&configuredRuns)
+
+                    if run = 1 then
+                        supervisor.Restart(RestartPolicy.OnCrash).MaxRestarts(1).Backoff(TimeSpan.Zero, 1.0)
+                    else
+                        // The second supervision must finish without a new restart. This makes the
+                        // observable zero unambiguous: it is the fresh run's reset, not a value that
+                        // happened to be sampled before its first immediate crash/restart.
+                        supervisor.Restart RestartPolicy.Never)
 
             let provider, hosted, service, _healthCheck =
                 startRegisteredService "restarter" (shell "exit 7") configure None
@@ -186,11 +202,12 @@ type HostedProcessHealthCheckTests() =
             Assert.That(completed, Is.True)
             Assert.That(service.RestartCount, Is.EqualTo 1)
 
-            // `StartAsync` resets `RestartCount` to 0 synchronously, before it hands the fresh
-            // supervision loop off to the background — spawning the real child (let alone a whole
-            // crash+restart cycle) always needs at least one asynchronous hop, so reading
-            // `RestartCount` right here, with no further await, cannot race a restart of the new run.
             do! hosted.StartAsync(CancellationToken.None)
+
+            let! restartedAndCompleted =
+                waitUntil (fun () -> Volatile.Read(&configuredRuns) = 2 && not service.IsSupervisionActive)
+
+            Assert.That(restartedAndCompleted, Is.True)
             Assert.That(service.RestartCount, Is.EqualTo 0)
 
             do! hosted.StopAsync(CancellationToken.None)
