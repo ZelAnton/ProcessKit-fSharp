@@ -1145,3 +1145,21 @@ type CorrectnessBugTests() =
                      ())
         }
         :> Task
+
+    [<Test>]
+    member _.``cgroup suspend and resume surface freeze write failures``() =
+        // A missing directory makes the cgroup.freeze write fail without requiring a writable cgroup v2
+        // hierarchy. The backend must expose that native failure rather than report a false success.
+        let missingCgroup =
+            Path.Combine(Path.GetTempPath(), $"processkit-missing-freeze-{Guid.NewGuid():N}")
+
+        let backend: IContainmentBackend = CgroupBackend missingCgroup
+
+        let assertIo operation result =
+            match result with
+            | Error(ProcessError.Io _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Io from {operation}, got {other}"
+            | Ok() -> Assert.Fail $"expected {operation} to surface the cgroup.freeze write failure"
+
+        assertIo "Suspend" (backend.Suspend())
+        assertIo "Resume" (backend.Resume())

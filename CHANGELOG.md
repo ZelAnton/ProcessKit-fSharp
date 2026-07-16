@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `ProcessGroup.Suspend()` and `Resume()` now report POSIX signal-delivery and cgroup freeze/thaw failures as `ProcessError.Io` instead of silently succeeding.
 
 ## [2.4.2] - 2026-07-13
 
