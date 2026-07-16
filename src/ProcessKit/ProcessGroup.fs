@@ -403,12 +403,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         this.WhenLive(fun () -> backend.Signal signal)
 
     /// Suspend (freeze) every process in the group. POSIX: `SIGSTOP` (level-triggered, idempotent).
-    /// Cgroup v2: `cgroup.freeze`. Windows: suspend every thread of every member — best-effort, and
-    /// suspend counts stack, so N `Suspend`s need N `Resume`s.
+    /// Cgroup v2: `cgroup.freeze`. Windows: suspend every thread of every member; suspend counts stack,
+    /// so N `Suspend`s need N `Resume`s. A failed native delivery or cgroup write returns
+    /// `ProcessError.Io`; a POSIX member that exited concurrently is a successful no-op.
     member this.Suspend() : Result<unit, ProcessError> =
         this.WhenLive(fun () -> backend.Suspend())
 
-    /// Resume a tree suspended by `Suspend`.
+    /// Resume a tree suspended by `Suspend`. Failed native delivery or cgroup thaw writes return
+    /// `ProcessError.Io`; a POSIX member that exited concurrently is a successful no-op.
     member this.Resume() : Result<unit, ProcessError> =
         this.WhenLive(fun () -> backend.Resume())
 

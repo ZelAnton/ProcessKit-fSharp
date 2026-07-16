@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `Exec.which` and `CliClient.EnsureAvailableAsync` no longer risk throwing a raw exception when a candidate on `PATH` disappears mid-probe (a TOCTOU race between the existence check and the POSIX executable-bit check) or is otherwise inaccessible: the offending candidate is now treated as not found and the `PATH` search continues, and any unexpected failure at the whole-resolution level surfaces as a typed `ProcessError.Io` instead.
+- `ProcessGroup.Suspend()` and `Resume()` now report POSIX signal-delivery and cgroup freeze/thaw failures as `ProcessError.Io` instead of silently succeeding.
 
 ## [2.4.2] - 2026-07-13
 
