@@ -126,7 +126,7 @@ module internal CaptureVerbs =
         parse program deserialize runText
 
     /// Deserialize the trimmed stdout from `runText` with caller-provided source-generated metadata.
-    /// Unlike `outputJson`, this uses the `JsonTypeInfo<'T>` overload directly and is trim-/AOT-safe.
+    /// Unlike `outputJson`, this uses the non-generic `JsonTypeInfo` overload (via upcast to sidestep nullness checks) and is trim-/AOT-safe.
     let outputJsonTyped<'T>
         (program: string)
         (typeInfo: JsonTypeInfo<'T>)

@@ -35,6 +35,21 @@ type JsonVerbTests() =
         JsonSerializerOptions.Default.GetTypeInfo(typeof<int>) :?> JsonTypeInfo<int>
 
     [<Test>]
+    member _.``Runner.outputJson deserializes valid JSON into a typed value``() : Task =
+        task {
+            let! result =
+                Command.create "widget-tool"
+                |> Runner.outputJson<Widget> runner CancellationToken.None None
+
+            match result with
+            | Ok widget ->
+                Assert.That(widget.Name, Is.EqualTo "gizmo")
+                Assert.That(widget.Count, Is.EqualTo 3)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``Runner.outputJsonTyped deserializes valid JSON into a typed value``() : Task =
         task {
             let! result =
@@ -50,6 +65,19 @@ type JsonVerbTests() =
         :> Task
 
     [<Test>]
+    member _.``Runner.outputJson surfaces invalid JSON as ProcessError.Parse``() : Task =
+        task {
+            let! result =
+                Command.create "bad-json-tool"
+                |> Runner.outputJson<Widget> runner CancellationToken.None None
+
+            match result with
+            | Error(ProcessError.Parse _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected a Parse error, got {other}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``Runner.outputJsonTyped surfaces invalid JSON as ProcessError.Parse``() : Task =
         task {
             let! result =
@@ -59,6 +87,19 @@ type JsonVerbTests() =
             match result with
             | Error(ProcessError.Parse _) -> Assert.Pass()
             | other -> Assert.Fail $"expected a Parse error, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Runner.outputJson surfaces a non-zero exit as ProcessError.Exit, not a parse attempt``() : Task =
+        task {
+            let! result =
+                Command.create "failing-tool"
+                |> Runner.outputJson<Widget> runner CancellationToken.None None
+
+            match result with
+            | Error(ProcessError.Exit(_, 1, _, stderr)) -> Assert.That(stderr, Is.EqualTo "boom")
+            | other -> Assert.Fail $"expected an Exit error, got {other}"
         }
         :> Task
 
@@ -109,18 +150,71 @@ type JsonVerbTests() =
                 else
                     Command.create "/bin/sh" |> Command.args [ "-c"; "echo 42" ]
 
-            match! echoNumber.OutputJsonAsync<int>(intTypeInfo) with
+            match! echoNumber.OutputJsonAsync<int>() with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"{error}"
 
-            match! echoNumber.OutputJsonAsync<int>(intTypeInfo, cancellationToken = CancellationToken.None) with
+            match! echoNumber.OutputJsonAsync<int>(cancellationToken = CancellationToken.None) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"(ct) {error}"
         }
         :> Task
 
     [<Test>]
+    member _.``Command.OutputJsonAsync with source-generated type info reaches the default runner``() : Task =
+        task {
+            let isWindows =
+                System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                    System.Runtime.InteropServices.OSPlatform.Windows
+                )
+
+            let echoNumber =
+                if isWindows then
+                    Command.create "cmd.exe" |> Command.args [ "/c"; "echo 42" ]
+                else
+                    Command.create "/bin/sh" |> Command.args [ "-c"; "echo 42" ]
+
+            match! echoNumber.OutputJsonAsync<int>(intTypeInfo) with
+            | Ok value -> Assert.That(value, Is.EqualTo 42)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Command.OutputJsonAsync with source-generated type info surfaces invalid JSON as ProcessError.Parse``
+        ()
+        : Task =
+        task {
+            let isWindows =
+                System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                    System.Runtime.InteropServices.OSPlatform.Windows
+                )
+
+            let echoGarbage =
+                if isWindows then
+                    Command.create "cmd.exe" |> Command.args [ "/c"; "echo not-json-at-all" ]
+                else
+                    Command.create "/bin/sh" |> Command.args [ "-c"; "echo not-json-at-all" ]
+
+            match! echoGarbage.OutputJsonAsync<int>(intTypeInfo) with
+            | Error(ProcessError.Parse _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected a Parse error, got {other}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``IProcessRunner.OutputJsonAsync extension deserializes through the configured runner``() : Task =
+        task {
+            match! runner.OutputJsonAsync<Widget>(Command.create "widget-tool") with
+            | Ok widget -> Assert.That(widget.Name, Is.EqualTo "gizmo")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``IProcessRunner.OutputJsonAsync extension with source-generated type info deserializes through a ScriptedRunner``
+        ()
+        : Task =
         task {
             match! runner.OutputJsonAsync<Widget>(Command.create "widget-tool", widgetTypeInfo) with
             | Ok widget -> Assert.That(widget.Name, Is.EqualTo "gizmo")
@@ -129,7 +223,33 @@ type JsonVerbTests() =
         :> Task
 
     [<Test>]
+    member _.``IProcessRunner.OutputJsonAsync extension with source-generated type info surfaces invalid JSON as ProcessError.Parse``
+        ()
+        : Task =
+        task {
+            match! runner.OutputJsonAsync<Widget>(Command.create "bad-json-tool", widgetTypeInfo) with
+            | Error(ProcessError.Parse _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected a Parse error, got {other}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``CliClient.OutputJsonAsync routes through the configured runner``() : Task =
+        task {
+            let client = CliClient("widget-tool").WithRunner runner
+
+            match! client.OutputJsonAsync<Widget> [] with
+            | Ok widget ->
+                Assert.That(widget.Name, Is.EqualTo "gizmo")
+                Assert.That(widget.Count, Is.EqualTo 3)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``CliClient.OutputJsonAsync with source-generated type info routes through the configured runner``
+        ()
+        : Task =
         task {
             let client = CliClient("widget-tool").WithRunner runner
 
@@ -138,6 +258,19 @@ type JsonVerbTests() =
                 Assert.That(widget.Name, Is.EqualTo "gizmo")
                 Assert.That(widget.Count, Is.EqualTo 3)
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``CliClient.OutputJsonAsync with source-generated type info surfaces invalid JSON as ProcessError.Parse``
+        ()
+        : Task =
+        task {
+            let client = CliClient("bad-json-tool").WithRunner runner
+
+            match! client.OutputJsonAsync<Widget>([], widgetTypeInfo) with
+            | Error(ProcessError.Parse _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected a Parse error, got {other}"
         }
         :> Task
 
@@ -161,8 +294,57 @@ type JsonVerbTests() =
 
             let pipeline = source.Pipe(Command.create "sort")
 
+            match! pipeline.OutputJsonAsync<int>() with
+            | Ok value -> Assert.That(value, Is.EqualTo 99)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Pipeline.OutputJsonAsync with source-generated type info deserializes the pipefail-representative stage's stdout``
+        ()
+        : Task =
+        task {
+            let isWindows =
+                System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                    System.Runtime.InteropServices.OSPlatform.Windows
+                )
+
+            let source =
+                if isWindows then
+                    Command.create "cmd.exe" |> Command.args [ "/c"; "echo 99" ]
+                else
+                    Command.create "/bin/sh" |> Command.args [ "-c"; "echo 99" ]
+
+            let pipeline = source.Pipe(Command.create "sort")
+
             match! pipeline.OutputJsonAsync<int>(intTypeInfo) with
             | Ok value -> Assert.That(value, Is.EqualTo 99)
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Pipeline.OutputJsonAsync with source-generated type info surfaces invalid JSON as ProcessError.Parse``
+        ()
+        : Task =
+        task {
+            // Real-process pipeline; a non-numeric line is not valid JSON for `int`.
+            let isWindows =
+                System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                    System.Runtime.InteropServices.OSPlatform.Windows
+                )
+
+            let source =
+                if isWindows then
+                    Command.create "cmd.exe" |> Command.args [ "/c"; "echo not-json-at-all" ]
+                else
+                    Command.create "/bin/sh" |> Command.args [ "-c"; "echo not-json-at-all" ]
+
+            let pipeline = source.Pipe(Command.create "sort")
+
+            match! pipeline.OutputJsonAsync<int>(intTypeInfo) with
+            | Error(ProcessError.Parse _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected a Parse error, got {other}"
         }
         :> Task

@@ -56,8 +56,22 @@ public class JsonVerbTests
         Assert.That(result.IsOk, Is.False);
         Assert.That(result.ErrorValue.IsParse, Is.True);
     }
+
     [Test]
     public async Task IProcessRunner_OutputJsonAsync_extension_deserializes_through_a_ScriptedRunner()
+    {
+        IProcessRunner runner = new ScriptedRunner().On(["widget-tool"], Reply.Ok("""{"Name":"gizmo","Count":3}"""));
+        var command = new Command("widget-tool");
+
+        var result = await runner.OutputJsonAsync<Widget>(command);
+
+        Assert.That(result.IsOk, Is.True);
+        Assert.That(result.ResultValue.Name, Is.EqualTo("gizmo"));
+        Assert.That(result.ResultValue.Count, Is.EqualTo(3));
+    }
+
+    [Test]
+    public async Task IProcessRunner_OutputJsonAsync_extension_deserializes_through_a_ScriptedRunner_with_source_generated_type_info()
     {
         IProcessRunner runner = new ScriptedRunner().On(["widget-tool"], Reply.Ok("""{"Name":"gizmo","Count":3}"""));
         var command = new Command("widget-tool");
@@ -85,6 +99,18 @@ public class JsonVerbTests
 
     [Test]
     public async Task IProcessRunner_OutputJsonAsync_surfaces_invalid_json_as_a_Parse_error_with_no_real_process()
+    {
+        IProcessRunner runner = new ScriptedRunner().On(["widget-tool"], Reply.Ok("not json at all"));
+        var command = new Command("widget-tool");
+
+        var result = await runner.OutputJsonAsync<Widget>(command);
+
+        Assert.That(result.IsOk, Is.False);
+        Assert.That(result.ErrorValue.IsParse, Is.True);
+    }
+
+    [Test]
+    public async Task IProcessRunner_OutputJsonAsync_surfaces_invalid_json_as_a_Parse_error_with_source_generated_type_info()
     {
         IProcessRunner runner = new ScriptedRunner().On(["widget-tool"], Reply.Ok("not json at all"));
         var command = new Command("widget-tool");
