@@ -396,6 +396,71 @@ type StreamingTests() =
         :> Task
 
     [<Test>]
+    member _.``StdoutJsonLinesAsync called twice on the same handle throws InvalidOperationException``() : Task =
+        task {
+            let payload = "{\"Id\":1,\"Label\":\"a\"}\n{\"Id\":2,\"Label\":\"b\"}\n"
+            use running = syntheticStdoutProcess (Command.create "test").Config payload
+
+            // First call succeeds and claims the stdout-streaming session
+            let _enum1 = running.StdoutJsonLinesAsync<JsonLine>()
+
+            // Second call on the same handle should raise InvalidOperationException when trying to claim the session
+            // (same as the already-consumed error StdoutLinesAsync() itself documents)
+            Assert.Throws<InvalidOperationException>(
+                Action(fun () ->
+                    let _enum2 = running.StdoutJsonLinesAsync<JsonLine>()
+                    ())
+            )
+            |> ignore
+
+            // The first enumerable should still be valid (the session is owned by it)
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutJsonLinesAsync then StdoutLinesAsync on the same handle throws InvalidOperationException``
+        ()
+        : Task =
+        task {
+            let payload =
+                "{\"Id\":1,\"Label\":\"a\"}\nline1\n{\"Id\":2,\"Label\":\"b\"}\nline2\n"
+
+            use running = syntheticStdoutProcess (Command.create "test").Config payload
+
+            // First call claims the stdout-streaming session via StdoutJsonLinesAsync
+            let _enum1 = running.StdoutJsonLinesAsync<JsonLine>()
+
+            // Second call via StdoutLinesAsync must throw InvalidOperationException, as the session was claimed by StdoutJsonLinesAsync
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutLinesAsync() |> ignore))
+            |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutLinesAsync then StdoutJsonLinesAsync on the same handle throws InvalidOperationException``
+        ()
+        : Task =
+        task {
+            let payload =
+                "line1\n{\"Id\":1,\"Label\":\"a\"}\nline2\n{\"Id\":2,\"Label\":\"b\"}\n"
+
+            use running = syntheticStdoutProcess (Command.create "test").Config payload
+
+            // First call claims the stdout-streaming session via StdoutLinesAsync
+            let _lines = running.StdoutLinesAsync()
+
+            // Second call via StdoutJsonLinesAsync must throw InvalidOperationException, as the session was claimed by StdoutLinesAsync
+            Assert.Throws<InvalidOperationException>(
+                Action(fun () -> running.StdoutJsonLinesAsync<JsonLine>() |> ignore)
+            )
+            |> ignore
+        }
+        :> Task
+
+    [<Test>]
     member _.``OutputEvents merges stdout and stderr``() : Task =
         let script =
             if isWindows then

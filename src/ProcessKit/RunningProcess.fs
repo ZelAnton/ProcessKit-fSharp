@@ -156,6 +156,17 @@ type RunningProcess internal (host: RunningHost) =
     let stateLock = obj ()
 
     let mutable stdinTaken = false
+    // Whether `StdoutLinesAsync()` — directly, or transitively through either `StdoutJsonLinesAsync`
+    // overload, which both fold into it — has already handed out its one enumerator. Deliberately a
+    // SEPARATE flag from `consumption`/`StartStdoutStreaming()`'s reentrant-by-design gate below: that
+    // gate must stay reentrant so `FinishAsync`/`WaitForLineAsync` can rejoin an already-claimed stdout
+    // session as companions, but the enumerator-producing call itself — `StdoutLinesAsync`/
+    // `StdoutJsonLinesAsync` — still must not silently hand out a second, redundant reader over the
+    // same channel (calling one after the other, or the same one twice). Set only from inside
+    // `StdoutLinesAsync()` itself, and only AFTER `StartStdoutStreaming()` has already succeeded, so a
+    // handle that never gets past that gate (a buffered/event-streaming verb claimed first) never has
+    // this flag poisoned by an attempt that was refused for an unrelated reason.
+    let mutable stdoutLinesClaimed = false
     let mutable stdoutLineCount = 0
     let mutable stderrLineCount = 0
     let mutable droppedStreamLineCount = 0
@@ -1063,19 +1074,32 @@ type RunningProcess internal (host: RunningHost) =
                 true)
 
     /// Stream stdout line by line as it arrives. Call `FinishAsync` afterwards for stderr + outcome.
+    /// Hands out its ONE enumerator exactly once per handle — a second call (directly, or via
+    /// `StdoutJsonLinesAsync`, which itself calls this) throws `InvalidOperationException`, same as any
+    /// other already-consumed verb; `FinishAsync`/`WaitForLineAsync` remain free to rejoin the same
+    /// session afterwards (they do not produce a second enumerator).
     member this.StdoutLinesAsync() : IAsyncEnumerable<string> =
         if not (this.StartStdoutStreaming()) then
             raise (InvalidOperationException alreadyConsumedMessage)
+
+        lock stateLock (fun () ->
+            if stdoutLinesClaimed then
+                // `StartStdoutStreaming()` above is deliberately reentrant (it must let `FinishAsync`/
+                // `WaitForLineAsync` rejoin an already-claimed session), so it alone can't refuse this
+                // second enumerator-producing call — that is what this flag is for.
+                raise (InvalidOperationException alreadyConsumedMessage)
+            else
+                stdoutLinesClaimed <- true)
 
         stdoutChannel.Reader.ReadAllAsync()
 
     /// Stream stdout as NDJSON / JSON Lines: each non-empty line is deserialized into a `'T` via
     /// `System.Text.Json` (`options` omitted uses the BCL defaults) as it arrives. A thin wrapper over
     /// `StdoutLinesAsync()` — it shares the very same exclusive-consumption gate
-    /// (`StartStdoutStreaming`), `LineTerminator`, and `StreamBuffer` policy, so calling this instead
-    /// of `StdoutLinesAsync()` (or vice versa, or twice) on one handle follows the same
-    /// already-consumed contract every other streaming verb already has; nothing extra needs
-    /// configuring here. An empty line (after that line-terminator policy is applied) is skipped
+    /// (`StartStdoutStreaming`) and the same already-consumed enumerator guard, `LineTerminator`, and
+    /// `StreamBuffer` policy, so calling this instead of `StdoutLinesAsync()` (or vice versa, or twice)
+    /// on one handle follows the same already-consumed contract every other streaming verb already has;
+    /// nothing extra needs configuring here. An empty line (after that line-terminator policy is applied) is skipped
     /// silently, never deserialized — a common NDJSON producer quirk (a trailing blank line, a
     /// keep-alive newline). A non-empty line that fails to deserialize ends the enumeration with
     /// `ProcessException(ProcessError.Parse(...))`, exactly like every other JSON verb's
