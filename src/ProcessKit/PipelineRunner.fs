@@ -351,28 +351,60 @@ module internal PipelineRunner =
 
                         index <- index + 1
 
+                    // The one shared "kill (when a hard teardown) → reap → drain → close" protocol for a
+                    // partially- or fully-spawned chain. All three terminal branches below used to open-code
+                    // this independently, and the three copies had drifted apart (T-061/T-071 each touched
+                    // exactly these spots) — keeping the teardown as ONE routine is the point of this helper.
+                    //
+                    // `killFirst = true` on the two ABORT exits (a stage spawn failure; a cancel/timeout that
+                    // halted staging): hard-kill the whole partial chain, stop stage 0's feed, and reap every
+                    // started stage here, returning those reap outcomes. `killFirst = false` on the normal
+                    // completion path: it has already reaped every stage through `observeStages` (whose lazy
+                    // per-checked-failure kill and timeout verdict are its own concern, and whose reap must not
+                    // be duplicated — a second `WaitHandle` on an already-reaped pid observes the wrong status)
+                    // and stops stage 0's feed later, only after observing that feed's fault — so this runs
+                    // just the shared tail and returns an empty outcome array (the caller uses `observeStages`'
+                    // outcomes instead).
+                    //
+                    // The shared tail is identical for all three: drain the inter-stage relays, await every
+                    // stage's stderr capture, then close every spawned pipe (the group's `use` dispose alone
+                    // hard-kills but neither waitpids POSIX leaders nor closes these parent-side streams, so
+                    // without this they would leak). The last stage's stdout capture is NOT closed here: the
+                    // normal path awaits it just before calling this, so it is fully drained before these
+                    // `closeSpawned` calls dispose that stream.
+                    let drainChain (killFirst: bool) : Task<Outcome[] * Pump.RawCapture[]> =
+                        task {
+                            if killFirst then
+                                group.KillTree()
+                                stopStage0Feed ()
+
+                            let! outcomes =
+                                if killFirst then
+                                    spawned
+                                    |> Seq.map (fun sp -> group.WaitHandle sp.Handle)
+                                    |> Seq.toArray
+                                    |> Task.WhenAll
+                                else
+                                    Task.FromResult(Array.empty<Outcome>)
+
+                            do! Task.WhenAll(copyTasks.ToArray())
+                            let! captures = Task.WhenAll(stderrTasks.ToArray())
+
+                            for sp in spawned do
+                                Pump.closeSpawned sp
+
+                            return outcomes, captures
+                        }
+
                     match spawnError with
                     | Some error ->
-                        // Some stages started before the failure. Hard-kill them, then reap (waitpid)
-                        // each, drain/observe the relay + stderr tasks, and close every pipe — the
-                        // group's `use` dispose alone hard-kills but does not waitpid POSIX leaders or
-                        // close these parent-side streams, so without this they would leak.
-                        group.KillTree()
-                        stopStage0Feed ()
-
-                        let! _ =
-                            spawned
-                            |> Seq.map (fun sp -> group.WaitHandle sp.Handle)
-                            |> Seq.toArray
-                            |> Task.WhenAll
-
-                        for t in copyTasks do
-                            do! t
-
-                        let! _ = Task.WhenAll(stderrTasks.ToArray())
-
-                        for sp in spawned do
-                            Pump.closeSpawned sp
+                        // Some stages started before the failure. Hard-kill them, reap (waitpid) each,
+                        // drain the relay + stderr tasks, and close every pipe through the shared teardown —
+                        // the group's `use` dispose alone hard-kills but does not waitpid POSIX leaders or
+                        // close these parent-side streams, so without this they would leak. This path alone
+                        // discards both the reap outcomes and the stderr captures: a spawn failure is not a
+                        // completed run, so it reports nothing built from them.
+                        let! _ = drainChain true
 
                         // A spawn failure is not a completed run — no duration/outcome to report,
                         // mirroring a single command's own spawn failure, which never reaches
@@ -389,26 +421,13 @@ module internal PipelineRunner =
                         // Cancellation or the timeout fired mid-staging, so the gate short-circuited the loop
                         // and only `spawned.Count` of `stages.Length` stages ever started. The callback's
                         // `KillTree` already covered exactly this set (the gate guarantees none escaped); reap
-                        // and drain them here — like the spawn-failure path above — so the caller gets a
-                        // prompt Cancelled/timed-out result with no straggling stage and no process/pipe
-                        // handle leak. The explicit `KillTree` makes the kill happen-before the waits, so the
-                        // reap can never block on a raced stage the callback had not reached yet.
-                        group.KillTree()
-                        stopStage0Feed ()
-
-                        let! killedOutcomes =
-                            spawned
-                            |> Seq.map (fun sp -> group.WaitHandle sp.Handle)
-                            |> Seq.toArray
-                            |> Task.WhenAll
-
-                        for t in copyTasks do
-                            do! t
-
-                        let! stderrCaptures = Task.WhenAll(stderrTasks.ToArray())
-
-                        for sp in spawned do
-                            Pump.closeSpawned sp
+                        // and drain them here through the same shared teardown as the spawn-failure path — so
+                        // the caller gets a prompt Cancelled/timed-out result with no straggling stage and no
+                        // process/pipe handle leak. `drainChain`'s explicit `KillTree` makes the kill
+                        // happen-before the waits, so the reap can never block on a raced stage the callback
+                        // had not reached yet; this path keeps the reap outcomes and stderr captures to build
+                        // its stage list.
+                        let! killedOutcomes, stderrCaptures = drainChain true
 
                         let duration = Stopwatch.GetElapsedTime startedAt
                         let timedOut = timeoutCts.IsCancellationRequested
@@ -546,13 +565,15 @@ module internal PipelineRunner =
 
                         // Only NOW, with every stage terminal and the deadline disarmed, drain the
                         // (possibly slow) relay/tee/stderr tail. A timer firing here can no longer flip
-                        // the verdict — it was fixed by `observeStages` above.
-                        do! Task.WhenAll(copyTasks.ToArray())
+                        // the verdict — it was fixed by `observeStages` above. Await the last stage's stdout
+                        // capture FIRST, so it is fully drained before `drainChain`'s `closeSpawned` disposes
+                        // that stream out from under it (the last stage has already exited, so its stdout is
+                        // at EOF and this cannot block on the relays). The shared tail then drains the relays
+                        // and stderr and closes every pipe: `killFirst = false` because the tree was killed
+                        // only lazily inside `observeStages`, the reap is already done there (never re-reap),
+                        // and stage 0's feed is stopped later once its fault has been observed below.
                         let! lastCapture = captureTask
-                        let! stderrCaptures = Task.WhenAll(stderrTasks.ToArray())
-
-                        for sp in spawned do
-                            Pump.closeSpawned sp
+                        let! _, stderrCaptures = drainChain false
 
                         let duration = Stopwatch.GetElapsedTime startedAt
                         let timedOut = observation.TimedOut

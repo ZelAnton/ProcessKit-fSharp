@@ -381,12 +381,14 @@ type internal CgroupBackend(cgroupPath: string) =
                     Error(ProcessError.Io $"failed to deliver signal {signalNum} to cgroup: {message} (errno {errno})")
 
         member _.Suspend() =
-            Native.Cgroup.freezeCgroup cgroupPath true
-            Ok()
+            match Native.Cgroup.freezeCgroup cgroupPath true with
+            | Ok() -> Ok()
+            | Error message -> Error(ProcessError.Io $"failed to freeze cgroup: {message}")
 
         member _.Resume() =
-            Native.Cgroup.freezeCgroup cgroupPath false
-            Ok()
+            match Native.Cgroup.freezeCgroup cgroupPath false with
+            | Ok() -> Ok()
+            | Error message -> Error(ProcessError.Io $"failed to thaw cgroup: {message}")
 
         member _.Stats() =
             // The active-process count comes from the same read as `Members`: a read failure must
@@ -553,22 +555,42 @@ type internal ProcessGroupBackend() =
                 )
 
         member _.Suspend() =
+            let mutable firstFailure: (int * string) option = None
+
             for pgid in children.Snapshot() do
                 if stillOurs pgid then
-                    Native.Posix.suspendProcessGroup pgid
+                    match Native.Posix.suspendProcessGroup pgid with
+                    | Native.Common.SignalDelivery.Delivered
+                    | Native.Common.SignalDelivery.TargetGone -> ()
+                    | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
+                        if firstFailure.IsNone then
+                            firstFailure <- Some(errno, message)
                 else
                     untrack pgid |> ignore
 
-            Ok()
+            match firstFailure with
+            | None -> Ok()
+            | Some(errno, message) ->
+                Error(ProcessError.Io $"failed to suspend process group: {message} (errno {errno})")
 
         member _.Resume() =
+            let mutable firstFailure: (int * string) option = None
+
             for pgid in children.Snapshot() do
                 if stillOurs pgid then
-                    Native.Posix.resumeProcessGroup pgid
+                    match Native.Posix.resumeProcessGroup pgid with
+                    | Native.Common.SignalDelivery.Delivered
+                    | Native.Common.SignalDelivery.TargetGone -> ()
+                    | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
+                        if firstFailure.IsNone then
+                            firstFailure <- Some(errno, message)
                 else
                     untrack pgid |> ignore
 
-            Ok()
+            match firstFailure with
+            | None -> Ok()
+            | Some(errno, message) ->
+                Error(ProcessError.Io $"failed to resume process group: {message} (errno {errno})")
 
         member _.Stats() =
             let active = children.Snapshot() |> List.filter stillOurs |> List.length

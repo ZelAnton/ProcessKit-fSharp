@@ -199,7 +199,16 @@ type PosixIdentityReuseTests() =
             backend.Track(spawnedFor pgidRecycled) |> ignore
             current[pgidRecycled] <- Some 555UL
 
-            backend.Suspend() |> ignore
+            // The synthetic but matching pgid reaches the real killpg and returns ESRCH. `Suspend`
+            // must classify that concurrent exit as a best-effort success while still pruning the
+            // recycled pgid without attempting delivery.
+            match backend.Suspend() with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Suspend failed: {e.Message}"
+
+            match backend.Resume() with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Resume failed: {e.Message}"
 
             Assert.That(delivered, Does.Contain pgidKept, "the matching-identity pgid must still be suspended")
             Assert.That(delivered, Does.Not.Contain pgidRecycled, "a recycled pgid must never be suspended"))

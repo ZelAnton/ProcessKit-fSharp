@@ -436,13 +436,12 @@ module internal Cgroup =
         broadcastIdentitySafe cgroupPath signalNum
 
     /// Freeze (`true`) or thaw (`false`) a cgroup (`cgroup.freeze`).
-    let freezeCgroup (cgroupPath: string) (frozen: bool) =
+    let freezeCgroup (cgroupPath: string) (frozen: bool) : Result<unit, string> =
         try
             File.WriteAllText(Path.Combine(cgroupPath, "cgroup.freeze"), (if frozen then "1" else "0"))
-        with _ ->
-            // Suspend/Resume of a cgroup is best-effort: the freeze controller may be absent, or the
-            // write may race the group's teardown. Leave the tree in its current state on failure.
-            ()
+            Ok()
+        with ex ->
+            Error ex.Message
 
     /// cgroup accounting for `stats`: cumulative CPU (cpu.stat `usage_usec`) and peak memory
     /// (`memory.peak`), each `None` when the file is absent.

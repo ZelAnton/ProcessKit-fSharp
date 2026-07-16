@@ -437,15 +437,15 @@ module internal Posix =
         observeGroupDelivery pgid
         classifySignalDelivery (killpg (pgid, signalNum))
 
-    /// Freeze a POSIX process group (SIGSTOP).
-    let suspendProcessGroup (pgid: int) =
+    /// Freeze a POSIX process group (SIGSTOP), classifying the delivery outcome.
+    let suspendProcessGroup (pgid: int) : SignalDelivery =
         observeGroupDelivery pgid
-        killpg (pgid, sigStop) |> ignore
+        classifySignalDelivery (killpg (pgid, sigStop))
 
-    /// Thaw a POSIX process group (SIGCONT).
-    let resumeProcessGroup (pgid: int) =
+    /// Thaw a POSIX process group (SIGCONT), classifying the delivery outcome.
+    let resumeProcessGroup (pgid: int) : SignalDelivery =
         observeGroupDelivery pgid
-        killpg (pgid, sigCont) |> ignore
+        classifySignalDelivery (killpg (pgid, sigCont))
 
     /// Send a raw signal to a single POSIX pid via `kill`, classified the same way as
     /// `signalProcessGroup` (see `SignalDelivery`).

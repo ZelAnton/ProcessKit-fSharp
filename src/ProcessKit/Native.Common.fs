@@ -125,50 +125,69 @@ module internal Common =
     /// recognized executable extension (`git.exe`, `git.cmd`, …); otherwise each `PATHEXT` extension is
     /// tried in order, appended to the bare name. POSIX: the plain file must exist and carry at least
     /// one executable permission bit.
+    ///
+    /// Exception-safe by construction: this candidate directory can vanish, or a matching file's
+    /// permissions can become unreadable, between the `File.Exists` existence check and the follow-up
+    /// probe (on POSIX, `File.GetUnixFileMode` — a genuine TOCTOU window, since another process/thread
+    /// can delete or replace the file in between). Any such race or access failure on THIS candidate is
+    /// caught and treated as "this candidate didn't pan out" (`None`), never a raw exception — so
+    /// `findInPath`'s PATH walk simply continues to the next directory instead of aborting the whole
+    /// resolution.
     let probeDir (dir: string) (program: string) : string option =
-        if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
-            let pathExt =
-                match Environment.GetEnvironmentVariable "PATHEXT" with
-                | null
-                | "" -> defaultPathExt
-                | value -> value
+        try
+            if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                let pathExt =
+                    match Environment.GetEnvironmentVariable "PATHEXT" with
+                    | null
+                    | "" -> defaultPathExt
+                    | value -> value
 
-            let extensions =
-                pathExt.Split ';'
-                |> Array.map (fun e -> e.Trim())
-                |> Array.filter (fun e -> e <> "")
+                let extensions =
+                    pathExt.Split ';'
+                    |> Array.map (fun e -> e.Trim())
+                    |> Array.filter (fun e -> e <> "")
 
-            let carriesExecExt (path: string) =
-                let ext = Path.GetExtension path
+                let carriesExecExt (path: string) =
+                    let ext = Path.GetExtension path
 
-                not (String.IsNullOrEmpty ext)
-                && extensions
-                   |> Array.exists (fun candidate -> String.Equals(candidate, ext, StringComparison.OrdinalIgnoreCase))
+                    not (String.IsNullOrEmpty ext)
+                    && extensions
+                       |> Array.exists (fun candidate ->
+                           String.Equals(candidate, ext, StringComparison.OrdinalIgnoreCase))
 
-            let candidate = Path.Combine(dir, program)
+                let candidate = Path.Combine(dir, program)
 
-            if carriesExecExt candidate && File.Exists candidate then
-                Some candidate
-            else
-                extensions
-                |> Array.tryPick (fun ext ->
-                    let named = candidate + ext
-                    if File.Exists named then Some named else None)
-        else
-            let candidate = Path.Combine(dir, program)
-
-            if File.Exists candidate then
-                let executableBits =
-                    UnixFileMode.UserExecute
-                    ||| UnixFileMode.GroupExecute
-                    ||| UnixFileMode.OtherExecute
-
-                if (File.GetUnixFileMode candidate &&& executableBits) <> UnixFileMode.None then
+                if carriesExecExt candidate && File.Exists candidate then
                     Some candidate
                 else
-                    None
+                    extensions
+                    |> Array.tryPick (fun ext ->
+                        let named = candidate + ext
+                        if File.Exists named then Some named else None)
             else
-                None
+                let candidate = Path.Combine(dir, program)
+
+                if File.Exists candidate then
+                    let executableBits =
+                        UnixFileMode.UserExecute
+                        ||| UnixFileMode.GroupExecute
+                        ||| UnixFileMode.OtherExecute
+
+                    if (File.GetUnixFileMode candidate &&& executableBits) <> UnixFileMode.None then
+                        Some candidate
+                    else
+                        None
+                else
+                    None
+        with
+        | :? IOException
+        | :? UnauthorizedAccessException ->
+            // The candidate vanished (TOCTOU race, e.g. `File.GetUnixFileMode` raising
+            // `FileNotFoundException` after `File.Exists` already returned `true`) or is otherwise
+            // inaccessible (exotic filesystem/permissions). Neither is a caller error — it just means
+            // this one candidate does not resolve; the PATH walk in `findInPath` continues to the next
+            // directory exactly as it would for a plain "not present" candidate.
+            None
 
     /// Search the current process's `PATH` for `program` (a bare name — see `isBareName`), reusing
     /// `probeDir` for each directory in order. Returns `(found, searched)`: `found` is the first
@@ -201,28 +220,38 @@ module internal Common =
     /// checked). This is the single resolution both `Exec.which`/`CliClient.EnsureAvailableAsync` and
     /// the spawn path's `NotFound` enrichment (`notFoundFromSpawnFailure` below) go through, so
     /// preflight and an actual spawn never disagree.
+    ///
+    /// Never throws: `probeDir` already absorbs per-candidate IO/access races (see its own doc comment),
+    /// so a raw exception surfacing here would be something unexpected at the level of the whole
+    /// resolution (not tied to one candidate) — the outer `with` below is that last-resort net, turning
+    /// it into a typed `ProcessError.Io` instead of letting it escape the Result-returning contract that
+    /// `Exec.which`/`CliClient.EnsureAvailableAsync` promise their callers.
     let resolveProgram (program: string) : Result<string, ProcessError> =
-        if String.IsNullOrWhiteSpace program then
-            Error(ProcessError.NotFound(program, None))
-        elif isBareName program then
-            match findInPath program with
-            | Some found, _ -> Ok found
-            | None, searched -> Error(ProcessError.NotFound(program, (if searched = "" then None else Some searched)))
-        else
-            let directory =
-                match Path.GetDirectoryName program with
-                | null
-                | "" -> "."
-                | d -> d
+        try
+            if String.IsNullOrWhiteSpace program then
+                Error(ProcessError.NotFound(program, None))
+            elif isBareName program then
+                match findInPath program with
+                | Some found, _ -> Ok found
+                | None, searched ->
+                    Error(ProcessError.NotFound(program, (if searched = "" then None else Some searched)))
+            else
+                let directory =
+                    match Path.GetDirectoryName program with
+                    | null
+                    | "" -> "."
+                    | d -> d
 
-            let fileName =
-                match Path.GetFileName program with
-                | null -> program
-                | name -> name
+                let fileName =
+                    match Path.GetFileName program with
+                    | null -> program
+                    | name -> name
 
-            match probeDir directory fileName with
-            | Some found -> Ok found
-            | None -> Error(ProcessError.NotFound(program, None))
+                match probeDir directory fileName with
+                | Some found -> Ok found
+                | None -> Error(ProcessError.NotFound(program, None))
+        with ex ->
+            Error(ProcessError.Io $"failed to resolve '{program}': {ex.Message}")
 
     /// Enrich a spawn-time not-found failure with the `Searched` diagnostic, reusing `resolveProgram`
     /// so the spawn path and the preflight helper can never disagree. The OS itself already reported

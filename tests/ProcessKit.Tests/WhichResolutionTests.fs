@@ -3,6 +3,7 @@ namespace ProcessKit.Tests
 open System
 open System.IO
 open System.Runtime.InteropServices
+open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
@@ -272,3 +273,58 @@ type WhichResolutionTests() =
                     Directory.Delete(dir, true)
         }
         :> Task
+
+    [<Test>]
+    member _.``probeDir survives a candidate disappearing between the existence check and the executable-bit check``() =
+        if isWindows then
+            Assert.Ignore
+                "the File.Exists -> File.GetUnixFileMode TOCTOU window is POSIX-only; Windows probing has no analogous race."
+        else
+            // There is no hook into `probeDir`'s internals to force the exact interleaving, so this
+            // reproduces the race as deterministically as the test harness allows: a background thread
+            // continuously creates/marks-executable/deletes the SAME candidate file while the main
+            // thread hammers `probeDir` on it. Across enough iterations the two threads are virtually
+            // certain to interleave such that `File.Exists` observes the file present just before the
+            // churner thread deletes it, forcing `File.GetUnixFileMode` to race a `FileNotFoundException`
+            // — the exact TOCTOU window `probeDir` must now absorb instead of letting escape.
+            let dir =
+                Path.Combine(Path.GetTempPath(), "processkit-toctou-" + Guid.NewGuid().ToString "N")
+
+            Directory.CreateDirectory dir |> ignore
+            let program = "pk134-toctou-tool"
+            let candidate = Path.Combine(dir, program)
+
+            use stop = new CancellationTokenSource()
+
+            let churn () =
+                while not stop.IsCancellationRequested do
+                    try
+                        File.WriteAllText(candidate, "x")
+                        File.SetUnixFileMode(candidate, UnixFileMode.UserExecute)
+                        File.Delete candidate
+                    with
+                    | :? IOException
+                    | :? UnauthorizedAccessException ->
+                        // Expected background noise from racing our own writes/deletes against
+                        // `probeDir`'s reads on the main thread — not the condition under test.
+                        ()
+
+            let churner = Task.Run churn
+
+            try
+                // 5000 iterations comfortably interleaves with the churner thread on every CI OS this
+                // runs on (Linux/macOS) without making the test slow; the assertion is simply that none
+                // of them throws, regardless of which candidate state `probeDir` happens to observe.
+                for _ in 1..5000 do
+                    Common.probeDir dir program |> ignore
+            finally
+                stop.Cancel()
+                churner.Wait()
+
+                try
+                    File.Delete candidate
+                with :? IOException ->
+                    // may already be gone from the churner's own last delete - fine, nothing to clean up.
+                    ()
+
+                Directory.Delete(dir, true)
