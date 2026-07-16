@@ -17,6 +17,7 @@ streams are `await foreach`.
 
 - [Lifecycle](#lifecycle)
 - [Streaming stdout line by line](#streaming-stdout-line-by-line)
+- [Streaming NDJSON / JSON Lines](#streaming-ndjson--json-lines)
 - [Interleaving stdout and stderr](#interleaving-stdout-and-stderr)
 - [Bounding the streaming backlog](#bounding-the-streaming-backlog)
 - [Finishing a streamed run](#finishing-a-streamed-run)
@@ -146,6 +147,66 @@ While you stream stdout, stderr is drained in the background, so a noisy child c
 never block on a full stderr pipe. The `OnStdoutLine` / `OnStderrLine` handlers and
 the output buffer policy from [Running commands](commands.md) still apply to a
 streamed run — a handler sees each line on the pump, in addition to your loop.
+
+## Streaming NDJSON / JSON Lines
+
+Many CLIs stream their output as one JSON document per line — NDJSON / JSON Lines
+(`docker events --format json`, `kubectl get -w -o json`, `rg --json`). Rather than
+combining `StdoutLinesAsync()` with your own `JsonSerializer` call on every line,
+`StdoutJsonLinesAsync<'T>()` does it for you: a thin typed wrapper over
+`StdoutLinesAsync()` that deserializes each non-empty line into a `'T` as it arrives.
+It shares the very same exclusive-consumption gate, `LineTerminator`, and
+`StreamBuffer` policy as `StdoutLinesAsync()` — pick one or the other for a given run,
+same as `StdoutLinesAsync()` / `OutputEventsAsync()` above:
+
+**F#**
+
+```fsharp
+type Event = { Type: string; Message: string }
+
+task {
+    match! (Command.create "docker" |> Command.args [ "events"; "--format"; "json" ]).StartAsync() with
+    | Error err -> eprintfn $"{err.Message}"
+    | Ok proc ->
+        use _ = proc
+        let e = proc.StdoutJsonLinesAsync<Event>().GetAsyncEnumerator()
+
+        try
+            let mutable go = true
+
+            while go do
+                match! e.MoveNextAsync() with
+                | true -> printfn $"{e.Current.Type}: {e.Current.Message}"
+                | false -> go <- false
+        finally
+            e.DisposeAsync().AsTask().Wait()
+}
+```
+
+**C#**
+
+```csharp
+record Event(string Type, string Message);
+
+await using var proc = (await new Command("docker").Args(["events", "--format", "json"]).StartAsync()).GetValueOrThrow();
+
+await foreach (var ev in proc.StdoutJsonLinesAsync<Event>())
+    Console.WriteLine($"{ev.Type}: {ev.Message}");
+```
+
+A blank line (after the `LineTerminator` policy is applied) is skipped silently —
+never deserialized — a common NDJSON producer quirk (a trailing blank line, a
+keep-alive newline). A non-empty line that fails to deserialize ends the enumeration
+with an exception carrying `ProcessError.Parse`, exactly like `OutputJsonAsync<'T>`'s
+`ProcessError.Parse` ([Running commands](commands.md#consuming-verbs)) — never a raw,
+undocumented exception. `StdoutJsonLinesAsync<'T>(options)` takes an optional
+`JsonSerializerOptions` (omitted uses the BCL defaults) and deserializes via
+reflection, so it is not trim-/NativeAOT-safe; for a trimmed/NativeAOT app, pass a
+source-generated `JsonTypeInfo<'T>` to the `StdoutJsonLinesAsync<'T>(typeInfo)`
+overload instead (`MyJsonContext.Default.MyType` from a `[JsonSerializable]`-annotated
+`JsonSerializerContext`) — no reflection, no `RequiresUnreferencedCode`/
+`RequiresDynamicCode`. Call `FinishAsync()` afterwards for stderr + outcome, same as
+after `StdoutLinesAsync()`.
 
 ## Interleaving stdout and stderr
 

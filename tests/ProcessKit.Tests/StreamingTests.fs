@@ -6,12 +6,20 @@ open System.Diagnostics
 open System.IO
 open System.Runtime.InteropServices
 open System.Text
+open System.Text.Json
+open System.Text.Json.Serialization.Metadata
 open System.Threading
 open System.Threading.Channels
 open System.Threading.Tasks
 open NUnit.Framework
 open NUnit.Framework.Legacy
 open ProcessKit
+
+/// A small F# record deserialized through STJ's constructor-based deserialization — the
+/// `StdoutJsonLinesAsync<'T>` analogue of `JsonVerbTests.fs`'s `Widget` (not reused directly: that
+/// file compiles AFTER this one in `ProcessKit.Tests.fsproj`, so its type isn't visible here yet).
+/// Must be public: STJ's constructor-based deserialization needs an accessible constructor.
+type JsonLine = { Id: int; Label: string }
 
 /// Raw `getrlimit`/`setrlimit` access to `RLIMIT_NOFILE`, used ONLY by the T-028 regression test
 /// below (``spawnPosix fails instead of silently inheriting when open(/dev/null) fails``) to pin
@@ -279,6 +287,176 @@ type StreamingTests() =
                 match finished with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // --- RunningProcess.StdoutJsonLinesAsync (NDJSON / JSON Lines) ---
+
+    [<Test>]
+    member _.``StdoutJsonLinesAsync deserializes each NDJSON line and skips blank lines, then Finish reaps``() : Task =
+        task {
+            let payload =
+                "{\"Id\":1,\"Label\":\"a\"}\n\n{\"Id\":2,\"Label\":\"b\"}\n{\"Id\":3,\"Label\":\"c\"}\n"
+
+            use running = syntheticStdoutProcess (Command.create "test").Config payload
+
+            let! lines = collect (running.StdoutJsonLinesAsync<JsonLine>())
+
+            CollectionAssert.AreEqual(
+                [ { Id = 1; Label = "a" }; { Id = 2; Label = "b" }; { Id = 3; Label = "c" } ],
+                lines
+            )
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutJsonLinesAsync surfaces an invalid line as ProcessException carrying ProcessError.Parse``
+        ()
+        : Task =
+        task {
+            let payload = "{\"Id\":1,\"Label\":\"a\"}\nnot-json\n{\"Id\":2,\"Label\":\"b\"}\n"
+            use running = syntheticStdoutProcess (Command.create "test").Config payload
+
+            let! drain = drainWithDeadline (running.StdoutJsonLinesAsync<JsonLine>()) 5000
+            let! error = processError drain
+
+            match error with
+            | Some(ProcessError.Parse _) -> ()
+            | other -> Assert.Fail $"expected ProcessError.Parse, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutJsonLinesAsync honours JsonSerializerOptions (case-insensitive property matching)``() : Task =
+        task {
+            let payload = "{\"id\":1,\"label\":\"a\"}\n"
+            use running = syntheticStdoutProcess (Command.create "test").Config payload
+            let options = JsonSerializerOptions(PropertyNameCaseInsensitive = true)
+
+            let! lines = collect (running.StdoutJsonLinesAsync<JsonLine>(options))
+            CollectionAssert.AreEqual([ { Id = 1; Label = "a" } ], lines)
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutJsonLinesAsync(JsonTypeInfo) overload deserializes the same NDJSON stream``() : Task =
+        task {
+            let payload = "{\"Id\":1,\"Label\":\"a\"}\n{\"Id\":2,\"Label\":\"b\"}\n"
+            use running = syntheticStdoutProcess (Command.create "test").Config payload
+
+            let typeInfo =
+                JsonSerializerOptions.Default.GetTypeInfo(typeof<JsonLine>) :?> JsonTypeInfo<JsonLine>
+
+            let! lines = collect (running.StdoutJsonLinesAsync<JsonLine> typeInfo)
+            CollectionAssert.AreEqual([ { Id = 1; Label = "a" }; { Id = 2; Label = "b" } ], lines)
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutJsonLinesAsync shares the exclusive-consumption gate with the other consuming verbs``() : Task =
+        task {
+            let payload = "{\"Id\":1,\"Label\":\"a\"}\n"
+
+            // Claiming the stdout-streaming session through StdoutJsonLinesAsync (like StdoutLinesAsync,
+            // it is a companion verb of that ONE session, not a competing claim) refuses a later,
+            // different-kind buffered verb with the same clean `Unsupported` error `OutputStringAsync`
+            // already reports for a second buffered verb (CorrectnessBugTests.fs).
+            use runningJsonFirst = syntheticStdoutProcess (Command.create "test").Config payload
+            runningJsonFirst.StdoutJsonLinesAsync<JsonLine>() |> ignore
+
+            match! runningJsonFirst.OutputStringAsync() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected the buffered verb to be refused, got {other}"
+
+            // A buffered verb claimed first refuses a later StdoutJsonLinesAsync — the same
+            // already-consumed contract `StdoutLinesAsync()` itself has (a thrown
+            // `InvalidOperationException`, not a `Result`).
+            use runningBufferedFirst =
+                syntheticStdoutProcess (Command.create "test").Config payload
+
+            let! _ = runningBufferedFirst.OutputStringAsync()
+
+            Assert.Throws<InvalidOperationException>(
+                Action(fun () -> runningBufferedFirst.StdoutJsonLinesAsync<JsonLine>() |> ignore)
+            )
+            |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutJsonLinesAsync called twice on the same handle throws InvalidOperationException``() : Task =
+        task {
+            let payload = "{\"Id\":1,\"Label\":\"a\"}\n{\"Id\":2,\"Label\":\"b\"}\n"
+            use running = syntheticStdoutProcess (Command.create "test").Config payload
+
+            // First call succeeds and claims the stdout-streaming session
+            let _enum1 = running.StdoutJsonLinesAsync<JsonLine>()
+
+            // Second call on the same handle should raise InvalidOperationException when trying to claim the session
+            // (same as the already-consumed error StdoutLinesAsync() itself documents)
+            Assert.Throws<InvalidOperationException>(
+                Action(fun () ->
+                    let _enum2 = running.StdoutJsonLinesAsync<JsonLine>()
+                    ())
+            )
+            |> ignore
+
+            // The first enumerable should still be valid (the session is owned by it)
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutJsonLinesAsync then StdoutLinesAsync on the same handle throws InvalidOperationException``
+        ()
+        : Task =
+        task {
+            let payload =
+                "{\"Id\":1,\"Label\":\"a\"}\nline1\n{\"Id\":2,\"Label\":\"b\"}\nline2\n"
+
+            use running = syntheticStdoutProcess (Command.create "test").Config payload
+
+            // First call claims the stdout-streaming session via StdoutJsonLinesAsync
+            let _enum1 = running.StdoutJsonLinesAsync<JsonLine>()
+
+            // Second call via StdoutLinesAsync must throw InvalidOperationException, as the session was claimed by StdoutJsonLinesAsync
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutLinesAsync() |> ignore))
+            |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutLinesAsync then StdoutJsonLinesAsync on the same handle throws InvalidOperationException``
+        ()
+        : Task =
+        task {
+            let payload =
+                "line1\n{\"Id\":1,\"Label\":\"a\"}\nline2\n{\"Id\":2,\"Label\":\"b\"}\n"
+
+            use running = syntheticStdoutProcess (Command.create "test").Config payload
+
+            // First call claims the stdout-streaming session via StdoutLinesAsync
+            let _lines = running.StdoutLinesAsync()
+
+            // Second call via StdoutJsonLinesAsync must throw InvalidOperationException, as the session was claimed by StdoutLinesAsync
+            Assert.Throws<InvalidOperationException>(
+                Action(fun () -> running.StdoutJsonLinesAsync<JsonLine>() |> ignore)
+            )
+            |> ignore
         }
         :> Task
 

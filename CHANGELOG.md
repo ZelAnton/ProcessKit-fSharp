@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Add AOT-safe overloads of `OutputJsonAsync<'T>` accepting `JsonTypeInfo<'T>` for use with source-generated serialization contexts in trimmed/NativeAOT applications.
+- `RunningProcess.StdoutJsonLinesAsync<'T>()` streams stdout as NDJSON / JSON Lines, deserializing each non-empty line into a typed value as it arrives (blank lines are skipped silently, an unparseable line ends the stream with `ProcessError.Parse`) — a typed, thin wrapper over `StdoutLinesAsync()` for tools like `docker events --format json` / `kubectl get -w -o json` / `rg --json`. A `JsonTypeInfo<'T>` overload is available for trim-/NativeAOT-safe deserialization alongside the reflection-based `JsonSerializerOptions` overload.
 
 ### Changed
 -

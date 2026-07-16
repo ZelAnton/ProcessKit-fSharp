@@ -807,6 +807,8 @@ class ProcessKit.RunningProcess
   member OutputStringAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   member ProfileAsync() : System.Threading.Tasks.Task<ProcessKit.RunProfile>
   member ProfileAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.RunProfile>
+  member StdoutJsonLinesAsync<T>(System.Text.Json.JsonSerializerOptions) : System.Collections.Generic.IAsyncEnumerable<T>
+  member StdoutJsonLinesAsync<T>(System.Text.Json.Serialization.Metadata.JsonTypeInfo<T>) : System.Collections.Generic.IAsyncEnumerable<T>
   member StdoutLinesAsync() : System.Collections.Generic.IAsyncEnumerable<System.String>
   member StopAsync() : System.Threading.Tasks.Task<ProcessKit.Outcome>
   member StopAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.Outcome>

@@ -3,10 +3,13 @@ namespace ProcessKit
 open System
 open System.Collections.Generic
 open System.Diagnostics
+open System.Diagnostics.CodeAnalysis
 open System.IO
 open System.Net
 open System.Runtime.ExceptionServices
 open System.Runtime.InteropServices
+open System.Text.Json
+open System.Text.Json.Serialization.Metadata
 open System.Threading
 open System.Threading.Tasks
 open System.Threading.Channels
@@ -73,6 +76,68 @@ type internal Consumption =
     | StdoutStreaming
     | EventStreaming
 
+/// The `IAsyncEnumerator<'T>` behind `RunningProcess.StdoutJsonLinesAsync`: projects a line-based
+/// `IAsyncEnumerator<string>` (the shape `StdoutLinesAsync` already returns) into a typed
+/// NDJSON/JSON-Lines sequence. An empty line (after the line-terminator policy the pump already
+/// applied) is skipped silently — never handed to `deserialize` — and a line that fails to
+/// deserialize raises `ProcessException(ProcessError.Parse(program, ...))`, so a malformed line
+/// surfaces the same typed-error signal every other streaming verb already uses for a pump/handler
+/// fault (`reportedPumpFault`, `StreamChannel.writeItem`'s `StreamFullMode.Error` case) rather than a
+/// raw, undocumented exception escaping the `IAsyncEnumerable`. Hand-written rather than an
+/// `async seq { }`/`taskSeq { }` builder because neither ships in this project's dependencies
+/// (FSharp.Core has no async-enumerable computation expression, and `FSharp.Control.TaskSeq` is not
+/// referenced) — this is the plain `IAsyncEnumerator<'T>` shape the BCL itself expects.
+type internal JsonLinesEnumerator<'T>(program: string, source: IAsyncEnumerator<string>, deserialize: string -> 'T) =
+
+    let mutable current = Unchecked.defaultof<'T>
+
+    interface IAsyncEnumerator<'T> with
+        member _.Current = current
+
+        member _.MoveNextAsync() : ValueTask<bool> =
+            let body =
+                task {
+                    let mutable result = ValueNone
+
+                    while result.IsNone do
+                        let! moved = source.MoveNextAsync()
+
+                        if not moved then
+                            result <- ValueSome false
+                        else
+                            let line = source.Current
+
+                            if String.IsNullOrEmpty line then
+                                // Empty (post-line-terminator) line - skip silently, never deserialized;
+                                // loop for the next one instead of ending the sequence early.
+                                ()
+                            else
+                                try
+                                    current <- deserialize line
+                                    result <- ValueSome true
+                                with ex ->
+                                    // `return` can't escape a `while` loop body here (its body type must
+                                    // unify with `unit`, not the enclosing `Task<bool>`) — `raise` alone
+                                    // still faults `body` (and, through it, `MoveNextAsync`'s `ValueTask`)
+                                    // exactly like a `return raise` would elsewhere in this file.
+                                    raise (ProcessException(ProcessError.Parse(program, ex.Message)))
+
+                    return result.Value
+                }
+
+            ValueTask<bool>(body)
+
+        member _.DisposeAsync() = source.DisposeAsync()
+
+/// The `IAsyncEnumerable<'T>` that `RunningProcess.StdoutJsonLinesAsync` returns — wraps the
+/// underlying line stream (`StdoutLinesAsync()`) with `JsonLinesEnumerator` above.
+type internal JsonLinesEnumerable<'T>(program: string, source: IAsyncEnumerable<string>, deserialize: string -> 'T) =
+
+    interface IAsyncEnumerable<'T> with
+        member _.GetAsyncEnumerator(cancellationToken: CancellationToken) : IAsyncEnumerator<'T> =
+            JsonLinesEnumerator<'T>(program, source.GetAsyncEnumerator cancellationToken, deserialize)
+            :> IAsyncEnumerator<'T>
+
 /// A live handle to a started process: stream its output, feed its stdin, wait for it, or
 /// collect it to completion. Disposing it reaps the whole process tree (kill-on-drop).
 [<Sealed>]
@@ -91,6 +156,17 @@ type RunningProcess internal (host: RunningHost) =
     let stateLock = obj ()
 
     let mutable stdinTaken = false
+    // Whether `StdoutLinesAsync()` — directly, or transitively through either `StdoutJsonLinesAsync`
+    // overload, which both fold into it — has already handed out its one enumerator. Deliberately a
+    // SEPARATE flag from `consumption`/`StartStdoutStreaming()`'s reentrant-by-design gate below: that
+    // gate must stay reentrant so `FinishAsync`/`WaitForLineAsync` can rejoin an already-claimed stdout
+    // session as companions, but the enumerator-producing call itself — `StdoutLinesAsync`/
+    // `StdoutJsonLinesAsync` — still must not silently hand out a second, redundant reader over the
+    // same channel (calling one after the other, or the same one twice). Set only from inside
+    // `StdoutLinesAsync()` itself, and only AFTER `StartStdoutStreaming()` has already succeeded, so a
+    // handle that never gets past that gate (a buffered/event-streaming verb claimed first) never has
+    // this flag poisoned by an attempt that was refused for an unrelated reason.
+    let mutable stdoutLinesClaimed = false
     let mutable stdoutLineCount = 0
     let mutable stderrLineCount = 0
     let mutable droppedStreamLineCount = 0
@@ -998,11 +1074,79 @@ type RunningProcess internal (host: RunningHost) =
                 true)
 
     /// Stream stdout line by line as it arrives. Call `FinishAsync` afterwards for stderr + outcome.
+    /// Hands out its ONE enumerator exactly once per handle — a second call (directly, or via
+    /// `StdoutJsonLinesAsync`, which itself calls this) throws `InvalidOperationException`, same as any
+    /// other already-consumed verb; `FinishAsync`/`WaitForLineAsync` remain free to rejoin the same
+    /// session afterwards (they do not produce a second enumerator).
     member this.StdoutLinesAsync() : IAsyncEnumerable<string> =
         if not (this.StartStdoutStreaming()) then
             raise (InvalidOperationException alreadyConsumedMessage)
 
+        lock stateLock (fun () ->
+            if stdoutLinesClaimed then
+                // `StartStdoutStreaming()` above is deliberately reentrant (it must let `FinishAsync`/
+                // `WaitForLineAsync` rejoin an already-claimed session), so it alone can't refuse this
+                // second enumerator-producing call — that is what this flag is for.
+                raise (InvalidOperationException alreadyConsumedMessage)
+            else
+                stdoutLinesClaimed <- true)
+
         stdoutChannel.Reader.ReadAllAsync()
+
+    /// Stream stdout as NDJSON / JSON Lines: each non-empty line is deserialized into a `'T` via
+    /// `System.Text.Json` (`options` omitted uses the BCL defaults) as it arrives. A thin wrapper over
+    /// `StdoutLinesAsync()` — it shares the very same exclusive-consumption gate
+    /// (`StartStdoutStreaming`) and the same already-consumed enumerator guard, `LineTerminator`, and
+    /// `StreamBuffer` policy, so calling this instead of `StdoutLinesAsync()` (or vice versa, or twice)
+    /// on one handle follows the same already-consumed contract every other streaming verb already has;
+    /// nothing extra needs configuring here. An empty line (after that line-terminator policy is applied) is skipped
+    /// silently, never deserialized — a common NDJSON producer quirk (a trailing blank line, a
+    /// keep-alive newline). A non-empty line that fails to deserialize ends the enumeration with
+    /// `ProcessException(ProcessError.Parse(...))`, exactly like every other JSON verb's
+    /// `ProcessError.Parse` (`OutputJsonAsync`/`ParseAsync`) — never a raw, undocumented exception
+    /// escaping the `IAsyncEnumerable`. Call `FinishAsync()` afterwards for stderr + outcome, same as
+    /// after `StdoutLinesAsync()`.
+    ///
+    /// **Trimming / AOT:** deserializes via reflection-based `System.Text.Json`
+    /// (`JsonSerializer.Deserialize(string, Type, JsonSerializerOptions)`), so it is not trim-/AOT-safe
+    /// — pass a `JsonTypeInfo&lt;'T&gt;` via the other overload, or avoid this verb, in a
+    /// trimmed/NativeAOT app.
+    [<RequiresUnreferencedCode "Deserializes each line by reflection via System.Text.Json; give the JsonTypeInfo<'T> overload, or avoid this verb, in a trimmed app.">]
+    [<RequiresDynamicCode "Deserializes each line by reflection via System.Text.Json; give the JsonTypeInfo<'T> overload, or avoid this verb, in a NativeAOT app.">]
+    member this.StdoutJsonLinesAsync<'T>([<Optional>] options: JsonSerializerOptions | null) : IAsyncEnumerable<'T> =
+        // Non-generic, `Type`-based overload rather than the generic `JsonSerializer.Deserialize<'T>` —
+        // same reasoning as `CaptureVerbs.outputJson`: the BCL's generic overload returns a
+        // `TValue?`-annotated value the F# nullness checker can't reconcile against our ambient,
+        // unconstrained `'T`. A genuine JSON `null` raises here, turned into `ProcessError.Parse` below
+        // exactly like a malformed document would.
+        let optionsArg = Option.ofObj options |> Option.toObj
+
+        let deserialize (line: string) : 'T =
+            match JsonSerializer.Deserialize(line, typeof<'T>, optionsArg) with
+            | null -> raise (JsonException "the JSON document deserialized to null")
+            | value -> unbox<'T> value
+
+        JsonLinesEnumerable<'T>(config.Program, this.StdoutLinesAsync(), deserialize) :> IAsyncEnumerable<'T>
+
+    /// Like the overload above, but deserializes each line via a source-generated
+    /// `JsonTypeInfo&lt;'T&gt;` instead of reflection — no `RequiresUnreferencedCode`/
+    /// `RequiresDynamicCode`, so this overload is trim-/NativeAOT-safe. Pass
+    /// `MyJsonContext.Default.MyType` from a `[&lt;JsonSerializable&gt;]`-annotated
+    /// `JsonSerializerContext`. Same empty-line-skip / `ProcessError.Parse` contract as the reflection
+    /// overload above.
+    member this.StdoutJsonLinesAsync<'T>(typeInfo: JsonTypeInfo<'T>) : IAsyncEnumerable<'T> =
+        ArgumentNullException.ThrowIfNull typeInfo
+
+        // Through the non-generic `JsonTypeInfo` base overload for the same reason the reflection
+        // overload above goes through `typeof<'T>` rather than the generic `Deserialize<'T>` — sidesteps
+        // the BCL's `TValue?`-annotated generic return the F# nullness checker can't reconcile against
+        // an unconstrained `'T`.
+        let deserialize (line: string) : 'T =
+            match JsonSerializer.Deserialize(line, typeInfo :> JsonTypeInfo) with
+            | null -> raise (JsonException "the JSON document deserialized to null")
+            | value -> unbox<'T> value
+
+        JsonLinesEnumerable<'T>(config.Program, this.StdoutLinesAsync(), deserialize) :> IAsyncEnumerable<'T>
 
     /// After streaming stdout, wait for exit and return the captured stderr. Reaps the tree.
     member this.FinishAsync() : Task<Result<Finished, ProcessError>> =
