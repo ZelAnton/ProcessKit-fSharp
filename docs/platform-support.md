@@ -86,11 +86,14 @@ filesystem and `libc` on Unix), so the supported runtime set is Windows, Linux, 
 the desktop and server platforms these target frameworks run on.
 
 The full test suite (minus the `Stress` category) runs in CI's `test` job matrix on
-`ubuntu-latest`, `ubuntu-24.04-arm`, `windows-latest`, and `macos-latest` — so the native syscall
+`ubuntu-latest`, `ubuntu-24.04-arm`, `windows-11-arm`, `windows-latest`, and `macos-latest` — so the native syscall
 layer (direct `syscall(2)` invocations, `siginfo` struct layout, signal/epoll handling in
 `Native.Posix.fs`) is verified on Linux ARM64 as well as x64, not merely asserted correct by
 argument-passing convention. macOS's GitHub-hosted runner is Apple Silicon (arm64) already; Windows
-CI runs on x64 only.
+CI now covers both x64 (windows-latest) and ARM64 (windows-11-arm). On ARM64, `actions/setup-dotnet`
+auto-resolves the .NET SDK; no x64-specific test fences were required (native P/Invoke code for Job Objects,
+overlapped named-pipe I/O, and struct marshalling is pointer-width-safe). This ARM64 coverage is documented
+reasoning pending the first real post-merge CI run on the windows-11-arm leg.
 
 ## Trimming and NativeAOT
 

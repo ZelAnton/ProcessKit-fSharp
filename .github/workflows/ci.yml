@@ -126,7 +126,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest]
+        # Matrix includes Windows ARM64 (windows-11-arm) to verify .NET SDK 10 resolves via
+        # actions/setup-dotnet on ARM64, and to ensure no x64-specific test assumptions break
+        # on ARM64 (native P/Invoke marshalling for Job Objects, named pipes, etc.). Pending
+        # first real CI run on this leg after merge; no live-run evidence yet.
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-11-arm, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
