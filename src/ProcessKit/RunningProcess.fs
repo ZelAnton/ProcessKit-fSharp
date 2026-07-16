@@ -122,7 +122,12 @@ type internal JsonLinesEnumerator<'T>(program: string, source: IAsyncEnumerator<
                                     // exactly like a `return raise` would elsewhere in this file.
                                     raise (ProcessException(ProcessError.Parse(program, ex.Message)))
 
-                    return result.Value
+                    return
+                        match result with
+                        | ValueSome v -> v
+                        | ValueNone ->
+                            invalidOp
+                                "Loop invariant violated: result should always be ValueSome after exiting the loop"
                 }
 
             ValueTask<bool>(body)
