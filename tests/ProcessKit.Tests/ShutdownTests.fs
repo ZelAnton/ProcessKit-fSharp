@@ -9,6 +9,50 @@ open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
 
+/// A minimal `IContainmentBackend` fault-injection seam for the T-132 regression below, local to this
+/// file: `ContainmentBugTests.SyntheticBackend` compiles AFTER `ShutdownTests.fs` in the `.fsproj`'s
+/// dependency order, so it is not visible here. Every verb is a no-op except `GracefulKillTree`, which
+/// always throws synchronously (simulating a faulting graceful-teardown stage), and `HardRelease`,
+/// whose call count this test asserts on directly.
+type private GracefulFaultBackend() =
+    let mutable hardReleaseCount = 0
+
+    /// How many times teardown (`HardRelease`) ran — must be exactly one, even after the graceful
+    /// stage faults, and must never run a second time on a later idempotent call.
+    member _.HardReleaseCount = hardReleaseCount
+
+    interface IContainmentBackend with
+        member _.Mechanism = Mechanism.ProcessGroup
+
+        member _.Spawn(_command) =
+            Ok
+                { Native.Common.Spawned.Handle = 0n
+                  Stdout = None
+                  Stderr = None
+                  Stdin = None
+                  WindowsCtrlGroup = false }
+
+        member _.Track(_spawned) = Ok()
+        member _.Release(_spawned) = ()
+        member _.Wait(_handle) = task { return Outcome.Exited 0 }
+        member _.PidOf(_spawned) = None
+        member _.KillChild(_spawned) = ()
+        member _.KillTree() = ()
+
+        member _.GracefulKillTree(_grace) : Task =
+            // The fault this backend exists to inject: `ShutdownAsync`'s graceful stage must still
+            // guarantee `hardRelease()` runs, and must still propagate this exception to the caller.
+            raise (InvalidOperationException "synthetic graceful-kill failure")
+
+        member _.Members() = Ok []
+        member _.Signal(_signal) = Ok()
+        member _.Suspend() = Ok()
+        member _.Resume() = Ok()
+        member _.Stats() = Ok(ProcessGroupStats(0, None, None))
+
+        member _.HardRelease() =
+            hardReleaseCount <- hardReleaseCount + 1
+
 [<TestFixture>]
 type ShutdownTests() =
 
@@ -107,6 +151,45 @@ type ShutdownTests() =
 
             use positiveGraceGroup = createGroup ()
             do! positiveGraceGroup.ShutdownAsync(TimeSpan.FromMilliseconds 1.0)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ShutdownAsync still hard-releases the container when the graceful kill throws``() : Task =
+        task {
+            let backend = GracefulFaultBackend()
+            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+            // The graceful stage faults; ShutdownAsync's `finally` must still run `hardRelease()`
+            // (never a forever-unreleased Job handle/cgroup/process group) AND propagate the original
+            // exception to this call's Task rather than swallow it.
+            let mutable thrown: exn option = None
+
+            try
+                do! group.ShutdownAsync(TimeSpan.FromMilliseconds 1.0)
+            with ex ->
+                thrown <- Some ex
+
+            match thrown with
+            | Some ex -> Assert.That(ex, Is.InstanceOf<InvalidOperationException>())
+            | None -> Assert.Fail "expected the synthetic GracefulKillTree failure to propagate"
+
+            Assert.That(
+                backend.HardReleaseCount,
+                Is.EqualTo 1,
+                "hardRelease() must still run once after a graceful-kill fault"
+            )
+
+            // A follow-up ShutdownAsync/Dispose must be a harmless no-op — the container really was
+            // released by the winner's `finally`, so the losers must not hang or double-release.
+            do! group.ShutdownAsync(TimeSpan.FromMilliseconds 1.0)
+            (group :> IDisposable).Dispose()
+
+            Assert.That(
+                backend.HardReleaseCount,
+                Is.EqualTo 1,
+                "a later idempotent Shutdown/Dispose call re-ran hardRelease()"
+            )
         }
         :> Task
 

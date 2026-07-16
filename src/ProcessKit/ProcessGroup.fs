@@ -469,7 +469,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// Tear the group down gracefully, then release it. On Unix: SIGTERM, then SIGKILL if still
     /// alive after `gracePeriod`. On Windows: an atomic Job kill. A negative `gracePeriod` is
     /// rejected with `ArgumentOutOfRangeException`; `TimeSpan.Zero` escalates immediately.
-    /// Idempotent with `Dispose`.
+    /// Idempotent with `Dispose` in the sense that matters — the one-shot teardown (`hardRelease`)
+    /// still runs exactly once no matter how many callers race `ShutdownAsync`/`Dispose`/`DisposeAsync`,
+    /// and every `GracefulKillTree` failure still leaves the container released, never leaked. It is
+    /// NOT idempotent in the sense of "every call observes the same completion": the caller that loses
+    /// the `claimRelease` race returns immediately without waiting for the winner's (possibly still
+    /// in-flight, up-to-`gracePeriod`) teardown to finish — unlike `RunningProcess.StopAsync`, which
+    /// funnels concurrent callers onto one shared conclusion. A loser that needs "the tree is fully torn
+    /// down" must await the SAME `Task` the winner returned, or otherwise synchronize with it itself.
     member this.ShutdownAsync(gracePeriod: TimeSpan) : Task =
         ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
 
@@ -479,9 +486,20 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // runs with NO lock held — the flag already fends off every new op. Only the winner reaches
             // the wait, so the one-shot teardown that follows runs exactly once.
             if claimRelease () then
-                do! backend.GracefulKillTree gracePeriod
-                hardRelease ()
-                GC.SuppressFinalize this
+                try
+                    do! backend.GracefulKillTree gracePeriod
+                finally
+                    // Guarantee `hardRelease`/`GC.SuppressFinalize` even if `GracefulKillTree` throws
+                    // synchronously or its `Task` faults — mirroring how `RunTelemetryScope.Conclude`
+                    // guards `Diag.runEnded` in a `finally`. `claimRelease()` already consumed the
+                    // live->released transition above, so without this `finally` a faulting graceful
+                    // stage would leave `hardRelease()` never called: every later Dispose/ShutdownAsync/
+                    // finalizer sees `releasedFlag <> 0` and no-ops, permanently leaking the Job handle /
+                    // cgroup / process group this container owns. The original exception (if any) is
+                    // NOT swallowed — `finally` only guarantees the cleanup runs alongside it, and the
+                    // exception still propagates to this call's `Task` once the `finally` completes.
+                    hardRelease ()
+                    GC.SuppressFinalize this
         }
         :> Task
 
