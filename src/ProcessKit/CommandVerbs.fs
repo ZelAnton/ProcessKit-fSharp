@@ -5,6 +5,7 @@ open System.Diagnostics.CodeAnalysis
 open System.Runtime.CompilerServices
 open System.Runtime.InteropServices
 open System.Text.Json
+open System.Text.Json.Serialization.Metadata
 open System.Threading
 
 /// Default-runner convenience verbs on `Command`, callable from F# and C# as
@@ -90,6 +91,16 @@ type CommandVerbs =
             [<Optional>] cancellationToken: CancellationToken
         ) =
         Runner.outputJson<'T> CommandVerbs.DefaultRunner cancellationToken (Option.ofObj options) command
+
+    /// Require a zero/accepted exit and deserialize the trimmed stdout using source-generated
+    /// `JsonTypeInfo<'T>` metadata. Invalid JSON becomes `ProcessError.Parse`; unlike the
+    /// `JsonSerializerOptions` overload, this overload is safe for trimmed and NativeAOT applications.
+    [<Extension>]
+    static member OutputJsonAsync<'T>
+        (command: Command, typeInfo: JsonTypeInfo<'T>, [<Optional>] cancellationToken: CancellationToken)
+        =
+        ArgumentNullException.ThrowIfNull typeInfo
+        Runner.outputJsonTyped<'T> CommandVerbs.DefaultRunner cancellationToken typeInfo command
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     [<Extension>]

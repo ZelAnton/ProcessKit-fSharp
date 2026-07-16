@@ -776,7 +776,9 @@ and turns a `false` return into `ProcessError.Parse`. (From F#, `Runner.tryParse
 record `[<CLIMutable>]` for the classic default-constructor-plus-settable-properties shape, or pass
 `options` with `PropertyNameCaseInsensitive = true` — otherwise STJ's constructor-based
 deserialization matches JSON property names to the record's constructor parameter names
-case-sensitively.
+case-sensitively. For trimmed/NativeAOT applications, pass source-generated `JsonTypeInfo<'T>` metadata
+to the `OutputJsonAsync(typeInfo)` overload instead: it has no reflection requirement. From F#, use
+`Runner.outputJsonTyped runner cancellationToken typeInfo command`.
 `FirstLineAsync` returns the first
 stdout line matching the predicate and kills the (private-group) child the moment
 it has its answer — you never wait out a long log for one line — and returns
