@@ -148,9 +148,12 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             children.Add spawned.Handle
 
             if spawned.WindowsCtrlGroup then
-                // Its console process-group id is its pid; the handle is still open here, so the pid is
-                // live and unambiguous. Records it as CTRL+BREAK-capable for `Signal.Int`/`Signal.Term`.
-                ctrlGroups[spawned.Handle] <- Native.Windows.processIdWindows spawned.Handle
+                // Its console process-group id is its pid; the handle is still open here, so a successful
+                // lookup is live and unambiguous. A failed lookup leaves the child contained but NOT
+                // CTRL+BREAK-capable: registering group 0 would broadcast to the caller's console.
+                match Native.Windows.processIdWindows spawned.Handle with
+                | Some processId -> ctrlGroups[spawned.Handle] <- processId
+                | None -> ()
 
             Ok()
 
@@ -164,7 +167,7 @@ type internal JobObjectBackend(jobHandle: nativeint) =
         member _.Wait(handle) = Native.Windows.waitWindows handle
 
         member _.PidOf(spawned) =
-            Some(Native.Windows.processIdWindows spawned.Handle)
+            Native.Windows.processIdWindows spawned.Handle
 
         member _.KillChild(spawned) =
             Native.Windows.terminateWindowsProcess spawned.Handle

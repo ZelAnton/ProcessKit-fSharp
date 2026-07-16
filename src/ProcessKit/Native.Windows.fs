@@ -222,8 +222,16 @@ module internal Windows =
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern uint32 private GetProcessId(nativeint hProcess)
 
-    /// The OS process id behind a Windows process handle.
-    let processIdWindows (hProcess: nativeint) : int = int (GetProcessId hProcess)
+    // Test seam: `GetProcessId`, overridable so a fault-injection test can force its documented zero
+    // failure sentinel deterministically. Production always runs the real entry point; only the
+    // (sequential) tests reassign it, and restore it in a `finally`.
+    let mutable getProcessIdHook: nativeint -> uint32 = GetProcessId
+
+    /// The OS process id behind a Windows process handle, when the native query succeeds.
+    let processIdWindows (hProcess: nativeint) : int option =
+        match getProcessIdHook hProcess with
+        | 0u -> None
+        | processId -> Some(int processId)
 
     // Std-handle ids and flags for the Inherit / Null stdio modes.
     [<Literal>]
@@ -434,6 +442,12 @@ module internal Windows =
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private GenerateConsoleCtrlEvent(uint32 dwCtrlEvent, uint32 dwProcessGroupId)
 
+    // Test seam: `GenerateConsoleCtrlEvent`, so validation tests can prove an invalid group id does not
+    // reach the native API. Production always runs the real entry point; only the (sequential) tests
+    // reassign it, and restore it in a `finally`.
+    let mutable generateConsoleCtrlEventHook: uint32 * uint32 -> bool =
+        GenerateConsoleCtrlEvent
+
     /// Best-effort soft stop for a console child: generate a CTRL+BREAK for the process group
     /// `processGroupId` (a child spawned with `CREATE_NEW_PROCESS_GROUP`, whose group id is its pid).
     /// The event is targeted at that SPECIFIC group — never group 0 — so the caller's own console group
@@ -442,7 +456,9 @@ module internal Windows =
     /// group, not that any child actually handled it: it reaches only console children sharing the
     /// caller's console, and a child may install its own handler.
     let sendConsoleCtrlBreakWindows (processGroupId: int) : Result<unit, string> =
-        if GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, uint32 processGroupId) then
+        if processGroupId <= 0 then
+            Error "process group id must be positive"
+        elif generateConsoleCtrlEventHook (CTRL_BREAK_EVENT, uint32 processGroupId) then
             Ok()
         else
             Error(Win32Exception(Marshal.GetLastWin32Error()).Message)

@@ -7,6 +7,7 @@ open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+open ProcessKit.Native
 
 [<TestFixture>]
 type ProcessControlTests() =
@@ -151,6 +152,66 @@ type ProcessControlTests() =
                     running.Kill()
                     let! _ = running.WaitAsync()
                     ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: CTRL+BREAK rejects non-positive process groups before the native API``() =
+        if not isWindows then
+            Assert.Ignore "Console CTRL-event delivery is a Windows-only concern."
+
+        let original = Windows.generateConsoleCtrlEventHook
+        let mutable invoked = false
+
+        try
+            Windows.generateConsoleCtrlEventHook <-
+                fun _ ->
+                    invoked <- true
+                    true
+
+            for processGroupId in [ 0; -1 ] do
+                match Windows.sendConsoleCtrlBreakWindows processGroupId with
+                | Error _ -> ()
+                | Ok() -> Assert.Fail $"expected non-positive group id {processGroupId} to be rejected"
+
+            Assert.That(invoked, Is.False, "an invalid process group id reached GenerateConsoleCtrlEvent")
+        finally
+            Windows.generateConsoleCtrlEventHook <- original
+
+    [<Test>]
+    member _.``Windows: GetProcessId failure leaves a ctrl child unregistered and without a pid``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Console CTRL-event delivery is a Windows-only concern."
+
+            let original = Windows.getProcessIdHook
+
+            try
+                // `GetProcessId` returns zero on failure. The child remains contained by its Job, but it
+                // must not be registered for CTRL+BREAK because group zero broadcasts to this console.
+                Windows.getProcessIdHook <- fun _ -> 0u
+                use group = create ()
+
+                let consoleChild =
+                    (Command.create "ping" |> Command.args [ "-n"; "30"; "127.0.0.1" ])
+                        .WindowsCtrlSignals()
+                        .Stdout(StdioMode.Null)
+                        .Timeout(TimeSpan.FromSeconds 15.0)
+
+                match! group.StartAsync consoleChild with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    Assert.That(running.Pid, Is.EqualTo None, "GetProcessId failure must not become Some 0")
+
+                    match group.Signal Signal.Int with
+                    | Error(ProcessError.Unsupported _) -> ()
+                    | other -> Assert.Fail $"expected no CTRL-capable child after GetProcessId failure, got {other}"
+
+                    running.Kill()
+                    let! _ = running.WaitAsync()
+                    ()
+            finally
+                Windows.getProcessIdHook <- original
         }
         :> Task
 
