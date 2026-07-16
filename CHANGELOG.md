@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- Add AOT-safe overloads of `OutputJsonAsync<'T>` accepting `JsonTypeInfo<'T>` for use with source-generated serialization contexts in trimmed/NativeAOT applications.
 
 ### Changed
 -

@@ -6,6 +6,7 @@ open System.IO
 open System.Runtime.CompilerServices
 open System.Runtime.InteropServices
 open System.Text.Json
+open System.Text.Json.Serialization.Metadata
 open System.Threading
 open System.Threading.Tasks
 
@@ -414,6 +415,16 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
         : Task<Result<'T, ProcessError>> =
         CaptureVerbs.outputJson (List.last commands).Program (Option.ofObj options) (fun () ->
             this.RunAsync cancellationToken)
+
+    /// Require a successful pipefail exit and deserialize the trimmed stdout using source-generated
+    /// `JsonTypeInfo<'T>` metadata. Invalid JSON becomes `ProcessError.Parse`; unlike the
+    /// `JsonSerializerOptions` overload, this overload is safe for trimmed and NativeAOT applications.
+    member this.OutputJsonAsync<'T>
+        (typeInfo: JsonTypeInfo<'T>, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<'T, ProcessError>> =
+        ArgumentNullException.ThrowIfNull typeInfo
+
+        CaptureVerbs.outputJsonTyped (List.last commands).Program typeInfo (fun () -> this.RunAsync cancellationToken)
 
 /// `Command.Pipe` builds a two-stage `Pipeline`; further `Pipeline.Pipe` calls extend it.
 [<Extension>]

@@ -2,6 +2,7 @@ namespace ProcessKit
 
 open System.Diagnostics.CodeAnalysis
 open System.Text.Json
+open System.Text.Json.Serialization.Metadata
 open System.Threading
 open System.Threading.Tasks
 
@@ -119,6 +120,20 @@ module internal CaptureVerbs =
             let optionsArg = options |> Option.toObj
 
             match JsonSerializer.Deserialize(text, typeof<'T>, optionsArg) with
+            | null -> raise (JsonException "the JSON document deserialized to null")
+            | value -> unbox<'T> value
+
+        parse program deserialize runText
+
+    /// Deserialize the trimmed stdout from `runText` with caller-provided source-generated metadata.
+    /// Unlike `outputJson`, this uses the `JsonTypeInfo<'T>` overload directly and is trim-/AOT-safe.
+    let outputJsonTyped<'T>
+        (program: string)
+        (typeInfo: JsonTypeInfo<'T>)
+        (runText: unit -> Task<Result<string, ProcessError>>)
+        : Task<Result<'T, ProcessError>> =
+        let deserialize (text: string) : 'T =
+            match JsonSerializer.Deserialize(text, typeInfo :> JsonTypeInfo) with
             | null -> raise (JsonException "the JSON document deserialized to null")
             | value -> unbox<'T> value
 
@@ -350,6 +365,17 @@ module Runner =
         (command: Command)
         : Task<Result<'T, ProcessError>> =
         CaptureVerbs.outputJson command.Program options (fun () -> run runner cancellationToken command)
+
+    /// Require a zero/accepted exit and deserialize the trimmed stdout with caller-provided
+    /// source-generated `JsonTypeInfo<'T>` metadata. Invalid JSON becomes `ProcessError.Parse`, just
+    /// like `outputJson`, and this overload is safe for trimmed and NativeAOT applications.
+    let outputJsonTyped<'T>
+        (runner: IProcessRunner)
+        (cancellationToken: CancellationToken)
+        (typeInfo: JsonTypeInfo<'T>)
+        (command: Command)
+        : Task<Result<'T, ProcessError>> =
+        CaptureVerbs.outputJsonTyped command.Program typeInfo (fun () -> run runner cancellationToken command)
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     let firstLine

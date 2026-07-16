@@ -269,7 +269,9 @@ return becomes `ProcessError.Parse` — F# reaches for the `Result`-returning `R
 `OutputJsonAsync<'T>` deserializes stdout as JSON via `System.Text.Json` (same explicit-type-argument
 need, since there is no parser argument to infer `'T` from — `OutputJsonAsync<int>()`), takes an
 optional `JsonSerializerOptions` overload, and turns invalid JSON into `ProcessError.Parse` just like
-a rejecting parser; `FirstLineAsync` returns the first stdout line matching a predicate.
+a rejecting parser. For trimmed/NativeAOT applications, call the `OutputJsonAsync(typeInfo)` overload with
+source-generated `JsonTypeInfo<'T>` metadata; from F#, use `Runner.outputJsonTyped`; `FirstLineAsync` returns
+the first stdout line matching a predicate.
 
 **F#**
 

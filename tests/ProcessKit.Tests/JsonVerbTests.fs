@@ -1,6 +1,7 @@
 namespace ProcessKit.Tests
 
 open System.Text.Json
+open System.Text.Json.Serialization.Metadata
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
@@ -25,12 +26,20 @@ type JsonVerbTests() =
             .On([ "bad-json-tool" ], Reply.Ok "not json at all")
             .On([ "failing-tool" ], Reply.Fail(1, "boom"))
 
+    // F# cannot run Roslyn source generators; the C# JsonVerbTests supplies generated metadata. These
+    // type infos still exercise the F#-facing overloads with the same public JsonTypeInfo contract.
+    let widgetTypeInfo =
+        JsonSerializerOptions.Default.GetTypeInfo(typeof<Widget>) :?> JsonTypeInfo<Widget>
+
+    let intTypeInfo =
+        JsonSerializerOptions.Default.GetTypeInfo(typeof<int>) :?> JsonTypeInfo<int>
+
     [<Test>]
-    member _.``Runner.outputJson deserializes valid JSON into a typed value``() : Task =
+    member _.``Runner.outputJsonTyped deserializes valid JSON into a typed value``() : Task =
         task {
             let! result =
                 Command.create "widget-tool"
-                |> Runner.outputJson<Widget> runner CancellationToken.None None
+                |> Runner.outputJsonTyped<Widget> runner CancellationToken.None widgetTypeInfo
 
             match result with
             | Ok widget ->
@@ -41,11 +50,11 @@ type JsonVerbTests() =
         :> Task
 
     [<Test>]
-    member _.``Runner.outputJson surfaces invalid JSON as ProcessError.Parse``() : Task =
+    member _.``Runner.outputJsonTyped surfaces invalid JSON as ProcessError.Parse``() : Task =
         task {
             let! result =
                 Command.create "bad-json-tool"
-                |> Runner.outputJson<Widget> runner CancellationToken.None None
+                |> Runner.outputJsonTyped<Widget> runner CancellationToken.None widgetTypeInfo
 
             match result with
             | Error(ProcessError.Parse _) -> Assert.Pass()
@@ -54,11 +63,11 @@ type JsonVerbTests() =
         :> Task
 
     [<Test>]
-    member _.``Runner.outputJson surfaces a non-zero exit as ProcessError.Exit, not a parse attempt``() : Task =
+    member _.``Runner.outputJsonTyped surfaces a non-zero exit as ProcessError.Exit, not a parse attempt``() : Task =
         task {
             let! result =
                 Command.create "failing-tool"
-                |> Runner.outputJson<Widget> runner CancellationToken.None None
+                |> Runner.outputJsonTyped<Widget> runner CancellationToken.None widgetTypeInfo
 
             match result with
             | Error(ProcessError.Exit(_, 1, _, stderr)) -> Assert.That(stderr, Is.EqualTo "boom")
@@ -100,11 +109,11 @@ type JsonVerbTests() =
                 else
                     Command.create "/bin/sh" |> Command.args [ "-c"; "echo 42" ]
 
-            match! echoNumber.OutputJsonAsync<int>() with
+            match! echoNumber.OutputJsonAsync<int>(intTypeInfo) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"{error}"
 
-            match! echoNumber.OutputJsonAsync<int>(cancellationToken = CancellationToken.None) with
+            match! echoNumber.OutputJsonAsync<int>(intTypeInfo, cancellationToken = CancellationToken.None) with
             | Ok value -> Assert.That(value, Is.EqualTo 42)
             | Error error -> Assert.Fail $"(ct) {error}"
         }
@@ -113,7 +122,7 @@ type JsonVerbTests() =
     [<Test>]
     member _.``IProcessRunner.OutputJsonAsync extension deserializes through the configured runner``() : Task =
         task {
-            match! runner.OutputJsonAsync<Widget>(Command.create "widget-tool") with
+            match! runner.OutputJsonAsync<Widget>(Command.create "widget-tool", widgetTypeInfo) with
             | Ok widget -> Assert.That(widget.Name, Is.EqualTo "gizmo")
             | Error error -> Assert.Fail $"{error}"
         }
@@ -124,7 +133,7 @@ type JsonVerbTests() =
         task {
             let client = CliClient("widget-tool").WithRunner runner
 
-            match! client.OutputJsonAsync<Widget> [] with
+            match! client.OutputJsonAsync<Widget>([], widgetTypeInfo) with
             | Ok widget ->
                 Assert.That(widget.Name, Is.EqualTo "gizmo")
                 Assert.That(widget.Count, Is.EqualTo 3)
@@ -152,7 +161,7 @@ type JsonVerbTests() =
 
             let pipeline = source.Pipe(Command.create "sort")
 
-            match! pipeline.OutputJsonAsync<int>() with
+            match! pipeline.OutputJsonAsync<int>(intTypeInfo) with
             | Ok value -> Assert.That(value, Is.EqualTo 99)
             | Error error -> Assert.Fail $"{error}"
         }

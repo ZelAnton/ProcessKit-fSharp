@@ -4,6 +4,7 @@ open System
 open System.Diagnostics.CodeAnalysis
 open System.Runtime.InteropServices
 open System.Text.Json
+open System.Text.Json.Serialization.Metadata
 open System.Threading
 open System.Threading.Tasks
 
@@ -130,6 +131,16 @@ type CliClient internal (config: CliClientConfig) =
             [<Optional>] cancellationToken: CancellationToken
         ) =
         Runner.outputJson<'T> config.Runner cancellationToken (Option.ofObj options) (this.Command args)
+
+    /// Build the command for `args`, require a zero/accepted exit, and deserialize the trimmed stdout
+    /// using source-generated `JsonTypeInfo<'T>` metadata. Invalid JSON becomes `ProcessError.Parse`;
+    /// unlike the `JsonSerializerOptions` overload, this overload is safe for trimmed and NativeAOT
+    /// applications.
+    member this.OutputJsonAsync<'T>
+        (args: seq<string>, typeInfo: JsonTypeInfo<'T>, [<Optional>] cancellationToken: CancellationToken)
+        =
+        ArgumentNullException.ThrowIfNull typeInfo
+        Runner.outputJsonTyped<'T> config.Runner cancellationToken typeInfo (this.Command args)
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     member this.FirstLineAsync
