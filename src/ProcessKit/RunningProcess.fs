@@ -6,6 +6,7 @@ open System.Diagnostics
 open System.Diagnostics.CodeAnalysis
 open System.IO
 open System.Net
+open System.Net.Http
 open System.Runtime.ExceptionServices
 open System.Runtime.InteropServices
 open System.Text.Json
@@ -316,6 +317,50 @@ type RunningProcess internal (host: RunningHost) =
                 stdoutStream, stderrStream
             else
                 None, None)
+
+    let waitForHttp
+        (uri: Uri)
+        (isSatisfactory: Func<HttpResponseMessage, bool>)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        task {
+            if cancellationToken.IsCancellationRequested then
+                return Error(ProcessError.Cancelled config.Program)
+            else
+                let stdout, stderr = probeDrainStreams ()
+
+                use readinessCts =
+                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                let readinessTask =
+                    ReadinessProbe.waitForHttp
+                        config.Program
+                        stdout
+                        stderr
+                        uri
+                        isSatisfactory
+                        timeout
+                        readinessCts.Token
+
+                // `RunningHost.Wait` is idempotent per child on every backend, so this observation can
+                // race the readiness poll without claiming the process's output consumption. If the child
+                // exits before its endpoint is healthy, stop the poll and report the honest NotReady result.
+                let childExitTask = host.Wait()
+                let! winner = Task.WhenAny(readinessTask :> Task, childExitTask :> Task)
+
+                if obj.ReferenceEquals(winner, readinessTask) || readinessTask.IsCompleted then
+                    return! readinessTask
+                else
+                    readinessCts.Cancel()
+                    let! _ = readinessTask
+
+                    if cancellationToken.IsCancellationRequested then
+                        return Error(ProcessError.Cancelled config.Program)
+                    else
+                        return Error(ProcessError.NotReady(config.Program, Timeouts.clampArmable timeout))
+        }
+
 
     let elapsed () =
         Stopwatch.GetElapsedTime host.StartedTimestamp
@@ -1315,7 +1360,7 @@ type RunningProcess internal (host: RunningHost) =
             task {
                 // Clamp so an out-of-range timeout can't throw out of the CTS constructor. The clamped
                 // value is also what gets reported in NotReady below — uniform with
-                // `ReadinessProbe.waitForPortUsing`/`waitForCore`: an over-long requested timeout is
+                // `ReadinessProbe.waitForPortUsing`/`waitForCoreUsing`: an over-long requested timeout is
                 // silently capped at ~24.8 days, so reporting the raw, un-clamped value would claim a
                 // budget longer than what was actually enforced.
                 let armedTimeout = Timeouts.clampArmable timeout
@@ -1371,7 +1416,7 @@ type RunningProcess internal (host: RunningHost) =
     /// verb (`OutputStringAsync`/`OutputBytesAsync`/`StdoutLinesAsync`/`OutputEventsAsync`) called
     /// AFTER this probe therefore only sees what the child wrote after the probe concluded, not the
     /// full run — the same "doesn't compose with a subsequent fresh capture" limitation
-    /// `WaitForLineAsync` already documents, now uniform across all three readiness probes. If a
+    /// `WaitForLineAsync` already documents, now uniform across all four readiness probes. If a
     /// buffered/streaming verb already claimed the pipes before this call, that verb's own pump is
     /// already draining them and this probe leaves them alone (no second reader).
     member _.WaitForPortAsync
@@ -1381,13 +1426,68 @@ type RunningProcess internal (host: RunningHost) =
         let stdout, stderr = probeDrainStreams ()
         ReadinessProbe.waitForPort config.Program stdout stderr endpoint timeout cancellationToken
 
+    /// Poll `uri` with HTTP GET until a response passes the default 2xx check, or fail with `NotReady`
+    /// once `timeout` expires (or `Cancelled` if `cancellationToken` fires first). Connection failures,
+    /// DNS failures, and request cancellations caused by the shared deadline are retried every 50ms.
+    /// If the child exits before a satisfactory response arrives, this returns `NotReady` immediately.
+    /// While polling, the child's piped stdout/stderr are background-drained and discarded exactly like
+    /// `WaitForPortAsync`, so startup output cannot block a chatty child before it becomes ready.
+    member this.WaitForHttpAsync
+        (uri: Uri, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        ArgumentNullException.ThrowIfNull uri
+
+        this.WaitForHttpAsync(
+            uri,
+            Func<HttpResponseMessage, bool>(fun response ->
+                let statusCode = int response.StatusCode
+                statusCode >= 200 && statusCode < 300),
+            timeout,
+            cancellationToken
+        )
+
+    /// Like `WaitForHttpAsync(uri, timeout, cancellationToken)`, but treats only status codes from
+    /// `acceptableStatusCodes` as ready. The sequence is materialized once before polling, so every retry
+    /// applies the same criteria.
+    member this.WaitForHttpAsync
+        (uri: Uri, acceptableStatusCodes: seq<int>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken) : Task<
+                                                                                                                                Result<
+                                                                                                                                    unit,
+                                                                                                                                    ProcessError
+                                                                                                                                 >
+                                                                                                                             >
+        =
+        ArgumentNullException.ThrowIfNull uri
+        ArgumentNullException.ThrowIfNull acceptableStatusCodes
+        let accepted = HashSet<int>(acceptableStatusCodes)
+
+        this.WaitForHttpAsync(
+            uri,
+            Func<HttpResponseMessage, bool>(fun response -> accepted.Contains(int response.StatusCode)),
+            timeout,
+            cancellationToken
+        )
+
+    /// Like `WaitForHttpAsync(uri, timeout, cancellationToken)`, but uses `isSatisfactory` to inspect
+    /// each response. A false result is retried; an exception from caller-supplied validation propagates.
+    member _.WaitForHttpAsync
+        (
+            uri: Uri,
+            isSatisfactory: Func<HttpResponseMessage, bool>,
+            timeout: TimeSpan,
+            [<Optional>] cancellationToken: CancellationToken
+        ) : Task<Result<unit, ProcessError>> =
+        ArgumentNullException.ThrowIfNull uri
+        ArgumentNullException.ThrowIfNull isSatisfactory
+        waitForHttp uri isSatisfactory timeout cancellationToken
+
     /// Poll `probe` until it returns true, or fail with `NotReady` once the shared `timeout` deadline
     /// elapses (or `Cancelled` if `cancellationToken` fires first). The deadline is honored even if
     /// `probe` never completes — or blocks synchronously without ever returning a task: the invocation
     /// is isolated on the thread pool and raced against the shared deadline, and the caller's token
     /// takes priority over a concurrent success. The API cannot force a caller-owned `probe` to stop, so
     /// an abandoned invocation keeps running in the background, but its late outcome is safely observed
-    /// (a late fault never becomes an unobserved task exception). See `ReadinessProbe.waitForCore` for
+    /// (a late fault never becomes an unobserved task exception). See `ReadinessProbe.waitForCoreUsing` for
     /// the full contract, including the ratified scheduler-bounded window at the deadline.
     /// Background-drains (and discards) the child's piped stdout/stderr for the duration of the poll,
     /// exactly like `WaitForPortAsync` — see its doc for what that does and doesn't compose with

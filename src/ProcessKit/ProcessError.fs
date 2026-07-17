@@ -33,7 +33,7 @@ type ProcessError =
     /// The run was cancelled through its `CancellationToken`. A cancellation is always an error.
     | Cancelled of Program: string
 
-    /// A readiness probe (`WaitForLineAsync` / `WaitForPortAsync` / `WaitForAsync`) did not succeed within its timeout.
+    /// A readiness probe (`WaitForLineAsync` / `WaitForPortAsync` / `WaitForHttpAsync` / `WaitForAsync`) did not succeed within its timeout.
     | NotReady of Program: string * Timeout: TimeSpan
 
     /// Parsing the captured output into a typed value failed.

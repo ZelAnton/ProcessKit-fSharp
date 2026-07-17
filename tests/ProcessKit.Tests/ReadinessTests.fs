@@ -5,9 +5,11 @@ open System.Diagnostics
 open System.IO
 open System.IO.Pipelines
 open System.Net
+open System.Net.Http
 open System.Net.Sockets
 open System.Runtime.CompilerServices
 open System.Runtime.InteropServices
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
@@ -81,6 +83,67 @@ type ReadinessTests() =
 
             do! stream.FlushAsync()
         }
+
+    let startHttpListener (statusForRequest: int -> int) : TcpListener * Uri * (unit -> int) =
+        let listener = new TcpListener(IPAddress.Loopback, 0)
+        listener.Start()
+        let port = (listener.LocalEndpoint :?> IPEndPoint).Port
+        let mutable requests = 0
+
+        let server =
+            task {
+                try
+                    while true do
+                        use! client = listener.AcceptTcpClientAsync()
+                        requests <- requests + 1
+                        use stream = client.GetStream()
+                        let status = statusForRequest requests
+
+                        let response =
+                            Encoding.ASCII.GetBytes(
+                                $"HTTP/1.1 {status} Readiness{Environment.NewLine}Content-Length: 0{Environment.NewLine}Connection: close{Environment.NewLine}{Environment.NewLine}"
+                            )
+
+                        do! stream.WriteAsync(response)
+                        do! stream.FlushAsync()
+                with
+                | :? SocketException ->
+                    // Stopping the listener unblocks a pending accept during test cleanup.
+                    ()
+                | :? ObjectDisposedException ->
+                    // Disposal can race Stop during test cleanup; no connection remains to serve.
+                    ()
+            }
+
+        server.ContinueWith(
+            (fun (finished: Task) -> finished.Exception |> ignore),
+            TaskContinuationOptions.OnlyOnFaulted
+            ||| TaskContinuationOptions.ExecuteSynchronously
+        )
+        |> ignore
+
+        listener, Uri($"http://127.0.0.1:{port}/"), (fun () -> requests)
+
+    let syntheticHttpProcess (exitTask: Task<Outcome>) : RunningProcess =
+        let config = (Command.create "test").Config
+
+        let host: RunningHost =
+            { Config = config
+              Pid = None
+              Stdout = None
+              Stderr = None
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = None
+              Wait = fun () -> exitTask
+              StdinError = fun () -> None
+              StdinFeedComplete = ignore
+              StartKill = ignore
+              GracefulKill = fun _ -> Task.CompletedTask
+              Teardown = fun () -> ValueTask() }
+
+        new RunningProcess(host)
 
     [<Test>]
     member _.``WaitForLine matches a stdout line, then dispose reaps the rest``() : Task =
@@ -157,6 +220,98 @@ type ReadinessTests() =
                     match! running.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 3.0) with
                     | Ok() -> Assert.Pass()
                     | Error error -> Assert.Fail $"{error}"
+            finally
+                listener.Stop()
+        }
+        :> Task
+
+    [<Test>]
+    member _.WaitForHttpRetriesUnsuccessfulResponsesUntilALoopbackEndpointIsReady() : Task =
+        task {
+            let listener, uri, requestCount =
+                startHttpListener (fun attempt -> if attempt > 2 then 200 else 503)
+
+            try
+                use running = syntheticHttpProcess (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForHttpAsync(uri, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.That(requestCount (), Is.GreaterThanOrEqualTo 3)
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                listener.Stop()
+        }
+        :> Task
+
+    [<Test>]
+    member _.WaitForHttpReturnsNotReadyWhenItsEndpointNeverReturnsASatisfactoryResponse() : Task =
+        task {
+            let listener, uri, _requestCount = startHttpListener (fun _ -> 503)
+
+            try
+                use running = syntheticHttpProcess (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForHttpAsync(uri, TimeSpan.FromMilliseconds 250.0) with
+                | Error(ProcessError.NotReady _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected NotReady, got {other}"
+            finally
+                listener.Stop()
+        }
+        :> Task
+
+    [<Test>]
+    member _.WaitForHttpReturnsNotReadyPromptlyWhenTheChildExitsBeforeReadiness() : Task =
+        task {
+            let listener, uri, _requestCount = startHttpListener (fun _ -> 503)
+
+            try
+                use running = syntheticHttpProcess (Task.FromResult(Outcome.Exited 1))
+                let elapsed = Stopwatch.StartNew()
+
+                match! running.WaitForHttpAsync(uri, TimeSpan.FromSeconds 5.0) with
+                | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+                | other -> Assert.Fail $"expected early NotReady, got {other}"
+            finally
+                listener.Stop()
+        }
+        :> Task
+
+    [<Test>]
+    member _.WaitForHttpSupportsExplicitStatusCodesAndResponsePredicates() : Task =
+        task {
+            let listener, uri, _requestCount = startHttpListener (fun _ -> 418)
+
+            try
+                use running = syntheticHttpProcess (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForHttpAsync(uri, seq { 418 }, TimeSpan.FromSeconds 3.0) with
+                | Error error -> Assert.Fail $"status-code overload failed: {error}"
+                | Ok() ->
+                    match!
+                        running.WaitForHttpAsync(
+                            uri,
+                            Func<HttpResponseMessage, bool>(fun response -> int response.StatusCode = 418),
+                            TimeSpan.FromSeconds 3.0
+                        )
+                    with
+                    | Ok() -> Assert.Pass()
+                    | Error error -> Assert.Fail $"predicate overload failed: {error}"
+            finally
+                listener.Stop()
+        }
+        :> Task
+
+    [<Test>]
+    member _.WaitForHttpObservesExternalCancellation() : Task =
+        task {
+            let listener, uri, _requestCount = startHttpListener (fun _ -> 503)
+
+            try
+                use running = syntheticHttpProcess (TaskCompletionSource<Outcome>().Task)
+                use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 100.0)
+
+                match! running.WaitForHttpAsync(uri, TimeSpan.FromSeconds 30.0, cts.Token) with
+                | Error(ProcessError.Cancelled _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected Cancelled, got {other}"
             finally
                 listener.Stop()
         }
