@@ -21,7 +21,14 @@ jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
+      # contents: push the release commit + tag to main and create the GitHub Release.
+      # id-token: mint this run's GitHub OIDC token, used BOTH for NuGet Trusted
+      #   Publishing (NuGet/login exchanges it for a short-lived push key) and for the
+      #   build-provenance attestation below.
+      # attestations: write the provenance attestation to the repo's attestation store.
       contents: write
+      id-token: write
+      attestations: write
     steps:
       # RELEASE ORDERING INVARIANT (rationale repeated at each relevant step):
       # publishing to NuGet.org is the single IRREVERSIBLE step, so it is the pivot.
@@ -58,21 +65,34 @@ jobs:
           fi
           echo "Dispatched from main."
 
-      - name: Preflight — required secrets present before any external action
+      - name: Preflight — publish prerequisites present before any external action
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_USER: ${{ vars.NUGET_USER }}
         run: |
           set -euo pipefail
-          # Fail fast, before any irreversible publish or VCS push, if the publish
-          # credential is missing — otherwise a missing secret only surfaces at the
-          # publish step, after the cheap work has run. If you switch to NuGet
-          # Trusted Publishing (OIDC, see the publish step below), drop the
-          # NUGET_API_KEY check here and verify id-token availability instead.
-          if [[ -z "${NUGET_API_KEY:-}" ]]; then
-            echo "::error::NUGET_API_KEY secret is not set. Add it under Settings -> Secrets and variables -> Actions before releasing."
+          # Fail fast, before any irreversible publish or VCS push, if a publish
+          # prerequisite is missing — otherwise a misconfiguration only surfaces at
+          # the publish step, after the cheap work has run.
+          #
+          # We publish via NuGet Trusted Publishing (OIDC), so there is NO long-lived
+          # NUGET_API_KEY secret to check. Instead the NuGet/login step (just before
+          # the pivot) exchanges this run's GitHub OIDC token for a short-lived push
+          # key, so the two prerequisites to verify up front are:
+          #   1. an OIDC token is actually mintable — i.e. `id-token: write` is in
+          #      effect. GitHub exposes it via ACTIONS_ID_TOKEN_REQUEST_URL, which is
+          #      empty when the permission is missing.
+          #   2. the nuget.org account username is configured (repo variable
+          #      NUGET_USER). NuGet/login needs it, and it must match the trusted-
+          #      publisher policy configured on nuget.org for this repo + workflow.
+          if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            echo "::error::GitHub OIDC token is unavailable (ACTIONS_ID_TOKEN_REQUEST_URL is empty). Keep 'permissions: id-token: write' on this job — it is required for NuGet Trusted Publishing and build provenance."
             exit 1
           fi
-          echo "Required secrets present."
+          if [[ -z "${NUGET_USER:-}" ]]; then
+            echo "::error::Repo variable NUGET_USER is not set. Add your nuget.org account username under Settings -> Secrets and variables -> Actions -> Variables, and configure a Trusted Publishing policy on nuget.org for this repo+workflow. See https://learn.microsoft.com/nuget/nuget-org/trusted-publishing"
+            exit 1
+          fi
+          echo "Publish prerequisites present (OIDC token mintable; NUGET_USER configured)."
 
       # Mint a short-lived GitHub App installation token. Pushing the release commit
       # to `main` with it makes the **App** the actor — and the App sits in the
@@ -321,6 +341,30 @@ jobs:
           sha256sum "${files[@]}" > SHA256SUMS
           cat SHA256SUMS
 
+      # Generate provenance attestations for the exact artifacts about to ship (the
+      # four .nupkg + their .snupkg symbol packages and the SHA256SUMS manifest),
+      # cryptographically binding them to this workflow run so consumers can verify
+      # origin with `gh attestation verify <file> --repo <owner>/<repo>`. A logical
+      # continuation of the repo's existing supply-chain hardening (SHA-pinned actions,
+      # SHA256SUMS) — it ADDS provenance, it does not replace the manifest.
+      #
+      # Ordering: this is a cheap, reversible PRE-pivot step. It writes only to
+      # GitHub's attestation store (no registry / no remote git write), so a failure
+      # here leaves nothing published and the run is safe to restart. Because GitHub
+      # allows multiple attestations per subject digest, a re-run simply records
+      # another attestation for the same artifacts instead of failing on "already
+      # attested" — so this step never breaks the publish step's idempotent retry.
+      # Needs id-token: write + attestations: write (granted at the job level above).
+      # The composite action's own transitive dependency (actions/attest) is already
+      # SHA-pinned inside it, so nothing extra to pin here.
+      - name: Attest build provenance for the artifacts
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+            artifacts/SHA256SUMS
+
       # Bump the declared <Version> of all four packages in lockstep (they are packed above with
       # -p:Version=<computed>, so this keeps the repo's seed versions consistent with what shipped).
       - name: Bump version in fsproj
@@ -398,6 +442,20 @@ jobs:
           git commit -m "Release ${{ steps.version.outputs.tag }}"
           git tag "${{ steps.version.outputs.tag }}"
 
+      # Mint a short-lived NuGet API key for THIS run via Trusted Publishing (OIDC):
+      # NuGet/login exchanges the job's GitHub OIDC token (id-token: write) with
+      # nuget.org's token service for a temporary push key, authorised by the trusted-
+      # publisher policy configured there for this repo + workflow. This replaces the
+      # long-lived NUGET_API_KEY secret entirely. Minted right before the pivot to keep
+      # the key's lifetime minimal; the key is exposed only as a masked step output and
+      # is consumed solely by the push step below. This mints a fresh key every run, so
+      # it does not interfere with the pivot's idempotent re-run behaviour.
+      - name: NuGet login (OIDC trusted publishing)
+        id: nuget-login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ vars.NUGET_USER }}
+
       # === PIVOT: the single irreversible step ===
       # NuGet publishing cannot be undone (a pushed version can only be unlisted,
       # never re-pushed), so it is the pivot and every reversible action is ordered
@@ -410,15 +468,14 @@ jobs:
       # sails through instead of erroring. The loop retries only transient failures
       # (network, registry blips).
       #
-      # MORE SECURE ALTERNATIVE — NuGet Trusted Publishing (OIDC): instead of a
-      # long-lived NUGET_API_KEY secret, mint a short-lived key per run. Add
-      # `id-token: write` to this job's permissions, configure a trusted publisher
-      # policy on nuget.org for this repo+workflow, then replace the step below with
-      # the `NuGet/login` action to obtain a temporary key (and update the preflight
-      # step accordingly). See https://learn.microsoft.com/nuget/nuget-org/trusted-publishing
+      # CREDENTIAL — NuGet Trusted Publishing (OIDC): the API key used below is the
+      # short-lived key minted by the NuGet/login step above for THIS run (derived
+      # from the job's OIDC token), NOT a long-lived NUGET_API_KEY secret. The
+      # trusted-publisher policy on nuget.org for this repo + workflow authorises the
+      # exchange. See https://learn.microsoft.com/nuget/nuget-org/trusted-publishing
       - name: Push to NuGet.org (irreversible pivot)
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
