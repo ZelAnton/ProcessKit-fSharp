@@ -237,6 +237,66 @@ type PtyTests() =
         }
 
     [<Test>]
+    member _.``Pty on POSIX applies the configured winsize (Cols/Rows) to the child terminal``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                // `stty size` reads its controlling terminal's window size (TIOCGWINSZ) and prints
+                // "rows cols". A pty opened WITHOUT applying PtyConfig.Cols/Rows carries the kernel's 0x0
+                // default and would print "0 0"; a 30x120 result proves the initial geometry is honoured
+                // via ioctl(TIOCSWINSZ) — parity with the Windows CreatePseudoConsole path, and no silent
+                // cross-platform downgrade of a validated user field.
+                let cmd =
+                    (Command.create "/bin/sh" |> Command.args [ "-c"; "stty size" ]).Pty(120, 30)
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok result ->
+                    Assert.That(
+                        result.Stdout.Trim(),
+                        Does.Contain "30 120",
+                        "the pty must carry the configured 30 rows x 120 cols winsize, not the kernel 0x0 default"
+                    )
+        }
+
+    [<Test>]
+    member _.``Pty on POSIX feeds an interactive stdin to the child terminal and exits cleanly``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                // A fed/interactive stdin under a PTY is written to the SINGLE pty master (there is no
+                // `dup` of it — a dup would drop the master's O_CLOEXEC and leak a writable master into a
+                // concurrent spawn, keeping the child from ever seeing its stdin EOF). `read` returns on
+                // the fed newline (it does not need EOF), so the child consumes the line and exits
+                // cleanly; a hang would trip the timeout. This exercises the interactive-stdin pty path
+                // end-to-end (previously untested).
+                let cmd =
+                    Command.create "/bin/sh"
+                    |> Command.args [ "-c"; "read line; printf 'GOT=%s' \"$line\"" ]
+                    |> Command.stdin (Stdin.FromString "pty-stdin-marker\n")
+                    |> Command.pty
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok result ->
+                    Assert.That(
+                        result.Stdout,
+                        Does.Contain "GOT=pty-stdin-marker",
+                        "the fed stdin line must reach the pty child"
+                    )
+
+                    match result.Outcome with
+                    | Outcome.Exited 0 -> ()
+                    | other -> Assert.Fail $"expected a clean exit from the pty child that read stdin, got {other}"
+        }
+
+    [<Test>]
     member _.``Pty on a host without the ctty helper is a typed Unsupported, never a fake tty (D9)``() : Task =
         task {
             if not isLinux then

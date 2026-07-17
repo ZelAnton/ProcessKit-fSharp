@@ -159,10 +159,31 @@ module internal Posix =
     [<DllImport("libc", SetLastError = true, CharSet = CharSet.Ansi)>]
     extern nativeint private ptsname(int fd)
 
-    // Duplicate a fd. Used to give an interactive/fed pty stdin its OWN owning fd over the master, so the
-    // read (stdout) and write (stdin) streams each dispose exactly one fd — no double close of one master.
+    // `struct winsize` — the terminal window size the kernel keeps per pty pair. Only the row/column
+    // fields are meaningful to a program reading TIOCGWINSZ; the pixel fields are unused and left 0.
+    // Sequential layout is the C ABI (four `unsigned short`s, 8 bytes), passed by-ref to `ioctl`.
+    [<Struct; StructLayout(LayoutKind.Sequential)>]
+    type private Winsize =
+        val mutable Row: uint16
+        val mutable Col: uint16
+        val mutable XPixel: uint16
+        val mutable YPixel: uint16
+
+    // ioctl(master, TIOCSWINSZ, &winsize) applies the INITIAL terminal geometry (PtyConfig.Cols/Rows) to
+    // a freshly opened pty, so a full-screen TUI (vim/top/less) sees the requested size instead of the
+    // kernel's 0x0 default — parity with the Windows CreatePseudoConsole geometry, never a silent
+    // cross-platform downgrade of a validated user field. `ioctl` is variadic in C, but the pty path is
+    // Linux-only (the ctty helper is util-linux `setsid --ctty`; macOS/BSD take the honest Unsupported
+    // path BEFORE any pty is opened), and on Linux the AArch64 ABI passes this single fixed pointer
+    // argument in a register exactly like a named arg — so a fixed-signature P/Invoke is correct here and
+    // the macOS variadic-ABI hazard that bans `fcntl` never applies. `request` is C `unsigned long`
+    // (`unativeint`); TIOCSWINSZ is 0x5414 across the Linux architectures this port targets
+    // (x86/x86_64/arm/arm64 share the asm-generic ioctl numbers).
+    [<Literal>]
+    let private TIOCSWINSZ = 0x5414
+
     [<DllImport("libc", SetLastError = true)>]
-    extern int private dup(int fd)
+    extern int private ioctl(int fd, unativeint request, Winsize& winsize)
 
     // read/write on a pty master fd. Unlike a socketpair end (a `Socket`/`NetworkStream` on the runtime's
     // epoll/kqueue engine), a pty master is a character device that engine cannot host, so `PtyStream`
@@ -547,9 +568,12 @@ module internal Posix =
     // POSIX pty (pseudo-terminal) master: fd allocation + an async Stream wrapper (Command.Pty)
     // ----------------------------------------------------------------------------------
 
-    /// A `Stream` over one owned fd of a POSIX pty MASTER — the single merged terminal output (D3), and,
-    /// when an interactive/fed stdin is wanted, a `dup` of the master for the write side. Unlike a
-    /// socketpair end (a `Socket`/`NetworkStream` driven by the runtime's epoll/kqueue `SocketAsyncEngine`),
+    /// A `Stream` over a POSIX pty MASTER fd — the single merged terminal output (D3). When an
+    /// interactive/fed stdin is also wanted, the SAME master is wrapped a second time as a NON-owning
+    /// `PtyStream` for the write side (a pty master is bidirectional; read and write on it are
+    /// independent), so there is one master fd, closed exactly once by the owning read stream — no `dup`,
+    /// hence no non-CLOEXEC duplicate to leak. Unlike a socketpair end (a `Socket`/`NetworkStream` driven
+    /// by the runtime's epoll/kqueue `SocketAsyncEngine`),
     /// a pty master is a character device that engine cannot host, so I/O goes through libc `read`/`write`;
     /// the base `Stream` offloads the synchronous `Read`/`Write` to the thread pool for its async verbs, so
     /// the `Pump`'s `ReadAsync` still completes on data with no busy-poll (it parks a pool thread for the
@@ -559,10 +583,12 @@ module internal Posix =
     ///     EIO rather than a clean 0-length EOF; this maps it to EOF so the merged-capture path ends
     ///     normally (macOS/BSD already give a real EOF). A write-side EIO/EPIPE becomes a broken-pipe
     ///     `IOException`, matching the socketpair path's write-after-peer-close.
-    ///   * **Single-owner fd.** The fd is owned by a `SafeFileHandle` (closed exactly once on `Dispose`,
-    ///     finalizer as the GC-time safety net) — the same contract the socketpair `SafeSocketHandle` gives.
-    ///     Reads/writes take a `DangerousAddRef`/`Release` around the syscall so a concurrent `Dispose`
-    ///     cannot close the fd mid-call.
+    ///   * **Single-owner fd.** The fd is held by a `SafeFileHandle`; the merged-output (read) stream owns
+    ///     it (closed exactly once on `Dispose`, finalizer as the GC-time safety net) — the same contract
+    ///     the socketpair `SafeSocketHandle` gives — while the optional stdin (write) view over the same fd
+    ///     is constructed non-owning, so it never closes the fd. Reads/writes take a
+    ///     `DangerousAddRef`/`Release` around the syscall so a concurrent `Dispose` cannot close the fd
+    ///     mid-call.
     type internal PtyStream(handle: Microsoft.Win32.SafeHandles.SafeFileHandle) =
         inherit Stream()
 
@@ -655,10 +681,14 @@ module internal Posix =
     /// versions, and — unlike a bare `openpty` — able to set O_CLOEXEC without `fcntl`, per the PTY ADR).
     /// Both ends are opened O_CLOEXEC so a DIFFERENT concurrent spawn never inherits them (the pty analogue
     /// of the socketpair's SOCK_CLOEXEC), and O_NOCTTY so opening the slave in the PARENT never steals it
-    /// as the parent's controlling terminal — the CHILD adopts it deliberately via `setsid --ctty`. Returns
-    /// the master and slave fds (the caller owns and must close both), or an errno-tagged message. Each
-    /// `Marshal.GetLastWin32Error()` is read immediately after its failing P/Invoke, before any other one.
-    let private openPtyPair () : Result<int * int, string> =
+    /// as the parent's controlling terminal — the CHILD adopts it deliberately via `setsid --ctty`. The
+    /// initial window size (`cols`/`rows` from `PtyConfig`) is applied to the pair via `ioctl(TIOCSWINSZ)`
+    /// so a full-screen TUI sees the requested geometry instead of the kernel's 0x0 default — parity with
+    /// the Windows `CreatePseudoConsole` path (`bare openpty` would take a `winsize` argument directly; the
+    /// `posix_openpt` sequence sets it explicitly after allocation). Returns the master and slave fds (the
+    /// caller owns and must close both), or an errno-tagged message. Each `Marshal.GetLastWin32Error()` is
+    /// read immediately after its failing P/Invoke, before any other one.
+    let private openPtyPair (cols: int) (rows: int) : Result<int * int, string> =
         let master = posix_openpt (O_RDWR ||| O_NOCTTY ||| O_CLOEXEC)
 
         if master < 0 then
@@ -697,7 +727,21 @@ module internal Posix =
                                 close master |> ignore
                                 Error $"open({slavePath}) failed (errno {errno})"
                             else
-                                Ok(master, slave)
+                                // Apply the initial geometry. A pty pair shares one `winsize`, so setting it
+                                // on the master is reflected on the slave the child reads. A failure here is a
+                                // real per-invocation error (not a capability gap): close BOTH ends and report
+                                // it rather than silently leave the child at the kernel's 0x0 default.
+                                let mutable ws = Winsize()
+                                ws.Row <- uint16 rows
+                                ws.Col <- uint16 cols
+
+                                if ioctl (master, unativeint TIOCSWINSZ, &ws) <> 0 then
+                                    let errno = Marshal.GetLastWin32Error()
+                                    close slave |> ignore
+                                    close master |> ignore
+                                    Error $"ioctl(TIOCSWINSZ) failed (errno {errno})"
+                                else
+                                    Ok(master, slave)
 
     // `waitpid` option: return immediately (0) if the child has not yet changed state, rather than
     // blocking. Same value on Linux and macOS.
@@ -1447,6 +1491,14 @@ module internal Posix =
         let mutable stderrChildFd = -1
         let mutable stderrParentRead: int option = None
         let mutable failure: string option = None
+        // Under a PTY with an interactive/fed stdin, the write side is the SAME single master fd the
+        // parent keeps for the merged output (a pty master is bidirectional; read and write on it are
+        // independent). `ptyMasterFd` carries that fd number to the stream-wrapping step, where it is
+        // wrapped as a NON-owning stdin view; `ptyStdinOverMaster` gates whether to build it. There is
+        // deliberately NO `dup` of the master — a `dup` would drop its O_CLOEXEC and leak a writable
+        // master into a concurrent spawn, keeping the pty-child from ever seeing its stdin EOF (R-02).
+        let mutable ptyMasterFd = -1
+        let mutable ptyStdinOverMaster = false
 
         // A failed open("/dev/null") (fd < 0, e.g. EMFILE/ENFILE) must fail the spawn honestly,
         // exactly like a failed socketpair() below (`makeStdioChannel`) already does — NOT leave the slot's
@@ -1481,13 +1533,16 @@ module internal Posix =
         // single merged terminal stream — handled as the FIRST branch here, so the ordinary per-stream
         // stdout/stderr setup below is skipped (`config.Pty.IsNone`).
         if config.Pty.IsSome then
+            let pty = config.Pty.Value
             // The slave becomes the child's controlling terminal (via the rewritten `setsid --ctty`
             // Program); it is dup'd onto 0/1/2 and its original closed by the file actions further down.
-            // The parent keeps the MASTER (`stdoutParentRead`) as the merged output, plus a `dup` of it
-            // for an interactive/fed stdin writer — two owning fds so each stream disposes exactly one.
+            // The parent keeps the SINGLE MASTER (`stdoutParentRead`) as the merged output. When an
+            // interactive/fed stdin is wanted, that SAME master is the write side too (its read and write
+            // are independent) — wrapped as a NON-owning stdin view below, so one master fd is closed
+            // exactly once by the owning stdout stream and there is no non-CLOEXEC `dup` to leak (R-02).
             // There is no separate stderr (`stderrParentRead` stays `None`, D3) and no `/dev/null` or
             // socketpair on this path.
-            match openPtyPair () with
+            match openPtyPair pty.Cols pty.Rows with
             | Error message -> failure <- Some message
             | Ok(master, slave) ->
                 childSideFds.Add slave
@@ -1495,14 +1550,8 @@ module internal Posix =
                 stdoutChildFd <- slave
                 stderrChildFd <- slave
                 stdoutParentRead <- Some master
-
-                if stdinWanted then
-                    let stdinDup = dup master
-
-                    if stdinDup < 0 then
-                        failure <- Some $"dup(pty master) failed for stdin (errno {Marshal.GetLastWin32Error()})"
-                    else
-                        stdinParentWrite <- Some stdinDup
+                ptyMasterFd <- master
+                ptyStdinOverMaster <- stdinWanted
         elif stdinInherit then
             // `InheritStdin`: hand the child the PARENT's own standard input directly (no socketpair,
             // no feeder). On macOS, POSIX_SPAWN_CLOEXEC_DEFAULT closes every fd not named by a file
@@ -1903,14 +1952,17 @@ module internal Posix =
                                     // is caught below: the streams already built are tracked in `createdStreams`,
                                     // so the teardown disposes them and closes the not-yet-wrapped ends — each fd
                                     // exactly once — after killing and reaping the child.
-                                    // Under a PTY the retained parent ends are pty MASTER fds (the merged output,
-                                    // and a `dup` of it for stdin) — a character device the `SocketAsyncEngine`
-                                    // cannot host, so a `Socket` ctor would reject the non-socket fd. Those wrap
-                                    // in `PtyStream` (libc read/write, hangup-EIO → EOF) over an owning
-                                    // `SafeFileHandle` instead — the same single-owner + finalizer contract, and
-                                    // the same `createdStreams`/ownership-transfer bookkeeping so the teardown
-                                    // closes each fd exactly once.
-                                    let pipeStream (label: string) fd =
+                                    // Under a PTY the retained parent end is the SINGLE pty MASTER fd (the merged
+                                    // output) — a character device the `SocketAsyncEngine` cannot host, so a
+                                    // `Socket` ctor would reject the non-socket fd. It wraps in `PtyStream` (libc
+                                    // read/write, hangup-EIO → EOF) over a `SafeFileHandle` instead — the same
+                                    // single-owner + finalizer contract, and the same `createdStreams` bookkeeping
+                                    // so the teardown closes it exactly once. An interactive/fed stdin under a PTY
+                                    // wraps that SAME master a second time as a NON-owning view (`owns = false`):
+                                    // the one master is closed exactly once by the owning stdout stream, and there
+                                    // is no `dup` — hence no non-CLOEXEC duplicate to leak into a concurrent spawn
+                                    // (R-02). `owns` is ignored on the socketpair path (always sole-owning there).
+                                    let pipeStream (label: string) (owns: bool) fd =
                                         streamWrapFaultForTests |> Option.iter (fun fault -> fault label)
 
                                         let stream =
@@ -1918,7 +1970,7 @@ module internal Posix =
                                                 let owned =
                                                     new Microsoft.Win32.SafeHandles.SafeFileHandle(
                                                         nativeint fd,
-                                                        ownsHandle = true
+                                                        ownsHandle = owns
                                                     )
 
                                                 new PtyStream(owned) :> Stream
@@ -1937,7 +1989,7 @@ module internal Posix =
                                     let stdoutStream =
                                         match stdoutParentRead with
                                         | Some fd ->
-                                            let stream = pipeStream "stdout" fd
+                                            let stream = pipeStream "stdout" true fd
                                             stdoutParentRead <- None
                                             Some stream
                                         | None -> None
@@ -1945,7 +1997,7 @@ module internal Posix =
                                     let stderrStream =
                                         match stderrParentRead with
                                         | Some fd ->
-                                            let stream = pipeStream "stderr" fd
+                                            let stream = pipeStream "stderr" true fd
                                             stderrParentRead <- None
                                             Some stream
                                         | None -> None
@@ -1953,9 +2005,16 @@ module internal Posix =
                                     let stdinStream =
                                         match stdinParentWrite with
                                         | Some fd ->
-                                            let stream = pipeStream "stdin" fd
+                                            // Socketpair path: the parent-write end is its own owning stream.
+                                            let stream = pipeStream "stdin" true fd
                                             stdinParentWrite <- None
                                             Some stream
+                                        | None when ptyStdinOverMaster && stdoutStream.IsSome ->
+                                            // PTY interactive/fed stdin: a NON-owning second view over the SAME
+                                            // master fd the stdout stream already owns (no `dup`, so nothing extra
+                                            // to close and nothing to leak — R-02). The stdout owner closes the one
+                                            // master exactly once; disposing this view is a no-op on the fd.
+                                            Some(pipeStream "stdin" false ptyMasterFd)
                                         | None -> None
 
                                     Ok
