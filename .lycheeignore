@@ -1,0 +1,10 @@
+# Regex patterns (one per line), matched against the full URL, for links that lychee
+# should skip entirely — reserved for domains that are known flaky/anti-bot or otherwise
+# unsuitable for automated checking (see `.github/workflows/link-check.yml`'s `external`
+# job), never for links that are genuinely broken: fix those instead of hiding them here.
+#
+# No such domain has shown up yet in this project's history. The first time the
+# `external` job flags a false positive that is really the *site* blocking the crawler
+# (a 403/999 from anti-bot protection, a CAPTCHA wall, persistent timeouts against an
+# otherwise-reachable site) rather than a genuinely dead link, add one pattern per line
+# here with a one-line comment recording which run/URL justified it.

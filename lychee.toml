@@ -1,0 +1,40 @@
+# Shared configuration for lychee (the link checker), applied by both legs of
+# .github/workflows/link-check.yml. This is lychee's own default config path
+# (`lychee.toml` at the current directory), so neither job needs a `--config` flag; the
+# workflow's own CLI arguments (input globs, `--offline`, `--scheme`) still apply on top
+# of whatever is set here.
+
+# Never scan generated/build output or vendored artifacts, even if a future glob change in
+# the workflow widens the input set beyond docs/**, root Markdown, apidocs/index.md, and
+# the sample READMEs. Values are regular expressions (lychee's --exclude-path semantics),
+# not globs - keep entries free of glob-only syntax like `**`.
+exclude_path = [
+  "^book/",
+  "^apidocs/output/",
+  "^BenchmarkDotNet\\.Artifacts/",
+  "(^|/)bin/",
+  "(^|/)obj/",
+  "(^|/)TestResults/",
+
+  # docs/SUMMARY.md's three draft prefix chapters (the "Rust version" / "Python wrapper" /
+  # ".NET version" implementation switcher — see its own header comment) use mdBook's own
+  # documented draft-chapter syntax, `[Title]()` with a deliberately empty target — see the
+  # "Draft chapters" section of https://rust-lang.github.io/mdBook/format/summary.html.
+  # lychee's Markdown link extractor treats an empty href as a hard parse error ("Empty URL found")
+  # raised before any URL ever exists to match against — verified neither `--exclude` nor
+  # `--remap` can suppress it, so there is no way to keep this one file in scope while
+  # ignoring just those three lines. Excluding the file loses nothing real: every actual
+  # navigational entry in it (Overview + the 12 numbered guides) points at a file this leg
+  # already scans via `docs/**/*.md`, and mdBook's own build (docs.yml) is the authoritative
+  # check that every one of those entries resolves to an existing chapter file.
+  # (matched against the reported path as-is, so this stays separator-agnostic — no leading
+  # anchor tied to "/" vs "\" — rather than "^docs/SUMMARY\.md$")
+  "SUMMARY\\.md$",
+]
+
+# Real network flake (the `external` scheduled leg) gets a few retries with backoff before
+# a link is reported broken. Inert for the `internal` --offline leg, which never touches
+# the network.
+max_retries = 3
+retry_wait_time = 5
+timeout = 20

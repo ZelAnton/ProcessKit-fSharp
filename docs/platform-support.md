@@ -298,7 +298,7 @@ pipes, a second, conflicting one is refused rather than racing two readers on th
 
 **Concurrency-friendly I/O.** Waiting on a running child no longer blocks a dedicated thread on either
 platform — Windows uses a thread-pool registered wait, and POSIX uses an event-driven `SIGCHLD`
-registration (see [`CHANGELOG.md`](CHANGELOG.md)) — and the parent side of a child's pipes is now
+registration (see [`CHANGELOG.md`](../CHANGELOG.md)) — and the parent side of a child's pipes is now
 genuinely asynchronous on both: Windows uses overlapped named pipes over IOCP, and Linux/macOS wrap
 each stdio channel's parent end (an `AF_UNIX` socketpair) in a `Socket`/`NetworkStream` whose reads
 and writes complete through the runtime's epoll/kqueue event loop — no thread-pool thread parked per

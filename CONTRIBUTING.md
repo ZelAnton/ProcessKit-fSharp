@@ -107,9 +107,26 @@ Every user-visible change ships its [`CHANGELOG.md`](CHANGELOG.md) entry in the
 same change set, under `## [Unreleased]`. Write the bullet for a consumer of the
 library, not the implementer. Pure internal refactors are exempt.
 
+## Link checking
+
+[`.github/workflows/link-check.yml`](.github/workflows/link-check.yml) checks Markdown
+links across `docs/**`, the root project Markdown, and the sample READMEs with
+[lychee](https://github.com/lycheeverse/lychee). The `internal` job runs `--offline`
+(local relative-path links only) on every pull request/push, so it is fast and fully
+deterministic; the `external` job additionally checks external URLs (and
+`apidocs/index.md`'s links to the site) on a weekly schedule (or `workflow_dispatch`), so
+a flaky third-party site never fails a PR. Shared settings live in
+[`lychee.toml`](lychee.toml); a supported ignore list for flaky/anti-bot domains lives in
+[`.lycheeignore`](.lycheeignore). Check locally with the
+[lychee CLI](https://github.com/lycheeverse/lychee#installation):
+
+```sh
+lychee --offline './docs/**/*.md' './*.md' './samples/**/README.md'
+```
+
 ## Pull requests
 
 - Keep changes focused; unrelated cleanups belong in their own PR.
-- Ensure CI (YAML lint, Fantomas formatting, and build/test on Linux, Windows,
-  and macOS) passes.
+- Ensure CI (YAML lint, Fantomas formatting, build/test on Linux, Windows, and
+  macOS, and the internal Markdown link check) passes.
 - Fill in the pull-request checklist.
