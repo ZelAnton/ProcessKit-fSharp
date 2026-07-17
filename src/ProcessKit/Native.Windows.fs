@@ -1017,10 +1017,13 @@ module internal Windows =
             true
 
     /// Spawn `command` attached to a Windows pseudoconsole (ConPTY) — see the ConPTY section comment above.
-    /// The child is born a Job member via PROC_THREAD_ATTRIBUTE_JOB_LIST in the SAME STARTUPINFOEX attribute
-    /// list as the pseudoconsole (D7), so kill-on-dispose containment is unchanged. Returns the process
-    /// handle, the parent-side MERGED output read stream (`Spawned.Stdout`; `Stderr` is always `None` under
-    /// a PTY — one terminal stream, D3), and, when kept, the pty master input stream for interactive stdin.
+    /// The STARTUPINFOEX attribute list carries ONLY the pseudoconsole; Job membership (kill-on-dispose
+    /// containment) is achieved the proven `spawnWindowsCore` way — CREATE_SUSPENDED, AssignProcessToJobObject
+    /// while still suspended, then ResumeThread — NOT via a PROC_THREAD_ATTRIBUTE_JOB_LIST attribute (the ADR's
+    /// D7-preferred form empirically leaves the child on the PARENT's console; suspended->assign->resume is
+    /// D7's permitted fallback), so containment is unchanged. Returns the process handle, the parent-side
+    /// MERGED output read stream (`Spawned.Stdout`; `Stderr` is always `None` under a PTY — one terminal
+    /// stream, D3), and, when kept, the pty master input stream for interactive stdin.
     let private spawnWindowsPtyCore
         (job: nativeint)
         (command: Command)
