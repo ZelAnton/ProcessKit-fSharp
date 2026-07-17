@@ -6,6 +6,12 @@ name: Benchmarks
 # or adds to its wall-clock time (see ci.yml's own `stress` job for the same pattern, applied here
 # to a separate workflow file instead of a job in ci.yml, to avoid touching that file at all).
 #
+# This workflow is NOT parameterized by a class/filter list — it runs every `[<Benchmark>]` class in
+# the assembly (`BenchmarkSwitcher.FromAssembly(...)`, no `--filter` passed below), so the
+# `ComparisonBenchmarks.fs` competitor suite (ProcessKit vs. raw `System.Diagnostics.Process` vs.
+# CliWrap) added alongside `PumpBenchmarks`/`ConcurrencyBenchmarks` is picked up automatically,
+# with no change needed here.
+#
 # Runs `benchmarks/ProcessKit.Benchmarks` with its `--ci` flag (see Program.fs), which swaps in
 # BenchmarkDotNet's reduced-iteration `Job.ShortRun` instead of the statistically-rigorous default
 # job and attaches the full JSON exporter. GitHub-hosted runners are shared, noisy machines —

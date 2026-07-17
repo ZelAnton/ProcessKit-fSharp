@@ -22,6 +22,9 @@
 	-->
 	<ItemGroup>
 		<PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
+		<!-- Comparison-only competitor, used exclusively by benchmarks/ProcessKit.Benchmarks
+		     (see docs/comparison.md); no shipping project (src/**) references it. -->
+		<PackageVersion Include="CliWrap" Version="3.10.2" />
 		<PackageVersion Include="coverlet.collector" Version="10.0.1" />
 		<PackageVersion Include="FSharp.Core" Version="10.1.300" />
 		<PackageVersion Include="Ionide.Analyzers" Version="0.15.0" />

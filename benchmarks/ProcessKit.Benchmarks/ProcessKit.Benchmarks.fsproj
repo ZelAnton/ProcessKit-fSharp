@@ -13,6 +13,7 @@
 	<ItemGroup>
 		<Compile Include="PumpBenchmarks.fs" />
 		<Compile Include="ConcurrencyBenchmarks.fs" />
+		<Compile Include="ComparisonBenchmarks.fs" />
 		<Compile Include="Program.fs" />
 	</ItemGroup>
 
@@ -21,6 +22,9 @@
 		<PackageReference Include="FSharp.Core" />
 		<PackageReference Include="BenchmarkDotNet" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+		<!-- Competitor library for ComparisonBenchmarks.fs only (see docs/comparison.md);
+		     never referenced from src/**. -->
+		<PackageReference Include="CliWrap" />
 	</ItemGroup>
 
 	<ItemGroup>

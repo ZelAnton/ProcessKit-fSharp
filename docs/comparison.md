@@ -116,6 +116,61 @@ arguments) to the console by default, which is the opposite of ProcessKit's "arg
 values are never logged automatically" stance — fine for a build script's own trusted commands, but
 worth turning off (`echoCommand: false`) before echoing anything derived from external input.
 
+## Measured comparison
+
+The qualitative differences above are backed by a small BenchmarkDotNet suite
+(`benchmarks/ProcessKit.Benchmarks/ComparisonBenchmarks.fs`) that runs the *same* three scenarios
+against ProcessKit, raw `System.Diagnostics.Process`, and CliWrap:
+
+1. **Single spawn + capture** — start one short-lived shell child and capture its stdout.
+2. **Streaming** — read ~2000 lines of stdout from a child, line by line, without buffering the
+   whole payload in memory.
+3. **Concurrent batch** — fan out `N` short-lived children concurrently and capture each one's
+   stdout.
+
+MedallionShell and SimpleExec are not part of the numeric comparison — see their sections above for
+why (SimpleExec has no line-streaming API at all, so scenario 2 has nothing equivalent to measure;
+MedallionShell's async surface is shaped differently enough that a faithful three-scenario harness
+for it was judged not worth the added benchmark-project surface right now).
+
+> **Measured**: 2026-07-17, Windows 11 (10.0.22621), Intel Core i9-9880H, .NET SDK 10.0.301 / .NET
+> 10.0.9 runtime, BenchmarkDotNet v0.15.8, in-process toolchain. Scenario 1 also ran BenchmarkDotNet's
+> full statistically-rigorous default job; scenarios 2 and 3 used the reduced-iteration `Job.ShortRun`
+> configuration (the same one `.github/workflows/benchmarks.yml` uses). This machine had other
+> concurrent builds running while measuring, so the absolute numbers are noisy (see the wide
+> `Error`/`StdDev` spread, especially the CliWrap FanOut=8 row below) — read this as an
+> order-of-magnitude trend, not a lab-grade number; reproduce locally on a quiet machine for a
+> tighter measurement via `dotnet run -c Release --project benchmarks/ProcessKit.Benchmarks --
+> --filter "*ComparisonBenchmarks*"` or a scenario-specific class name
+> (`SingleSpawnCaptureBenchmarks` / `StreamingBenchmarks` / `ConcurrentBatchBenchmarks`).
+
+Mean wall-clock time per operation:
+
+| Scenario | RawProcess | ProcessKit | CliWrap |
+|---|---:|---:|---:|
+| Single spawn + capture | 12.55 ms | 12.55 ms | 39.75 ms |
+| Streaming ~2000 lines | 288.5 ms | 293.4 ms | 327.2 ms |
+| Concurrent batch, FanOut=2 | 190.6 ms | 97.5 ms | 173.5 ms |
+| Concurrent batch, FanOut=8 | 54.3 ms | 53.4 ms | 753.7 ms |
+
+Allocated managed memory per operation (`MemoryDiagnoser`, same runs):
+
+| Scenario | RawProcess | ProcessKit | CliWrap |
+|---|---:|---:|---:|
+| Single spawn + capture | 15.14 KB | 65.86 KB | 48.17 KB |
+| Streaming ~2000 lines | 1093.09 KB | 427.38 KB | 1123.25 KB |
+| Concurrent batch, FanOut=2 | 30.71 KB | 133.11 KB | 96.69 KB |
+| Concurrent batch, FanOut=8 | 121.39 KB | 526.31 KB | 382.81 KB |
+
+Reading these: ProcessKit's per-call latency tracks the raw `Process` baseline closely across every
+scenario, within this run's measurement noise (the concurrent-batch rows even show ProcessKit
+*faster* than the baseline — plausibly noise from the shared machine rather than a generalizable
+result, so don't read too much into that one comparison). Where ProcessKit consistently costs more is
+allocated memory per call, which matches the trade-off described qualitatively above: the whole-tree
+kill-on-drop container, the typed structured `Result` (rather than a bare exit code or a thrown
+exception), and the streaming/backpressure plumbing all cost allocations that a bare `Process` call
+— or CliWrap's thinner honest-by-default posture — doesn't pay for.
+
 ## Migration recipes
 
 Every snippet below assumes `open ProcessKit` (F#) / `using ProcessKit;` (C#), matching the rest of
