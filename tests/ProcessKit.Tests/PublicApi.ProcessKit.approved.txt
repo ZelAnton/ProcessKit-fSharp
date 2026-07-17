@@ -44,6 +44,9 @@ class ProcessKit.Command
   member OnStdoutLine(System.Action<System.String>) : ProcessKit.Command
   member OutputBuffer(ProcessKit.OutputBufferPolicy) : ProcessKit.Command
   member Priority(ProcessKit.Priority) : ProcessKit.Command
+  member Pty() : ProcessKit.Command
+  member Pty(ProcessKit.PtyConfig) : ProcessKit.Command
+  member Pty(System.Int32, System.Int32) : ProcessKit.Command
   member Retry(System.Int32, System.TimeSpan, System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Command
   member RetryNever() : ProcessKit.Command
   member Setsid() : ProcessKit.Command
@@ -94,6 +97,7 @@ module ProcessKit.CommandModule
   static member onStdoutLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command
   static member outputBuffer(ProcessKit.OutputBufferPolicy, ProcessKit.Command) : ProcessKit.Command
   static member priority(ProcessKit.Priority, ProcessKit.Command) : ProcessKit.Command
+  static member pty(ProcessKit.Command) : ProcessKit.Command
   static member retry(System.Int32, System.TimeSpan, Microsoft.FSharp.Core.FSharpFunc<ProcessKit.ProcessError, System.Boolean>, ProcessKit.Command) : ProcessKit.Command
   static member retryNever(ProcessKit.Command) : ProcessKit.Command
   static member setsid(ProcessKit.Command) : ProcessKit.Command
@@ -728,6 +732,22 @@ class ProcessKit.ProcessStdin
   member WriteAsync(System.Byte[], System.Threading.CancellationToken) : System.Threading.Tasks.Task
   member WriteLineAsync(System.String, System.Threading.CancellationToken) : System.Threading.Tasks.Task
 
+class ProcessKit.PtyConfig
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.PtyConfig>
+  member Equals(ProcessKit.PtyConfig) : System.Boolean
+  member Equals(ProcessKit.PtyConfig, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  new(System.Int32, System.Int32, System.Boolean)
+  property Cols : System.Int32 { get }
+  property Default : ProcessKit.PtyConfig { get }
+  property Echo : System.Boolean { get }
+  property Rows : System.Int32 { get }
+
 class ProcessKit.ResourceLimits
   member WithCpuQuota(System.Double) : ProcessKit.ResourceLimits
   member WithMaxProcesses(System.Int32) : ProcessKit.ResourceLimits
@@ -815,6 +835,9 @@ class ProcessKit.RunningProcess
   member TakeStdin() : Microsoft.FSharp.Core.FSharpOption<ProcessKit.ProcessStdin>
   member WaitAsync() : System.Threading.Tasks.Task<ProcessKit.Outcome>
   member WaitForAsync(System.Func<System.Threading.Tasks.Task<System.Boolean>>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member WaitForHttpAsync(System.Uri, System.Collections.Generic.IEnumerable<System.Int32>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member WaitForHttpAsync(System.Uri, System.Func<System.Net.Http.HttpResponseMessage, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member WaitForHttpAsync(System.Uri, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForLineAsync(System.Func<System.String, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
   member WaitForPortAsync(System.Net.IPEndPoint, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }

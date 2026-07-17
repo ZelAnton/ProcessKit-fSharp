@@ -92,6 +92,21 @@ module internal PipelineStageGuard =
                 )
             )
 
+    /// Reject `Pty` on a stage that is (or is about to become) a **non-last** pipeline stage. A PTY gives
+    /// the child one merged terminal stream as its output; on an intermediate stage that stdout is wired
+    /// into the next stage's stdin, so the tty stream (VT escapes and all) would become the downstream
+    /// stage's input data — a silent change to what it reads. A PTY is allowed only as a standalone run or
+    /// the LAST stage of a pipeline. Enforced at build time the moment a stage stops being last (another
+    /// stage is appended after it), mirroring `rejectMergeOnNonLast`.
+    let rejectPtyOnNonLast (paramName: string) (stageIndex: int) (command: Command) =
+        if command.Config.Pty.IsSome then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets Pty but is not the last stage: a pipeline wires each stage's stdout into the next stage's stdin, and a PTY stage's output is a single merged terminal stream, so placing it before another stage would inject the tty stream into that stage's input. A PTY is allowed only as a standalone run or the last stage of a pipeline.",
+                    paramName
+                )
+            )
+
 /// An immutable left-to-right chain of commands wired stdout -> stdin, with **no shell** involved:
 /// each stage's standard output feeds the next stage's standard input directly. The whole chain
 /// runs inside one shared kill-on-dispose group, so cancelling, timing out, or disposing the run
@@ -256,9 +271,11 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     member _.Pipe(command: Command) =
         ArgumentNullException.ThrowIfNull command
         PipelineStageGuard.validate (nameof command) commands.Length command
-        // Appending demotes the current last stage to an intermediate one, where an OS-level MergeStderr
-        // would leak its stderr into `command`'s stdin — reject it now (the moment it stops being last).
+        // Appending demotes the current last stage to an intermediate one, where an OS-level MergeStderr —
+        // or a PTY's merged terminal output — would leak into `command`'s stdin; reject either now (the
+        // moment the current last stage stops being last).
         PipelineStageGuard.rejectMergeOnNonLast (nameof command) (commands.Length - 1) (List.last commands)
+        PipelineStageGuard.rejectPtyOnNonLast (nameof command) (commands.Length - 1) (List.last commands)
         Pipeline(commands @ [ command ], timeout, cancelOn)
 
     /// Kill the whole pipeline after `duration`, reporting the result as `Outcome.TimedOut`. A
@@ -440,9 +457,11 @@ type PipelineExtensions =
         ArgumentNullException.ThrowIfNull next
         PipelineStageGuard.validate (nameof command) 0 command
         PipelineStageGuard.validate (nameof next) 1 next
-        // `command` (stage 0) is not the last stage, so an OS-level MergeStderr on it would leak its
-        // stderr into `next`'s stdin — reject it (only the last stage, `next`, may merge).
+        // `command` (stage 0) is not the last stage, so an OS-level MergeStderr — or a PTY's merged
+        // terminal output — on it would leak into `next`'s stdin; reject either (only the last stage,
+        // `next`, may merge or be a PTY).
         PipelineStageGuard.rejectMergeOnNonLast (nameof command) 0 command
+        PipelineStageGuard.rejectPtyOnNonLast (nameof command) 0 command
         Pipeline([ command; next ], None, None)
 
 /// Pipe-friendly functions over `Pipeline`, mirroring the instance methods.

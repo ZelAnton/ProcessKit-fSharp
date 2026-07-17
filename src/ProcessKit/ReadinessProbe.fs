@@ -4,6 +4,7 @@ open System
 open System.Diagnostics
 open System.IO
 open System.Net
+open System.Net.Http
 open System.Net.Sockets
 open System.Threading
 open System.Threading.Tasks
@@ -263,9 +264,9 @@ module internal ReadinessProbe =
     /// running on a pool thread but is abandoned (and its eventual fault observed) exactly like a
     /// returned-but-never-completing task. The API does not claim it can force a caller-owned probe to
     /// stop.
-    let private waitForCore
+    let private waitForCoreUsing
         (program: string)
-        (probe: Func<Task<bool>>)
+        (probe: CancellationToken -> Task<bool>)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -309,7 +310,7 @@ module internal ReadinessProbe =
                         // returning a task at all) can't pin this loop and defeat the deadline. The
                         // `Task.Run<bool>` overload unwraps the returned `Task<bool>`, so `probeTask`
                         // completes with the probe's own result/fault, just off the calling thread.
-                        let probeTask = Task.Run<bool>(fun () -> probe.Invoke())
+                        let probeTask = Task.Run<bool>(fun () -> probe linked.Token)
                         let! winner = Task.WhenAny(probeTask :> Task, deadlineSignal)
 
                         if obj.ReferenceEquals(winner, deadlineSignal) then
@@ -366,8 +367,65 @@ module internal ReadinessProbe =
                     return Error(ProcessError.NotReady(program, armedTimeout))
         }
 
+    /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
+    /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).
+    /// `getResponse` is factored out so tests can exercise the polling contract without depending on a
+    /// particular HTTP transport. Network failures are deliberately false results: a refused connection,
+    /// DNS failure, or a request cancelled by the shared deadline means the server is not ready yet.
+    let internal waitForHttpUsing
+        (getResponse: Uri -> CancellationToken -> Task<HttpResponseMessage>)
+        (isSatisfactory: Func<HttpResponseMessage, bool>)
+        (program: string)
+        (uri: Uri)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        let probe (ct: CancellationToken) : Task<bool> =
+            task {
+                try
+                    use! response = getResponse uri ct
+                    return isSatisfactory.Invoke response
+                with
+                | :? HttpRequestException ->
+                    // The endpoint is not reachable yet; retry until the shared deadline expires.
+                    return false
+                | :? OperationCanceledException ->
+                    // A request can be cancelled by the caller or shared readiness deadline; the polling
+                    // loop classifies that token state as Cancelled or NotReady after this attempt.
+                    return false
+            }
+
+        waitForCoreUsing program probe timeout cancellationToken
+
+    /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
+    /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).
+    /// A single client is used for this readiness operation; its own timeout is disabled so every request
+    /// is bounded only by the shared readiness deadline passed to `GetAsync`.
+    let waitForHttp
+        (program: string)
+        (stdout: Stream option)
+        (stderr: Stream option)
+        (uri: Uri)
+        (isSatisfactory: Func<HttpResponseMessage, bool>)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        task {
+            use client = new HttpClient(Timeout = Timeout.InfiniteTimeSpan)
+
+            return!
+                withBackgroundDrain stdout stderr (fun () ->
+                    waitForHttpUsing
+                        (fun requestUri ct -> client.GetAsync(requestUri, ct))
+                        isSatisfactory
+                        program
+                        uri
+                        timeout
+                        cancellationToken)
+        }
+
     /// Poll `probe` until it returns true, or fail with `NotReady` once the shared `timeout` deadline
-    /// elapses (or `Cancelled` if `cancellationToken` fires first). See `waitForCore` for the full
+    /// elapses (or `Cancelled` if `cancellationToken` fires first). See `waitForCoreUsing` for the full
     /// deadline contract (including the ratified scheduler-bounded window at the deadline, the
     /// `Task.Run` isolation of a synchronously-blocking probe, and the safe observation of an abandoned
     /// probe's late fault). Background-drains (and discards) the child's piped `stdout`/`stderr` for the
@@ -380,4 +438,5 @@ module internal ReadinessProbe =
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        withBackgroundDrain stdout stderr (fun () -> waitForCore program probe timeout cancellationToken)
+        withBackgroundDrain stdout stderr (fun () ->
+            waitForCoreUsing program (fun _ -> probe.Invoke()) timeout cancellationToken)

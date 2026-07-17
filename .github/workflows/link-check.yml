@@ -1,0 +1,113 @@
+name: Link Check
+
+# Checks Markdown links across the documentation surface with lychee
+# (https://github.com/lycheeverse/lychee), split into two independent legs so a flaky
+# external site can never fail an ordinary PR/push run:
+#
+#   * internal - `--offline` (resolves local relative-path links only; makes no network
+#     requests at all), on every pull request/push that touches Markdown. Fast and fully
+#     deterministic, so it is a required-check candidate (the actual required-status
+#     decision is out of scope here).
+#   * external - the full, non-offline check restricted to http(s) links, run weekly on a
+#     schedule (plus workflow_dispatch, so it can also be run on demand). Kept off the
+#     ordinary PR/push path because third-party sites 403 crawlers, rate-limit, or simply
+#     go down transiently — noise that must never block a PR.
+#
+# Both legs scan the root-level project Markdown (README.md, ROADMAP.md, CHANGELOG.md,
+# CONTRIBUTING.md, SECURITY.md, release-token-bypass.md), docs/** (the mdBook guides —
+# see the docs/SUMMARY.md note below), and the sample project READMEs. The `external` job
+# additionally scans apidocs/index.md, the hand-written fsdocs landing page.
+#
+# NOT scanned by `internal`: apidocs/index.md's two relative links to the generated fsdocs
+# reference (`reference/*.html`) only exist once fsdocs has run (docs.yml, from the latest
+# published release) — there is no "this commit's" copy of that output for an --offline,
+# local-file check to resolve, so `internal` honestly excludes this file rather than
+# reporting them broken. `external` still checks it: with `--scheme https/http`, only its
+# genuine http(s) links (github.com, the Pages site) are checked, and the two local
+# fsdocs-output links are naturally skipped as out-of-scheme rather than reported broken.
+#
+# NOT scanned by either job: the generated fsdocs API reference output itself
+# (apidocs/output/) and the mdBook build output (book/) — both are build artifacts of
+# docs.yml, git-ignored, and simply absent from a plain checkout.
+#
+# docs/SUMMARY.md is excluded at the file level (see lychee.toml's exclude_path) — its
+# three draft prefix chapters use mdBook's own documented empty-target syntax
+# (`[Title]()`), which lychee's Markdown parser rejects as a hard "empty URL" error with no
+# available suppression (see lychee.toml for the full rationale). Its real navigational
+# entries are still covered: every chapter file it lists is scanned directly via
+# docs/**/*.md, and mdBook's own build (docs.yml) is the authoritative check that each
+# entry resolves to an existing chapter file.
+#
+# Shared lychee settings (exclude_path, retry/timeout tuning) live in lychee.toml at the
+# repo root (lychee's own default config path — no --config needed). A supported ignore
+# list for flaky/anti-bot domains lives in .lycheeignore.
+#
+# This workflow does not touch ci.yml/docs.yml: its own triggers, concurrency group, and
+# job names are all distinct from theirs.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*.md'
+      - 'lychee.toml'
+      - '.lycheeignore'
+      - '.github/workflows/link-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**/*.md'
+      - 'lychee.toml'
+      - '.lycheeignore'
+      - '.github/workflows/link-check.yml'
+  workflow_dispatch:
+  # Weekly, off the ordinary PR/push path - feeds only the `external` job below (see its
+  # own `if:` guard, mirroring the `stress` job in ci.yml).
+  schedule:
+    - cron: '0 7 * * 1'
+
+# Distinct group name from ci.yml's `ci-${{ github.ref }}` / docs.yml's `pages` -
+# concurrency groups are compared repository-wide, not per-workflow.
+concurrency:
+  group: link-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Local-file link resolution only (relative links between docs/**, root Markdown, and
+  # the sample READMEs) - no network calls, so it can safely gate every PR/push.
+  internal:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to a full commit SHA (supply-chain hardening); the trailing
+      # comment records the human-readable version. Dependabot bumps the SHA and updates
+      # the comment on its weekly run.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Check internal links (offline - local files only, no network)
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --offline --no-progress
+            './docs/**/*.md' './*.md' './samples/**/README.md'
+          fail: true
+
+  # Full check (network included), restricted to http(s) links - external URLs are the
+  # whole point of this leg, since internal links are already covered, deterministically,
+  # by the `internal` job above.
+  external:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Check external links (scheduled - real network requests)
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --no-progress --scheme https --scheme http
+            './docs/**/*.md' './*.md' './apidocs/index.md' './samples/**/README.md'
+          fail: true

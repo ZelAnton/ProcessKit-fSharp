@@ -6,6 +6,7 @@ open System.Diagnostics
 open System.Diagnostics.CodeAnalysis
 open System.IO
 open System.Net
+open System.Net.Http
 open System.Runtime.ExceptionServices
 open System.Runtime.InteropServices
 open System.Text.Json
@@ -537,6 +538,59 @@ type RunningProcess internal (host: RunningHost) =
                 bufferedOutcome <- waitWithTimeout ()
 
             bufferedOutcome)
+
+    let waitForHttp
+        (uri: Uri)
+        (isSatisfactory: Func<HttpResponseMessage, bool>)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        task {
+            if cancellationToken.IsCancellationRequested then
+                return Error(ProcessError.Cancelled config.Program)
+            else
+                let stdout, stderr = probeDrainStreams ()
+
+                use readinessCts =
+                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                let readinessTask =
+                    ReadinessProbe.waitForHttp
+                        config.Program
+                        stdout
+                        stderr
+                        uri
+                        isSatisfactory
+                        timeout
+                        readinessCts.Token
+
+                // Early-exit detection MUST share the one reap-once exit wait every other verb on this
+                // handle uses (`ensureBufferedWait`, memoized under `stateLock`) rather than starting an
+                // independent `host.Wait()`: on POSIX, `host.Wait()`/`waitPosix` REAPS the child and
+                // consumes its exit status, and is idempotent only while a wait stays in flight — never
+                // after the pid has already been reaped (KB K-016). A second, unrelated `host.Wait()`
+                // here would race the reap started by this one, so a later `WaitAsync`/`ProfileAsync`
+                // call (the common "diagnose why the service died on startup" path) would either see the
+                // pid already gone (ECHILD → fabricated `Outcome.Unobserved`) or, worse, risk observing a
+                // recycled pid. Calling `ensureBufferedWait()` here (instead of claiming the pipes via
+                // `claimBuffered`) starts/joins that ONE shared wait without claiming `consumption`, so
+                // `consumption` stays `Fresh` and a subsequent buffered verb can still claim the pipes and
+                // reuse this exact same memoized wait — one `host.Wait()`, one reap, shared by the probe
+                // and by whatever verb runs afterward.
+                let childExitTask = ensureBufferedWait ()
+                let! winner = Task.WhenAny(readinessTask :> Task, childExitTask :> Task)
+
+                if obj.ReferenceEquals(winner, readinessTask) || readinessTask.IsCompleted then
+                    return! readinessTask
+                else
+                    readinessCts.Cancel()
+                    let! _ = readinessTask
+
+                    if cancellationToken.IsCancellationRequested then
+                        return Error(ProcessError.Cancelled config.Program)
+                    else
+                        return Error(ProcessError.NotReady(config.Program, Timeouts.clampArmable timeout))
+        }
 
     // Kill the tree the moment an output pump faults, so a still-producing child can't wedge the exit
     // wait — and the pump's siblings — by blocking on a full pipe that nobody drains once the pump
@@ -1315,7 +1369,7 @@ type RunningProcess internal (host: RunningHost) =
             task {
                 // Clamp so an out-of-range timeout can't throw out of the CTS constructor. The clamped
                 // value is also what gets reported in NotReady below — uniform with
-                // `ReadinessProbe.waitForPortUsing`/`waitForCore`: an over-long requested timeout is
+                // `ReadinessProbe.waitForPortUsing`/`waitForCoreUsing`: an over-long requested timeout is
                 // silently capped at ~24.8 days, so reporting the raw, un-clamped value would claim a
                 // budget longer than what was actually enforced.
                 let armedTimeout = Timeouts.clampArmable timeout
@@ -1371,7 +1425,7 @@ type RunningProcess internal (host: RunningHost) =
     /// verb (`OutputStringAsync`/`OutputBytesAsync`/`StdoutLinesAsync`/`OutputEventsAsync`) called
     /// AFTER this probe therefore only sees what the child wrote after the probe concluded, not the
     /// full run — the same "doesn't compose with a subsequent fresh capture" limitation
-    /// `WaitForLineAsync` already documents, now uniform across all three readiness probes. If a
+    /// `WaitForLineAsync` already documents, now uniform across all four readiness probes. If a
     /// buffered/streaming verb already claimed the pipes before this call, that verb's own pump is
     /// already draining them and this probe leaves them alone (no second reader).
     member _.WaitForPortAsync
@@ -1381,13 +1435,68 @@ type RunningProcess internal (host: RunningHost) =
         let stdout, stderr = probeDrainStreams ()
         ReadinessProbe.waitForPort config.Program stdout stderr endpoint timeout cancellationToken
 
+    /// Poll `uri` with HTTP GET until a response passes the default 2xx check, or fail with `NotReady`
+    /// once `timeout` expires (or `Cancelled` if `cancellationToken` fires first). Connection failures,
+    /// DNS failures, and request cancellations caused by the shared deadline are retried every 50ms.
+    /// If the child exits before a satisfactory response arrives, this returns `NotReady` immediately.
+    /// While polling, the child's piped stdout/stderr are background-drained and discarded exactly like
+    /// `WaitForPortAsync`, so startup output cannot block a chatty child before it becomes ready.
+    member this.WaitForHttpAsync
+        (uri: Uri, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        ArgumentNullException.ThrowIfNull uri
+
+        this.WaitForHttpAsync(
+            uri,
+            Func<HttpResponseMessage, bool>(fun response ->
+                let statusCode = int response.StatusCode
+                statusCode >= 200 && statusCode < 300),
+            timeout,
+            cancellationToken
+        )
+
+    /// Like `WaitForHttpAsync(uri, timeout, cancellationToken)`, but treats only status codes from
+    /// `acceptableStatusCodes` as ready. The sequence is materialized once before polling, so every retry
+    /// applies the same criteria.
+    member this.WaitForHttpAsync
+        (uri: Uri, acceptableStatusCodes: seq<int>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken) : Task<
+                                                                                                                                Result<
+                                                                                                                                    unit,
+                                                                                                                                    ProcessError
+                                                                                                                                 >
+                                                                                                                             >
+        =
+        ArgumentNullException.ThrowIfNull uri
+        ArgumentNullException.ThrowIfNull acceptableStatusCodes
+        let accepted = HashSet<int>(acceptableStatusCodes)
+
+        this.WaitForHttpAsync(
+            uri,
+            Func<HttpResponseMessage, bool>(fun response -> accepted.Contains(int response.StatusCode)),
+            timeout,
+            cancellationToken
+        )
+
+    /// Like `WaitForHttpAsync(uri, timeout, cancellationToken)`, but uses `isSatisfactory` to inspect
+    /// each response. A false result is retried; an exception from caller-supplied validation propagates.
+    member _.WaitForHttpAsync
+        (
+            uri: Uri,
+            isSatisfactory: Func<HttpResponseMessage, bool>,
+            timeout: TimeSpan,
+            [<Optional>] cancellationToken: CancellationToken
+        ) : Task<Result<unit, ProcessError>> =
+        ArgumentNullException.ThrowIfNull uri
+        ArgumentNullException.ThrowIfNull isSatisfactory
+        waitForHttp uri isSatisfactory timeout cancellationToken
+
     /// Poll `probe` until it returns true, or fail with `NotReady` once the shared `timeout` deadline
     /// elapses (or `Cancelled` if `cancellationToken` fires first). The deadline is honored even if
     /// `probe` never completes — or blocks synchronously without ever returning a task: the invocation
     /// is isolated on the thread pool and raced against the shared deadline, and the caller's token
     /// takes priority over a concurrent success. The API cannot force a caller-owned `probe` to stop, so
     /// an abandoned invocation keeps running in the background, but its late outcome is safely observed
-    /// (a late fault never becomes an unobserved task exception). See `ReadinessProbe.waitForCore` for
+    /// (a late fault never becomes an unobserved task exception). See `ReadinessProbe.waitForCoreUsing` for
     /// the full contract, including the ratified scheduler-bounded window at the deadline.
     /// Background-drains (and discards) the child's piped stdout/stderr for the duration of the poll,
     /// exactly like `WaitForPortAsync` — see its doc for what that does and doesn't compose with
@@ -1407,9 +1516,15 @@ type RunningProcess internal (host: RunningHost) =
     /// - `Buffered` (a capture verb already started — the "verb, then WaitAny/WaitAll" order): the
     ///   verb's own single wait, shared via `ensureBufferedWait` (memoized under the same lock, so it
     ///   is observed here regardless of which of the two reached it first).
-    /// - `Fresh` (WaitAny/WaitAll arrives first): claims the buffered slot itself and runs its own
-    ///   drains, so a terminal verb called afterwards on the same handle is refused
-    ///   (`alreadyConsumedError`) rather than racing a second reader.
+    /// - `Fresh` (WaitAny/WaitAll arrives first, and no readiness probe already started the shared
+    ///   wait either): claims the buffered slot itself and runs its own drains, so a terminal verb
+    ///   called afterwards on the same handle is refused (`alreadyConsumedError`) rather than racing
+    ///   a second reader. Even here the wait itself goes through `ensureBufferedWait()`, not a raw
+    ///   `waitWithTimeout()`: a readiness probe's own early-exit detection (`waitForHttp` et al.) can
+    ///   already have started the one shared `host.Wait()` while deliberately leaving `consumption`
+    ///   at `Fresh` (so a later buffered verb can still claim the pipes) — `ensureBufferedWait()`
+    ///   reuses that wait when it exists, or starts the sole wait itself when this genuinely is the
+    ///   first consumer, either way guaranteeing exactly one `host.Wait()`/reap per handle.
     member internal _.ExitTask: Task<Outcome> =
         lock stateLock (fun () ->
             if not exitStarted then
@@ -1428,9 +1543,9 @@ type RunningProcess internal (host: RunningHost) =
                         // `host.Wait()`. Its own pumps drain the pipes, so the reused wait needs none.
                         ensureBufferedWait ()
                     else
-                        // Fresh: no verb has run yet. Claim the buffered slot (inline — we already hold
-                        // `stateLock`) so a terminal verb called after WaitAny/WaitAll on the same handle
-                        // is refused rather than racing a second reader on these pipes.
+                        // Fresh: no verb has claimed the pipes yet. Claim the buffered slot (inline — we
+                        // already hold `stateLock`) so a terminal verb called after WaitAny/WaitAll on the
+                        // same handle is refused rather than racing a second reader on these pipes.
                         consumption <- Consumption.Buffered
 
                         task {
@@ -1442,7 +1557,15 @@ type RunningProcess internal (host: RunningHost) =
                             let stderrDrain =
                                 Pump.drainDiscardOrEmptyUntilDone stderrStream CancellationToken.None
 
-                            let! outcome = waitWithTimeout ()
+                            // `ensureBufferedWait()`, not `waitWithTimeout()`: a readiness probe may already
+                            // own the one shared exit wait (see the doc comment above), and `consumption`
+                            // staying `Fresh` until this very claim is exactly what lets that be true — so a
+                            // raw `waitWithTimeout()` here would start a second, independent `host.Wait()`
+                            // racing the probe's, reproducing the reap-once bug (KB K-016) `ensureBufferedWait`
+                            // exists to prevent. `ensureBufferedWait()` reuses the probe's wait if one is
+                            // already in flight, or starts it fresh otherwise — reentrant on `stateLock`,
+                            // which we already hold here (see the `Buffered` branch above, which does the same).
+                            let! outcome = ensureBufferedWait ()
                             do! Task.WhenAll([| stdoutDrain; stderrDrain |])
                             // Racing this handle to exit *is* its completion (conclude does not reap, so the
                             // no-reap contract holds), so a `WaitAny`/`WaitAll`-only run still records its

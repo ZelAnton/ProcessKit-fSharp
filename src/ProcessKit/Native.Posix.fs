@@ -1729,27 +1729,33 @@ module internal Posix =
     let spawnPosix (command: Command) : Result<Spawned, ProcessError> =
         let config = command.Config
 
-        match groupsRequireDropError command with
-        | Some error -> Error error
-        | None ->
-            if config.Uid.IsSome || config.Gid.IsSome then
-                match privilegeDropPrecheck command with
-                | Some error -> Error error
-                | None ->
-                    match spawnPosixViaSpawn (setprivCommand command) with
-                    | Error(ProcessError.NotFound _) ->
-                        // `posix_spawn` could not find `setpriv` on PATH — report it against the ORIGINAL
-                        // program (not the helper), so a caller who never mentioned `setpriv` gets a
-                        // message that explains what a `Uid`/`Gid` drop needs on this host.
-                        Error(
-                            ProcessError.Spawn(
-                                command.Program,
-                                "a Uid/Gid privilege drop needs the 'setpriv' helper (util-linux) on PATH; it was not found (available on mainstream Linux; absent on macOS/BSD)"
+        if config.Pty.IsSome then
+            // The POSIX `openpty`/`setsid --ctty` mechanism arrives in a later PTY stage; until then a PTY
+            // on POSIX is an honest typed failure, never a socketpair silently pretending to be a tty (D9).
+            Error(ProcessError.Unsupported "Pty (POSIX pty spawn not yet implemented)")
+        else
+
+            match groupsRequireDropError command with
+            | Some error -> Error error
+            | None ->
+                if config.Uid.IsSome || config.Gid.IsSome then
+                    match privilegeDropPrecheck command with
+                    | Some error -> Error error
+                    | None ->
+                        match spawnPosixViaSpawn (setprivCommand command) with
+                        | Error(ProcessError.NotFound _) ->
+                            // `posix_spawn` could not find `setpriv` on PATH — report it against the ORIGINAL
+                            // program (not the helper), so a caller who never mentioned `setpriv` gets a
+                            // message that explains what a `Uid`/`Gid` drop needs on this host.
+                            Error(
+                                ProcessError.Spawn(
+                                    command.Program,
+                                    "a Uid/Gid privilege drop needs the 'setpriv' helper (util-linux) on PATH; it was not found (available on mainstream Linux; absent on macOS/BSD)"
+                                )
                             )
-                        )
-                    | other -> other
-            else
-                spawnPosixViaSpawn command
+                        | other -> other
+                else
+                    spawnPosixViaSpawn command
 
     // ----------------------------------------------------------------------------------
     // Linux cgroup v2: place the child INSIDE its cgroup atomically with its own execution
@@ -1834,12 +1840,18 @@ module internal Posix =
                 )
             | other -> other
 
-        match groupsRequireDropError command with
-        | Some error -> Error error
-        | None ->
-            if config.Uid.IsSome || config.Gid.IsSome then
-                match privilegeDropPrecheck command with
-                | Some error -> Error error
-                | None -> launch ()
-            else
-                launch ()
+        if config.Pty.IsSome then
+            // As in `spawnPosix`: the POSIX pty mechanism is a later stage, so a PTY here is an honest
+            // typed failure rather than a silently-unconstrained-or-tty-less run (D9).
+            Error(ProcessError.Unsupported "Pty (POSIX pty spawn not yet implemented)")
+        else
+
+            match groupsRequireDropError command with
+            | Some error -> Error error
+            | None ->
+                if config.Uid.IsSome || config.Gid.IsSome then
+                    match privilegeDropPrecheck command with
+                    | Some error -> Error error
+                    | None -> launch ()
+                else
+                    launch ()
