@@ -275,6 +275,77 @@ type ReadinessTests() =
         }
         :> Task
 
+    // Regression for KB K-016 / R-01: the ONLY readiness probe that races the child's own exit
+    // (`WaitForHttpAsync`'s early-exit detection) previously did so via a raw, independent
+    // `host.Wait()` instead of the memoized reap-once wait the rest of `RunningProcess` shares.
+    // On POSIX, `host.Wait()`/`waitPosix` REAPS the child and consumes its exit status; a second,
+    // uncoordinated `host.Wait()` afterward (e.g. from `WaitAsync`) then races an already-reaped
+    // pid and fabricates `Outcome.Unobserved` instead of the real exit code. This exercises a REAL
+    // spawned child (not the synthetic `RunningHost` used by the tests above), so it reproduces the
+    // real reap machinery rather than a stand-in `Wait` delegate.
+    [<Test>]
+    member _.``WaitForHttp then WaitAsync reports the real exit code after an early child exit``() : Task =
+        task {
+            let listener, uri, _requestCount = startHttpListener (fun _ -> 503)
+
+            try
+                match! runner.StartAsync(shell "exit 7", CancellationToken.None) with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    use running = running
+
+                    match! running.WaitForHttpAsync(uri, TimeSpan.FromSeconds 5.0) with
+                    | Error(ProcessError.NotReady _) -> ()
+                    | other -> Assert.Fail $"expected NotReady, got {other}"
+
+                    // Before the fix, this second `host.Wait()` (via `WaitAsync`) raced an already-reaped
+                    // pid on POSIX and fabricated `Outcome.Unobserved` instead of the real exit code.
+                    let! outcome = running.WaitAsync()
+
+                    match outcome with
+                    | Outcome.Exited code -> Assert.That(code, Is.EqualTo 7)
+                    | other -> Assert.Fail $"expected Exited 7, got {other}"
+            finally
+                listener.Stop()
+        }
+        :> Task
+
+    // Companion regression for the "child becomes ready" branch: the shared exit wait the probe now
+    // starts (`ensureBufferedWait`, reused from a real verb afterward) must not leave an
+    // uncoordinated, un-reaped wait registration hanging around, nor claim the handle's pipes —
+    // `StopAsync` afterward must still complete promptly against a REAL still-running child.
+    [<Test>]
+    member _.``WaitForHttp then StopAsync still completes promptly once the child becomes ready``() : Task =
+        task {
+            let listener, uri, _requestCount = startHttpListener (fun _ -> 200)
+
+            try
+                match! runner.StartAsync(lingering (), CancellationToken.None) with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    use running = running
+
+                    match! running.WaitForHttpAsync(uri, TimeSpan.FromSeconds 5.0) with
+                    | Ok() -> ()
+                    | other -> Assert.Fail $"expected Ok, got {other}"
+
+                    let stopTask = running.StopAsync()
+                    let watchdog = Task.Delay(TimeSpan.FromSeconds 5.0)
+                    let! winner = Task.WhenAny(stopTask :> Task, watchdog)
+
+                    Assert.That(
+                        obj.ReferenceEquals(winner, watchdog),
+                        Is.False,
+                        "StopAsync hung after WaitForHttpAsync's ready path"
+                    )
+
+                    let! _ = stopTask
+                    ()
+            finally
+                listener.Stop()
+        }
+        :> Task
+
     [<Test>]
     member _.WaitForHttpSupportsExplicitStatusCodesAndResponsePredicates() : Task =
         task {

@@ -318,50 +318,6 @@ type RunningProcess internal (host: RunningHost) =
             else
                 None, None)
 
-    let waitForHttp
-        (uri: Uri)
-        (isSatisfactory: Func<HttpResponseMessage, bool>)
-        (timeout: TimeSpan)
-        (cancellationToken: CancellationToken)
-        : Task<Result<unit, ProcessError>> =
-        task {
-            if cancellationToken.IsCancellationRequested then
-                return Error(ProcessError.Cancelled config.Program)
-            else
-                let stdout, stderr = probeDrainStreams ()
-
-                use readinessCts =
-                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-
-                let readinessTask =
-                    ReadinessProbe.waitForHttp
-                        config.Program
-                        stdout
-                        stderr
-                        uri
-                        isSatisfactory
-                        timeout
-                        readinessCts.Token
-
-                // `RunningHost.Wait` is idempotent per child on every backend, so this observation can
-                // race the readiness poll without claiming the process's output consumption. If the child
-                // exits before its endpoint is healthy, stop the poll and report the honest NotReady result.
-                let childExitTask = host.Wait()
-                let! winner = Task.WhenAny(readinessTask :> Task, childExitTask :> Task)
-
-                if obj.ReferenceEquals(winner, readinessTask) || readinessTask.IsCompleted then
-                    return! readinessTask
-                else
-                    readinessCts.Cancel()
-                    let! _ = readinessTask
-
-                    if cancellationToken.IsCancellationRequested then
-                        return Error(ProcessError.Cancelled config.Program)
-                    else
-                        return Error(ProcessError.NotReady(config.Program, Timeouts.clampArmable timeout))
-        }
-
-
     let elapsed () =
         Stopwatch.GetElapsedTime host.StartedTimestamp
 
@@ -582,6 +538,59 @@ type RunningProcess internal (host: RunningHost) =
                 bufferedOutcome <- waitWithTimeout ()
 
             bufferedOutcome)
+
+    let waitForHttp
+        (uri: Uri)
+        (isSatisfactory: Func<HttpResponseMessage, bool>)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        task {
+            if cancellationToken.IsCancellationRequested then
+                return Error(ProcessError.Cancelled config.Program)
+            else
+                let stdout, stderr = probeDrainStreams ()
+
+                use readinessCts =
+                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                let readinessTask =
+                    ReadinessProbe.waitForHttp
+                        config.Program
+                        stdout
+                        stderr
+                        uri
+                        isSatisfactory
+                        timeout
+                        readinessCts.Token
+
+                // Early-exit detection MUST share the one reap-once exit wait every other verb on this
+                // handle uses (`ensureBufferedWait`, memoized under `stateLock`) rather than starting an
+                // independent `host.Wait()`: on POSIX, `host.Wait()`/`waitPosix` REAPS the child and
+                // consumes its exit status, and is idempotent only while a wait stays in flight — never
+                // after the pid has already been reaped (KB K-016). A second, unrelated `host.Wait()`
+                // here would race the reap started by this one, so a later `WaitAsync`/`ProfileAsync`
+                // call (the common "diagnose why the service died on startup" path) would either see the
+                // pid already gone (ECHILD → fabricated `Outcome.Unobserved`) or, worse, risk observing a
+                // recycled pid. Calling `ensureBufferedWait()` here (instead of claiming the pipes via
+                // `claimBuffered`) starts/joins that ONE shared wait without claiming `consumption`, so
+                // `consumption` stays `Fresh` and a subsequent buffered verb can still claim the pipes and
+                // reuse this exact same memoized wait — one `host.Wait()`, one reap, shared by the probe
+                // and by whatever verb runs afterward.
+                let childExitTask = ensureBufferedWait ()
+                let! winner = Task.WhenAny(readinessTask :> Task, childExitTask :> Task)
+
+                if obj.ReferenceEquals(winner, readinessTask) || readinessTask.IsCompleted then
+                    return! readinessTask
+                else
+                    readinessCts.Cancel()
+                    let! _ = readinessTask
+
+                    if cancellationToken.IsCancellationRequested then
+                        return Error(ProcessError.Cancelled config.Program)
+                    else
+                        return Error(ProcessError.NotReady(config.Program, Timeouts.clampArmable timeout))
+        }
 
     // Kill the tree the moment an output pump faults, so a still-producing child can't wedge the exit
     // wait — and the pump's siblings — by blocking on a full pipe that nobody drains once the pump
