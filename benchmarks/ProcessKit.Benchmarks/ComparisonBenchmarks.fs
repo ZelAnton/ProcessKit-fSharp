@@ -80,15 +80,18 @@ module private ComparisonShell =
     let countLinesAsync (lines: IAsyncEnumerable<string>) : Task<int> =
         task {
             let enumerator = lines.GetAsyncEnumerator()
-            let mutable more = true
-            let mutable count = 0
 
-            while more do
-                let! has = enumerator.MoveNextAsync()
-                if has then count <- count + 1 else more <- false
+            try
+                let mutable more = true
+                let mutable count = 0
 
-            do! enumerator.DisposeAsync()
-            return count
+                while more do
+                    let! has = enumerator.MoveNextAsync()
+                    if has then count <- count + 1 else more <- false
+
+                return count
+            finally
+                enumerator.DisposeAsync().AsTask().Wait()
         }
 
 /// Scenario 1: spawn one short-lived child and capture its stdout — the most common
