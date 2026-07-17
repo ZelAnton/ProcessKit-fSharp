@@ -870,6 +870,402 @@ module internal Windows =
             server.Dispose()
             reraise ()
 
+    // ----------------------------------------------------------------------------------
+    // Windows: ConPTY (pseudoconsole) — the opt-in `Command.Pty` mechanism
+    // ----------------------------------------------------------------------------------
+    //
+    // Under `Command.Pty` the child's stdio is REPLACED, not extended: instead of inheriting pipe handles
+    // it is attached to a pseudoconsole (a real terminal — `isatty` true) whose single MERGED output
+    // stream we capture (there is no separate stderr under a tty — D3). `CreatePseudoConsole` spins up a
+    // headless conhost/OpenConsole sidecar (an I/O helper process OUTSIDE the Job — an honest, documented
+    // containment divergence) bound to the pseudoconsole handle; closing that handle tears the sidecar
+    // down. Kill-on-dispose containment is unchanged: the child is spawned CREATE_SUSPENDED, assigned to
+    // the Job while still suspended, then resumed — the proven `spawnWindowsCore` dance. (The ADR (D7)
+    // preferred a PROC_THREAD_ATTRIBUTE_JOB_LIST attribute in the same list as the pseudoconsole, but that
+    // empirically leaves the child on the PARENT's console rather than the pseudoconsole; the suspended->
+    // assign->resume flow is D7's permitted fallback and is what `spawnWindowsPtyCore` uses.) Needs Windows
+    // 10 1809 (build 17763); older hosts return a typed `ProcessError.Unsupported` (D9), probed via the
+    // kernel32 export table (below) rather than a blind call that would throw `EntryPointNotFoundException`.
+
+    [<Literal>]
+    let private EXTENDED_STARTUPINFO_PRESENT = 0x00080000u
+
+    // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE is a DWORD_PTR-sized attribute id (not `[<Literal>]`-able as nativeint).
+    let private PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: nativeint = nativeint 0x00020016
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private STARTUPINFOEX =
+        struct
+            val mutable StartupInfo: STARTUPINFO
+            val mutable lpAttributeList: nativeint
+        end
+
+    // `CreatePseudoConsole`/`ResizePseudoConsole` take a `COORD` by value. A `COORD` is two `SHORT`s — 4
+    // bytes, ABI-passed exactly like a 32-bit integer — so it is marshalled as a packed `uint32` (X = cols
+    // in the low word, Y = rows in the high word), sidestepping struct-by-value marshalling entirely.
+    let private packCoord (cols: int) (rows: int) : uint32 =
+        (uint32 (uint16 rows) <<< 16) ||| uint32 (uint16 cols)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern int private CreatePseudoConsole(
+        uint32 size,
+        nativeint hInput,
+        nativeint hOutput,
+        uint32 dwFlags,
+        nativeint& phPC
+    )
+
+    // Declared for the resize verb a later PTY stage wires up (Stage 4 — `RunningProcess.ResizeAsync`);
+    // intentionally unused at this stage.
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern int private ResizePseudoConsole(nativeint hPC, uint32 size)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern void private ClosePseudoConsole(nativeint hPC)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private InitializeProcThreadAttributeList(
+        nativeint lpAttributeList,
+        uint32 dwAttributeCount,
+        uint32 dwFlags,
+        nativeint& lpSize
+    )
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private UpdateProcThreadAttribute(
+        nativeint lpAttributeList,
+        uint32 dwFlags,
+        nativeint attribute,
+        nativeint lpValue,
+        nativeint cbSize,
+        nativeint lpPreviousValue,
+        nativeint lpReturnSize
+    )
+
+    [<DllImport("kernel32.dll")>]
+    extern void private DeleteProcThreadAttributeList(nativeint lpAttributeList)
+
+    // A second binding of `CreateProcessW` whose `lpStartupInfo` is a `STARTUPINFOEX&` (for
+    // EXTENDED_STARTUPINFO_PRESENT + the attribute list). Distinct F# name, same entry point.
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "CreateProcessW")>]
+    extern bool private CreateProcessExtended(
+        nativeint lpApplicationName,
+        string lpCommandLine,
+        nativeint lpProcessAttributes,
+        nativeint lpThreadAttributes,
+        bool bInheritHandles,
+        uint32 dwCreationFlags,
+        nativeint lpEnvironment,
+        string lpCurrentDirectory,
+        STARTUPINFOEX& lpStartupInfo,
+        PROCESS_INFORMATION& lpProcessInformation
+    )
+
+    /// Whether this Windows build exposes ConPTY (`CreatePseudoConsole` arrived in Windows 10 1809 / build
+    /// 17763). Probed once via the kernel32 export table — never a blind call that would throw
+    /// `EntryPointNotFoundException` on a pre-1809 host — so `Command.Pty` there fails with a typed
+    /// `ProcessError.Unsupported` (D9), never a silent pipe fallback.
+    let private conptyAvailability =
+        lazy
+            (try
+                let handle = NativeLibrary.Load "kernel32.dll"
+                let mutable export = IntPtr.Zero
+                NativeLibrary.TryGetExport(handle, "CreatePseudoConsole", &export)
+             with _ ->
+                 // Failing to even load kernel32 / probe its exports is treated as "no ConPTY".
+                 false)
+
+    let conptyAvailable () : bool = conptyAvailability.Value
+
+    /// Close the pseudoconsole `hPC` — tearing down the conhost sidecar (which lives OUTSIDE the Job) —
+    /// once the child `hProcess` exits. Closing the pseudoconsole also closes the merged-output pipe's
+    /// write end, so the parent's read reaches EOF and the capture/streaming pumps conclude (they never
+    /// would while conhost holds that write handle open). Waits on our OWN duplicate of the process handle
+    /// (the backend may close its copy on reap) via a thread-pool registered wait — one pool wait thread
+    /// serves ~63 handles, so no dedicated thread is parked per PTY child. `hPC` is closed exactly once, by
+    /// this one-shot wait — never elsewhere (no double-close). Returns `false` only if the initial handle
+    /// duplication fails (near-impossible for a just-created process).
+    let private closePseudoConsoleOnChildExit (hProcess: nativeint) (hPC: nativeint) : bool =
+        let current = GetCurrentProcess()
+        let mutable duplicate = IntPtr.Zero
+
+        if not (DuplicateHandle(current, hProcess, current, &duplicate, 0u, false, DUPLICATE_SAME_ACCESS)) then
+            false
+        else
+            let waitHandle =
+                new OwnedProcessWait(new SafeWaitHandle(duplicate, ownsHandle = true))
+
+            let tcs = TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            // Fires once, when the child exits: close the pseudoconsole (conhost flushes its final output
+            // to the pipe, then exits), then let the continuation unregister the wait and release the
+            // duplicate. Publishing the registration before attaching the continuation makes the unregister
+            // race-free even if the child had already exited when we registered (mirrors `waitWindows`).
+            let callback =
+                WaitOrTimerCallback(fun _ _ ->
+                    ClosePseudoConsole hPC
+                    tcs.TrySetResult() |> ignore)
+
+            let registration =
+                ThreadPool.RegisterWaitForSingleObject(waitHandle, callback, null, -1, true)
+
+            tcs.Task.ContinueWith(fun (_: Task) ->
+                registration.Unregister null |> ignore
+                waitHandle.Dispose()) // disposes the SafeWaitHandle -> closes our duplicate
+            |> ignore
+
+            true
+
+    /// Spawn `command` attached to a Windows pseudoconsole (ConPTY) — see the ConPTY section comment above.
+    /// The STARTUPINFOEX attribute list carries ONLY the pseudoconsole; Job membership (kill-on-dispose
+    /// containment) is achieved the proven `spawnWindowsCore` way — CREATE_SUSPENDED, AssignProcessToJobObject
+    /// while still suspended, then ResumeThread — NOT via a PROC_THREAD_ATTRIBUTE_JOB_LIST attribute (the ADR's
+    /// D7-preferred form empirically leaves the child on the PARENT's console; suspended->assign->resume is
+    /// D7's permitted fallback), so containment is unchanged. Returns the process handle, the parent-side
+    /// MERGED output read stream (`Spawned.Stdout`; `Stderr` is always `None` under a PTY — one terminal
+    /// stream, D3), and, when kept, the pty master input stream for interactive stdin.
+    let private spawnWindowsPtyCore
+        (job: nativeint)
+        (command: Command)
+        (pty: PtyConfig)
+        : Result<Spawned, ProcessError> =
+        let config = command.Config
+        // `InheritStdin` has no meaning under a PTY (the child's stdin is the pty master, not the parent's
+        // console), so the input write end is kept only for a feeder source or `KeepStdinOpen`.
+        let stdinInherit = Stdin.isInherit config.StdinSource
+
+        let stdinPipeKept =
+            (config.StdinSource.IsSome && not stdinInherit) || config.KeepStdinOpen
+
+        // Every parent/child pipe end created, torn down (best-effort, reverse order) if setup fails.
+        let createdPipes = ResizeArray<IDisposable>()
+
+        let disposeCreatedPipes () =
+            for i in createdPipes.Count - 1 .. -1 .. 0 do
+                try
+                    createdPipes[i].Dispose()
+                with _ ->
+                    // Best-effort unwind after an earlier failure; the original failure is what we report.
+                    ()
+
+        // The pseudoconsole handle, set once created; cleared once its ownership is handed to the exit-wait
+        // (success) or it has been closed on an error branch — read by the outer `with` so an exception
+        // after CreatePseudoConsole succeeds still tears the sidecar down rather than leaking it.
+        let mutable pendingPseudoConsole = IntPtr.Zero
+
+        try
+            // Two async pipe pairs. Parent keeps the input WRITE end (pty master stdin) and the output READ
+            // end (the single merged terminal stream); the child-side ends are handed to CreatePseudoConsole
+            // and closed once it has duplicated them into the conhost sidecar.
+            let inServer, inClient = createAsyncPipePair PipeDirection.Out
+            createdPipes.Add inServer
+            createdPipes.Add inClient
+            let outServer, outClient = createAsyncPipePair PipeDirection.In
+            createdPipes.Add outServer
+            createdPipes.Add outClient
+
+            let mutable hPC = IntPtr.Zero
+
+            let hr =
+                CreatePseudoConsole(
+                    packCoord pty.Cols pty.Rows,
+                    inClient.SafePipeHandle.DangerousGetHandle(),
+                    outClient.SafePipeHandle.DangerousGetHandle(),
+                    0u,
+                    &hPC
+                )
+
+            if hr <> 0 then
+                disposeCreatedPipes ()
+                let hrHex = hr.ToString("X8")
+                Error(ProcessError.Spawn(command.Program, $"CreatePseudoConsole failed (HRESULT 0x{hrHex})"))
+            else
+                pendingPseudoConsole <- hPC
+                // ConPTY duplicated the child-side ends into the sidecar; drop our copies so only the parent
+                // ends (kept below) remain. (Still listed in `createdPipes`; `Stream.Dispose` is safe to
+                // call twice, so a later failure's unwind is harmless.)
+                inClient.Dispose()
+                outClient.Dispose()
+
+                // A STARTUPINFOEX attribute list carrying ONE attribute: the pseudoconsole. Containment
+                // (Job membership) is done the proven way — CREATE_SUSPENDED, AssignProcessToJobObject while
+                // still suspended, then resume — NOT via a PROC_THREAD_ATTRIBUTE_JOB_LIST in the same list.
+                // The ADR (D7) preferred the job-list attribute, but empirically a job-list attribute
+                // alongside PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE leaves the child attached to the PARENT's
+                // console instead of the pseudoconsole — its output then escapes the captured merged stream.
+                // The suspended->assign->resume flow is D7's explicitly-permitted fallback: it keeps the
+                // kill-on-dispose guarantee intact (the child is contained before it runs a single
+                // instruction) and composes cleanly with the pseudoconsole, exactly as `spawnWindowsCore`.
+                let mutable listSize = IntPtr.Zero
+                // First call sizes the list (returns FALSE with ERROR_INSUFFICIENT_BUFFER — expected).
+                InitializeProcThreadAttributeList(IntPtr.Zero, 1u, 0u, &listSize) |> ignore
+                let attrList = Marshal.AllocHGlobal listSize
+
+                // Release the initialized attribute list (post-CreateProcess or on error).
+                let cleanupInitializedScratch () =
+                    DeleteProcThreadAttributeList attrList
+                    Marshal.FreeHGlobal attrList
+
+                if not (InitializeProcThreadAttributeList(attrList, 1u, 0u, &listSize)) then
+                    let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                    // The list was never initialized — free the raw buffer WITHOUT DeleteProcThreadAttributeList.
+                    Marshal.FreeHGlobal attrList
+                    ClosePseudoConsole hPC
+                    pendingPseudoConsole <- IntPtr.Zero
+                    disposeCreatedPipes ()
+                    Error(ProcessError.Spawn(command.Program, $"InitializeProcThreadAttributeList failed: {message}"))
+                // PSEUDOCONSOLE's value is the HPCON handle itself (passed by value in the lpValue slot),
+                // cbSize = pointer size.
+                elif
+                    not (
+                        UpdateProcThreadAttribute(
+                            attrList,
+                            0u,
+                            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                            hPC,
+                            nativeint IntPtr.Size,
+                            IntPtr.Zero,
+                            IntPtr.Zero
+                        )
+                    )
+                then
+                    let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                    cleanupInitializedScratch ()
+                    ClosePseudoConsole hPC
+                    pendingPseudoConsole <- IntPtr.Zero
+                    disposeCreatedPipes ()
+                    Error(ProcessError.Spawn(command.Program, $"UpdateProcThreadAttribute failed: {message}"))
+                else
+                    let mutable startup = STARTUPINFOEX()
+                    startup.StartupInfo.cb <- Marshal.SizeOf<STARTUPINFOEX>()
+                    // Deliberately NO STARTF_USESTDHANDLES and no std handles — a ConPTY child's std handles
+                    // come from the pseudoconsole. The fundamental divergence from the pipe path.
+                    startup.lpAttributeList <- attrList
+
+                    let mutable info = PROCESS_INFORMATION()
+                    let commandLine = buildWindowsCommandLine command
+
+                    let workingDirectory =
+                        config.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
+
+                    let environment = buildWindowsEnvironment command
+
+                    let flags =
+                        // Spawn SUSPENDED so the child is assigned to the Job before it runs (proven
+                        // containment). EXTENDED_STARTUPINFO_PRESENT selects the STARTUPINFOEX form.
+                        EXTENDED_STARTUPINFO_PRESENT
+                        ||| CREATE_SUSPENDED
+                        ||| (if environment = IntPtr.Zero then
+                                 0u
+                             else
+                                 CREATE_UNICODE_ENVIRONMENT)
+                        ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
+                        ||| (if config.WindowsCtrlSignals then
+                                 CREATE_NEW_PROCESS_GROUP
+                             else
+                                 0u)
+                        ||| (match config.Priority with
+                             | Some priority -> PriorityMapping.windowsCreationFlag priority
+                             | None -> 0u)
+
+                    let created =
+                        CreateProcessExtended(
+                            IntPtr.Zero,
+                            commandLine,
+                            IntPtr.Zero,
+                            IntPtr.Zero,
+                            // A ConPTY child inherits no handles; its stdio comes from the pseudoconsole.
+                            false,
+                            flags,
+                            environment,
+                            workingDirectory,
+                            &startup,
+                            &info
+                        )
+
+                    let lastError = Marshal.GetLastWin32Error()
+
+                    if environment <> IntPtr.Zero then
+                        Marshal.FreeHGlobal environment
+
+                    cleanupInitializedScratch ()
+
+                    if not created then
+                        ClosePseudoConsole hPC
+                        pendingPseudoConsole <- IntPtr.Zero
+                        disposeCreatedPipes ()
+
+                        if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
+                            Error(notFoundFromSpawnFailure command.Program)
+                        else
+                            Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
+                    elif not (AssignProcessToJobObject(job, info.hProcess)) then
+                        // Suspended but uncontained — kill it rather than let it run free (mirrors
+                        // `spawnWindowsCore`), and tear down the pseudoconsole + pipes.
+                        let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                        TerminateProcess(info.hProcess, 1u) |> ignore
+                        CloseHandle info.hThread |> ignore
+                        CloseHandle info.hProcess |> ignore
+                        ClosePseudoConsole hPC
+                        pendingPseudoConsole <- IntPtr.Zero
+                        disposeCreatedPipes ()
+                        Error(ProcessError.Spawn(command.Program, $"could not assign process to job object: {message}"))
+                    elif resumeThreadHook info.hThread = UInt32.MaxValue then
+                        // `ResumeThread` returned its `(DWORD)-1` failure sentinel: the child is contained
+                        // but stuck SUSPENDED and would never run. Kill it and report honestly.
+                        let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                        TerminateProcess(info.hProcess, 1u) |> ignore
+                        CloseHandle info.hThread |> ignore
+                        CloseHandle info.hProcess |> ignore
+                        ClosePseudoConsole hPC
+                        pendingPseudoConsole <- IntPtr.Zero
+                        disposeCreatedPipes ()
+                        Error(ProcessError.Spawn(command.Program, $"could not resume the suspended child: {message}"))
+                    else
+                        CloseHandle info.hThread |> ignore
+
+                        if not (closePseudoConsoleOnChildExit info.hProcess hPC) then
+                            // Near-impossible (duplicating a just-created process handle failed): fail
+                            // honestly rather than leak the conhost sidecar. The child is a Job member, so
+                            // terminate it, close the pseudoconsole, and release the pipes.
+                            ClosePseudoConsole hPC
+                            pendingPseudoConsole <- IntPtr.Zero
+                            TerminateProcess(info.hProcess, 1u) |> ignore
+                            CloseHandle info.hProcess |> ignore
+                            disposeCreatedPipes ()
+
+                            Error(
+                                ProcessError.Spawn(
+                                    command.Program,
+                                    "could not register the pseudoconsole teardown wait"
+                                )
+                            )
+                        else
+                            // Ownership of `hPC` is now the exit-wait's; it closes it exactly once.
+                            pendingPseudoConsole <- IntPtr.Zero
+
+                            let stdinStream =
+                                if stdinPipeKept then
+                                    Some(inServer :> Stream)
+                                else
+                                    // No feeder/interactive writer: close the pty master input end.
+                                    inServer.Dispose()
+                                    None
+
+                            Ok
+                                { Handle = info.hProcess
+                                  // One merged terminal stream (D3): stdout carries all output, no stderr.
+                                  Stdout = Some(outServer :> Stream)
+                                  Stderr = None
+                                  Stdin = stdinStream
+                                  WindowsCtrlGroup = config.WindowsCtrlSignals }
+        with ex ->
+            if pendingPseudoConsole <> IntPtr.Zero then
+                ClosePseudoConsole pendingPseudoConsole
+
+            disposeCreatedPipes ()
+            Error(ProcessError.Spawn(command.Program, ex.Message))
+
     /// Spawn `command` suspended, assign it to `job` while still suspended (so no
     /// grandchild can escape the container), then resume it. Returns the process handle and
     /// managed read streams for stdout/stderr.
@@ -1135,4 +1531,16 @@ module internal Windows =
         | _, _, Some _, _, _ -> Error(ProcessError.Unsupported "gid")
         | _, _, _, true, _ -> Error(ProcessError.Unsupported "setsid")
         | _, _, _, _, Some _ -> Error(ProcessError.Unsupported "groups")
-        | None, None, None, false, None -> lock windowsSpawnLock (fun () -> spawnWindowsCore job command)
+        | None, None, None, false, None ->
+            match config.Pty with
+            | Some pty ->
+                // ConPTY needs Windows 10 1809+; probe the export rather than blind-calling so a pre-1809
+                // host is a typed `ProcessError.Unsupported`, never a silent pipe downgrade (D9). The spawn
+                // takes `windowsSpawnLock` for the same reason the pipe path does: a concurrent pipe spawn
+                // with `bInheritHandles = true` must not snapshot this path's inheritable pipe-client ends
+                // in its own child (this path itself passes `bInheritHandles = false`).
+                if not (conptyAvailable ()) then
+                    Error(ProcessError.Unsupported "Pty (needs Windows 10 1809+ / ConPTY)")
+                else
+                    lock windowsSpawnLock (fun () -> spawnWindowsPtyCore job command pty)
+            | None -> lock windowsSpawnLock (fun () -> spawnWindowsCore job command)

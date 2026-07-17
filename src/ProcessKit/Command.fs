@@ -9,6 +9,36 @@ open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 
+/// Initial terminal geometry and behaviour flags for an opt-in pseudo-terminal (PTY) run — see
+/// `Command.Pty`. A PTY gives the child a real controlling terminal (`isatty` true) on a single
+/// merged stdout+stderr stream, for tools that demand a tty (an interactive `ssh`/`sudo` prompt, a
+/// credential helper, a TUI, a progress bar that switches to "dumb" line-buffered output when it
+/// detects a pipe). The default (no PTY) is byte-identical to a plain pipe run.
+///
+/// **Secret-safety (echo footgun).** A terminal echoes typed input back into its *output* by default
+/// (cooked-mode `ECHO`), so bytes written to the child's stdin through the PTY — including an
+/// interactively typed password — are echoed into the captured merged output. This is standard
+/// terminal behaviour, not a bug, but it means a credential can appear in captured output (or a
+/// recorded cassette). Set `Echo = false` to request the terminal echo be disabled (the effect is
+/// wired in a later PTY stage; the flag is carried now so the config shape is stable). As everywhere
+/// else in the library, argv and environment **values** — and any PTY credentials — are never logged
+/// or traced; the record/replay redaction hook still governs what a cassette persists.
+[<NoComparison>]
+type PtyConfig =
+    {
+        /// Initial terminal width in columns. Must be positive (the ratified default is 80).
+        Cols: int
+        /// Initial terminal height in rows. Must be positive (the ratified default is 24).
+        Rows: int
+        /// Leave the terminal's cooked-mode echo on (`true`, the OS default) or request it disabled
+        /// (`false`). See the type-level secret-safety note; the echo *effect* is wired in a later PTY
+        /// stage, but the flag is part of the config shape now.
+        Echo: bool
+    }
+
+    /// The ratified default PTY geometry and flags: 80 columns × 24 rows, cooked-mode echo on.
+    static member Default = { Cols = 80; Rows = 24; Echo = true }
+
 /// The immutable configuration behind a `Command`. Internal — consumers build it through the
 /// `Command` builder; the runner/native layer reads it to spawn.
 ///
@@ -111,6 +141,17 @@ type internal CommandConfig =
       // than combining with it; the kill-on-drop `killpg(pid)` teardown still reaches the whole session,
       // so containment is preserved (see `Native.Posix`).
       Setsid: bool
+      // Opt-in pseudo-terminal (PTY) mode: run the child under a real controlling terminal on a single
+      // merged stdout+stderr stream, instead of the default parent/child pipes. `None` (the default) is
+      // the plain pipe run, byte-identical to before PTY existed. A PTY implies OS-level merge semantics
+      // (there is one terminal stream — `Spawned.Stderr` is `None`, `OutputEvent.Stderr` is never
+      // produced), so it is rejected at the builder boundary alongside the separate-stderr observation
+      // hooks (`StderrTee`/`OnStderrLine`) and alongside `Setsid` (a new session with NO controlling
+      // tty, contradicting a PTY's controlling tty), and only as a standalone run or the last stage of a
+      // pipeline. Windows: ConPTY (`CreatePseudoConsole`, Windows 10 1809+; older hosts fail the spawn
+      // with a typed `ProcessError.Unsupported`, never a silent pipe downgrade). POSIX: currently a typed
+      // `ProcessError.Unsupported` — the `openpty` mechanism arrives in a later stage. See `Command.Pty`.
+      Pty: PtyConfig option
       Logger: ILogger option
       // A per-run correlation id, stamped once at the verb layer so a run's log/trace events (and its
       // retries) share it. `None` until stamped; a direct spawn gets a per-incarnation id instead.
@@ -155,6 +196,7 @@ module internal CommandConfig =
           Gid = None
           Groups = None
           Setsid = false
+          Pty = None
           Logger = None
           RunId = None }
 
@@ -213,6 +255,58 @@ module internal CommandConfig =
     let ensureNoMergeStderr (config: CommandConfig) (knob: string) =
         if config.MergeStderr then
             raise (mergeStderrConflict knob)
+
+    // Reasons a knob cannot coexist with `Pty`, reused so the message is identical regardless of which of
+    // the pair was set second (the checks below are bidirectional, mirroring `mergeStderrConflict`).
+    [<Literal>]
+    let private ptyMergedStreamReason =
+        "a PTY gives the child a single merged terminal stream (its stdout and stderr are one device), so there is no separate stderr stream to observe"
+
+    [<Literal>]
+    let private ptySetsidReason =
+        "Setsid detaches the child into a new session with NO controlling terminal, whereas Pty gives it a new session WITH a controlling pseudo-terminal — the two are contradictory"
+
+    /// The `ArgumentException` for combining `Pty` with a knob a pseudo-terminal cannot honour. Named after
+    /// the offending knob so the message points at whichever of the pair was set second, per the project's
+    /// "reject conflicts at the builder boundary, never a silent downgrade" rule.
+    let private ptyConflict (knob: string) (reason: string) =
+        ArgumentException($"{knob} cannot be combined with Pty: {reason}. Drop one of the two.", knob)
+
+    /// Guard `Pty(...)`: reject it when a separate-stderr observation hook (`StderrTee`/`OnStderrLine`, D4)
+    /// or `Setsid` (D8) is already set. A PTY implies OS-level merge semantics (one terminal stream, no
+    /// separate stderr) and a controlling pseudo-terminal (contradicting `Setsid`'s controlling-tty-less
+    /// new session).
+    let ensurePtyCompatible (config: CommandConfig) =
+        if config.StderrTee.IsSome then
+            raise (ptyConflict "StderrTee" ptyMergedStreamReason)
+
+        if config.OnStderrLine.IsSome then
+            raise (ptyConflict "OnStderrLine" ptyMergedStreamReason)
+
+        if config.Setsid then
+            raise (ptyConflict "Setsid" ptySetsidReason)
+
+    /// Guard `StderrTee`/`OnStderrLine`: reject them when `Pty` is already set — the mirror of
+    /// `ensurePtyCompatible`'s observer checks, so the conflict is caught in either chaining order.
+    let ensureNoPty (config: CommandConfig) (knob: string) =
+        if config.Pty.IsSome then
+            raise (ptyConflict knob ptyMergedStreamReason)
+
+    /// Guard `Setsid()`: reject it when `Pty` is already set — the mirror of `ensurePtyCompatible`'s
+    /// `Setsid` check (D8), so the conflict is caught in either chaining order.
+    let ensureNoPtyForSetsid (config: CommandConfig) =
+        if config.Pty.IsSome then
+            raise (ptyConflict "Setsid" ptySetsidReason)
+
+    /// Validate a `PtyConfig`'s geometry at the `Command.Pty` builder boundary: both dimensions must be at
+    /// least 1 (a terminal has no zero/negative size) and fit a Win32 `COORD`'s `SHORT`
+    /// (`Int16.MaxValue`, also a sane ceiling on POSIX `winsize`), rejected with
+    /// `ArgumentOutOfRangeException` naming the offending dimension.
+    let validatePtyConfig (pty: PtyConfig) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(pty.Cols, 1, "Cols")
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(pty.Cols, int Int16.MaxValue, "Cols")
+        ArgumentOutOfRangeException.ThrowIfLessThan(pty.Rows, 1, "Rows")
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(pty.Rows, int Int16.MaxValue, "Rows")
 
     /// The `ArgumentException` for combining `InheritStdin` with an incompatible stdin knob. `InheritStdin`
     /// hands the child the parent's own standard input directly, with no pipe — so there is nothing for a
@@ -466,6 +560,7 @@ type Command internal (config: CommandConfig) =
     member _.OnStderrLine(handler: Action<string>) =
         ArgumentNullException.ThrowIfNull handler
         CommandConfig.ensureNoMergeStderr config "OnStderrLine"
+        CommandConfig.ensureNoPty config "OnStderrLine"
 
         Command(
             { config with
@@ -483,6 +578,7 @@ type Command internal (config: CommandConfig) =
     member _.StderrTee(sink: Stream) =
         ArgumentNullException.ThrowIfNull sink
         CommandConfig.ensureNoMergeStderr config "StderrTee"
+        CommandConfig.ensureNoPty config "StderrTee"
         Command({ config with StderrTee = Some sink })
 
     /// Merge the child's standard **error** into its standard **output** at the OS level — the library
@@ -749,7 +845,49 @@ type Command internal (config: CommandConfig) =
     /// so the kill-on-drop group teardown (`killpg`) still reaches the whole session — containment is
     /// preserved; the new session simply replaces the group's default `POSIX_SPAWN_SETPGROUP` for this
     /// command. A `setsid()` the OS refuses fails the spawn with `ProcessError.Spawn`.
-    member _.Setsid() = Command({ config with Setsid = true })
+    member _.Setsid() =
+        CommandConfig.ensureNoPtyForSetsid config
+        Command({ config with Setsid = true })
+
+    /// Run the child under an opt-in **pseudo-terminal (PTY)** with `pty`'s initial geometry and flags:
+    /// the child gets a real controlling terminal (`isatty` true) on a **single merged stdout+stderr
+    /// stream**, for tools that demand a tty — an interactive `ssh`/`sudo` password prompt, a credential
+    /// helper, a TUI, or a progress bar that switches to "dumb" line-buffered output when it detects a
+    /// pipe. A PTY is never implicit; the default (this method unset) is byte-identical to a plain pipe run.
+    ///
+    /// **One merged stream.** A tty is a single bidirectional device, so under a PTY the child's stdout
+    /// and stderr are physically one stream: `ProcessResult.Stderr` is empty and `OutputEventsAsync` emits
+    /// only `OutputEvent.Stdout` events. Because there is no separate stderr, the separate-stderr
+    /// observation knobs are rejected at the builder boundary (`ArgumentException`, in either chaining
+    /// order): `StderrTee` and `OnStderrLine`. `Setsid` is likewise rejected — it detaches the child into
+    /// a new session with **no** controlling tty, contradicting a PTY's controlling pseudo-terminal. Inside
+    /// a `Pipeline` a PTY is allowed only as a standalone run or the **last** stage (its merged output
+    /// would otherwise be injected into the downstream stage's stdin).
+    ///
+    /// **Platform support (typed, never a silent downgrade).** Windows: ConPTY, needing Windows 10 1809+;
+    /// an older host fails the spawn with `ProcessError.Unsupported "Pty (needs Windows 10 1809+ /
+    /// ConPTY)"`. POSIX: currently `ProcessError.Unsupported` — the `openpty` mechanism arrives in a later
+    /// stage; a PTY on POSIX never silently falls back to pipes.
+    ///
+    /// **Secret-safety.** A terminal echoes typed input into its captured output by default — see
+    /// `PtyConfig` for the echo footgun and the `Echo` flag. argv/env values and any PTY credentials are
+    /// never logged or traced.
+    member _.Pty(pty: PtyConfig) =
+        CommandConfig.validatePtyConfig pty
+        CommandConfig.ensurePtyCompatible config
+        Command({ config with Pty = Some pty })
+
+    /// Run the child under a pseudo-terminal with the default 80×24 geometry (echo on). See
+    /// `Command.Pty(PtyConfig)`.
+    member this.Pty() = this.Pty PtyConfig.Default
+
+    /// Run the child under a pseudo-terminal with the given initial geometry (echo on). `cols` and `rows`
+    /// must each be at least 1 (rejected with `ArgumentOutOfRangeException`). See `Command.Pty(PtyConfig)`.
+    member this.Pty(cols: int, rows: int) =
+        this.Pty
+            { PtyConfig.Default with
+                Cols = cols
+                Rows = rows }
 
     /// Emit structured lifecycle events (spawn / exit / timeout / retry) to `logger`. The program
     /// name and non-secret facts only — **argv and environment are never logged**.
@@ -910,6 +1048,11 @@ module Command =
     /// Detach the child into a new session (`setsid()`). Unix-only: a set request fails a Windows spawn
     /// with `ProcessError.Unsupported`. Containment is preserved. See `Command.Setsid`.
     let setsid (command: Command) = command.Setsid()
+
+    /// Run the child under a pseudo-terminal (PTY) with the default 80×24 geometry (echo on) — a single
+    /// merged stdout+stderr terminal stream, for tools that demand a tty. Windows: ConPTY (Win10 1809+);
+    /// POSIX: currently `ProcessError.Unsupported` until a later stage. See `Command.Pty`.
+    let pty (command: Command) = command.Pty()
 
     /// Emit structured lifecycle events to `logger` (argv/env never logged).
     let logger (logger: ILogger) (command: Command) = command.Logger logger
