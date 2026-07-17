@@ -148,7 +148,7 @@ The current interface has 15 abstract members:
 
 `TrackedChildren<'T>` serializes `Add`, `Remove`, `Snapshot`, and `Drain` behind one lock. `Drain` is essential during teardown: it atomically transfers ownership of every recorded child to the teardown path. A mere snapshot would allow a racing cleanup to act twice on a recycled PID or handle.
 
-`GracefulTeardown.poll` supplies the POSIX/cgroup shape: send `SIGTERM`, poll every 50 ms until empty or the grace period expires, then force-kill survivors. `PosixReap.leader` pairs `killpg` with `waitpid`; killing a process group does not reap the direct child that ProcessKit owns.
+`GracefulTeardown.poll` supplies the graceful-stop shape shared by all three backends: post the soft stop, poll every 50 ms until empty or the grace period expires, then force-kill survivors. Only the soft stop differs per platform — `SIGTERM` on the POSIX/cgroup backends, a `WM_CLOSE` posted to members' top-level windows on Windows — while the poll-then-unconditional-hard-kill escalation is identical. `PosixReap.leader` pairs `killpg` with `waitpid`; killing a process group does not reap the direct child that ProcessKit owns.
 
 The implementation is split across four files. `Native.Windows.fs`, `Native.Posix.fs`, and `Native.Cgroup.fs` provide the OS-specific operations; `Backend.fs` composes them into `JobObjectBackend`, `ProcessGroupBackend`, and `CgroupBackend`, respectively, behind `IContainmentBackend`.
 
@@ -156,9 +156,9 @@ The implementation is split across four files. `Native.Windows.fs`, `Native.Posi
 
 `JobObjectBackend` owns one Job handle plus child process handles. `Native.Windows.spawnWindows` creates the process suspended, assigns it to the Job, and only then resumes it. This prevents a child from escaping by forking before assignment. The Job has `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; closing the Job is the final kill-on-drop guarantee. Requested memory, process-count, and CPU limits are applied through Job Object limit APIs.
 
-`Signal.Kill` terminates the Job atomically. `Signal.Int` and `Signal.Term` are not Unix signals: for children explicitly started with `Command.WindowsCtrlSignals()`, they map to `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)`. The child is created with `CREATE_NEW_PROCESS_GROUP`, and its PID is its console group ID. Without an eligible child or a shared console, delivery returns `Unsupported`; it never silently becomes a hard kill. Other signals are unsupported.
+`Signal.Kill` terminates the Job atomically. `Signal.Int` and `Signal.Term` are not Unix signals: they map to a best-effort soft stop built from two complementary, individually pid-targeted deliveries. For children explicitly started with `Command.WindowsCtrlSignals()`, ProcessKit sends `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` — the child is created with `CREATE_NEW_PROCESS_GROUP`, so its PID is its console group ID and only CTRL+BREAK (not CTRL+C) can be group-targeted; this reaches *console* children. In addition, a `WM_CLOSE` is posted to the top-level windows of every member that has one (located by pid via `GetWindowThreadProcessId`, so no window outside the group is hit); this reaches *windowed* children (Electron/GUI tools) that have no console to signal. Delivery is a best-effort `Ok` when either mechanism reaches at least one member — delivery, not the child's compliance (a child may install a handler or a window may veto the close). It returns `Unsupported` only when the group has *neither* a CTRL-capable child *nor* any windowed member, and never silently becomes a hard kill. Other signals are unsupported.
 
-Tracked process handles pin PID identity until release, preventing the stored console-group ID from becoming a wrong target. Windows graceful tree shutdown has no Job-wide soft primitive, so `GracefulKillTree` performs the atomic hard Job termination.
+Tracked process handles pin PID identity until release, preventing a stored console-group ID (or the pid used to locate a member's windows) from becoming a wrong target. Windows has no Job-wide soft signal, but `GracefulKillTree` still runs a best-effort soft phase around the same poll shape the Unix backends use: it posts a `WM_CLOSE` to every member's top-level windows, polls up to the grace period for the tree to drain, then *unconditionally* terminates the Job whatever survives. The hard kill is never removed or weakened — a child with no window, or one that vetoes the close, is force-killed exactly as before — and `grace = 0` skips the wait and hard-kills at once.
 
 ### POSIX process groups
 
@@ -244,8 +244,8 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 | Selection | Windows, with or without limits | macOS/BSD; Linux without requested limits | Linux when limits are requested |
 | Containment timing | Child suspended, assigned to Job, then resumed | Group created atomically by `posix_spawn` attributes | POSIX group at spawn; `/bin/sh` launcher joins the cgroup before `exec`ing the target (already contained on its first instruction) |
 | Whole-tree hard kill | Terminate Job or close kill-on-close Job handle | `killpg(SIGKILL)` for each tracked pgid | `cgroup.kill`; freeze-and-SIGKILL sweep fallback |
-| Graceful tree stop | No Job-wide soft stop; hard kill | `SIGTERM`, poll, then `SIGKILL` | signal members with `SIGTERM`, poll, then cgroup hard kill |
-| General signals | Kill; Int/Term as opt-in CTRL+BREAK only | `killpg` with mapped/raw signal | per-current-member signal sweep; Kill is atomic cgroup kill |
+| Graceful tree stop | Best-effort `WM_CLOSE` to members' windows, poll to grace, then hard Job kill | `SIGTERM`, poll, then `SIGKILL` | signal members with `SIGTERM`, poll, then cgroup hard kill |
+| General signals | Kill; Int/Term as best-effort CTRL+BREAK (`WindowsCtrlSignals()` child) and/or `WM_CLOSE` (windowed member) | `killpg` with mapped/raw signal | per-current-member signal sweep; Kill is atomic cgroup kill |
 | Suspend/resume | Best-effort per-thread; suspend counts stack | `SIGSTOP` / `SIGCONT` | `cgroup.freeze` best effort |
 | Resource controls | Job memory, active-process, CPU limits | None | `memory.max`, `pids.max`, `cpu.max` |
 | Membership snapshot | All Job PIDs | Tracked group leaders, not every descendant PID | Current `cgroup.procs` PIDs |
