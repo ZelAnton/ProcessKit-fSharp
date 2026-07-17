@@ -149,8 +149,9 @@ type internal CommandConfig =
       // hooks (`StderrTee`/`OnStderrLine`) and alongside `Setsid` (a new session with NO controlling
       // tty, contradicting a PTY's controlling tty), and only as a standalone run or the last stage of a
       // pipeline. Windows: ConPTY (`CreatePseudoConsole`, Windows 10 1809+; older hosts fail the spawn
-      // with a typed `ProcessError.Unsupported`, never a silent pipe downgrade). POSIX: currently a typed
-      // `ProcessError.Unsupported` — the `openpty` mechanism arrives in a later stage. See `Command.Pty`.
+      // with a typed `ProcessError.Unsupported`, never a silent pipe downgrade). POSIX: `openpty` +
+      // `setsid --ctty` (util-linux); a host without the ctty helper or the pty devfs (macOS/BSD) is a
+      // typed `ProcessError.Unsupported`, never a socketpair pretending to be a tty. See `Command.Pty`.
       Pty: PtyConfig option
       Logger: ILogger option
       // A per-run correlation id, stamped once at the verb layer so a run's log/trace events (and its
@@ -866,8 +867,9 @@ type Command internal (config: CommandConfig) =
     ///
     /// **Platform support (typed, never a silent downgrade).** Windows: ConPTY, needing Windows 10 1809+;
     /// an older host fails the spawn with `ProcessError.Unsupported "Pty (needs Windows 10 1809+ /
-    /// ConPTY)"`. POSIX: currently `ProcessError.Unsupported` — the `openpty` mechanism arrives in a later
-    /// stage; a PTY on POSIX never silently falls back to pipes.
+    /// ConPTY)"`. POSIX: a real controlling pty via `openpty` + the `setsid --ctty` helper (util-linux);
+    /// a host missing that ctty helper or the pty devfs (macOS/BSD) fails with `ProcessError.Unsupported`,
+    /// never a socketpair silently pretending to be a tty.
     ///
     /// **Secret-safety.** A terminal echoes typed input into its captured output by default — see
     /// `PtyConfig` for the echo footgun and the `Echo` flag. argv/env values and any PTY credentials are

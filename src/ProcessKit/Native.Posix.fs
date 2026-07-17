@@ -30,6 +30,16 @@ module internal Posix =
     [<Literal>]
     let private O_WRONLY = 1
 
+    // Read/write, and "do not acquire this terminal as MY controlling tty on open" — used opening a pty
+    // master/slave pair (`openPtyPair`): the master is O_RDWR (the single bidirectional merged stream),
+    // and both ends carry O_NOCTTY so the PARENT never accidentally adopts the slave as its controlling
+    // terminal (the CHILD acquires it deliberately, via `setsid --ctty`). Same numeric values on Linux.
+    [<Literal>]
+    let private O_RDWR = 2
+
+    [<Literal>]
+    let private O_NOCTTY = 0x100
+
     // Non-variadic close-on-exec, used instead of fcntl (which a fixed-signature P/Invoke cannot
     // call under the AArch64 variadic ABI): Linux gets O_CLOEXEC on open (and the sibling SOCK_CLOEXEC
     // on the stdio socketpairs); macOS gets POSIX_SPAWN_CLOEXEC_DEFAULT, which closes every non-dup2 fd
@@ -129,6 +139,41 @@ module internal Posix =
     [<DllImport("libc", SetLastError = true)>]
     extern int kill(int pid, int signalNumber)
 
+    // POSIX pty (pseudo-terminal) master/slave allocation for `Command.Pty` (see `openPtyPair`).
+    // `posix_openpt`/`grantpt`/`unlockpt`/`ptsname` are ALL in libc — portable across glibc versions and
+    // back to old glibc where `openpty(3)` lived only in `libutil` — and `posix_openpt` accepts O_CLOEXEC,
+    // so the master fd is close-on-exec ATOMICALLY (no `fcntl`, which this port avoids on the AArch64
+    // variadic ABI). That is the pty analogue of the socketpair's SOCK_CLOEXEC, and the exact reason the
+    // PTY ADR ratifies `posix_openpt` as the mechanism a bare `openpty` cannot match here.
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private posix_openpt(int flags)
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private grantpt(int fd)
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private unlockpt(int fd)
+
+    // Returns a pointer to a static buffer holding the slave device path (e.g. "/dev/pts/3"); marshalled
+    // with `Marshal.PtrToStringAnsi`. NULL on failure.
+    [<DllImport("libc", SetLastError = true, CharSet = CharSet.Ansi)>]
+    extern nativeint private ptsname(int fd)
+
+    // Duplicate a fd. Used to give an interactive/fed pty stdin its OWN owning fd over the master, so the
+    // read (stdout) and write (stdin) streams each dispose exactly one fd — no double close of one master.
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private dup(int fd)
+
+    // read/write on a pty master fd. Unlike a socketpair end (a `Socket`/`NetworkStream` on the runtime's
+    // epoll/kqueue engine), a pty master is a character device that engine cannot host, so `PtyStream`
+    // does its I/O with these directly (offloaded to the thread pool for async by the base `Stream`).
+    // `nativeint` is `ssize_t` — a negative return signals an error whose errno decides EOF vs a fault.
+    [<DllImport("libc", SetLastError = true, EntryPoint = "read")>]
+    extern nativeint private ptyReadRaw(int fd, nativeint buffer, nativeint count)
+
+    [<DllImport("libc", SetLastError = true, EntryPoint = "write")>]
+    extern nativeint private ptyWriteRaw(int fd, nativeint buffer, nativeint count)
+
     // setpriority(PRIO_PROCESS, pid, nice) sets a process's absolute nice value (its CPU-scheduling
     // priority). `posix_spawn` has no attribute for nice, so `Command.Priority` applies it to the
     // spawned leader from the parent right after the spawn returns (see `spawnPosix`).
@@ -202,6 +247,14 @@ module internal Posix =
     /// actually delivered to — proving a recycled number is pruned and NEVER signalled/killed, and a
     /// matching one still is. Production leaves it `None`.
     let mutable groupDeliveryObserverForTests: (int -> unit) option = None
+
+    /// Test seam (internal, not public API): overrides the `setsid --ctty` controlling-terminal helper
+    /// availability probe, so a test can force the "no ctty helper" host (macOS/BSD, an old util-linux)
+    /// deterministically ON a host that DOES carry `setsid` — exercising the honest typed
+    /// `ProcessError.Unsupported` a PTY returns where a controlling terminal cannot be established (D9),
+    /// without a socketpair ever pretending to be a tty. Production leaves it `None` and runs the real
+    /// `resolveProgram "setsid"` PATH probe.
+    let mutable ptyCttyHelperAvailableForTests: (unit -> bool) option = None
 
     // Fire the group-delivery test observer (if installed) with the target pgid BEFORE the syscall, so a
     // test can record exactly which pgids a signal/kill path delivered to — and so it can never perturb
@@ -482,6 +535,169 @@ module internal Posix =
 
     // errno value for a syscall interrupted by a signal (same number on Linux and macOS).
     let private EINTR = 4
+
+    // errno for an I/O error, and for a broken pipe. Once the child has closed the LAST slave fd (the pty
+    // "hangup"), a Linux `read`/`write` on the master returns EIO where a pipe/socket would give a clean
+    // 0-length EOF / EPIPE. `PtyStream` maps a read-side EIO to EOF and a write-side EIO/EPIPE to a
+    // broken-pipe `IOException`; macOS/BSD give a normal EOF instead (harmless — the EIO branch is Linux).
+    let private EIO = 5
+    let private EPIPE = 32
+
+    // ----------------------------------------------------------------------------------
+    // POSIX pty (pseudo-terminal) master: fd allocation + an async Stream wrapper (Command.Pty)
+    // ----------------------------------------------------------------------------------
+
+    /// A `Stream` over one owned fd of a POSIX pty MASTER — the single merged terminal output (D3), and,
+    /// when an interactive/fed stdin is wanted, a `dup` of the master for the write side. Unlike a
+    /// socketpair end (a `Socket`/`NetworkStream` driven by the runtime's epoll/kqueue `SocketAsyncEngine`),
+    /// a pty master is a character device that engine cannot host, so I/O goes through libc `read`/`write`;
+    /// the base `Stream` offloads the synchronous `Read`/`Write` to the thread pool for its async verbs, so
+    /// the `Pump`'s `ReadAsync` still completes on data with no busy-poll (it parks a pool thread for the
+    /// read's duration — the pty analogue accepted here in place of the socketpair's epoll path). Two
+    /// pty-specific wrinkles it hides from the `Pump`:
+    ///   * **Hangup EIO → EOF.** On Linux, once the child closes the last slave fd, a master `read` returns
+    ///     EIO rather than a clean 0-length EOF; this maps it to EOF so the merged-capture path ends
+    ///     normally (macOS/BSD already give a real EOF). A write-side EIO/EPIPE becomes a broken-pipe
+    ///     `IOException`, matching the socketpair path's write-after-peer-close.
+    ///   * **Single-owner fd.** The fd is owned by a `SafeFileHandle` (closed exactly once on `Dispose`,
+    ///     finalizer as the GC-time safety net) — the same contract the socketpair `SafeSocketHandle` gives.
+    ///     Reads/writes take a `DangerousAddRef`/`Release` around the syscall so a concurrent `Dispose`
+    ///     cannot close the fd mid-call.
+    type internal PtyStream(handle: Microsoft.Win32.SafeHandles.SafeFileHandle) =
+        inherit Stream()
+
+        // Run one libc read/write (`op`) against the owned fd with the caller's buffer pinned at `offset`,
+        // holding a ref on the SafeHandle so `Dispose` cannot close the fd underneath the syscall.
+        let withPinnedFd (buffer: byte[]) (offset: int) (op: int -> nativeint -> nativeint) : nativeint =
+            let mutable refAdded = false
+
+            try
+                handle.DangerousAddRef &refAdded
+                let fd = int (handle.DangerousGetHandle())
+                let pin = GCHandle.Alloc(buffer, GCHandleType.Pinned)
+
+                try
+                    op fd (pin.AddrOfPinnedObject() + nativeint offset)
+                finally
+                    pin.Free()
+            finally
+                if refAdded then
+                    handle.DangerousRelease()
+
+        override _.CanRead = true
+        override _.CanWrite = true
+        override _.CanSeek = false
+        override _.Flush() = ()
+        override _.Length = raise (NotSupportedException "a pty master stream has no length")
+
+        override _.Position
+            with get () = raise (NotSupportedException "a pty master stream is not seekable")
+            and set _ = raise (NotSupportedException "a pty master stream is not seekable")
+
+        override _.Seek(_, _) =
+            raise (NotSupportedException "a pty master stream is not seekable")
+
+        override _.SetLength _ =
+            raise (NotSupportedException "a pty master stream has no length")
+
+        override _.Read(buffer, offset, count) =
+            if count = 0 then
+                0
+            else
+                let rec attempt () =
+                    let n =
+                        withPinnedFd buffer offset (fun fd ptr -> ptyReadRaw (fd, ptr, nativeint count))
+
+                    if n >= 0n then
+                        int n
+                    else
+                        let errno = Marshal.GetLastWin32Error()
+
+                        if errno = EINTR then
+                            attempt () // interrupted before any byte arrived; retry the read
+                        elif errno = EIO then
+                            0 // pty hangup: the child closed the last slave fd — an ordinary end-of-stream
+                        else
+                            raise (IOException $"read from the pty master failed (errno {errno})")
+
+                attempt ()
+
+        override _.Write(buffer, offset, count) =
+            let mutable written = 0
+
+            while written < count do
+                let remaining = count - written
+
+                let n =
+                    withPinnedFd buffer (offset + written) (fun fd ptr -> ptyWriteRaw (fd, ptr, nativeint remaining))
+
+                if n >= 0n then
+                    written <- written + int n
+                else
+                    let errno = Marshal.GetLastWin32Error()
+
+                    if errno = EINTR then
+                        () // interrupted before any byte was written; retry the remaining bytes
+                    elif errno = EIO || errno = EPIPE then
+                        raise (
+                            IOException $"write to the pty master failed: the child closed the terminal (errno {errno})"
+                        )
+                    else
+                        raise (IOException $"write to the pty master failed (errno {errno})")
+
+        override _.Dispose(disposing) =
+            if disposing then
+                handle.Dispose()
+
+            base.Dispose disposing
+
+    /// Open a POSIX pty master/slave pair via the all-libc `posix_openpt` sequence (portable across glibc
+    /// versions, and — unlike a bare `openpty` — able to set O_CLOEXEC without `fcntl`, per the PTY ADR).
+    /// Both ends are opened O_CLOEXEC so a DIFFERENT concurrent spawn never inherits them (the pty analogue
+    /// of the socketpair's SOCK_CLOEXEC), and O_NOCTTY so opening the slave in the PARENT never steals it
+    /// as the parent's controlling terminal — the CHILD adopts it deliberately via `setsid --ctty`. Returns
+    /// the master and slave fds (the caller owns and must close both), or an errno-tagged message. Each
+    /// `Marshal.GetLastWin32Error()` is read immediately after its failing P/Invoke, before any other one.
+    let private openPtyPair () : Result<int * int, string> =
+        let master = posix_openpt (O_RDWR ||| O_NOCTTY ||| O_CLOEXEC)
+
+        if master < 0 then
+            Error $"posix_openpt failed (errno {Marshal.GetLastWin32Error()})"
+        else
+            let grantRc = grantpt master
+
+            if grantRc <> 0 then
+                let errno = Marshal.GetLastWin32Error()
+                close master |> ignore
+                Error $"grantpt failed (errno {errno})"
+            else
+                let unlockRc = unlockpt master
+
+                if unlockRc <> 0 then
+                    let errno = Marshal.GetLastWin32Error()
+                    close master |> ignore
+                    Error $"unlockpt failed (errno {errno})"
+                else
+                    let namePtr = ptsname master
+
+                    if namePtr = IntPtr.Zero then
+                        let errno = Marshal.GetLastWin32Error()
+                        close master |> ignore
+                        Error $"ptsname failed (errno {errno})"
+                    else
+                        match Marshal.PtrToStringAnsi namePtr with
+                        | null ->
+                            close master |> ignore
+                            Error "ptsname returned an empty slave device path"
+                        | slavePath ->
+                            let slave = openFile (slavePath, O_RDWR ||| O_NOCTTY ||| O_CLOEXEC)
+
+                            if slave < 0 then
+                                let errno = Marshal.GetLastWin32Error()
+                                close master |> ignore
+                                Error $"open({slavePath}) failed (errno {errno})"
+                            else
+                                Ok(master, slave)
 
     // `waitpid` option: return immediately (0) if the child has not yet changed state, rather than
     // blocking. Same value on Linux and macOS.
@@ -1260,8 +1476,34 @@ module internal Posix =
             else
                 Some(fds[0], fds[1])
 
-        // stdin
-        if stdinInherit then
+        // stdin / stdout / stderr. A PTY replaces the whole socketpair wiring (D3/D7): one pty master/
+        // slave pair, the slave dup'd onto the child's 0/1/2 and the parent keeping the master as the
+        // single merged terminal stream — handled as the FIRST branch here, so the ordinary per-stream
+        // stdout/stderr setup below is skipped (`config.Pty.IsNone`).
+        if config.Pty.IsSome then
+            // The slave becomes the child's controlling terminal (via the rewritten `setsid --ctty`
+            // Program); it is dup'd onto 0/1/2 and its original closed by the file actions further down.
+            // The parent keeps the MASTER (`stdoutParentRead`) as the merged output, plus a `dup` of it
+            // for an interactive/fed stdin writer — two owning fds so each stream disposes exactly one.
+            // There is no separate stderr (`stderrParentRead` stays `None`, D3) and no `/dev/null` or
+            // socketpair on this path.
+            match openPtyPair () with
+            | Error message -> failure <- Some message
+            | Ok(master, slave) ->
+                childSideFds.Add slave
+                stdinChildFd <- slave
+                stdoutChildFd <- slave
+                stderrChildFd <- slave
+                stdoutParentRead <- Some master
+
+                if stdinWanted then
+                    let stdinDup = dup master
+
+                    if stdinDup < 0 then
+                        failure <- Some $"dup(pty master) failed for stdin (errno {Marshal.GetLastWin32Error()})"
+                    else
+                        stdinParentWrite <- Some stdinDup
+        elif stdinInherit then
             // `InheritStdin`: hand the child the PARENT's own standard input directly (no socketpair,
             // no feeder). On macOS, POSIX_SPAWN_CLOEXEC_DEFAULT closes every fd not named by a file
             // action at exec, so register a self-dup2 (0 -> 0) to keep fd 0 open in the child; on Linux
@@ -1279,8 +1521,8 @@ module internal Posix =
         else
             stdinChildFd <- openNul "stdin" O_RDONLY
 
-        // stdout
-        if failure.IsNone then
+        // stdout (skipped under a PTY — its stdout is the merged pty master, wired above)
+        if failure.IsNone && config.Pty.IsNone then
             match config.StdoutMode with
             | StdioMode.Piped ->
                 match makeStdioChannel "stdout" with
@@ -1296,8 +1538,9 @@ module internal Posix =
                 // open in the child; on Linux the fd is inherited naturally, so no dup2 is needed.
                 stdoutChildFd <- if isMacOs then 1 else -1
 
-        // stderr
-        if failure.IsNone then
+        // stderr (skipped under a PTY — a tty is one device, so stderr is physically merged into the
+        // master; `stderrParentRead` stays `None`, D3)
+        if failure.IsNone && config.Pty.IsNone then
             if config.MergeStderr then
                 // `Command.MergeStderr` (2>&1): route the child's stderr at the SAME destination as its
                 // stdout, at the OS level, by dup2'ing fd 2 onto stdout's child-side fd below — so both
@@ -1489,11 +1732,22 @@ module internal Posix =
                     // pgid equals it either way, so `killProcessGroup` (killpg on the pid) reaps the whole
                     // session-group in teardown exactly as it does for a `SETPGROUP` child — containment is
                     // preserved; the only difference is the detached session and dropped controlling tty.
+                    //
+                    // A PTY (`config.Pty`) sets NEITHER flag: the rewritten `setsid --ctty` helper performs
+                    // `setsid()` ITSELF post-`exec` (to become a session leader before `TIOCSCTTY`), and
+                    // `setsid()` fails for a process that is already a group/session leader — so pre-setting
+                    // `SETPGROUP`/`SETSID` here would break it (`SETPGROUP` makes `setsid --ctty` fork the
+                    // real target into a DIFFERENT, untracked pgid; `SETSID` makes its `setsid()` EPERM).
+                    // Left without either flag the helper inherits the parent's group (never a leader, since
+                    // its fresh pid cannot equal the parent's pgid), its `setsid()` succeeds, and the target
+                    // ends up at pgid == pid == sid IN PLACE — the same invariant `SETSID` gives, so
+                    // `killProcessGroup pid` still reaps the whole session-group. The one cost is a
+                    // sub-millisecond window before that `setsid()` where `killpg pid` does not yet target
+                    // the child; `postSpawnTeardown` closes it with a direct single-pid kill (below).
                     let groupFlag =
-                        if config.Setsid then
-                            posixSpawnSetsid
-                        else
-                            POSIX_SPAWN_SETPGROUP
+                        if config.Pty.IsSome then 0s
+                        elif config.Setsid then posixSpawnSetsid
+                        else POSIX_SPAWN_SETPGROUP
 
                     let spawnFlags =
                         if isMacOs then
@@ -1503,10 +1757,11 @@ module internal Posix =
 
                     register "posix_spawnattr_setflags" (fun () -> posix_spawnattr_setflags (attributes, spawnFlags))
 
-                    // Only set an explicit pgroup when NOT detaching a session; `POSIX_SPAWN_SETSID`
-                    // establishes the child's own group itself, and a `setpgroup` alongside it is
-                    // redundant (and rejected on some libc).
-                    if not config.Setsid then
+                    // Only set an explicit pgroup when NOT detaching a session and NOT under a PTY;
+                    // `POSIX_SPAWN_SETSID` establishes the child's own group itself, and the pty helper's
+                    // own `setsid()` does the same — a `setpgroup` alongside either is redundant (and, for
+                    // the pty case, would re-introduce the group-leader-before-`setsid()` breakage above).
+                    if not config.Setsid && config.Pty.IsNone then
                         register "posix_spawnattr_setpgroup" (fun () -> posix_spawnattr_setpgroup (attributes, 0))
 
                     match err with
@@ -1582,6 +1837,16 @@ module internal Posix =
 
                             let postSpawnTeardown () =
                                 killProcessGroup pid
+
+                                // A PTY child is spawned with no `SETPGROUP` (its `setsid --ctty` helper does
+                                // `setsid()` itself, post-`exec`), so for the sub-millisecond window before that
+                                // call `killpg pid` above may not yet target it. A direct single-pid SIGKILL on
+                                // this fault-path teardown closes that window so a just-spawned pty child — one
+                                // whose stream ctor threw, say — is never stranded. Redundant with `killpg` once
+                                // `setsid()` has run, and harmless (an already-reaped pid is `ESRCH`).
+                                if config.Pty.IsSome then
+                                    kill (pid, SIGKILL) |> ignore
+
                                 reapLeader pid
 
                                 for stream in createdStreams do
@@ -1638,10 +1903,31 @@ module internal Posix =
                                     // is caught below: the streams already built are tracked in `createdStreams`,
                                     // so the teardown disposes them and closes the not-yet-wrapped ends — each fd
                                     // exactly once — after killing and reaping the child.
+                                    // Under a PTY the retained parent ends are pty MASTER fds (the merged output,
+                                    // and a `dup` of it for stdin) — a character device the `SocketAsyncEngine`
+                                    // cannot host, so a `Socket` ctor would reject the non-socket fd. Those wrap
+                                    // in `PtyStream` (libc read/write, hangup-EIO → EOF) over an owning
+                                    // `SafeFileHandle` instead — the same single-owner + finalizer contract, and
+                                    // the same `createdStreams`/ownership-transfer bookkeeping so the teardown
+                                    // closes each fd exactly once.
                                     let pipeStream (label: string) fd =
                                         streamWrapFaultForTests |> Option.iter (fun fault -> fault label)
-                                        let socket = new Socket(new SafeSocketHandle(nativeint fd, ownsHandle = true))
-                                        let stream = new NetworkStream(socket, ownsSocket = true) :> Stream
+
+                                        let stream =
+                                            if config.Pty.IsSome then
+                                                let owned =
+                                                    new Microsoft.Win32.SafeHandles.SafeFileHandle(
+                                                        nativeint fd,
+                                                        ownsHandle = true
+                                                    )
+
+                                                new PtyStream(owned) :> Stream
+                                            else
+                                                let socket =
+                                                    new Socket(new SafeSocketHandle(nativeint fd, ownsHandle = true))
+
+                                                new NetworkStream(socket, ownsSocket = true) :> Stream
+
                                         createdStreams.Add stream
                                         stream
 
@@ -1720,6 +2006,104 @@ module internal Posix =
                 closeParentEnds ()
                 Error(ProcessError.Spawn(command.Program, ex.Message))
 
+    // ----------------------------------------------------------------------------------
+    // POSIX pty (Command.Pty): the `setsid --ctty` controlling-terminal helper + host gating
+    // ----------------------------------------------------------------------------------
+    //
+    // A pty needs a controlling terminal, which is a pre-`exec` step `posix_spawn` attributes cannot
+    // express — `setsid()` → `ioctl(slave, TIOCSCTTY)` → the slave on fd 0/1/2 (the `login_tty(3)`
+    // sequence). As with `setpriv`/cgroup, no managed code may run in a forked child, so this rides the
+    // helper-launcher pattern: `setsid --ctty <program> <args…>` (util-linux) does the `setsid()` +
+    // `TIOCSCTTY` and `exec`s the target IN PLACE (same pid — so `Spawned.Handle`, the pgid, and
+    // kill-on-drop are unchanged). The pty stdio (master/slave) is wired by `spawnPosixViaSpawn` above
+    // when `config.Pty` is set. A host lacking that helper (macOS/BSD, an old util-linux) — or the pty
+    // devfs — gets a typed `ProcessError.Unsupported`, never a socketpair pretending to be a tty (D9).
+
+    /// Whether the `setsid --ctty` controlling-terminal helper is available on this host (util-linux
+    /// `setsid`, resolved on PATH). The test seam forces the verdict so the honest-`Unsupported` path can
+    /// be exercised on a host that DOES carry `setsid`.
+    let private cttyHelperAvailable () : bool =
+        match ptyCttyHelperAvailableForTests with
+        | Some hook -> hook ()
+        | None ->
+            match resolveProgram "setsid" with
+            | Ok _ -> true
+            | Error _ -> false
+
+    /// The typed `ProcessError.Unsupported` for a host that cannot honor a PTY, or `None` when it can: the
+    /// `setsid --ctty` ctty helper must be present (absent on macOS/BSD, an old util-linux), and the pty
+    /// devfs (`/dev/ptmx`) must exist. Checked at dispatch, BEFORE any spawn, so a PTY on an unsupported
+    /// host is an honest up-front failure rather than a socketpair silently standing in for a tty (D9). A
+    /// transient runtime pty-open failure (EMFILE, a devfs race) surfaces later as `ProcessError.Spawn`
+    /// from `openPtyPair`, which is correct — that is a per-invocation failure, not a capability gap.
+    let private ptyHostUnsupported () : ProcessError option =
+        if not (cttyHelperAvailable ()) then
+            Some(
+                ProcessError.Unsupported
+                    "Pty (needs the 'setsid --ctty' controlling-terminal helper from util-linux on PATH; not found here — absent on macOS/BSD and old util-linux)"
+            )
+        elif not (File.Exists "/dev/ptmx") then
+            Some(ProcessError.Unsupported "Pty (host has no /dev/ptmx pseudo-terminal support)")
+        else
+            None
+
+    /// Rewrite `command` to run under the `setsid --ctty` controlling-terminal helper:
+    /// `setsid --ctty <program> <args…>`. `setsid` performs `setsid()` + `TIOCSCTTY` on its stdin — which
+    /// the pty stdio wiring points at the slave — making the pty the child's controlling terminal, then
+    /// `exec`s the real program IN PLACE. A requested `Uid`/`Gid` drop is nested INSIDE
+    /// (`setsid --ctty setpriv <flags> <program> …`), so the (privilege-free) controlling-tty setup runs
+    /// before the drop, mirroring how the cgroup launcher nests `setpriv`. `Pty` is KEPT so
+    /// `spawnPosixViaSpawn` wires the pty stdio; `Uid`/`Gid`/`Groups` are cleared so it does not ALSO wrap
+    /// this in a second `setpriv` layer. Every other knob rides `posix_spawn` and is inherited across the
+    /// `exec`s.
+    let private cttyShimCommand (command: Command) : Command =
+        let config = command.Config
+
+        let target =
+            if config.Uid.IsSome || config.Gid.IsSome then
+                "setpriv" :: (setprivFlags config @ (config.Program :: List.ofSeq config.Args))
+            else
+                config.Program :: List.ofSeq config.Args
+
+        Command(
+            { config with
+                Program = "setsid"
+                Args = System.Collections.Immutable.ImmutableList.CreateRange("--ctty" :: target)
+                Uid = None
+                Gid = None
+                Groups = None }
+        )
+
+    /// Spawn `command` (which requests `Command.Pty`) as a contained POSIX child with a real controlling
+    /// pseudo-terminal. Gates an unsupported host up front (`ptyHostUnsupported`), refuses a supplementary
+    /// `Groups` without a drop and a non-root uid/gid drop exactly as the plain path does, then spawns the
+    /// `setsid --ctty` shim (with any drop nested inside). A `NotFound` for the just-checked `setsid`
+    /// (a PATH race between the availability check and the spawn) maps back to a typed `Unsupported`.
+    let private spawnPosixPty (command: Command) : Result<Spawned, ProcessError> =
+        let config = command.Config
+
+        match ptyHostUnsupported () with
+        | Some error -> Error error
+        | None ->
+            match groupsRequireDropError command with
+            | Some error -> Error error
+            | None ->
+                let proceed () =
+                    match spawnPosixViaSpawn (cttyShimCommand command) with
+                    | Error(ProcessError.NotFound _) ->
+                        Error(
+                            ProcessError.Unsupported
+                                "Pty (the 'setsid' controlling-terminal helper was not found by the spawn; util-linux setsid must be on PATH)"
+                        )
+                    | other -> other
+
+                if config.Uid.IsSome || config.Gid.IsSome then
+                    match privilegeDropPrecheck command with
+                    | Some error -> Error error
+                    | None -> proceed ()
+                else
+                    proceed ()
+
     /// Spawn `command` as a contained POSIX child. A command requesting a privilege drop (`Uid`/`Gid`) is
     /// rewritten to run through the `setpriv` helper and spawned on the ordinary `posix_spawn` path — the
     /// drop runs in `setpriv` before it `exec`s the real program, so no managed code runs in a forked
@@ -1730,9 +2114,9 @@ module internal Posix =
         let config = command.Config
 
         if config.Pty.IsSome then
-            // The POSIX `openpty`/`setsid --ctty` mechanism arrives in a later PTY stage; until then a PTY
-            // on POSIX is an honest typed failure, never a socketpair silently pretending to be a tty (D9).
-            Error(ProcessError.Unsupported "Pty (POSIX pty spawn not yet implemented)")
+            // A PTY gives the child a real controlling pseudo-terminal via the `setsid --ctty` helper (see
+            // `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe (D9).
+            spawnPosixPty command
         else
 
             match groupsRequireDropError command with
@@ -1808,11 +2192,22 @@ module internal Posix =
             // The argv the launcher `exec`s after migrating: the real program (and its args), or — when a
             // uid/gid drop is requested — the `setpriv` helper wrapping it, so the drop happens AFTER the
             // privileged cgroup join. Mirrors `setprivCommand`'s `setpriv <flags> <program> <args...>`.
-            let innerArgv =
+            let dropOrPlain =
                 if config.Uid.IsSome || config.Gid.IsSome then
                     "setpriv" :: (setprivFlags config @ (config.Program :: List.ofSeq config.Args))
                 else
                     config.Program :: List.ofSeq config.Args
+
+            let innerArgv =
+                if config.Pty.IsSome then
+                    // PTY under a cgroup: the launcher joins `cgroup.procs`, then `exec`s the
+                    // `setsid --ctty` controlling-terminal shim (with any privilege drop nested inside it,
+                    // after the privileged join). The cgroup membership is by the launcher's `$$` — which is
+                    // still the target's pid after the whole exec chain and after the helper's `setsid()` —
+                    // so limits and the controlling pty compose; `Mechanism.CgroupV2` is reported unchanged.
+                    "setsid" :: "--ctty" :: dropOrPlain
+                else
+                    dropOrPlain
 
             let launcherArgs = "-c" :: cgroupLauncherScript :: "sh" :: cgroupProcs :: innerArgv
 
@@ -1840,12 +2235,13 @@ module internal Posix =
                 )
             | other -> other
 
-        if config.Pty.IsSome then
-            // As in `spawnPosix`: the POSIX pty mechanism is a later stage, so a PTY here is an honest
-            // typed failure rather than a silently-unconstrained-or-tty-less run (D9).
-            Error(ProcessError.Unsupported "Pty (POSIX pty spawn not yet implemented)")
-        else
+        // A PTY gates the same unsupported-host check as `spawnPosixPty` before the cgroup launch; the rest
+        // of the dispatch (Groups-need-a-drop, non-root drop precheck) is shared with the non-pty path.
+        let ptyGate = if config.Pty.IsSome then ptyHostUnsupported () else None
 
+        match ptyGate with
+        | Some error -> Error error
+        | None ->
             match groupsRequireDropError command with
             | Some error -> Error error
             | None ->
