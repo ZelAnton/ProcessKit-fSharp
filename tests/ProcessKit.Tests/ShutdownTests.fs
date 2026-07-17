@@ -90,6 +90,53 @@ type ShutdownTests() =
         else
             shell "sleep 30"
 
+    // A Windows child that owns a REAL top-level GUI window (a WinForms form pumping a message loop),
+    // for the best-effort WM_CLOSE soft-close path (T-146). It prints `ready` from the form's `Shown`
+    // handler — so the window provably exists before the test posts WM_CLOSE — then blocks in
+    // `Application.Run`. A WM_CLOSE closes the form, `Application.Run` returns, and PowerShell exits
+    // cleanly with code 0; a hard `TerminateJobObject` would instead give a non-zero exit. So a later
+    // `Exited 0` proves the soft close reached the window AND the grace window let it act, exactly as
+    // the POSIX SIGTERM test asserts a clean `Exited 42`. `-Sta` gives the required apartment for a
+    // message pump; `-NoProfile`/`-NonInteractive` keep stdout to just the `ready` line.
+    let windowedChildScript =
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        + "$f = New-Object System.Windows.Forms.Form; "
+        + "$f.ShowInTaskbar = $false; "
+        + "$f.WindowState = 'Minimized'; "
+        + "$f.Add_Shown({ [Console]::Out.WriteLine('ready'); [Console]::Out.Flush() }); "
+        + "[System.Windows.Forms.Application]::Run($f)"
+
+    let windowedChild =
+        Command.create "powershell.exe"
+        |> Command.args [ "-NoProfile"; "-NonInteractive"; "-Sta"; "-Command"; windowedChildScript ]
+
+    // Gate a windowed-child test on its window actually coming up: return true once `ready` is seen, or
+    // false (after reaping the child) when it never arrives — a host with no interactive desktop that
+    // WinForms can render on, where the WM_CLOSE scenario simply cannot be exercised. Callers
+    // `Assert.Ignore` on false rather than fail, mirroring the other best-effort platform gates here.
+    //
+    // `WaitForLineAsync` starts the stdout STREAMING session, so from here the outcome must be observed
+    // through `FinishAsync`/`StopAsync` (which reuse that session), never `WaitAsync` (a second,
+    // conflicting consumption). `finishOutcome` below is the shared way to read it.
+    let awaitWindowReady (proc: RunningProcess) : Task<bool> =
+        task {
+            match! proc.WaitForLineAsync((fun line -> line = "ready"), TimeSpan.FromSeconds 20.0) with
+            | Ok _ -> return true
+            | Error _ ->
+                proc.Kill()
+                let! _ = proc.FinishAsync() // reuses the streaming session to reap the killed child
+                return false
+        }
+
+    // The exit outcome of a windowed child whose stdout streaming session is already underway (started
+    // by `awaitWindowReady`): `FinishAsync` reuses that session's wait instead of claiming a second one.
+    let finishOutcome (proc: RunningProcess) : Task<Outcome> =
+        task {
+            match! proc.FinishAsync() with
+            | Ok finished -> return finished.Outcome
+            | Error error -> return failwith $"FinishAsync failed: {error}"
+        }
+
     let assertTerminal (outcome: Outcome) =
         match outcome with
         | Outcome.Exited _
@@ -428,5 +475,134 @@ type ShutdownTests() =
             let! outcome = proc.StopAsync(TimeSpan.FromSeconds 1.0) // stop on top of the in-flight kill
 
             assertTerminal outcome
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: StopAsync closes a windowed child with WM_CLOSE inside the grace window``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The best-effort WM_CLOSE soft close is a Windows-only concern."
+
+            let! proc = startProc windowedChild
+            let! ready = awaitWindowReady proc
+
+            if not ready then
+                Assert.Ignore "the test host could not bring up a WinForms window (no interactive desktop)."
+            else
+                let stopwatch = Stopwatch.StartNew()
+                // The soft phase posts WM_CLOSE to the form; a 5s grace is far more than the form needs to
+                // close, so it should never reach the post-grace hard kill.
+                let! outcome = proc.StopAsync(TimeSpan.FromSeconds 5.0)
+                stopwatch.Stop()
+
+                // Exited 0 = the form closed itself in response to WM_CLOSE and PowerShell returned cleanly,
+                // NOT a TerminateJobObject hard kill (which exits non-zero). This is the whole point of the
+                // soft phase for GUI children.
+                match outcome with
+                | Outcome.Exited 0 -> Assert.Pass()
+                | Outcome.Exited code ->
+                    Assert.Fail $"expected a clean Exited 0 from the WM_CLOSE close, got a non-zero Exited {code}"
+                | other -> Assert.Fail $"expected Exited 0 from the WM_CLOSE close, got {other}"
+
+                Assert.That(
+                    stopwatch.Elapsed,
+                    Is.LessThan(TimeSpan.FromSeconds 5.0),
+                    "the child closed only at/after the grace deadline, so WM_CLOSE did not close it early"
+                )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: ShutdownAsync closes a windowed child with WM_CLOSE inside the grace window``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The best-effort WM_CLOSE soft close is a Windows-only concern."
+
+            use group = createGroup ()
+
+            match! group.StartAsync windowedChild with
+            | Error error -> Assert.Fail $"StartAsync failed: {error}"
+            | Ok running ->
+                let! ready = awaitWindowReady running
+
+                if not ready then
+                    Assert.Ignore "the test host could not bring up a WinForms window (no interactive desktop)."
+                else
+                    // ShutdownAsync's graceful stage posts WM_CLOSE to every member's windows, polls up to
+                    // the grace, then hard-kills survivors. The form should close well before the deadline.
+                    let stopwatch = Stopwatch.StartNew()
+                    do! group.ShutdownAsync(TimeSpan.FromSeconds 5.0)
+                    let! outcome = finishOutcome running
+                    stopwatch.Stop()
+
+                    match outcome with
+                    | Outcome.Exited 0 -> Assert.Pass()
+                    | Outcome.Exited code ->
+                        Assert.Fail $"expected a clean Exited 0 from the WM_CLOSE close, got a non-zero Exited {code}"
+                    | other -> Assert.Fail $"expected Exited 0 from the WM_CLOSE close, got {other}"
+
+                    Assert.That(
+                        stopwatch.Elapsed,
+                        Is.LessThan(TimeSpan.FromSeconds 5.0),
+                        "the tree drained only at/after the grace deadline, so WM_CLOSE did not close the child early"
+                    )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: Signal.Term posts WM_CLOSE to a windowed child and returns Ok``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The best-effort WM_CLOSE soft close is a Windows-only concern."
+
+            use group = createGroup ()
+
+            match! group.StartAsync windowedChild with
+            | Error error -> Assert.Fail $"StartAsync failed: {error}"
+            | Ok running ->
+                let! ready = awaitWindowReady running
+
+                if not ready then
+                    Assert.Ignore "the test host could not bring up a WinForms window (no interactive desktop)."
+                else
+                    // A windowed member turns Signal.Int/Term from the pre-T-146 honest Unsupported into a
+                    // best-effort Ok: the WM_CLOSE was posted to a top-level window even though this child
+                    // was NOT started with WindowsCtrlSignals() (so there is no CTRL+BREAK path).
+                    match group.Signal Signal.Term with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"expected Ok for Signal.Term against a windowed child, got {error}"
+
+                    // And the delivery is real: the form closes and PowerShell exits cleanly on its own.
+                    let! outcome = finishOutcome running
+
+                    match outcome with
+                    | Outcome.Exited 0 -> Assert.Pass()
+                    | other -> Assert.Fail $"expected the windowed child to close cleanly on WM_CLOSE, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: a windowless child is still hard-killed under StopAsync (WM_CLOSE is a no-op)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "This pins the Windows windowless-child regression specifically."
+
+            // A console child with no top-level window: WM_CLOSE finds nothing to post to (a no-op, not an
+            // error), so the soft phase changes nothing and the post-grace hard kill still reaps it — the
+            // exact pre-T-146 behaviour, unregressed.
+            let! proc = startProc longSleeper
+
+            let stopwatch = Stopwatch.StartNew()
+            let! outcome = proc.StopAsync(TimeSpan.FromMilliseconds 300.0)
+            stopwatch.Stop()
+
+            assertTerminal outcome
+
+            Assert.That(
+                stopwatch.Elapsed,
+                Is.LessThan(TimeSpan.FromSeconds 10.0),
+                "the windowless child was not hard-killed promptly after the grace window"
+            )
         }
         :> Task

@@ -690,6 +690,105 @@ module internal Windows =
             Marshal.FreeHGlobal accBuffer
             Marshal.FreeHGlobal extBuffer
 
+    /// Whether the Job still contains any live process — the liveness predicate for the Windows
+    /// graceful-teardown poll (`JobObjectBackend.GracefulKillTree`). Reads the Job accounting's
+    /// active-process count. A failed query is treated as "still alive" (fail-safe): a transient
+    /// accounting hiccup can then never let the poll skip its unconditional hard kill and leave a
+    /// tree running.
+    let jobTreeAliveWindows (job: nativeint) : bool =
+        match jobStatsWindows job with
+        | Some(active, _, _) -> active > 0
+        | None -> true
+
+    // ----------------------------------------------------------------------------------
+    // Windows: best-effort WM_CLOSE soft close for GUI children (Electron/desktop tools)
+    // ----------------------------------------------------------------------------------
+    //
+    // The SOFT phase of a graceful stop for a WINDOWED child: post `WM_CLOSE` to every top-level window
+    // owned by a member of the Job — the standard graceful close a GUI app turns into its own shutdown
+    // (a form's close handler, an app's "are you sure?" is bypassed by a plain WM_CLOSE, an Electron
+    // `before-quit`), exactly what `taskkill` (without `/F`) does. It is complementary to the console
+    // CTRL+BREAK path (`sendConsoleCtrlBreakWindows`), which reaches only console children started with
+    // `Command.WindowsCtrlSignals()`: a GUI child has no console to CTRL+BREAK, and a console child has
+    // no top-level window to WM_CLOSE, so the two mechanisms cover disjoint child classes.
+    //
+    // Targeted strictly by pid via `GetWindowThreadProcessId`, so — unlike a console CTRL event — it can
+    // never reach a window outside the Job (no `CREATE_NEW_PROCESS_GROUP` requirement, no risk of hitting
+    // the caller's own console group). That is why it is an UNCONDITIONAL addition to the soft phase for
+    // every child, not a new opt-in builder: a child with no top-level window is simply a no-op, never a
+    // regression. Honest and best-effort: a window may prompt/veto the close (WM_CLOSE is a request), and
+    // the unconditional `TerminateJobObject` after the grace window remains the deterministic guarantee.
+
+    [<Literal>]
+    let private WM_CLOSE = 0x0010u
+
+    // The `EnumWindows` callback (`WNDENUMPROC`) — invoked once per top-level window on the caller's
+    // desktop, on the calling thread, synchronously for the duration of the `EnumWindows` call. `Winapi`
+    // calling convention matches the Win32 `CALLBACK`/`__stdcall` contract. Passing a managed delegate as
+    // a native callback is a standard, trim/NativeAOT-safe marshalling scenario (unlike
+    // `Marshal.GetDelegateForFunctionPointer` over an arbitrary runtime type).
+    [<UnmanagedFunctionPointer(CallingConvention.Winapi)>]
+    type private EnumWindowsProc = delegate of nativeint * nativeint -> bool
+
+    [<DllImport("user32.dll", SetLastError = true)>]
+    extern bool private EnumWindows(EnumWindowsProc lpEnumFunc, nativeint lParam)
+
+    [<DllImport("user32.dll", SetLastError = true)>]
+    extern uint32 private GetWindowThreadProcessId(nativeint hWnd, uint32& lpdwProcessId)
+
+    [<DllImport("user32.dll", SetLastError = true)>]
+    extern bool private PostMessageW(nativeint hWnd, uint32 Msg, nativeint wParam, nativeint lParam)
+
+    /// Best-effort soft close for a Windows GUI tree: enumerate the caller's desktop top-level windows
+    /// ONCE, keep those owned by a process currently in `job`, then `PostMessage(WM_CLOSE)` to each.
+    /// Returns the number of windows posted to — `0` means the tree has no top-level window (a no-op,
+    /// NOT an error), matching how `sendConsoleCtrlBreakWindows`/`membersWindows` honestly distinguish
+    /// "nothing to signal" from "the request failed". NEVER throws: a failed member query, a failed
+    /// enumeration (e.g. a session with no interactive desktop), or a failed post is just reported as
+    /// zero-or-fewer windows closed, never an exception that could derail the graceful-kill path that
+    /// calls it. Windows are collected first and posted to afterwards, so posting can never perturb the
+    /// enumeration in flight.
+    let postCloseToJobWindows (job: nativeint) : int =
+        try
+            let memberPids =
+                match membersWindows job with
+                | Ok pids -> Set.ofList pids
+                | Error _ -> Set.empty
+
+            if Set.isEmpty memberPids then
+                0
+            else
+                let targets = ResizeArray<nativeint>()
+
+                let collect =
+                    EnumWindowsProc(fun hWnd _ ->
+                        let mutable owningPid = 0u
+                        GetWindowThreadProcessId(hWnd, &owningPid) |> ignore
+                        // `owningPid = 0` is the documented "could not determine the owner" result — never a
+                        // real pid, so it can't spuriously match a member and is skipped.
+                        if owningPid <> 0u && Set.contains (int owningPid) memberPids then
+                            targets.Add hWnd
+
+                        true) // keep enumerating every remaining top-level window
+
+                // EnumWindows walks the desktop synchronously, so `collect` is alive for the whole call;
+                // `GC.KeepAlive` pins it against an over-eager collection, and its `bool` result is ignored
+                // (FALSE here only signals an early stop / empty desktop — neither an error for this pass).
+                EnumWindows(collect, IntPtr.Zero) |> ignore
+                GC.KeepAlive collect
+
+                for hWnd in targets do
+                    // A REQUEST, not a guarantee: the window's own close handler may prompt or veto. That
+                    // is why the post-grace `TerminateJobObject` is the unconditional backstop.
+                    PostMessageW(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero) |> ignore
+
+                targets.Count
+        with _ ->
+            // Best-effort by contract (see the section comment): enumeration/post failing on a host with
+            // no usable desktop must never throw into the graceful-kill path — report "nothing closed" and
+            // let the unconditional hard kill proceed.
+            0
+
     // Job-Object resource limits (the `limits` backend on Windows).
     [<Literal>]
     let private JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008u

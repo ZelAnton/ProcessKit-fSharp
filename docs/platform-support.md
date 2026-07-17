@@ -161,17 +161,22 @@ Legend: ✅ full support · 🟡 supported with a documented qualification · �
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
 |---|:---:|:---:|:---:|
 | Kill-on-dispose, whole tree | ✅ | ✅ | ✅ |
-| Graceful `ShutdownAsync` (TERM → grace → KILL) | 🟡 atomic kill only | ✅ | ✅ |
+| Graceful `ShutdownAsync` (TERM → grace → KILL) | 🟡 best-effort `WM_CLOSE` → grace → atomic kill | ✅ | ✅ |
 
-`ShutdownAsync(grace)` on Windows has no per-job graceful signal, so it is the atomic Job terminate;
-on the Unix mechanisms it is `SIGTERM`, then a grace window, then `SIGKILL`.
+`ShutdownAsync(grace)` on Windows has no per-job graceful signal, but a **windowed** child (Electron/GUI
+tool) closes gracefully on a best-effort `WM_CLOSE` posted to its top-level windows: the soft phase posts
+one to every member's windows, waits up to the grace window for the tree to drain, then unconditionally
+terminates the Job — so a child with no window (or one that vetoes the close) is still hard-killed exactly
+as before, and the kill-on-dispose guarantee is never weakened. On the Unix mechanisms it is `SIGTERM`,
+then a grace window, then `SIGKILL`.
 
 **Signals (`Signal`)**
 
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
 |---|:---:|:---:|:---:|
 | `Signal.Kill` | ✅ maps to Job terminate | ✅ | ✅ |
-| Any other signal (`Term`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other n`) | ❌ `ProcessError.Unsupported` | ✅ | ✅ |
+| `Signal.Int` / `Signal.Term` | 🟡 best-effort CTRL+BREAK (a `WindowsCtrlSignals()` child) and/or `WM_CLOSE` (a windowed member); `Unsupported` only when the group has neither | ✅ | ✅ |
+| Any other signal (`Hup`, `Quit`, `Usr1`, `Usr2`, `Other n`) | ❌ `ProcessError.Unsupported` | ✅ | ✅ |
 
 **Suspend / resume**
 

@@ -785,9 +785,11 @@ type RunningProcess internal (host: RunningHost) =
     /// `Dispose`, and a repeat `StopAsync`: the tree is reaped exactly once.
     ///
     /// **Platform / shared-group degradation (no new silent downgrade).** A soft signal needs a
-    /// mechanism that has one. On **Windows** there is no per-tree graceful signal, so `gracePeriod`
-    /// is skipped and this is the atomic Job kill — exactly as `Command.TimeoutGrace` and
-    /// `ProcessGroup.ShutdownAsync` already degrade there (a console child can still get a best-effort
+    /// mechanism that has one. On **Windows** there is no per-tree graceful signal, but a windowed child
+    /// (Electron/GUI) is sent a best-effort `WM_CLOSE` at the start of the grace window and can close
+    /// itself within it; a child with no window (or one that vetoes the close) is hard-killed by the
+    /// atomic Job terminate when the grace elapses — exactly as `Command.TimeoutGrace` and
+    /// `ProcessGroup.ShutdownAsync` behave there (a console child can additionally get a best-effort
     /// CTRL+BREAK via `Command.WindowsCtrlSignals()` + `ProcessGroup.Signal`). On a **shared** group
     /// (a handle from `ProcessGroup.StartAsync`, where the group — not the handle — owns the tree)
     /// there is no per-child graceful signal either, so this immediately hard-kills just this child

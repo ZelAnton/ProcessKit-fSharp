@@ -250,7 +250,7 @@ There are three ways out, from blunt to graceful:
 |---|---|---|
 | dispose (`use` / `Dispose()` / `DisposeAsync()`) | Immediate **hard kill** of the whole tree, then releases the container | The safety net — always on, even on an exception or early return |
 | `group.KillAll()` | The same hard kill, but the group **stays usable** for further spawns; idempotent | Explicit teardown mid-flight when you want to keep the group |
-| `group.ShutdownAsync()` / `group.ShutdownAsync(grace)` | **Graceful**: on Unix `SIGTERM` → wait the grace window → `SIGKILL` survivors; on Windows the atomic Job kill. Releases the group | A clean service stop |
+| `group.ShutdownAsync()` / `group.ShutdownAsync(grace)` | **Graceful**: on Unix `SIGTERM` → wait the grace window → `SIGKILL` survivors; on Windows a best-effort `WM_CLOSE` to any GUI child's windows → wait the grace window → atomic Job kill of survivors. Releases the group | A clean service stop |
 
 `ProcessGroup` implements both `IDisposable` and `IAsyncDisposable`, so a `use`
 binding reaps the tree deterministically on scope exit — disposing is a pure hard
@@ -333,13 +333,30 @@ hatch `Signal.Other n` for any other signal number.
 | Platform | Deliverable signals |
 |---|---|
 | Linux (cgroup or process group), macOS / BSD | Any — `Term`, `Kill`, `Int`, `Hup`, `Quit`, `Usr1`, `Usr2`, `Other n` |
-| Windows | `Kill` only (maps to the Job terminate); anything else → `ProcessError.Unsupported` |
+| Windows | `Kill` (maps to the Job terminate); `Int` / `Term` as a best-effort soft stop (see below); anything else → `ProcessError.Unsupported` |
+
+On **Windows**, `Signal.Int` and `Signal.Term` map to a best-effort soft stop built
+from two individually-targeted mechanisms:
+
+- a console **CTRL+BREAK** to each child started with `Command.WindowsCtrlSignals()`
+  (spawned in its own console process group), and
+- a **`WM_CLOSE`** posted to the top-level windows of every member that has one —
+  the standard graceful close a windowed app (an Electron/GUI tool) turns into its
+  own shutdown, exactly what `taskkill` (without `/F`) does. It is targeted strictly
+  by process id, so it never reaches a window outside the group, and needs no opt-in.
+
+Either mechanism reaching at least one member is a best-effort `Ok` (delivery is not
+compliance — a child may install its own handler or a window may prompt/veto the
+close). The call returns `ProcessError.Unsupported` **only** when the group has
+*neither* a CTRL-capable child *nor* any member with a top-level window — nothing to
+soft-signal at all — never a silent downgrade to the hard Job kill. A child with no
+window is simply a `WM_CLOSE` no-op, not a regression.
 
 `Signal.Kill` always takes the same atomic whole-tree kill path as
 `KillAll`, so it can't miss a process forked mid-broadcast; other signals are
 a best-effort per-member broadcast against a tree that may be forking at that
 instant. An already-exited member is skipped, and an empty group accepts any
-deliverable signal trivially. On Windows, a non-`Kill` signal fails fast:
+deliverable signal trivially. On Windows, an undeliverable signal fails fast:
 
 **F#**
 

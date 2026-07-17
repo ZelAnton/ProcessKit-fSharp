@@ -175,9 +175,20 @@ type internal JobObjectBackend(jobHandle: nativeint) =
         member _.KillTree() =
             Native.Windows.terminateWindowsJob jobHandle
 
-        member _.GracefulKillTree(_grace) =
-            // No per-job graceful signal on Windows; this is the atomic Job kill.
-            task { Native.Windows.terminateWindowsJob jobHandle } :> Task
+        member _.GracefulKillTree(grace) =
+            // A best-effort SOFT phase before the atomic Job kill. Windows has no per-job graceful
+            // signal, but a WINDOWED child (Electron/GUI) closes gracefully on a `WM_CLOSE` posted to
+            // its top-level windows — so post one to every member's windows, poll up to `grace` for the
+            // tree to drain (the same shape the POSIX/cgroup backends use), then UNCONDITIONALLY
+            // `terminateWindowsJob` whatever is still alive. The hard kill is never removed or weakened:
+            // it is the deterministic fallback regardless of the WM_CLOSE outcome (a child with no
+            // window, or one that vetoes the close, is force-killed exactly as before). `grace = 0` skips
+            // the poll wait and hard-kills at once (the WM_CLOSE post is a harmless no-op then).
+            GracefulTeardown.poll
+                (fun () -> Native.Windows.postCloseToJobWindows jobHandle |> ignore)
+                (fun () -> Native.Windows.jobTreeAliveWindows jobHandle)
+                (fun () -> Native.Windows.terminateWindowsJob jobHandle)
+                grace
 
         member _.Members() =
             // `membersWindows` already returns a `Result` — it grows the buffer to the whole job and
@@ -191,39 +202,56 @@ type internal JobObjectBackend(jobHandle: nativeint) =
                 Ok()
             | Signal.Int
             | Signal.Term ->
-                // Best-effort SOFT stop: deliver a console CTRL+BREAK to every child started with
-                // `Command.WindowsCtrlSignals()`, targeting each child's OWN process group id (its pid)
-                // so the caller's own console group is never signalled. `Signal.Int`/`Signal.Term` both
-                // map to CTRL+BREAK — the closest Windows analogue — because CREATE_NEW_PROCESS_GROUP
-                // disables the child's CTRL+C and only CTRL+BREAK can be group-targeted.
+                // Best-effort SOFT stop combining TWO complementary, individually-targeted deliveries so
+                // the caller's own console/windows are never touched:
+                //   1. a console CTRL+BREAK to every child started with `Command.WindowsCtrlSignals()`,
+                //      targeting each child's OWN process group id (its pid) — CTRL+BREAK, not CTRL+C,
+                //      because CREATE_NEW_PROCESS_GROUP disables the child's CTRL+C and only CTRL+BREAK
+                //      can be group-targeted; reaches CONSOLE children;
+                //   2. a WM_CLOSE posted to the top-level windows of every member (targeted by pid via
+                //      GetWindowThreadProcessId, so no foreign window is hit) — reaches WINDOWED children
+                //      (Electron/GUI tools), which have no console to CTRL+BREAK.
+                // `Signal.Int`/`Signal.Term` both map to this soft stop — the closest Windows analogue.
                 let groups = ctrlGroups.Values |> List.ofSeq
+                // Count the CTRL+BREAKs actually generated vs. those that genuinely failed (e.g. the
+                // caller has no console to share), so success/failure below reflects real delivery.
+                let mutable ctrlDelivered = 0
+                let mutable ctrlFailure: string option = None
 
-                if List.isEmpty groups then
-                    // No child in this group can receive a Ctrl event — honest Unsupported, never a
-                    // silent downgrade to the Job kill.
+                for groupId in groups do
+                    match Native.Windows.sendConsoleCtrlBreakWindows groupId with
+                    | Ok() -> ctrlDelivered <- ctrlDelivered + 1
+                    | Error message ->
+                        if ctrlFailure.IsNone then
+                            ctrlFailure <- Some message
+
+                // WM_CLOSE to every windowed member; the count is how many top-level windows were posted
+                // to (0 = no member has a window — a no-op, not an error).
+                let windowsClosed = Native.Windows.postCloseToJobWindows jobHandle
+
+                if ctrlDelivered > 0 || windowsClosed > 0 then
+                    // At least one soft signal was delivered best-effort (a CTRL+BREAK generated and/or a
+                    // WM_CLOSE posted to a window). Success is delivery, not the child's compliance — a
+                    // child may install its own handler or veto the close.
+                    Ok()
+                elif List.isEmpty groups then
+                    // No CTRL-capable child AND no windowed member: the group truly has nothing to receive
+                    // a soft signal — honest Unsupported, never a silent downgrade to the Job kill. (This
+                    // is the preserved pre-WM_CLOSE Unsupported case, now also requiring "no windows".)
                     Error(
                         ProcessError.Unsupported
-                            $"{signal} on Windows is deliverable only to a child started with Command.WindowsCtrlSignals() (CREATE_NEW_PROCESS_GROUP); this group has none"
+                            $"{signal} on Windows is deliverable only as a console CTRL+BREAK to a child started with Command.WindowsCtrlSignals() (CREATE_NEW_PROCESS_GROUP) or as a WM_CLOSE to a member with a top-level window; this group has neither"
                     )
                 else
-                    // Send to every capable child; a member whose send fails (e.g. the caller has no
-                    // console to share) is not silently ignored — the first genuine failure is reported.
-                    let mutable firstFailure: string option = None
+                    // There ARE CTRL-capable children but every CTRL+BREAK genuinely failed, and no member
+                    // has a window to absorb a WM_CLOSE either — nothing was delivered. Honest failure
+                    // rather than a false Ok.
+                    let detail = ctrlFailure |> Option.defaultValue "unknown error"
 
-                    for groupId in groups do
-                        match Native.Windows.sendConsoleCtrlBreakWindows groupId with
-                        | Ok() -> ()
-                        | Error message ->
-                            if firstFailure.IsNone then
-                                firstFailure <- Some message
-
-                    match firstFailure with
-                    | None -> Ok()
-                    | Some message ->
-                        Error(
-                            ProcessError.Unsupported
-                                $"{signal} on Windows could not be delivered as a console CTRL+BREAK (GenerateConsoleCtrlEvent failed: {message}); the caller may have no console to share with the child"
-                        )
+                    Error(
+                        ProcessError.Unsupported
+                            $"{signal} on Windows could not be delivered as a console CTRL+BREAK (GenerateConsoleCtrlEvent failed: {detail}) and no member has a top-level window to receive a WM_CLOSE"
+                    )
             | _ ->
                 Error(
                     ProcessError.Unsupported

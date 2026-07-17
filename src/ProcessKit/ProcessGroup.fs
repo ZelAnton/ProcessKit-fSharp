@@ -393,12 +393,15 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// still receives the signal.
     ///
     /// On **Windows** `Signal.Kill` maps to the atomic Job terminate. `Signal.Int` and `Signal.Term`
-    /// are delivered as a best-effort console **CTRL+BREAK**, but ONLY to children started with
-    /// `Command.WindowsCtrlSignals()` (spawned in their own console process group): if the group has
-    /// no such child, or the caller has no console to share with it, the call returns
-    /// `ProcessError.Unsupported` rather than silently downgrading to a kill. Delivery is not
-    /// guaranteed even on success — a console child may install its own handler. Every other Windows
-    /// signal returns `ProcessError.Unsupported`.
+    /// are a best-effort soft stop combining two individually-targeted deliveries: a console
+    /// **CTRL+BREAK** to each child started with `Command.WindowsCtrlSignals()` (spawned in its own
+    /// console process group) AND a **`WM_CLOSE`** posted to the top-level windows of every member that
+    /// has one (a windowed Electron/GUI child), targeted strictly by process id so no foreign window is
+    /// touched. Either mechanism reaching a member is a best-effort `Ok`; the call returns
+    /// `ProcessError.Unsupported` ONLY when the group has neither a CTRL-capable child nor a windowed
+    /// member — never a silent downgrade to a kill. Delivery is not compliance even on success — a child
+    /// may install its own handler or a window may prompt/veto the close. Every other Windows signal
+    /// returns `ProcessError.Unsupported`.
     member this.Signal(signal: Signal) : Result<unit, ProcessError> =
         this.WhenLive(fun () -> backend.Signal signal)
 

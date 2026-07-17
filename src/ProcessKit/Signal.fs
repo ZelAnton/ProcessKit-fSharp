@@ -3,10 +3,11 @@ namespace ProcessKit
 /// A signal to broadcast to every process in a `ProcessGroup` via `ProcessGroup.Signal`.
 ///
 /// The curated variants map to the POSIX signal of the same name on Unix. On **Windows** `Kill` maps
-/// to the Job Object terminate (the same hard kill as `ProcessGroup.KillAll`), and `Int`/`Term` are
-/// delivered as a best-effort console CTRL+BREAK — but only to a child started with
-/// `Command.WindowsCtrlSignals()`; without one (or without a console to share) they yield
-/// `ProcessError.Unsupported`, never a silent downgrade. Every other variant yields
+/// to the Job Object terminate (the same hard kill as `ProcessGroup.KillAll`), and `Int`/`Term` are a
+/// best-effort soft stop: a console CTRL+BREAK to each child started with `Command.WindowsCtrlSignals()`
+/// and a `WM_CLOSE` posted to the top-level windows of every member that has one (a GUI child). They
+/// yield `ProcessError.Unsupported` only when the group has neither a CTRL-capable child nor a windowed
+/// member — nothing to soft-signal — never a silent downgrade. Every other variant yields
 /// `ProcessError.Unsupported` on Windows.
 ///
 /// `Other` is an escape hatch carrying a raw signal number on Unix (e.g. `SIGWINCH`); it is always
