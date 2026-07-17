@@ -310,6 +310,44 @@ type ReadinessTests() =
         }
         :> Task
 
+    // Regression for R-02: `ExitTask` (the internal member backing `WaitAnyAsync`/`WaitAllAsync`)
+    // has its own `Fresh` branch, separate from the `WaitAsync` path R-01 fixed above, and that
+    // branch previously called `waitWithTimeout()` directly instead of `ensureBufferedWait()` — so
+    // it assumed `consumption = Fresh` always meant "no wait has started yet", when in fact
+    // `WaitForHttpAsync`'s early-exit detection deliberately starts the shared wait via
+    // `ensureBufferedWait()` while leaving `consumption` at `Fresh` (so a later buffered verb can
+    // still claim the pipes). Calling `WaitAnyAsync`/`WaitAllAsync` instead of a buffered verb after
+    // such a probe therefore started a second, independent `host.Wait()`, reproducing the exact same
+    // KB K-016 reap-once bug the R-01 fix addressed, just through this other path. Exercises a REAL
+    // spawned child so it reproduces the real reap machinery rather than a stand-in `Wait` delegate.
+    [<Test>]
+    member _.``WaitForHttp then WaitAnyAsync reports the real exit code after an early child exit``() : Task =
+        task {
+            let listener, uri, _requestCount = startHttpListener (fun _ -> 503)
+
+            try
+                match! runner.StartAsync(shell "exit 7", CancellationToken.None) with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    use running = running
+
+                    match! running.WaitForHttpAsync(uri, TimeSpan.FromSeconds 5.0) with
+                    | Error(ProcessError.NotReady _) -> ()
+                    | other -> Assert.Fail $"expected NotReady, got {other}"
+
+                    // Before the fix, ExitTask's Fresh branch started a second `host.Wait()` here (via
+                    // `WaitAnyAsync`), racing an already-reaped pid on POSIX and fabricating
+                    // `Outcome.Unobserved` instead of the real exit code.
+                    let! result = RunningProcess.WaitAnyAsync [| running |]
+
+                    match result.Outcome with
+                    | Outcome.Exited code -> Assert.That(code, Is.EqualTo 7)
+                    | other -> Assert.Fail $"expected Exited 7, got {other}"
+            finally
+                listener.Stop()
+        }
+        :> Task
+
     // Companion regression for the "child becomes ready" branch: the shared exit wait the probe now
     // starts (`ensureBufferedWait`, reused from a real verb afterward) must not leave an
     // uncoordinated, un-reaped wait registration hanging around, nor claim the handle's pipes —

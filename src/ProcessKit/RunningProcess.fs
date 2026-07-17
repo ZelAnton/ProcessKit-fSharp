@@ -1516,9 +1516,15 @@ type RunningProcess internal (host: RunningHost) =
     /// - `Buffered` (a capture verb already started — the "verb, then WaitAny/WaitAll" order): the
     ///   verb's own single wait, shared via `ensureBufferedWait` (memoized under the same lock, so it
     ///   is observed here regardless of which of the two reached it first).
-    /// - `Fresh` (WaitAny/WaitAll arrives first): claims the buffered slot itself and runs its own
-    ///   drains, so a terminal verb called afterwards on the same handle is refused
-    ///   (`alreadyConsumedError`) rather than racing a second reader.
+    /// - `Fresh` (WaitAny/WaitAll arrives first, and no readiness probe already started the shared
+    ///   wait either): claims the buffered slot itself and runs its own drains, so a terminal verb
+    ///   called afterwards on the same handle is refused (`alreadyConsumedError`) rather than racing
+    ///   a second reader. Even here the wait itself goes through `ensureBufferedWait()`, not a raw
+    ///   `waitWithTimeout()`: a readiness probe's own early-exit detection (`waitForHttp` et al.) can
+    ///   already have started the one shared `host.Wait()` while deliberately leaving `consumption`
+    ///   at `Fresh` (so a later buffered verb can still claim the pipes) — `ensureBufferedWait()`
+    ///   reuses that wait when it exists, or starts the sole wait itself when this genuinely is the
+    ///   first consumer, either way guaranteeing exactly one `host.Wait()`/reap per handle.
     member internal _.ExitTask: Task<Outcome> =
         lock stateLock (fun () ->
             if not exitStarted then
@@ -1537,9 +1543,9 @@ type RunningProcess internal (host: RunningHost) =
                         // `host.Wait()`. Its own pumps drain the pipes, so the reused wait needs none.
                         ensureBufferedWait ()
                     else
-                        // Fresh: no verb has run yet. Claim the buffered slot (inline — we already hold
-                        // `stateLock`) so a terminal verb called after WaitAny/WaitAll on the same handle
-                        // is refused rather than racing a second reader on these pipes.
+                        // Fresh: no verb has claimed the pipes yet. Claim the buffered slot (inline — we
+                        // already hold `stateLock`) so a terminal verb called after WaitAny/WaitAll on the
+                        // same handle is refused rather than racing a second reader on these pipes.
                         consumption <- Consumption.Buffered
 
                         task {
@@ -1551,7 +1557,15 @@ type RunningProcess internal (host: RunningHost) =
                             let stderrDrain =
                                 Pump.drainDiscardOrEmptyUntilDone stderrStream CancellationToken.None
 
-                            let! outcome = waitWithTimeout ()
+                            // `ensureBufferedWait()`, not `waitWithTimeout()`: a readiness probe may already
+                            // own the one shared exit wait (see the doc comment above), and `consumption`
+                            // staying `Fresh` until this very claim is exactly what lets that be true — so a
+                            // raw `waitWithTimeout()` here would start a second, independent `host.Wait()`
+                            // racing the probe's, reproducing the reap-once bug (KB K-016) `ensureBufferedWait`
+                            // exists to prevent. `ensureBufferedWait()` reuses the probe's wait if one is
+                            // already in flight, or starts it fresh otherwise — reentrant on `stateLock`,
+                            // which we already hold here (see the `Buffered` branch above, which does the same).
+                            let! outcome = ensureBufferedWait ()
                             do! Task.WhenAll([| stdoutDrain; stderrDrain |])
                             // Racing this handle to exit *is* its completion (conclude does not reap, so the
                             // no-reap contract holds), so a `WaitAny`/`WaitAll`-only run still records its
