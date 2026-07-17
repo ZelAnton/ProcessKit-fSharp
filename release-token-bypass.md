@@ -83,5 +83,7 @@ bypass list, not merely installed).
   (`Anton Zhelezniakou` / `github@zelanton.net`), not to the App.
 - When configured, the App token authenticates both the **push to `main`** and the
   **GitHub Release** creation (each falls back to the default `GITHUB_TOKEN` when the
-  App isn't set up). NuGet publishing uses `NUGET_API_KEY` and is independent of this
-  setup.
+  App isn't set up). NuGet publishing is independent of this setup: it uses NuGet
+  Trusted Publishing (OIDC), minting a short-lived push key per run via `NuGet/login`
+  from the job's `id-token`, so it needs the repo variable `NUGET_USER` plus a
+  trusted-publisher policy on nuget.org — not a long-lived `NUGET_API_KEY` secret.

@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RunningProcess.StdoutJsonLinesAsync<'T>()` streams stdout as NDJSON / JSON Lines, deserializing each non-empty line into a typed value as it arrives (blank lines are skipped silently, an unparseable line ends the stream with `ProcessError.Parse`) — a typed, thin wrapper over `StdoutLinesAsync()` for tools like `docker events --format json` / `kubectl get -w -o json` / `rg --json`. A `JsonTypeInfo<'T>` overload is available for trim-/NativeAOT-safe deserialization alongside the reflection-based `JsonSerializerOptions` overload.
 
 ### Changed
--
+- Hardened the release supply chain: packages are now published to NuGet.org via Trusted Publishing (short-lived OIDC-minted key per run) instead of a long-lived API-key secret, and every released artifact (`.nupkg`, `.snupkg`, and the `SHA256SUMS` manifest) now carries a build-provenance attestation. Consumers can verify a package's origin against this repository and workflow with `gh attestation verify <file> --repo ZelAnton/ProcessKit-fSharp`.
 
 ### Fixed
 - `Exec.which` and `CliClient.EnsureAvailableAsync` no longer risk throwing a raw exception when a candidate on `PATH` disappears mid-probe (a TOCTOU race between the existence check and the POSIX executable-bit check) or is otherwise inaccessible: the offending candidate is now treated as not found and the `PATH` search continues, and any unexpected failure at the whole-resolution level surfaces as a typed `ProcessError.Io` instead.
