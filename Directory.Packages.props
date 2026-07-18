@@ -29,18 +29,18 @@
 		<PackageVersion Include="FSharp.Core" Version="10.1.300" />
 		<PackageVersion Include="Ionide.Analyzers" Version="0.15.0" />
 		<PackageVersion Include="FsCheck" Version="3.3.3" />
-		<PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.9" />
-		<PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.9" />
-		<PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
-		<PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions" Version="10.0.9" />
-		<PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.9" />
-		<PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.9" />
-		<PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.9" />
-		<PackageVersion Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.9" />
-		<PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.7.0" />
-		<PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.300" />
+		<PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.10" />
+		<PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.10" />
+		<PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.10" />
+		<PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions" Version="10.0.10" />
+		<PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.10" />
+		<PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
+		<PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.10" />
+		<PackageVersion Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.10" />
+		<PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+		<PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.301" />
 		<PackageVersion Include="NUnit" Version="4.6.1" />
 		<PackageVersion Include="NUnit3TestAdapter" Version="6.2.0" />
-		<PackageVersion Include="System.IO.Pipelines" Version="9.0.0" />
+		<PackageVersion Include="System.IO.Pipelines" Version="9.0.18" />
 	</ItemGroup>
 </Project>

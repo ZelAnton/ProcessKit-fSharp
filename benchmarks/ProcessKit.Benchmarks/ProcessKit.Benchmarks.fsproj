@@ -21,10 +21,13 @@
 		<!-- See the library .fsproj: explicit FSharp.Core is required under CPM. -->
 		<PackageReference Include="FSharp.Core" />
 		<PackageReference Include="BenchmarkDotNet" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection" VersionOverride="6.0.2" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
 		<!-- Competitor library for ComparisonBenchmarks.fs only (see docs/comparison.md);
 		     never referenced from src/**. -->
 		<PackageReference Include="CliWrap" />
+		<PackageReference Include="Microsoft.Extensions.Options" VersionOverride="6.0.1" />
 	</ItemGroup>
 
 	<ItemGroup>

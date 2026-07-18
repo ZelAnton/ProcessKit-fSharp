@@ -115,6 +115,7 @@
 		     dropped from the dependency graph, so declare it here or the runtime cannot
 		     load FSharp.Core and NUnit discovers zero tests. -->
 		<PackageReference Include="FSharp.Core" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
 	</ItemGroup>
 
