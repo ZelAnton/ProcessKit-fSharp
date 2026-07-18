@@ -1014,8 +1014,8 @@ module internal Windows =
         nativeint& phPC
     )
 
-    // Declared for the resize verb a later PTY stage wires up (Stage 4 — `RunningProcess.ResizeAsync`);
-    // intentionally unused at this stage.
+    // The resize verb's native primitive (Stage 4 — `RunningProcess.ResizeAsync`), wrapped by
+    // `resizePseudoConsole` below; takes a `COORD` by value, marshalled as the packed `uint32` (see `packCoord`).
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern int private ResizePseudoConsole(nativeint hPC, uint32 size)
 
@@ -1114,6 +1114,23 @@ module internal Windows =
             |> ignore
 
             true
+
+    /// Resize the pseudoconsole `hPC` (retained from spawn as `Spawned.PtyControl`) to `cols` x `rows` —
+    /// the Windows arm of `RunningProcess.ResizeAsync` (Stage 4 / D6). Reuses the SAME packed-`COORD`
+    /// encoding `CreatePseudoConsole` already uses (X = cols in the low word, Y = rows in the high word),
+    /// so the resize geometry marshals identically to the initial geometry. `ResizePseudoConsole` returns
+    /// an HRESULT; a non-zero value — e.g. the pseudoconsole was already closed when the child exited — is
+    /// surfaced as a typed `ProcessError.Io`, never a silent success. The geometry is validated positive
+    /// and `SHORT`-bounded by the caller (`RunningProcess.ResizeAsync`), matching the `Command.Pty` builder.
+    let resizePseudoConsole (hPC: nativeint) (cols: int) (rows: int) : Result<unit, ProcessError> =
+        let hr = ResizePseudoConsole(hPC, packCoord cols rows)
+
+        if hr = 0 then
+            Ok()
+        else
+            // A double-quoted format inside an interpolation hole is FS3373 (KB K-026) — bind first.
+            let hrHex = hr.ToString("X8")
+            Error(ProcessError.Io $"ResizePseudoConsole failed (HRESULT 0x{hrHex})")
 
     /// Spawn `command` attached to a Windows pseudoconsole (ConPTY) — see the ConPTY section comment above.
     /// The STARTUPINFOEX attribute list carries ONLY the pseudoconsole; Job membership (kill-on-dispose
@@ -1357,7 +1374,12 @@ module internal Windows =
                                   Stdout = Some(outServer :> Stream)
                                   Stderr = None
                                   Stdin = stdinStream
-                                  WindowsCtrlGroup = config.WindowsCtrlSignals }
+                                  WindowsCtrlGroup = config.WindowsCtrlSignals
+                                  // Retain the pseudoconsole handle so `RunningProcess.ResizeAsync` can
+                                  // `ResizePseudoConsole` it (Stage 4 / D6). The exit-wait still owns closing it
+                                  // exactly once on child exit; a resize after that returns a typed error, never
+                                  // a crash. Its value stays valid for the child's whole running lifetime.
+                                  PtyControl = Some hPC }
         with ex ->
             if pendingPseudoConsole <> IntPtr.Zero then
                 ClosePseudoConsole pendingPseudoConsole
@@ -1610,7 +1632,9 @@ module internal Windows =
                       Stdout = outStream
                       Stderr = errStream
                       Stdin = stdinStream
-                      WindowsCtrlGroup = config.WindowsCtrlSignals }
+                      WindowsCtrlGroup = config.WindowsCtrlSignals
+                      // Not a PTY run — no pseudoconsole to resize (`ResizeAsync` → typed Unsupported).
+                      PtyControl = None }
         with ex ->
             disposeCreatedPipes ()
             Error(ProcessError.Spawn(command.Program, ex.Message))

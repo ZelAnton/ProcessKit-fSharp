@@ -49,6 +49,7 @@ type StatsTests() =
           StdinFeedComplete = ignore
           StartKill = ignore
           GracefulKill = fun _ -> Task.CompletedTask
+          ResizePty = None
           Teardown = fun () -> ValueTask() }
 
     [<Test>]

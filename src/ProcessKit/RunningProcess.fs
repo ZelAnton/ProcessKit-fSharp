@@ -52,6 +52,11 @@ type internal RunningHost =
         /// Gracefully kill the tree (SIGTERM, then SIGKILL after the grace period) without
         /// releasing the container — for timeouts.
         GracefulKill: TimeSpan -> Task
+        /// Resize the child's pseudo-terminal to `(cols, rows)` — `Some` only for a `Command.Pty` run
+        /// (the retained pseudoconsole handle / pty master fd from spawn), `None` otherwise. Backs
+        /// `RunningProcess.ResizeAsync`, which returns a typed `ProcessError.Unsupported` when it is
+        /// `None` (a non-PTY run — D6). A pure resize: it never touches the exit-wait/consumption state.
+        ResizePty: (int * int -> Result<unit, ProcessError>) option
         /// Reap the tree and release the container.
         Teardown: unit -> ValueTask
     }
@@ -760,6 +765,31 @@ type RunningProcess internal (host: RunningHost) =
     /// Signal the process tree to die without waiting (fire-and-forget, like `Process.Kill()`); the
     /// tree is fully reaped when the handle is disposed. For a blocking kill, dispose the handle.
     member _.Kill() = host.StartKill()
+
+    /// Resize the child's controlling pseudo-terminal to `cols` columns x `rows` rows (a `Command.Pty`
+    /// run only). Windows applies it with `ResizePseudoConsole`; POSIX applies `ioctl(TIOCSWINSZ)` on the
+    /// pty master and then delivers `SIGWINCH` to the child so a running TUI re-queries its geometry (D6).
+    ///
+    /// Honest, never a silent no-op: on a **non-PTY** run this returns `Error(ProcessError.Unsupported)`,
+    /// and a native resize failure returns `Error(ProcessError.Io ...)` — a garbled/partial resize is
+    /// never reported as success. `cols` and `rows` must each be at least 1 and at most `Int16.MaxValue`
+    /// (a terminal `COORD`/`winsize` is a `SHORT`), rejected with `ArgumentOutOfRangeException` at the
+    /// boundary, matching the `Command.Pty` builder's geometry validation.
+    ///
+    /// A **pure** verb: it neither consumes the output pipes nor touches the exit-wait/reap path, so it is
+    /// callable at any time — before or after a capturing/streaming/`WaitAsync` verb has claimed the
+    /// handle — and never trips the "already consumed by another verb" gate.
+    member _.ResizeAsync(cols: int, rows: int) : Task<Result<unit, ProcessError>> =
+        ArgumentOutOfRangeException.ThrowIfLessThan(cols, 1, nameof cols)
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(cols, int Int16.MaxValue, nameof cols)
+        ArgumentOutOfRangeException.ThrowIfLessThan(rows, 1, nameof rows)
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(rows, int Int16.MaxValue, nameof rows)
+
+        // No `stateLock`, no `consumption` claim, no `host.Wait()`/`ensureBufferedWait()` — a resize is
+        // independent of the exit-wait/reap-once ledger (KB K-016) and is not a consuming verb (KB K-031).
+        match host.ResizePty with
+        | Some resize -> Task.FromResult(resize (cols, rows))
+        | None -> Task.FromResult(Error(ProcessError.Unsupported "Resize (not a PTY run)"))
 
     // The grace window the parameterless `StopAsync()` uses — 2 seconds, matching
     // `ProcessGroupOptions.ShutdownTimeout`'s default so a live handle and its owning group agree on

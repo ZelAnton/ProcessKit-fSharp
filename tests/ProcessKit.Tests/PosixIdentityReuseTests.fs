@@ -35,7 +35,8 @@ type PosixIdentityReuseTests() =
           Stdout = None
           Stderr = None
           Stdin = None
-          WindowsCtrlGroup = false }
+          WindowsCtrlGroup = false
+          PtyControl = None }
 
     // Drive a `ProcessGroupBackend` against deterministic identity/liveness/delivery seams. `current`
     // maps a pgid to the identity a probe reads NOW — mutate it between track and signal to simulate a

@@ -84,7 +84,8 @@ type internal SyntheticBackend() =
                   Stdout = None
                   Stderr = None
                   Stdin = None
-                  WindowsCtrlGroup = false }
+                  WindowsCtrlGroup = false
+                  PtyControl = None }
 
         member _.Track(spawned) =
             requireLive "Track"

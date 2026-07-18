@@ -77,6 +77,8 @@ type FakeProcess private (template: Command, stdout: string, stderr: string, out
               StdinFeedComplete = ignore
               StartKill = fun () -> ()
               GracefulKill = fun _ -> Task.CompletedTask
+              // A fake has no real pseudo-terminal, so `ResizeAsync` reports a typed `Unsupported` (D6).
+              ResizePty = None
               Teardown =
                 fun () ->
                     stdoutStream.Dispose()

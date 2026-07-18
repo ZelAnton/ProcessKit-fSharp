@@ -257,6 +257,23 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     else
                         Task.CompletedTask)
 
+            // The pty-resize closure, built ONLY for a `Command.Pty` run — a retained pseudoconsole
+            // handle / pty master fd survives in `spawned.PtyControl`; a non-PTY run leaves it `None`, so
+            // `RunningProcess.ResizeAsync` reports a typed `Unsupported` (D6). The resize touches neither the
+            // container's release state nor the exit-wait/reap ledger, so — unlike the kill closures — it
+            // needs no `sync`/`killWhenLive` gating. `spawned.Handle` is the child pid on POSIX (the
+            // `SIGWINCH` target); on Windows the resize goes through the pseudoconsole handle alone.
+            let resizePty =
+                spawned.PtyControl
+                |> Option.map (fun control ->
+                    let childHandle = spawned.Handle
+
+                    fun (cols: int, rows: int) ->
+                        if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                            Native.Windows.resizePseudoConsole control cols rows
+                        else
+                            Native.Posix.resizePty control childHandle cols rows)
+
             { Config = command.Config
               Pid = pid
               Stdout = spawned.Stdout
@@ -307,6 +324,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                          // (documented `StopAsync`/`TimeoutGrace` degradation), gated the same way.
                          killWhenLive (fun () -> backend.KillChild spawned)
                          Task.CompletedTask))
+              ResizePty = resizePty
               Teardown =
                 fun () ->
                     // Stop the stdin feeder first: cancelling its lifecycle token unblocks a feed parked

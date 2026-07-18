@@ -30,7 +30,8 @@ type private GracefulFaultBackend() =
                   Stdout = None
                   Stderr = None
                   Stdin = None
-                  WindowsCtrlGroup = false }
+                  WindowsCtrlGroup = false
+                  PtyControl = None }
 
         member _.Track(_spawned) = Ok()
         member _.Release(_spawned) = ()

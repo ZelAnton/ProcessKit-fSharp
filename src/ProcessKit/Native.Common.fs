@@ -33,6 +33,12 @@ module internal Common =
             /// best-effort `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to it. Always `false` on
             /// POSIX, which delivers signals through `killpg` regardless of this flag.
             WindowsCtrlGroup: bool
+            /// The retained PTY control handle/fd for a `Command.Pty` run, kept for the child's whole
+            /// lifetime so `RunningProcess.ResizeAsync` can reach it — the Windows pseudoconsole handle
+            /// (`HPCON`, the resize target for `ResizePseudoConsole`) or the POSIX pty MASTER fd (the
+            /// `ioctl(TIOCSWINSZ)` target). `None` for every non-PTY spawn, on which `ResizeAsync`
+            /// returns a typed `ProcessError.Unsupported` rather than a silent no-op (D6).
+            PtyControl: nativeint option
         }
 
     /// The effective environment for the child: the inherited set (unless cleared) with the

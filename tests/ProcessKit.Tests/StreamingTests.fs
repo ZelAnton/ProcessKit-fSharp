@@ -207,6 +207,7 @@ type StreamingTests() =
               StdinFeedComplete = ignore
               StartKill = ignore
               GracefulKill = fun _ -> Task.CompletedTask
+              ResizePty = None
               Teardown = fun () -> ValueTask() }
 
         new RunningProcess(host)
@@ -233,6 +234,7 @@ type StreamingTests() =
               StdinFeedComplete = ignore
               StartKill = ignore
               GracefulKill = fun _ -> Task.CompletedTask
+              ResizePty = None
               Teardown = fun () -> ValueTask() }
 
         new RunningProcess(host)
@@ -837,6 +839,7 @@ type StreamingTests() =
                   StdinFeedComplete = ignore
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
+                  ResizePty = None
                   Teardown =
                     fun () ->
                         teardowns <- teardowns + 1
@@ -921,6 +924,7 @@ type StreamingTests() =
                   StdinFeedComplete = ignore
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
+                  ResizePty = None
                   Teardown = fun () -> ValueTask() }
 
             let profile =
@@ -1489,6 +1493,7 @@ type StreamingTests() =
                   StdinFeedComplete = ignore
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
+                  ResizePty = None
                   Teardown = fun () -> ValueTask() }
 
             use running = new RunningProcess(host)

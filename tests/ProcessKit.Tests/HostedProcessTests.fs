@@ -68,6 +68,7 @@ type private BlockingRunner() =
                             stopRequested.TrySetResult() |> ignore
                             finished.TrySetResult(Outcome.Signalled None) |> ignore
                             Task.CompletedTask
+                      ResizePty = None
                       Teardown =
                         fun () ->
                             stdout.Dispose()
@@ -129,6 +130,7 @@ type private LateFaultingStopRunner() =
                                 failwith "late graceful-kill fault"
                             }
                             :> Task
+                      ResizePty = None
                       Teardown =
                         fun () ->
                             stdout.Dispose()

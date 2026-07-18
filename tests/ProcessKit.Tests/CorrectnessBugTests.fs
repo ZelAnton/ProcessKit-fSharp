@@ -142,6 +142,7 @@ type CorrectnessBugTests() =
           StdinFeedComplete = ignore
           StartKill = ignore
           GracefulKill = fun _ -> Task.CompletedTask
+          ResizePty = None
           Teardown = fun () -> ValueTask() }
 
     let shell (script: string) =
@@ -283,6 +284,7 @@ type CorrectnessBugTests() =
                   StdinFeedComplete = ignore
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
+                  ResizePty = None
                   Teardown = fun () -> ValueTask() }
 
             use running = new RunningProcess(host)
@@ -342,6 +344,7 @@ type CorrectnessBugTests() =
                   StdinFeedComplete = ignore
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
+                  ResizePty = None
                   Teardown = fun () -> ValueTask() }
 
             use running = new RunningProcess(host)

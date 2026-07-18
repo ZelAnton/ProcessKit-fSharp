@@ -185,6 +185,40 @@ module internal Posix =
     [<DllImport("libc", SetLastError = true)>]
     extern int private ioctl(int fd, unativeint request, Winsize& winsize)
 
+    // termios (line-discipline) get/set for `PtyConfig.Echo`. The whole `struct termios` is blitted
+    // through an opaque unmanaged buffer (a raw `nativeint`), NOT a modelled struct: that way every field
+    // — c_cc[NCCS] control chars, the input/output speeds — round-trips from `tcgetattr` back to
+    // `tcsetattr` unchanged, and only `c_lflag` (the 4th 32-bit flag word, offset 12 on Linux) is edited
+    // to clear the ECHO bit. Modelling the struct partially (an explicit `Size` over-pad, or a half-filled
+    // field list) would let the marshaller zero the untouched tail on the write-back and corrupt the
+    // terminal's control chars/baud — so the buffer is passed verbatim. POSIX pty is Linux-only here (the
+    // ctty helper is util-linux `setsid --ctty`; macOS/BSD take the honest Unsupported path before any pty
+    // opens), so the Linux `c_lflag` offset and `ECHO`/`TCSANOW` values apply.
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private tcgetattr(int fd, nativeint termios)
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private tcsetattr(int fd, int optionalActions, nativeint termios)
+
+    // termios c_lflag ECHO bit (Linux): a terminal echoes typed input back into its OUTPUT by default
+    // (cooked mode). Cleared for `PtyConfig.Echo = false` so a credential fed to the child's stdin through
+    // the pty is not echoed into the captured merged stream — the ADR's secret-safety mitigation.
+    [<Literal>]
+    let private ECHO = 0x8
+
+    // Byte offset of `c_lflag` inside `struct termios` (the 4th `tcflag_t`, each a 4-byte `unsigned int`).
+    [<Literal>]
+    let private TERMIOS_LFLAG_OFFSET = 12
+
+    // tcsetattr optional_actions: apply the change immediately (POSIX `TCSANOW` = 0 on Linux).
+    [<Literal>]
+    let private TCSANOW = 0
+
+    // SIGWINCH — "window size changed" (Linux value 28, shared across the arches this port targets).
+    // Delivered to the pty child after a resize so a running TUI re-queries its geometry (ADR D6).
+    [<Literal>]
+    let private SIGWINCH = 28
+
     // read/write on a pty master fd. Unlike a socketpair end (a `Socket`/`NetworkStream` on the runtime's
     // epoll/kqueue engine), a pty master is a character device that engine cannot host, so `PtyStream`
     // does its I/O with these directly (offloaded to the thread pool for async by the base `Stream`).
@@ -677,6 +711,35 @@ module internal Posix =
 
             base.Dispose disposing
 
+    /// Clear the pty's cooked-mode ECHO bit on `fd` (the slave, before the child adopts it) so typed input
+    /// is NOT echoed into the terminal's output — the `PtyConfig.Echo = false` secret-safety mitigation.
+    /// The whole `struct termios` is read into an opaque unmanaged buffer and written back verbatim with
+    /// only `c_lflag`'s ECHO bit cleared, so no other line-discipline setting (control chars, speeds) is
+    /// disturbed. A generous 128-byte buffer over-covers glibc's ~60-byte `struct termios`. A `tcgetattr`/
+    /// `tcsetattr` failure is a real per-invocation error the caller turns into a failed spawn — silently
+    /// leaving echo ON when the caller explicitly asked for it off is the exact secret leak this guards.
+    let private disableEcho (fd: int) : Result<unit, string> =
+        let buffer = Marshal.AllocHGlobal 128
+
+        try
+            // Zero the buffer so a short `tcgetattr` write can never leave stack garbage in the tail that a
+            // subsequent `tcsetattr` would then apply.
+            for i in 0..127 do
+                Marshal.WriteByte(buffer, i, 0uy)
+
+            if tcgetattr (fd, buffer) <> 0 then
+                Error $"tcgetattr failed (errno {Marshal.GetLastWin32Error()})"
+            else
+                let lflag = Marshal.ReadInt32(buffer, TERMIOS_LFLAG_OFFSET)
+                Marshal.WriteInt32(buffer, TERMIOS_LFLAG_OFFSET, lflag &&& ~~~ECHO)
+
+                if tcsetattr (fd, TCSANOW, buffer) <> 0 then
+                    Error $"tcsetattr(TCSANOW) failed (errno {Marshal.GetLastWin32Error()})"
+                else
+                    Ok()
+        finally
+            Marshal.FreeHGlobal buffer
+
     /// Open a POSIX pty master/slave pair via the all-libc `posix_openpt` sequence (portable across glibc
     /// versions, and — unlike a bare `openpty` — able to set O_CLOEXEC without `fcntl`, per the PTY ADR).
     /// Both ends are opened O_CLOEXEC so a DIFFERENT concurrent spawn never inherits them (the pty analogue
@@ -685,10 +748,12 @@ module internal Posix =
     /// initial window size (`cols`/`rows` from `PtyConfig`) is applied to the pair via `ioctl(TIOCSWINSZ)`
     /// so a full-screen TUI sees the requested geometry instead of the kernel's 0x0 default — parity with
     /// the Windows `CreatePseudoConsole` path (`bare openpty` would take a `winsize` argument directly; the
-    /// `posix_openpt` sequence sets it explicitly after allocation). Returns the master and slave fds (the
-    /// caller owns and must close both), or an errno-tagged message. Each `Marshal.GetLastWin32Error()` is
-    /// read immediately after its failing P/Invoke, before any other one.
-    let private openPtyPair (cols: int) (rows: int) : Result<int * int, string> =
+    /// `posix_openpt` sequence sets it explicitly after allocation). When `echo` is false the slave's
+    /// cooked-mode ECHO is cleared via `termios` before the child adopts it (`PtyConfig.Echo` — the
+    /// secret-safety mitigation). Returns the master and slave fds (the caller owns and must close both),
+    /// or an errno-tagged message. Each `Marshal.GetLastWin32Error()` is read immediately after its failing
+    /// P/Invoke, before any other one.
+    let private openPtyPair (cols: int) (rows: int) (echo: bool) : Result<int * int, string> =
         let master = posix_openpt (O_RDWR ||| O_NOCTTY ||| O_CLOEXEC)
 
         if master < 0 then
@@ -740,8 +805,39 @@ module internal Posix =
                                     close slave |> ignore
                                     close master |> ignore
                                     Error $"ioctl(TIOCSWINSZ) failed (errno {errno})"
+                                elif not echo then
+                                    // `PtyConfig.Echo = false`: clear ECHO on the SLAVE (the child's side)
+                                    // before it is dup'd onto the child's 0/1/2, so no typed credential is
+                                    // echoed into the captured merged output. A failure fails the spawn
+                                    // (both ends closed) — never a silent fallback to echo-on (the secret leak).
+                                    match disableEcho slave with
+                                    | Ok() -> Ok(master, slave)
+                                    | Error message ->
+                                        close slave |> ignore
+                                        close master |> ignore
+                                        Error message
                                 else
                                     Ok(master, slave)
+
+    /// Resize the pty behind `masterFd` (retained from spawn as `Spawned.PtyControl`) to `cols` x `rows`
+    /// and notify the child `pid` — the POSIX arm of `RunningProcess.ResizeAsync` (Stage 4 / D6). Applies
+    /// the new geometry via `ioctl(TIOCSWINSZ)` on the master (mirroring the initial-geometry call in
+    /// `openPtyPair`, KB K-028 — the pair shares one `winsize`, so the slave the child reads sees it),
+    /// then delivers SIGWINCH so a running TUI re-queries its size. An ioctl failure is a typed
+    /// `ProcessError.Io`; the SIGWINCH is best-effort — a child that already exited is a harmless ESRCH,
+    /// not a resize failure. Geometry is validated positive and SHORT-bounded by the caller
+    /// (`RunningProcess.ResizeAsync`), matching the `Command.Pty` builder's `validatePtyConfig`.
+    let resizePty (masterFd: nativeint) (pid: nativeint) (cols: int) (rows: int) : Result<unit, ProcessError> =
+        let mutable ws = Winsize()
+        ws.Row <- uint16 rows
+        ws.Col <- uint16 cols
+
+        if ioctl (int masterFd, unativeint TIOCSWINSZ, &ws) <> 0 then
+            Error(ProcessError.Io $"ioctl(TIOCSWINSZ) failed (errno {Marshal.GetLastWin32Error()})")
+        else
+            // Best-effort SIGWINCH to the child; a race with the child's own exit (ESRCH) is not a failure.
+            kill (int pid, SIGWINCH) |> ignore
+            Ok()
 
     // `waitpid` option: return immediately (0) if the child has not yet changed state, rather than
     // blocking. Same value on Linux and macOS.
@@ -1542,7 +1638,7 @@ module internal Posix =
             // exactly once by the owning stdout stream and there is no non-CLOEXEC `dup` to leak (R-02).
             // There is no separate stderr (`stderrParentRead` stays `None`, D3) and no `/dev/null` or
             // socketpair on this path.
-            match openPtyPair pty.Cols pty.Rows with
+            match openPtyPair pty.Cols pty.Rows pty.Echo with
             | Error message -> failure <- Some message
             | Ok(master, slave) ->
                 childSideFds.Add slave
@@ -2025,7 +2121,17 @@ module internal Posix =
                                           Stdin = stdinStream
                                           // POSIX signals the child's process group directly (killpg); the
                                           // Windows console-ctrl-group flag has no bearing here.
-                                          WindowsCtrlGroup = false }
+                                          WindowsCtrlGroup = false
+                                          // Retain the pty MASTER fd for `RunningProcess.ResizeAsync`
+                                          // (ioctl(TIOCSWINSZ) target, D6); `None` for a non-PTY run.
+                                          // `ptyMasterFd` is set (>= 0) only on the pty branch above; the one
+                                          // owning stdout stream closes it, so the raw fd stays valid for the
+                                          // child's whole running lifetime (no `dup`, no extra owner).
+                                          PtyControl =
+                                            (if ptyMasterFd >= 0 then
+                                                 Some(nativeint ptyMasterFd)
+                                             else
+                                                 None) }
                             with ex ->
                                 // A stream ctor (or the priority hook) threw after the child was spawned: tear the
                                 // child down and release every parent/child fd exactly once, then report the

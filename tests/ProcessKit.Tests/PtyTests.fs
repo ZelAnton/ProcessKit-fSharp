@@ -353,6 +353,156 @@ type PtyTests() =
         }
 
     // ----------------------------------------------------------------------------------
+    // Stage 4 (T-140): RunningProcess.ResizeAsync + PtyConfig.Echo effect
+    // ----------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``ResizeAsync off a PTY validates geometry, reports Unsupported, and never consumes the handle (D6, K-031/K-016)``
+        ()
+        : Task =
+        task {
+            // A plain (non-PTY) run — cross-platform. `ResizeAsync` must reject bad geometry up front,
+            // return a typed `Unsupported` (never a silent no-op), and — crucially — NOT be a consuming
+            // verb: an exit-consuming `WaitAsync` still succeeds afterward (KB K-031), and the shared
+            // reap-once exit wait is untouched (KB K-016).
+            let baseCmd =
+                if isWindows then
+                    Command.create "cmd.exe" |> Command.args [ "/c"; "echo hi" ]
+                else
+                    Command.create "/bin/sh" |> Command.args [ "-c"; "echo hi" ]
+
+            let cmd = baseCmd |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+            match! runner.StartAsync(cmd, CancellationToken.None) with
+            | Error e -> Assert.Fail $"spawn failed: {e}"
+            | Ok running ->
+                use _running = running
+
+                // Programmer-error geometry is rejected synchronously, matching the Command.Pty builder.
+                Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> running.ResizeAsync(0, 24) |> ignore))
+                |> ignore
+
+                Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> running.ResizeAsync(80, 0) |> ignore))
+                |> ignore
+
+                // Non-PTY run: a typed Unsupported, never a silent/garbled resize (D6).
+                match! running.ResizeAsync(120, 40) with
+                | Error(ProcessError.Unsupported msg) -> Assert.That(msg, Does.Contain "Resize")
+                | Error other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+                | Ok() -> Assert.Fail "ResizeAsync on a non-PTY run must not succeed"
+
+                // The consuming verb still runs — proving ResizeAsync claimed no consumption (K-031) and
+                // did not touch the reap-once wait path (K-016): no "already consumed by another verb".
+                let! outcome = running.WaitAsync()
+
+                match outcome with
+                | Outcome.Exited _ -> ()
+                | other -> Assert.Fail $"expected a clean exit after ResizeAsync, got {other}"
+        }
+
+    [<Test>]
+    member _.``ResizeAsync resizes the POSIX pty and the child observes the new geometry (D6)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                // The child blocks on `read _`, THEN prints its terminal size (`stty size` → "rows cols").
+                // We `ResizeAsync` to 120x40 BEFORE unblocking `read`, so the size it reports is the
+                // POST-resize winsize (ioctl(TIOCSWINSZ) on the master, shared with the slave, + SIGWINCH):
+                // a "40 120" line proves the live resize actually reached the child's terminal.
+                let cmd =
+                    (Command.create "/bin/sh" |> Command.args [ "-c"; "read _; stty size" ]).Pty(80, 24)
+                    |> Command.keepStdinOpen
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! runner.StartAsync(cmd, CancellationToken.None) with
+                | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok running ->
+                    use _running = running
+
+                    match! running.ResizeAsync(120, 40) with
+                    | Ok() -> ()
+                    | Error e -> Assert.Fail $"ResizeAsync on a live pty run failed: {e}"
+
+                    // Unblock `read` so the child proceeds to `stty size` (its output — a few bytes — sits
+                    // in the pty buffer until the drain below).
+                    match running.TakeStdin() with
+                    | Some stdin ->
+                        do! stdin.WriteLineAsync ""
+                        do! stdin.FlushAsync()
+                    | None -> Assert.Fail "expected an interactive stdin on a KeepStdinOpen pty run"
+
+                    let! events = collect (running.OutputEventsAsync())
+                    let text = events |> Seq.map (fun e -> e.Text) |> String.concat "\n"
+
+                    Assert.That(
+                        text,
+                        Does.Contain "40 120",
+                        "the child's terminal must report the resized 40 rows x 120 cols, not the initial 24x80"
+                    )
+        }
+
+    [<Test>]
+    member _.``Pty with Echo=false keeps a fed credential out of the captured output (secret-safety)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                // The secret-invariant round-trip: `read pw` consumes the fed line SILENTLY (the child
+                // itself never prints it — it only prints "done"), so the ONLY path by which `secret` could
+                // reach the CAPTURED merged output is the terminal's cooked-mode ECHO. Echo=false clears the
+                // pty slave's termios ECHO bit at spawn, so the fed credential must NOT appear.
+                let secret = "hunter2-SECRET-should-not-echo"
+
+                let cmd =
+                    (Command.create "/bin/sh" |> Command.args [ "-c"; "read pw; printf 'done\\n'" ])
+                        .Pty({ Cols = 80; Rows = 24; Echo = false })
+                    |> Command.stdin (Stdin.FromString(secret + "\n"))
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok result ->
+                    Assert.That(result.Stdout, Does.Contain "done", "the child must have read the fed credential line")
+
+                    Assert.That(
+                        result.Stdout,
+                        Does.Not.Contain secret,
+                        "Echo=false must keep the fed credential out of the captured merged output (secret-safety)"
+                    )
+        }
+
+    [<Test>]
+    member _.``Pty with the default cooked echo reflects fed input into the captured output``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                // The deliberate contrast to the Echo=false secret test: with the OS cooked-mode default
+                // (echo on), the pty line discipline DOES echo fed input back into the captured output —
+                // proving the terminal really echoes by default, so Echo=false's suppression above is a
+                // genuine effect and not a coincidental no-op.
+                let marker = "echoed-marker-xyz"
+
+                let cmd =
+                    (Command.create "/bin/sh" |> Command.args [ "-c"; "read line; printf 'done\\n'" ]).Pty(80, 24) // echo on (the ratified default)
+                    |> Command.stdin (Stdin.FromString(marker + "\n"))
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok result ->
+                    Assert.That(
+                        result.Stdout,
+                        Does.Contain marker,
+                        "with cooked-mode echo on (the default), fed input is echoed into the captured output"
+                    )
+        }
+
+    // ----------------------------------------------------------------------------------
     // The default (no PTY) path is unchanged: separate stdout/stderr, exactly as before.
     // ----------------------------------------------------------------------------------
 

@@ -19,10 +19,16 @@ open Microsoft.Extensions.Logging
 /// (cooked-mode `ECHO`), so bytes written to the child's stdin through the PTY — including an
 /// interactively typed password — are echoed into the captured merged output. This is standard
 /// terminal behaviour, not a bug, but it means a credential can appear in captured output (or a
-/// recorded cassette). Set `Echo = false` to request the terminal echo be disabled (the effect is
-/// wired in a later PTY stage; the flag is carried now so the config shape is stable). As everywhere
-/// else in the library, argv and environment **values** — and any PTY credentials — are never logged
-/// or traced; the record/replay redaction hook still governs what a cassette persists.
+/// recorded cassette). Set `Echo = false` to disable the terminal echo: on **POSIX** ProcessKit clears
+/// the pty slave's cooked-mode `ECHO` bit (`termios`) before the child adopts it, so a password typed to
+/// the child through the PTY is not echoed into the captured merged stream (proven by test). On
+/// **Windows** the echo of a ConPTY is governed by the child's own console mode
+/// (`ENABLE_ECHO_INPUT`/`ENABLE_LINE_INPUT` on `CONIN$`), which has no supported parent-side pre-spawn
+/// override; ProcessKit therefore does not force echo off there — a documented platform divergence, not
+/// a silent claim (an interactive prompt on Windows should suppress its own echo, as `ssh`/credential
+/// helpers do). As everywhere else in the library, argv and environment **values** — and any PTY
+/// credentials — are never logged or traced; the record/replay redaction hook still governs what a
+/// cassette persists.
 [<NoComparison>]
 type PtyConfig =
     {
@@ -30,9 +36,9 @@ type PtyConfig =
         Cols: int
         /// Initial terminal height in rows. Must be positive (the ratified default is 24).
         Rows: int
-        /// Leave the terminal's cooked-mode echo on (`true`, the OS default) or request it disabled
-        /// (`false`). See the type-level secret-safety note; the echo *effect* is wired in a later PTY
-        /// stage, but the flag is part of the config shape now.
+        /// Leave the terminal's cooked-mode echo on (`true`, the OS default) or disable it (`false`).
+        /// When `false`, POSIX clears the pty slave's `termios` `ECHO` bit at spawn so typed input (e.g. a
+        /// password) is not echoed into the captured merged output — see the type-level secret-safety note.
         Echo: bool
     }
 
