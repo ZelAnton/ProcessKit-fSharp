@@ -22,6 +22,27 @@ type private CountingRunner(inner: IProcessRunner) =
 [<TestFixture>]
 type TestabilityTests() =
 
+    /// Drain a merged stdout+stderr event stream to a list (for the PTY merged-stream assertions).
+    let collectEvents (proc: RunningProcess) : Task<OutputEvent list> =
+        task {
+            let acc = ResizeArray<OutputEvent>()
+            let enumerator = proc.OutputEventsAsync().GetAsyncEnumerator()
+            let mutable more = true
+
+            while more do
+                let! has = enumerator.MoveNextAsync()
+
+                if has then acc.Add enumerator.Current else more <- false
+
+            do! enumerator.DisposeAsync()
+            return List.ofSeq acc
+        }
+
+    let isStdout (event: OutputEvent) =
+        match event with
+        | OutputEvent.Stdout _ -> true
+        | OutputEvent.Stderr _ -> false
+
     [<Test>]
     member _.``FakeProcess builds a RunningProcess the buffered verbs can consume``() : Task =
         task {
@@ -261,4 +282,108 @@ type TestabilityTests() =
                 | Error(ProcessError.Unobserved(_, detail)) -> Assert.That(detail, Is.EqualTo "native failure")
                 | other -> Assert.Fail $"expected an Unobserved error, got {other}"
             | Error error -> Assert.Fail $"expected a completed (non-success) result, got {error.Message}"
+        }
+
+    // --- PTY test doubles (Stage 5 — D3 merged stream / D10 recorded-no-op resize) -----------------
+
+    [<Test>]
+    member _.``a PTY FakeProcess emits only OutputEvent.Stdout on the merged stream (D3)``() : Task =
+        task {
+            use proc = FakeProcess.Create("tui").WithPty().WithStdout("line1\nline2").Build()
+
+            let! events = collectEvents proc
+
+            Assert.That(events |> List.forall isStdout, Is.True, "a PTY fake must never emit OutputEvent.Stderr")
+            CollectionAssert.AreEqual([| "line1"; "line2" |], events |> List.map (fun e -> e.Text) |> List.toArray)
+        }
+
+    [<Test>]
+    member _.``a PTY FakeProcess folds scripted stderr into the merged stream, never a Stderr event``() : Task =
+        task {
+            // Explicitly setting a separate stderr on a PTY fake must NOT surface an OutputEvent.Stderr:
+            // under a real PTY (D3) there is one physical stream, so the stderr text folds into stdout.
+            use proc =
+                FakeProcess.Create("tui").WithPty().WithStdout("out").WithStderr("err").Build()
+
+            let! events = collectEvents proc
+
+            Assert.That(events |> List.forall isStdout, Is.True, "stderr must fold into the merged stdout stream")
+            let texts = events |> List.map (fun e -> e.Text)
+            Assert.That(texts, Does.Contain "out")
+            Assert.That(texts, Does.Contain "err")
+        }
+
+    [<Test>]
+    member _.``a PTY FakeProcess reports an empty ProcessResult.Stderr (no separate stderr channel)``() : Task =
+        task {
+            use proc =
+                FakeProcess.Create("tui").WithPty().WithStdout("hello").WithStderr("diag").Build()
+
+            match! proc.OutputStringAsync() with
+            | Ok result ->
+                Assert.That(result.Stderr, Is.EqualTo "", "a PTY fake has no separate stderr")
+                Assert.That(result.Stdout, Does.Contain "hello")
+                Assert.That(result.Stdout, Does.Contain "diag", "scripted stderr folds into the merged stdout")
+            | Error error -> Assert.Fail $"{error.Message}"
+        }
+
+    [<Test>]
+    member _.``ResizeAsync on a PTY FakeProcess is a recorded no-op success with the last geometry (D10)``() : Task =
+        task {
+            let fake = FakeProcess.Create("tui").WithPty().WithStdout("x")
+            use proc = fake.Build()
+
+            Assert.That(fake.LastResize, Is.EqualTo None, "no resize requested yet")
+
+            match! proc.ResizeAsync(120, 40) with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"a PTY fake's ResizeAsync must succeed, not Unsupported: {error.Message}"
+
+            Assert.That(fake.LastResize, Is.EqualTo(Some(120, 40)))
+
+            // A later resize updates the recorded last-requested geometry.
+            match! proc.ResizeAsync(80, 24) with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"{error.Message}"
+
+            Assert.That(fake.LastResize, Is.EqualTo(Some(80, 24)))
+        }
+
+    [<Test>]
+    member _.``ResizeAsync on a non-PTY FakeProcess stays a typed Unsupported (regression invariant)``() : Task =
+        task {
+            let fake = FakeProcess.Create("svc").WithStdout("x")
+            use proc = fake.Build()
+
+            match! proc.ResizeAsync(80, 24) with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"a non-PTY fake's ResizeAsync must be Unsupported, got {other}"
+
+            Assert.That(fake.LastResize, Is.EqualTo None, "a non-PTY fake records no resize")
+        }
+
+    [<Test>]
+    member _.``ScriptedRunner serves a Command.Pty script as a merged-stream PTY fake``() : Task =
+        task {
+            let runner: IProcessRunner =
+                ScriptedRunner().On([ "tui" ], (Reply.Ok "frame1\nframe2").WithStderr "diag")
+
+            let command = Command.create "tui" |> Command.pty
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error.Message}"
+            | Ok proc ->
+                use proc = proc
+                let! events = collectEvents proc
+
+                Assert.That(
+                    events |> List.forall isStdout,
+                    Is.True,
+                    "a Command.Pty script must replay as a merged stream (only OutputEvent.Stdout)"
+                )
+
+                let texts = events |> List.map (fun e -> e.Text)
+                Assert.That(texts, Does.Contain "frame1")
+                Assert.That(texts, Does.Contain "frame2")
+                Assert.That(texts, Does.Contain "diag", "scripted stderr folds into the merged stream")
         }

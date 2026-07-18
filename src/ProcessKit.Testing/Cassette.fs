@@ -83,6 +83,18 @@ type CassetteEntry =
         /// The recorded wall-clock duration in milliseconds, so `ProcessResult.Duration` survives replay.
         /// Absent in a pre-1.x cassette — defaults to `0`.
         DurationMs: double
+        /// Whether the recording was of a `Command.Pty` (pseudo-terminal) run — a single **merged**
+        /// stdout+stderr terminal stream (D3). On replay the reconstructed handle is a merged-stream
+        /// fake (`OutputEvent.Stderr` is never produced; the recorded `Stdout` **is** the merged stream).
+        /// Absent in a pre-v4 cassette — defaults to `false`.
+        Pty: bool
+        /// The PTY's initial terminal width in columns when `Pty` is set; `null` otherwise (and in a
+        /// pre-v4 cassette). Recorded for inspection/replay fidelity — the captured merged output itself
+        /// lives in `Stdout`.
+        PtyCols: Nullable<int>
+        /// The PTY's initial terminal height in rows when `Pty` is set; `null` otherwise (and in a
+        /// pre-v4 cassette).
+        PtyRows: Nullable<int>
     }
 
 /// The on-disk cassette envelope: a format `version` (so a format newer than this build understands is
@@ -218,8 +230,10 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // The cassette format version this build writes. Older, still-supported versions load (missing
     // fields default); a version newer than this is rejected. Bump when the on-disk schema changes.
     // v2 added `StdoutBase64` (exact bytes for the bytes capture verb); v3 added `EnvFingerprint` (the
-    // effective-environment fingerprint that folds env semantics into the replay match key).
-    static let currentFormatVersion = 3
+    // effective-environment fingerprint that folds env semantics into the replay match key); v4 added
+    // `Pty`/`PtyCols`/`PtyRows` (the merged-stream pseudo-terminal recording — D3). A pre-v4 entry with
+    // no `Pty` flag loads as a non-PTY recording (`Pty` defaults `false`, the geometry `null`).
+    static let currentFormatVersion = 4
 
     static let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
@@ -596,8 +610,22 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         | Some c -> Nullable c
         | None -> Nullable()
 
-    // Record a text capture: stdout/stderr are the decoded strings (redacted); no base64.
+    // The PTY fields for a recording: whether the command asked for a pseudo-terminal (D3 merged
+    // stream) and, if so, its initial geometry — recorded so replay reconstructs a merged-stream handle
+    // at the right size. A non-PTY command records `false`/`null`, indistinguishable from a pre-v4
+    // cassette (which is exactly the back-compat intent).
+    let ptyFieldsOf (command: Command) : bool * Nullable<int> * Nullable<int> =
+        match command.Config.Pty with
+        | Some pty -> true, Nullable pty.Cols, Nullable pty.Rows
+        | None -> false, Nullable(), Nullable()
+
+    // Record a text capture: stdout/stderr are the decoded strings (redacted); no base64. For a PTY run
+    // (D3) `Stdout` IS the single merged stream, so the redaction hook that scrubs it covers the whole
+    // captured PTY output (where an echoed credential could otherwise land) — there is no separate
+    // stderr to leak through.
     let entryOfText (command: Command) (result: ProcessResult<string>) (digest: string option) : CassetteEntry =
+        let pty, ptyCols, ptyRows = ptyFieldsOf command
+
         { Program = command.Program
           Args = Seq.toArray command.Config.Args
           Cwd = Option.toObj command.WorkingDirectory
@@ -612,11 +640,16 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           TimedOut = result.IsTimedOut
           Signal = signalOf result.Outcome
           Truncated = result.Truncated
-          DurationMs = result.Duration.TotalMilliseconds }
+          DurationMs = result.Duration.TotalMilliseconds
+          Pty = pty
+          PtyCols = ptyCols
+          PtyRows = ptyRows }
 
     // Record a bytes capture: exact stdout bytes go to base64 (Stdout text stays empty — a string-verb
     // replay decodes the base64); stderr is text (redacted). The opaque bytes are not redacted.
     let entryOfBytes (command: Command) (result: ProcessResult<byte[]>) (digest: string option) : CassetteEntry =
+        let pty, ptyCols, ptyRows = ptyFieldsOf command
+
         { Program = command.Program
           Args = Seq.toArray command.Config.Args
           Cwd = Option.toObj command.WorkingDirectory
@@ -631,7 +664,10 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           TimedOut = result.IsTimedOut
           Signal = signalOf result.Outcome
           Truncated = result.Truncated
-          DurationMs = result.Duration.TotalMilliseconds }
+          DurationMs = result.Duration.TotalMilliseconds
+          Pty = pty
+          PtyCols = ptyCols
+          PtyRows = ptyRows }
 
     // The cassette schema records exactly the three "normal" outcomes (`TimedOut`/`Signal`/`Code`) a
     // live run can be recorded as via `entryOfText`/`entryOfBytes`. `loadEntries`/`validateEntry` already
@@ -727,14 +763,14 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         match stdoutText command entry with
         | Error error -> Error error
         | Ok stdout ->
-            Ok(
-                FakeProcess
-                    .OfCommand(command)
-                    .WithStdout(stdout)
-                    .WithStderr(entry.Stderr)
-                    .WithOutcome(outcomeOf entry)
-                    .Build()
-            )
+            let fake =
+                FakeProcess.OfCommand(command).WithStdout(stdout).WithStderr(entry.Stderr).WithOutcome(outcomeOf entry)
+
+            // A PTY recording (D3) replays as a merged-stream handle: `OutputEventsAsync` yields only
+            // `OutputEvent.Stdout` and `ResizeAsync` is a recorded no-op success. The recorded `Stdout`
+            // is the merged stream; the entry flag is authoritative (independent of the live command).
+            let fake = if entry.Pty then fake.WithPty() else fake
+            Ok(fake.Build())
 
     let play (slots: Dictionary<Key, ReplaySlot>) (key: Key) : CassetteEntry option =
         match slots.TryGetValue key with

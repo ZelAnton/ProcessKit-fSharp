@@ -8,6 +8,7 @@ open System.Text
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
+open NUnit.Framework.Legacy
 open ProcessKit
 open ProcessKit.Testing
 
@@ -1166,4 +1167,167 @@ type CassetteTests() =
                 | Error(ProcessError.Io message) ->
                     Assert.That(message, Does.Contain "entry 0", "the error must name the offending entry's index")
                 | other -> Assert.Fail $"expected a rejected load for a missing Program, got {other}"
+            })
+
+    // --- PTY recordings (Stage 5 — D3 merged stream, v4 schema bump, back-compat load) -------------
+
+    [<Test>]
+    member _.``recording a Command.Pty run writes a v4 cassette with the Pty flag and geometry``() : Task =
+        withCassette (fun path ->
+            task {
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("frame", 0))
+                        let command = Command.create "tui" |> Command.pty
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                let onDisk = File.ReadAllText path
+                Assert.That(onDisk, Does.Contain "\"Version\": 4", "a PTY recording writes the v4 format")
+                Assert.That(onDisk, Does.Contain "\"Pty\": true")
+                // PtyConfig.Default geometry is 80x24.
+                Assert.That(onDisk, Does.Contain "\"PtyCols\": 80")
+                Assert.That(onDisk, Does.Contain "\"PtyRows\": 24")
+            })
+
+    [<Test>]
+    member _.``pre-v4 cassettes v1 v2 and v3 still load and replay as non-PTY under the v4 build``() : Task =
+        task {
+            // One hand-crafted fixture per legacy version. Each must load under the v4 build (a missing
+            // Pty field defaults to false / non-PTY) and replay its recorded stdout, proving the v1→v4
+            // back-compat load path, not just v1/v2.
+            let fixtures =
+                [ 1,
+                  "legacy1",
+                  "one",
+                  """{ "Version": 1, "Entries": [ { "Program": "legacy1", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "one", "Stderr": "" } ] }"""
+                  2,
+                  "legacy2",
+                  "two",
+                  """{ "Version": 2, "Entries": [ { "Program": "legacy2", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "two", "Stderr": "", "StdoutBase64": null } ] }"""
+                  3,
+                  "legacy3",
+                  "three",
+                  """{ "Version": 3, "Entries": [ { "Program": "legacy3", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "three", "Stderr": "" } ] }""" ]
+
+            for version, program, expected, json in fixtures do
+                let path = Path.GetTempFileName()
+
+                try
+                    File.WriteAllText(path, json)
+
+                    match RecordReplayRunner.Replay path with
+                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v4 build: {error}"
+                    | Ok replayer ->
+                        match! (runner replayer).OutputStringAsync(Command.create program, CancellationToken.None) with
+                        | Ok result ->
+                            Assert.That(result.Stdout, Is.EqualTo expected, $"v{version} entry must replay its stdout")
+                            Assert.That(result.Stderr, Is.EqualTo "")
+                        | Error error -> Assert.Fail $"a v{version} entry must replay: {error}"
+                finally
+                    if File.Exists path then
+                        File.Delete path
+        }
+
+    [<Test>]
+    member _.``a redaction hook scrubs the merged PTY stream (an echoed credential) before it is stored``() : Task =
+        withCassette (fun path ->
+            task {
+                // A PTY run captures ONE merged stream (D3); an interactively typed credential can be
+                // echoed into it. The redaction hook must scrub that merged stdout before it reaches disk
+                // — this proves the redactor covers the PTY stream, not just an ordinary stdout capture.
+                let options =
+                    RecordReplayOptions().WithRedaction(fun s -> s.Replace("hunter2", "[REDACTED]"))
+
+                do!
+                    task {
+                        use recorder =
+                            RecordReplayRunner.Record(path, FixedRunner("Password: hunter2\nlogged in", 0), options)
+
+                        let command = Command.create "ssh" |> Command.pty
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                let onDisk = File.ReadAllText path
+
+                Assert.That(
+                    onDisk,
+                    Does.Not.Contain "hunter2",
+                    "the echoed credential must not reach the merged-stream recording"
+                )
+
+                Assert.That(onDisk, Does.Contain "[REDACTED]")
+                Assert.That(onDisk, Does.Contain "\"Pty\": true", "the recording must be marked as a PTY run")
+
+                // ...and the scrubbed merged stream is what replays.
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok replayer ->
+                    match!
+                        (runner replayer)
+                            .OutputStringAsync(Command.create "ssh" |> Command.pty, CancellationToken.None)
+                    with
+                    | Ok result ->
+                        Assert.That(result.Stdout, Does.Contain "[REDACTED]")
+                        Assert.That(result.Stdout, Does.Not.Contain "hunter2")
+                    | Error error -> Assert.Fail $"{error}"
+            })
+
+    [<Test>]
+    member _.``a recorded PTY run replays through SpawnAsync as a merged stream (only Stdout events)``() : Task =
+        withCassette (fun path ->
+            task {
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("out1\nout2", 0))
+                        let command = Command.create "tui" |> Command.pty
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok replayer ->
+                    match!
+                        (runner replayer).SpawnAsync(Command.create "tui" |> Command.pty, CancellationToken.None)
+                    with
+                    | Error error -> Assert.Fail $"a PTY recording must replay a live handle: {error}"
+                    | Ok proc ->
+                        use proc = proc
+                        let events = ResizeArray<OutputEvent>()
+                        let enumerator = proc.OutputEventsAsync().GetAsyncEnumerator()
+                        let mutable more = true
+
+                        while more do
+                            let! has = enumerator.MoveNextAsync()
+
+                            if has then events.Add enumerator.Current else more <- false
+
+                        do! enumerator.DisposeAsync()
+
+                        Assert.That(
+                            events
+                            |> Seq.forall (fun e ->
+                                match e with
+                                | OutputEvent.Stdout _ -> true
+                                | OutputEvent.Stderr _ -> false),
+                            Is.True,
+                            "a replayed PTY handle must emit only OutputEvent.Stdout"
+                        )
+
+                        CollectionAssert.AreEqual(
+                            [| "out1"; "out2" |],
+                            events |> Seq.map (fun e -> e.Text) |> Seq.toArray
+                        )
             })

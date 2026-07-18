@@ -9,7 +9,7 @@ class ProcessKit.Testing.CassetteEntry
   member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
   member ToString() : System.String
   new()
-  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double)
+  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double, System.Boolean, System.Nullable<System.Int32>, System.Nullable<System.Int32>)
   property Args : System.String[] { get; set }
   property Code : System.Nullable<System.Int32> { get; set }
   property Cwd : System.String { get; set }
@@ -18,6 +18,9 @@ class ProcessKit.Testing.CassetteEntry
   property EnvNames : System.String[] { get; set }
   property HasStdin : System.Boolean { get; set }
   property Program : System.String { get; set }
+  property Pty : System.Boolean { get; set }
+  property PtyCols : System.Nullable<System.Int32> { get; set }
+  property PtyRows : System.Nullable<System.Int32> { get; set }
   property Signal : System.Nullable<System.Int32> { get; set }
   property Stderr : System.String { get; set }
   property StdinDigest : System.String { get; set }
@@ -52,9 +55,11 @@ class ProcessKit.Testing.FakeProcess
   member WithExit(System.Int32) : ProcessKit.Testing.FakeProcess
   member WithOutcome(ProcessKit.Outcome) : ProcessKit.Testing.FakeProcess
   member WithPid(System.Int32) : ProcessKit.Testing.FakeProcess
+  member WithPty() : ProcessKit.Testing.FakeProcess
   member WithStderr(System.String) : ProcessKit.Testing.FakeProcess
   member WithStdout(System.String) : ProcessKit.Testing.FakeProcess
   member WithStdoutLines(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Testing.FakeProcess
+  property LastResize : Microsoft.FSharp.Core.FSharpOption<System.Tuple<System.Int32, System.Int32>> { get }
   static member Create() : ProcessKit.Testing.FakeProcess
   static member Create(System.String) : ProcessKit.Testing.FakeProcess
 

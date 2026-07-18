@@ -363,6 +363,44 @@ and a [`Pipeline`](pipelines.md) are best tested against a real (possibly trivia
 process; keep the scripted/cassette doubles for everything that flows through the capture
 primitives.
 
+## Pseudo-terminal (PTY) doubles
+
+A [`Command.Pty`](commands.md) run gives the child a single **merged** stdout+stderr terminal
+stream — `OutputEvent.Stderr` is never produced (the two streams are physically one tty
+device). The doubles model that observable shape:
+
+- **`FakeProcess.WithPty()`** marks a fake as a PTY run. On the built handle
+  `OutputEventsAsync()` then yields only `OutputEvent.Stdout`, `ProcessResult.Stderr` is empty,
+  and any text set via `WithStderr` is **folded into** the merged stdout stream (a fake cannot
+  reproduce real OS interleaving, so folded stderr simply follows the stdout text) rather than
+  surfaced as a separate event.
+- **`ResizeAsync` is a recorded no-op success.** On a PTY fake `ResizeAsync(cols, rows)` returns
+  `Ok ()` (not the typed `Unsupported` a non-PTY fake returns) and records the geometry — read
+  the last requested `(cols, rows)` back through `FakeProcess.LastResize` for assertions.
+- **`ScriptedRunner`** serves a command built with `Command.Pty()` as a merged-stream PTY fake
+  automatically, so a scripted PTY scenario reads back the same way.
+- **Cassettes** record a `Pty` flag and geometry (schema v4) and replay as a merged-stream
+  handle; the [`WithRedaction`](#record-and-replay) hook scrubs the whole merged stream, so an
+  echoed credential never lands in a committed fixture.
+
+```fsharp
+task {
+    // A PTY fake: one merged stream, resize is a recorded no-op.
+    let fake = FakeProcess.Create("tui").WithPty().WithStdout("frame1\nframe2")
+    use proc = fake.Build()
+
+    let! _ = proc.ResizeAsync(120, 40)
+    Assert.That(fake.LastResize, Is.EqualTo(Some(120, 40)))
+    // proc.OutputEventsAsync() yields only OutputEvent.Stdout — never OutputEvent.Stderr.
+}
+```
+
+**Inherent limitation (not papered over).** A double has no real terminal, so it **cannot** make
+the child observe `isatty = true`. Any behaviour that depends on the *child* seeing a tty — a
+tool switching from line-buffered "dumb" output to full-screen TUI mode, a shell enabling colour,
+a prompt suppressing echo — is not reproducible with a fake or a cassette; only the *observable
+merged-stream shape* is. Test that child-tty behaviour against a real `Command.Pty` run.
+
 ## Record and replay
 
 `RecordReplayRunner` (also in `ProcessKit.Testing`) closes the loop: record real
@@ -427,7 +465,8 @@ Semantics worth knowing before you commit a cassette:
 | Fidelity | for the **capture** verbs, a recording's **truncation** flag and wall-clock **duration** survive replay, so `ProcessResult.Truncated` / `Duration` read true on replay (not a synthetic `false` / `0`). Streaming replay (`SpawnAsync`) reconstructs the recorded lines and outcome; its duration is measured live and truncation is not replayed |
 | Err results | not recorded — only completed runs (a non-zero exit and a captured timeout *are* results and are recorded) |
 | One-shot stdin | `Stdin.FromStream` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
-| Format | a versioned JSON envelope — `{ "Version", "Entries" }` (current version **3**); a cassette **newer** than this build understands is rejected on load, while an older compatible one (a v1/v2 cassette) still loads (missing fields default — a pre-v3 entry with no env fingerprint keys as the default, un-customized environment). A partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
+| Format | a versioned JSON envelope — `{ "Version", "Entries" }` (current version **4**); a cassette **newer** than this build understands is rejected on load, while an older compatible one (a v1/v2/v3 cassette) still loads (missing fields default — a pre-v3 entry with no env fingerprint keys as the default, un-customized environment; a pre-v4 entry with no `Pty` flag loads as a non-PTY recording). A partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
+| PTY | a [`Command.Pty`](#pseudo-terminal-pty-doubles) recording carries a `Pty` flag and its geometry (`PtyCols`/`PtyRows`) and replays as a **merged-stream** handle (only `OutputEvent.Stdout`). Because a PTY captures one merged stream, the [`WithRedaction`](#record-and-replay) hook scrubs that whole stream — an echoed credential is scrubbed before it lands in the cassette |
 
 Only env *values* are redacted. `program`, `args`, `stdout`, and `stderr` are
 stored **verbatim** and can carry secrets (a `--password=…` flag, a token echoed
