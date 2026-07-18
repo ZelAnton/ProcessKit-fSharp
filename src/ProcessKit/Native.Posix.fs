@@ -1532,8 +1532,8 @@ module internal Posix =
         // slave pair, the slave dup'd onto the child's 0/1/2 and the parent keeping the master as the
         // single merged terminal stream — handled as the FIRST branch here, so the ordinary per-stream
         // stdout/stderr setup below is skipped (`config.Pty.IsNone`).
-        if config.Pty.IsSome then
-            let pty = config.Pty.Value
+        match config.Pty with
+        | Some pty ->
             // The slave becomes the child's controlling terminal (via the rewritten `setsid --ctty`
             // Program); it is dup'd onto 0/1/2 and its original closed by the file actions further down.
             // The parent keeps the SINGLE MASTER (`stdoutParentRead`) as the merged output. When an
@@ -1552,23 +1552,24 @@ module internal Posix =
                 stdoutParentRead <- Some master
                 ptyMasterFd <- master
                 ptyStdinOverMaster <- stdinWanted
-        elif stdinInherit then
-            // `InheritStdin`: hand the child the PARENT's own standard input directly (no socketpair,
-            // no feeder). On macOS, POSIX_SPAWN_CLOEXEC_DEFAULT closes every fd not named by a file
-            // action at exec, so register a self-dup2 (0 -> 0) to keep fd 0 open in the child; on Linux
-            // fd 0 is inherited naturally, so no dup2 is needed. Symmetric to the stdout/stderr
-            // `StdioMode.Inherit` branches below. `stdinParentWrite` stays `None`, so `Spawned.Stdin` is
-            // `None` and no feeder is ever started.
-            stdinChildFd <- if isMacOs then 0 else -1
-        elif stdinWanted then
-            match makeStdioChannel "stdin" with
-            | Some(readFd, writeFd) ->
-                stdinChildFd <- readFd
-                childSideFds.Add readFd
-                stdinParentWrite <- Some writeFd
-            | None -> ()
-        else
-            stdinChildFd <- openNul "stdin" O_RDONLY
+        | None ->
+            if stdinInherit then
+                // `InheritStdin`: hand the child the PARENT's own standard input directly (no socketpair,
+                // no feeder). On macOS, POSIX_SPAWN_CLOEXEC_DEFAULT closes every fd not named by a file
+                // action at exec, so register a self-dup2 (0 -> 0) to keep fd 0 open in the child; on Linux
+                // fd 0 is inherited naturally, so no dup2 is needed. Symmetric to the stdout/stderr
+                // `StdioMode.Inherit` branches below. `stdinParentWrite` stays `None`, so `Spawned.Stdin` is
+                // `None` and no feeder is ever started.
+                stdinChildFd <- if isMacOs then 0 else -1
+            elif stdinWanted then
+                match makeStdioChannel "stdin" with
+                | Some(readFd, writeFd) ->
+                    stdinChildFd <- readFd
+                    childSideFds.Add readFd
+                    stdinParentWrite <- Some writeFd
+                | None -> ()
+            else
+                stdinChildFd <- openNul "stdin" O_RDONLY
 
         // stdout (skipped under a PTY — its stdout is the merged pty master, wired above)
         if failure.IsNone && config.Pty.IsNone then
