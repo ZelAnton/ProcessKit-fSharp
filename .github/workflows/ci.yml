@@ -75,11 +75,12 @@ jobs:
       - name: Restore packages
         run: dotnet restore
 
-      # The CLI does not discover MSBuild PackageReference analyzers on its own.
-      # Ionide.Analyzers 0.15.0 is built for fsharp-analyzers 0.36.0; newer
-      # versions may break compatibility, so keep the package/tool pins aligned.
+      # The CLI does not discover MSBuild PackageReference analyzers on its own. Ionide.Analyzers
+      # 0.15.0 is built for fsharp-analyzers 0.36.0, so the tool manifest deliberately pins that
+      # compatible version. Resolve the restored version from the manifest instead of repeating it
+      # here, so a future coordinated update has only one version to change.
       #
-      # fsharp-analyzers 0.36.0 ships only a net8.0 executable (see .config/dotnet-tools.json
+      # fsharp-analyzers ships only a net8.0 executable (see .config/dotnet-tools.json
       # and the `tools/net8.0/any` layout of the restored package) — it relies on its
       # runtimeconfig.json's `"rollForward": "LatestMajor"` to run on newer runtimes. That
       # roll-forward only kicks in when no exact framework match is found. GitHub-hosted
@@ -103,7 +104,13 @@ jobs:
           fi
 
           nuget_packages="${NUGET_PACKAGES:-$HOME/.nuget/packages}"
-          tool_dll="$nuget_packages/fsharp-analyzers/0.36.0/tools/net8.0/any/FSharp.Analyzers.Cli.dll"
+          tool_version="$(dotnet tool list --local | awk '$1 == "fsharp-analyzers" { print $2 }')"
+          if [ -z "$tool_version" ]; then
+            echo "::error::fsharp-analyzers was not restored from .config/dotnet-tools.json"
+            exit 1
+          fi
+
+          tool_dll="$nuget_packages/fsharp-analyzers/$tool_version/tools/net8.0/any/FSharp.Analyzers.Cli.dll"
           if [ ! -f "$tool_dll" ]; then
             echo "::error::fsharp-analyzers tool assembly was not restored under $tool_dll"
             exit 1
