@@ -843,35 +843,95 @@ module internal Posix =
     // blocking. Same value on Linux and macOS.
     let private WNOHANG = 1
 
-    // An event-driven `waitPosix` wait in flight for one pid: the completion source the eventual
-    // `waitpid` result feeds. Keyed by pid in `pendingWaits` below.
+    // The set of event-driven `waitPosix` waits in flight for ONE pid. Every waiter for the same pid
+    // shares a single group — and therefore a single OS reap (`waitpid`/`waitid`) — so registering a
+    // second wait for a pid never triggers a second reap: the one decoded status is fanned out to every
+    // waiter (reap-once, K-016). `Waiters` doubles as the group's lock object. `Outcome` caches the decoded
+    // result once the child has been reaped, so a wait that registers AFTER the reap (the double-
+    // registration race) still observes the real status instead of losing an ECHILD race.
     [<NoComparison; NoEquality>]
-    type private PendingWait = { Tcs: TaskCompletionSource<Outcome> }
+    type private PendingWait =
+        { Waiters: ResizeArray<TaskCompletionSource<Outcome>>
+          mutable Outcome: Outcome voption }
 
-    // Every event-driven POSIX wait currently in flight, process-wide. `waitPosix` adds an entry;
-    // whichever of `reapAllPending` (SIGCHLD-triggered) or `reapLeader` (teardown) actually reaps a
-    // given child removes it and completes its `Tcs` — only one of them ever can, since a child's
-    // exit status is consumed exactly once by whichever `waitpid` call gets there first.
+    // Every event-driven POSIX wait currently in flight — or just-reaped and briefly lingering with its
+    // cached outcome — process-wide, keyed by pid. `waitPosix` adds a waiter to the pid's group (creating
+    // it on first use); whichever of `reapAllPending` (SIGCHLD-triggered), the pidfd reaper, or `reapLeader`
+    // (teardown) actually reaps a given child resolves the group and fans the ONE real status out to every
+    // waiter — the OS status is consumed exactly once, since only one `waitpid`/`waitid` can get there.
     let private pendingWaits = ConcurrentDictionary<int, PendingWait>()
 
-    // Complete a pending event-driven wait for `pid` (if `waitPosix` registered one) with `outcome`.
-    // Shared by the SIGCHLD-triggered reap path below and by `reapLeader`'s teardown reap, so
-    // whichever of the two actually reaps a given child still delivers the real decoded status to
-    // anything awaiting it, instead of leaving the wait to notice only `ECHILD`. A no-op if nothing
-    // is pending for `pid` (no `waitPosix` call is in flight for it).
+    // How long a resolved group lingers in `pendingWaits` after its child was reaped, so a second
+    // `waitPosix` for the same pid that registers just AFTER the reap still finds the cached outcome
+    // instead of re-reaping an already-consumed child (ECHILD) and inventing an `Unobserved`. Kept short:
+    // far below any possible pid-number wraparound (which needs millions of spawns), so the cache can never
+    // hand a reused pid a stale generation's status — and the reap itself stays pidfd-identity-safe
+    // regardless of this window.
+    [<Literal>]
+    let private resolvedGroupLingerMs = 200
+
+    // True once the group's child has been reaped and its outcome cached. Read under the group lock so the
+    // two-word `voption` struct is never observed torn.
+    let private groupResolved (group: PendingWait) : bool =
+        lock group.Waiters (fun () ->
+            match group.Outcome with
+            | ValueSome _ -> true
+            | ValueNone -> false)
+
+    // Resolve `group` (for `pid`) with the ONE decoded `outcome` and fan it out to every waiter registered
+    // so far. Atomic against a concurrent `waitPosix` join (both take the group lock): a waiter enlisted
+    // before this call is completed here; one that races in after sees `Outcome` already set and completes
+    // itself from the cache — so no waiter is ever stranded. The first resolution wins and schedules the
+    // group's eventual eviction; later reap attempts for the same child (a losing SIGCHLD/pidfd ECHILD
+    // race, or `reapLeader`) find it already resolved and are no-ops, preserving reap-once (K-016).
+    let private resolveGroup (pid: int) (group: PendingWait) (outcome: Outcome) =
+        let waiters, firstResolution =
+            lock group.Waiters (fun () ->
+                match group.Outcome with
+                | ValueSome _ -> Array.empty<TaskCompletionSource<Outcome>>, false
+                | ValueNone ->
+                    group.Outcome <- ValueSome outcome
+                    let snapshot = group.Waiters.ToArray()
+                    group.Waiters.Clear()
+                    snapshot, true)
+
+        for waiter in waiters do
+            waiter.TrySetResult outcome |> ignore
+
+        if firstResolution then
+            // Evict after a brief linger (see `resolvedGroupLingerMs`), removing only if THIS exact group is
+            // still the mapped value, so a newer generation's group for a reused pid is never dropped. Fire-
+            // and-forget on the thread pool; nothing inside can throw, so it needs no fault observer.
+            task {
+                do! Task.Delay resolvedGroupLingerMs
+
+                pendingWaits.TryRemove(System.Collections.Generic.KeyValuePair(pid, group))
+                |> ignore
+            }
+            |> ignore
+
+    // Resolve whatever wait (if any) is registered for `pid` with `outcome`. Shared by the SIGCHLD-triggered
+    // reap path below and by `reapLeader`'s teardown reap, so whichever of the two actually reaps a given
+    // child still delivers the real decoded status to everything awaiting it, instead of leaving the wait to
+    // notice only `ECHILD`. A no-op if nothing is pending for `pid` (no `waitPosix` call is in flight).
     let private completePending (pid: int) (outcome: Outcome) =
-        match pendingWaits.TryRemove pid with
-        | true, pending -> pending.Tcs.TrySetResult outcome |> ignore
+        match pendingWaits.TryGetValue pid with
+        | true, group -> resolveGroup pid group outcome
         | false, _ -> ()
 
     // Best-effort, non-blocking reap of one pending pid. Returns `true` once nothing further needs to
-    // be done SYNCHRONOUSLY for it (reaped by us; nothing was ever pending; or an `ECHILD` race whose
-    // resolution has been handed off to an async grace-then-fallback on the thread pool — see below);
-    // `false` if it is still alive (left pending for the next trigger). Never blocks.
+    // be done SYNCHRONOUSLY for it (reaped by us; nothing was ever pending; already reaped and only
+    // lingering with its cached outcome; or an `ECHILD` race whose resolution has been handed off to an
+    // async grace-then-fallback on the thread pool — see below); `false` if it is still alive (left
+    // pending for the next trigger). Never blocks.
     let private tryReapPending (pid: int) : bool =
-        if not (pendingWaits.ContainsKey pid) then
+        match pendingWaits.TryGetValue pid with
+        | false, _ -> true
+        | true, group when groupResolved group ->
+            // Already reaped; the group is only lingering so late registrants can read the cached outcome.
+            // Re-probing would just hit ECHILD, so leave the consumed child alone (reap-once, K-016).
             true
-        else
+        | true, group ->
             let mutable status = 0
             let mutable result = waitpid (pid, &status, WNOHANG)
 
@@ -888,35 +948,37 @@ module internal Posix =
             if result = 0 then
                 false // still alive
             elif result = pid then
-                // We won the reap race — this is the real, decoded status.
-                completePending pid (decodeWaitStatus status)
+                // We won the reap race — this is the real, decoded status; fan it out to every waiter.
+                resolveGroup pid group (decodeWaitStatus status)
                 true
             else
                 // `ECHILD`: some concurrent caller (most plausibly `reapLeader` tearing down an
                 // abandoned run, or another `tryReapPending` invocation that already won this exact
                 // race) has already reaped this pid and holds the REAL status; we have nothing to
-                // report ourselves. `completePending` is a `TryRemove`, so whichever side calls it
-                // *first* decides the outcome — not whichever side won the `waitpid` race — so give the
-                // genuine winner a brief grace period to land its real result before falling back.
+                // report ourselves. `resolveGroup` completes only the FIRST resolution, so whichever side
+                // resolves the group *first* decides the outcome — not whichever side won the `waitpid`
+                // race — so give the genuine winner a brief grace period to land its real result before
+                // falling back.
                 //
                 // This grace-then-fallback runs on the thread pool (fire-and-forget), NOT spun in-line:
                 // this function is called from the shared SIGCHLD callback, so blocking it here would
                 // stall the runtime's whole signal-dispatch path and delay reaping every other pending
-                // child. Nothing inside the task can throw (`ContainsKey`/`completePending` don't), so
+                // child. Nothing inside the task can throw (`groupResolved`/`resolveGroup` don't), so
                 // it needs no fault observer.
                 task {
                     let mutable spins = 0
 
-                    while pendingWaits.ContainsKey pid && spins < 20 do
+                    while not (groupResolved group) && spins < 20 do
                         do! Task.Delay 1
                         spins <- spins + 1
 
-                    // Still pending after the grace period: nobody ever reported this pid's real status
-                    // (the genuine winner errored out before calling `completePending`, or something
-                    // outside ProcessKit's own reap machinery reaped it). Resolve honestly instead of
-                    // leaving the wait hanging forever or inventing a clean exit.
-                    completePending
+                    // Still unresolved after the grace period: nobody ever reported this pid's real status
+                    // (the genuine winner errored out before resolving the group, or something outside
+                    // ProcessKit's own reap machinery reaped it). Resolve honestly instead of leaving the
+                    // waiters hanging forever or inventing a clean exit — a no-op if the winner just landed.
+                    resolveGroup
                         pid
+                        group
                         (Outcome.Unobserved "the process's exit status could not be observed (ECHILD race)")
                 }
                 |> ignore
@@ -1167,30 +1229,24 @@ module internal Posix =
     let mutable private epollFd = -1
     let private epollInitLock = obj ()
 
-    // Resolve exactly the wait THIS pidfd registration owns. Remove the shared `pendingWaits` entry only
-    // when it still maps to this exact registration (reference equality via the value comparer), so a
-    // stale pidfd for a reused pid can't evict a newer generation's entry; then set our own TCS
-    // (idempotent). Symmetric to the SIGCHLD path's `completePending`, but keyed by registration identity
-    // instead of by pid — the pid-reuse-safe reap the pidfd path exists for.
+    // Resolve exactly the group THIS pidfd registration owns, fanning the outcome out to every waiter on
+    // it. `resolveGroup` operates on the group carried by reference (never re-looked-up by pid) and evicts
+    // only when it still maps to this exact registration, so a stale pidfd for a reused pid can't resolve
+    // or evict a NEWER generation's group. Symmetric to the SIGCHLD path's `completePending`, but keyed by
+    // registration identity instead of by pid — the pid-reuse-safe reap the pidfd path exists for.
     let private completePidfdReg (reg: PidfdReg) (outcome: Outcome) =
-        pendingWaits.TryRemove(System.Collections.Generic.KeyValuePair(reg.Pid, reg.Pending))
-        |> ignore
-
-        reg.Pending.Tcs.TrySetResult outcome |> ignore
+        resolveGroup reg.Pid reg.Pending outcome
 
     // `waitid` came back ECHILD (or a spurious wake): the genuine winner — `reapLeader` racing this
     // child's teardown — holds the real status and is about to deliver it via `completePending`. Give it
-    // the same brief grace the SIGCHLD path's ECHILD branch gives, then resolve OUR registration
-    // honestly. Keyed by registration identity throughout, so a reused pid is never crossed. Runs on the
-    // thread pool so it never blocks the shared reaper thread.
+    // the same brief grace the SIGCHLD path's ECHILD branch gives, then resolve OUR group honestly. Keyed
+    // by registration identity throughout (`groupResolved`/`resolveGroup` act on the group by reference),
+    // so a reused pid is never crossed. Runs on the thread pool so it never blocks the shared reaper thread.
     let private graceThenResolve (reg: PidfdReg) : Task =
         task {
             let mutable spins = 0
 
-            while (match pendingWaits.TryGetValue reg.Pid with
-                   | true, current -> obj.ReferenceEquals(current, reg.Pending)
-                   | false, _ -> false)
-                  && spins < 20 do
+            while not (groupResolved reg.Pending) && spins < 20 do
                 do! Task.Delay 1
                 spins <- spins + 1
 
@@ -1343,21 +1399,37 @@ module internal Posix =
     /// public contract (the decoded `Outcome`, zombie-free teardown, the `nativeint` pid handle) is
     /// identical either way.
     ///
-    /// Idempotent per pid: a second call while a wait for the same pid is already in flight reuses the
-    /// existing registration's task instead of opening a second pidfd or overwriting `pendingWaits` — an
-    /// unconditional overwrite would strand the earlier `TaskCompletionSource` forever (nothing would
-    /// complete it, since the `TryRemove` handoffs only ever observe the newer entry). Both callers
-    /// observe the same eventual outcome.
+    /// Idempotent per pid: any number of concurrent OR sequential waits for the same pid resolve to the
+    /// SAME real decoded outcome. They share ONE group — and thus ONE OS reap (`waitpid`/`waitid`, reap-
+    /// once, K-016) — with the status fanned out to every waiter; a second wait never opens a second pidfd
+    /// or triggers a second reap. A wait that registers just AFTER the child was reaped (the double-
+    /// registration race the flaky idempotency test exercises) still gets the real status from the group's
+    /// briefly-cached outcome, instead of losing an ECHILD race and inventing an `Unobserved`.
     let rec private waitPosixCore (usePidfd: bool) (pid: nativeint) : Task<Outcome> =
         let intPid = int pid
 
-        match pendingWaits.TryGetValue intPid with
-        | true, existing -> existing.Tcs.Task
-        | false, _ ->
-            let tcs =
-                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let tcs =
+            TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-            let pending = { Tcs = tcs }
+        match pendingWaits.TryGetValue intPid with
+        | true, existing ->
+            // A wait for this pid is already registered — or was just reaped and is lingering with its
+            // cached outcome. Join it under the group lock: take the already-decoded outcome if it is
+            // resolved, else enlist as one more waiter the single shared reap will fan the status out to.
+            // Never a second pidfd / second reap for the same pid.
+            lock existing.Waiters (fun () ->
+                match existing.Outcome with
+                | ValueSome outcome -> tcs.TrySetResult outcome |> ignore
+                | ValueNone -> existing.Waiters.Add tcs)
+
+            tcs.Task
+        | false, _ ->
+            let waiters = ResizeArray<TaskCompletionSource<Outcome>>()
+            waiters.Add tcs
+
+            let pending =
+                { Waiters = waiters
+                  Outcome = ValueNone }
 
             if pendingWaits.TryAdd(intPid, pending) then
                 if usePidfd && pidfdSupported then
@@ -1371,7 +1443,7 @@ module internal Posix =
                 tcs.Task
             else
                 // Lost the race to register first — a concurrent call for the same pid won in between our
-                // `TryGetValue` miss and this `TryAdd`. Reuse the winner's entry instead.
+                // `TryGetValue` miss and this `TryAdd`. Retry so we join the winner's group instead.
                 waitPosixCore usePidfd pid
 
     /// Reap a POSIX child on the mechanism selected once for this process (pidfd fast path where
@@ -1411,10 +1483,11 @@ module internal Posix =
             else
                 finished <- true // reaped (result = pid), or ECHILD / other error — nothing more to do
 
-                // If an event-driven `waitPosix` wait is still pending for this pid (an abandoned run
-                // being torn down concurrently with, or just ahead of, its own exit), hand it the real
-                // decoded status now that we have it, rather than leaving it to notice only `ECHILD`
-                // whenever it next gets a chance to look.
+                // If event-driven `waitPosix` waits are still pending for this pid (an abandoned run
+                // being torn down concurrently with, or just ahead of, its own exit), hand EVERY waiter on
+                // the group the real decoded status now that we have it, rather than leaving them to notice
+                // only `ECHILD` whenever they next get a chance to look. `completePending` resolves the
+                // whole group at once, so all waiters agree on this one status.
                 if result = pid then
                     completePending pid (decodeWaitStatus status)
 

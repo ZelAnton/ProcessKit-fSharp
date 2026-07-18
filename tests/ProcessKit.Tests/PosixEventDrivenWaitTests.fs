@@ -65,30 +65,38 @@ type PosixEventDrivenWaitTests() =
                 return outcome
         }
 
+    // Assert that a `spawnAndDoubleWait` result is BOTH a clean exit AND agreed on by the two waiters —
+    // the idempotency contract: two `waitPosix` calls on one pid must resolve to the SAME real outcome,
+    // never one to the real status and the other to `Unobserved (ECHILD race)`.
+    let assertCleanAgreement (result: Result<Outcome * Outcome, ProcessError>) =
+        match result with
+        | Error e -> Assert.Fail $"spawn failed: {e.Message}"
+        | Ok(firstOutcome, secondOutcome) ->
+            Assert.That(secondOutcome, Is.EqualTo firstOutcome, "the two waitPosix calls disagreed on the outcome")
+
+            match firstOutcome with
+            | Outcome.Exited 0 -> ()
+            | other -> Assert.Fail $"expected a clean exit, got {other}"
+
     [<Test>]
     member _.``waitPosix is idempotent for a repeated pid and does not leak a descriptor``() : Task =
         task {
             if isWindows then
                 Assert.Ignore "POSIX-only: exercises Native.Posix.waitPosix directly"
 
-            match! spawnAndDoubleWait () with
-            | Error e -> Assert.Fail $"spawn failed: {e.Message}"
-            | Ok(firstOutcome, secondOutcome) ->
-                Assert.That(secondOutcome, Is.EqualTo firstOutcome, "the two waitPosix calls disagreed on the outcome")
-
-                match firstOutcome with
-                | Outcome.Exited 0 -> ()
-                | other -> Assert.Fail $"expected a clean exit, got {other}"
+            let! firstResult = spawnAndDoubleWait ()
+            assertCleanAgreement firstResult
 
             if isLinux then
                 // Warm up (JIT, the lazy shared SIGCHLD registration) before the baseline, then repeat
-                // the double-registration scenario under load: any per-spawn fd left open (stdio
-                // pipes, or anything the losing side of the registration race failed to release)
-                // would show up as fd growth proportional to the iteration count.
+                // the double-registration scenario under load. Every iteration re-asserts idempotency, so
+                // the loop doubles as a determinism stress test for the concurrent double-registration
+                // race (not just an fd probe): a flaky ECHILD race would surface as a disagreement here.
+                // Separately, any per-spawn fd left open (stdio pipes, or anything the losing side of the
+                // registration race failed to release) shows up as fd growth proportional to the count.
                 for _ in 1..5 do
-                    match! spawnAndDoubleWait () with
-                    | Ok _ -> ()
-                    | Error e -> Assert.Fail $"{e.Message}"
+                    let! warmup = spawnAndDoubleWait ()
+                    assertCleanAgreement warmup
 
                 let fdCount () =
                     Directory.GetFileSystemEntries("/proc/self/fd").Length
@@ -96,9 +104,8 @@ type PosixEventDrivenWaitTests() =
                 let baseline = fdCount ()
 
                 for _ in 1..50 do
-                    match! spawnAndDoubleWait () with
-                    | Ok _ -> ()
-                    | Error e -> Assert.Fail $"{e.Message}"
+                    let! loaded = spawnAndDoubleWait ()
+                    assertCleanAgreement loaded
 
                 let after = fdCount ()
 
