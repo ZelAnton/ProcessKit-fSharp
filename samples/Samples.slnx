@@ -1,5 +1,11 @@
 <Solution>
 	<Folder Name="/Samples/">
+		<Project Path="FSharp.Pty/FSharp.Pty.fsproj">
+			<BuildDependency Project="../src/ProcessKit/ProcessKit.fsproj" />
+		</Project>
+		<Project Path="CSharp.Pty/CSharp.Pty.csproj">
+			<BuildDependency Project="../src/ProcessKit/ProcessKit.fsproj" />
+		</Project>
 		<Project Path="FSharp.Catalog/FSharp.Catalog.fsproj">
 			<BuildDependency Project="../src/ProcessKit/ProcessKit.fsproj" />
 			<BuildDependency Project="../src/ProcessKit.Testing/ProcessKit.Testing.fsproj" />

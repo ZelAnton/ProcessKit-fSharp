@@ -16,6 +16,7 @@ methods.
 - [Accepting non-zero exits](#accepting-non-zero-exits)
 - [Parsing output](#parsing-output)
 - [Standard input](#standard-input)
+- [Interactive password prompt through a PTY](#interactive-password-prompt-through-a-pty)
 - [Pipelines](#pipelines)
 - [Streaming and interactive I/O](#streaming-and-interactive-io)
 - [Readiness probes](#readiness-probes)
@@ -319,6 +320,77 @@ var cmd = new Command("grep")
 Sources: `Stdin.FromString`, `FromBytes`, `FromFile path`, `FromStream stream`,
 `FromLines seq`, `FromAsyncLines asyncSeq`, and `Stdin.Empty`. For interactive writing, see
 [streaming](#streaming-and-interactive-io).
+
+## Interactive password prompt through a PTY
+
+Some tools show a credential prompt only when stdin is a tty. Start them with a PTY, keep stdin
+open, write the credential, then close stdin so the prompt can complete. Without a PTY, the prompt
+may not appear at all or the tool may wait for a terminal it was never given.
+
+This POSIX example uses a small shell prompt only to make the I/O flow visible; substitute the
+credential tool you actually need. `Echo = false` prevents POSIX terminal echo from copying the
+credential into the merged captured output. On Windows, the prompt program must suppress its own
+console echo; ConPTY cannot force that setting.
+
+**F#**
+
+```fsharp
+task {
+    let command =
+        (Command.create "/bin/sh" |> Command.args [ "-c"; "printf 'Password: '; IFS= read -r password; printf 'OK\\n'" ])
+            .Pty({ PtyConfig.Default with Echo = false })
+            .KeepStdinOpen()
+
+    match! command.StartAsync() with
+    | Error err -> eprintfn $"{err.Message}"
+    | Ok process ->
+        use process = process
+
+        match process.TakeStdin() with
+        | Some stdin ->
+            do! stdin.WriteLineAsync "credential-from-a-secret-store"
+            do! stdin.FinishAsync() // EOF lets the prompt finish.
+        | None -> failwith "PTY stdin was not available"
+
+        let enumerator = process.StdoutLinesAsync().GetAsyncEnumerator()
+
+        try
+            let mutable more = true
+
+            while more do
+                let! moved = enumerator.MoveNextAsync().AsTask()
+
+                if moved then
+                    printfn $"> {enumerator.Current}" // one merged PTY stream
+                else
+                    more <- false
+        finally
+            enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult()
+}
+```
+
+**C#**
+
+```csharp
+var command = new Command("/bin/sh")
+    .Args(["-c", "printf 'Password: '; IFS= read -r password; printf 'OK\\n'"])
+    .Pty(new PtyConfig(80, 24, false))
+    .KeepStdinOpen();
+
+await using var process = (await command.StartAsync()).GetValueOrThrow();
+
+if (process.TakeStdin() is { Value: var stdin })
+{
+    await stdin.WriteLineAsync("credential-from-a-secret-store");
+    await stdin.FinishAsync(); // EOF lets the prompt finish.
+}
+
+await foreach (var line in process.StdoutLinesAsync())
+    Console.WriteLine($"> {line}"); // one merged PTY stream
+```
+
+See the [PTY guide](pty.md) for resize behaviour, platform support, and the output/secret-safety
+contract.
 
 ## Pipelines
 

@@ -14,6 +14,10 @@ Shipped changes are in [`CHANGELOG.md`](CHANGELOG.md).
 - A live **`RunningProcess`**: line streaming (`StdoutLines` / `OutputEvents`), interactive stdin,
   readiness probes (`WaitForLine` / `WaitForPort` / `WaitFor`), racing (`WaitAny` / `WaitAll`),
   per-run profiling, and stopping — `Kill` (immediate) or `StopAsync` (graceful SIGTERM → grace → SIGKILL).
+- **Pseudo-terminals (PTYs)** via `Command.Pty` / `PtyConfig` and `RunningProcess.ResizeAsync`: Windows
+  ConPTY and POSIX `openpty` + `setsid --ctty`, with unsupported hosts returning
+  `ProcessError.Unsupported`; test doubles model the merged stream and resize, and v4 cassettes record
+  the PTY geometry.
 - Shell-free **`Pipeline`s** with pipefail semantics.
 - **`Supervisor`** — restart policies, exponential backoff + jitter, and a failure-storm guard.
 - Tree control on **`ProcessGroup`** (`Signal` / `Suspend` / `Resume` / `Members` / `KillAll` /
@@ -67,12 +71,6 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
   `epoll`) for O(1) per-child dispatch and pid-reuse-safe reaping, instead of a `SIGCHLD`-triggered
   rescan of every outstanding wait, closer to how tokio waits on Linux — a scalability refinement,
   not a correctness one; the current design already meets the "no thread per child" goal.
-
-## Not currently supported
-
-- **Pseudo-terminal (PTY).** ProcessKit wires pipes, not a tty, so a tool that *demands* a tty (an
-  interactive `ssh` / `sudo` password prompt, some credential helpers) won't get one. Drive such
-  tools non-interactively, or feed a known answer over interactive stdin.
 
 ## Versioning & stability
 

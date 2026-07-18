@@ -215,6 +215,24 @@ limit-capable container, the POSIX process-group mechanism cannot enforce any of
 limits where none can apply fails at creation with `ProcessError.ResourceLimit` rather than
 returning a silently-unbounded group.
 
+### Pseudo-terminal (PTY) capabilities
+
+`Command.Pty` gives a child a controlling terminal and one merged stdout+stderr stream. Every
+unavailable case is a typed `ProcessError.Unsupported`; ProcessKit never quietly falls back to
+pipes.
+
+| Capability | Windows (ConPTY) | Linux (`openpty` + `setsid --ctty`) | macOS/BSD (POSIX pgid + ctty helper) |
+|---|:---:|:---:|:---:|
+| PTY spawn | ✅ Windows 10 1809+ | ✅ | 🟡 needs a controlling-terminal helper |
+| `ResizeAsync` on a PTY | ✅ `ResizePseudoConsole` | ✅ `TIOCSWINSZ` + `SIGWINCH` | ✅ `TIOCSWINSZ` + `SIGWINCH` |
+| `ResizeAsync` on a non-PTY | ❌ `Unsupported` | ❌ `Unsupported` | ❌ `Unsupported` |
+| Containment under PTY | ✅ Job Object | ✅ cgroup v2 or pgid | ✅ pgid |
+
+Windows older than 10 version 1809 returns `Unsupported`. Linux needs the `setsid --ctty` helper
+as well as a usable PTY device. `openpty` exists on macOS/BSD, but their standard `setsid` does not
+provide `--ctty`; until a helper is supplied, a PTY spawn there is `Unsupported` rather than a
+controlling-terminal-less half implementation.
+
 Everything not listed here — capture, line streaming, interactive stdin, encodings, buffer
 policies, timeouts, retry, pipelines, supervision, readiness probes, cancellation, and the
 testing seams — is platform-agnostic and behaves identically everywhere. See [commands.md](commands.md),
@@ -225,6 +243,18 @@ and [testing.md](testing.md).
 
 The honest fine print — mostly consequences of OS semantics, plus a few tracked internal
 constraints that do not change the public surface.
+
+**Windows ConPTY sidecar ownership.** The `conhost` / `OpenConsole.exe` sidecar created for a
+ConPTY is not a Job Object member. That is a real difference from the child process tree, not a
+hidden containment claim: ProcessKit owns the sidecar through the pseudoconsole handle and closes it
+deterministically with `ClosePseudoConsole` during teardown. The child itself is still born inside
+the Job Object.
+
+**Windows PTY echo belongs to the child.** `PtyConfig.Echo = false` clears the POSIX slave terminal's
+`ECHO` bit before spawn, but Windows echo is controlled by the child's `CONIN$` console mode. ConPTY
+does not expose a supported parent-side pre-spawn override, so a Windows credential prompt must
+suppress its own echo. This is documented rather than silently treating `Echo = false` as a Windows
+guarantee.
 
 **POSIX process groups: a `setsid` child can escape.** The process-group mechanism tracks each
 child's pgid, and teardown signals those pgids. A descendant that deliberately starts a new

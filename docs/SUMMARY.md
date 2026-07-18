@@ -23,6 +23,7 @@
 - [Running commands](commands.md)
 - [Process groups](process-groups.md)
 - [Streaming & interactive I/O](streaming.md)
+- [Pseudo-terminal (PTY)](pty.md)
 - [Pipelines](pipelines.md)
 - [Timeouts, retries & cancellation](timeouts-and-cancellation.md)
 - [Supervision](supervision.md)
@@ -31,4 +32,3 @@
 - [Dependency injection](dependency-injection.md)
 - [Platform support](platform-support.md)
 - [Running in containers](containers.md)
-
