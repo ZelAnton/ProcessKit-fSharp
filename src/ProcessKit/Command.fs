@@ -1059,7 +1059,9 @@ module Command =
 
     /// Run the child under a pseudo-terminal (PTY) with the default 80×24 geometry (echo on) — a single
     /// merged stdout+stderr terminal stream, for tools that demand a tty. Windows: ConPTY (Win10 1809+);
-    /// POSIX: currently `ProcessError.Unsupported` until a later stage. See `Command.Pty`.
+    /// POSIX: a real controlling pty via `openpty` + the `setsid --ctty` helper (util-linux); a host
+    /// missing that ctty helper or the pty devfs (macOS/BSD) fails with `ProcessError.Unsupported`. See
+    /// `Command.Pty`.
     let pty (command: Command) = command.Pty()
 
     /// Emit structured lifecycle events to `logger` (argv/env never logged).
