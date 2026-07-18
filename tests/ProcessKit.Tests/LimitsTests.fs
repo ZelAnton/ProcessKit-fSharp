@@ -1,6 +1,7 @@
 namespace ProcessKit.Tests
 
 open System
+open System.Collections.Generic
 open System.IO
 open System.Runtime.InteropServices
 open System.Threading
@@ -68,6 +69,22 @@ type LimitsTests() =
         task {
             let runner: IProcessRunner = group
             return! runner.OutputStringAsync(shell "echo limited", CancellationToken.None)
+        }
+
+    // Drain an async sequence (the streaming event verbs) into a list for assertions.
+    let collect (items: IAsyncEnumerable<'T>) =
+        task {
+            let acc = ResizeArray<'T>()
+            let e = items.GetAsyncEnumerator()
+            let mutable more = true
+
+            while more do
+                match! e.MoveNextAsync() with
+                | true -> acc.Add e.Current
+                | false -> more <- false
+
+            do! e.DisposeAsync()
+            return acc
         }
 
     [<Test>]
@@ -439,6 +456,103 @@ type LimitsTests() =
                         running.Kill()
                         let! _ = running.WaitAsync()
                         ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Pty composes with cgroup v2: the child gets a controlling terminal AND is a cgroup member``() : Task =
+        task {
+            if isWindows || isMacOs then
+                Assert.Ignore "cgroup v2 + PTY composition is Linux-only (the ctty helper is util-linux setsid --ctty)"
+            else
+                // T-139: Command.Pty and ResourceLimits(Mechanism.CgroupV2) at the same time. The self-
+                // migrating cgroup launcher `exec`s the `setsid --ctty` shim (with any privilege drop nested
+                // inside), so cgroup membership (by the launcher's own pid, written to cgroup.procs before
+                // exec) and the controlling-tty setup compose on one unchanged pid. This proves both halves
+                // of that composition at once: (a) the child really gets a controlling pty (a single merged
+                // stream, never a separate stderr — D3) AND (b) it really runs inside the cgroup (a
+                // cgroup.procs member of the limited group, Mechanism.CgroupV2 — never a silent process-group
+                // fallback). Requires the real cgroup root: the privileged CI leg sets PROCESSKIT_EXPECT_CGROUP
+                // so this *requires* the cgroup path; unprivileged it fails fast and is ignored.
+                let expectCgroup =
+                    Environment.GetEnvironmentVariable "PROCESSKIT_EXPECT_CGROUP" = "1"
+
+                let options =
+                    ProcessGroupOptions().WithMemoryMax(256L * 1024L * 1024L).WithMaxProcesses(64)
+
+                match ProcessGroup.Create options with
+                | Error(ProcessError.ResourceLimit _) when not expectCgroup ->
+                    Assert.Ignore "cgroup v2 limits not enforceable here (not at the real cgroup root)"
+                | Error other -> Assert.Fail $"expected a CgroupV2 group (PROCESSKIT_EXPECT_CGROUP set), got {other}"
+                | Ok group ->
+                    use group = group
+                    // (b) the cgroup v2 mechanism actually engaged, not a silent process-group fallback.
+                    Assert.That(group.Mechanism, Is.EqualTo Mechanism.CgroupV2)
+
+                    // A pty child that proves its controlling terminal in its first output, then sleeps so it
+                    // stays observable while the parent confirms cgroup.procs membership below. `test -t
+                    // 0/1/2` proves all three descriptors are ttys, and opening `/dev/tty` succeeds only when
+                    // the session HAS a controlling terminal — the one `setsid --ctty` set on the pty slave,
+                    // composed AFTER the launcher's cgroup join.
+                    let script =
+                        "if test -t 0 && test -t 1 && test -t 2 && : < /dev/tty; then printf 'CTTY-OK\\n'; "
+                        + "else printf 'CTTY-NO\\n'; fi; sleep 30"
+
+                    let cmd = Command.create "/bin/sh" |> Command.args [ "-c"; script ] |> Command.pty
+
+                    match! group.StartAsync(cmd, CancellationToken.None) with
+                    | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                    | Error other -> Assert.Fail $"unexpected error starting a pty run inside a cgroup: {other}"
+                    | Ok running ->
+                        // Drain the merged pty stream in the background: the child prints CTTY-OK, then
+                        // sleeps, so this completes only once the run is killed below.
+                        let collectTask = collect (running.OutputEventsAsync())
+
+                        // (b) parent-side cgroup.procs membership — the authoritative check the other
+                        // LimitsTests use: the pty child is a real member of the limited group's cgroup.
+                        let mutable memberCount = 0
+                        let mutable attempts = 0
+
+                        while memberCount < 1 && attempts < 200 do
+                            match group.Members() with
+                            | Ok m -> memberCount <- m.Count
+                            | Error e -> Assert.Fail $"members: {e}"
+
+                            if memberCount < 1 then
+                                do! Task.Delay 20
+                                attempts <- attempts + 1
+
+                        Assert.That(
+                            memberCount,
+                            Is.GreaterThanOrEqualTo 1,
+                            "the pty child must be a real cgroup.procs member of the limited group"
+                        )
+
+                        // Tear the run down, then drain the merged stream captured while it ran (the
+                        // streaming verb has already consumed the run, so it — not a separate WaitAsync —
+                        // observes the child's end; disposing the group reaps the tree).
+                        running.Kill()
+                        let! events = collectTask
+
+                        // (a) merged terminal stream: every event is a Stdout event, never a separate stderr,
+                        // under a PTY (D3).
+                        let allStdout =
+                            events
+                            |> Seq.forall (fun e ->
+                                match e with
+                                | OutputEvent.Stdout _ -> true
+                                | OutputEvent.Stderr _ -> false)
+
+                        Assert.That(allStdout, Is.True, "every event under a PTY must be a Stdout event (D3)")
+
+                        // (a) a real controlling terminal even under the cgroup launcher.
+                        let text = events |> Seq.map (fun e -> e.Text) |> String.concat "\n"
+
+                        Assert.That(
+                            text,
+                            Does.Contain "CTTY-OK",
+                            "the pty child must have a real controlling terminal even when spawned via the cgroup launcher"
+                        )
         }
         :> Task
 
