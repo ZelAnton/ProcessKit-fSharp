@@ -26,7 +26,9 @@ type OverflowMode =
     /// output survives.
     | DropOldest
 
-    /// "Head" semantics: keep what is already buffered and discard new lines.
+    /// "Head" semantics: keep a contiguous prefix of what is already buffered and discard new lines.
+    /// Once a byte cap rejects a line, later shorter lines are also discarded rather than filling a
+    /// hole in that prefix.
     | DropNewest
 
     /// Fail-loud ceiling: once the cap would be exceeded the run errors with

@@ -213,6 +213,21 @@ type HostedProcessService
 
     let runSupervision () =
         task {
+            // Force the async boundary *before* any real work, so the whole synchronous supervision
+            // prefix runs off the caller's thread — i.e. off the `gate` that `StartAsync` holds while it
+            // publishes `supervisionTask`. Without this yield, `runSupervision ()`'s synchronous prefix
+            // (the caller-supplied `configureSupervisor` inside `buildSupervisor`, then the native
+            // first-incarnation spawn reached synchronously inside `Supervisor.RunAsync` —
+            // `ProcessGroup.Create()` + `StartInternal`, i.e. CreateProcessW/posix_spawnp) would execute
+            // inline under that lock: it would block every `gate` reader (`IsSupervisionActive`/
+            // `RestartCount`/`IsStormPaused`/`LastOutcome`, and transitively `HostedProcessHealthCheck`)
+            // for the full spawn, run caller code under the service's own lock (a deadlock risk if the
+            // callback touches this service from another thread), and make `StartAsync` slow against the
+            // spirit of `IHostedService`. Publishing the `Task` handle stays synchronous under the lock
+            // (so `StopAsync`/`Dispose`/`DisposeAsync` snapshot exactly this task); only the *run* is
+            // deferred past this point.
+            do! Task.Yield()
+
             try
                 match buildSupervisor () with
                 | Error err ->
@@ -341,6 +356,12 @@ type HostedProcessService
         /// standard `IHostedService` cancellation contract: this returns a cancelled task without
         /// starting supervision or spawning a child. A no-op once `Dispose` has run — `Dispose`
         /// permanently forbids new starts.
+        ///
+        /// Fast and non-blocking: only the state transition (reset `stopping`/counters, publish the
+        /// supervision `Task` handle) runs under `gate`. The actual supervision start — the caller's
+        /// `configureSupervisor` and the native spawn of the first incarnation — is forced off the lock
+        /// by the leading `Task.Yield()` in `runSupervision`, so gate readers (`IsSupervisionActive`
+        /// et al.) are never blocked for the spawn and caller code never runs under the service's lock.
         member _.StartAsync(cancellationToken) =
             if cancellationToken.IsCancellationRequested then
                 Task.FromCanceled cancellationToken
@@ -355,6 +376,13 @@ type HostedProcessService
                         // count / storm-pause flag — this is a new lifetime, not a continuation.
                         restartCount <- 0
                         stormPaused <- false
+                        // `runSupervision ()` yields before any real work (see its leading `Task.Yield()`),
+                        // so this call returns an already-suspended, not-yet-completed task immediately:
+                        // the handle is published under `gate` here (so `StopAsync`/`Dispose`/`DisposeAsync`
+                        // snapshot exactly it, with no "Stop saw a stale/null task" window), while the
+                        // configure-and-spawn prefix runs off the lock. `IsCompleted` is therefore `false`
+                        // the instant the handle is assigned, so a racing second `StartAsync` sees an
+                        // active task and does not start a second supervision loop.
                         supervisionTask <- runSupervision ()
 
                     Task.CompletedTask)
