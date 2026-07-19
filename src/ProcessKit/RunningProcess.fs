@@ -985,18 +985,19 @@ type RunningProcess internal (host: RunningHost) =
 
     /// Run to completion while periodically sampling the child's CPU/memory every `interval`, and
     /// return a `RunProfile`. Drains and discards output (like `WaitAsync`) and reaps the tree.
+    /// A non-positive `interval` (`<= TimeSpan.Zero`) is rejected with `ArgumentOutOfRangeException`
+    /// — a sampling cadence must be a positive duration. Validated up front, before the pipes are
+    /// claimed, so an invalid call neither consumes this one-shot handle nor starts a tight loop.
     member _.ProfileAsync(interval: TimeSpan) : Task<RunProfile> =
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero)
+
         if not (claimBuffered ()) then
             raise (InvalidOperationException alreadyConsumedMessage)
 
         task {
             use _reap = reapGuard ()
 
-            let period =
-                if interval <= TimeSpan.Zero then
-                    TimeSpan.FromMilliseconds 1.0
-                else
-                    interval
+            let period = interval
 
             let mutable samples = 0
             let mutable lastCpu = None

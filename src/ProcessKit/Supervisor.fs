@@ -289,16 +289,24 @@ type Supervisor internal (config: SupervisorConfig) =
     /// killed by its timeout) — so a long-lived service that crashes occasionally restarts promptly
     /// instead of being pinned at the ceiling. `n` is not the lifetime restart count
     /// (`SupervisionOutcome.Restarts`). A `factor` below `1.0` (or non-finite) is treated as `1.0`.
-    /// Default: `200ms × 2.0`.
+    /// A negative `baseDelay` is rejected with `ArgumentOutOfRangeException`; `TimeSpan.Zero` is
+    /// accepted and restarts with no backoff delay. Default: `200ms × 2.0`.
     member _.Backoff(baseDelay: TimeSpan, factor: float) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(baseDelay, TimeSpan.Zero)
+
         Supervisor(
             { config with
                 BackoffBase = baseDelay
                 BackoffFactor = factor }
         )
 
-    /// Cap any single backoff delay (default: 30 s).
+    /// Cap any single backoff delay (default: 30 s). A negative `cap` is rejected with
+    /// `ArgumentOutOfRangeException` — besides being a nonsensical negative ceiling, a negative cap
+    /// would make the healthy-incarnation escalation reset (`result.Duration >= MaxBackoff` in
+    /// `RunAsync`) fire after *every* incarnation, so the backoff would never climb. `TimeSpan.Zero`
+    /// is accepted (every backoff delay is then capped to zero — restart immediately).
     member _.MaxBackoff(cap: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(cap, TimeSpan.Zero)
         Supervisor({ config with MaxBackoff = cap })
 
     /// Multiply each backoff delay by a uniform factor in `[0.5, 1.5)` (default: **on**), so a
@@ -310,13 +318,19 @@ type Supervisor internal (config: SupervisorConfig) =
     /// Enable the **failure-storm guard**: when crash-restarts cluster faster than the failure
     /// score can decay, pause restarts once for `pause` (jittered per `Jitter`), then reset the
     /// score and resume. Off by default. Pauses taken are reported in
-    /// `SupervisionOutcome.StormPauses`.
+    /// `SupervisionOutcome.StormPauses`. A negative `pause` is rejected with
+    /// `ArgumentOutOfRangeException`; `TimeSpan.Zero` is accepted and still counts as a storm pause
+    /// (it resets the score, increments `StormPauses`, and fires `OnStormPause`) but sleeps out no
+    /// real time — enabling the guard's accounting without a wait.
     member _.StormPause(pause: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(pause, TimeSpan.Zero)
         Supervisor({ config with StormPause = Some pause })
 
     /// Half-life of the failure score used by the storm guard (default: 30 s). A zero half-life
-    /// keeps no history. No effect unless `StormPause` is set.
+    /// keeps no history (every failure scores exactly `1.0`). A negative `decay` is rejected with
+    /// `ArgumentOutOfRangeException`. No effect unless `StormPause` is set.
     member _.FailureDecay(decay: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(decay, TimeSpan.Zero)
         Supervisor({ config with FailureDecay = decay })
 
     /// Failure score above which the storm guard trips (default: `5.0`). A non-finite threshold

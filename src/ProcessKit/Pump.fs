@@ -38,6 +38,9 @@ module internal Pump =
         let mutable totalBytes = 0
         let mutable truncated = false
         let mutable tooLarge = false
+        // DropNewest must retain a contiguous prefix: once its byte cap rejects a line (or is
+        // reached exactly), later shorter lines cannot fill a hole in the captured output.
+        let mutable dropNewestByteCapClosed = false
 
         // The retained/total byte counts only matter when a byte cap is set or the fail-loud ceiling
         // is in play; under the default (line-only / unbounded) policy, skip the per-line UTF-8 scan
@@ -67,13 +70,19 @@ module internal Pump =
             let bytes = if needBytes then Encoding.UTF8.GetByteCount line + 1 else 0
             totalLines <- totalLines + 1
             totalBytes <- totalBytes + bytes
-            let full = overLineCap () || wouldOverByteCap bytes
+
+            let full =
+                overLineCap ()
+                || wouldOverByteCap bytes
+                || (policy.Overflow = OverflowMode.DropNewest && dropNewestByteCapClosed)
 
             match policy.Overflow with
             | OverflowMode.Error when full ->
                 // Fail-loud ceiling: count but never retain.
                 tooLarge <- true
-            | OverflowMode.DropNewest when full -> truncated <- true
+            | OverflowMode.DropNewest when full ->
+                truncated <- true
+                dropNewestByteCapClosed <- dropNewestByteCapClosed || wouldOverByteCap bytes
             | OverflowMode.DropOldest when full ->
                 truncated <- true
                 retained.AddLast(struct (line, bytes)) |> ignore
@@ -97,6 +106,11 @@ module internal Pump =
             | _ ->
                 retained.AddLast(struct (line, bytes)) |> ignore
                 retainedBytes <- retainedBytes + bytes
+
+                match policy.MaxBytes with
+                | Some cap when policy.Overflow = OverflowMode.DropNewest && retainedBytes >= cap ->
+                    dropNewestByteCapClosed <- true
+                | _ -> ()
 
     /// The retained bytes of a bounded raw-byte capture, plus whether the byte cap truncated them
     /// (`DropOldest`/`DropNewest`) or tripped the fail-loud ceiling (`Error`), and the cumulative byte

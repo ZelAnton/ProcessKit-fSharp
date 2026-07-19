@@ -72,6 +72,24 @@ type StatsTests() =
         :> Task
 
     [<Test>]
+    member _.``ProfileAsync rejects a non-positive interval``() : Task =
+        task {
+            // The interval is validated before the pipes are claimed, so a synthetic host (no real
+            // child) suffices and the rejected call never consumes the one-shot handle. `use` inside
+            // the task CE disposes the `IAsyncDisposable` handle.
+            use running = new RunningProcess(hostOverCurrentProcess None)
+
+            Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> running.ProfileAsync(TimeSpan.Zero) |> ignore))
+            |> ignore
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () -> running.ProfileAsync(TimeSpan.FromSeconds -1.0) |> ignore)
+            )
+            |> ignore
+        }
+        :> Task
+
+    [<Test>]
     member _.``group Stats reports an active process count``() : Task =
         task {
             use group = create ()
@@ -123,6 +141,20 @@ type StatsTests() =
                 ()
         }
         :> Task
+
+    [<Test>]
+    member _.``SampleStatsAsync rejects a non-positive interval``() =
+        // Rejected eagerly by the call itself (not deferred to enumeration), so no enumerator is
+        // ever produced for a non-positive cadence.
+        use group = create ()
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> group.SampleStatsAsync(TimeSpan.Zero) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> group.SampleStatsAsync(TimeSpan.FromSeconds -1.0) |> ignore)
+        )
+        |> ignore
 
     [<Test>]
     member _.``per-process metrics are available while the child runs``() : Task =
