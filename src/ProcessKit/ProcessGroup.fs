@@ -405,10 +405,12 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// Broadcast `signal` to every process in the group. A member that has already exited (or an
     /// already-empty group) is a best-effort success — that races the target's own exit, not a
-    /// caller error. An invalid delivery — most notably `Signal.Other` with a signal number the
-    /// platform rejects — is a genuine failure and returns `ProcessError.Io` with the errno detail;
-    /// when the group has several members, the first genuine failure is reported but every member
-    /// still receives the signal.
+    /// caller error. `Signal.Other 0` (a liveness *probe* that delivers nothing) and a negative
+    /// number are not deliverable signals at all: they are refused up front with
+    /// `ProcessError.Unsupported`, never a false success, even on an empty group. A number that IS a
+    /// signal but the platform rejects (e.g. an out-of-range `Signal.Other 999`, EINVAL) is a genuine
+    /// delivery failure and returns `ProcessError.Io` with the errno detail; when the group has several
+    /// members, the first genuine failure is reported but every member still receives the signal.
     ///
     /// On **Windows** `Signal.Kill` maps to the atomic Job terminate. `Signal.Int` and `Signal.Term`
     /// are a best-effort soft stop combining two individually-targeted deliveries: a console

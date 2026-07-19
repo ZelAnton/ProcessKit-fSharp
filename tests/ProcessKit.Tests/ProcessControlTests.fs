@@ -13,6 +13,7 @@ open ProcessKit.Native
 type ProcessControlTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    let isMacOs = RuntimeInformation.IsOSPlatform OSPlatform.OSX
 
     let shell (script: string) =
         if isWindows then
@@ -112,6 +113,76 @@ type ProcessControlTests() =
                     ()
         }
         :> Task
+
+    [<Test>]
+    member _.``Signal.Other 0 (and a negative) no longer reports a false success on POSIX``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "Signal.Other is always Unsupported on Windows; the false-success was POSIX-only."
+            else
+                use group = create ()
+
+                match! group.StartAsync sleeper with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok running ->
+                    // Signal 0 is a liveness probe that delivers nothing; with a LIVE child in the group it
+                    // used to return Ok() (a false delivery). It must now be a typed error, not a silent
+                    // success — the honesty regression this task closes.
+                    match group.Signal(Signal.Other 0) with
+                    | Error(ProcessError.Unsupported _) -> ()
+                    | other -> Assert.Fail $"expected Unsupported for Signal.Other 0, got {other}"
+
+                    // A negative number is likewise not a signal, so it is refused the same way.
+                    match group.Signal(Signal.Other(-1)) with
+                    | Error(ProcessError.Unsupported _) -> ()
+                    | other -> Assert.Fail $"expected Unsupported for Signal.Other -1, got {other}"
+
+                    running.Kill()
+                    let! _ = running.WaitAsync()
+                    ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ProcessGroupBackend refuses Signal.Other 0 and negatives before any delivery``() =
+        if isWindows then
+            Assert.Ignore "The POSIX process-group backend is not used on Windows."
+
+        let backend: IContainmentBackend = ProcessGroupBackend()
+
+        // The guard sits at the API boundary (before the per-pgid delivery loop), so it rejects a probe
+        // even on an empty group — no child is needed to prove the false success is gone.
+        for raw in [ 0; -1 ] do
+            match backend.Signal(Signal.Other raw) with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected Unsupported for Signal.Other {raw}, got {other}"
+
+    [<Test>]
+    member _.``CgroupBackend refuses Signal.Other 0 and negatives before any delivery``() =
+        if isWindows || isMacOs then
+            Assert.Ignore "The cgroup v2 backend is Linux-only."
+
+        // The guard short-circuits before cgroup.procs is ever read, so a placeholder path never matters.
+        let backend: IContainmentBackend =
+            CgroupBackend "/nonexistent/processkit-signal-guard-probe"
+
+        for raw in [ 0; -1 ] do
+            match backend.Signal(Signal.Other raw) with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected Unsupported for Signal.Other {raw}, got {other}"
+
+    [<Test>]
+    member _.``signalProcessGroup refuses a non-deliverable number without a false Delivered``() =
+        if isWindows then
+            Assert.Ignore "killpg-based process-group signalling is POSIX-only."
+
+        // The guard returns before killpg, so the pgid is never actually signalled — any value stands in.
+        // The primitive must report DeliveryFailed, never the Delivered that killpg(pgid, 0)'s success
+        // return would otherwise yield (the false success this fixes, one layer below the backend).
+        for raw in [ 0; -1 ] do
+            match Native.Posix.signalProcessGroup 999999 raw with
+            | Native.Common.SignalDelivery.DeliveryFailed _ -> ()
+            | other -> Assert.Fail $"expected DeliveryFailed for signal {raw}, got {other}"
 
     [<Test>]
     member _.``Signal on an empty/concluded group still returns Ok``() : Task =

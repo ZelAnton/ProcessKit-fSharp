@@ -41,7 +41,12 @@ type Signal =
     /// `SIGUSR2` — user-defined.
     | Usr2
 
-    /// A raw signal number, passed through verbatim (Unix only). It must be a valid signal; it
-    /// lands in the *signal* argument of `kill(pid, sig)` (never the pid/target), so an
-    /// out-of-range value simply fails the send — it cannot retarget the signal.
+    /// A raw signal number, passed through verbatim (Unix only). It must be a real, *deliverable*
+    /// signal (`>= 1`): it lands in the *signal* argument of `kill(pid, sig)` (never the pid/target),
+    /// so an out-of-range value cannot retarget the signal — it simply fails the send. The number
+    /// **0** is rejected rather than sent: `kill`/`killpg` with signal 0 is a *liveness probe* that
+    /// only checks the target exists (and the caller may signal it) and delivers nothing, so accepting
+    /// it would report a successful delivery while doing nothing. A **negative** number is likewise not
+    /// a signal and is refused. Both fail with a typed `ProcessError` (not an exception) — never a
+    /// silent success. Always unsupported on Windows.
     | Other of SignalNumber: int
