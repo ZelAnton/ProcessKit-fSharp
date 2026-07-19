@@ -4,7 +4,9 @@ open System
 open System.Collections.Concurrent
 open System.Diagnostics
 open System.Diagnostics.Metrics
+open System.IO
 open System.Runtime.InteropServices
+open System.Text
 open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
@@ -121,6 +123,29 @@ type LoggingTests() =
 
         listener.Start()
         listener, activeDeltas, (fun () -> startedCount), (fun () -> completedCount)
+
+    // A minimal synthetic `RunningHost` for the T-158 reapGuard-fault-abandon tests below: no real
+    // process behind it — `Wait`/`Stdout`/`Stderr` are swapped in per test (`{ baseHost cfg with ... }`)
+    // to simulate a buffered verb faulting before it reaches its own `conclude outcome`.
+    let baseHost (config: CommandConfig) : RunningHost =
+        { Config = config
+          Pid = None
+          Stdout = None
+          Stderr = None
+          Stdin = None
+          StartTime = DateTime.UtcNow
+          StartedTimestamp = Stopwatch.GetTimestamp()
+          StartTimeIdentity = None
+          Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+          StdinError = fun () -> None
+          StdinFeedComplete = ignore
+          StartKill = ignore
+          GracefulKill = fun _ -> Task.CompletedTask
+          ResizePty = None
+          Teardown = fun () -> ValueTask() }
+
+    let memoryStream (text: string) : Stream =
+        new MemoryStream(Encoding.UTF8.GetBytes text) :> Stream
 
     [<Test>]
     member _.``a run logs spawn and exit``() : Task =
@@ -359,6 +384,190 @@ type LoggingTests() =
             Assert.That(started (), Is.EqualTo 1L)
             Assert.That(completed (), Is.EqualTo 1L, "a run through a terminal verb must count as completed")
             Assert.That(activeDeltas |> Seq.sum, Is.EqualTo 0L, "active must settle at zero, not go negative")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a fault before conclude in OutputStringAsync still clears runs.active (T-158)``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            // A throwing OnStdoutLine handler faults the stdout pump before `OutputStringAsync` ever
+            // reaches its own `conclude outcome` — `reapGuard`'s `DisposeAsync` must still clear
+            // `runs.active` on this unwind (T-158's leak).
+            let config =
+                (Command.create "test"
+                 |> Command.onStdoutLine (fun _ -> raise (InvalidOperationException "boom")))
+                    .Config
+
+            let host =
+                { baseHost config with
+                    Stdout = Some(memoryStream "line1\n") }
+
+            use running = new RunningProcess(host)
+
+            let mutable caught = false
+
+            try
+                let! _ = running.OutputStringAsync()
+                ()
+            with _ ->
+                caught <- true
+
+            Assert.That(caught, Is.True, "the throwing OnStdoutLine handler must fault the verb")
+            Assert.That(started (), Is.EqualTo 1L)
+            Assert.That(completed (), Is.EqualTo 0L, "a verb that faulted before conclude must not count as completed")
+
+            Assert.That(
+                activeDeltas |> Seq.sum,
+                Is.EqualTo 0L,
+                "runs.active must return to zero after an OutputStringAsync verb-fault"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a fault before conclude in OutputBytesAsync still clears runs.active (T-158)``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            // The raw stdout capture has no per-line hook, so drive the fault through the (line-pumped)
+            // stderr side instead — a throwing OnStderrLine handler faults the verb before it ever
+            // reaches `conclude outcome`.
+            let config =
+                (Command.create "test"
+                 |> Command.onStderrLine (fun _ -> raise (InvalidOperationException "boom")))
+                    .Config
+
+            let host =
+                { baseHost config with
+                    Stderr = Some(memoryStream "line1\n") }
+
+            use running = new RunningProcess(host)
+
+            let mutable caught = false
+
+            try
+                let! _ = running.OutputBytesAsync()
+                ()
+            with _ ->
+                caught <- true
+
+            Assert.That(caught, Is.True, "the throwing OnStderrLine handler must fault the verb")
+            Assert.That(started (), Is.EqualTo 1L)
+            Assert.That(completed (), Is.EqualTo 0L, "a verb that faulted before conclude must not count as completed")
+
+            Assert.That(
+                activeDeltas |> Seq.sum,
+                Is.EqualTo 0L,
+                "runs.active must return to zero after an OutputBytesAsync verb-fault"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a fault before conclude in WaitAsync still clears runs.active (T-158)``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            // The exit wait itself faults (no configured timeout, so `waitWithTimeout` returns
+            // `host.Wait()` unmodified) — `WaitAsync` never reaches `conclude outcome`.
+            let config = (Command.create "test").Config
+
+            let host =
+                { baseHost config with
+                    Wait = fun () -> Task.FromException<Outcome>(InvalidOperationException "wait-boom") }
+
+            use running = new RunningProcess(host)
+
+            let mutable caught = false
+
+            try
+                let! _ = running.WaitAsync()
+                ()
+            with _ ->
+                caught <- true
+
+            Assert.That(caught, Is.True, "the faulted exit wait must fault the verb")
+            Assert.That(started (), Is.EqualTo 1L)
+            Assert.That(completed (), Is.EqualTo 0L, "a verb that faulted before conclude must not count as completed")
+
+            Assert.That(
+                activeDeltas |> Seq.sum,
+                Is.EqualTo 0L,
+                "runs.active must return to zero after a WaitAsync verb-fault"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a fault before conclude in ProfileAsync still clears runs.active (T-158)``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            let config = (Command.create "test").Config
+
+            let host =
+                { baseHost config with
+                    Wait = fun () -> Task.FromException<Outcome>(InvalidOperationException "wait-boom") }
+
+            use running = new RunningProcess(host)
+
+            let mutable caught = false
+
+            try
+                let! _ = running.ProfileAsync(TimeSpan.FromMilliseconds 50.0)
+                ()
+            with _ ->
+                caught <- true
+
+            Assert.That(caught, Is.True, "the faulted exit wait must fault the verb")
+            Assert.That(started (), Is.EqualTo 1L)
+            Assert.That(completed (), Is.EqualTo 0L, "a verb that faulted before conclude must not count as completed")
+
+            Assert.That(
+                activeDeltas |> Seq.sum,
+                Is.EqualTo 0L,
+                "runs.active must return to zero after a ProfileAsync verb-fault"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a fault before conclude in StopAsync still clears runs.active (T-158)``() : Task =
+        task {
+            let listener, activeDeltas, started, completed = listenToRunMetrics ()
+            use _listener = listener
+
+            let config = (Command.create "test").Config
+
+            let host =
+                { baseHost config with
+                    Wait = fun () -> Task.FromException<Outcome>(InvalidOperationException "wait-boom") }
+
+            use running = new RunningProcess(host)
+
+            let mutable caught = false
+
+            try
+                let! _ = running.StopAsync(TimeSpan.Zero)
+                ()
+            with _ ->
+                caught <- true
+
+            Assert.That(caught, Is.True, "the faulted exit wait must fault the verb")
+            Assert.That(started (), Is.EqualTo 1L)
+            Assert.That(completed (), Is.EqualTo 0L, "a verb that faulted before conclude must not count as completed")
+
+            Assert.That(
+                activeDeltas |> Seq.sum,
+                Is.EqualTo 0L,
+                "runs.active must return to zero after a StopAsync verb-fault"
+            )
         }
         :> Task
 

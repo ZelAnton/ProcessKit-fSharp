@@ -80,6 +80,14 @@ module internal Posix =
     [<Literal>]
     let private ESRCH = 3
 
+    // errno EINVAL — "invalid argument", the kernel's verdict on an out-of-range signal *number*. Used
+    // for the synthetic classification of a non-deliverable number (signal 0 / a negative) that
+    // `signalProcessGroup` refuses *before* the syscall, so a probe never masquerades as a delivered
+    // signal. Signal 0 is not itself an EINVAL to `killpg` (it is a liveness probe that returns success),
+    // which is exactly why it must be refused here rather than run.
+    [<Literal>]
+    let private EINVAL = 22
+
     let private isMacOs = RuntimeInformation.IsOSPlatform OSPlatform.OSX
 
     [<DllImport("libc", SetLastError = true)>]
@@ -539,11 +547,47 @@ module internal Posix =
         | Signal.Usr2 -> if isMacOs then 31 else 12
         | Signal.Other n -> n
 
+    /// Whether `signalNum` is a signal that can actually be *delivered*. A real signal is `>= 1`; the
+    /// number 0 is a liveness *probe* (`kill`/`killpg` with a zero number only checks the target's
+    /// existence/permissions and delivers nothing, yet returns success), and a negative number is not a
+    /// signal at all — neither may ever be mistaken for a delivered signal.
+    let isDeliverableSignal (signalNum: int) : bool = signalNum >= 1
+
+    /// Reject a non-deliverable signal number at the API boundary, *before* any native delivery, as the
+    /// typed error the signal verbs return in their `Result` channel — never an exception, and never the
+    /// false `Ok()` that running `killpg(pgid, 0)` (a probe that reports success while delivering nothing)
+    /// used to produce. Both POSIX backends (`ProcessGroupBackend.Signal` / `CgroupBackend.Signal`) funnel
+    /// through this, so signal 0 (and negatives) fail honestly regardless of whether the group currently
+    /// has members — the per-pgid / per-member delivery loops would otherwise skip a probe entirely on an
+    /// empty group and report a vacuous success. `signalPid` deliberately keeps signal 0 usable as a bare
+    /// liveness probe (its callers ask for existence, not delivery), so it is *not* routed through here.
+    let ensureDeliverable (signalNum: int) : Result<unit, ProcessError> =
+        if isDeliverableSignal signalNum then
+            Ok()
+        else
+            Error(
+                ProcessError.Unsupported(
+                    $"signal {signalNum} is a liveness probe, not a deliverable signal: kill/killpg with signal 0 only "
+                    + "checks that the target exists and delivers nothing (and a negative number is not a signal at all) "
+                    + "— pass Signal.Other with a real signal number (>= 1)"
+                )
+            )
+
     /// Broadcast a raw signal to a POSIX process group via `killpg`, classifying the outcome (see
-    /// `SignalDelivery`) instead of collapsing every non-zero errno into "not delivered".
+    /// `SignalDelivery`) instead of collapsing every non-zero errno into "not delivered". A non-deliverable
+    /// number (signal 0 — a liveness probe — or a negative) is refused *before* the syscall, so the
+    /// primitive itself can never report a probe as `Delivered` the way `killpg(pgid, 0)`'s success return
+    /// otherwise would. The API boundary (`ensureDeliverable`, called by both POSIX backends) already turns
+    /// that into a typed error; this is the low-level safety net for any direct caller.
     let signalProcessGroup (pgid: int) (signalNum: int) : SignalDelivery =
-        observeGroupDelivery pgid
-        classifySignalDelivery (killpg (pgid, signalNum))
+        if not (isDeliverableSignal signalNum) then
+            SignalDelivery.DeliveryFailed(
+                EINVAL,
+                $"signal {signalNum} is a liveness probe / non-signal, not a deliverable signal — refused before killpg"
+            )
+        else
+            observeGroupDelivery pgid
+            classifySignalDelivery (killpg (pgid, signalNum))
 
     /// Freeze a POSIX process group (SIGSTOP), classifying the delivery outcome.
     let suspendProcessGroup (pgid: int) : SignalDelivery =

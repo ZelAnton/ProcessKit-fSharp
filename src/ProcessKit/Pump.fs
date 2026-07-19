@@ -230,13 +230,13 @@ module internal Pump =
             let mutable p = start
 
             while p < stop do
-                if line.Length >= cap then
+                if line.Length > 0 && line.Length >= cap then
                     do! onLine (line.ToString())
                     line.Clear() |> ignore
                     line.Append buffer[p] |> ignore
                     p <- p + 1
                 else
-                    let budget = cap - line.Length
+                    let budget = max 1 (cap - line.Length)
                     let take = min budget (stop - p)
                     line.Append(buffer, p, take) |> ignore
                     p <- p + take

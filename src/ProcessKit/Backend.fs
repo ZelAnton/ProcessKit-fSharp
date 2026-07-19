@@ -405,11 +405,20 @@ type internal CgroupBackend(cgroupPath: string) =
             | _ ->
                 let signalNum = Native.Posix.signalNumber signal
 
-                match Native.Cgroup.signalCgroup cgroupPath signalNum with
-                | Native.Common.SignalDelivery.Delivered
-                | Native.Common.SignalDelivery.TargetGone -> Ok()
-                | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
-                    Error(ProcessError.Io $"failed to deliver signal {signalNum} to cgroup: {message} (errno {errno})")
+                // Refuse a non-deliverable number (signal 0 — a liveness probe — or a negative) at the API
+                // boundary, before the identity-safe pidfd broadcast, so it can never look like a delivered
+                // signal. This also covers an empty cgroup, where the per-member broadcast would otherwise
+                // signal nobody and report a vacuous success.
+                match Native.Posix.ensureDeliverable signalNum with
+                | Error error -> Error error
+                | Ok() ->
+                    match Native.Cgroup.signalCgroup cgroupPath signalNum with
+                    | Native.Common.SignalDelivery.Delivered
+                    | Native.Common.SignalDelivery.TargetGone -> Ok()
+                    | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
+                        Error(
+                            ProcessError.Io $"failed to deliver signal {signalNum} to cgroup: {message} (errno {errno})"
+                        )
 
         member _.Suspend() =
             match Native.Cgroup.freezeCgroup cgroupPath true with
@@ -560,30 +569,39 @@ type internal ProcessGroupBackend() =
 
         member _.Signal(signal) =
             let signalNum = Native.Posix.signalNumber signal
-            let mutable firstFailure: (int * string) option = None
 
-            // Broadcast to every tracked pgid that is still ours; a pgid recycled since it was tracked
-            // (the choke reports it gone) is pruned and never signalled — the wrong-target delivery this
-            // closes. A member that has already exited (ESRCH) must not abort delivery to the rest, and
-            // only the first genuine delivery failure (e.g. EINVAL for an invalid signal number) is
-            // reported.
-            for pgid in children.Snapshot() do
-                if stillOurs pgid then
-                    match Native.Posix.signalProcessGroup pgid signalNum with
-                    | Native.Common.SignalDelivery.Delivered
-                    | Native.Common.SignalDelivery.TargetGone -> ()
-                    | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
-                        if firstFailure.IsNone then
-                            firstFailure <- Some(errno, message)
-                else
-                    untrack pgid |> ignore
+            // Refuse a non-deliverable number (signal 0 — a liveness probe — or a negative) at the API
+            // boundary, before the delivery loop, so it can never look like a delivered signal. This also
+            // covers a group whose pgids have all drained/recycled, where the loop would otherwise signal
+            // nobody and report a vacuous success.
+            match Native.Posix.ensureDeliverable signalNum with
+            | Error error -> Error error
+            | Ok() ->
+                let mutable firstFailure: (int * string) option = None
 
-            match firstFailure with
-            | None -> Ok()
-            | Some(errno, message) ->
-                Error(
-                    ProcessError.Io $"failed to deliver signal {signalNum} to process group: {message} (errno {errno})"
-                )
+                // Broadcast to every tracked pgid that is still ours; a pgid recycled since it was tracked
+                // (the choke reports it gone) is pruned and never signalled — the wrong-target delivery this
+                // closes. A member that has already exited (ESRCH) must not abort delivery to the rest, and
+                // only the first genuine delivery failure (e.g. EINVAL for an invalid signal number) is
+                // reported.
+                for pgid in children.Snapshot() do
+                    if stillOurs pgid then
+                        match Native.Posix.signalProcessGroup pgid signalNum with
+                        | Native.Common.SignalDelivery.Delivered
+                        | Native.Common.SignalDelivery.TargetGone -> ()
+                        | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
+                            if firstFailure.IsNone then
+                                firstFailure <- Some(errno, message)
+                    else
+                        untrack pgid |> ignore
+
+                match firstFailure with
+                | None -> Ok()
+                | Some(errno, message) ->
+                    Error(
+                        ProcessError.Io
+                            $"failed to deliver signal {signalNum} to process group: {message} (errno {errno})"
+                    )
 
         member _.Suspend() =
             let mutable firstFailure: (int * string) option = None

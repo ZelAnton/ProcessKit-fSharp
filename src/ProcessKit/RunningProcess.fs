@@ -677,6 +677,12 @@ type RunningProcess internal (host: RunningHost) =
                 // Unblock a writer parked on bounded-stream backpressure before/while tearing down, so
                 // it can't outlive this scope (see `disposalCts`'s own comment above).
                 disposalCts.Cancel()
+                // Clear `runs.active` for a verb that faults before reaching its own `conclude outcome`
+                // (e.g. a throwing `OnStdoutLine`/`OnStderrLine` handler, or a faulted exit wait) — a
+                // no-op (guarded by `RunTelemetryScope`'s once-guard) on the ordinary success path,
+                // where `conclude outcome` already claimed it before this scope exits. Mirrors the outer
+                // `RunningProcess.DisposeAsync`'s own `markAbandoned()` call below, for the same reason.
+                markAbandoned ()
                 host.Teardown() }
 
     // Observe any fault on an otherwise fire-and-forget outcome task, so it can never surface as an

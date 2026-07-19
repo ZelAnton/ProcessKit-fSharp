@@ -616,6 +616,30 @@ type PumpTests() =
         CollectionAssert.AreEqual([ "aaa"; "bbb"; "c" ], segments)
 
     [<Test>]
+    member _.``readLines with a zero cap emits only real content segments``() =
+        // A zero cap must still consume the input, but it must not force-flush the initially empty line.
+        use stream = new MemoryStream(Encoding.UTF8.GetBytes "abc")
+        let segments = ResizeArray<string>()
+        let buf = Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes 0)
+
+        (Pump.readLines
+            stream
+            Encoding.UTF8
+            LineTerminator.Lf
+            None
+            (fun l ->
+                segments.Add l
+                buf.Add l
+                ValueTask.CompletedTask)
+            (Some 0)
+            CancellationToken.None)
+            .Wait()
+
+        CollectionAssert.AreEqual([ "a"; "b"; "c" ], segments)
+        Assert.That(buf.TotalLines, Is.EqualTo 3)
+        Assert.That(buf.TotalBytes, Is.EqualTo 6)
+
+    [<Test>]
     member _.``readLines force-flush segments stay aligned when the cap boundary coincides with the 8192-char read boundary``
         ()
         =
