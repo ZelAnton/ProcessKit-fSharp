@@ -215,6 +215,24 @@ type DependencyInjectionTests() =
         :> Task
 
     [<Test>]
+    member _.``A duplicate client name is rejected instead of silently dropping the second program``() =
+        let services = ServiceCollection()
+        services.AddProcessKitClient("git", "git") |> ignore
+
+        // Registering a different program under the same key is a configuration mistake; the underlying
+        // TryAddKeyedSingleton would silently keep the first and drop this one — reject it honestly.
+        try
+            services.AddProcessKitClient("git", "hg") |> ignore
+            Assert.Fail "expected a duplicate client name to be rejected"
+        with :? InvalidOperationException as ex ->
+            Assert.That(ex.Message, Does.Contain "git")
+
+        // The first registration is intact and unchanged (still targets the original program).
+        use provider = services.BuildServiceProvider()
+        let client = provider.GetRequiredKeyedService<CliClient> "git"
+        Assert.That(client.Command([ "status" ]).Program, Is.EqualTo "git")
+
+    [<Test>]
     member _.``AddProcessKitGroup shares a container-managed group; disposing the provider reaps its children``
         ()
         : Task =

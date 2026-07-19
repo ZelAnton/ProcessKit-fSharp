@@ -10,11 +10,39 @@ open Microsoft.Extensions.Logging.Abstractions
 open Microsoft.Extensions.Options
 open ProcessKit
 
+module private Registration =
+
+    /// True when `services` already carries a keyed `HostedProcessService` registered under `name` —
+    /// the marker `AddProcessKitHostedProcess` uses to reject a duplicate name rather than silently
+    /// dropping the second call's `command`/`configureSupervisor` (see that method's doc comment).
+    /// Reading `descriptor.ServiceKey` is only valid on a keyed descriptor, so `IsKeyedService` is
+    /// checked first (the `&&` short-circuits).
+    let hasHostedProcess (services: IServiceCollection) (name: string) : bool =
+        services
+        |> Seq.exists (fun descriptor ->
+            descriptor.IsKeyedService
+            && descriptor.ServiceType = typeof<HostedProcessService>
+            && (match descriptor.ServiceKey with
+                | :? string as existing -> String.Equals(existing, name, StringComparison.Ordinal)
+                | _ -> false))
+
 /// `IServiceCollection.AddProcessKitHostedProcess()` extensions.
 [<Extension>]
 type HostedServiceCollectionExtensions =
 
     /// Register one supervised child process as an `IHostedService`.
+    ///
+    /// The `name` must be unique across `AddProcessKitHostedProcess` calls on this `IServiceCollection`.
+    /// Registering a second process under a name already in use throws `InvalidOperationException`
+    /// rather than silently taking the first registration and dropping this call's `command`/
+    /// `configureSupervisor` (which the underlying `TryAddKeyedSingleton` would otherwise do), and
+    /// rather than adding a second `IHostedService` that resolves to the very same keyed instance —
+    /// so the host would `StartAsync`/`StopAsync` one service twice. A differing second registration
+    /// under the same name is a configuration mistake, so it is surfaced honestly instead of downgraded
+    /// to a partial no-op; register the second process under a different name. This mirrors
+    /// `AddProcessKitClient`, which rejects a duplicate client name the same way. (`AddProcessKit` /
+    /// `AddProcessKitGroup` are unnamed idempotent registrations and keep their first-wins `TryAdd`
+    /// semantics — repeating them is benign, not a mistake.)
     [<Extension>]
     static member AddProcessKitHostedProcess
         (services: IServiceCollection, name: string, command: Command, configureSupervisor: Func<Supervisor, Supervisor>) : IServiceCollection =
@@ -22,6 +50,12 @@ type HostedServiceCollectionExtensions =
         ArgumentNullException.ThrowIfNull name
         ArgumentNullException.ThrowIfNull command
         ArgumentNullException.ThrowIfNull configureSupervisor
+
+        if Registration.hasHostedProcess services name then
+            raise (
+                InvalidOperationException
+                    $"A ProcessKit hosted process named '{name}' is already registered. Each AddProcessKitHostedProcess name must be unique; register the second process under a different name."
+            )
 
         services.AddOptions() |> ignore
 

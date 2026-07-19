@@ -881,3 +881,33 @@ type HostedProcessTests() =
                     $"expected a predicate-matched outcome (from the combined host-stop predicate), got %A{other}"
         }
         :> Task
+
+    [<Test>]
+    member _.``A duplicate hosted-process name is rejected, so the second registration is never silently dropped``() =
+        let services = ServiceCollection()
+
+        services.AddProcessKitHostedProcess("worker", Command.create "first") |> ignore
+
+        // The second registration under the same name differs (a different command); it must not be
+        // silently discarded by the underlying TryAdd — it is a configuration mistake, surfaced honestly.
+        try
+            services.AddProcessKitHostedProcess("worker", Command.create "second") |> ignore
+            Assert.Fail "expected a duplicate hosted-process name to be rejected"
+        with :? InvalidOperationException as ex ->
+            Assert.That(ex.Message, Does.Contain "worker")
+
+        // The rejected duplicate left no second IHostedService behind: exactly one is registered, so the
+        // host starts/stops the single keyed service exactly once (the previously hidden double-start bug).
+        use provider = services.BuildServiceProvider()
+        let hostedServices = provider.GetServices<IHostedService>() |> Seq.toList
+        Assert.That(hostedServices.Length, Is.EqualTo 1)
+
+    [<Test>]
+    member _.``Distinct hosted-process names each register their own IHostedService``() =
+        let services = ServiceCollection()
+        services.AddProcessKitHostedProcess("alpha", Command.create "first") |> ignore
+        services.AddProcessKitHostedProcess("beta", Command.create "second") |> ignore
+
+        use provider = services.BuildServiceProvider()
+        let hostedServices = provider.GetServices<IHostedService>() |> Seq.length
+        Assert.That(hostedServices, Is.EqualTo 2)

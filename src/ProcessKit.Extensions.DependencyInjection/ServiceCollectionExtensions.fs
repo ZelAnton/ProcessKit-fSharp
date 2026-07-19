@@ -81,6 +81,20 @@ module internal DiInternals =
         | null -> withDefaults
         | factory -> LoggingRunner(withDefaults, factory.CreateLogger "ProcessKit") :> IProcessRunner
 
+    /// True when `services` already carries a keyed `CliClient` registered under `name` — the marker
+    /// `AddProcessKitClient` uses to reject a duplicate name rather than silently dropping the second
+    /// call's `program`/`configure` (see that method's doc comment). Reading `descriptor.ServiceKey`
+    /// is only valid on a keyed descriptor, so `IsKeyedService` is checked first (the `&&`
+    /// short-circuits).
+    let hasClient (services: IServiceCollection) (name: string) : bool =
+        services
+        |> Seq.exists (fun descriptor ->
+            descriptor.IsKeyedService
+            && descriptor.ServiceType = typeof<CliClient>
+            && (match descriptor.ServiceKey with
+                | :? string as existing -> String.Equals(existing, name, StringComparison.Ordinal)
+                | _ -> false))
+
 /// `IServiceCollection.AddProcessKit()` / `AddProcessKitClient()` / `AddProcessKitGroup()` extensions.
 [<Extension>]
 type ServiceCollectionExtensions =
@@ -127,13 +141,30 @@ type ServiceCollectionExtensions =
     /// `IProcessRunner` when present (so it is logger-aware and honours a shared group / test runner),
     /// otherwise a default `JobRunner`. `configure` applies shared defaults via the `CliClient` builder
     /// (`WithDefaults` — timeout, working directory, environment, encoding, ok-codes, …).
+    ///
+    /// The `name` must be unique across `AddProcessKitClient` calls on this `IServiceCollection`.
+    /// Registering a second client under a name already in use throws `InvalidOperationException`
+    /// rather than silently taking the first registration and dropping this call's `program`/`configure`
+    /// (which the underlying `TryAddKeyedSingleton` would otherwise do). A differing second registration
+    /// under the same name is a configuration mistake, so it is surfaced honestly instead of downgraded
+    /// to a silent no-op; register the second client under a different name. This mirrors
+    /// `AddProcessKitHostedProcess`, which rejects a duplicate process name the same way. (`AddProcessKit`
+    /// / `AddProcessKitGroup` are unnamed idempotent registrations and keep their first-wins `TryAdd`
+    /// semantics — repeating them is benign, not a mistake.)
     [<Extension>]
     static member AddProcessKitClient
         (services: IServiceCollection, name: string, program: string, configure: Func<CliClient, CliClient>)
         : IServiceCollection =
+        ArgumentNullException.ThrowIfNull services
         ArgumentNullException.ThrowIfNull name
         ArgumentNullException.ThrowIfNull program
         ArgumentNullException.ThrowIfNull configure
+
+        if DiInternals.hasClient services name then
+            raise (
+                InvalidOperationException
+                    $"A ProcessKit client named '{name}' is already registered. Each AddProcessKitClient name must be unique; register the second client under a different name."
+            )
 
         services.TryAddKeyedSingleton<CliClient>(
             name,
