@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProcessGroup.ShutdownAsync(gracePeriod)` now guarantees the container is released even when the graceful-kill stage throws or its task faults, instead of leaving the Job handle/cgroup/process group unreleased forever; the original exception still propagates to the caller.
 - Windows CTRL+BREAK delivery now refuses an unavailable child process ID instead of broadcasting CTRL+BREAK to the caller's console group when `GetProcessId` fails.
 - `ProcessKit.Extensions.Hosting`: `HostedProcessService.StartAsync` no longer holds the service's internal lock across the synchronous supervision start — the caller's `configureSupervisor` callback and the native spawn of the first incarnation now run off the lock. `StartAsync` returns promptly per the `IHostedService` contract, observers reading `IsSupervisionActive`/`RestartCount`/`IsStormPaused`/`LastOutcome` (and the hosted-process health check) are no longer blocked for the duration of the spawn, and a `configureSupervisor` that touches the same service from another thread can no longer deadlock; start idempotency and Start/Stop/Dispose races are unchanged.
+- Fixed `OverflowMode.DropNewest` with `OutputBufferPolicy.MaxBytes` retaining later short lines after an over-cap line, so buffered text now always remains a contiguous prefix of the process output.
 
 ## [2.4.2] - 2026-07-13
 

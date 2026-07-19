@@ -427,6 +427,18 @@ type PumpTests() =
         Assert.That(buf.Truncated, Is.True)
 
     [<Test>]
+    member _.``LineBuffer DropNewest keeps a contiguous prefix after a byte-cap rejection``() =
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes(10).WithOverflow OverflowMode.DropNewest)
+
+        [ "aaaa"; String('b', 11); "cc" ] |> List.iter buf.Add
+
+        Assert.That(buf.Text, Is.EqualTo "aaaa")
+        Assert.That(buf.Truncated, Is.True)
+        Assert.That(buf.TotalLines, Is.EqualTo 3)
+        Assert.That(buf.TotalBytes, Is.EqualTo 20)
+
+    [<Test>]
     member _.``LineBuffer Error with no limits retains all lines``() =
         let buf =
             Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithOverflow OverflowMode.Error)
@@ -539,6 +551,18 @@ type PumpTests() =
         Assert.That(buf.TotalLines, Is.EqualTo 100_000)
         Assert.That(buf.Truncated, Is.True)
         Assert.That(Encoding.UTF8.GetByteCount buf.Text, Is.LessThanOrEqualTo 10)
+
+    [<Test>]
+    member _.``LineBuffer DropNewest byte cap keeps a contiguous prefix after rejecting a long line``() =
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes(10).WithOverflow OverflowMode.DropNewest)
+
+        [ "aaaa"; String('b', 11); "cc" ] |> List.iter buf.Add
+
+        Assert.That(buf.Text, Is.EqualTo "aaaa")
+        Assert.That(buf.Truncated, Is.True)
+        Assert.That(buf.TotalLines, Is.EqualTo 3)
+        Assert.That(buf.TotalBytes, Is.EqualTo 20)
 
     [<Test>]
     member _.``LineBuffer under a byte cap alone bounds an empty-line flood with Error``() =
