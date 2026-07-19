@@ -367,6 +367,23 @@ type CommandTests() =
         Assert.That(dropped.Config.Gid, Is.EqualTo(Some 1000))
         Assert.That(dropped.Config.Groups, Is.EqualTo(Some [ 27; 44 ]))
 
+    // ---- Pty + InheritStdin builder-boundary conflict (T-159) ---------------------------------
+    // A PTY replaces the child's stdin with its own pty slave/ConPTY input pipe, so InheritStdin
+    // would be silently ignored under it (previously a quiet downgrade). Mirrors the existing
+    // Setsid+Pty guard pair (PtyTests: "Pty then Setsid is rejected (D8)" / reverse order).
+
+    [<Test>]
+    member _.``Pty then InheritStdin is rejected``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> (Command.create "cmd" |> Command.pty).InheritStdin() |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``InheritStdin then Pty is rejected, reverse order``() =
+        Assert.Throws<ArgumentException>(Action(fun () -> ((Command.create "cmd").InheritStdin()).Pty() |> ignore))
+        |> ignore
+
     // ---- LineTerminator -----------------------------------------------------------------------
 
     [<Test>]

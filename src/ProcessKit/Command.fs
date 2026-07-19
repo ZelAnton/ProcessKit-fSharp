@@ -273,16 +273,21 @@ module internal CommandConfig =
     let private ptySetsidReason =
         "Setsid detaches the child into a new session with NO controlling terminal, whereas Pty gives it a new session WITH a controlling pseudo-terminal — the two are contradictory"
 
+    [<Literal>]
+    let private ptyInheritStdinReason =
+        "a PTY replaces the child's stdin with the pty slave/ConPTY input pipe, so there is no way to also hand it the parent's own standard input — InheritStdin would be silently ignored"
+
     /// The `ArgumentException` for combining `Pty` with a knob a pseudo-terminal cannot honour. Named after
     /// the offending knob so the message points at whichever of the pair was set second, per the project's
     /// "reject conflicts at the builder boundary, never a silent downgrade" rule.
     let private ptyConflict (knob: string) (reason: string) =
         ArgumentException($"{knob} cannot be combined with Pty: {reason}. Drop one of the two.", knob)
 
-    /// Guard `Pty(...)`: reject it when a separate-stderr observation hook (`StderrTee`/`OnStderrLine`, D4)
-    /// or `Setsid` (D8) is already set. A PTY implies OS-level merge semantics (one terminal stream, no
-    /// separate stderr) and a controlling pseudo-terminal (contradicting `Setsid`'s controlling-tty-less
-    /// new session).
+    /// Guard `Pty(...)`: reject it when a separate-stderr observation hook (`StderrTee`/`OnStderrLine`, D4),
+    /// `Setsid` (D8), or `InheritStdin` is already set. A PTY implies OS-level merge semantics (one terminal
+    /// stream, no separate stderr), a controlling pseudo-terminal (contradicting `Setsid`'s
+    /// controlling-tty-less new session), and its own stdin device (contradicting `InheritStdin`'s promise
+    /// of the parent's own standard input).
     let ensurePtyCompatible (config: CommandConfig) =
         if config.StderrTee.IsSome then
             raise (ptyConflict "StderrTee" ptyMergedStreamReason)
@@ -292,6 +297,9 @@ module internal CommandConfig =
 
         if config.Setsid then
             raise (ptyConflict "Setsid" ptySetsidReason)
+
+        if Stdin.isInherit config.StdinSource then
+            raise (ptyConflict "InheritStdin" ptyInheritStdinReason)
 
     /// Guard `StderrTee`/`OnStderrLine`: reject them when `Pty` is already set — the mirror of
     /// `ensurePtyCompatible`'s observer checks, so the conflict is caught in either chaining order.
@@ -333,8 +341,10 @@ module internal CommandConfig =
         | Some source when Stdin.isInherit (Some source) -> raise (stdinInheritConflict knob)
         | _ -> ()
 
-    /// Guard `InheritStdin`: reject it when a feeder source (`Stdin`) or `KeepStdinOpen` is already set —
-    /// the mirror of `ensureNoStdinInherit`, so the conflict is caught in either chaining order.
+    /// Guard `InheritStdin`: reject it when a feeder source (`Stdin`), `KeepStdinOpen`, or `Pty` is already
+    /// set. The first two mirror `ensureNoStdinInherit`, so the conflict is caught in either chaining order;
+    /// `Pty` is rejected because a pseudo-terminal replaces the child's stdin with its own device (the mirror
+    /// of `ensurePtyCompatible`'s `InheritStdin` check).
     let ensureInheritStdinCompatible (config: CommandConfig) =
         if config.KeepStdinOpen then
             raise (stdinInheritConflict "KeepStdinOpen")
@@ -342,6 +352,9 @@ module internal CommandConfig =
         match config.StdinSource with
         | Some source when not (Stdin.isInherit (Some source)) -> raise (stdinInheritConflict "Stdin")
         | _ -> ()
+
+        if config.Pty.IsSome then
+            raise (ptyConflict "InheritStdin" ptyInheritStdinReason)
 
 /// An immutable description of a process to run.
 ///
@@ -467,10 +480,12 @@ type Command internal (config: CommandConfig) =
     /// analogue of `StdioMode.Inherit` for stdout/stderr. Because there is no stdin pipe, it is
     /// incompatible with the pipe-based stdin knobs and rejected together with them at the builder
     /// boundary (`ArgumentException`, in either chaining order): a feeder source (`Stdin`) and
-    /// `KeepStdinOpen`. For the same reason `RunningProcess.TakeStdin` yields `None` for an inherited-stdin
-    /// child (there is no interactive pipe to hand out). The capture/streaming verbs are unaffected — only
-    /// the child's stdin wiring changes. Repeatable: a retry or a supervisor restart re-inherits the
-    /// parent's stdin, so `InheritStdin` is never refused by the one-shot-source retry guard.
+    /// `KeepStdinOpen`. `Pty` is rejected too (either chaining order): a pseudo-terminal gives the child its
+    /// own pty slave/ConPTY input as stdin, leaving nothing for the parent's own standard input to attach
+    /// to. For the same reason `RunningProcess.TakeStdin` yields `None` for an inherited-stdin child (there
+    /// is no interactive pipe to hand out). The capture/streaming verbs are unaffected — only the child's
+    /// stdin wiring changes. Repeatable: a retry or a supervisor restart re-inherits the parent's stdin, so
+    /// `InheritStdin` is never refused by the one-shot-source retry guard.
     member _.InheritStdin() =
         CommandConfig.ensureInheritStdinCompatible config
 
@@ -867,9 +882,11 @@ type Command internal (config: CommandConfig) =
     /// only `OutputEvent.Stdout` events. Because there is no separate stderr, the separate-stderr
     /// observation knobs are rejected at the builder boundary (`ArgumentException`, in either chaining
     /// order): `StderrTee` and `OnStderrLine`. `Setsid` is likewise rejected — it detaches the child into
-    /// a new session with **no** controlling tty, contradicting a PTY's controlling pseudo-terminal. Inside
-    /// a `Pipeline` a PTY is allowed only as a standalone run or the **last** stage (its merged output
-    /// would otherwise be injected into the downstream stage's stdin).
+    /// a new session with **no** controlling tty, contradicting a PTY's controlling pseudo-terminal.
+    /// `InheritStdin` is rejected too (either chaining order): a PTY gives the child its own pty
+    /// slave/ConPTY input as stdin, so there is no way to also hand it the parent's own standard input.
+    /// Inside a `Pipeline` a PTY is allowed only as a standalone run or the **last** stage (its merged
+    /// output would otherwise be injected into the downstream stage's stdin).
     ///
     /// **Platform support (typed, never a silent downgrade).** Windows: ConPTY, needing Windows 10 1809+;
     /// an older host fails the spawn with `ProcessError.Unsupported "Pty (needs Windows 10 1809+ /
