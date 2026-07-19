@@ -66,7 +66,7 @@ module internal ReadinessProbe =
             | None -> return result
         }
 
-    /// The fixed polling backoff between failed attempts in `waitForPortUsing`/`waitFor`.
+    /// The fixed polling backoff between failed attempts in `waitForCoreUsing`.
     let private pollBackoff = TimeSpan.FromMilliseconds 50.0
 
     /// The backoff to use for the next poll: the smaller of the fixed `pollBackoff` and whatever time
@@ -81,17 +81,21 @@ module internal ReadinessProbe =
         else
             min remaining pollBackoff
 
-    /// Wait until `connect` completes for `endpoint`, or fail with `NotReady` once the shared `timeout`
-    /// deadline elapses (or `Cancelled` if `cancellationToken` fires first). A non-positive `timeout` is
-    /// an immediate `NotReady` — `connect` is never invoked. The `timeout` is clamped through
+    /// The single polling/deadline core every readiness probe funnels through: the HTTP
+    /// (`waitForHttpUsing`), port (`waitForPortUsing`), and custom (`waitFor`) probes each express
+    /// their per-attempt check as a `probe: CancellationToken -> Task<bool>` (true = ready) and hand it
+    /// here, so the deadline mechanics live in exactly one place instead of being hand-synchronised
+    /// across copies. Polls `probe` until it returns true, or fails with `NotReady` once the shared
+    /// `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). A non-positive
+    /// `timeout` is an immediate `NotReady` — `probe` is never invoked. The `timeout` is clamped through
     /// `Timeouts.clampArmable` (an over-long span is capped at ~24.8 days), and that clamped value is
     /// what a resulting `NotReady` reports, so the reported budget never claims more than was enforced.
     ///
-    /// Every connect attempt and polling backoff shares the same deadline token, so a short overall
+    /// Every `probe` invocation and polling backoff shares the same deadline token, so a short overall
     /// `timeout` can never be overrun by a longer fixed per-attempt window: each attempt is *raced*
     /// against a single shared `deadlineSignal` (not merely started with its own timer), so this returns
     /// the instant the remaining budget (or the caller's token) runs out — it does not wait for a
-    /// non-cooperative connect (one that, like a real in-flight `TcpClient.ConnectAsync`, can ignore its
+    /// non-cooperative `probe` (one that, like a real in-flight `TcpClient.ConnectAsync`, can ignore its
     /// own cancellation token once the OS has committed to the handshake) to finish on its own.
     ///
     /// The loop refuses to start a new attempt once the deadline has been *observed* to elapse — it
@@ -111,159 +115,12 @@ module internal ReadinessProbe =
     /// `CancellationTokenSource.CancelAfter`: cancellation is *signaled* at the due time and *observed*
     /// at the next opportunity.
     ///
-    /// `connect` is factored out (rather than hard-coding `TcpClient`) so tests can substitute a
-    /// deterministically slow stand-in — exercising deadline cancellation of an in-flight attempt without
-    /// depending on real network behaviour (e.g. an unassigned TEST-NET-1 address), which varies across
-    /// sandboxed CI environments. `waitForPort` below is the production entry point, wired to a real
-    /// `TcpClient` and to the background drain.
-    let internal waitForPortUsing
-        (connect: IPEndPoint -> CancellationToken -> Task)
-        (program: string)
-        (endpoint: IPEndPoint)
-        (timeout: TimeSpan)
-        (cancellationToken: CancellationToken)
-        : Task<Result<unit, ProcessError>> =
-        task {
-            if cancellationToken.IsCancellationRequested then
-                return Error(ProcessError.Cancelled program)
-            elif timeout <= TimeSpan.Zero then
-                return Error(ProcessError.NotReady(program, timeout))
-            else
-                // Clamp so an out-of-range timeout can't throw out of the CTS constructor. The clamped
-                // value is also what gets reported in NotReady below — an over-long requested timeout is
-                // silently capped at ~24.8 days, so reporting the raw, un-clamped value would claim a
-                // budget longer than what was actually enforced.
-                let armedTimeout = Timeouts.clampArmable timeout
-                use timeoutCts = new CancellationTokenSource(armedTimeout)
-
-                use linked =
-                    CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken)
-
-                let clock = Stopwatch.StartNew()
-
-                // A standalone deadline signal — a task that only ever completes (cancelled) once
-                // `linked` fires — reused across attempts: each connect attempt is raced against it so a
-                // non-cooperative connect (one that ignores its own cancellation token) cannot block this
-                // loop past the shared budget.
-                let deadlineSignal = Task.Delay(Timeout.Infinite, linked.Token)
-
-                let mutable connected = false
-                let mutable stopped = false
-
-                while not connected && not stopped do
-                    if linked.Token.IsCancellationRequested || clock.Elapsed >= armedTimeout then
-                        // The shared deadline (or the caller's token) already fired since the last
-                        // backoff completed — do not start another connect attempt past the budget.
-                        // Checked by elapsed time as well as by token, because a `CancellationTokenSource`
-                        // timer callback is not guaranteed to have run yet even though its due time has
-                        // already passed — relying on the token alone could start one more attempt after
-                        // the deadline has, in wall-clock terms, already elapsed.
-                        stopped <- true
-                    else
-                        let connectTask = connect endpoint linked.Token
-                        let! winner = Task.WhenAny(connectTask, deadlineSignal)
-
-                        if obj.ReferenceEquals(winner, deadlineSignal) then
-                            // The shared deadline (or the caller's token) fired before `connect`
-                            // completed. There is no way to force a non-cooperative connect attempt to
-                            // stop, so let it keep running in the background — but observe its eventual
-                            // outcome so a late fault is not left as an unobserved task exception.
-                            stopped <- true
-
-                            connectTask.ContinueWith(
-                                (fun (finished: Task) -> finished.Exception |> ignore),
-                                TaskContinuationOptions.OnlyOnFaulted
-                                ||| TaskContinuationOptions.ExecuteSynchronously
-                            )
-                            |> ignore
-                        else
-                            try
-                                do! connectTask
-                                connected <- true
-                            with
-                            | :? OperationCanceledException ->
-                                // The shared deadline elapsed, or the caller's token fired — either way
-                                // there is no budget left for another attempt.
-                                stopped <- true
-                            | _ ->
-                                // Any other connection failure (refused / unreachable) just means the
-                                // server is not up yet — back off and retry, still bounded by the same
-                                // shared token so the backoff itself can't run past the deadline. The
-                                // backoff itself is also capped to whatever budget remains, so a fixed
-                                // 50ms poll can't overrun a very short overall timeout on its own.
-                                let backoff = remainingBackoff clock armedTimeout
-
-                                if backoff <= TimeSpan.Zero then
-                                    stopped <- true
-                                else
-                                    try
-                                        do! Task.Delay(backoff, linked.Token)
-                                    with :? OperationCanceledException ->
-                                        stopped <- true
-
-                if connected && cancellationToken.IsCancellationRequested then
-                    // The connect happened to succeed, but the caller's own token fired concurrently —
-                    // it still takes priority over a technically-successful result.
-                    return Error(ProcessError.Cancelled program)
-                elif
-                    connected
-                    && (linked.Token.IsCancellationRequested || clock.Elapsed >= armedTimeout)
-                then
-                    // `Task.WhenAny` can still pick `connectTask` as the winner even though the deadline
-                    // fired at essentially the same moment (both tasks completing concurrently is a
-                    // genuine scheduler race, not just a check-then-act gap) — the unified-deadline
-                    // contract requires reporting the stale success as NotReady, not
-                    // as a technically-successful `Ok`.
-                    return Error(ProcessError.NotReady(program, armedTimeout))
-                elif connected then
-                    return Ok()
-                elif cancellationToken.IsCancellationRequested then
-                    return Error(ProcessError.Cancelled program)
-                else
-                    return Error(ProcessError.NotReady(program, armedTimeout))
-        }
-
-    /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` once the shared
-    /// `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). See
-    /// `waitForPortUsing` for the full deadline contract (including the ratified scheduler-bounded
-    /// window at the deadline); this wires it to a real `TcpClient`. Background-drains (and discards)
-    /// the child's piped `stdout`/`stderr` for the duration of the poll — see `withBackgroundDrain`.
-    let waitForPort
-        (program: string)
-        (stdout: Stream option)
-        (stderr: Stream option)
-        (endpoint: IPEndPoint)
-        (timeout: TimeSpan)
-        (cancellationToken: CancellationToken)
-        : Task<Result<unit, ProcessError>> =
-        let tcpConnect (endpoint: IPEndPoint) (ct: CancellationToken) : Task =
-            task {
-                use client = new TcpClient()
-                do! client.ConnectAsync(endpoint.Address, endpoint.Port, ct)
-            }
-
-        withBackgroundDrain stdout stderr (fun () ->
-            waitForPortUsing tcpConnect program endpoint timeout cancellationToken)
-
-    /// The `waitFor` polling loop itself, unaware of draining — factored out so `waitFor` can wrap it
-    /// with `withBackgroundDrain` without duplicating the loop. Shares the exact deadline shape of
-    /// `waitForPortUsing`: one `CancellationTokenSource(armedTimeout)` linked with the caller's token, a
-    /// single reusable `deadlineSignal`, every `probe` invocation raced against it, backoff capped to the
-    /// remaining budget, a non-positive `timeout` returning `NotReady` immediately (with the clamped
-    /// value), post-deadline success reported as `NotReady`, and the caller's token winning over a
-    /// concurrent success. The same ratified scheduler-bounded window applies: a new `probe` is only
-    /// invoked once the loop-top guard confirms the deadline has not been observed to elapse, but a
-    /// preemptive runtime may still let at most one invocation begin marginally after the wall-clock
-    /// deadline — its late success is reported as `NotReady` and its late fault is safely observed via an
-    /// `OnlyOnFaulted` continuation, never surfacing as an unobserved task exception.
-    ///
-    /// `probe` is invoked through `Task.Run`: a caller-owned `Func<Task<bool>>` has no cancellation seam
-    /// of its own, and one that *blocks synchronously* — never even returning a task — would otherwise
-    /// pin this loop and defeat the deadline entirely. Isolating the invocation on the thread pool means
-    /// even such a probe cannot delay this loop's return past the deadline; the blocked call keeps
-    /// running on a pool thread but is abandoned (and its eventual fault observed) exactly like a
-    /// returned-but-never-completing task. The API does not claim it can force a caller-owned probe to
-    /// stop.
+    /// `probe` is invoked through `Task.Run`: a caller-owned probe has no cancellation seam of its own,
+    /// and one that *blocks synchronously* — never even returning a task — would otherwise pin this loop
+    /// and defeat the deadline entirely. Isolating the invocation on the thread pool means even such a
+    /// probe cannot delay this loop's return past the deadline; the blocked call keeps running on a pool
+    /// thread but is abandoned (and its eventual fault observed) exactly like a returned-but-never-
+    /// completing task. The API does not claim it can force a caller-owned probe to stop.
     let private waitForCoreUsing
         (program: string)
         (probe: CancellationToken -> Task<bool>)
@@ -367,6 +224,71 @@ module internal ReadinessProbe =
                     return Error(ProcessError.NotReady(program, armedTimeout))
         }
 
+    /// Wait until `connect` succeeds for `endpoint`, or fail with `NotReady` once the shared `timeout`
+    /// deadline elapses (or `Cancelled` if `cancellationToken` fires first). A thin adapter over the
+    /// shared `waitForCoreUsing` core — see it for the full deadline contract, including the ratified
+    /// scheduler-bounded window at the deadline and the safe observation of an abandoned attempt's late
+    /// fault. Each poll is a single connect attempt expressed as a `probe` that returns true on a
+    /// successful connection and false on any failure: a refused / unreachable endpoint, or a connect
+    /// cancelled by the shared deadline, all mean "not open yet", so the core retries until the deadline
+    /// and then classifies the token state as `Cancelled` or `NotReady`.
+    ///
+    /// `connect` is factored out (rather than hard-coding `TcpClient`) so tests can substitute a
+    /// deterministically slow stand-in — exercising deadline cancellation of an in-flight attempt without
+    /// depending on real network behaviour (e.g. an unassigned TEST-NET-1 address), which varies across
+    /// sandboxed CI environments. `waitForPort` below is the production entry point, wired to a real
+    /// `TcpClient` and to the background drain.
+    let internal waitForPortUsing
+        (connect: IPEndPoint -> CancellationToken -> Task)
+        (program: string)
+        (endpoint: IPEndPoint)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        let probe (ct: CancellationToken) : Task<bool> =
+            task {
+                try
+                    do! connect endpoint ct
+                    return true
+                with _ ->
+                    // ANY connect failure means the port is not open yet — a refused/unreachable
+                    // endpoint, or a connect the shared deadline cancelled. Return false so the core
+                    // loop retries within budget; it then reads the token state and reports Cancelled or
+                    // NotReady. Catching every failure (not just OperationCanceledException) preserves the
+                    // original loop's "any other connection failure just means the server is not up yet"
+                    // retry semantics, and awaiting `connect` here observes a late fault from an abandoned
+                    // attempt so it never surfaces as an unobserved task exception.
+                    return false
+            }
+
+        waitForCoreUsing program probe timeout cancellationToken
+
+    /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` once the shared
+    /// `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). See
+    /// `waitForPortUsing`/`waitForCoreUsing` for the full deadline contract (including the ratified
+    /// scheduler-bounded window at the deadline); this wires it to a real `TcpClient`. Background-drains
+    /// (and discards) the child's piped `stdout`/`stderr` for the duration of the poll — see
+    /// `withBackgroundDrain`. Child-exit detection is not done here: `RunningProcess.WaitForPortAsync`
+    /// layers it on (racing this against the handle's shared reap-once exit wait), so a probe on a child
+    /// that has already exited reports `NotReady` promptly instead of polling out the whole `timeout` —
+    /// the same early-exit contract `WaitForHttpAsync`/`WaitForAsync` honour.
+    let waitForPort
+        (program: string)
+        (stdout: Stream option)
+        (stderr: Stream option)
+        (endpoint: IPEndPoint)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        let tcpConnect (endpoint: IPEndPoint) (ct: CancellationToken) : Task =
+            task {
+                use client = new TcpClient()
+                do! client.ConnectAsync(endpoint.Address, endpoint.Port, ct)
+            }
+
+        withBackgroundDrain stdout stderr (fun () ->
+            waitForPortUsing tcpConnect program endpoint timeout cancellationToken)
+
     /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).
     /// `getResponse` is factored out so tests can exercise the polling contract without depending on a
@@ -429,7 +351,11 @@ module internal ReadinessProbe =
     /// deadline contract (including the ratified scheduler-bounded window at the deadline, the
     /// `Task.Run` isolation of a synchronously-blocking probe, and the safe observation of an abandoned
     /// probe's late fault). Background-drains (and discards) the child's piped `stdout`/`stderr` for the
-    /// duration of the poll, like `waitForPort` — see `withBackgroundDrain`.
+    /// duration of the poll, like `waitForPort` — see `withBackgroundDrain`. Child-exit detection is not
+    /// done here: `RunningProcess.WaitForAsync` layers it on (racing this against the handle's shared
+    /// reap-once exit wait), so a probe on a child that has already exited reports `NotReady` promptly
+    /// instead of polling out the whole `timeout` — the same early-exit contract
+    /// `WaitForHttpAsync`/`WaitForPortAsync` honour.
     let waitFor
         (program: string)
         (stdout: Stream option)

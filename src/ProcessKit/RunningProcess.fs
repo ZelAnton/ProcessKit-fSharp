@@ -544,11 +544,31 @@ type RunningProcess internal (host: RunningHost) =
 
             bufferedOutcome)
 
-    let waitForHttp
-        (uri: Uri)
-        (isSatisfactory: Func<HttpResponseMessage, bool>)
+    // Race a readiness probe against the child's own exit so a probe on a child that has already
+    // exited — or that dies early on startup — resolves to `NotReady` promptly instead of burning the
+    // whole `timeout` polling a condition that can never come true. Shared by all three readiness
+    // probes (`WaitForHttpAsync`/`WaitForPortAsync`/`WaitForAsync`) so their early-exit behaviour cannot
+    // drift apart: `startProbe` builds the underlying `ReadinessProbe.*` task from the snapshotted
+    // (still-`Fresh`) drain streams and a readiness token linked to the caller's `cancellationToken`;
+    // everything else — the exit race, cancellation, and `NotReady`/`Cancelled` selection — lives here,
+    // once.
+    //
+    // Early-exit detection MUST share the one reap-once exit wait every other verb on this handle uses
+    // (`ensureBufferedWait`, memoized under `stateLock`) rather than starting an independent
+    // `host.Wait()`: on POSIX, `host.Wait()`/`waitPosix` REAPS the child and consumes its exit status,
+    // and is idempotent only while a wait stays in flight — never after the pid has already been reaped
+    // (KB K-016). A second, unrelated `host.Wait()` here would race the reap started by this one, so a
+    // later `WaitAsync`/`ProfileAsync` call (the common "diagnose why the service died on startup" path)
+    // would either see the pid already gone (ECHILD → fabricated `Outcome.Unobserved`) or, worse, risk
+    // observing a recycled pid. Calling `ensureBufferedWait()` here (instead of claiming the pipes via
+    // `claimBuffered`) starts/joins that ONE shared wait without claiming `consumption`, so `consumption`
+    // stays `Fresh` and a subsequent buffered verb can still claim the pipes and reuse this exact same
+    // memoized wait — one `host.Wait()`, one reap, shared by the probe and by whatever verb runs
+    // afterward.
+    let raceReadinessAgainstExit
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
+        (startProbe: Stream option -> Stream option -> CancellationToken -> Task<Result<unit, ProcessError>>)
         : Task<Result<unit, ProcessError>> =
         task {
             if cancellationToken.IsCancellationRequested then
@@ -559,29 +579,8 @@ type RunningProcess internal (host: RunningHost) =
                 use readinessCts =
                     CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
 
-                let readinessTask =
-                    ReadinessProbe.waitForHttp
-                        config.Program
-                        stdout
-                        stderr
-                        uri
-                        isSatisfactory
-                        timeout
-                        readinessCts.Token
+                let readinessTask = startProbe stdout stderr readinessCts.Token
 
-                // Early-exit detection MUST share the one reap-once exit wait every other verb on this
-                // handle uses (`ensureBufferedWait`, memoized under `stateLock`) rather than starting an
-                // independent `host.Wait()`: on POSIX, `host.Wait()`/`waitPosix` REAPS the child and
-                // consumes its exit status, and is idempotent only while a wait stays in flight — never
-                // after the pid has already been reaped (KB K-016). A second, unrelated `host.Wait()`
-                // here would race the reap started by this one, so a later `WaitAsync`/`ProfileAsync`
-                // call (the common "diagnose why the service died on startup" path) would either see the
-                // pid already gone (ECHILD → fabricated `Outcome.Unobserved`) or, worse, risk observing a
-                // recycled pid. Calling `ensureBufferedWait()` here (instead of claiming the pipes via
-                // `claimBuffered`) starts/joins that ONE shared wait without claiming `consumption`, so
-                // `consumption` stays `Fresh` and a subsequent buffered verb can still claim the pipes and
-                // reuse this exact same memoized wait — one `host.Wait()`, one reap, shared by the probe
-                // and by whatever verb runs afterward.
                 let childExitTask = ensureBufferedWait ()
                 let! winner = Task.WhenAny(readinessTask :> Task, childExitTask :> Task)
 
@@ -596,6 +595,31 @@ type RunningProcess internal (host: RunningHost) =
                     else
                         return Error(ProcessError.NotReady(config.Program, Timeouts.clampArmable timeout))
         }
+
+    let waitForHttp
+        (uri: Uri)
+        (isSatisfactory: Func<HttpResponseMessage, bool>)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
+            ReadinessProbe.waitForHttp config.Program stdout stderr uri isSatisfactory timeout readinessToken)
+
+    let waitForPort
+        (endpoint: IPEndPoint)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
+            ReadinessProbe.waitForPort config.Program stdout stderr endpoint timeout readinessToken)
+
+    let waitForCustom
+        (probe: Func<Task<bool>>)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
+            ReadinessProbe.waitFor config.Program stdout stderr probe timeout readinessToken)
 
     // Kill the tree the moment an output pump faults, so a still-producing child can't wedge the exit
     // wait — and the pump's siblings — by blocking on a full pipe that nobody drains once the pump
@@ -1454,25 +1478,27 @@ type RunningProcess internal (host: RunningHost) =
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` once the shared
     /// `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). Every connect
     /// attempt and polling backoff shares that one deadline, so a slow or non-cooperative connect can
-    /// never overrun a short `timeout` — see `ReadinessProbe.waitForPortUsing` for the full contract,
-    /// including the ratified scheduler-bounded window at the deadline. Background-drains (and discards)
-    /// the child's piped stdout/stderr for the duration of the poll — like `WaitForLineAsync`, so a child
-    /// that writes more than one OS pipe buffer of startup output (~64 KiB on Linux) before becoming
-    /// ready can't block in `write()` and spuriously time out this probe — but unlike
-    /// `WaitForLineAsync`, the drained bytes are discarded rather than handed back, and draining stops
-    /// once the probe concludes rather than continuing as an established streaming session. A capture
-    /// verb (`OutputStringAsync`/`OutputBytesAsync`/`StdoutLinesAsync`/`OutputEventsAsync`) called
-    /// AFTER this probe therefore only sees what the child wrote after the probe concluded, not the
-    /// full run — the same "doesn't compose with a subsequent fresh capture" limitation
-    /// `WaitForLineAsync` already documents, now uniform across all four readiness probes. If a
-    /// buffered/streaming verb already claimed the pipes before this call, that verb's own pump is
+    /// never overrun a short `timeout` — see `ReadinessProbe.waitForCoreUsing` for the full contract,
+    /// including the ratified scheduler-bounded window at the deadline. If the child exits before the
+    /// port opens, this returns `NotReady` immediately rather than polling out the full `timeout` — the
+    /// same early-exit contract `WaitForHttpAsync`/`WaitForAsync` honour, and via the one reap-once exit
+    /// wait the rest of the handle shares (so a later `WaitAsync`/`ProfileAsync` still reports the real
+    /// exit). Background-drains (and discards) the child's piped stdout/stderr for the duration of the
+    /// poll — like `WaitForLineAsync`, so a child that writes more than one OS pipe buffer of startup
+    /// output (~64 KiB on Linux) before becoming ready can't block in `write()` and spuriously time out
+    /// this probe — but unlike `WaitForLineAsync`, the drained bytes are discarded rather than handed
+    /// back, and draining stops once the probe concludes rather than continuing as an established
+    /// streaming session. A capture verb (`OutputStringAsync`/`OutputBytesAsync`/`StdoutLinesAsync`/
+    /// `OutputEventsAsync`) called AFTER this probe therefore only sees what the child wrote after the
+    /// probe concluded, not the full run — the same "doesn't compose with a subsequent fresh capture"
+    /// limitation `WaitForLineAsync` already documents, now uniform across all four readiness probes. If
+    /// a buffered/streaming verb already claimed the pipes before this call, that verb's own pump is
     /// already draining them and this probe leaves them alone (no second reader).
     member _.WaitForPortAsync
         (endpoint: IPEndPoint, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull endpoint
-        let stdout, stderr = probeDrainStreams ()
-        ReadinessProbe.waitForPort config.Program stdout stderr endpoint timeout cancellationToken
+        waitForPort endpoint timeout cancellationToken
 
     /// Poll `uri` with HTTP GET until a response passes the default 2xx check, or fail with `NotReady`
     /// once `timeout` expires (or `Cancelled` if `cancellationToken` fires first). Connection failures,
@@ -1536,16 +1562,18 @@ type RunningProcess internal (host: RunningHost) =
     /// takes priority over a concurrent success. The API cannot force a caller-owned `probe` to stop, so
     /// an abandoned invocation keeps running in the background, but its late outcome is safely observed
     /// (a late fault never becomes an unobserved task exception). See `ReadinessProbe.waitForCoreUsing` for
-    /// the full contract, including the ratified scheduler-bounded window at the deadline.
-    /// Background-drains (and discards) the child's piped stdout/stderr for the duration of the poll,
-    /// exactly like `WaitForPortAsync` — see its doc for what that does and doesn't compose with
-    /// afterward.
+    /// the full contract, including the ratified scheduler-bounded window at the deadline. If the child
+    /// exits before `probe` returns true, this returns `NotReady` immediately rather than polling out the
+    /// full `timeout` — the same early-exit contract `WaitForHttpAsync`/`WaitForPortAsync` honour, and via
+    /// the one reap-once exit wait the rest of the handle shares (so a later `WaitAsync`/`ProfileAsync`
+    /// still reports the real exit). Background-drains (and discards) the child's piped stdout/stderr for
+    /// the duration of the poll, exactly like `WaitForPortAsync` — see its doc for what that does and
+    /// doesn't compose with afterward.
     member _.WaitForAsync
         (probe: Func<Task<bool>>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull probe
-        let stdout, stderr = probeDrainStreams ()
-        ReadinessProbe.waitFor config.Program stdout stderr probe timeout cancellationToken
+        waitForCustom probe timeout cancellationToken
 
     /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
     /// the racing primitive behind `WaitAnyAsync`/`WaitAllAsync`. Built exactly once under `stateLock`

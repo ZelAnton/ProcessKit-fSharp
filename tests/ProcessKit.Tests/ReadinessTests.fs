@@ -37,9 +37,12 @@ type ReadinessTests() =
     // A synthetic `RunningProcess` over two BOUNDED, backpressure-honouring stdout/stderr pipes (a
     // small `System.IO.Pipelines.Pipe` per stream, not a real OS pipe/subprocess) — deterministic
     // across the CI matrix, unlike racing a real child against real OS pipe buffering (see
-    // `StreamingTests.syntheticStdoutProcess`'s comment for the same rationale). `Wait` resolves
-    // immediately; nothing here exercises the process's own exit path. Returns the process plus the
-    // two writer-side `Stream`s the test uses to play "the child" writing its startup burst.
+    // `StreamingTests.syntheticStdoutProcess`'s comment for the same rationale). `Wait` never
+    // completes, modelling a child that stays running throughout the probe: the readiness probes now
+    // race the child's own exit (`RunningProcess.raceReadinessAgainstExit`), so an immediately-resolving
+    // `Wait` would fire that early-exit path and report `NotReady` before the burst below could finish
+    // — which is not what these "becomes ready while chatty" tests exercise. Returns the process plus
+    // the two writer-side `Stream`s the test uses to play "the child" writing its startup burst.
     let syntheticBackpressureProcess (config: CommandConfig) : RunningProcess * Stream * Stream =
         // A tiny pause/resume threshold (well under the >64 KiB burst the tests below write) so a
         // writer that outpaces the reader genuinely blocks in `WriteAsync`/`FlushAsync` — the same
@@ -59,7 +62,7 @@ type ReadinessTests() =
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
               StartTimeIdentity = None
-              Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+              Wait = fun () -> TaskCompletionSource<Outcome>().Task
               StdinError = fun () -> None
               StdinFeedComplete = ignore
               StartKill = ignore
@@ -125,7 +128,11 @@ type ReadinessTests() =
 
         listener, Uri($"http://127.0.0.1:{port}/"), (fun () -> requests)
 
-    let syntheticHttpProcess (exitTask: Task<Outcome>) : RunningProcess =
+    // A synthetic `RunningProcess` with no piped streams whose exit is fully driven by `exitTask`:
+    // pass a never-completing task to model a child that stays running, or `Task.FromResult(Outcome...)`
+    // to model one that has already exited. Used to drive the readiness probes' exit-race path
+    // (HTTP/port/custom) deterministically, without a real subprocess.
+    let syntheticProcess (exitTask: Task<Outcome>) : RunningProcess =
         let config = (Command.create "test").Config
 
         let host: RunningHost =
@@ -234,7 +241,7 @@ type ReadinessTests() =
                 startHttpListener (fun attempt -> if attempt > 2 then 200 else 503)
 
             try
-                use running = syntheticHttpProcess (TaskCompletionSource<Outcome>().Task)
+                use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
 
                 match! running.WaitForHttpAsync(uri, TimeSpan.FromSeconds 3.0) with
                 | Ok() -> Assert.That(requestCount (), Is.GreaterThanOrEqualTo 3)
@@ -250,7 +257,7 @@ type ReadinessTests() =
             let listener, uri, _requestCount = startHttpListener (fun _ -> 503)
 
             try
-                use running = syntheticHttpProcess (TaskCompletionSource<Outcome>().Task)
+                use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
 
                 match! running.WaitForHttpAsync(uri, TimeSpan.FromMilliseconds 250.0) with
                 | Error(ProcessError.NotReady _) -> Assert.Pass()
@@ -266,7 +273,7 @@ type ReadinessTests() =
             let listener, uri, _requestCount = startHttpListener (fun _ -> 503)
 
             try
-                use running = syntheticHttpProcess (Task.FromResult(Outcome.Exited 1))
+                use running = syntheticProcess (Task.FromResult(Outcome.Exited 1))
                 let elapsed = Stopwatch.StartNew()
 
                 match! running.WaitForHttpAsync(uri, TimeSpan.FromSeconds 5.0) with
@@ -392,7 +399,7 @@ type ReadinessTests() =
             let listener, uri, _requestCount = startHttpListener (fun _ -> 418)
 
             try
-                use running = syntheticHttpProcess (TaskCompletionSource<Outcome>().Task)
+                use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
 
                 match! running.WaitForHttpAsync(uri, seq { 418 }, TimeSpan.FromSeconds 3.0) with
                 | Error error -> Assert.Fail $"status-code overload failed: {error}"
@@ -417,7 +424,7 @@ type ReadinessTests() =
             let listener, uri, _requestCount = startHttpListener (fun _ -> 503)
 
             try
-                use running = syntheticHttpProcess (TaskCompletionSource<Outcome>().Task)
+                use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
                 use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 100.0)
 
                 match! running.WaitForHttpAsync(uri, TimeSpan.FromSeconds 30.0, cts.Token) with
@@ -953,6 +960,81 @@ type ReadinessTests() =
                 match! running.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 30.0, cts.Token) with
                 | Error(ProcessError.Cancelled _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
                 | other -> Assert.Fail $"expected Cancelled, got {other}"
+        }
+        :> Task
+
+    // Early-exit contract, port probe: a child that has already exited must resolve to `NotReady`
+    // promptly rather than polling the port out for the full timeout — the same behaviour
+    // `WaitForHttpAsync` gives (see `WaitForHttpReturnsNotReadyPromptlyWhenTheChildExitsBeforeReadiness`).
+    // `Wait` resolves to an exited outcome, so the shared exit wait the probe races against completes at
+    // once and cancels the still-polling port probe.
+    [<Test>]
+    member _.``WaitForPort returns NotReady promptly when the child has already exited``() : Task =
+        task {
+            // A port nothing is listening on (reserve then release it) so every connect is refused and,
+            // absent early-exit detection, the probe would poll the full 5s timeout.
+            let probeListener = new TcpListener(IPAddress.Loopback, 0)
+            probeListener.Start()
+            let port = (probeListener.LocalEndpoint :?> IPEndPoint).Port
+            probeListener.Stop()
+
+            use running = syntheticProcess (Task.FromResult(Outcome.Exited 1))
+            let endpoint = IPEndPoint(IPAddress.Loopback, port)
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 5.0) with
+            | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+            | other -> Assert.Fail $"expected early NotReady, got {other}"
+        }
+        :> Task
+
+    // Early-exit contract, custom probe: a predicate that never flips true against an already-exited
+    // child must resolve to `NotReady` promptly, not poll out the full timeout — the `WaitForAsync`
+    // sibling of the port test above.
+    [<Test>]
+    member _.``WaitFor returns NotReady promptly when the child has already exited``() : Task =
+        task {
+            use running = syntheticProcess (Task.FromResult(Outcome.Exited 1))
+            let neverReady () = TaskCompletionSource<bool>().Task
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForAsync(neverReady, TimeSpan.FromSeconds 5.0) with
+            | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+            | other -> Assert.Fail $"expected early NotReady, got {other}"
+        }
+        :> Task
+
+    // Reap-once (KB K-016) regression for the port probe's new early-exit path, mirroring the existing
+    // `WaitForHttp then WaitAsync reports the real exit code` test: the port probe now races the child's
+    // exit via the memoized reap-once wait (`ensureBufferedWait`), not a raw independent `host.Wait()`.
+    // If it started a second, uncoordinated `host.Wait()` on POSIX, the child would be reaped twice and
+    // the follow-up `WaitAsync` would race an already-reaped pid and fabricate `Outcome.Unobserved`
+    // instead of the real exit code. Exercises a REAL spawned child so it drives the real reap machinery.
+    [<Test>]
+    member _.``WaitForPort then WaitAsync reports the real exit code after an early child exit``() : Task =
+        task {
+            let probeListener = new TcpListener(IPAddress.Loopback, 0)
+            probeListener.Start()
+            let port = (probeListener.LocalEndpoint :?> IPEndPoint).Port
+            probeListener.Stop()
+
+            match! runner.StartAsync(shell "exit 7", CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                let endpoint = IPEndPoint(IPAddress.Loopback, port)
+
+                match! running.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 5.0) with
+                | Error(ProcessError.NotReady _) -> ()
+                | other -> Assert.Fail $"expected NotReady, got {other}"
+
+                // Before the shared-wait fix, this second `host.Wait()` (via `WaitAsync`) raced an
+                // already-reaped pid on POSIX and fabricated `Outcome.Unobserved` instead of the real code.
+                let! outcome = running.WaitAsync()
+
+                match outcome with
+                | Outcome.Exited code -> Assert.That(code, Is.EqualTo 7)
+                | other -> Assert.Fail $"expected Exited 7, got {other}"
         }
         :> Task
 
