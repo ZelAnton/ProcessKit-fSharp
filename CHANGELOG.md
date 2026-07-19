@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProcessGroup.Suspend()` and `Resume()` now report POSIX signal-delivery and cgroup freeze/thaw failures as `ProcessError.Io` instead of silently succeeding.
 - `ProcessGroup.ShutdownAsync(gracePeriod)` now guarantees the container is released even when the graceful-kill stage throws or its task faults, instead of leaving the Job handle/cgroup/process group unreleased forever; the original exception still propagates to the caller.
 - Windows CTRL+BREAK delivery now refuses an unavailable child process ID instead of broadcasting CTRL+BREAK to the caller's console group when `GetProcessId` fails.
+- Fixed `OverflowMode.DropNewest` with `OutputBufferPolicy.MaxBytes` retaining later short lines after an over-cap line, so buffered text now always remains a contiguous prefix of the process output.
 
 ## [2.4.2] - 2026-07-13
 
