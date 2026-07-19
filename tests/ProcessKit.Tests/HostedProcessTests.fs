@@ -159,6 +159,76 @@ type private ThrowingRunner() =
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "not used"))
 
+/// An `IProcessRunner` whose `SpawnAsync` blocks *synchronously* (before it returns its task) until the
+/// test releases it — standing in for the real `JobRunner`'s synchronous native-spawn prefix
+/// (`ProcessGroup.Create()` + `StartInternal`, i.e. CreateProcessW/posix_spawnp, done inline before the
+/// first await). Lets a test prove `StartAsync` no longer holds the service's internal `gate` across
+/// that synchronous spawn: a concurrent property read must not block on it (T-154).
+type private SlowSpawnRunner() =
+    let spawnEntered =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let releaseSpawn = new ManualResetEventSlim(false)
+
+    let stopRequested =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let finished =
+        new TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    /// Completes (asynchronously) the instant `SpawnAsync` is entered and about to block mid-spawn.
+    member _.SpawnEntered = spawnEntered.Task
+
+    /// Unblocks the in-flight synchronous spawn. Idempotent — safe to call from both the test body and
+    /// its `finally`.
+    member _.ReleaseSpawn() = releaseSpawn.Set()
+
+    interface IProcessRunner with
+        member _.SpawnAsync(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                // Signal entry, then block the *synchronous* portion of the spawn: this is exactly where
+                // the real JobRunner would be doing its native spawn inline, before the first await.
+                spawnEntered.TrySetResult() |> ignore
+                releaseSpawn.Wait()
+
+                let stdout = new MemoryStream()
+                let stderr = new MemoryStream()
+
+                let host: RunningHost =
+                    { Config = command.Config
+                      Pid = Some 12345
+                      Stdout = Some(stdout :> Stream)
+                      Stderr = Some(stderr :> Stream)
+                      Stdin = None
+                      StartTime = DateTime.UtcNow
+                      StartedTimestamp = Stopwatch.GetTimestamp()
+                      StartTimeIdentity = None
+                      Wait = fun () -> finished.Task
+                      StdinError = fun () -> None
+                      StdinFeedComplete = ignore
+                      StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
+                      GracefulKill =
+                        fun _ ->
+                            stopRequested.TrySetResult() |> ignore
+                            finished.TrySetResult(Outcome.Signalled None) |> ignore
+                            Task.CompletedTask
+                      ResizePty = None
+                      Teardown =
+                        fun () ->
+                            stdout.Dispose()
+                            stderr.Dispose()
+                            ValueTask.CompletedTask }
+
+                Task.FromResult(Ok(new RunningProcess(host)))
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used"))
+
 [<TestFixture>]
 type HostedProcessTests() =
 
@@ -236,6 +306,53 @@ type HostedProcessTests() =
             Assert.That(service.LastOutcome.IsNone, Is.True)
 
             do! hosted.StopAsync(CancellationToken.None)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StartAsync does not hold the gate across the synchronous child spawn``() : Task =
+        task {
+            let runner = SlowSpawnRunner()
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "worker"
+                    (Command.create "worker")
+                    (Func<Supervisor, Supervisor>(id))
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+
+            try
+                // Kick `StartAsync` off the test thread: with the fix it returns immediately, but a
+                // regression that held `gate` across the synchronous spawn would wedge inside this call
+                // rather than fail an assertion, so it must never be awaited inline.
+                let startTask = Task.Run(fun () -> hosted.StartAsync CancellationToken.None)
+
+                // The supervision loop has now entered `SpawnAsync` and is blocked mid-spawn.
+                do! runner.SpawnEntered.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+                // While that spawn is still blocked, a concurrent `gate` read must complete promptly. If
+                // `StartAsync` still held `gate` across the spawn, this read would block until the
+                // `ReleaseSpawn` below, and the 2s ceiling would elect `Task.Delay` instead — failing the
+                // assertion.
+                let readTask = Task.Run(fun () -> service.IsSupervisionActive)
+                let! firstDone = Task.WhenAny(readTask :> Task, Task.Delay(TimeSpan.FromSeconds 2.0))
+
+                Assert.That(
+                    Object.ReferenceEquals(firstDone, readTask),
+                    Is.True,
+                    "IsSupervisionActive must not block while the child is being spawned"
+                )
+
+                Assert.That(readTask.Result, Is.True, "supervision is active the moment StartAsync publishes the task")
+
+                // Release the blocked spawn, confirm `StartAsync` itself completed, and tear down cleanly.
+                runner.ReleaseSpawn()
+                do! startTask
+                do! hosted.StopAsync(CancellationToken.None)
+            finally
+                runner.ReleaseSpawn()
         }
         :> Task
 
