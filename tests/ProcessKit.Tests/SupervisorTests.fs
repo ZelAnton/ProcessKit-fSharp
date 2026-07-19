@@ -129,6 +129,31 @@ type SupervisorTests() =
         |> ignore
 
     [<Test>]
+    member _.``Backoff, MaxBackoff, StormPause and FailureDecay reject a negative span but accept zero``() =
+        let s = Supervisor(Command.create "x")
+        let negative = TimeSpan.FromSeconds -1.0
+
+        // Zero is a valid, meaningful config for each knob (restart with no delay / cap delays to
+        // zero / trip the storm guard without a real pause / keep no failure history), so it is
+        // accepted rather than silently coerced from a negative value.
+        s.Backoff(TimeSpan.Zero, 1.0) |> ignore
+        s.MaxBackoff(TimeSpan.Zero) |> ignore
+        s.StormPause(TimeSpan.Zero) |> ignore
+        s.FailureDecay(TimeSpan.Zero) |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.Backoff(negative, 1.0) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.MaxBackoff(negative) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.StormPause(negative) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.FailureDecay(negative) |> ignore))
+        |> ignore
+
+    [<Test>]
     member _.``zero MaxRestarts means a single run``() : Task =
         task {
             match! supervise([ failWith 1; ok () ]).MaxRestarts(0).RunAsync() with

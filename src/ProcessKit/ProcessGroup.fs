@@ -445,14 +445,15 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// **Pull-based** — it samples only as the enumeration is pulled and runs no background task, so
     /// it neither keeps the group alive nor leaks if abandoned. The series ends on the first snapshot
     /// the group fails to report (notably after it is torn down) or when the enumerator's token fires.
+    /// A non-positive `interval` (`<= TimeSpan.Zero`) is rejected with `ArgumentOutOfRangeException`,
+    /// thrown eagerly by this call rather than deferred to enumeration — a sampling cadence must be a
+    /// positive duration.
     member this.SampleStatsAsync(interval: TimeSpan) : IAsyncEnumerable<ProcessGroupStats> =
-        let period =
-            if interval <= TimeSpan.Zero then
-                TimeSpan.FromMilliseconds 1.0
-            else
-                // Cap an over-long interval into the armable range so the sampler's `Task.Delay` can't
-                // throw synchronously (it then samples at the max ~24.8-day cadence instead of faulting).
-                Timeouts.clampArmable interval
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero)
+
+        // Cap an over-long interval into the armable range so the sampler's `Task.Delay` can't throw
+        // synchronously (it then samples at the max ~24.8-day cadence instead of faulting).
+        let period = Timeouts.clampArmable interval
 
         StatsSamplerSeq((fun () -> this.Stats()), period)
 
