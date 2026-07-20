@@ -131,13 +131,12 @@ An `Error` from a capture verb such as `OutputStringAsync` means a stage couldn'
 or driven* at all — a spawn failure, a not-found program, broken plumbing — **never** a
 mere non-zero exit. A non-zero exit is data in the `ProcessResult`.
 
-There is deliberately no streaming verb and no `FirstLineAsync` on a `Pipeline`: a chain
-consumes its last stage in full to fold the pipefail outcome, so there is no live handle
-to stream from. To *capture* the first matching line of a finished chain, append a
-`head -n 1` (POSIX) / `findstr` (Windows) stage and capture its stdout. If you instead
-need a streaming readiness probe over a chain that must keep running — wait for a banner
-line, then leave it alive — a `head` stage would tear it down; reach for a single
-`Command` with `WaitForLineAsync` instead (see [streaming.md](streaming.md)).
+The buffering verbs above run the whole chain to completion before returning. For a
+**long-running or interactive** pipeline whose final output you want to read *line by line
+as it appears* — a live handle to stream from, wait for a readiness line on, and stop on
+demand — start a streaming session with `StartAsync` instead (see
+[Streaming a pipeline](#streaming-a-pipeline) below). It is the pipeline analogue of a
+single command's `StartAsync` → `RunningProcess`.
 
 ## Pipefail: the result and the ends
 
@@ -407,6 +406,103 @@ fires. Setting one is a configuration error, so `.Pipe` rejects it with an `Argu
 Cancel the whole chain with the chain-level `Pipeline.CancelOn` (or pass a token to the verb)
 instead. For the full model — captured vs. raised deadlines, and how cancellation differs from a
 timeout — see [timeouts-and-cancellation.md](timeouts-and-cancellation.md).
+
+## Streaming a pipeline
+
+The buffering verbs run the whole chain to completion before handing back its folded
+result. For a **long-running or interactive** pipeline — `journalctl -f | grep ERROR`, a
+server started behind a filter, any chain whose final output you want to read *as it
+arrives* rather than buffered until every stage exits — start a live **streaming session**
+instead. `Pipeline.StartAsync()` spawns the whole chain into one shared kill-on-dispose
+group and returns a `Task<Result<PipelineSession, ProcessError>>`.
+
+A `PipelineSession` is the pipeline analogue of a single command's
+[`RunningProcess`](streaming.md): it streams the **final** stage's stdout as it arrives,
+waits for the whole chain with the *same* [pipefail](#pipefail-the-result-and-the-ends)
+classification the buffering verbs use, and stops/reaps the entire chain on demand.
+
+**F#**
+
+```fsharp
+task {
+    let pipeline =
+        (Command.create "journalctl" |> Command.args [ "-f" ])
+            .Pipe(Command.create "grep" |> Command.args [ "--line-buffered"; "ERROR" ])
+
+    match! pipeline.StartAsync() with
+    | Error err -> eprintfn $"could not start: {err.Message}"
+    | Ok session ->
+        use session = session
+        let e = session.StdoutLinesAsync().GetAsyncEnumerator()
+
+        try
+            // Read matching lines from the LAST stage (grep) as they appear.
+            let mutable seen = 0
+
+            while seen < 10 do
+                match! e.MoveNextAsync() with
+                | true ->
+                    printfn $"error: {e.Current}"
+                    seen <- seen + 1
+                | false -> seen <- 10
+        finally
+            e.DisposeAsync().AsTask().Wait()
+
+        // Tears down BOTH stages (journalctl AND grep), not just the last.
+        let! _ = session.StopAsync()
+        ()
+}
+```
+
+**C#**
+
+```csharp
+var pipeline = new Command("journalctl").Args(["-f"])
+    .Pipe(new Command("grep").Args(["--line-buffered", "ERROR"]));
+
+await using var session = (await pipeline.StartAsync()).GetValueOrThrow();
+
+var seen = 0;
+await foreach (var line in session.StdoutLinesAsync())
+{
+    Console.WriteLine($"error: {line}");
+    if (++seen >= 10) break;
+}
+
+await session.StopAsync();   // reaps BOTH stages
+```
+
+The session mirrors `RunningProcess`:
+
+| Member | What it does |
+|---|---|
+| `StdoutLinesAsync()` | the final stage's stdout, line by line, as it arrives |
+| `StdoutJsonLinesAsync<'T>()` | the same, each non-empty line deserialized as NDJSON / JSON Lines |
+| `OutputEventsAsync()` | the final stage's stdout as `OutputEvent.Stdout` line events (a pipeline captures only the final stdout, so — unlike a single command — there are no `Stderr` events) |
+| `WaitForLineAsync(pred, timeout)` | wait until a final-stage stdout line matches — a readiness probe over the running chain |
+| `FinishAsync()` | wait for the WHOLE chain, then return `Finished` (the pipefail representative's `Outcome` + that stage's stderr); pairs with `StdoutLinesAsync` |
+| `StopAsync()` / `StopAsync(grace)` | gracefully stop and reap **every** stage, returning the pipefail outcome |
+| `Kill()` | fire-and-forget kill of the whole chain |
+| `DisposeAsync()` | reap the whole chain's tree (kill-on-drop) |
+
+**Single consumption**, exactly like `RunningProcess`: the final stage's stdout is pumped
+once, so `StdoutLinesAsync` and `OutputEventsAsync` are mutually exclusive (a second,
+different streaming consumer throws), and `FinishAsync` rejoins the stdout-streaming
+session `StdoutLinesAsync` started — call it *after* streaming lines; after
+`OutputEventsAsync`, reap with `StopAsync` (or dispose) rather than `FinishAsync`.
+
+**Whole-chain semantics.** The *stream* is the final stage's stdout, but `FinishAsync` /
+`StopAsync` reap and classify the ENTIRE chain: the returned `Finished.Outcome` is the
+[pipefail](#pipefail-the-result-and-the-ends) representative (the rightmost checked stage
+that did not exit with an accepted code, or a `TimedOut`/`Cancelled` for the whole chain),
+and `Finished.Stderr` is that stage's stderr — identical to what `RunAsync` reports, never
+a final-stage-only view. A non-zero pipefail exit is *data* in `Finished.Outcome`; a
+fail-loud [output overflow](#fail-loud-output-overflow) on any stage or a stage-0
+stdin-source failure surfaces as `Error`. The chain-level
+[`Timeout`/`CancelOn`](#timeouts-and-cancellation) still apply — either firing hard-kills
+the tree, and `FinishAsync` then reports `TimedOut`/`Cancelled`. Stopping or disposing
+tears down **every** stage — including a partially started chain, when a later stage never
+spawned — never just the last, so no stage is ever orphaned.
 
 ## Re-running a pipeline
 

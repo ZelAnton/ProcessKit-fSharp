@@ -1,6 +1,7 @@
 namespace ProcessKit
 
 open System
+open System.Collections.Generic
 open System.Diagnostics.CodeAnalysis
 open System.IO
 open System.Runtime.CompilerServices
@@ -107,6 +108,131 @@ module internal PipelineStageGuard =
                 )
             )
 
+/// A live streaming session over a whole pipeline — the multi-stage analogue of `RunningProcess`,
+/// returned by `Pipeline.StartAsync`. It gives a pipeline the streaming layer a single command has long
+/// had: stream the **final** stage's stdout line by line as it arrives (`StdoutLinesAsync` /
+/// `StdoutJsonLinesAsync` / `OutputEventsAsync`), wait on a readiness line (`WaitForLineAsync`), wait for
+/// the whole chain to finish with the SAME pipefail classification the buffering verbs use
+/// (`FinishAsync`), or stop / reap the entire chain (`StopAsync` / `Kill` / dispose). Disposing it reaps
+/// every stage's tree (kill-on-drop), just like disposing a `RunningProcess`.
+///
+/// **Single consumption** (the `RunningProcess` rule, [[K-031]]): the final stage's stdout is pumped
+/// exactly once, so `StdoutLinesAsync` and `OutputEventsAsync` are mutually exclusive — a second,
+/// different consumer throws `"already consumed by another verb"`. `FinishAsync` rejoins the SAME
+/// stdout-streaming session `StdoutLinesAsync` started (so it is the natural "wait for the rest" after
+/// streaming lines); after `OutputEventsAsync`, use `StopAsync` (or dispose) to reap. These hold because
+/// the session delegates every streaming/consuming verb to one underlying `RunningProcess`.
+///
+/// **Whole-chain semantics.** The stream is the final stage's stdout, but `FinishAsync`/`StopAsync`
+/// reap and classify the ENTIRE chain: the returned `Finished.Outcome` is the pipefail representative
+/// (the rightmost checked stage that did not exit with an accepted code, or a `TimedOut`/`Cancelled`
+/// for the whole chain), and `Finished.Stderr` is that representative stage's stderr — identical to what
+/// `Pipeline.RunAsync` would report, never a final-stage-only view. Stopping or disposing tears down
+/// EVERY stage (including a partially started chain), never just the last.
+[<Sealed>]
+type PipelineSession
+    internal (inner: RunningProcess, commands: Command list, capture: Task<PipelineCapture>, wasCancelled: unit -> bool)
+    =
+
+    // Build the completion result from the stashed whole-chain capture, applying the EXACT same three
+    // pipefail rules as the buffering verbs (`PipelineClassify`) — so a streamed run's outcome/error set
+    // is never a truncated version of `RunAsync`'s. A whole-chain cancellation (the verb token or
+    // `Pipeline.CancelOn`) wins over the killed chain's raw outcome, mirroring the buffered path's
+    // `Cancelled`-takes-precedence classification.
+    let classify (capture: PipelineCapture) : Result<Finished, ProcessError> =
+        if wasCancelled () then
+            Error(ProcessError.Cancelled (List.last commands).Program)
+        else
+            match PipelineClassify.outputTooLargeError commands capture with
+            | Some error -> Error error
+            | None ->
+                let stage = PipelineClassify.representative capture
+
+                match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
+                | Some error -> Error error
+                | None -> Ok(Finished(stage.Outcome, stage.Stderr))
+
+    /// Stream the FINAL stage's stdout line by line as it arrives — the pipeline analogue of
+    /// `RunningProcess.StdoutLinesAsync`. Hands out its ONE enumerator exactly once; a second streaming
+    /// consumer (this again, or `OutputEventsAsync`) throws. Call `FinishAsync` afterwards for the
+    /// whole-chain outcome + the representative stage's stderr.
+    member _.StdoutLinesAsync() : IAsyncEnumerable<string> = inner.StdoutLinesAsync()
+
+    /// Stream the final stage's stdout as NDJSON / JSON Lines (reflection-based `System.Text.Json`), each
+    /// non-empty line deserialized into a `'T` as it arrives — the pipeline analogue of
+    /// `RunningProcess.StdoutJsonLinesAsync`. Not trim-/AOT-safe; prefer the `JsonTypeInfo<'T>` overload
+    /// in a trimmed/NativeAOT app.
+    [<RequiresUnreferencedCode "Deserializes each line by reflection via System.Text.Json; give the JsonTypeInfo<'T> overload, or avoid this verb, in a trimmed app.">]
+    [<RequiresDynamicCode "Deserializes each line by reflection via System.Text.Json; give the JsonTypeInfo<'T> overload, or avoid this verb, in a NativeAOT app.">]
+    member _.StdoutJsonLinesAsync<'T>([<Optional>] options: JsonSerializerOptions | null) : IAsyncEnumerable<'T> =
+        inner.StdoutJsonLinesAsync<'T>(options)
+
+    /// Like the overload above, but deserializes each line via a source-generated `JsonTypeInfo<'T>` —
+    /// trim-/NativeAOT-safe.
+    member _.StdoutJsonLinesAsync<'T>(typeInfo: JsonTypeInfo<'T>) : IAsyncEnumerable<'T> =
+        inner.StdoutJsonLinesAsync<'T>(typeInfo)
+
+    /// Stream merged final-stage stdout line events as they arrive, each tagged `OutputEvent.Stdout` — the
+    /// pipeline analogue of `RunningProcess.OutputEventsAsync`. A pipeline captures only the final stage's
+    /// stdout (each earlier stage's stdout is wired into the next stage's stdin, and every stage's stderr
+    /// is drained under its own byte cap for the pipefail result), so — unlike a single command — no
+    /// `OutputEvent.Stderr` is produced here. Mutually exclusive with `StdoutLinesAsync`; after it, reap
+    /// with `StopAsync` (or dispose) rather than `FinishAsync`.
+    member _.OutputEventsAsync() : IAsyncEnumerable<OutputEvent> = inner.OutputEventsAsync()
+
+    /// Wait until a final-stage stdout line satisfies `predicate`, or fail with `NotReady` after
+    /// `timeout` (or `Cancelled` if `cancellationToken` fires first) — the pipeline analogue of
+    /// `RunningProcess.WaitForLineAsync`. Consumed lines are not re-delivered; a later `StdoutLinesAsync`/
+    /// `FinishAsync` sees the rest.
+    member _.WaitForLineAsync
+        (predicate: Func<string, bool>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<string, ProcessError>> =
+        inner.WaitForLineAsync(predicate, timeout, cancellationToken)
+
+    /// Wait for the WHOLE chain to finish, then return how it concluded (the pipefail representative's
+    /// `Outcome`) plus that stage's stderr — with the same classification `Pipeline.RunAsync` applies:
+    /// an `OutputTooLarge` on any stage's fail-loud stream, or a stage-0 stdin-source failure on an
+    /// otherwise-successful run, surfaces as `Error`, and a whole-chain cancellation is `Cancelled`. A
+    /// non-zero pipefail exit is *data* in `Finished.Outcome`, not an `Error`. Reaps the whole tree.
+    /// Pairs with `StdoutLinesAsync` (it rejoins that stdout-streaming session); called with no prior
+    /// streaming it buffers and discards the final stdout, then reports the outcome.
+    member _.FinishAsync() : Task<Result<Finished, ProcessError>> =
+        task {
+            match! inner.FinishAsync() with
+            | Error error ->
+                // The inner handle drains no stderr of its own (the pipeline owns every stage's stderr),
+                // so this branch is unreachable in practice; forward any inner error rather than mask it.
+                return Error error
+            | Ok _ ->
+                let! settled = capture
+                return classify settled
+        }
+
+    /// Gracefully stop the WHOLE chain (soft signal, wait up to `gracePeriod`, then hard-kill the
+    /// remainder — the same machinery `RunningProcess.StopAsync` drives), reap every stage, and return
+    /// the pipefail representative's `Outcome`. Safe to call after any streaming verb (or none) and
+    /// idempotent/race-safe with `Kill`/dispose — the tree is reaped exactly once.
+    member _.StopAsync(gracePeriod: TimeSpan) : Task<Outcome> =
+        task {
+            let! _ = inner.StopAsync gracePeriod
+            let! settled = capture
+            return (PipelineClassify.representative settled).Outcome
+        }
+
+    /// `StopAsync` using the default grace window (2 seconds, matching `ProcessGroupOptions.ShutdownTimeout`).
+    member this.StopAsync() : Task<Outcome> =
+        this.StopAsync(TimeSpan.FromSeconds 2.0)
+
+    /// Signal the whole chain to die without waiting (fire-and-forget, like `RunningProcess.Kill`); the
+    /// tree is fully reaped when the session is disposed. For a blocking stop, use `StopAsync` or dispose.
+    member _.Kill() = inner.Kill()
+
+    interface IAsyncDisposable with
+        /// Reap the whole chain's tree (kill-on-drop): disposes the underlying `RunningProcess`, whose
+        /// teardown hard-kills and reaps every stage and releases the shared group.
+        member _.DisposeAsync() =
+            (inner :> IAsyncDisposable).DisposeAsync()
+
 /// An immutable left-to-right chain of commands wired stdout -> stdin, with **no shell** involved:
 /// each stage's standard output feeds the next stage's standard input directly. The whole chain
 /// runs inside one shared kill-on-dispose group, so cancelling, timing out, or disposing the run
@@ -114,8 +240,9 @@ module internal PipelineStageGuard =
 ///
 /// Build it by piping commands (`a.Pipe(b).Pipe(c)`), then run it to completion with the same
 /// run-and-capture verbs a single command exposes (`RunAsync`/`OutputStringAsync`/`OutputBytesAsync`/`ExitCodeAsync`/
-/// `ProbeAsync`/`ParseAsync`/`TryParseAsync`). A pipeline runs as a whole, so the *streaming* verbs (`FirstLineAsync`,
-/// `StdoutLinesAsync`) are deliberately not offered — capture the last stage's output instead. The exit
+/// `ProbeAsync`/`ParseAsync`/`TryParseAsync`). To stream the final stage's stdout as it arrives instead
+/// of buffering the whole chain, start a live session with `StartAsync` (→ `PipelineSession`), the
+/// pipeline analogue of `Command.StartAsync` → `RunningProcess`. The exit
 /// status follows shell **pipefail**: the rightmost stage that did not exit with an accepted code
 /// (its `Command.OkCodes`, `{0}` by default) determines the result, unless that stage opted out with
 /// `Command.UncheckedInPipe`.
@@ -167,103 +294,6 @@ module internal PipelineStageGuard =
 [<Sealed>]
 type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancelOn: CancellationToken option) =
 
-    // pipefail: the representative stage carries the program/outcome/stderr for the verb result.
-    // It is the rightmost *checked* stage that did not exit with an accepted code; if every checked
-    // stage succeeded, the last checked stage stands (so an unchecked, failed final stage does not
-    // fail the pipeline). With no checked stages at all the pipeline is reported as a success. A
-    // timed-out pipeline reports TimedOut against the last stage.
-    static let representative (capture: PipelineCapture) : PipelineStage =
-        let last = List.last capture.Stages
-
-        if capture.TimedOut then
-            { last with Outcome = Outcome.TimedOut }
-        else
-            let checkedStages = capture.Stages |> List.filter (fun stage -> not stage.Unchecked)
-
-            let failed (stage: PipelineStage) =
-                // A stage succeeds when it exits with one of *its own* accepted codes (`Command.OkCodes`,
-                // default `{0}`); a signal/timeout is always a failure.
-                not (stage.Outcome.IsAcceptedBy stage.OkCodes)
-
-            let checkedFailures = checkedStages |> List.filter failed
-
-            // The rightmost checked failure is where the pipeline failed — but a stage the chain's own
-            // proactive teardown hard-killed (`TornDown`, killed after a *sibling* failed) is a victim,
-            // not the culprit, so it must never steal the blame: prefer the rightmost NON-torn-down
-            // checked failure, falling back to the rightmost failure only when every checked failure is a
-            // teardown victim. With no proactive teardown in play (every `TornDown` is false) this is
-            // exactly the previous "rightmost checked failure" rule, so the pipefail result is unchanged.
-            let culprit =
-                checkedFailures
-                |> List.filter (fun stage -> not stage.TornDown)
-                |> List.tryLast
-                |> Option.orElseWith (fun () -> List.tryLast checkedFailures)
-
-            match culprit with
-            | Some stage -> stage // the checked failure the pipeline failed at
-            | None ->
-                // No checked stage failed: the pipeline succeeded. Report the last checked stage
-                // (its accepted exit).
-                match List.tryLast checkedStages with
-                | Some stage -> stage
-                | None ->
-                    // Every stage opted out of pipefail (`UncheckedInPipe`): nothing can fail the
-                    // pipeline, so report success against the last stage regardless of its raw exit
-                    // (otherwise an all-unchecked chain with a failing last stage would wrongly fail
-                    // `RunAsync`/`ExitCodeAsync`). Use the last stage's own first accepted code.
-                    let okCode = last.OkCodes |> List.tryHead |> Option.defaultValue 0
-
-                    { last with
-                        Outcome = Outcome.Exited okCode }
-
-    // A genuine stage-0 stdin source failure surfaces as `ProcessError.Stdin` — uniformly with a single
-    // command — but only on an otherwise-successful pipeline (the pipefail representative exited with an
-    // accepted code); a pipefail failure or a timeout is the "realer" failure and passes through. The
-    // program is stage 0's, whose source could not be read.
-    static let stdinErrorOnSuccess (program: string) (capture: PipelineCapture) (representative: PipelineStage) =
-        if representative.Outcome.IsAcceptedBy representative.OkCodes then
-            capture.Stdin0Error
-            |> Option.map (fun ex -> ProcessError.Stdin(program, ex.Message))
-        else
-            None
-
-    // A pipeline honours the fail-loud (`OverflowMode.Error`) byte ceiling on EVERY captured stream, not
-    // just the last stage's stdout: the last stage's captured stdout AND every stage's drained stderr can
-    // each trip its own stage's `OutputBuffer` cap. When more than one trips at once (several stages, and/
-    // or a stage's stderr together with the final stdout), one deterministic error is chosen by
-    // **first-offending-stage-in-pipeline-order** — the leftmost stage in the chain wins, because that is
-    // the earliest point the chain overflowed; within a single stage its captured stdout (only the last
-    // stage has one) is preferred over its stderr. That tie-break keeps the pre-existing "only the final
-    // stdout overflowed" case reported exactly as before — same program, limits, and totals — while an
-    // overflow on any earlier stage's stderr now takes precedence over the final stdout. Each candidate
-    // names the offending stage's program and its configured caps (`MaxLines`/`MaxBytes` from THAT stage's
-    // `OutputBuffer`); the overflow is on a raw byte capture, so it carries no lines (`TotalLines = 0`),
-    // matching a single command's byte verb. Returns `None` when nothing overflowed. Checked before the
-    // pipefail/stdin classification, mirroring the single-command order. The precedence rule is documented
-    // in `docs/pipelines.md`; keep the two in sync.
-    static let outputTooLargeError (commands: Command list) (capture: PipelineCapture) : ProcessError option =
-        let cmds = List.toArray commands
-        let lastIndex = cmds.Length - 1
-
-        let build (index: int) (totalBytes: int) =
-            let policy = cmds[index].Config.OutputBuffer
-            ProcessError.OutputTooLarge(cmds[index].Program, policy.MaxLines, policy.MaxBytes, 0, totalBytes)
-
-        // Overflow candidates keyed by `(stageIndex, streamRank)`: a lower stageIndex is further left in
-        // the chain (higher precedence); within one stage stdout (rank 0) precedes stderr (rank 1). Sorting
-        // by that key and taking the first yields the leftmost-stage, stdout-before-stderr winner.
-        let candidates =
-            [ if capture.LastStdoutTooLarge then
-                  (lastIndex, 0, build lastIndex capture.LastStdoutTotalBytes)
-              for index, stage in List.indexed capture.Stages do
-                  if stage.StderrTooLarge then
-                      (index, 1, build index stage.StderrTotalBytes) ]
-
-        candidates
-        |> List.sortBy (fun (stageIndex, streamRank, _) -> (stageIndex, streamRank))
-        |> List.tryHead
-        |> Option.map (fun (_, _, error) -> error)
-
     /// Append another stage; its stdin is fed from the current last stage's stdout. Rejects
     /// (`ArgumentException`) a stage that sets a per-stage `Timeout`/`IdleTimeout`/`Retry`/`CancelOn` or
     /// a `Stdin` source — a pipeline cannot honour those (see the type doc); the appended stage is
@@ -306,6 +336,39 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             | None -> return! PipelineRunner.run commands timeout lastTee cancellationToken
         }
 
+    /// Start the pipeline as a live **streaming session** instead of running it to completion: spawn the
+    /// whole chain into one shared kill-on-dispose group and hand back a `PipelineSession` that streams
+    /// the FINAL stage's stdout line by line (`StdoutLinesAsync`/`OutputEventsAsync`), waits for the whole
+    /// chain with the same pipefail classification the buffering verbs use (`FinishAsync`), and stops/reaps
+    /// the entire chain (`StopAsync`/dispose). This is the pipeline analogue of `Command.StartAsync` →
+    /// `RunningProcess`, for long-running or interactive pipelines (`journalctl -f | grep …`) whose final
+    /// output must be read as it appears rather than buffered until the whole chain exits.
+    ///
+    /// `cancellationToken` is checked once, before spawning (an already-cancelled token reports
+    /// `ProcessError.Cancelled` and starts nothing). The chain-level `Timeout`/`CancelOn` set on this
+    /// pipeline still apply to the live session: either one firing hard-kills the whole tree, and a
+    /// subsequent `FinishAsync` then reports the run as `TimedOut`/`Cancelled`. Otherwise the session is
+    /// caller-driven — stop it with `StopAsync`/`Kill`/dispose. A stage that fails to spawn tears down the
+    /// partially started chain and returns its error, orphaning nothing.
+    member _.StartAsync
+        ([<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<PipelineSession, ProcessError>> =
+        task {
+            // The whole-chain cancellation predicate the session uses to classify a killed run as
+            // `Cancelled` (over the killed chain's raw outcome), matching the buffered path.
+            let wasCancelled () =
+                cancellationToken.IsCancellationRequested
+                || (cancelOn |> Option.exists (fun t -> t.IsCancellationRequested))
+
+            match! PipelineRunner.start commands timeout cancelOn cancellationToken with
+            | Error error -> return Error error
+            | Ok started ->
+                // Reuse `RunningProcess`'s guarded construction (as `ProcessGroup.StartAsync` does): if the
+                // handle ever faulted after spawn it reaps the tree via `host.Teardown` and re-raises.
+                let! inner = RunningProcess.buildGuarded started.Host
+                return Ok(PipelineSession(inner, commands, started.Capture, wasCancelled))
+        }
+
     /// Run the pipeline to completion, capturing the last stage's stdout as raw bytes. A non-zero
     /// pipefail exit is data here, not an error.
     member this.OutputBytesAsync
@@ -315,12 +378,12 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             match! this.Execute cancellationToken with
             | Error error -> return Error error
             | Ok capture ->
-                match outputTooLargeError commands capture with
+                match PipelineClassify.outputTooLargeError commands capture with
                 | Some error -> return Error error
                 | None ->
-                    let stage = representative capture
+                    let stage = PipelineClassify.representative capture
 
-                    match stdinErrorOnSuccess (List.head commands).Program capture stage with
+                    match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
                     | Some err -> return Error err
                     | None ->
                         return
@@ -348,12 +411,12 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             match! this.Execute cancellationToken with
             | Error error -> return Error error
             | Ok capture ->
-                match outputTooLargeError commands capture with
+                match PipelineClassify.outputTooLargeError commands capture with
                 | Some error -> return Error error
                 | None ->
-                    let stage = representative capture
+                    let stage = PipelineClassify.representative capture
 
-                    match stdinErrorOnSuccess (List.head commands).Program capture stage with
+                    match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
                     | Some err -> return Error err
                     | None ->
                         let encoding = (List.last commands).Config.StdoutEncoding

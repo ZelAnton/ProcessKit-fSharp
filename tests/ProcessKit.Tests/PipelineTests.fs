@@ -362,6 +362,25 @@ type PipelineTests() =
         listener.Start()
         listener, activeDeltas, (fun () -> startedCount), (fun () -> completedCount)
 
+    // Drain a streaming session's line/event enumerable to a list (mirrors `StreamingTests.collect`;
+    // that fixture's private copy is not reachable from this file). `IAsyncEnumerable` is fully
+    // qualified rather than `open`ed — `open System.Collections.Generic` would shadow the F# `List`
+    // module used throughout this file (see the note by the stdin-feeder doubles above).
+    let collect (source: System.Collections.Generic.IAsyncEnumerable<'T>) =
+        task {
+            let acc = ResizeArray<'T>()
+            let enumerator = source.GetAsyncEnumerator()
+            let mutable more = true
+
+            while more do
+                let! has = enumerator.MoveNextAsync()
+
+                if has then acc.Add enumerator.Current else more <- false
+
+            do! enumerator.DisposeAsync()
+            return acc
+        }
+
     [<Test>]
     member _.``two-stage pipeline wires stdout into the next stage's stdin``() : Task =
         task {
@@ -1360,5 +1379,168 @@ type PipelineTests() =
             match! run with
             | Ok output -> Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana" ]))
             | Error error -> Assert.Fail $"a slow tee must not time out a settled success, got {error}"
+        }
+        :> Task
+
+    // --- Streaming pipeline session (T-168): Pipeline.StartAsync -> PipelineSession ---
+
+    [<Test>]
+    member _.``StartAsync streams the final stage's stdout line by line``() : Task =
+        // Happy path: the session yields the LAST stage's stdout (here the sorted output of `emit | sort`)
+        // through `StdoutLinesAsync`, and `FinishAsync` then reports the whole chain's clean exit.
+        task {
+            let pipeline = (emit [ "banana"; "apple"; "cherry" ]).Pipe sortStage
+
+            match! pipeline.StartAsync() with
+            | Error error -> Assert.Fail $"start failed: {error}"
+            | Ok session ->
+                use session = session
+                let! streamed = collect (session.StdoutLinesAsync())
+
+                let got =
+                    streamed
+                    |> Seq.map (fun s -> s.Trim())
+                    |> Seq.filter (fun s -> s.Length > 0)
+                    |> Seq.toList
+
+                Assert.That(got, Is.EqualTo(box [ "apple"; "banana"; "cherry" ]))
+
+                match! session.FinishAsync() with
+                | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+                | Error error -> Assert.Fail $"finish failed: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputEventsAsync yields the final stage's stdout as Stdout events``() : Task =
+        // A pipeline captures only the final stage's stdout, so every merged event is a `Stdout` event
+        // (no separate `Stderr` events — the stderr of each stage is drained for the pipefail result).
+        task {
+            let pipeline = (emit [ "banana"; "apple" ]).Pipe sortStage
+
+            match! pipeline.StartAsync() with
+            | Error error -> Assert.Fail $"start failed: {error}"
+            | Ok session ->
+                use session = session
+                let! events = collect (session.OutputEventsAsync())
+
+                let onlyStdout =
+                    events
+                    |> Seq.forall (fun e ->
+                        match e with
+                        | OutputEvent.Stdout _ -> true
+                        | OutputEvent.Stderr _ -> false)
+
+                Assert.That(onlyStdout, Is.True, "a pipeline session emits only Stdout events")
+
+                let got =
+                    events
+                    |> Seq.map (fun e -> e.Text.Trim())
+                    |> Seq.filter (fun s -> s.Length > 0)
+                    |> Seq.toList
+
+                Assert.That(got, Is.EqualTo(box [ "apple"; "banana" ]))
+                let! _ = session.StopAsync()
+                ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync tears down every stage of the chain, not just the last``() : Task =
+        // The whole-chain teardown criterion: stage 0 is a long-lived silent producer and the last stage
+        // (`sort`) blocks reading its stdin, so both are alive when the session starts. `StopAsync` must
+        // reap the ENTIRE chain — if it killed only the last stage, the reap would block on stage 0's
+        // still-running 30s process. Finishing far inside the 15s window proves stage 0 was killed too.
+        task {
+            let pipeline = slowSilentStage.Pipe sortStage
+
+            match! pipeline.StartAsync() with
+            | Error error -> Assert.Fail $"start failed: {error}"
+            | Ok session ->
+                use session = session
+                do! assertFinishesPromptly (session.StopAsync())
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StartAsync tears down a partially started chain when a later stage fails to spawn``() : Task =
+        // The "partially started chain" case: stage 0 (a live 30s silent producer) has already spawned when
+        // a later stage's program is not found. Staging aborts, the chain is torn down, and an error is
+        // returned — with no orphan left behind (finishing inside the window proves stage 0 was reaped, not
+        // left to run its 30s).
+        task {
+            let missing = Command.create "processkit-nonexistent-stage-xyz"
+            let pipeline = slowSilentStage.Pipe(missing).Pipe(sortStage)
+
+            let start = pipeline.StartAsync()
+            do! assertFinishesPromptly start
+
+            match! start with
+            | Ok session ->
+                do! (session :> IAsyncDisposable).DisposeAsync()
+                Assert.Fail "a middle stage that cannot spawn must fail StartAsync, not return a session"
+            | Error _ -> () // the started stage-0 producer was reaped during the abort teardown (prompt above)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a streamed pipeline preserves the buffered pipefail outcome classification``() : Task =
+        // The classification-parity criterion: the streaming `FinishAsync` reports the SAME pipefail
+        // representative outcome the buffering `OutputStringAsync` does. Stage 0 exits 3 (a checked
+        // failure) and the last stage exits 0, so pipefail blames stage 0 (`Exited 3`) on both paths.
+        task {
+            let buffered = (shell "exit 3").Pipe sortStage
+
+            let! bufferedResult = buffered.OutputStringAsync()
+
+            let bufferedOutcome =
+                match bufferedResult with
+                | Ok result -> result.Outcome
+                | Error error ->
+                    Assert.Fail $"buffered run errored unexpectedly: {error}"
+                    Outcome.Exited 0
+
+            let streamed = (shell "exit 3").Pipe sortStage
+
+            match! streamed.StartAsync() with
+            | Error error -> Assert.Fail $"start failed: {error}"
+            | Ok session ->
+                use session = session
+                let! _ = collect (session.StdoutLinesAsync())
+
+                match! session.FinishAsync() with
+                | Ok finished ->
+                    Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 3))
+
+                    Assert.That(
+                        finished.Outcome,
+                        Is.EqualTo bufferedOutcome,
+                        "streamed and buffered pipefail must agree"
+                    )
+                | Error error -> Assert.Fail $"finish classified a pipefail exit as an error: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a streaming pipeline session emits exactly one whole-chain telemetry triple``() : Task =
+        // Telemetry parity criterion: a whole streaming run counts as ONE run (composite `a | b` label),
+        // not one per stage and not double-counted between the staging and the session's RunningProcess.
+        task {
+            let listener, activeDeltas, getStarted, getCompleted = listenToRunMetrics ()
+            use _listener = listener
+
+            let pipeline = (emit [ "banana"; "apple" ]).Pipe sortStage
+
+            match! pipeline.StartAsync() with
+            | Error error -> Assert.Fail $"start failed: {error}"
+            | Ok session ->
+                use session = session
+                let! _ = collect (session.StdoutLinesAsync())
+                let! _ = session.FinishAsync()
+                ()
+
+            Assert.That(getStarted (), Is.EqualTo 1L, "exactly one run started for the whole chain")
+            Assert.That(getCompleted (), Is.EqualTo 1L, "exactly one run completed for the whole chain")
+            Assert.That(Seq.sum activeDeltas, Is.EqualTo 0L, "the in-flight run count returns to zero")
         }
         :> Task

@@ -313,9 +313,19 @@ module internal Windows =
             CreateFileW("NUL", access, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, 0u, IntPtr.Zero)
 
         if isValidHandle handle then
-            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) |> ignore
-
-        handle
+            // If `SetHandleInformation` fails, the handle stays non-inheritable: `CreateProcessW`
+            // (`bInheritHandles=true`) would silently not copy it, and the child would receive a
+            // std handle that is invalid in its own process — writes to it fail silently instead of
+            // reaching the null device. Close it and hand back a sentinel so the `isValidHandle`
+            // gate in `setupOut` fails the spawn honestly (same pattern as `inheritableStdHandle`
+            // above), rather than let a broken handle through as if it were inheritable.
+            if not (SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) then
+                CloseHandle handle |> ignore
+                IntPtr.Zero
+            else
+                handle
+        else
+            handle
 
     /// An inheritable duplicate of one of the parent's std handles, for `StdioMode.Inherit`.
     let private inheritableStdHandle (stdHandleId: int) : nativeint =

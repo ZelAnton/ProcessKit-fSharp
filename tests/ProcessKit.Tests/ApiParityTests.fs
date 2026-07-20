@@ -18,6 +18,7 @@ open ProcessKit.Testing
 type ApiParityTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
 
     let shell (script: string) =
         if isWindows then
@@ -267,6 +268,91 @@ type ApiParityTests() =
                 | other -> Assert.Fail $"expected Cancelled, got {other}"
 
                 do! (running :> IAsyncDisposable).DisposeAsync()
+        }
+
+    // --- Pty pipe-friendly mirrors (T-167): Command.ptySize / Command.ptyConfig must observably match
+    // the equivalent instance Pty(cols, rows) / Pty(PtyConfig) overloads (PtyTests carries the
+    // instance-side ground truth for the same assertions). Each test below runs BOTH the pipe-friendly
+    // path and the equivalent instance-method path side by side and asserts their observable output is
+    // identical, not just individually correct (R-01: explicit dual-path comparison, not just parity
+    // by implementation inspection). ----------------------------------------------------------------
+
+    /// Runs `cmd` and returns its captured stdout, or lets NUnit `Ignore`/`Fail` the test on the
+    /// documented failure modes shared by every PTY-backed test in this file.
+    member private _.RunPtyCapturingStdout(cmd: Command) : Task<string> =
+        task {
+            match! cmd.OutputStringAsync() with
+            | Error(ProcessError.Unsupported msg) ->
+                Assert.Ignore $"host lacks a PTY: {msg}"
+                return Unchecked.defaultof<_>
+            | Error other ->
+                Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                return Unchecked.defaultof<_>
+            | Ok result -> return result.Stdout
+        }
+
+    [<Test>]
+    member this.``Command.ptySize applies the same winsize as the equivalent instance Pty(cols, rows)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                let build (applyPty: Command -> Command) =
+                    Command.create "/bin/sh"
+                    |> Command.args [ "-c"; "stty size" ]
+                    |> applyPty
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                let! pipeStdout = this.RunPtyCapturingStdout(build (Command.ptySize 120 30))
+                let! instanceStdout = this.RunPtyCapturingStdout(build (fun c -> c.Pty(120, 30)))
+
+                Assert.That(
+                    pipeStdout.Trim(),
+                    Is.EqualTo "30 120",
+                    "Command.ptySize must carry a 30 rows x 120 cols winsize"
+                )
+
+                Assert.That(
+                    pipeStdout,
+                    Is.EqualTo instanceStdout,
+                    "Command.ptySize must produce output identical to the equivalent .Pty(120, 30) instance call"
+                )
+        }
+
+    [<Test>]
+    member this.``Command.ptyConfig with Echo=false suppresses echo, same as the equivalent instance Pty(PtyConfig)``
+        ()
+        : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                let secret = "hunter2-SECRET-should-not-echo"
+                let ptyConfig: PtyConfig = { Cols = 80; Rows = 24; Echo = false }
+
+                let build (applyPty: Command -> Command) =
+                    Command.create "/bin/sh"
+                    |> Command.args [ "-c"; "read pw; printf 'done\\n'" ]
+                    |> applyPty
+                    |> Command.stdin (Stdin.FromString(secret + "\n"))
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                let! pipeStdout = this.RunPtyCapturingStdout(build (Command.ptyConfig ptyConfig))
+                let! instanceStdout = this.RunPtyCapturingStdout(build (fun c -> c.Pty ptyConfig))
+
+                Assert.That(pipeStdout, Does.Contain "done", "the child must have read the fed credential line")
+
+                Assert.That(
+                    pipeStdout,
+                    Does.Not.Contain secret,
+                    "Command.ptyConfig Echo=false must keep the fed credential out of the captured output"
+                )
+
+                Assert.That(
+                    pipeStdout,
+                    Is.EqualTo instanceStdout,
+                    "Command.ptyConfig must produce output identical to the equivalent .Pty(PtyConfig) instance call"
+                )
         }
 
     [<Test>]
