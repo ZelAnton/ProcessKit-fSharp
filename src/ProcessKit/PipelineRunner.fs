@@ -48,6 +48,103 @@ type internal PipelineCapture =
       TimedOut: bool
       Stdin0Error: exn option }
 
+/// The pipefail classification over a finished `PipelineCapture` — the rightmost-checked-failure fold,
+/// the stage-0 stdin-source-error rule, and the leftmost-stage output-overflow rule. Extracted from the
+/// `Pipeline` type so the buffering verbs (`Pipeline.RunAsync`/`OutputStringAsync`/…) AND the streaming
+/// session (`Pipeline.StartAsync` → `PipelineSession.FinishAsync`) apply the EXACT same rules, rather
+/// than the streaming path re-deriving a divergent (possibly truncated) classification. Pure functions
+/// over the capture — no I/O, no reap — so both consumers share one source of truth.
+module internal PipelineClassify =
+
+    /// The representative stage carrying the program/outcome/stderr for the verb result: pipefail's
+    /// rightmost *checked* stage that did not exit with an accepted code; if every checked stage
+    /// succeeded, the last checked stage stands (so an unchecked, failed final stage does not fail the
+    /// pipeline). With no checked stages at all the pipeline is a success. A timed-out pipeline reports
+    /// `TimedOut` against the last stage.
+    let representative (capture: PipelineCapture) : PipelineStage =
+        let last = List.last capture.Stages
+
+        if capture.TimedOut then
+            { last with Outcome = Outcome.TimedOut }
+        else
+            let checkedStages = capture.Stages |> List.filter (fun stage -> not stage.Unchecked)
+
+            let failed (stage: PipelineStage) =
+                // A stage succeeds when it exits with one of *its own* accepted codes (`Command.OkCodes`,
+                // default `{0}`); a signal/timeout is always a failure.
+                not (stage.Outcome.IsAcceptedBy stage.OkCodes)
+
+            let checkedFailures = checkedStages |> List.filter failed
+
+            // The rightmost checked failure is where the pipeline failed — but a stage the chain's own
+            // proactive teardown hard-killed (`TornDown`, killed after a *sibling* failed) is a victim,
+            // not the culprit, so it must never steal the blame: prefer the rightmost NON-torn-down
+            // checked failure, falling back to the rightmost failure only when every checked failure is a
+            // teardown victim. With no proactive teardown in play (every `TornDown` is false) this is
+            // exactly the previous "rightmost checked failure" rule, so the pipefail result is unchanged.
+            let culprit =
+                checkedFailures
+                |> List.filter (fun stage -> not stage.TornDown)
+                |> List.tryLast
+                |> Option.orElseWith (fun () -> List.tryLast checkedFailures)
+
+            match culprit with
+            | Some stage -> stage // the checked failure the pipeline failed at
+            | None ->
+                // No checked stage failed: the pipeline succeeded. Report the last checked stage
+                // (its accepted exit).
+                match List.tryLast checkedStages with
+                | Some stage -> stage
+                | None ->
+                    // Every stage opted out of pipefail (`UncheckedInPipe`): nothing can fail the
+                    // pipeline, so report success against the last stage regardless of its raw exit
+                    // (otherwise an all-unchecked chain with a failing last stage would wrongly fail
+                    // `RunAsync`/`ExitCodeAsync`). Use the last stage's own first accepted code.
+                    let okCode = last.OkCodes |> List.tryHead |> Option.defaultValue 0
+
+                    { last with
+                        Outcome = Outcome.Exited okCode }
+
+    /// A genuine stage-0 stdin source failure surfaces as `ProcessError.Stdin` — uniformly with a single
+    /// command — but only on an otherwise-successful pipeline (the pipefail representative exited with an
+    /// accepted code); a pipefail failure or a timeout is the "realer" failure and passes through. The
+    /// program is stage 0's, whose source could not be read.
+    let stdinErrorOnSuccess (program: string) (capture: PipelineCapture) (representative: PipelineStage) =
+        if representative.Outcome.IsAcceptedBy representative.OkCodes then
+            capture.Stdin0Error
+            |> Option.map (fun ex -> ProcessError.Stdin(program, ex.Message))
+        else
+            None
+
+    /// The fail-loud (`OverflowMode.Error`) byte-ceiling classification across EVERY captured stream: the
+    /// last stage's captured stdout AND every stage's drained stderr can each trip its own stage's
+    /// `OutputBuffer` cap. When more than one trips, one deterministic error is chosen by
+    /// **first-offending-stage-in-pipeline-order** (leftmost stage wins; within a stage its captured
+    /// stdout is preferred over its stderr). Returns `None` when nothing overflowed. The precedence rule
+    /// is documented in `docs/pipelines.md`; keep the two in sync.
+    let outputTooLargeError (commands: Command list) (capture: PipelineCapture) : ProcessError option =
+        let cmds = List.toArray commands
+        let lastIndex = cmds.Length - 1
+
+        let build (index: int) (totalBytes: int) =
+            let policy = cmds[index].Config.OutputBuffer
+            ProcessError.OutputTooLarge(cmds[index].Program, policy.MaxLines, policy.MaxBytes, 0, totalBytes)
+
+        // Overflow candidates keyed by `(stageIndex, streamRank)`: a lower stageIndex is further left in
+        // the chain (higher precedence); within one stage stdout (rank 0) precedes stderr (rank 1). Sorting
+        // by that key and taking the first yields the leftmost-stage, stdout-before-stderr winner.
+        let candidates =
+            [ if capture.LastStdoutTooLarge then
+                  (lastIndex, 0, build lastIndex capture.LastStdoutTotalBytes)
+              for index, stage in List.indexed capture.Stages do
+                  if stage.StderrTooLarge then
+                      (index, 1, build index stage.StderrTotalBytes) ]
+
+        candidates
+        |> List.sortBy (fun (stageIndex, streamRank, _) -> (stageIndex, streamRank))
+        |> List.tryHead
+        |> Option.map (fun (_, _, error) -> error)
+
 /// Runs a multi-stage pipeline inside one fresh shared `ProcessGroup` — the staging/wiring/teardown
 /// for the `Pipeline` type. Kept next to `Pipeline` (its only consumer) rather than inside
 /// `ProcessGroup`, which it drives purely through that group's public/internal surface.
@@ -641,4 +738,393 @@ module internal PipelineRunner =
                                       Duration = duration
                                       TimedOut = timedOut
                                       Stdin0Error = stdin0Error }
+        }
+
+    /// The live materials a streaming pipeline session (`Pipeline.StartAsync`) is built from. `Host` is a
+    /// `RunningHost` over the LAST stage — its stdout is the streamed output, while its Wait/Teardown/kill
+    /// closures drive the WHOLE chain — and `Capture` is the memoized whole-chain observation the session
+    /// reads for its pipefail-classified completion. Internal — `Pipeline.StartAsync` turns `Host` into a
+    /// `RunningProcess` (reusing that type's claim gate / `ensureBufferedWait` / streaming machinery) and
+    /// wraps it in a `PipelineSession`.
+    type PipelineStart =
+        { Host: RunningHost
+          Capture: Task<PipelineCapture> }
+
+    /// Spawn every stage of a *streaming* pipeline into one fresh shared group, wire the chain, and return
+    /// a `PipelineStart`. The last stage's stdout is left for the session's `RunningProcess` to stream
+    /// (rather than captured like `run` does); the returned `RunningHost.Wait` observes the WHOLE chain
+    /// through the same reap-once choke point the buffered `run` uses — `observeStages` + `group.WaitHandle`
+    /// (K-016/K-043) — so there is no fifth independent copy of the wait/reap logic. Cancellation
+    /// (`cancellationToken`/`cancelOn`) or the chain `timeout` hard-kill the tree.
+    ///
+    /// The staging loop below deliberately mirrors `run`'s (spawn + stdout→stdin wiring + per-stage stderr
+    /// drain + stage-0 feed, all under the T-061 cancellation gate); keep the two in sync. It diverges only
+    /// in the tail: `run` reaps/captures inline and returns a `PipelineCapture`, whereas this hands the live
+    /// chain to a session and defers the reap to `Wait`/`Teardown`. Telemetry also lives elsewhere: the
+    /// session's `RunningProcess` owns the one whole-run `Diag`/`Log.spawn`/exit triple (composite
+    /// `programLabel`, shared `runId`, stage-0 logger), so this staging starts NO `RunTelemetryScope` and
+    /// logs no spawn of its own — avoiding the double-count a second telemetry owner would cause.
+    let start
+        (commands: Command list)
+        (timeout: TimeSpan option)
+        (cancelOn: CancellationToken option)
+        (cancellationToken: CancellationToken)
+        : Task<Result<PipelineStart, ProcessError>> =
+        task {
+            let stages = List.toArray commands
+
+            let cancelledUpFront =
+                cancellationToken.IsCancellationRequested
+                || (cancelOn |> Option.exists (fun t -> t.IsCancellationRequested))
+
+            if stages.Length = 0 then
+                return Error(ProcessError.Spawn("<pipeline>", "a pipeline needs at least one stage"))
+            elif cancelledUpFront then
+                return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
+            else
+                // The pipeline's whole-run observability identity (used by the session's `RunningProcess`,
+                // not started here): stage 0's logger, one shared `runId`, and the composite `a | b | c`
+                // program label — built from `Command.Program` only, never argv/env.
+                let logger = stages[0].Config.Logger
+                let programLabel = stages |> Array.map (fun c -> c.Program) |> String.concat " | "
+                let runId = Diag.newRunId ()
+
+                match ProcessGroup.Create() with
+                | Error error -> return Error error
+                | Ok group ->
+                    let startedAt = Stopwatch.GetTimestamp()
+                    let startTimeUtc = DateTime.UtcNow
+                    let timeoutCts = new CancellationTokenSource()
+
+                    // Link the verb token, the chain-level `CancelOn`, and the deadline into one token whose
+                    // firing hard-kills the whole tree. The session owns (and disposes) all three CTS /
+                    // registration on teardown, since — unlike `run` — they must outlive this call.
+                    let linkTokens = ResizeArray<CancellationToken>()
+                    linkTokens.Add cancellationToken
+                    linkTokens.Add timeoutCts.Token
+                    cancelOn |> Option.iter linkTokens.Add
+
+                    let linkedCts =
+                        CancellationTokenSource.CreateLinkedTokenSource(linkTokens.ToArray())
+
+                    match timeout with
+                    // Only arm the deadline when it fits a BCL timer; an over-long span is "no timeout".
+                    | Some duration when Timeouts.isArmable duration -> timeoutCts.CancelAfter duration
+                    | _ -> ()
+
+                    // The T-061 staging gate: "spawn a stage" and "mark cancelled, then sweep" are mutually
+                    // exclusive, so no stage can start after the cancellation sweep (see `run`).
+                    let stagingGate = obj ()
+                    let mutable cancellationFired = false
+
+                    let registration =
+                        linkedCts.Token.Register(fun () ->
+                            lock stagingGate (fun () -> cancellationFired <- true)
+                            group.KillTree())
+
+                    let closeQuietly = Pump.disposeQuietly
+                    let spawned = ResizeArray<Native.Common.Spawned>()
+                    let copyTasks = ResizeArray<Task>()
+                    let stderrTasks = ResizeArray<Task<Pump.RawCapture>>()
+                    let mutable prevStdout: Stream option = None
+                    let mutable spawnError = None
+                    let mutable stagingHalted = false
+                    let mutable stage0Feed: Pump.StdinFeeder option = None
+                    let mutable index = 0
+
+                    let stopStage0Feed () =
+                        stage0Feed |> Option.iter (fun feeder -> feeder.Stop())
+
+                    while index < stages.Length && spawnError.IsNone && not stagingHalted do
+                        // Force `Piped` stdout on every stage (the last stage's is the streamed output), and
+                        // an open stdin pipe on every stage after the first (fed the previous stage's stdout).
+                        let piped = stages[index] |> Command.stdout StdioMode.Piped
+                        let stage = if index > 0 then piped.KeepStdinOpen() else piped
+
+                        let spawnOutcome =
+                            lock stagingGate (fun () ->
+                                if cancellationFired then
+                                    ValueNone
+                                else
+                                    ValueSome(group.SpawnInto stage))
+
+                        match spawnOutcome with
+                        | ValueNone ->
+                            // Cancellation/timeout already fired: start neither this nor any later stage.
+                            stagingHalted <- true
+                        | ValueSome(Error error) -> spawnError <- Some error
+                        | ValueSome(Ok sp) ->
+                            spawned.Add sp
+
+                            if index = 0 then
+                                // Only stage 0 may carry a stdin source; close its pipe after the source
+                                // (`keepStdinOpen = false`) — a pipeline exposes no interactive writer.
+                                stage0Feed <- Some(Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource false)
+                            else
+                                match prevStdout, sp.Stdin with
+                                | Some upstream, Some downstream ->
+                                    copyTasks.Add(
+                                        task {
+                                            try
+                                                do! upstream.CopyToAsync downstream
+                                            with _ ->
+                                                // Downstream exited early (broken pipe) or teardown tore the
+                                                // stream down; fall through to close both ends.
+                                                ()
+
+                                            closeQuietly downstream
+                                            closeQuietly upstream
+                                        }
+                                        :> Task
+                                    )
+                                | _ -> ()
+
+                            // Drain EVERY stage's stderr (including the last) under that stage's own
+                            // `OutputBuffer` byte cap — identical to `run`, so the pipefail classification
+                            // sees every stage's stderr uniformly. The last stage's stdout is NOT drained
+                            // here; the session's `RunningProcess` streams it.
+                            stderrTasks.Add(
+                                Pump.captureRawOrEmpty
+                                    sp.Stderr
+                                    None
+                                    stages[index].Config.OutputBuffer
+                                    CancellationToken.None
+                            )
+
+                            prevStdout <- sp.Stdout
+                            stageSpawnedTestHook |> Option.iter (fun hook -> hook index)
+
+                        index <- index + 1
+
+                    if spawnError.IsSome || stagingHalted then
+                        // Abort: a stage failed to spawn, or cancellation/timeout halted staging. Hard-kill
+                        // and reap the partial chain here (the "partially started chain" teardown: earlier
+                        // stages are already live, later ones never started) so no stage is orphaned, then
+                        // return an error — no session is handed back. Reap goes through `group.WaitHandle`,
+                        // the reap-once choke point, exactly like `run`'s abort branch.
+                        group.KillTree()
+                        stopStage0Feed ()
+
+                        let! _ =
+                            spawned
+                            |> Seq.map (fun sp -> group.WaitHandle sp.Handle)
+                            |> Seq.toArray
+                            |> Task.WhenAll
+
+                        do! Task.WhenAll(copyTasks.ToArray())
+                        let! _ = Task.WhenAll(stderrTasks.ToArray())
+
+                        for sp in spawned do
+                            Pump.closeSpawned sp
+
+                        registration.Dispose()
+                        (group :> IDisposable).Dispose()
+                        timeoutCts.Dispose()
+                        linkedCts.Dispose()
+
+                        match spawnError with
+                        | Some error -> return Error error
+                        | None -> return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
+                    else
+                        // The whole chain is live. Build the `RunningHost` over the last stage; the session's
+                        // `RunningProcess` streams its stdout and drives the closures below.
+                        let lastSpawned = spawned[spawned.Count - 1]
+
+                        let captureTcs =
+                            TaskCompletionSource<PipelineCapture>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                        // One teardown gate guarding the group against a post-release kill (K-025-class
+                        // use-after-close): kills no-op once `tornDown` is set, and the one-shot `teardown`
+                        // runs its reap/close/dispose exactly once (`RunningProcess` calls `Teardown` twice —
+                        // a terminal verb's reap-guard, then handle disposal — so it must be idempotent).
+                        let teardownGate = obj ()
+                        let mutable tornDown = false
+                        let mutable teardownStarted = false
+
+                        let killTreeGated () =
+                            lock teardownGate (fun () ->
+                                if not tornDown then
+                                    group.KillTree())
+
+                        let gracefulKillGated (grace: TimeSpan) : Task =
+                            lock teardownGate (fun () ->
+                                if not tornDown then
+                                    group.GracefulKillTree grace
+                                else
+                                    Task.CompletedTask)
+
+                        // Observe the whole chain through the shared reap-once choke point, drain the
+                        // relay/stderr tail, build + stash the pipefail capture, and return the SAME
+                        // telemetry outcome `run` reports (`TimedOut`, else the last stage's raw outcome —
+                        // the session derives the pipefail representative from the stashed capture instead).
+                        let waitWhole () : Task<Outcome> =
+                            task {
+                                let waits = [| for sp in spawned -> group.WaitHandle sp.Handle |]
+
+                                let isCheckedFailure (i: int) (outcome: Outcome) =
+                                    not stages[i].Config.UncheckedInPipe
+                                    && not (outcome.IsAcceptedBy stages[i].Config.OkCodes)
+
+                                let disarmTimeout () =
+                                    try
+                                        timeoutCts.CancelAfter Timeout.InfiniteTimeSpan
+                                    with :? ObjectDisposedException ->
+                                        // Disposed by a concurrent teardown; a disarmed timer no longer matters.
+                                        ()
+
+                                let! observation =
+                                    observeStages
+                                        waits
+                                        isCheckedFailure
+                                        killTreeGated
+                                        (fun () -> linkedCts.IsCancellationRequested)
+                                        (fun () -> timeoutCts.IsCancellationRequested)
+                                        disarmTimeout
+
+                                do! Task.WhenAll(copyTasks.ToArray())
+                                let! stderrCaptures = Task.WhenAll(stderrTasks.ToArray())
+                                let duration = Stopwatch.GetElapsedTime startedAt
+                                let outcomes = observation.Outcomes
+
+                                let stageResults =
+                                    [ for i in 0 .. stages.Length - 1 ->
+                                          { Program = stages[i].Program
+                                            Outcome = outcomes[i]
+                                            Unchecked = stages[i].Config.UncheckedInPipe
+                                            Stderr = stages[i].Config.StderrEncoding.GetString stderrCaptures[i].Bytes
+                                            OkCodes = stages[i].Config.OkCodes
+                                            StderrTooLarge = stderrCaptures[i].TooLarge
+                                            StderrTotalBytes = stderrCaptures[i].TotalBytes
+                                            TornDown = observation.TornDown[i] } ]
+
+                                let stdin0Error = stage0Feed |> Option.bind (fun feeder -> feeder.Fault)
+                                stopStage0Feed ()
+
+                                let capture =
+                                    { LastStdout = Array.empty
+                                      LastStdoutTruncated = false
+                                      LastStdoutTooLarge = false
+                                      LastStdoutTotalBytes = 0
+                                      Stages = stageResults
+                                      Duration = duration
+                                      TimedOut = observation.TimedOut
+                                      Stdin0Error = stdin0Error }
+
+                                captureTcs.TrySetResult capture |> ignore
+
+                                // Timeout parity with `run`: emit the explicit deadline-kill event before the
+                                // session's `RunningProcess` logs its own `Log.exit`/`Diag.runCompleted`.
+                                match timeout with
+                                | Some deadline when observation.TimedOut ->
+                                    Log.timeout logger programLabel deadline runId
+                                | _ -> ()
+
+                                return
+                                    if observation.TimedOut then
+                                        Outcome.TimedOut
+                                    else
+                                        outcomes[outcomes.Length - 1]
+                            }
+
+                        let teardownWhole () : Task =
+                            task {
+                                // Hard-kill, then reap EVERY started stage through `group.WaitHandle` — the
+                                // reap-once choke point (K-016/K-151). This is self-contained: it does not
+                                // depend on whether `Wait` (`observeStages`) ever ran, and because concurrent
+                                // waiters on one pid share the single OS reap, running it alongside an
+                                // in-flight `observeStages` (a session disposed mid-stream) neither
+                                // double-reaps nor leaks a zombie. On the normal path (a terminal verb reaped
+                                // through `observeStages` already) these waits hit the warm linger cache and
+                                // return promptly; their discarded outcomes don't matter here.
+                                group.KillTree()
+                                stopStage0Feed ()
+
+                                let! _ =
+                                    spawned
+                                    |> Seq.map (fun sp -> group.WaitHandle sp.Handle)
+                                    |> Seq.toArray
+                                    |> Task.WhenAll
+
+                                do! Task.WhenAll(copyTasks.ToArray())
+                                let! _ = Task.WhenAll(stderrTasks.ToArray())
+
+                                for sp in spawned do
+                                    Pump.closeSpawned sp
+
+                                // Block further kills BEFORE releasing the group, then dispose the owned
+                                // resources. `registration.Dispose()` waits for any in-flight cancel-callback
+                                // `KillTree` to finish, so the group is released only after it, never under it.
+                                lock teardownGate (fun () -> tornDown <- true)
+                                registration.Dispose()
+                                (group :> IDisposable).Dispose()
+                                timeoutCts.Dispose()
+                                linkedCts.Dispose()
+                            }
+                            :> Task
+
+                        // Synthesize the inner handle's config: the last stage drives stdout streaming
+                        // (encoding, line terminator, tee, stream/output buffer), but the whole-run identity
+                        // (composite label, shared runId, stage-0 logger) rides here so the session emits ONE
+                        // whole-chain telemetry triple. The chain-level timeout/cancel are handled by the
+                        // staging above, so they are cleared here to avoid a second, per-handle deadline; the
+                        // pipeline exposes no interactive stdin / per-line handlers (matching the buffered
+                        // pipeline's "observation hooks not applied" rule for stdout line handlers).
+                        let lastConfig = (List.last commands).Config
+
+                        let innerConfig =
+                            { lastConfig with
+                                Program = programLabel
+                                Logger = logger
+                                RunId = Some runId
+                                Timeout = None
+                                IdleTimeout = None
+                                CancelOn = None
+                                Retry = None
+                                RetryDisabled = false
+                                StdinSource = None
+                                KeepStdinOpen = false
+                                OnStdoutLine = None
+                                OnStderrLine = None
+                                StderrTee = None }
+
+                        let host: RunningHost =
+                            { Config = innerConfig
+                              // No single pid represents a multi-process chain (matching `run`'s spawn log).
+                              Pid = None
+                              Stdout = lastSpawned.Stdout
+                              // The last stage's stderr is drained by the pipeline's own `stderrTasks` (above)
+                              // for the pipefail classification, so the inner handle pumps no stderr of its own.
+                              Stderr = None
+                              // A pipeline exposes no live stdin handle (see the `Pipeline` type doc).
+                              Stdin = None
+                              StartTime = startTimeUtc
+                              StartedTimestamp = startedAt
+                              StartTimeIdentity = None
+                              Wait = waitWhole
+                              // Stage-0 stdin faults are surfaced through the stashed capture's `Stdin0Error`
+                              // by the session, not the inner handle, so it never errors on stdin itself.
+                              StdinError = (fun () -> None)
+                              StdinFeedComplete = (fun () -> ())
+                              StartKill = killTreeGated
+                              GracefulKill = gracefulKillGated
+                              ResizePty = None
+                              Teardown =
+                                fun () ->
+                                    let shouldRun =
+                                        lock teardownGate (fun () ->
+                                            if teardownStarted then
+                                                false
+                                            else
+                                                teardownStarted <- true
+                                                true)
+
+                                    if shouldRun then
+                                        ValueTask(teardownWhole ())
+                                    else
+                                        ValueTask() }
+
+                        return
+                            Ok
+                                { Host = host
+                                  Capture = captureTcs.Task }
         }

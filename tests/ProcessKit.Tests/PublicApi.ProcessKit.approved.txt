@@ -373,6 +373,7 @@ class ProcessKit.Pipeline
   member ProbeAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
   member RunAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
   member RunUnitAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member StartAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.PipelineSession, ProcessKit.ProcessError>>
   member Timeout(System.TimeSpan) : ProcessKit.Pipeline
   member TryParseAsync<T>(ProcessKit.TryParser<T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
 
@@ -384,6 +385,18 @@ module ProcessKit.PipelineModule
   static member create(ProcessKit.Command, ProcessKit.Command) : ProcessKit.Pipeline
   static member pipe(ProcessKit.Command, ProcessKit.Pipeline) : ProcessKit.Pipeline
   static member timeout(System.TimeSpan, ProcessKit.Pipeline) : ProcessKit.Pipeline
+
+class ProcessKit.PipelineSession
+  :> System.IAsyncDisposable
+  member FinishAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.Finished, ProcessKit.ProcessError>>
+  member Kill() : System.Void
+  member OutputEventsAsync() : System.Collections.Generic.IAsyncEnumerable<ProcessKit.OutputEvent>
+  member StdoutJsonLinesAsync<T>(System.Text.Json.JsonSerializerOptions) : System.Collections.Generic.IAsyncEnumerable<T>
+  member StdoutJsonLinesAsync<T>(System.Text.Json.Serialization.Metadata.JsonTypeInfo<T>) : System.Collections.Generic.IAsyncEnumerable<T>
+  member StdoutLinesAsync() : System.Collections.Generic.IAsyncEnumerable<System.String>
+  member StopAsync() : System.Threading.Tasks.Task<ProcessKit.Outcome>
+  member StopAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.Outcome>
+  member WaitForLineAsync(System.Func<System.String, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
 
 class ProcessKit.Priority
   :> System.Collections.IStructuralEquatable

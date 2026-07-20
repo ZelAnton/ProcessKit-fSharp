@@ -405,6 +405,52 @@ don't care about output, `WaitAsync()` returns the `Outcome` directly and discar
 captured output; if you skipped streaming altogether, `OutputStringAsync()` /
 `OutputBytesAsync()` buffer and return everything just like the one-shot verbs.
 
+## Streaming a pipeline's final stage
+
+Everything in this chapter has a **pipeline** counterpart. A [`Pipeline`](pipelines.md)
+normally runs to completion behind its buffering verbs, but `Pipeline.StartAsync()` starts
+it as a live session — a `PipelineSession`, the multi-stage analogue of `RunningProcess` —
+and streams the **final** stage's stdout exactly as `StdoutLinesAsync` /
+`StdoutJsonLinesAsync` / `OutputEventsAsync` / `WaitForLineAsync` do above:
+
+**F#**
+
+```fsharp
+task {
+    let pipeline =
+        (Command.create "journalctl" |> Command.args [ "-f" ])
+            .Pipe(Command.create "grep" |> Command.args [ "--line-buffered"; "ERROR" ])
+
+    match! pipeline.StartAsync() with
+    | Error err -> eprintfn $"{err.Message}"
+    | Ok session ->
+        use session = session
+        let e = session.StdoutLinesAsync().GetAsyncEnumerator()
+
+        try
+            let mutable go = true
+
+            while go do
+                match! e.MoveNextAsync() with
+                | true -> printfn $"error: {e.Current}"
+                | false -> go <- false
+        finally
+            e.DisposeAsync().AsTask().Wait()
+
+        // FinishAsync reaps the WHOLE chain and reports the pipefail outcome + that
+        // stage's stderr — identical to Pipeline.RunAsync, never a final-stage-only view.
+        match! session.FinishAsync() with
+        | Ok finished -> printfn $"chain finished: {finished.Outcome}"
+        | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+`FinishAsync` / `StopAsync` reap and classify the entire chain (not just the final stage),
+so a non-zero exit deep in the pipe still surfaces as the pipefail representative's
+`Outcome`, and stopping or disposing tears down **every** stage. The single-consumption,
+timeout, and cancellation rules are the ones you already know from `RunningProcess`. See
+[Streaming a pipeline](pipelines.md#streaming-a-pipeline) for the full session surface.
+
 ## Interactive stdin
 
 Conversational tools — write a request, read the response, repeat. Keep stdin open
