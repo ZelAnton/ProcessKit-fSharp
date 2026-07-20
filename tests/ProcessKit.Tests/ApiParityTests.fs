@@ -18,6 +18,7 @@ open ProcessKit.Testing
 type ApiParityTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
 
     let shell (script: string) =
         if isWindows then
@@ -267,6 +268,63 @@ type ApiParityTests() =
                 | other -> Assert.Fail $"expected Cancelled, got {other}"
 
                 do! (running :> IAsyncDisposable).DisposeAsync()
+        }
+
+    // --- Pty pipe-friendly mirrors (T-167): Command.ptySize / Command.ptyConfig must observably match
+    // the equivalent instance Pty(cols, rows) / Pty(PtyConfig) overloads (PtyTests carries the
+    // instance-side ground truth for the same assertions). --------------------------------------------
+
+    [<Test>]
+    member _.``Command.ptySize applies the same winsize as the equivalent instance Pty(cols, rows)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                let cmd =
+                    Command.create "/bin/sh"
+                    |> Command.args [ "-c"; "stty size" ]
+                    |> Command.ptySize 120 30
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok result ->
+                    Assert.That(
+                        result.Stdout.Trim(),
+                        Is.EqualTo "30 120",
+                        "Command.ptySize must carry the same 30 rows x 120 cols winsize as an equivalent .Pty(120, 30) instance call"
+                    )
+        }
+
+    [<Test>]
+    member _.``Command.ptyConfig with Echo=false suppresses echo, same as the equivalent instance Pty(PtyConfig)``
+        ()
+        : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                let secret = "hunter2-SECRET-should-not-echo"
+
+                let cmd =
+                    Command.create "/bin/sh"
+                    |> Command.args [ "-c"; "read pw; printf 'done\\n'" ]
+                    |> Command.ptyConfig { Cols = 80; Rows = 24; Echo = false }
+                    |> Command.stdin (Stdin.FromString(secret + "\n"))
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok result ->
+                    Assert.That(result.Stdout, Does.Contain "done", "the child must have read the fed credential line")
+
+                    Assert.That(
+                        result.Stdout,
+                        Does.Not.Contain secret,
+                        "Command.ptyConfig Echo=false must keep the fed credential out of the captured output, same as an equivalent .Pty(PtyConfig) instance call"
+                    )
         }
 
     [<Test>]
