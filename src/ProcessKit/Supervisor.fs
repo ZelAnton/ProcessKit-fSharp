@@ -560,8 +560,12 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                         // A graceful stop was requested while between incarnations (a backoff / storm
                         // sleep was just interrupted by `stopCts`): end now with the last incarnation's
                         // result rather than start another one.
-                        final <-
-                            Some(Ok(SupervisionOutcome(lastResult.Value, restarts, StopReason.Stopped, stormPauses)))
+                        match lastResult with
+                        | Some last ->
+                            final <- Some(Ok(SupervisionOutcome(last, restarts, StopReason.Stopped, stormPauses)))
+                        | None ->
+                            // The guard above proves this unreachable; continue if concurrent state changes.
+                            ()
                     else
                         match! captureIncarnation command with
                         | Ok result ->
