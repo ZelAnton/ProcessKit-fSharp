@@ -90,23 +90,6 @@ module internal Posix =
 
     let private isMacOs = RuntimeInformation.IsOSPlatform OSPlatform.OSX
 
-    // fcntl(F_SETFL, O_APPEND): F_SETFL is shared by Linux and macOS.
-    [<Literal>]
-    let private F_SETFL = 4
-
-    // O_APPEND's numeric value differs by platform: Linux/Alpine 0x400 (asm-generic/fcntl.h), Darwin/macOS
-    // 0x0008 (sys/fcntl.h) — on Darwin 0x400 is O_TRUNC, which is NOT an F_SETFL-settable flag and would be
-    // silently ignored, leaving append unset (the redirect append bug this fix closes would still reproduce
-    // on macOS). `[<Literal>]` cannot branch on a runtime check, so this is a plain binding resolved once
-    // from `isMacOs` (defined above) — the same per-platform pattern as `sigStop`/`sigCont`/`posixSpawnSetsid`.
-    let private O_APPEND = if isMacOs then 0x0008 else 0x400
-
-    // fcntl(2) is C-variadic because its third operand varies by command. This dedicated, non-variadic
-    // binding fixes that operand to the int flags accepted by F_SETFL, so the call has a fixed ABI even on
-    // AArch64 rather than attempting to model fcntl as a true variadic P/Invoke.
-    [<DllImport("libc", EntryPoint = "fcntl", SetLastError = true)>]
-    extern int private fcntlSetFlags(int fd, int command, int flags)
-
     [<DllImport("libc", SetLastError = true)>]
     extern int private socketpair(int domain, int socketType, int protocol, int[] fds)
 
@@ -1749,32 +1732,48 @@ module internal Posix =
         // `Command.StdoutToFile`/`StderrToFile`: open the redirect file ON THE PARENT and hand its fd to
         // the child as a child-side fd (dup2'd onto the child's slot by a `posix_spawn` file action, then
         // closed in the child; the parent's copy closed after spawn), exactly like the `/dev/null` fd from
-        // `openNul`. The open goes through .NET (`File.OpenHandle`), which sets the create/truncate
-        // flags and O_CLOEXEC portably across Linux and macOS (no variadic `open(…, mode)` P/Invoke — the
-        // AArch64 variadic-ABI hazard this port avoids for `fcntl`). Ownership is then released from the
-        // SafeFileHandle (`SetHandleAsInvalid` — it does NOT close the fd) so the raw fd is managed by the
-        // SAME single-close child-side machinery: one CLOEXEC fd, handed to the child with NO `dup(2)` of a
-        // second logical copy (which would drop O_CLOEXEC — K-029). `append = false` creates/truncates
-        // (`FileMode.Create`); when `append = true`, the kernel O_APPEND flag is explicitly set on the fd via
-        // fcntl(F_SETFL, O_APPEND), so every raw child write atomically appends at EOF. A bad path/permission
-        // or fcntl failure fails the spawn honestly.
+        // `openNul`. Both the create/truncate and the append opens go through .NET's own `open(2)`, which
+        // sets O_CLOEXEC portably across Linux and macOS (no variadic `open(…, mode)` P/Invoke — the
+        // AArch64 variadic-ABI hazard this port avoids for `fcntl`), so the fd reaches the child with NO
+        // `dup(2)` of a second logical copy that would drop O_CLOEXEC (K-029). Ownership is then released
+        // from the SafeFileHandle (`SetHandleAsInvalid` — it does NOT close the fd) so the raw fd is
+        // managed by the SAME single-close child-side machinery. `append = false` creates/truncates via
+        // `File.OpenHandle(FileMode.Create)`; `append = true` opens a `FileStream(FileMode.Append)`, whose
+        // Unix open sets the kernel O_APPEND flag AT OPEN TIME (the classic multi-writer shared-log idiom
+        // .NET guarantees on Unix — unlike the lower-level `File.OpenHandle`) so every raw child write lands
+        // atomically at EOF on Linux, Alpine, and macOS alike, with no custom `fcntl(F_SETFL)` and no
+        // per-platform O_APPEND numeric value — closing the whole variadic-ABI risk class the two earlier
+        // fcntl-based fixes were exposed to. A bad path/permission fails the spawn honestly.
         let openRedirectFile (label: string) (path: string) (append: bool) : int =
             try
-                let mode = if append then FileMode.Append else FileMode.Create
-                let handle = File.OpenHandle(path, mode, FileAccess.Write, FileShare.ReadWrite)
-                let fd = int (handle.DangerousGetHandle())
-                // Release .NET's ownership WITHOUT closing the fd; the raw fd is now ours to hand to the
-                // child and to close exactly once via `childSideFds` (parent) + a child-side addclose.
-                handle.SetHandleAsInvalid()
+                let fd =
+                    if append then
+                        // Kernel O_APPEND is set at OPEN TIME by `FileMode.Append`'s Unix `open(2)`. The raw
+                        // fd is detached from the FileStream (`SetHandleAsInvalid` marks the handle closed
+                        // WITHOUT calling close(2)) BEFORE `fs` is disposed at end of this branch's scope, so
+                        // the FileStream's own Dispose — with an empty write buffer (nothing was written) —
+                        // is a no-op on the real fd, which stays ours to hand to the child.
+                        use fs =
+                            new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)
 
-                if append && (fcntlSetFlags (fd, F_SETFL, O_APPEND) <> 0) then
-                    let errno = Marshal.GetLastWin32Error()
-                    close fd |> ignore
-                    failure <- Some $"could not set O_APPEND on redirect file '{path}' for {label} (errno {errno})"
-                    -1
-                else
-                    childSideFds.Add fd
-                    fd
+                        let handle = fs.SafeFileHandle
+                        let raw = int (handle.DangerousGetHandle())
+                        handle.SetHandleAsInvalid()
+                        raw
+                    else
+                        // Create/truncate: no append concern, so the lighter `File.OpenHandle` primitive is
+                        // kept. Release .NET's ownership WITHOUT closing the fd, exactly as before.
+                        let handle =
+                            File.OpenHandle(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite)
+
+                        let raw = int (handle.DangerousGetHandle())
+                        handle.SetHandleAsInvalid()
+                        raw
+
+                // The raw fd is now ours to hand to the child and to close exactly once via `childSideFds`
+                // (parent) + a child-side addclose.
+                childSideFds.Add fd
+                fd
             with ex ->
                 // A bad redirect path / denied access is an honest per-invocation spawn failure — symmetric
                 // to a failed `open(/dev/null)` (`openNul`) or `socketpair()` (`makeStdioChannel`) — never a
