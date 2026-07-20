@@ -359,6 +359,32 @@ type LimitsTests() =
                 Directory.Delete(dir, true)
 
     [<Test>]
+    member _.``migrateToCgroup treats a short write to cgroup.procs as a migration failure``() =
+        if isWindows then
+            Assert.Ignore "the cgroup migration write is a POSIX libc (open/write/close) path"
+        else
+            // A genuine short write() on cgroup.procs is (per the kernel's atomic per-write handling)
+            // effectively unprovokable for a payload this small, so use `migrateWriteTestHook` (the same
+            // test-seam pattern as `PipelineRunner.stageSpawnedTestHook`) to force the raw write() return
+            // value down by one byte and exercise the classification deterministically.
+            let dir = Directory.CreateTempSubdirectory("pk-procs-short-").FullName
+
+            try
+                let procs = Path.Combine(dir, "cgroup.procs")
+                File.WriteAllText(procs, "")
+
+                Native.Cgroup.migrateWriteTestHook <- Some(fun written -> written - 1n)
+
+                try
+                    match Native.Cgroup.migrateToCgroup dir 12345 with
+                    | Ok() -> Assert.Fail "a short write to cgroup.procs must not be reported as a successful migration"
+                    | Error detail -> Assert.That(detail, Does.Contain "short write")
+                finally
+                    Native.Cgroup.migrateWriteTestHook <- None
+            finally
+                Directory.Delete(dir, true)
+
+    [<Test>]
     member _.``the cgroup mechanism drives the control verbs``() : Task =
         task {
             if isWindows || isMacOs then

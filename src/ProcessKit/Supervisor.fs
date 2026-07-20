@@ -44,6 +44,12 @@ type StopReason =
     /// directly as `RunAsync`'s `Error`, same as an exhausted budget on that path.
     | GaveUp
 
+    /// A `SupervisionSession.StopAsync` graceful stop ended supervision: the current incarnation was
+    /// stopped through its own graceful path (`RunningProcess.StopAsync`) and the loop concluded
+    /// cleanly. Not a crash and not a token cancellation — the reported `SupervisionOutcome.FinalResult`
+    /// is the honest result of that last, deliberately-stopped incarnation.
+    | Stopped
+
 /// A single restart, reported live from the supervision loop (see `Supervisor.OnRestart`) — not to
 /// be confused with the final `SupervisionOutcome.Restarts` count.
 ///
@@ -229,6 +235,490 @@ module internal SupervisorConfig =
           Now = realNow
           Sleep = realSleep }
 
+/// A consistent, point-in-time snapshot of a `SupervisionSession`'s live state — read atomically, so
+/// every field agrees with the others (no torn read across a concurrent update from the supervision
+/// loop). Only non-secret facts are exposed (activity, counts, the current child's pid/start time);
+/// argv and environment values never appear here, matching `ProcessKitDiagnostics`'s taxonomy.
+///
+/// Sealed with an internal constructor so it can gain fields without breaking the frozen API.
+[<Sealed>]
+type SupervisionStatus
+    internal (isActive: bool, restarts: int, isStormPaused: bool, pid: int option, startTime: DateTime option) =
+
+    /// Whether the supervision loop is still running: `true` from `StartAsync` until supervision ends
+    /// (naturally, via a graceful `SupervisionSession.StopAsync`, or by token cancellation), `false`
+    /// once the final `SupervisionOutcome` (or terminal error) has been produced.
+    member _.IsActive = isActive
+
+    /// How many times the child has been *re*-run so far, live — mirrors `SupervisionOutcome.Restarts`
+    /// but updates as each restart happens rather than only once supervision ends. The first run is not
+    /// a restart, so `0` while the first incarnation is alive.
+    member _.Restarts = restarts
+
+    /// Whether restarts are currently paused by the failure-storm guard (`Supervisor.StormPause`) —
+    /// `true` only while a storm pause is being slept out. Always `false` when `StormPause` is unset.
+    member _.IsStormPaused = isStormPaused
+
+    /// The OS process id of the current live incarnation, or `None` when no child is alive right now
+    /// (between incarnations, during a backoff/storm pause, or once supervision has ended) or when the
+    /// runner exposes no live handle (a scripted test double).
+    member _.Pid = pid
+
+    /// When the current live incarnation started, or `None` when no child is alive right now (see
+    /// `Pid`).
+    member _.StartTime = startTime
+
+/// A live handle to a running supervision, returned by `Supervisor.StartAsync`. Unlike `RunAsync` —
+/// which only reports its `SupervisionOutcome` at the very end — a session lets a caller watch
+/// supervision *while it runs* (`Status`), ask it to stop *gracefully* (`StopAsync`), and await its
+/// eventual outcome (`Completion`). This is the primitive for building daemons / process managers on
+/// top of the runner layer without pulling in `Microsoft.Extensions.Hosting`.
+///
+/// Thread-safe: `Status` is read under the same lock the supervision loop uses to publish each state
+/// change, so a concurrent read never races an update nor throws; `StopAsync` is idempotent and
+/// race-safe against the loop (and against a repeat call).
+///
+/// Sealed with an internal constructor — build one via `Supervisor.StartAsync`.
+[<Sealed>]
+type SupervisionSession internal (config: SupervisorConfig, cancellationToken: CancellationToken) =
+
+    // The grace window the parameterless `StopAsync()` uses — 2 s, matching `RunningProcess.StopAsync`'s
+    // own default so a session and a live handle agree on how long a soft stop waits before escalating.
+    static let defaultStopGrace = TimeSpan.FromSeconds 2.0
+
+    // Serializes the observable snapshot and the stop/current-child state, so an external `Status`/
+    // `StopAsync` reader never races the supervision loop's publications. Kept deliberately simple (one
+    // lock, immutable snapshot) rather than a lattice of volatiles — the loop publishes rarely (once per
+    // incarnation / restart / storm pause) and the lock is uncontended on the hot path.
+    let gate = obj ()
+
+    // Cancels an in-flight backoff / storm-pause sleep when a graceful stop is requested, so a stop
+    // taken *between* incarnations ends the loop promptly instead of waiting the delay out. Distinct
+    // from the caller's `cancellationToken` (whose cancellation is an *error*): a stop is not an error.
+    let stopCts = new CancellationTokenSource()
+
+    // Loop-owned mirror fields (only the supervision loop writes them), republished into `status` under
+    // `gate` on every change so external readers see a consistent snapshot.
+    let mutable restarts = 0
+    let mutable stormPaused = false
+    let mutable active = true
+    let mutable current: RunningProcess option = None
+
+    // The graceful-stop request, set by `StopAsync`, read by the loop and by `captureIncarnation`.
+    let mutable stopping = false
+    let mutable stopGrace = TimeSpan.Zero
+
+    // Latches false the first time the configured runner proves capture-only (its `SpawnAsync` throws
+    // because it scripts only the capture primitive): the session then drives incarnations through
+    // `CaptureStringAsync` — no live pid / graceful child-stop, but supervision itself is unaffected.
+    let mutable spawnCapable = true
+
+    // The atomically-published snapshot. Seeded active-with-no-child; refreshed on every state change.
+    let mutable status = SupervisionStatus(true, 0, false, None, None)
+
+    // Rebuild the published snapshot from the mirror fields. Caller must hold `gate`.
+    let refresh () =
+        let pid = current |> Option.bind (fun running -> running.Pid)
+        let startTime = current |> Option.map (fun running -> running.StartTime)
+        status <- SupervisionStatus(active, restarts, stormPaused, pid, startTime)
+
+    // Publish a freshly-spawned child as the current incarnation AND, atomically under `gate`, learn
+    // whether a graceful stop is already pending — closing the `StopAsync`-vs-spawn race: whichever of
+    // the two takes `gate` second sees the other's write, so the child is always stopped exactly once
+    // (here if the stop landed first, or in `StopAsync` if the publish landed first).
+    let publishCurrent (running: RunningProcess) : TimeSpan option =
+        lock gate (fun () ->
+            current <- Some running
+            refresh ()
+            if stopping then Some stopGrace else None)
+
+    let clearCurrent (running: RunningProcess) =
+        lock gate (fun () ->
+            match current with
+            | Some existing when Object.ReferenceEquals(existing, running) -> current <- None
+            | _ -> ()
+
+            refresh ())
+
+    let bumpRestarts () =
+        lock gate (fun () ->
+            restarts <- restarts + 1
+            refresh ())
+
+    let setStormPaused (value: bool) =
+        lock gate (fun () ->
+            stormPaused <- value
+            refresh ())
+
+    let markInactive () =
+        lock gate (fun () ->
+            active <- false
+            current <- None
+            refresh ())
+
+    let isStopping () = lock gate (fun () -> stopping)
+
+    // Observe an abandoned graceful-stop task's eventual fault so it never surfaces as an unobserved
+    // task exception at finalization — mirrors `TrackingRunner.StopActiveAsync` / `RunningProcess`.
+    let observeFault (stopTask: Task<Outcome>) =
+        stopTask.ContinueWith(
+            Action<Task<Outcome>>(fun completed -> completed.Exception |> ignore),
+            TaskContinuationOptions.OnlyOnFaulted
+            ||| TaskContinuationOptions.ExecuteSynchronously
+        )
+        |> ignore
+
+    // Drive one incarnation to a completion result. Prefer a spawn+track path so the session can expose
+    // the live child's pid/StartTime and stop it through `RunningProcess.StopAsync`; a capture-only
+    // runner (a scripted double with no live handle) latches onto its `CaptureStringAsync` primitive.
+    // The tracked path is a faithful inline of `CaptureVerbs.runToCompletion` (kept in step with it) —
+    // same `CancelOn` linking, same up-front and post-consume cancellation checks — plus the live-handle
+    // publication and the capture-only fallback.
+    let captureIncarnation (command: Command) : Task<Result<ProcessResult<string>, ProcessError>> =
+        if not spawnCapable then
+            config.Runner.CaptureStringAsync(command, cancellationToken)
+        else
+            task {
+                use linkedCts =
+                    match command.Config.CancelOn with
+                    | Some extra -> CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, extra)
+                    | None -> CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+
+                let effectiveToken = linkedCts.Token
+
+                if effectiveToken.IsCancellationRequested then
+                    return Error(ProcessError.Cancelled command.Program)
+                else
+                    let spawned =
+                        try
+                            Some(config.Runner.SpawnAsync(command, effectiveToken))
+                        with _ ->
+                            // A capture-only runner throws from `SpawnAsync` (it has no live handle to
+                            // return). Latch onto its capture primitive for the rest of the session and
+                            // drive this incarnation through it below — supervision is unaffected; only
+                            // the live pid / graceful child-stop degrade. A real runner never throws here
+                            // (it returns `Ok`/`Error`), so it stays on the tracked path.
+                            spawnCapable <- false
+                            None
+
+                    match spawned with
+                    | None -> return! config.Runner.CaptureStringAsync(command, cancellationToken)
+                    | Some spawnTask ->
+                        match! spawnTask with
+                        | Error error -> return Error error
+                        | Ok running ->
+                            let pendingGrace = publishCurrent running
+                            use _registration = effectiveToken.Register(fun () -> running.Kill())
+
+                            // A graceful stop landed just before this child became current: stop it now
+                            // through its own path (fire-and-forget — `OutputStringAsync` below observes
+                            // the exit, and the loop ends with `Stopped` once this returns).
+                            match pendingGrace with
+                            | Some grace -> observeFault (running.StopAsync grace)
+                            | None -> ()
+
+                            try
+                                let! result = running.OutputStringAsync()
+
+                                if effectiveToken.IsCancellationRequested then
+                                    return Error(ProcessError.Cancelled command.Program)
+                                else
+                                    return result
+                            finally
+                                clearCurrent running
+            }
+
+    // The supervision loop itself — one faithful copy of `Supervisor.RunAsync`'s former body, extended
+    // with the session's live-status publication and graceful-stop handling. Started in the background
+    // by the constructor (`let completion` below); `RunAsync` awaits its result through `Completion`.
+    //
+    // Runs as a `backgroundTask` — detached onto the thread pool — so it never captures the
+    // `SynchronizationContext` of the thread that called `StartAsync`. The loop is kicked off
+    // synchronously from the `SupervisionSession` constructor (itself built synchronously by
+    // `Supervisor.StartAsync`), and its `Completion` is exactly the primitive a daemon/process-manager
+    // consumer naturally blocks on (`Completion.GetAwaiter().GetResult()`, `StopAsync(grace).Result`).
+    // A plain `task { }` would post every post-`await` continuation (each `config.Sleep`,
+    // `captureIncarnation`, `OutputStringAsync`) back to the caller's context; on a single-threaded
+    // context (a WPF/WinForms UI thread, classic ASP.NET) that blocking wait would deadlock the loop —
+    // the one thread is parked in the wait, so no continuation could ever run. `backgroundTask` keeps
+    // the whole loop on the pool, so such a blocking wait is safe (see `Pump.feedStdin` for the same
+    // pattern). Off any such context — a pool or background thread, as in the tests and CI —
+    // `backgroundTask` is identical to `task`, so nothing else changes.
+    let runLoop () : Task<Result<SupervisionOutcome, ProcessError>> =
+        let factor =
+            if Double.IsFinite config.BackoffFactor then
+                max config.BackoffFactor 1.0
+            else
+                1.0
+
+        let command = config.Command.OutputBuffer config.Capture
+        let program = config.Command.Program
+
+        let restartCapable =
+            match config.Policy with
+            | RestartPolicy.Never -> false
+            | _ -> config.MaxRestarts |> Option.forall (fun limit -> limit > 0)
+
+        backgroundTask {
+            // Force the async boundary before any real work, so the constructor returns before the first
+            // incarnation is spawned (the whole configure-and-spawn prefix runs off the caller's thread).
+            do! Task.Yield()
+
+            // Sleeps observe both the caller's cancellation and a session stop, so a graceful stop (which
+            // cancels `stopCts`) promptly interrupts an in-flight backoff / storm pause. The incarnation
+            // capture, by contrast, keeps the *caller's* token only — a stop must gracefully stop the
+            // child (`RunningProcess.StopAsync`), never hard-cancel it as an error.
+            use sleepCts =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, stopCts.Token)
+
+            let sleepToken = sleepCts.Token
+
+            let mutable escalation = 0
+            let mutable stormScore = 0.0
+            let mutable lastFailureAt: float option = None
+            let mutable stormPauses = 0
+            let mutable lastResult: ProcessResult<string> option = None
+
+            let mutable final: Result<SupervisionOutcome, ProcessError> option =
+                if restartCapable && Stdin.isOneShot command.Config.StdinSource then
+                    Some(
+                        Error(
+                            ProcessError.Unsupported
+                                $"'{program}' has a one-shot stdin source and cannot be supervised with restarts enabled: a restarted incarnation would find the source already exhausted"
+                        )
+                    )
+                else
+                    None
+
+            let stormGate () : Task =
+                task {
+                    match config.StormPause with
+                    | None -> ()
+                    | Some pause ->
+                        let now = config.Now()
+
+                        let elapsed =
+                            match lastFailureAt with
+                            | Some at -> max 0.0 (now - at)
+                            | None -> 0.0
+
+                        lastFailureAt <- Some now
+                        stormScore <- Supervision.decayedFailureScore stormScore elapsed config.FailureDecay
+
+                        if Double.IsFinite config.FailureThreshold && stormScore > config.FailureThreshold then
+                            let jittered = Supervision.applyJitter pause config.Jitter
+                            Log.stormPause config.Command.Config.Logger program jittered
+                            Diag.stormPaused program
+
+                            match config.OnStormPause with
+                            | Some handler -> handler (SupervisorStormPauseEvent(program, stormPauses + 1, jittered))
+                            | None -> ()
+
+                            // Bracket exactly the pause window in the live status: paused while the jittered
+                            // sleep runs, cleared the instant it returns (or is cut short by a stop).
+                            setStormPaused true
+
+                            if jittered > TimeSpan.Zero then
+                                do! config.Sleep jittered sleepToken
+
+                            setStormPaused false
+                            stormScore <- 0.0
+                            lastFailureAt <- None
+                            stormPauses <- stormPauses + 1
+                }
+                :> Task
+
+            let sleepBackoff (exponent: int) (restartNumber: int) : Task =
+                task {
+                    let delay =
+                        Supervision.backoffDelay config.BackoffBase factor exponent config.MaxBackoff
+
+                    let delay = Supervision.applyJitter delay config.Jitter
+                    Log.supervisorRestart config.Command.Config.Logger program restartNumber delay
+                    Diag.supervisorRestarted program
+
+                    match config.OnRestart with
+                    | Some handler -> handler (SupervisorRestartEvent(program, restartNumber, delay))
+                    | None -> ()
+
+                    if delay > TimeSpan.Zero then
+                        do! config.Sleep delay sleepToken
+                }
+                :> Task
+
+            let budgetExhausted () =
+                config.MaxRestarts |> Option.exists (fun limit -> restarts >= limit)
+
+            let giveUpMatches (error: ProcessError) =
+                config.GiveUpWhen |> Option.exists (fun classify -> classify error)
+
+            try
+                while final.IsNone do
+                    if cancellationToken.IsCancellationRequested then
+                        final <- Some(Error(ProcessError.Cancelled program))
+                    elif isStopping () && lastResult.IsSome then
+                        // A graceful stop was requested while between incarnations (a backoff / storm
+                        // sleep was just interrupted by `stopCts`): end now with the last incarnation's
+                        // result rather than start another one.
+                        final <-
+                            Some(Ok(SupervisionOutcome(lastResult.Value, restarts, StopReason.Stopped, stormPauses)))
+                    else
+                        match! captureIncarnation command with
+                        | Ok result ->
+                            lastResult <- Some result
+
+                            if isStopping () then
+                                // The current incarnation was gracefully stopped (or completed while a
+                                // stop was pending): end with its honest result and `Stopped`, wins over
+                                // policy/predicate — the caller explicitly asked to stop.
+                                final <- Some(Ok(SupervisionOutcome(result, restarts, StopReason.Stopped, stormPauses)))
+                            else
+                                let predicateMatched =
+                                    match config.StopWhen with
+                                    | Some predicate -> predicate result
+                                    | None -> false
+
+                                if predicateMatched then
+                                    final <-
+                                        Some(
+                                            Ok(SupervisionOutcome(result, restarts, StopReason.Predicate, stormPauses))
+                                        )
+                                else
+                                    let crashed = not result.IsSuccess
+
+                                    let wantsRestart =
+                                        match config.Policy with
+                                        | RestartPolicy.Always -> true
+                                        | RestartPolicy.OnCrash -> crashed
+                                        | RestartPolicy.Never -> false
+
+                                    if not wantsRestart then
+                                        final <-
+                                            Some(
+                                                Ok(
+                                                    SupervisionOutcome(
+                                                        result,
+                                                        restarts,
+                                                        StopReason.PolicySatisfied,
+                                                        stormPauses
+                                                    )
+                                                )
+                                            )
+                                    elif crashed && giveUpMatches result.FailureError then
+                                        final <-
+                                            Some(
+                                                Ok(SupervisionOutcome(result, restarts, StopReason.GaveUp, stormPauses))
+                                            )
+                                    elif budgetExhausted () then
+                                        final <-
+                                            Some(
+                                                Ok(
+                                                    SupervisionOutcome(
+                                                        result,
+                                                        restarts,
+                                                        StopReason.RestartsExhausted,
+                                                        stormPauses
+                                                    )
+                                                )
+                                            )
+                                    else
+                                        if crashed then
+                                            do! stormGate ()
+
+                                        if result.Duration >= config.MaxBackoff && not result.IsTimedOut then
+                                            escalation <- 0
+
+                                        do! sleepBackoff escalation (restarts + 1)
+                                        escalation <- escalation + 1
+                                        bumpRestarts ()
+                        | Error error ->
+                            match error with
+                            | ProcessError.Cancelled _ -> final <- Some(Error error)
+                            | _ ->
+                                let wantsRestart =
+                                    match config.Policy with
+                                    | RestartPolicy.Never -> false
+                                    | _ -> ProcessError.isTransient error
+
+                                if isStopping () then
+                                    // A graceful stop was requested; end now rather than restart. A run
+                                    // that never produced a result has none to report, so surface the
+                                    // honest terminal error (same shape as an exhausted budget here).
+                                    final <- Some(Error error)
+                                elif not wantsRestart || giveUpMatches error || budgetExhausted () then
+                                    final <- Some(Error error)
+                                else
+                                    do! stormGate ()
+                                    do! sleepBackoff escalation (restarts + 1)
+                                    escalation <- escalation + 1
+                                    bumpRestarts ()
+
+                match final with
+                | Some result -> return result
+                | None -> return Error(ProcessError.Io "Supervisor loop ended without a final result.")
+            finally
+                // Always flip the live status to inactive before the loop's task completes, so an observer
+                // that awaits `Completion` then reads `Status` never sees `IsActive = true` on a finished
+                // (or faulted) session.
+                markInactive ()
+        }
+
+    // Launch the loop in the background as the constructor's last step. `runLoop` yields before any real
+    // work, so this returns an already-suspended, not-yet-completed task immediately.
+    let completion = runLoop ()
+
+    /// A consistent live snapshot of this session's state (activity, restart count, storm-pause flag,
+    /// and the current live incarnation's pid/start time). Cheap and lock-guarded — safe to poll from
+    /// any thread, e.g. a health check, without racing the supervision loop.
+    member _.Status: SupervisionStatus = lock gate (fun () -> status)
+
+    /// The task that resolves to the final `SupervisionOutcome` (or a terminal `ProcessError`) when
+    /// supervision ends — exactly what `Supervisor.RunAsync` returns. `await` it to block until
+    /// supervision concludes on its own, via `StopAsync`, or via the `StartAsync` token's cancellation.
+    member _.Completion: Task<Result<SupervisionOutcome, ProcessError>> = completion
+
+    /// Request a graceful stop with `gracePeriod`: stop the current live incarnation through its own
+    /// graceful path (`RunningProcess.StopAsync`, honouring the grace window) and end the supervision
+    /// loop with `StopReason.Stopped` — reported as a normal `SupervisionOutcome`, never a crash or a
+    /// cancellation error. Interrupts an in-flight backoff / storm pause so a stop taken between
+    /// incarnations also ends promptly. Idempotent and race-safe against the loop and repeat calls.
+    /// Returns the session's `Completion`, so a caller can `await` the final outcome directly. A
+    /// negative `gracePeriod` is rejected with `ArgumentOutOfRangeException`; `TimeSpan.Zero` escalates
+    /// the child kill immediately.
+    member _.StopAsync(gracePeriod: TimeSpan) : Task<Result<SupervisionOutcome, ProcessError>> =
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
+
+        // Record the request and snapshot the current child atomically under `gate` (see
+        // `publishCurrent` for the race this closes).
+        let child =
+            lock gate (fun () ->
+                stopGrace <- gracePeriod
+                stopping <- true
+                current)
+
+        // Interrupt any in-flight backoff / storm sleep so a between-incarnations loop ends promptly.
+        try
+            stopCts.Cancel()
+        with :? ObjectDisposedException ->
+            // Already disposed under a concurrent teardown; nothing further to cancel.
+            ()
+
+        task {
+            match child with
+            | Some running ->
+                // Stop the live child through its graceful path; the loop ends with `Stopped` once the
+                // in-flight capture returns that child's honest result.
+                let! _ = running.StopAsync gracePeriod
+                return! completion
+            | None ->
+                // No live child right now (capture-only runner, or a between-incarnations stop): the
+                // `stopping` flag + the `stopCts` cancellation above end the loop on their own.
+                return! completion
+        }
+
+    /// `StopAsync` using the default 2-second grace window (matching `RunningProcess.StopAsync`).
+    member this.StopAsync() : Task<Result<SupervisionOutcome, ProcessError>> = this.StopAsync defaultStopGrace
+
 /// Keeps a `Command` alive: runs it, classifies every exit against the `RestartPolicy` and the
 /// `StopWhen` predicate, and restarts it after an exponential-backoff delay until supervision ends.
 ///
@@ -251,6 +741,12 @@ module internal SupervisorConfig =
 /// restart/pause; keep handlers quick and non-blocking. Neither callback changes
 /// `SupervisionOutcome`'s semantics — `Restarts`/`StormPauses`/`Stopped` are unaffected and remain
 /// the authoritative final tally; the callbacks are an additive, best-effort live view.
+///
+/// **Interactive supervision.** For a poll-and-control view — a live `Status` snapshot (activity,
+/// restart count, storm-pause flag, the current child's pid/start time), a graceful `StopAsync`, and a
+/// `Completion` task — use `StartAsync`, which returns a live `SupervisionSession` handle. `RunAsync`
+/// is a thin wrapper over `StartAsync` + awaiting `Completion`; the `Status` snapshot *adds* to the
+/// `OnRestart`/`OnStormPause` callbacks without replacing them.
 [<Sealed>]
 type Supervisor internal (config: SupervisorConfig) =
 
@@ -431,241 +927,33 @@ type Supervisor internal (config: SupervisorConfig) =
     member internal _.CurrentOnStormPause: (SupervisorStormPauseEvent -> unit) option =
         config.OnStormPause
 
+    /// Start supervising and return a live `SupervisionSession` handle — the interactive counterpart to
+    /// `RunAsync`. Supervision runs in the background from the moment this returns; poll the session's
+    /// `Status` for a live snapshot (activity, restart count, storm-pause flag, current child pid/start
+    /// time), ask it to stop gracefully with `StopAsync`, or `await` its `Completion` for the final
+    /// `SupervisionOutcome` (which is exactly what `RunAsync` would have returned).
+    ///
+    /// Returns a already-resolved `Task<SupervisionSession>`: the session is created synchronously (the
+    /// background loop yields before its first spawn), and the `Task` shape keeps the verb consistent
+    /// with `Command.StartAsync` and leaves room to await first-spawn readiness in a future revision.
+    member _.StartAsync([<Optional>] cancellationToken: CancellationToken) : Task<SupervisionSession> =
+        Task.FromResult(SupervisionSession(config, cancellationToken))
+
     /// Supervise until the policy, the predicate, or the restart budget ends it, and report the
-    /// `SupervisionOutcome`.
+    /// `SupervisionOutcome`. A thin wrapper over `StartAsync` + awaiting the session's `Completion`, so
+    /// its behaviour is identical to driving a `SupervisionSession` to its natural end.
     ///
     /// Returns `Error` only when the *terminating* attempt failed to produce a result at all (a
     /// spawn/IO failure with no further restart allowed) — there is no final result to report. A
     /// spawn failure with restarts remaining counts as a crash and is retried. An incarnation
     /// cancelled via its token is terminal: supervision returns that `Cancelled` immediately,
     /// regardless of policy or budget.
-    member _.RunAsync
+    member this.RunAsync
         ([<Optional>] cancellationToken: CancellationToken)
         : Task<Result<SupervisionOutcome, ProcessError>> =
-        let factor =
-            if Double.IsFinite config.BackoffFactor then
-                max config.BackoffFactor 1.0
-            else
-                1.0
-
-        let command = config.Command.OutputBuffer config.Capture
-        let program = config.Command.Program
-
-        // Restart-capable: the policy could restart at least once more (`Never`, or an explicit
-        // `MaxRestarts(0)`, never restarts at all — those are effectively a single run). Computed from
-        // *configuration* alone, not from whether a restart actually happens at runtime: a one-shot
-        // stdin source must be refused up front, before the first incarnation ever reads it, not only
-        // once a crash would trigger the restart that exhausts it.
-        let restartCapable =
-            match config.Policy with
-            | RestartPolicy.Never -> false
-            | _ -> config.MaxRestarts |> Option.forall (fun limit -> limit > 0)
-
         task {
-            let mutable restarts = 0
-            // The backoff *escalation* exponent — distinct from the lifetime `restarts` (which drives the
-            // `MaxRestarts` budget and the reported count). It climbs per restart but RESETS after a
-            // healthy incarnation, so a long-lived service that crashes occasionally isn't pinned at the
-            // `MaxBackoff` ceiling forever.
-            let mutable escalation = 0
-            let mutable stormScore = 0.0
-            let mutable lastFailureAt: float option = None
-            let mutable stormPauses = 0
-
-            // Seeded up front (instead of `None`) when the command is refused before its first
-            // incarnation: a one-shot stdin source (`FromStream`/`FromLines`/`FromAsyncLines`) can only
-            // be pumped once, so restarting the incarnation would silently feed the next one
-            // empty/truncated input instead of replaying the original one. Fail loudly, before the first
-            // incarnation ever runs, rather than let a restart quietly corrupt the input (T-088; ports
-            // ProcessKit-rs `c1f39c7`/`8472007`). Seeding `final` here — rather than branching around the
-            // loop — makes the `while final.IsNone` loop below skip its body outright, no restructuring
-            // needed. `RestartPolicy.Never` / an explicit `MaxRestarts(0)` is unaffected (not
-            // restart-capable), and so is every repeatable source (`Bytes`/`String`/`File`/`Empty`).
-            let mutable final: Result<SupervisionOutcome, ProcessError> option =
-                if restartCapable && Stdin.isOneShot command.Config.StdinSource then
-                    Some(
-                        Error(
-                            ProcessError.Unsupported
-                                $"'{program}' has a one-shot stdin source and cannot be supervised with restarts enabled: a restarted incarnation would find the source already exhausted"
-                        )
-                    )
-                else
-                    None
-
-            // The failure-storm gate, run before the backoff of every *failure*-driven restart:
-            // fold the failure into the decaying score and, past the threshold, sleep out one
-            // jittered pause and reset the score (a fresh window).
-            let stormGate () : Task =
-                task {
-                    match config.StormPause with
-                    | None -> ()
-                    | Some pause ->
-                        let now = config.Now()
-
-                        let elapsed =
-                            match lastFailureAt with
-                            | Some at -> max 0.0 (now - at)
-                            | None -> 0.0
-
-                        lastFailureAt <- Some now
-                        stormScore <- Supervision.decayedFailureScore stormScore elapsed config.FailureDecay
-
-                        // A non-finite threshold never trips (matches the doc): `Double.IsFinite` keeps
-                        // `-infinity` from making the comparison true for every finite score.
-                        if Double.IsFinite config.FailureThreshold && stormScore > config.FailureThreshold then
-                            let jittered = Supervision.applyJitter pause config.Jitter
-                            Log.stormPause config.Command.Config.Logger program jittered
-                            Diag.stormPaused program
-
-                            match config.OnStormPause with
-                            | Some handler -> handler (SupervisorStormPauseEvent(program, stormPauses + 1, jittered))
-                            | None -> ()
-
-                            if jittered > TimeSpan.Zero then
-                                do! config.Sleep jittered cancellationToken
-
-                            stormScore <- 0.0
-                            lastFailureAt <- None
-                            stormPauses <- stormPauses + 1
-                }
-                :> Task
-
-            // `exponent` is the resettable backoff escalation; `restartNumber` is the 1-based *lifetime*
-            // restart count for the log, so the logged number tracks `SupervisionOutcome.Restarts` (it
-            // must NOT be the escalation, which resets after a healthy run).
-            let sleepBackoff (exponent: int) (restartNumber: int) : Task =
-                task {
-                    let delay =
-                        Supervision.backoffDelay config.BackoffBase factor exponent config.MaxBackoff
-
-                    let delay = Supervision.applyJitter delay config.Jitter
-                    Log.supervisorRestart config.Command.Config.Logger program restartNumber delay
-                    Diag.supervisorRestarted program
-
-                    match config.OnRestart with
-                    | Some handler -> handler (SupervisorRestartEvent(program, restartNumber, delay))
-                    | None -> ()
-
-                    if delay > TimeSpan.Zero then
-                        do! config.Sleep delay cancellationToken
-                }
-                :> Task
-
-            let budgetExhausted () =
-                config.MaxRestarts |> Option.exists (fun limit -> restarts >= limit)
-
-            // True when `GiveUpWhen` is set and its classifier recognizes `error` as permanent.
-            // Callers only consult this once a restart would otherwise be attempted (a policy that
-            // already stops, or a `StopWhen`/terminal-error match, wins with its own more specific
-            // reason and never reaches this check) — matching `StopWhen`'s own "checked before the
-            // policy" placement but one step later, since a permanent verdict should win over an
-            // exhausted budget, not just over the plain policy decision.
-            let giveUpMatches (error: ProcessError) =
-                config.GiveUpWhen |> Option.exists (fun classify -> classify error)
-
-            while final.IsNone do
-                if cancellationToken.IsCancellationRequested then
-                    final <- Some(Error(ProcessError.Cancelled program))
-                else
-                    // Capture through the seam primitive directly: the supervisor owns the retry/restart
-                    // policy, so it must not also pick up the command's verb-level `Retry` here.
-                    match! config.Runner.CaptureStringAsync(command, cancellationToken) with
-                    | Ok result ->
-                        let predicateMatched =
-                            match config.StopWhen with
-                            | Some predicate -> predicate result
-                            | None -> false
-
-                        if predicateMatched then
-                            final <- Some(Ok(SupervisionOutcome(result, restarts, StopReason.Predicate, stormPauses)))
-                        else
-                            let crashed = not result.IsSuccess
-
-                            let wantsRestart =
-                                match config.Policy with
-                                | RestartPolicy.Always -> true
-                                | RestartPolicy.OnCrash -> crashed
-                                | RestartPolicy.Never -> false
-
-                            if not wantsRestart then
-                                final <-
-                                    Some(
-                                        Ok(
-                                            SupervisionOutcome(
-                                                result,
-                                                restarts,
-                                                StopReason.PolicySatisfied,
-                                                stormPauses
-                                            )
-                                        )
-                                    )
-                            elif crashed && giveUpMatches result.FailureError then
-                                final <- Some(Ok(SupervisionOutcome(result, restarts, StopReason.GaveUp, stormPauses)))
-                            elif budgetExhausted () then
-                                final <-
-                                    Some(
-                                        Ok(
-                                            SupervisionOutcome(
-                                                result,
-                                                restarts,
-                                                StopReason.RestartsExhausted,
-                                                stormPauses
-                                            )
-                                        )
-                                    )
-                            else
-                                if crashed then
-                                    do! stormGate ()
-
-                                // A healthy incarnation — one that stayed up at least as long as the backoff
-                                // ceiling AND wasn't a hang killed by its own timeout — resets the escalation,
-                                // so the next restart starts at the base delay again. A tight crash loop, or a
-                                // hang that times out on every incarnation, does NOT clear the bar, so it keeps
-                                // climbing and self-throttles.
-                                if result.Duration >= config.MaxBackoff && not result.IsTimedOut then
-                                    escalation <- 0
-
-                                do! sleepBackoff escalation (restarts + 1)
-                                escalation <- escalation + 1
-                                restarts <- restarts + 1
-                    | Error error ->
-                        match error with
-                        | ProcessError.Cancelled _ -> final <- Some(Error error)
-                        | _ ->
-                            // Restart only a *transient* error (a spawn race, transient I/O) — the only
-                            // kind that can succeed on a re-run. Every other error is terminal: a
-                            // deterministic startup/config failure (the program isn't found, the stdin
-                            // source can't be read, a resource limit can't be enforced) would fail
-                            // identically forever, and even a variable failure like an output-cap overflow
-                            // is better surfaced than hidden behind an unbounded restart storm. Defers to
-                            // `ProcessError.isTransient` so the classification lives in one place. An actual
-                            // crash arrives on the `Ok` branch (a non-zero exit is data), so crash-restart
-                            // is unaffected; `Cancelled` is already terminal above.
-                            let wantsRestart =
-                                match config.Policy with
-                                | RestartPolicy.Never -> false
-                                | _ -> ProcessError.isTransient error
-
-                            // A permanent-failure verdict on a run that never produced a result has no
-                            // `ProcessResult` to report through `SupervisionOutcome`, so it surfaces the
-                            // classified error directly — same as an exhausted budget or an already-terminal
-                            // error on this path. Only consulted once a restart would otherwise be attempted
-                            // (`wantsRestart`), so a classifier is never invoked for a policy/error class
-                            // that already stops for its own, more specific reason.
-                            if not wantsRestart || giveUpMatches error || budgetExhausted () then
-                                final <- Some(Error error)
-                            else
-                                // A transient error produced no healthy incarnation, so the escalation only
-                                // climbs here (no reset); it uses the shared exponent so a run that
-                                // alternates transient errors and crashes backs off consistently.
-                                do! stormGate ()
-                                do! sleepBackoff escalation (restarts + 1)
-                                escalation <- escalation + 1
-                                restarts <- restarts + 1
-
-            match final with
-            | Some result -> return result
-            | None -> return Error(ProcessError.Io "Supervisor loop ended without a final result.")
+            let! session = this.StartAsync cancellationToken
+            return! session.Completion
         }
 
 /// Pipe-friendly entry points for `Supervisor`.

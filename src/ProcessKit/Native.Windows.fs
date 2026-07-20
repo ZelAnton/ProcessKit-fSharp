@@ -370,6 +370,25 @@ module internal Windows =
 
     let closeWindowsHandle (handle: nativeint) = CloseHandle handle |> ignore
 
+    /// Duplicate a Job Object handle into a second, caller-owned handle to the SAME underlying Job. The
+    /// Windows graceful-teardown poll (`JobObjectBackend.GracefulKillTree`) runs its liveness query and
+    /// final force-kill on THIS duplicate rather than the backend's `jobHandle`, so a concurrent
+    /// `HardRelease` that closes `jobHandle` mid-poll can never turn those calls into a use-after-close —
+    /// nor a wrong-target `TerminateJobObject` on a handle value the OS has since recycled to an unrelated
+    /// object (T-162). It mirrors the self-owned-duplicate pattern `waitWindows` already uses for a
+    /// child's process handle: the duplicate refers to the same kernel object, keeps that Job alive for
+    /// the bounded grace window even if the backend closes its own handle underneath the poll, and is
+    /// closed when the poll concludes (at which point `KILL_ON_JOB_CLOSE` fires as the final backstop if
+    /// it was the last handle). `None` when duplication fails, i.e. the source handle is already unusable.
+    let duplicateJobHandle (job: nativeint) : nativeint option =
+        let current = GetCurrentProcess()
+        let mutable duplicate = IntPtr.Zero
+
+        if DuplicateHandle(current, job, current, &duplicate, 0u, false, DUPLICATE_SAME_ACCESS) then
+            Some duplicate
+        else
+            None
+
     /// A `WaitHandle` over an already-owned `SafeWaitHandle`. Subclassing avoids `new ManualResetEvent()`
     /// — which allocates a throwaway kernel event that assigning `SafeWaitHandle` would orphan until GC.
     type private OwnedProcessWait(handle: SafeWaitHandle) =

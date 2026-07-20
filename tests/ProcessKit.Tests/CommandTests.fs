@@ -246,6 +246,13 @@ type CommandTests() =
         )
         |> ignore
 
+    [<Test>]
+    member _.``OkCodes rejects an empty set``() =
+        // An empty set has no meaningful semantics (no exit could count as success), so it is refused at
+        // the builder boundary rather than silently kept as the previously configured codes.
+        Assert.Throws<ArgumentException>(Action(fun () -> Command.create "git" |> Command.okCodes [] |> ignore))
+        |> ignore
+
     // ---- Uid / Gid / User / Setsid (Unix privilege drop & session detach) ---------------------
 
     [<Test>]

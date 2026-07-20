@@ -607,3 +607,36 @@ type ShutdownTests() =
             )
         }
         :> Task
+
+    [<Test>]
+    member _.``Windows: StopAsync racing a concurrent Dispose in the grace window is use-after-close-safe``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The Windows Job-handle use-after-close race (T-162) is a Windows-only concern."
+
+            // T-162 regression. `StopAsync(grace)`'s graceful poll on the OWNED Job tree runs OFF the
+            // group's lifecycle lock, so a concurrent Dispose can win the release and close the Job handle
+            // while that poll is still in flight. Before the fix the poll's liveness query + final
+            // `TerminateJobObject` then ran on the just-closed handle — a use-after-close, and a potential
+            // wrong-target terminate on a handle value the OS had recycled. Now the poll owns its OWN
+            // duplicate Job handle, so the concurrent close can neither invalidate nor divert it. Pin the
+            // documented public contract: `StopAsync` stays race-safe with `Dispose` — no invalid-handle
+            // exception escapes either call, the tree is still reaped, and both return promptly. A
+            // windowless child (no WM_CLOSE target, ignores the soft phase) keeps the poll looping for the
+            // whole grace window, so the mid-poll close lands squarely inside it; loop to widen the window.
+            for _ in 1..5 do
+                let! proc = startProc longSleeper
+
+                // Kick off the graceful stop: its duplicate handle is taken and the poll enters its wait
+                // loop synchronously as this call returns. Then, well inside the grace window, close the
+                // Job handle underneath the in-flight poll via a concurrent Dispose.
+                let stop = proc.StopAsync(TimeSpan.FromSeconds 1.0)
+                do! Task.Delay 150
+                let dispose = (proc :> IAsyncDisposable).DisposeAsync().AsTask()
+
+                // Neither public call may throw an invalid-handle error; the child must conclude terminally.
+                let! outcome = stop
+                do! dispose
+                assertTerminal outcome
+        }
+        :> Task

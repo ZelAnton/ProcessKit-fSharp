@@ -31,12 +31,15 @@
 	     function must be declared before its first use. Seam (the shared Serve→verbs
 	     projection) depends only on ProcessKit, so it precedes everything else that uses
 	     it; FakeProcess is independent of the other three; Reply must precede ScriptedRunner
-	     (which scripts Reply values); DryRunRunner only needs FakeProcess and Seam, so it can
-	     sit alongside ScriptedRunner; Cassette is last (it reuses FakeProcess). -->
+	     (which scripts Reply values); RecordedInvocation (the structural call-journal entry)
+	     also precedes ScriptedRunner, which records one per verb; DryRunRunner only needs
+	     FakeProcess and Seam, so it can sit alongside ScriptedRunner; Cassette is last (it
+	     reuses FakeProcess). -->
 	<ItemGroup>
 		<Compile Include="Seam.fs" />
 		<Compile Include="FakeProcess.fs" />
 		<Compile Include="Reply.fs" />
+		<Compile Include="RecordedInvocation.fs" />
 		<Compile Include="ScriptedRunner.fs" />
 		<Compile Include="DryRunRunner.fs" />
 		<Compile Include="Cassette.fs" />
