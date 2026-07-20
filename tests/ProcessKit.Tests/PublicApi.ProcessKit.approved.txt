@@ -680,6 +680,7 @@ class ProcessKit.ProcessGroup
   member StartAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
   member Stats() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroupStats, ProcessKit.ProcessError>
   member Suspend() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member UpdateLimits(ProcessKit.ResourceLimits) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   property Mechanism : ProcessKit.Mechanism { get }
   property Options : ProcessKit.ProcessGroupOptions { get }
   static member Create() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroup, ProcessKit.ProcessError>

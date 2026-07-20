@@ -27,6 +27,7 @@ type internal SyntheticBackend() =
     let mutable killChildCount = 0
     let mutable killTreeCount = 0
     let mutable gracefulKillTreeCount = 0
+    let mutable updateLimitsCount = 0
 
     let note (message: string) =
         lock gate (fun () -> violations.Add message)
@@ -70,6 +71,9 @@ type internal SyntheticBackend() =
     member _.KillTreeCount = lock gate (fun () -> killTreeCount)
     /// How many times a native graceful tree kill actually reached the backend.
     member _.GracefulKillTreeCount = lock gate (fun () -> gracefulKillTreeCount)
+    /// How many times a live limit re-apply actually reached the backend (a gated update that is
+    /// refused on a released group before touching native never increments this).
+    member _.UpdateLimitsCount = lock gate (fun () -> updateLimitsCount)
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.ProcessGroup
@@ -132,6 +136,13 @@ type internal SyntheticBackend() =
         member _.Stats() =
             requireLive "Stats"
             Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None))
+
+        member _.UpdateLimits(_limits) =
+            // A live limit re-apply must never reach the backend after teardown; count the ones that do
+            // so a live update is still observable and a post-release one is a flagged violation.
+            requireLive "UpdateLimits"
+            lock gate (fun () -> updateLimitsCount <- updateLimitsCount + 1)
+            Ok()
 
         member _.HardRelease() =
             // Drain (reap) every tracked child exactly once and mark released, all under one lock — the
@@ -375,6 +386,42 @@ type ContainmentBugTests() =
                     | Ok() -> ()
                     | Error err -> Assert.That(ProcessError.isTransient err, Is.False)
         }
+
+    [<Test>]
+    member _.``UpdateLimits after the group is released is non-transient and never touches the backend``() =
+        // A released group must refuse a live limit update the same way every other control verb does:
+        // the lifecycle gate returns a non-transient error BEFORE the backend is reached, so no
+        // SetInformationJobObject / cgroup write can ever land on a closed/recycled native handle.
+        let backend = SyntheticBackend()
+        let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+        (group :> IDisposable).Dispose()
+
+        match group.UpdateLimits(ResourceLimits.None.WithMemoryMax(64L * 1024L * 1024L)) with
+        | Error err -> Assert.That(ProcessError.isTransient err, Is.False)
+        | Ok() -> Assert.Fail "UpdateLimits on a released group must fail, not silently succeed"
+
+        Assert.That(backend.UpdateLimitsCount, Is.EqualTo 0, "a limit update reached the backend after release")
+        Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+
+    [<Test>]
+    member _.``UpdateLimits on a live group reaches the backend and refreshes the Options snapshot``() =
+        // The happy path through the lifecycle gate: the update reaches the live backend exactly once and
+        // the `Options` snapshot a consumer reads back is swapped to the new set (only on success).
+        let backend = SyntheticBackend()
+        let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+        let newLimits =
+            ResourceLimits.None.WithMemoryMax(200L * 1024L * 1024L).WithCpuQuota(1.5)
+
+        match group.UpdateLimits newLimits with
+        | Ok() ->
+            Assert.That(backend.UpdateLimitsCount, Is.EqualTo 1)
+            Assert.That(group.Options.Limits.MemoryMax, Is.EqualTo(Some(200L * 1024L * 1024L)))
+            Assert.That(group.Options.Limits.CpuQuota, Is.EqualTo(Some 1.5))
+        | Error err -> Assert.Fail $"a live update on the synthetic backend should succeed, got {err}"
+
+        Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
 
     [<Test>]
     member _.``concurrent Dispose, DisposeAsync, and ShutdownAsync tear down exactly once``() : Task =
