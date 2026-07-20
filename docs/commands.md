@@ -291,6 +291,18 @@ streaming, and per-line handlers to see anything. `StdioMode.Inherit` lets the
 child share the parent's stream (its output goes straight to your terminal and
 can't be captured); `StdioMode.Null` discards the stream without tying up a pipe.
 
+`Command.StdoutToFile(path, append)` / `Command.StderrToFile(path, append)` add a
+fourth destination: the stream is redirected **straight to a file at the OS
+level**, handed to the child as its std handle/fd on the spawn (an inheritable
+file handle in `STARTUPINFO` on Windows; a file fd via a `posix_spawn` file action
+on POSIX), so the child writes the file directly — no parent pump, and the file
+outlives the parent. `append = false` creates/truncates, `true` appends. Like
+`Null`/`Inherit`, a redirected stream has no parent-side view, so the knobs that
+need one are rejected in combination — see
+[the redirect-to-file section in the streaming guide](streaming.md#redirecting-a-stream-straight-to-a-file)
+for the full contract and the allowed/rejected combinations. As a destination
+setter it composes last-wins with `Stdout`/`Stderr`.
+
 ### Merging stderr into stdout (`2>&1`)
 
 `Command.MergeStderr` folds the child's standard error into its standard output

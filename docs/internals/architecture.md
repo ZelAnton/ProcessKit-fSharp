@@ -104,6 +104,8 @@ termination: timeout/cancel/dispose -> KillChild or KillTree -> Wait/reap -> Rel
 
 Output pumps run concurrently with the wait. They must continuously drain piped stdout and stderr, even when capture retention is full, or the child can block in an OS pipe and never reach exit. Capture verbs accumulate output in `LineBuffer` or `RawBuffer`; streaming verbs feed channels. A channel configured for backpressure is the deliberate exception: it lets the consumer pace the pump and therefore may eventually pace the child.
 
+A stream is *not* always a parent pipe. `StdioMode.Null`/`Inherit`, and `Command.StdoutToFile`/`StderrToFile`, hand the child a std handle/fd that never round-trips through the parent — for a file redirect it is an inheritable file handle in `STARTUPINFO` (Windows) or a file fd installed by a `posix_spawn` file action (POSIX), opened on the parent and dropped there right after the spawn, so the child owns it alone and writes the file directly with **no** parent pump. `Spawn` returns `None` for that stream, so no pump, capture buffer, or channel is created for it, and its capture verbs observe nothing — the redirected output lives only in the file, which keeps growing after the parent (or a pump draining a pipe) is gone. The builder rejects combining a file redirect with anything that needs a parent-side view of the same stream (the tees, per-line handlers, `MergeStderr`, `Pty`).
+
 Natural exit, explicit kill, timeout, cancellation, and disposal converge on waiting/reaping and teardown. A verb may transform the resulting `Outcome`, but it must not bypass ownership cleanup.
 
 ## Containment backend contract

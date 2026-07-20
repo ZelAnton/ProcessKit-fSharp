@@ -63,6 +63,19 @@ type internal CommandConfig =
       KeepStdinOpen: bool
       StdoutMode: StdioMode
       StderrMode: StdioMode
+      // Opt-in direct redirect of the child's stdout/stderr straight to a file at the OS level, handed to
+      // the child as its std handle/fd ON THE SPAWN (Windows: an inheritable file handle in `STARTUPINFO`;
+      // POSIX: a file fd via a spawn file action) — zero parent-side copying and no parent pump, so the
+      // file keeps growing even after the parent (or a pump that would have drained a pipe) is gone. Each
+      // is `(path, append)`: `append = false` creates/truncates, `true` appends. `None` (the default) is
+      // the ordinary pipe/inherit/null wiring of `StdoutMode`/`StderrMode`. When set it takes precedence
+      // over the matching `StdioMode` (the redirected stream has NO parent-side stream — `Spawned.Stdout`/
+      // `Stderr` is `None`, exactly as `Null`/`Inherit`). Rejected at the builder boundary in combination
+      // with anything that needs a parent-side view of that same stream (`StdoutTee`/`StderrTee`,
+      // `OnStdoutLine`/`OnStderrLine`) and with `MergeStderr`/`Pty`; the other stream may still be captured
+      // normally. Set/cleared as a pair with the matching `StdioMode` setter so the last destination wins.
+      StdoutFile: (string * bool) option
+      StderrFile: (string * bool) option
       StdoutEncoding: Encoding
       StderrEncoding: Encoding
       // How the line-pumped path frames a captured/streamed line, per stream. The default
@@ -176,6 +189,8 @@ module internal CommandConfig =
           KeepStdinOpen = false
           StdoutMode = StdioMode.Piped
           StderrMode = StdioMode.Piped
+          StdoutFile = None
+          StderrFile = None
           StdoutEncoding = Encoding.UTF8
           StderrEncoding = Encoding.UTF8
           StdoutLineTerminator = LineTerminator.Lf
@@ -312,6 +327,79 @@ module internal CommandConfig =
     let ensureNoPtyForSetsid (config: CommandConfig) =
         if config.Pty.IsSome then
             raise (ptyConflict "Setsid" ptySetsidReason)
+
+    // The `ArgumentException` for combining a stdout/stderr file redirect (`StdoutToFile`/`StderrToFile`)
+    // with a knob that needs a parent-side view of that same stream, or with `MergeStderr`/`Pty`. Named
+    // after the OTHER knob (the check is bidirectional, mirroring `mergeStderrConflict`) so the message is
+    // identical regardless of which of the pair was set second. A file-redirected stream is handed to the
+    // child straight at the OS level, so there is no separate parent-side stream at all.
+    let private stdoutFileConflict (knob: string) =
+        ArgumentException(
+            $"{knob} cannot be combined with StdoutToFile: StdoutToFile hands the child's stdout straight to a file at the OS level (the file grows even after the parent's pump is gone), so there is no separate parent-side stdout stream. Drop one of the two.",
+            knob
+        )
+
+    let private stderrFileConflict (knob: string) =
+        ArgumentException(
+            $"{knob} cannot be combined with StderrToFile: StderrToFile hands the child's stderr straight to a file at the OS level (the file grows even after the parent's pump is gone), so there is no separate parent-side stderr stream. Drop one of the two.",
+            knob
+        )
+
+    /// Guard `StdoutToFile(...)`: reject it when a knob that needs a parent-side stdout stream
+    /// (`StdoutTee`/`OnStdoutLine`) — or `MergeStderr` (which folds stderr into the stdout stream the
+    /// parent observes) or `Pty` (which replaces the child's stdio with one terminal device) — is already
+    /// set. The stderr side is deliberately NOT checked here: redirecting stdout to a file while capturing
+    /// stderr normally (and vice versa) is an explicitly supported combination.
+    let ensureStdoutFileCompatible (config: CommandConfig) =
+        if config.StdoutTee.IsSome then
+            raise (stdoutFileConflict "StdoutTee")
+
+        if config.OnStdoutLine.IsSome then
+            raise (stdoutFileConflict "OnStdoutLine")
+
+        if config.MergeStderr then
+            raise (stdoutFileConflict "MergeStderr")
+
+        if config.Pty.IsSome then
+            raise (stdoutFileConflict "Pty")
+
+    /// Guard `StderrToFile(...)`: the stderr mirror of `ensureStdoutFileCompatible`.
+    let ensureStderrFileCompatible (config: CommandConfig) =
+        if config.StderrTee.IsSome then
+            raise (stderrFileConflict "StderrTee")
+
+        if config.OnStderrLine.IsSome then
+            raise (stderrFileConflict "OnStderrLine")
+
+        if config.MergeStderr then
+            raise (stderrFileConflict "MergeStderr")
+
+        if config.Pty.IsSome then
+            raise (stderrFileConflict "Pty")
+
+    /// Guard `StdoutTee`/`OnStdoutLine`: reject them when stdout is already redirected to a file — the
+    /// mirror of `ensureStdoutFileCompatible`, so the conflict is caught in either chaining order.
+    let ensureNoStdoutFile (config: CommandConfig) (knob: string) =
+        if config.StdoutFile.IsSome then
+            raise (stdoutFileConflict knob)
+
+    /// Guard `StderrTee`/`OnStderrLine`: the stderr mirror of `ensureNoStdoutFile`.
+    let ensureNoStderrFile (config: CommandConfig) (knob: string) =
+        if config.StderrFile.IsSome then
+            raise (stderrFileConflict knob)
+
+    /// Guard `MergeStderr()`/`Pty(...)`: reject them when EITHER stream is already redirected to a file.
+    /// `MergeStderr` needs a parent-observable stdout stream to fold stderr into (absent when stdout is a
+    /// file) and no separate stderr stream (contradicted when stderr is a file); a `Pty` replaces all of
+    /// the child's stdio with one terminal device, leaving nothing to redirect. The mirror of the
+    /// `MergeStderr`/`Pty` checks in `ensureStdoutFileCompatible`/`ensureStderrFileCompatible`, so the
+    /// conflict is caught in either chaining order.
+    let ensureNoFileRedirect (config: CommandConfig) (knob: string) =
+        if config.StdoutFile.IsSome then
+            raise (stdoutFileConflict knob)
+
+        if config.StderrFile.IsSome then
+            raise (stderrFileConflict knob)
 
     /// Validate a `PtyConfig`'s geometry at the `Command.Pty` builder boundary: both dimensions must be at
     /// least 1 (a terminal has no zero/negative size) and fit a Win32 `COORD`'s `SHORT`
@@ -504,13 +592,79 @@ type Command internal (config: CommandConfig) =
         CommandConfig.ensureNoStdinInherit config "KeepStdinOpen"
         Command({ config with KeepStdinOpen = true })
 
-    /// Set how the child's standard output is connected (default `Piped`).
+    /// Set how the child's standard output is connected (default `Piped`). This is a stdout *destination*
+    /// setter, so it also clears any prior `StdoutToFile` redirect — the last destination in a chain wins.
     member _.Stdout(mode: StdioMode) =
-        Command({ config with StdoutMode = mode })
+        Command(
+            { config with
+                StdoutMode = mode
+                StdoutFile = None }
+        )
 
-    /// Set how the child's standard error is connected (default `Piped`).
+    /// Set how the child's standard error is connected (default `Piped`). Also clears any prior
+    /// `StderrToFile` redirect — the last destination in a chain wins (see `Stdout`).
     member _.Stderr(mode: StdioMode) =
-        Command({ config with StderrMode = mode })
+        Command(
+            { config with
+                StderrMode = mode
+                StderrFile = None }
+        )
+
+    /// Redirect the child's standard **output** straight to the file at `path`, at the OS level — the
+    /// child is handed the open file as its stdout handle/fd ON THE SPAWN (Windows: an inheritable file
+    /// handle in `STARTUPINFO`; POSIX: a file fd via a `posix_spawn` file action), with **zero** copying
+    /// through the parent and **no** parent pump. The file therefore keeps growing even after the parent
+    /// process (or a pump that would have drained a pipe) is gone — ideal for a long-lived service's log
+    /// under a `Supervisor`. `append = false` creates the file (truncating an existing one); `append =
+    /// true` appends to it. `path` must be non-null and must not contain an embedded NUL (`'\000'`); a bad
+    /// path (missing directory, permission denied) fails the spawn with `ProcessError.Spawn`, not here.
+    ///
+    /// **There is then no parent-side stdout stream** — `ProcessResult.Stdout` is empty, the streaming
+    /// stdout verbs yield nothing, and `OutputEvent.Stdout` is never produced, exactly as for
+    /// `StdioMode.Null`/`Inherit` (the child's stdout does not reach the parent at all). Because of that,
+    /// the knobs that need a parent-side stdout stream are rejected at the builder boundary with an
+    /// `ArgumentException` (in either chaining order): `StdoutTee` and `OnStdoutLine`. `MergeStderr` is
+    /// rejected too (it folds stderr into the stdout stream the parent observes, which is absent here), as
+    /// is `Pty` (a pseudo-terminal replaces the child's stdio with one terminal device). What is **allowed**
+    /// and useful: redirect stdout to a file while capturing stderr the ordinary way (`ProcessResult.Stderr`,
+    /// `OnStderrLine`, `StderrTee`, the stderr streaming verbs all still work), or redirect **both** streams
+    /// to files with `StderrToFile`. As a stdout destination this overrides — and is overridden by — a later
+    /// `Stdout(mode)` in the same chain (the last destination wins).
+    member _.StdoutToFile(path: string, append: bool) =
+        ArgumentNullException.ThrowIfNull path
+        CommandConfig.rejectEmbeddedNul (nameof path) path
+        CommandConfig.ensureStdoutFileCompatible config
+
+        Command(
+            { config with
+                StdoutFile = Some(path, append) }
+        )
+
+    /// Redirect the child's standard output straight to the file at `path`, creating it (truncating an
+    /// existing one). Shorthand for `StdoutToFile(path, append = false)` — see that overload.
+    member this.StdoutToFile(path: string) = this.StdoutToFile(path, false)
+
+    /// Redirect the child's standard **error** straight to the file at `path`, at the OS level — the
+    /// stderr mirror of `StdoutToFile`. The child is handed the open file as its stderr handle/fd on the
+    /// spawn, with no parent pump, so the file outlives the parent. `append = false` creates/truncates,
+    /// `true` appends. There is then no parent-side stderr stream (`ProcessResult.Stderr` empty,
+    /// `OnStderrLine` never fires, `OutputEvent.Stderr` never produced), so `StderrTee`, `OnStderrLine`,
+    /// `MergeStderr`, and `Pty` are rejected at the builder boundary (in either chaining order). Redirecting
+    /// stderr to a file while capturing stdout normally — or redirecting both streams with `StdoutToFile` —
+    /// is supported. See `StdoutToFile` for the full contract.
+    member _.StderrToFile(path: string, append: bool) =
+        ArgumentNullException.ThrowIfNull path
+        CommandConfig.rejectEmbeddedNul (nameof path) path
+        CommandConfig.ensureStderrFileCompatible config
+
+        Command(
+            { config with
+                StderrFile = Some(path, append) }
+        )
+
+    /// Redirect the child's standard error straight to the file at `path`, creating it (truncating an
+    /// existing one). Shorthand for `StderrToFile(path, append = false)` — see that overload.
+    member this.StderrToFile(path: string) = this.StderrToFile(path, false)
 
     /// Decode captured stdout with `encoding` (default UTF-8).
     member _.StdoutEncoding(encoding: Encoding) =
@@ -567,9 +721,12 @@ type Command internal (config: CommandConfig) =
                 StderrLineTerminator = terminator }
         )
 
-    /// Invoke `handler` for each captured stdout line, as it is pumped.
+    /// Invoke `handler` for each captured stdout line, as it is pumped. Rejected (`ArgumentException`)
+    /// together with `StdoutToFile`, which redirects stdout straight to a file at the OS level, leaving no
+    /// parent-side stdout stream for the handler to observe.
     member _.OnStdoutLine(handler: Action<string>) =
         ArgumentNullException.ThrowIfNull handler
+        CommandConfig.ensureNoStdoutFile config "OnStdoutLine"
 
         Command(
             { config with
@@ -583,15 +740,19 @@ type Command internal (config: CommandConfig) =
         ArgumentNullException.ThrowIfNull handler
         CommandConfig.ensureNoMergeStderr config "OnStderrLine"
         CommandConfig.ensureNoPty config "OnStderrLine"
+        CommandConfig.ensureNoStderrFile config "OnStderrLine"
 
         Command(
             { config with
                 OnStderrLine = Some handler }
         )
 
-    /// Copy raw captured stdout bytes to `sink` (a tee), in addition to capture.
+    /// Copy raw captured stdout bytes to `sink` (a tee), in addition to capture. Rejected
+    /// (`ArgumentException`) together with `StdoutToFile`, which redirects stdout straight to a file at the
+    /// OS level, leaving no parent-side stdout stream to tee.
     member _.StdoutTee(sink: Stream) =
         ArgumentNullException.ThrowIfNull sink
+        CommandConfig.ensureNoStdoutFile config "StdoutTee"
         Command({ config with StdoutTee = Some sink })
 
     /// Copy raw captured stderr bytes to `sink` (a tee), in addition to capture. Rejected
@@ -601,6 +762,7 @@ type Command internal (config: CommandConfig) =
         ArgumentNullException.ThrowIfNull sink
         CommandConfig.ensureNoMergeStderr config "StderrTee"
         CommandConfig.ensureNoPty config "StderrTee"
+        CommandConfig.ensureNoStderrFile config "StderrTee"
         Command({ config with StderrTee = Some sink })
 
     /// Merge the child's standard **error** into its standard **output** at the OS level — the library
@@ -632,6 +794,7 @@ type Command internal (config: CommandConfig) =
     /// stderr would inject it into the downstream stage's input data.
     member _.MergeStderr() =
         CommandConfig.ensureNoMergeStderrObservers config
+        CommandConfig.ensureNoFileRedirect config "MergeStderr"
         Command({ config with MergeStderr = true })
 
     /// Bound the in-memory backlog of captured lines.
@@ -906,6 +1069,7 @@ type Command internal (config: CommandConfig) =
     member _.Pty(pty: PtyConfig) =
         CommandConfig.validatePtyConfig pty
         CommandConfig.ensurePtyCompatible config
+        CommandConfig.ensureNoFileRedirect config "Pty"
         Command({ config with Pty = Some pty })
 
     /// Run the child under a pseudo-terminal with the default 80×24 geometry (echo on). See
@@ -1005,6 +1169,16 @@ module Command =
 
     /// Copy raw captured stderr bytes to `sink`.
     let stderrTee (sink: Stream) (command: Command) = command.StderrTee sink
+
+    /// Redirect the child's stdout straight to the file at `path` at the OS level (no parent pump — the
+    /// file outlives the parent). `append` chooses create/truncate (`false`) or append (`true`). Leaves
+    /// no parent-side stdout stream, so it is rejected with `StdoutTee`/`OnStdoutLine`/`MergeStderr`/`Pty`.
+    /// See `Command.StdoutToFile`.
+    let stdoutToFile (path: string) (append: bool) (command: Command) = command.StdoutToFile(path, append)
+
+    /// Redirect the child's stderr straight to the file at `path` at the OS level — the stderr mirror of
+    /// `stdoutToFile`. See `Command.StderrToFile`.
+    let stderrToFile (path: string) (append: bool) (command: Command) = command.StderrToFile(path, append)
 
     /// Merge the child's stderr into its stdout at the OS level (like a shell `2>&1`); the two streams
     /// then interleave byte-for-byte on the single stdout stream, and there is no separate stderr stream.

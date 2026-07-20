@@ -234,8 +234,11 @@ provide `--ctty`; until a helper is supplied, a PTY spawn there is `Unsupported`
 controlling-terminal-less half implementation.
 
 Everything not listed here — capture, line streaming, interactive stdin, encodings, buffer
-policies, timeouts, retry, pipelines, supervision, readiness probes, cancellation, and the
-testing seams — is platform-agnostic and behaves identically everywhere. See [commands.md](commands.md),
+policies, timeouts, retry, pipelines, supervision, readiness probes, cancellation, redirecting
+stdout/stderr straight to a file (`Command.StdoutToFile`/`StderrToFile` — an inheritable file
+handle in `STARTUPINFO` on Windows, a file fd via a `posix_spawn` file action on POSIX; the same
+create/truncate/append semantics and the same builder-boundary conflict rules on every platform),
+and the testing seams — is platform-agnostic and behaves identically everywhere. See [commands.md](commands.md),
 [streaming.md](streaming.md), [pipelines.md](pipelines.md), [supervision.md](supervision.md),
 and [testing.md](testing.md).
 
