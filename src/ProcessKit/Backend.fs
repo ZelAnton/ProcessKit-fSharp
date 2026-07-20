@@ -179,16 +179,45 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             // A best-effort SOFT phase before the atomic Job kill. Windows has no per-job graceful
             // signal, but a WINDOWED child (Electron/GUI) closes gracefully on a `WM_CLOSE` posted to
             // its top-level windows — so post one to every member's windows, poll up to `grace` for the
-            // tree to drain (the same shape the POSIX/cgroup backends use), then UNCONDITIONALLY
-            // `terminateWindowsJob` whatever is still alive. The hard kill is never removed or weakened:
-            // it is the deterministic fallback regardless of the WM_CLOSE outcome (a child with no
-            // window, or one that vetoes the close, is force-killed exactly as before). `grace = 0` skips
-            // the poll wait and hard-kills at once (the WM_CLOSE post is a harmless no-op then).
-            GracefulTeardown.poll
-                (fun () -> Native.Windows.postCloseToJobWindows jobHandle |> ignore)
-                (fun () -> Native.Windows.jobTreeAliveWindows jobHandle)
-                (fun () -> Native.Windows.terminateWindowsJob jobHandle)
-                grace
+            // tree to drain (the same shape the POSIX/cgroup backends use), then UNCONDITIONALLY force-
+            // kill whatever is still alive. The hard kill is never removed or weakened: it is the
+            // deterministic fallback regardless of the WM_CLOSE outcome (a child with no window, or one
+            // that vetoes the close, is force-killed exactly as before). `grace = 0` skips the poll wait
+            // and hard-kills at once (the WM_CLOSE post is a harmless no-op then).
+            //
+            // The WHOLE poll — the WM_CLOSE post, the liveness query, and the final force-kill — runs on
+            // our OWN duplicate of the Job handle, never the backend's `jobHandle` (T-162). Only the
+            // graceful START is serialized by the group's `sync`/`releasedFlag` lifecycle lock
+            // (`ProcessGroup.gracefulKillWhenLive`); the poll loop that follows runs OFF that lock, so a
+            // concurrent `DisposeAsync`/teardown can win `claimRelease` and `HardRelease` — closing
+            // `jobHandle` — while this poll is still in flight (the `StopAsync` vs `Dispose` race). Polling
+            // or terminating on that just-closed handle would be a use-after-close whose recycled value
+            // could `TerminateJobObject` an unrelated Job. The duplicate is taken SYNCHRONOUSLY here — this
+            // prefix runs under the lifecycle lock with the group still live, so `jobHandle` is guaranteed
+            // open — and keeps the Job object itself alive for the bounded grace window even if the backend
+            // closes its handle underneath us; it is closed when the poll concludes, at which point
+            // `KILL_ON_JOB_CLOSE` is the final backstop. Mirrors how `waitWindows` waits on its own
+            // duplicate of a child's process handle. If duplication ever fails (near-impossible under the
+            // lock with a valid handle), fall back to an immediate hard kill on the still-valid `jobHandle`
+            // rather than poll a handle we cannot protect — the unconditional kill-on-drop guarantee holds
+            // either way.
+            match Native.Windows.duplicateJobHandle jobHandle with
+            | None ->
+                Native.Windows.terminateWindowsJob jobHandle
+                Task.CompletedTask
+            | Some ownedJob ->
+                task {
+                    try
+                        do!
+                            GracefulTeardown.poll
+                                (fun () -> Native.Windows.postCloseToJobWindows ownedJob |> ignore)
+                                (fun () -> Native.Windows.jobTreeAliveWindows ownedJob)
+                                (fun () -> Native.Windows.terminateWindowsJob ownedJob)
+                                grace
+                    finally
+                        Native.Windows.closeWindowsHandle ownedJob
+                }
+                :> Task
 
         member _.Members() =
             // `membersWindows` already returns a `Result` — it grows the buffer to the whole job and
