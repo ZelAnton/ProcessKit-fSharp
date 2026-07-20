@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `OverflowMode.DropNewest` with `OutputBufferPolicy.MaxBytes` retaining later short lines after an over-cap line, so buffered text now always remains a contiguous prefix of the process output.
 - `ProcessGroup.Signal(Signal.Other 0)` on POSIX no longer reports a false success: signal 0 is a liveness *probe* (`kill`/`killpg` with a zero number checks the target exists but delivers nothing, yet returns success), so it — and a negative number, which is not a signal at all — is now refused up front with `ProcessError.Unsupported` on both POSIX backends (process-group and cgroup v2), even for an empty group, instead of masquerading as a delivered signal. A valid-but-platform-rejected number (e.g. an out-of-range `Signal.Other 999`) still fails honestly as `ProcessError.Io`.
 - A buffered `RunningProcess` verb (`OutputStringAsync`/`OutputBytesAsync`/`WaitAsync`/`ProfileAsync`/`StopAsync`) that faults before reaching its own completion — e.g. a throwing `OnStdoutLine`/`OnStderrLine` handler, or a faulted exit wait — no longer leaves the `processkit.runs.active` metric permanently inflated: the verb's teardown now clears it on every exit path, not just the successful one.
+- The cgroup v2 `limits` backend's confirmation write of a child's pid into `cgroup.procs` now treats a short write (fewer bytes landed than the pid's decimal payload) as a genuine migration failure instead of silently reporting a successful migration.
 
 ## [2.4.2] - 2026-07-13
 

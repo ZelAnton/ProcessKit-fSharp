@@ -154,6 +154,13 @@ module internal Cgroup =
     [<DllImport("libc", SetLastError = true, EntryPoint = "close")>]
     extern int private closeFd(int fd)
 
+    /// Test-only seam (same pattern as `PipelineRunner.stageSpawnedTestHook`): when set, transforms the
+    /// raw `write()` return value before `migrateToCgroup` classifies it. A genuine short write on
+    /// `cgroup.procs` is (per the kernel's atomic per-write handling) effectively unprovokable for a
+    /// payload this small, so this is how the short-write branch gets exercised deterministically.
+    /// Reset to `None` after use.
+    let mutable internal migrateWriteTestHook: (nativeint -> nativeint) option = None
+
     /// Confirm the child was placed into the cgroup, and belt-and-suspenders migrate it. The `/bin/sh`
     /// launcher (`Native.Posix.spawnPosixIntoCgroup`) already writes the child's own pid into
     /// `cgroup.procs` before it `exec`s the target, so the target starts already contained; this parent
@@ -178,10 +185,22 @@ module internal Cgroup =
         else
             try
                 let payload = System.Text.Encoding.ASCII.GetBytes(string pid)
-                let written = writeAll (fd, payload, nativeint payload.Length)
+                let rawWritten = writeAll (fd, payload, nativeint payload.Length)
 
-                if written >= 0n then
+                let written =
+                    match migrateWriteTestHook with
+                    | Some hook -> hook rawWritten
+                    | None -> rawWritten
+
+                if written >= 0n && written = nativeint payload.Length then
                     Ok()
+                elif written >= 0n then
+                    // A short write: fewer bytes landed than the pid's decimal payload. The kernel
+                    // handles cgroup.procs writes atomically in practice, so this is unreachable in
+                    // practice - but a partial pid is neither a confirmed migration nor a clean
+                    // failure signal (errno is not set on a short, non-negative write), so treat it
+                    // as an honest migration failure rather than silently reporting success.
+                    Error $"short write migrating pid {pid} to {procs} ({written} of {payload.Length} bytes)"
                 else
                     let errno = Marshal.GetLastWin32Error()
 
