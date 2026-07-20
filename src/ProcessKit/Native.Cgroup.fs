@@ -159,6 +159,11 @@ module internal Cgroup =
     /// `cgroup.procs` is (per the kernel's atomic per-write handling) effectively unprovokable for a
     /// payload this small, so this is how the short-write branch gets exercised deterministically.
     /// Reset to `None` after use.
+    ///
+    /// NOT thread-safe: this is a process-wide, unsynchronized mutable, the same convention already
+    /// used by `PipelineRunner.stageSpawnedTestHook` and other test-only hooks in this suite. It relies
+    /// on tests that set it running sequentially (no `[<Parallelizable>]`) and always resetting it in a
+    /// `finally`; do not set it from tests that may run concurrently with other users of this hook.
     let mutable internal migrateWriteTestHook: (nativeint -> nativeint) option = None
 
     /// Confirm the child was placed into the cgroup, and belt-and-suspenders migrate it. The `/bin/sh`
