@@ -431,6 +431,19 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     // The supervision loop itself — one faithful copy of `Supervisor.RunAsync`'s former body, extended
     // with the session's live-status publication and graceful-stop handling. Started in the background
     // by the constructor (`let completion` below); `RunAsync` awaits its result through `Completion`.
+    //
+    // Runs as a `backgroundTask` — detached onto the thread pool — so it never captures the
+    // `SynchronizationContext` of the thread that called `StartAsync`. The loop is kicked off
+    // synchronously from the `SupervisionSession` constructor (itself built synchronously by
+    // `Supervisor.StartAsync`), and its `Completion` is exactly the primitive a daemon/process-manager
+    // consumer naturally blocks on (`Completion.GetAwaiter().GetResult()`, `StopAsync(grace).Result`).
+    // A plain `task { }` would post every post-`await` continuation (each `config.Sleep`,
+    // `captureIncarnation`, `OutputStringAsync`) back to the caller's context; on a single-threaded
+    // context (a WPF/WinForms UI thread, classic ASP.NET) that blocking wait would deadlock the loop —
+    // the one thread is parked in the wait, so no continuation could ever run. `backgroundTask` keeps
+    // the whole loop on the pool, so such a blocking wait is safe (see `Pump.feedStdin` for the same
+    // pattern). Off any such context — a pool or background thread, as in the tests and CI —
+    // `backgroundTask` is identical to `task`, so nothing else changes.
     let runLoop () : Task<Result<SupervisionOutcome, ProcessError>> =
         let factor =
             if Double.IsFinite config.BackoffFactor then
@@ -446,7 +459,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
             | RestartPolicy.Never -> false
             | _ -> config.MaxRestarts |> Option.forall (fun limit -> limit > 0)
 
-        task {
+        backgroundTask {
             // Force the async boundary before any real work, so the constructor returns before the first
             // incarnation is spawned (the whole configure-and-spawn prefix runs off the caller's thread).
             do! Task.Yield()
