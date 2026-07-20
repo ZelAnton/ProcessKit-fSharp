@@ -963,6 +963,30 @@ type StreamingTests() =
     // read back the process's current fd high-water mark; macOS has no equally cheap, portable way
     // to do that, so there is no way to pin the limit at "one more fd, no further" there without
     // guessing at an ambient fd count (risking starving the whole test process of descriptors).
+    //
+    // K-047: this exact test was seen on ubuntu-latest CI failing with "socketpair() failed for
+    // stderr" instead of the expected "open(/dev/null) failed for stdout" — not ambient CI noise
+    // from an unrelated process, but this test's OWN fd budget landing on a different one of
+    // `spawnPosixViaSpawn`'s several fd-creating calls than intended. The original command left
+    // stdin and stderr at their defaults, so `spawnPosixViaSpawn` made THREE fd-creating calls in
+    // order (stdin's `openNul`, stdout's `openNul`, stderr's `socketpair()` for its default
+    // `StdioMode.Piped`) while the test's rlimit math only ever accounted for the first two:
+    // any stray fd churn from the .NET runtime itself (GC finalizing a handle, thread-pool/JIT
+    // background activity) landing in the narrow window between the `/proc/self/fd` snapshot and
+    // the actual `spawnPosix` call could free up or consume a slot, letting BOTH of the first two
+    // opens (stdin, stdout) succeed unexpectedly and pushing the failure onto stderr's
+    // `socketpair()` instead — a real, reproducible ordering hazard, not a flaky assertion. Fixed
+    // by removing the ambiguity at its source: `InheritStdin`/`StdioMode.Inherit` are no-ops on
+    // Linux (no fd created at all, see `spawnPosixViaSpawn`'s `stdinInherit`/`StdioMode.Inherit`
+    // branches), so stdin and stderr are pinned to Inherit here, leaving the stdout `StdioMode.Null`
+    // open as the ONLY fd-creating call `spawnPosixViaSpawn` can make for this command on Linux —
+    // there is no other call left for a shifted budget to land on. The rlimit budget is tightened
+    // to match: zero spare fds (`maxOpenFd + 1`), so that one call is guaranteed to fail regardless
+    // of any single fd of background churn either way. A settle pass (`GC.Collect` +
+    // `WaitForPendingFinalizers` + `GC.Collect`, the established pattern in this test suite —
+    // see e.g. `PosixSpawnCleanupTests.fs`/`RedirectToFileTests.fs`) is also taken right before the
+    // `/proc/self/fd` snapshot, to further shrink the odds of the runtime's own fd churn falling in
+    // the narrow window that remains.
     [<Test>]
     member _.``spawnPosix fails instead of silently inheriting when open(/dev/null) fails``() : Task =
         task {
@@ -971,6 +995,10 @@ type StreamingTests() =
 
             if not isLinux then
                 Assert.Ignore "macOS: no /proc/self/fd to pin the exact rlimit deterministically"
+
+            GC.Collect()
+            GC.WaitForPendingFinalizers()
+            GC.Collect()
 
             let mutable original = DevNullExhaustion.RLimit()
 
@@ -989,7 +1017,7 @@ type StreamingTests() =
             // Fill any gaps in the fd table below maxOpenFd so it becomes contiguous.
             // RLIMIT_NOFILE bounds the fd *number*, not the open fd *count*, so pre-existing gaps below
             // the high-water mark can be reused by open() for "free" without consuming the budget.
-            // By filling them first, we ensure the "budget of 1 new fd" assumption is exact.
+            // By filling them first, we ensure the "zero spare fds" assumption below is exact.
             let gapCount = (maxOpenFd + 1) - usedCount
             let fillerFds = ResizeArray<int>(gapCount)
 
@@ -1001,13 +1029,15 @@ type StreamingTests() =
                 else
                     Assert.Fail $"failed to fill fd gap (errno {Marshal.GetLastWin32Error()})"
 
-            // Now the fd table 0..maxOpenFd is fully occupied, so the next open will request fd `maxOpenFd + 1`.
-            // Allow exactly one more fd beyond the process's current high-water mark: enough for
-            // the default stdin's own open("/dev/null") — the first fd-creating call spawnPosix
-            // makes, since this command sets no stdin source — to succeed, so the very NEXT open,
-            // the explicit StdioMode.Null stdout below, is the one that fails with EMFILE.
+            // Now the fd table 0..maxOpenFd is fully occupied, so the next open would request fd
+            // `maxOpenFd + 1`. Allow NO further fd at all (`Current = maxOpenFd + 1`, i.e. the highest
+            // legal fd number stays `maxOpenFd`): the command below pins stdin and stderr to Inherit
+            // (no-ops on Linux, see the member comment above), so the explicit `StdioMode.Null` stdout
+            // open is the only fd-creating call `spawnPosixViaSpawn` makes for it — and with zero spare
+            // fds, that call is guaranteed to be the one that fails, independent of any stray
+            // background fd churn.
             let mutable exhausted =
-                DevNullExhaustion.RLimit(Current = int64 (maxOpenFd + 2), Max = original.Max)
+                DevNullExhaustion.RLimit(Current = int64 (maxOpenFd + 1), Max = original.Max)
 
             try
                 Assert.That(
@@ -1016,7 +1046,11 @@ type StreamingTests() =
                     "setrlimit failed"
                 )
 
-                let command = shell "true" |> Command.stdout StdioMode.Null
+                let command =
+                    shell "true"
+                    |> Command.inheritStdin
+                    |> Command.stdout StdioMode.Null
+                    |> Command.stderr StdioMode.Inherit
 
                 match Native.Posix.spawnPosix command with
                 | Error(ProcessError.Spawn(_, message)) ->

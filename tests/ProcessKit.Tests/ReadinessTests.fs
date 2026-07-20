@@ -830,16 +830,34 @@ type ReadinessTests() =
         task {
             // `lateConnect` ignores the cancellation token it is handed (as a real, already-in-flight
             // `TcpClient.ConnectAsync` effectively does once the OS has committed to completing the
-            // handshake) and only ever succeeds — 300ms after invocation, well past the 100ms shared
-            // deadline. Regression test for two things at once: (1) the deadline is honored even though
-            // the connect itself never observes cancellation — this must not block for the connect's own
-            // 300ms, only race it against the deadline, and (2) once the abandoned connect does complete
-            // in the background, its stale success is still reported as NotReady, never surfaced as a
-            // late `Ok` from this call (which has already returned).
+            // handshake) and only ever succeeds — 500ms after invocation, well past the 100ms shared
+            // deadline and past `deadlineOverrunBound` on every platform (raised from 300ms alongside
+            // the widened macOS bound below, K-038, so the two stay comfortably apart). Regression test
+            // for two things at once: (1) the deadline is honored even though the connect itself never
+            // observes cancellation — this must not block for the connect's own 500ms, only race it
+            // against the deadline, and (2) once the abandoned connect does complete in the background,
+            // its stale success is still reported as NotReady, never surfaced as a late `Ok` from this
+            // call (which has already returned).
+            //
+            // `deadlineOverrunBound` is a platform-aware upper bound for that racing assertion: macOS CI
+            // runners have shown materially more scheduler slack than other platforms between the shared
+            // deadline firing and this call actually returning — K-038 measured a real 263ms against the
+            // previous flat 250ms bound (a ~13ms overrun) on a macOS CI leg, with nothing in the diff
+            // under review touching the deadline mechanism (`ReadinessProbe.waitForCoreUsing`'s
+            // `Task.WhenAny` race). Rather than a uniform, unbounded widening "on the eye", only the
+            // platform that has actually shown the variance gets a wider bound, with the connect fake's
+            // own completion delay raised in step so the bound still stays well clear of it — this keeps
+            // proving the deadline is genuinely raced, not silently waited out, on every platform.
+            let deadlineOverrunBound =
+                if RuntimeInformation.IsOSPlatform OSPlatform.OSX then
+                    TimeSpan.FromMilliseconds 400.0
+                else
+                    TimeSpan.FromMilliseconds 300.0
+
             let mutable lateConnectTask: Task = Unchecked.defaultof<Task>
 
             let lateConnect (_: IPEndPoint) (_: CancellationToken) : Task =
-                let t = task { do! Task.Delay 300 }
+                let t = task { do! Task.Delay 500 }
                 lateConnectTask <- t
                 t
 
@@ -855,9 +873,9 @@ type ReadinessTests() =
                     CancellationToken.None
             with
             | Error(ProcessError.NotReady _) ->
-                // Bounded well below the connect's own 300ms — the fix under test is that a
+                // Bounded well below the connect's own 500ms — the fix under test is that a
                 // non-cooperative connect is raced against the shared deadline rather than blocked on.
-                Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromMilliseconds 250.0))
+                Assert.That(elapsed.Elapsed, Is.LessThan(deadlineOverrunBound))
                 // The abandoned connect keeps running past the deadline in the background; wait for it
                 // to actually finish and confirm it completed successfully (not faulted), demonstrating
                 // its stale success never reaches this already-returned call as an `Ok`.

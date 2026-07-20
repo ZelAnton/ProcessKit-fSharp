@@ -102,11 +102,22 @@ type WindowsOverlappedPipeTests() =
             let after = proc.HandleCount
 
             // A per-spawn leak of even one handle would show up as growth proportional to the 200
-            // runs; a generous absolute slack (`+50`) absorbs incidental steady-state noise (GC/JIT/
-            // thread-pool handles) without masking a real leak.
+            // runs; a generous absolute slack absorbs incidental steady-state noise (GC/JIT/
+            // thread-pool handles) without masking a real leak. `windows-11-arm` has shown materially
+            // more of this noise than x64 — K-038 measured a real 582 against a 578 ceiling
+            // (baseline+50, a 4-handle overrun) on that leg, consistent with ARM64 emulation/JIT
+            // overhead rather than a per-spawn leak (which would scale with the 200 iterations, not sit
+            // within single digits of a fixed ceiling) — so only that architecture gets a wider slack,
+            // rather than an unbounded blanket widening for every platform.
+            let handleSlack =
+                if RuntimeInformation.OSArchitecture = Architecture.Arm64 then
+                    90
+                else
+                    50
+
             Assert.That(
                 after,
-                Is.LessThan(baseline + 50),
+                Is.LessThan(baseline + handleSlack),
                 $"handle count grew from {baseline} to {after} after 200 piped spawns — looks like a leak"
             )
         }
