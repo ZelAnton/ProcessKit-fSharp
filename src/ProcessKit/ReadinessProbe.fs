@@ -82,10 +82,11 @@ module internal ReadinessProbe =
             min remaining pollBackoff
 
     /// The single polling/deadline core every readiness probe funnels through: the HTTP
-    /// (`waitForHttpUsing`), port (`waitForPortUsing`), and custom (`waitFor`) probes each express
-    /// their per-attempt check as a `probe: CancellationToken -> Task<bool>` (true = ready) and hand it
-    /// here, so the deadline mechanics live in exactly one place instead of being hand-synchronised
-    /// across copies. Polls `probe` until it returns true, or fails with `NotReady` once the shared
+    /// (`waitForHttpUsing`), port (`waitForPortUsing`), Unix domain socket (`waitForSocketUsing`), and
+    /// custom (`waitFor`) probes each express their per-attempt check as a
+    /// `probe: CancellationToken -> Task<bool>` (true = ready) and hand it here, so the deadline
+    /// mechanics live in exactly one place instead of being hand-synchronised across copies. Polls
+    /// `probe` until it returns true, or fails with `NotReady` once the shared
     /// `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). A non-positive
     /// `timeout` is an immediate `NotReady` — `probe` is never invoked. The `timeout` is clamped through
     /// `Timeouts.clampArmable` (an over-long span is capped at ~24.8 days), and that clamped value is
@@ -288,6 +289,77 @@ module internal ReadinessProbe =
 
         withBackgroundDrain stdout stderr (fun () ->
             waitForPortUsing tcpConnect program endpoint timeout cancellationToken)
+
+    /// Whether this host can dial a Unix domain socket at all. Factored out as a predicate — rather than
+    /// inlined as `Socket.OSSupportsUnixDomainSockets` — so a test can force both branches deterministically
+    /// regardless of the actual host's real `AF_UNIX` support: every platform this library targets (Windows
+    /// 10 1809+, any current Linux, macOS) supports it, so the unsupported branch is rare in practice but
+    /// must still fail with a typed `Unsupported`, never dial (and unpredictably fail/hang on) a socket
+    /// family the OS doesn't have, nor silently downgrade to some other transport.
+    let internal unixDomainSocketsSupported (isSupported: unit -> bool) : Result<unit, ProcessError> =
+        if isSupported () then
+            Ok()
+        else
+            Error(ProcessError.Unsupported "WaitForSocketAsync (this host has no AF_UNIX support)")
+
+    /// Wait until `connect` succeeds for the Unix domain socket at `path`, or fail with `NotReady` once the
+    /// shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). A thin adapter
+    /// over the shared `waitForCoreUsing` core — see `waitForPortUsing`/`waitForCoreUsing` for the full
+    /// deadline contract. Each poll is a single connect attempt, exactly like `waitForPortUsing`: any
+    /// failure (no listener bound at `path` yet, or a connect the shared deadline cancelled) means "not open
+    /// yet" and is retried until the deadline. `connect` is factored out so tests can substitute a
+    /// deterministically slow stand-in — same rationale as `waitForPortUsing`. `waitForSocket` below is the
+    /// production entry point, wired to a real `AddressFamily.Unix` socket and to the background drain.
+    let internal waitForSocketUsing
+        (connect: string -> CancellationToken -> Task)
+        (program: string)
+        (path: string)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        let probe (ct: CancellationToken) : Task<bool> =
+            task {
+                try
+                    do! connect path ct
+                    return true
+                with _ ->
+                    // ANY connect failure means the socket is not accepting yet — no listener bound at
+                    // `path`, or a connect the shared deadline cancelled. Return false so the core loop
+                    // retries within budget; mirrors `waitForPortUsing`'s identical rationale.
+                    return false
+            }
+
+        waitForCoreUsing program probe timeout cancellationToken
+
+    /// Wait until a connection to the Unix domain socket at `path` succeeds, or fail with `NotReady` once
+    /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). See
+    /// `waitForSocketUsing`/`waitForCoreUsing` for the full deadline contract; this wires it to a real
+    /// `Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)`. Background-drains (and
+    /// discards) the child's piped `stdout`/`stderr` for the duration of the poll, exactly like
+    /// `waitForPort` — see `withBackgroundDrain`. Child-exit detection is not done here:
+    /// `RunningProcess.WaitForSocketAsync` layers it on (racing this against the handle's shared reap-once
+    /// exit wait), the same early-exit contract every other probe honours. Does NOT itself check
+    /// `Socket.OSSupportsUnixDomainSockets` — `RunningProcess.WaitForSocketAsync` gates on
+    /// `unixDomainSocketsSupported` before ever calling this function, so an unsupported host never reaches
+    /// the `AddressFamily.Unix` socket construction below.
+    let waitForSocket
+        (program: string)
+        (stdout: Stream option)
+        (stderr: Stream option)
+        (path: string)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        let unixConnect (path: string) (ct: CancellationToken) : Task =
+            task {
+                use client =
+                    new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
+
+                do! client.ConnectAsync(UnixDomainSocketEndPoint path, ct)
+            }
+
+        withBackgroundDrain stdout stderr (fun () ->
+            waitForSocketUsing unixConnect program path timeout cancellationToken)
 
     /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).

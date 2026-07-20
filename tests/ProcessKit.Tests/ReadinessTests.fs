@@ -128,6 +128,59 @@ type ReadinessTests() =
 
         listener, Uri($"http://127.0.0.1:{port}/"), (fun () -> requests)
 
+    // A minimal accept-and-close Unix domain socket server bound to a fresh path under the temp
+    // directory (mirrors `startHttpListener`'s shape). Every accepted connection is immediately
+    // shut down — `WaitForSocketAsync` only probes that a connection succeeds, it never exchanges
+    // data. The caller is responsible for calling `Dispose()` on the returned `Socket` and deleting
+    // the socket path afterwards (Unix domain sockets leave a filesystem entry that closing the
+    // listener does not remove).
+    let startUnixSocketListener () : Socket * string =
+        let path = Path.Combine(Path.GetTempPath(), $"processkit-{Guid.NewGuid():N}.sock")
+
+        let listener =
+            new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
+
+        listener.Bind(UnixDomainSocketEndPoint path)
+        listener.Listen(1)
+
+        let server =
+            task {
+                try
+                    while true do
+                        use! client = listener.AcceptAsync()
+
+                        try
+                            client.Shutdown(SocketShutdown.Both)
+                        with :? SocketException ->
+                            // The peer may already have closed its end; nothing left to shut down.
+                            ()
+                with
+                | :? SocketException ->
+                    // Stopping/disposing the listener unblocks a pending accept during test cleanup.
+                    ()
+                | :? ObjectDisposedException ->
+                    // Disposal can race the accept loop during test cleanup; no connection remains.
+                    ()
+            }
+
+        server.ContinueWith(
+            (fun (finished: Task) -> finished.Exception |> ignore),
+            TaskContinuationOptions.OnlyOnFaulted
+            ||| TaskContinuationOptions.ExecuteSynchronously
+        )
+        |> ignore
+
+        listener, path
+
+    // Deletes a Unix domain socket path left behind by `startUnixSocketListener`, tolerating a path
+    // that was never bound (the "nothing is listening" tests) or already removed.
+    let deleteSocketPathIfPresent (path: string) : unit =
+        try
+            File.Delete path
+        with :? IOException ->
+            // Best-effort cleanup only; leaving a stray temp file behind is not a test failure.
+            ()
+
     // A synthetic `RunningProcess` with no piped streams whose exit is fully driven by `exitTask`:
     // pass a never-completing task to model a child that stays running, or `Task.FromResult(Outcome...)`
     // to model one that has already exited. Used to drive the readiness probes' exit-race path
@@ -1035,6 +1088,110 @@ type ReadinessTests() =
                 match outcome with
                 | Outcome.Exited code -> Assert.That(code, Is.EqualTo 7)
                 | other -> Assert.Fail $"expected Exited 7, got {other}"
+        }
+        :> Task
+
+    // The platform-support gate (`ReadinessProbe.unixDomainSocketsSupported`) is factored out as a
+    // predicate specifically so both branches are testable without depending on the actual host's real
+    // `AF_UNIX` support — see its doc comment. These two tests exercise the gate directly, deterministic
+    // on every CI host regardless of whether that host truly supports `AF_UNIX`.
+    [<Test>]
+    member _.``WaitForSocket support gate reports Unsupported when the host has no AF_UNIX support``() =
+        match ReadinessProbe.unixDomainSocketsSupported (fun () -> false) with
+        | Error(ProcessError.Unsupported _) -> Assert.Pass()
+        | other -> Assert.Fail $"expected Unsupported, got {other}"
+
+    [<Test>]
+    member _.``WaitForSocket support gate passes through when the host supports AF_UNIX``() =
+        match ReadinessProbe.unixDomainSocketsSupported (fun () -> true) with
+        | Ok() -> Assert.Pass()
+        | other -> Assert.Fail $"expected Ok, got {other}"
+
+    [<Test>]
+    member _.``WaitForSocket connects to a listening Unix domain socket``() : Task =
+        task {
+            if not Socket.OSSupportsUnixDomainSockets then
+                Assert.Ignore "this host has no AF_UNIX support"
+
+            let listener, path = startUnixSocketListener ()
+
+            try
+                // A never-completing `Wait` models a child that stays running throughout the probe
+                // (KB K-044): an immediately-resolving one would spuriously trigger the early-exit race
+                // this test is not exercising.
+                use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForSocketAsync(path, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.Pass()
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                listener.Dispose()
+                deleteSocketPathIfPresent path
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForSocket returns NotReady when nothing is listening on the socket path``() : Task =
+        task {
+            if not Socket.OSSupportsUnixDomainSockets then
+                Assert.Ignore "this host has no AF_UNIX support"
+
+            let path = Path.Combine(Path.GetTempPath(), $"processkit-{Guid.NewGuid():N}.sock")
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForSocketAsync(path, TimeSpan.FromMilliseconds 250.0) with
+            | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    // Early-exit contract, socket probe: a child that has already exited must resolve to `NotReady`
+    // promptly rather than polling the socket path out for the full timeout — the same behaviour
+    // `WaitForPortAsync`/`WaitForHttpAsync` give (see the equivalent port test above). `Wait` resolves to
+    // an exited outcome, so the shared exit wait the probe races against completes at once and cancels
+    // the still-polling socket probe.
+    [<Test>]
+    member _.``WaitForSocket returns NotReady promptly when the child has already exited``() : Task =
+        task {
+            if not Socket.OSSupportsUnixDomainSockets then
+                Assert.Ignore "this host has no AF_UNIX support"
+
+            // Nothing is bound at this path, so every connect attempt fails and, absent early-exit
+            // detection, the probe would poll out the full 5s timeout.
+            let path = Path.Combine(Path.GetTempPath(), $"processkit-{Guid.NewGuid():N}.sock")
+            use running = syntheticProcess (Task.FromResult(Outcome.Exited 1))
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForSocketAsync(path, TimeSpan.FromSeconds 5.0) with
+            | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+            | other -> Assert.Fail $"expected early NotReady, got {other}"
+        }
+        :> Task
+
+    // `RunningProcess.WaitForSocketAsync` wires the injectable gate above to the real
+    // `Socket.OSSupportsUnixDomainSockets`; the two real-dial tests above already prove that wiring
+    // doesn't short-circuit to `Unsupported` on a host that does support `AF_UNIX` (they'd fail on
+    // `Assert.Fail` for an unexpected `Unsupported`, not just skip). This test instead proves the gate
+    // fires BEFORE the shared exit race starts (KB K-043/K-016): a synthetic host whose `Wait` never
+    // completes would hang if `WaitForSocketAsync` ever awaited `raceReadinessAgainstExit`'s exit race
+    // for it, so a prompt result here (whichever branch the real host takes) demonstrates the gate is
+    // checked up front. Only meaningful on a host WITHOUT `AF_UNIX` support — skipped otherwise, since
+    // the two tests above already cover the supported-host wiring.
+    [<Test>]
+    member _.``WaitForSocket reports Unsupported promptly, without racing the child's exit, when AF_UNIX is unavailable``
+        ()
+        : Task =
+        task {
+            if Socket.OSSupportsUnixDomainSockets then
+                Assert.Ignore "this host supports AF_UNIX; covered instead by the real-dial tests above"
+
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForSocketAsync("/nonexistent/path.sock", TimeSpan.FromSeconds 5.0) with
+            | Error(ProcessError.Unsupported _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 1.0))
+            | other -> Assert.Fail $"expected Unsupported, got {other}"
         }
         :> Task
 

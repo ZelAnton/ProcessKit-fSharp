@@ -7,6 +7,7 @@ open System.Diagnostics.CodeAnalysis
 open System.IO
 open System.Net
 open System.Net.Http
+open System.Net.Sockets
 open System.Runtime.ExceptionServices
 open System.Runtime.InteropServices
 open System.Text.Json
@@ -546,10 +547,10 @@ type RunningProcess internal (host: RunningHost) =
 
     // Race a readiness probe against the child's own exit so a probe on a child that has already
     // exited — or that dies early on startup — resolves to `NotReady` promptly instead of burning the
-    // whole `timeout` polling a condition that can never come true. Shared by all three readiness
-    // probes (`WaitForHttpAsync`/`WaitForPortAsync`/`WaitForAsync`) so their early-exit behaviour cannot
-    // drift apart: `startProbe` builds the underlying `ReadinessProbe.*` task from the snapshotted
-    // (still-`Fresh`) drain streams and a readiness token linked to the caller's `cancellationToken`;
+    // whole `timeout` polling a condition that can never come true. Shared by all readiness probes
+    // (`WaitForHttpAsync`/`WaitForPortAsync`/`WaitForSocketAsync`/`WaitForAsync`) so their early-exit
+    // behaviour cannot drift apart: `startProbe` builds the underlying `ReadinessProbe.*` task from the
+    // snapshotted (still-`Fresh`) drain streams and a readiness token linked to the caller's `cancellationToken`;
     // everything else — the exit race, cancellation, and `NotReady`/`Cancelled` selection — lives here,
     // once.
     //
@@ -612,6 +613,14 @@ type RunningProcess internal (host: RunningHost) =
         : Task<Result<unit, ProcessError>> =
         raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
             ReadinessProbe.waitForPort config.Program stdout stderr endpoint timeout readinessToken)
+
+    let waitForSocket
+        (path: string)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
+            ReadinessProbe.waitForSocket config.Program stdout stderr path timeout readinessToken)
 
     let waitForCustom
         (probe: Func<Task<bool>>)
@@ -1483,17 +1492,17 @@ type RunningProcess internal (host: RunningHost) =
     /// never overrun a short `timeout` — see `ReadinessProbe.waitForCoreUsing` for the full contract,
     /// including the ratified scheduler-bounded window at the deadline. If the child exits before the
     /// port opens, this returns `NotReady` immediately rather than polling out the full `timeout` — the
-    /// same early-exit contract `WaitForHttpAsync`/`WaitForAsync` honour, and via the one reap-once exit
-    /// wait the rest of the handle shares (so a later `WaitAsync`/`ProfileAsync` still reports the real
-    /// exit). Background-drains (and discards) the child's piped stdout/stderr for the duration of the
-    /// poll — like `WaitForLineAsync`, so a child that writes more than one OS pipe buffer of startup
-    /// output (~64 KiB on Linux) before becoming ready can't block in `write()` and spuriously time out
-    /// this probe — but unlike `WaitForLineAsync`, the drained bytes are discarded rather than handed
-    /// back, and draining stops once the probe concludes rather than continuing as an established
+    /// same early-exit contract `WaitForHttpAsync`/`WaitForSocketAsync`/`WaitForAsync` honour, and via the
+    /// one reap-once exit wait the rest of the handle shares (so a later `WaitAsync`/`ProfileAsync` still
+    /// reports the real exit). Background-drains (and discards) the child's piped stdout/stderr for the
+    /// duration of the poll — like `WaitForLineAsync`, so a child that writes more than one OS pipe buffer
+    /// of startup output (~64 KiB on Linux) before becoming ready can't block in `write()` and spuriously
+    /// time out this probe — but unlike `WaitForLineAsync`, the drained bytes are discarded rather than
+    /// handed back, and draining stops once the probe concludes rather than continuing as an established
     /// streaming session. A capture verb (`OutputStringAsync`/`OutputBytesAsync`/`StdoutLinesAsync`/
     /// `OutputEventsAsync`) called AFTER this probe therefore only sees what the child wrote after the
     /// probe concluded, not the full run — the same "doesn't compose with a subsequent fresh capture"
-    /// limitation `WaitForLineAsync` already documents, now uniform across all four readiness probes. If
+    /// limitation `WaitForLineAsync` already documents, now uniform across all five readiness probes. If
     /// a buffered/streaming verb already claimed the pipes before this call, that verb's own pump is
     /// already draining them and this probe leaves them alone (no second reader).
     member _.WaitForPortAsync
@@ -1501,6 +1510,23 @@ type RunningProcess internal (host: RunningHost) =
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull endpoint
         waitForPort endpoint timeout cancellationToken
+
+    /// Wait until a connection to the Unix domain socket at `path` succeeds, or fail with `NotReady` once
+    /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). Behaves
+    /// exactly like `WaitForPortAsync` (same deadline mechanics, same early-exit-on-child-death contract,
+    /// same background stdout/stderr draining), but dials `AddressFamily.Unix` instead of TCP — see
+    /// `ReadinessProbe.waitForSocket`/`waitForCoreUsing` for the full contract. Requires the host to
+    /// support `AF_UNIX` sockets (Windows 10 1809+, any current Linux/macOS via .NET's own requirement);
+    /// on a host without that support this returns `Error(ProcessError.Unsupported ...)` immediately,
+    /// before ever attempting to dial — never a silent downgrade or an inevitable hang.
+    member _.WaitForSocketAsync
+        (path: string, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        ArgumentNullException.ThrowIfNull path
+
+        match ReadinessProbe.unixDomainSocketsSupported (fun () -> Socket.OSSupportsUnixDomainSockets) with
+        | Error err -> Task.FromResult(Error err)
+        | Ok() -> waitForSocket path timeout cancellationToken
 
     /// Poll `uri` with HTTP GET until a response passes the default 2xx check, or fail with `NotReady`
     /// once `timeout` expires (or `Cancelled` if `cancellationToken` fires first). Connection failures,
