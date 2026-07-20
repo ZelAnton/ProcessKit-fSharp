@@ -2,6 +2,7 @@ namespace ProcessKit.Tests
 
 open System
 open System.Collections.Generic
+open System.Diagnostics
 open System.IO
 open System.Text
 open System.Threading
@@ -62,6 +63,173 @@ type private FakeClock() =
         delays.Add delay
         now <- now + delay.TotalSeconds
         Task.CompletedTask
+
+/// Build an in-memory `RunningProcess` over a `RunningHost` with a caller-supplied wait / graceful-kill
+/// — the same pattern the hosting tests use to model a live child without spawning a real process.
+[<AutoOpen>]
+module private SessionTestHelpers =
+
+    let buildRunningProcess
+        (command: Command)
+        (pid: int option)
+        (wait: unit -> Task<Outcome>)
+        (graceful: TimeSpan -> Task)
+        (startKill: unit -> unit)
+        : RunningProcess =
+        let stdout = new MemoryStream()
+        let stderr = new MemoryStream()
+
+        let host: RunningHost =
+            { Config = command.Config
+              Pid = pid
+              Stdout = Some(stdout :> Stream)
+              Stderr = Some(stderr :> Stream)
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = None
+              Wait = wait
+              StdinError = fun () -> None
+              StdinFeedComplete = ignore
+              StartKill = startKill
+              GracefulKill = graceful
+              ResizePty = None
+              Teardown =
+                fun () ->
+                    stdout.Dispose()
+                    stderr.Dispose()
+                    ValueTask.CompletedTask }
+
+        new RunningProcess(host)
+
+    /// Poll `predicate` until it holds or a generous deadline elapses, failing the test loudly on a
+    /// timeout so a wedged supervision loop surfaces as a clear assertion rather than a hung test.
+    let waitUntil (description: string) (predicate: unit -> bool) : Task =
+        task {
+            let deadline = DateTime.UtcNow.AddSeconds 10.0
+
+            while not (predicate ()) && DateTime.UtcNow < deadline do
+                do! Task.Delay 10
+
+            if not (predicate ()) then
+                Assert.Fail $"timed out waiting for: {description}"
+        }
+        :> Task
+
+/// A spawn-capable runner that crashes its first `crashesBeforeAlive` incarnations (exit 1) then keeps
+/// the next one alive until it is gracefully stopped — so a session parks on a live child with a known
+/// pid after exactly that many restarts.
+type private SupervisedChildRunner(crashesBeforeAlive: int) =
+    let mutable spawns = 0
+    let alivePid = 4242
+
+    let aliveWait =
+        new TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let aliveSpawned =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let gracefulStopped =
+        new TaskCompletionSource<TimeSpan>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    member _.AlivePid = alivePid
+    member _.AliveSpawned = aliveSpawned.Task
+    member _.GracefulStopRequested = gracefulStopped.Task
+
+    interface IProcessRunner with
+        member _.SpawnAsync(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                let n = Interlocked.Increment(&spawns)
+
+                let running =
+                    if n <= crashesBeforeAlive then
+                        buildRunningProcess
+                            command
+                            (Some(1000 + n))
+                            (fun () -> Task.FromResult(Outcome.Exited 1))
+                            (fun _ -> Task.CompletedTask)
+                            (fun () -> ())
+                    else
+                        aliveSpawned.TrySetResult() |> ignore
+
+                        buildRunningProcess
+                            command
+                            (Some alivePid)
+                            (fun () -> aliveWait.Task)
+                            (fun grace ->
+                                gracefulStopped.TrySetResult grace |> ignore
+                                aliveWait.TrySetResult(Outcome.Signalled(Some 15)) |> ignore
+                                Task.CompletedTask)
+                            (fun () -> aliveWait.TrySetResult(Outcome.Signalled None) |> ignore)
+
+                Task.FromResult(Ok running)
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "SupervisedChildRunner drives incarnations via SpawnAsync"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "SupervisedChildRunner drives incarnations via SpawnAsync"))
+
+/// A spawn-capable runner whose every incarnation crashes immediately (exit 1) — for exercising the
+/// failure-storm guard live.
+type private CrashLoopRunner() =
+    let mutable spawns = 0
+
+    member _.Spawns = Volatile.Read(&spawns)
+
+    interface IProcessRunner with
+        member _.SpawnAsync(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                Interlocked.Increment(&spawns) |> ignore
+
+                Task.FromResult(
+                    Ok(
+                        buildRunningProcess
+                            command
+                            (Some 999)
+                            (fun () -> Task.FromResult(Outcome.Exited 1))
+                            (fun _ -> Task.CompletedTask)
+                            (fun () -> ())
+                    )
+                )
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "CrashLoopRunner drives incarnations via SpawnAsync"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "CrashLoopRunner drives incarnations via SpawnAsync"))
+
+/// A capture-only runner (its `SpawnAsync` throws, like the scripted doubles) that blocks its single
+/// incarnation until the test releases it — for exercising the graceful-stop loop control on a runner
+/// that exposes no live handle.
+type private GatedCaptureRunner() =
+    let started =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let release =
+        new TaskCompletionSource<Result<ProcessResult<string>, ProcessError>>(
+            TaskCreationOptions.RunContinuationsAsynchronously
+        )
+
+    member _.Started = started.Task
+    member _.Release(reply: Result<ProcessResult<string>, ProcessError>) = release.TrySetResult reply |> ignore
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            task {
+                started.TrySetResult() |> ignore
+                return! release.Task
+            }
+
+        member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
+            failwith "GatedCaptureRunner only scripts CaptureString"
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "GatedCaptureRunner only scripts CaptureString"
 
 [<TestFixture>]
 type SupervisorTests() =
@@ -845,6 +1013,173 @@ type SupervisorTests() =
                 Assert.That(events[0].StormPause, Is.EqualTo 1)
                 Assert.That(events[0].Program, Is.EqualTo "worker")
                 Assert.That(events[0].Delay, Is.EqualTo(TimeSpan.FromSeconds 1.0))
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // ----- interactive supervision session (StartAsync / SupervisionSession) -----
+
+    [<Test>]
+    member _.``a session's live status tracks the restart count and current pid, then StopAsync ends with Stopped``
+        ()
+        : Task =
+        task {
+            let runner = SupervisedChildRunner 2
+
+            let supervisor =
+                Supervisor(Command.create "worker").WithRunner(runner).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+            let! session = supervisor.StartAsync()
+
+            // The loop restarts twice, then parks on the live incarnation whose pid the status exposes.
+            do!
+                waitUntil "two restarts, live child" (fun () ->
+                    let status = session.Status
+                    status.Restarts = 2 && status.Pid = Some runner.AlivePid)
+
+            let live = session.Status
+            Assert.That(live.IsActive, Is.True)
+            Assert.That(live.Restarts, Is.EqualTo 2, "live restart count reflects the two restarts so far")
+            Assert.That(live.Pid, Is.EqualTo(Some runner.AlivePid), "status exposes the current incarnation's pid")
+            Assert.That(live.StartTime.IsSome, Is.True, "status exposes the current incarnation's start time")
+            Assert.That(live.IsStormPaused, Is.False)
+
+            // Graceful stop halts the live child through its own path and ends supervision with `Stopped`.
+            let! outcome = session.StopAsync(TimeSpan.FromSeconds 1.0)
+
+            match outcome with
+            | Ok result ->
+                Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped, "a graceful stop is not a crash/cancel")
+                Assert.That(result.Restarts, Is.EqualTo 2)
+
+                Assert.That(
+                    result.FinalResult.Outcome,
+                    Is.EqualTo(Outcome.Signalled(Some 15)),
+                    "the outcome reports the stopped incarnation's honest result"
+                )
+            | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
+
+            Assert.That(
+                runner.GracefulStopRequested.IsCompleted,
+                Is.True,
+                "the current child was stopped through its graceful path"
+            )
+
+            // Status after the stop reflects inactivity and no live child.
+            let ended = session.Status
+            Assert.That(ended.IsActive, Is.False)
+            Assert.That(ended.Pid, Is.EqualTo None)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync ends supervision with Stopped even for a capture-only runner (no live handle)``() : Task =
+        task {
+            let runner = GatedCaptureRunner()
+
+            let supervisor =
+                Supervisor(Command.create "worker").WithRunner(runner).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+            let! session = supervisor.StartAsync()
+            do! waitUntil "first incarnation running" (fun () -> runner.Started.IsCompleted)
+
+            // A capture-only runner exposes no live handle, so there is no pid to report — but the
+            // session is still active and can be gracefully stopped.
+            Assert.That(session.Status.Pid, Is.EqualTo None)
+            Assert.That(session.Status.IsActive, Is.True)
+
+            // Request the stop, then let the blocked incarnation conclude; supervision ends with Stopped.
+            let stopTask = session.StopAsync(TimeSpan.FromSeconds 1.0)
+
+            runner.Release(
+                Ok(ProcessResult<string>("worker", "bye", "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ]))
+            )
+
+            let! outcome = stopTask
+
+            match outcome with
+            | Ok result ->
+                Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+                Assert.That(result.FinalResult.Code, Is.EqualTo(Some 0))
+            | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
+
+            Assert.That(session.Status.IsActive, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a session's status reflects an in-progress storm pause``() : Task =
+        task {
+            let runner = CrashLoopRunner()
+
+            // Zero backoff -> zero decay: scores 1, 2, 3; the third crosses 2.5 -> a long storm pause.
+            let supervisor =
+                Supervisor(Command.create "worker")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .StormPause(TimeSpan.FromSeconds 30.0)
+                    .FailureThreshold(2.5)
+                    .FailureDecay(TimeSpan.FromSeconds 1000.0)
+
+            let! session = supervisor.StartAsync()
+            do! waitUntil "storm pause in progress" (fun () -> session.Status.IsStormPaused)
+
+            Assert.That(session.Status.IsStormPaused, Is.True)
+            Assert.That(session.Status.IsActive, Is.True)
+
+            // A zero-grace stop interrupts the storm pause and ends supervision promptly.
+            let! outcome = session.StopAsync(TimeSpan.Zero)
+
+            match outcome with
+            | Ok result -> Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+            | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
+
+            Assert.That(session.Status.IsActive, Is.False)
+            Assert.That(session.Status.IsStormPaused, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync rejects a negative grace period``() : Task =
+        task {
+            let runner = GatedCaptureRunner()
+
+            let supervisor =
+                Supervisor(Command.create "worker").WithRunner(runner).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+            let! session = supervisor.StartAsync()
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () -> session.StopAsync(TimeSpan.FromSeconds -1.0) |> ignore)
+            )
+            |> ignore
+
+            // Release the parked incarnation and let the session end so the test leaves nothing running.
+            do! waitUntil "first incarnation running" (fun () -> runner.Started.IsCompleted)
+            let stopTask = session.StopAsync()
+            runner.Release(Ok(ProcessResult<string>("worker", "", "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ])))
+            let! _ = stopTask
+            ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``RunAsync stays a thin wrapper over StartAsync and the session Completion``() : Task =
+        task {
+            // Same scripted crashes-then-success, driven two ways, must agree — RunAsync just awaits the
+            // session's Completion.
+            match! supervise([ failWith 1; ok () ]).RunAsync() with
+            | Ok viaRun ->
+                let! session = supervise([ failWith 1; ok () ]).StartAsync()
+                let! viaSession = session.Completion
+
+                match viaSession with
+                | Ok viaStart ->
+                    Assert.That(viaStart.Restarts, Is.EqualTo viaRun.Restarts)
+                    Assert.That(viaStart.Stopped, Is.EqualTo viaRun.Stopped)
+                    Assert.That(session.Status.IsActive, Is.False)
+                | Error error -> Assert.Fail $"{error}"
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
