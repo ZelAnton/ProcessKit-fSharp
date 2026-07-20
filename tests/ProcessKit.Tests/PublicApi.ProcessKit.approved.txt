@@ -965,26 +965,31 @@ class ProcessKit.StopReason
   member get_IsPolicySatisfied() : System.Boolean
   member get_IsPredicate() : System.Boolean
   member get_IsRestartsExhausted() : System.Boolean
+  member get_IsStopped() : System.Boolean
   member get_Tag() : System.Int32
   property GaveUp : ProcessKit.StopReason { get }
   property IsGaveUp : System.Boolean { get }
   property IsPolicySatisfied : System.Boolean { get }
   property IsPredicate : System.Boolean { get }
   property IsRestartsExhausted : System.Boolean { get }
+  property IsStopped : System.Boolean { get }
   property PolicySatisfied : ProcessKit.StopReason { get }
   property Predicate : ProcessKit.StopReason { get }
   property RestartsExhausted : ProcessKit.StopReason { get }
+  property Stopped : ProcessKit.StopReason { get }
   property Tag : System.Int32 { get }
   static member get_GaveUp() : ProcessKit.StopReason
   static member get_PolicySatisfied() : ProcessKit.StopReason
   static member get_Predicate() : ProcessKit.StopReason
   static member get_RestartsExhausted() : ProcessKit.StopReason
+  static member get_Stopped() : ProcessKit.StopReason
 
 module ProcessKit.StopReason+Tags
   field literal GaveUp : System.Int32
   field literal PolicySatisfied : System.Int32
   field literal Predicate : System.Int32
   field literal RestartsExhausted : System.Int32
+  field literal Stopped : System.Int32
 
 class ProcessKit.StreamBufferPolicy
   member WithFullMode(ProcessKit.StreamFullMode) : ProcessKit.StreamBufferPolicy
@@ -1034,6 +1039,19 @@ class ProcessKit.SupervisionOutcome
   property Stopped : ProcessKit.StopReason { get }
   property StormPauses : System.Int32 { get }
 
+class ProcessKit.SupervisionSession
+  member StopAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>>
+  member StopAsync(System.TimeSpan) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>>
+  property Completion : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>> { get }
+  property Status : ProcessKit.SupervisionStatus { get }
+
+class ProcessKit.SupervisionStatus
+  property IsActive : System.Boolean { get }
+  property IsStormPaused : System.Boolean { get }
+  property Pid : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Restarts : System.Int32 { get }
+  property StartTime : Microsoft.FSharp.Core.FSharpOption<System.DateTime> { get }
+
 class ProcessKit.Supervisor
   member Backoff(System.TimeSpan, System.Double) : ProcessKit.Supervisor
   member Capture(ProcessKit.OutputBufferPolicy) : ProcessKit.Supervisor
@@ -1047,6 +1065,7 @@ class ProcessKit.Supervisor
   member OnStormPause(System.Action<ProcessKit.SupervisorStormPauseEvent>) : ProcessKit.Supervisor
   member Restart(ProcessKit.RestartPolicy) : ProcessKit.Supervisor
   member RunAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>>
+  member StartAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<ProcessKit.SupervisionSession>
   member StopWhen(System.Func<ProcessKit.ProcessResult<System.String>, System.Boolean>) : ProcessKit.Supervisor
   member StormPause(System.TimeSpan) : ProcessKit.Supervisor
   member WithRunner(ProcessKit.IProcessRunner) : ProcessKit.Supervisor

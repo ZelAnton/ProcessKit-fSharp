@@ -20,13 +20,20 @@ type ProcessResult<'T>
         duration: TimeSpan,
         truncated: bool,
         okCodes: int list,
-        ?configuredTimeoutDuration: TimeSpan
+        ?configuredTimeoutDuration: TimeSpan,
+        ?stdoutEncoding: Encoding
     ) =
 
     // Real runners supply the configured deadline that actually fired. Results created by third-party
     // runners and test doubles cannot always identify that cause, so their honest backward-compatible
     // fallback is the actual elapsed duration rather than a fabricated configured value.
     let timeoutDuration = defaultArg configuredTimeoutDuration duration
+
+    // The command's configured `StdoutEncoding` (`Command.StdoutEncoding`, `Encoding.UTF8` by default),
+    // used to decode a `byte[]` capture in `StdoutText`. Real runners supply the command's actual
+    // configured encoding; the test factories below (`Success`/`Failure`/`Create`) default to UTF-8,
+    // matching `Command`'s own default so their behaviour is unchanged for existing callers.
+    let stdoutEncoding = defaultArg stdoutEncoding Encoding.UTF8
 
     /// The program that was run.
     member _.Program = program
@@ -61,18 +68,20 @@ type ProcessResult<'T>
     /// True when the process exited with one of the accepted codes (`Command.OkCodes`; `{0}` by default).
     member _.IsSuccess = outcome.IsAcceptedBy okCodes
 
-    /// Stdout as text (never null): the value itself for a `string` capture, UTF-8-decoded for a
-    /// `byte[]` capture, `ToString()` for any other captured type, `""` for a null capture. Backs the
-    /// string-typed error field and the text-search / combined helpers.
+    /// Stdout as text (never null): the value itself for a `string` capture, decoded with the command's
+    /// configured `StdoutEncoding` (`Encoding.UTF8` by default) for a `byte[]` capture, `ToString()` for
+    /// any other captured type, `""` for a null capture. Backs the string-typed error field and the
+    /// text-search / combined helpers.
     member private _.StdoutText: string =
         match box stdout with
         | :? string as s -> s
-        | :? (byte[]) as bytes -> Encoding.UTF8.GetString bytes
+        | :? (byte[]) as bytes -> stdoutEncoding.GetString bytes
         | null -> ""
         | other -> string other
 
     /// The captured stdout and stderr joined into one string — stdout, then stderr on a new line when
-    /// both are non-empty (for a `byte[]` stdout, UTF-8-decoded). Shares the exact join rule with
+    /// both are non-empty (for a `byte[]` stdout, decoded with the configured `StdoutEncoding`). Shares
+    /// the exact join rule with
     /// `ProcessError.Combined`. This is a **post-hoc concatenation** of the two *separately* captured
     /// streams, so it does **not** reproduce their real terminal interleaving. For an honest, byte-for-byte
     /// `2>&1` view use `Command.MergeStderr`, which merges the streams at the OS level: the interleaved
@@ -101,7 +110,8 @@ type ProcessResult<'T>
     /// The single mapping from a non-success outcome to its `ProcessError`. Lives on the type so the
     /// instance `EnsureSuccess` and the module verbs (`ensureSuccess` / `exitCode` / `probe`, on a
     /// command or a pipeline) can never drift on how a non-zero exit, signal kill, or timeout is
-    /// reported. For a `byte[]` capture the stdout is decoded UTF-8 to fill the (string) error field.
+    /// reported. For a `byte[]` capture the stdout is decoded with the configured `StdoutEncoding` to
+    /// fill the (string) error field.
     member internal this.FailureError: ProcessError =
         match outcome with
         | Outcome.Exited code -> ProcessError.Exit(program, code, this.StdoutText, stderr)
