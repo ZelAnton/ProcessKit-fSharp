@@ -736,17 +736,23 @@ type Command internal (config: CommandConfig) =
 
     /// Replace the set of exit codes treated as success (the default is `{0}`) — this is what
     /// `ProcessResult.IsSuccess`, `ensureSuccess`, and the `RunAsync` verbs check. The codes *replace* the
-    /// default rather than adding to it, so pass `[0; 3]` to accept both `0` and `3`. An empty set is a
-    /// **no-op** — the previously configured codes are kept (it never resets the accepted set), so it
-    /// can't accidentally clear a caller's `[0; 3]` down to nothing.
+    /// default rather than adding to it, so pass `[0; 3]` to accept both `0` and `3`. An empty set has no
+    /// meaningful semantics — no exit could ever count as success — so it is rejected at the builder
+    /// boundary with `ArgumentException`, matching every other builder knob that fails loud on an invalid
+    /// value rather than silently keeping the previous codes. Pass at least one code.
     member _.OkCodes(codes: seq<int>) =
         ArgumentNullException.ThrowIfNull codes
         let list = List.ofSeq codes
 
-        Command(
-            { config with
-                OkCodes = (if List.isEmpty list then config.OkCodes else list) }
-        )
+        if List.isEmpty list then
+            raise (
+                ArgumentException(
+                    "the ok-codes set must not be empty — at least one exit code must count as success",
+                    nameof codes
+                )
+            )
+
+        Command({ config with OkCodes = list })
 
     /// Windows: run the child with `CREATE_NO_WINDOW`, so a console child spawned from a GUI app
     /// does not flash a console window. No effect on Unix.
@@ -1036,8 +1042,8 @@ module Command =
     /// Inside a pipeline, allow this stage to exit non-zero without failing the pipeline.
     let uncheckedInPipe (command: Command) = command.UncheckedInPipe()
 
-    /// Replace the success exit-code set with these codes (default `{0}`; include `0` to keep it; an
-    /// empty set is a no-op that keeps the previously configured codes).
+    /// Replace the success exit-code set with these codes (default `{0}`; include `0` to keep it). An
+    /// empty set is rejected at the builder boundary with `ArgumentException`. See `Command.OkCodes`.
     let okCodes (codes: seq<int>) (command: Command) = command.OkCodes codes
 
     /// Windows: run the child with `CREATE_NO_WINDOW` (no effect on Unix).
