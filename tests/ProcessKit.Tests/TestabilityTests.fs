@@ -387,3 +387,128 @@ type TestabilityTests() =
                 Assert.That(texts, Does.Contain "frame2")
                 Assert.That(texts, Does.Contain "diag", "scripted stderr folds into the merged stream")
         }
+
+    // --- Structural invocation journal (ScriptedRunner.Received / CountReceived) --------------------
+
+    [<Test>]
+    member _.``ScriptedRunner.Received records the secret-free shape and verb of each call in order``() : Task =
+        task {
+            let scripted = ScriptedRunner().On([ "git" ], Reply.Ok "ok").Fallback(Reply.Ok "")
+
+            let runner = scripted :> IProcessRunner
+
+            let gitCommit =
+                Command.create "git"
+                |> Command.args [ "commit"; "-m"; "msg" ]
+                |> Command.currentDir "/repo"
+                |> Command.env "GIT_AUTHOR_NAME" "Ada"
+
+            // A text capture, then a bytes capture, then a spawn of a PTY command — one of each verb.
+            let! _ = runner.OutputStringAsync(gitCommit, CancellationToken.None)
+            let! _ = runner.OutputBytesAsync(Command.create "ls", CancellationToken.None)
+
+            match! runner.StartAsync(Command.create "top" |> Command.pty, CancellationToken.None) with
+            | Error error -> Assert.Fail $"Start failed: {error.Message}"
+            | Ok proc -> do! (proc :> System.IAsyncDisposable).DisposeAsync().AsTask()
+
+            let received = scripted.Received
+            Assert.That(received.Count, Is.EqualTo 3, "one entry per verb call, in order")
+
+            let first = received[0]
+            Assert.That(first.Program, Is.EqualTo "git")
+            CollectionAssert.AreEqual([| "commit"; "-m"; "msg" |], first.Args |> Seq.toArray)
+            Assert.That(first.Cwd, Is.EqualTo(Some "/repo"))
+            Assert.That(first.EnvNames, Does.Contain "GIT_AUTHOR_NAME")
+            Assert.That(first.HasStdin, Is.False)
+            Assert.That(first.Pty, Is.False)
+            Assert.That(first.Verb, Is.EqualTo RunnerVerb.CaptureString)
+
+            let second = received[1]
+            Assert.That(second.Program, Is.EqualTo "ls")
+            Assert.That(second.Verb, Is.EqualTo RunnerVerb.CaptureBytes)
+
+            let third = received[2]
+            Assert.That(third.Program, Is.EqualTo "top")
+            Assert.That(third.Pty, Is.True, "a Command.Pty run is recorded as such")
+            Assert.That(third.Verb, Is.EqualTo RunnerVerb.Spawn)
+        }
+
+    [<Test>]
+    member _.``ScriptedRunner.CountReceived counts matching invocations without a decorator``() : Task =
+        task {
+            let scripted = ScriptedRunner().Fallback(Reply.Ok "")
+            let runner = scripted :> IProcessRunner
+
+            let commit () =
+                Command.create "git" |> Command.args [ "commit"; "-m"; "x" ]
+
+            let status () =
+                Command.create "git" |> Command.args [ "status" ]
+
+            let! _ = runner.OutputStringAsync(commit (), CancellationToken.None)
+            let! _ = runner.OutputStringAsync(status (), CancellationToken.None)
+            let! _ = runner.OutputStringAsync(commit (), CancellationToken.None)
+
+            // Token matcher (mirrors On's semantics): exactly two `git commit` calls, one `git status`.
+            Assert.That(scripted.CountReceived(fun inv -> inv.Matches [ "git"; "commit" ]), Is.EqualTo 2)
+            Assert.That(scripted.CountReceived(fun inv -> inv.Matches [ "git"; "status" ]), Is.EqualTo 1)
+            Assert.That(scripted.CountReceived(fun inv -> inv.Matches [ "push" ]), Is.EqualTo 0)
+            // A plain structural predicate works too.
+            Assert.That(scripted.CountReceived(fun inv -> inv.Program = "git"), Is.EqualTo 3)
+        }
+
+    [<Test>]
+    member _.``ScriptedRunner.Received never captures env values or stdin content (secret invariant)``() : Task =
+        task {
+            let secretEnv = "s3cr3t-token-value"
+            let secretStdin = "hunter2-secret-input"
+
+            let scripted = ScriptedRunner().On([ "deploy" ], Reply.Ok "done")
+            let runner = scripted :> IProcessRunner
+
+            let command =
+                Command.create "deploy"
+                |> Command.args [ "--to"; "prod" ]
+                |> Command.env "API_TOKEN" secretEnv
+                |> Command.stdin (Stdin.FromString secretStdin)
+
+            let! _ = runner.OutputStringAsync(command, CancellationToken.None)
+
+            let inv = scripted.Received |> Seq.exactlyOne
+
+            // Traverse EVERY field of the record; none may carry the secret env value or stdin content.
+            let everyField =
+                [ yield inv.Program
+                  yield! inv.Args
+                  yield inv.Cwd |> Option.defaultValue "<none>"
+                  yield! inv.EnvNames
+                  yield string inv.HasStdin
+                  yield string inv.Pty
+                  yield string inv.Verb ]
+
+            for field in everyField do
+                Assert.That(field, Does.Not.Contain secretEnv, "an env VALUE must never reach the journal")
+                Assert.That(field, Does.Not.Contain secretStdin, "stdin CONTENT must never reach the journal")
+
+            // The env NAME and the stdin PRESENCE flag are recorded — only the payloads are withheld.
+            Assert.That(inv.EnvNames, Does.Contain "API_TOKEN")
+            Assert.That(inv.HasStdin, Is.True, "the fact of stdin is recorded, its content is not")
+        }
+
+    [<Test>]
+    member _.``ScriptedRunner builder methods yield a runner with its own empty journal``() : Task =
+        task {
+            let baseRunner = ScriptedRunner().On([ "x" ], Reply.Ok "a")
+            let derived = baseRunner.Fallback(Reply.Ok "b")
+
+            // Run only through the derived runner.
+            let! _ = (derived :> IProcessRunner).OutputStringAsync(Command.create "x", CancellationToken.None)
+
+            Assert.That(derived.Received.Count, Is.EqualTo 1)
+
+            Assert.That(
+                baseRunner.Received.Count,
+                Is.EqualTo 0,
+                "a builder method returns a runner with its own journal"
+            )
+        }
