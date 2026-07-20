@@ -81,6 +81,16 @@ class ProcessKit.Testing.RecordReplayRunner
   static member Replay(System.String) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
   static member Replay(System.String, ProcessKit.Testing.RecordReplayOptions) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
 
+class ProcessKit.Testing.RecordedInvocation
+  member Matches(System.Collections.Generic.IEnumerable<System.String>) : System.Boolean
+  property Args : System.Collections.Generic.IReadOnlyList<System.String> { get }
+  property Cwd : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property EnvNames : System.Collections.Generic.IReadOnlyList<System.String> { get }
+  property HasStdin : System.Boolean { get }
+  property Program : System.String { get }
+  property Pty : System.Boolean { get }
+  property Verb : ProcessKit.Testing.RunnerVerb { get }
+
 class ProcessKit.Testing.Reply
   member WithStderr(System.String) : ProcessKit.Testing.Reply
   member WithStdout(System.String) : ProcessKit.Testing.Reply
@@ -93,10 +103,48 @@ class ProcessKit.Testing.Reply
   static member Signalled(System.Int32) : ProcessKit.Testing.Reply
   static member Unobserved(System.String) : ProcessKit.Testing.Reply
 
+class ProcessKit.Testing.RunnerVerb
+  :> System.Collections.IStructuralComparable
+  :> System.Collections.IStructuralEquatable
+  :> System.IComparable
+  :> System.IComparable<ProcessKit.Testing.RunnerVerb>
+  :> System.IEquatable<ProcessKit.Testing.RunnerVerb>
+  member CompareTo(ProcessKit.Testing.RunnerVerb) : System.Int32
+  member CompareTo(System.Object) : System.Int32
+  member CompareTo(System.Object, System.Collections.IComparer) : System.Int32
+  member Equals(ProcessKit.Testing.RunnerVerb) : System.Boolean
+  member Equals(ProcessKit.Testing.RunnerVerb, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsCaptureBytes() : System.Boolean
+  member get_IsCaptureString() : System.Boolean
+  member get_IsSpawn() : System.Boolean
+  member get_Tag() : System.Int32
+  property CaptureBytes : ProcessKit.Testing.RunnerVerb { get }
+  property CaptureString : ProcessKit.Testing.RunnerVerb { get }
+  property IsCaptureBytes : System.Boolean { get }
+  property IsCaptureString : System.Boolean { get }
+  property IsSpawn : System.Boolean { get }
+  property Spawn : ProcessKit.Testing.RunnerVerb { get }
+  property Tag : System.Int32 { get }
+  static member get_CaptureBytes() : ProcessKit.Testing.RunnerVerb
+  static member get_CaptureString() : ProcessKit.Testing.RunnerVerb
+  static member get_Spawn() : ProcessKit.Testing.RunnerVerb
+
+module ProcessKit.Testing.RunnerVerb+Tags
+  field literal CaptureBytes : System.Int32
+  field literal CaptureString : System.Int32
+  field literal Spawn : System.Int32
+
 class ProcessKit.Testing.ScriptedRunner
   :> ProcessKit.IProcessRunner
+  member CountReceived(System.Func<ProcessKit.Testing.RecordedInvocation, System.Boolean>) : System.Int32
   member Fallback(ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
   member On(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
   member When(System.Func<ProcessKit.Command, System.Boolean>, ProcessKit.Testing.Reply) : ProcessKit.Testing.ScriptedRunner
   new()
+  property Received : System.Collections.Generic.IReadOnlyList<ProcessKit.Testing.RecordedInvocation> { get }
 

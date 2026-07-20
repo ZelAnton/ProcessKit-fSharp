@@ -49,6 +49,7 @@ single raw capture with no retry, call `CaptureStringAsync` directly.)
 
 - [The `IProcessRunner` seam](#the-iprocessrunner-seam)
 - [Scripting replies](#scripting-replies)
+- [Verifying calls](#verifying-calls)
 - [Custom doubles and mocking frameworks](#custom-doubles-and-mocking-frameworks)
 - [What the doubles don't cover](#what-the-doubles-dont-cover)
 - [Record and replay](#record-and-replay)
@@ -246,6 +247,64 @@ switch (await runner.OutputStringAsync(grep))
     case { IsOk: false, ErrorValue: var err }:   Assert.Fail(err.Message); break;
 }
 ```
+
+## Verifying calls
+
+Scripting replies covers the *stub* side — canned answers so the code under test
+runs. The *mock* side is the mirror image: after the run, assert **what was
+called**. `ScriptedRunner` records every command routed through it in
+`Received`, a structural, secret-free journal — so a test like "the deploy code
+ran `git commit` exactly once" needs no bespoke counting decorator:
+
+**F#**
+
+```fsharp
+task {
+    let runner = (ScriptedRunner()).Fallback(Reply.Ok "")
+
+    do! deploy (runner :> IProcessRunner) // the code under test, run through the double
+
+    // Verify by predicate — Matches mirrors On's token semantics (program + args, order-independent):
+    Assert.That(runner.CountReceived(fun inv -> inv.Matches [ "git"; "commit" ]), Is.EqualTo 1)
+
+    // …or inspect the journal directly:
+    let last = runner.Received |> Seq.last
+    Assert.That(last.Program, Is.EqualTo "git")
+    Assert.That(last.Verb, Is.EqualTo RunnerVerb.CaptureString)
+}
+```
+
+**C#**
+
+```csharp
+var runner = new ScriptedRunner().Fallback(Reply.Ok(""));
+
+await Deploy(runner); // the code under test
+
+Assert.That(runner.CountReceived(inv => inv.Matches(["git", "commit"])), Is.EqualTo(1));
+
+var last = runner.Received[^1];
+Assert.That(last.Program, Is.EqualTo("git"));
+Assert.That(last.Verb, Is.EqualTo(RunnerVerb.CaptureString));
+```
+
+Each `RecordedInvocation` carries the *shape* of one call: `Program`, `Args`,
+`Cwd`, `EnvNames`, `HasStdin`, `Pty`, and `Verb` — which of the three primitives
+(`RunnerVerb.CaptureString` / `CaptureBytes` / `Spawn`) served it, so you can
+assert a call streamed (`Spawn`) rather than buffered.
+
+- **`CountReceived(predicate)`** counts matches — the ergonomic "exactly once"
+  check. **`RecordedInvocation.Matches(tokens)`** is the same subset test `On`
+  uses, so a call scripted with `On([ "git"; "commit" ], …)` verifies with
+  `Matches([ "git"; "commit" ])`.
+- **The journal is per instance.** `On` / `When` / `Fallback` are fluent and
+  return a **new** runner with its own empty journal, so record and assert
+  against the *same* instance you handed the code under test.
+- **The secret invariant holds** — the same one the [cassettes](#record-and-replay)
+  keep. Only environment-variable **names** are recorded (never their values),
+  and only *whether* stdin was present (never its content). A secret passed as
+  `Command.Env("TOKEN", secret)` or fed to stdin never lands in `Received`, so a
+  dumped journal is safe to log or attach to a failing test.
 
 ## Custom doubles and mocking frameworks
 

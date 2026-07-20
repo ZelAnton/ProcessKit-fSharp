@@ -941,8 +941,9 @@ Console.WriteLine(await grep.RunAsync() switch
 
 `OkCodes` sets which exit codes `ProcessResult.IsSuccess`, `ensureSuccess`, and
 `RunAsync` / `RunUnitAsync` accept. The codes *replace* the default rather than adding to it, so
-include `0` if you still want it (as `[ 0; 1 ]` above does); an empty set is a **no-op** that
-keeps the previously configured codes (it never clears them).
+include `0` if you still want it (as `[ 0; 1 ]` above does); an empty set has no meaningful
+semantics (no exit could count as success) and is **rejected** at the builder boundary with
+`ArgumentException`, like every other invalid builder input.
 
 ### The `Outcome` enum
 

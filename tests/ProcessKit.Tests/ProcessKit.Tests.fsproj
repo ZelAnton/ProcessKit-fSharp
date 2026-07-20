@@ -48,6 +48,7 @@
 		<Compile Include="ArgvEnvRoundTripTests.fs" />
 		<Compile Include="ApiSurfaceTests.fs" />
 		<Compile Include="StressTests.fs" />
+		<Compile Include="InterleavingTests.fs" />
 		<Compile Include="HostedProcessTests.fs" />
 		<Compile Include="HostedProcessHealthCheckTests.fs" />
 	</ItemGroup>
