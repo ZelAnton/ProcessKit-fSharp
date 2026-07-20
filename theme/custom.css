@@ -82,8 +82,22 @@
     max-width: 100%;
 }
 
-/* Pinned title ("Overview") above the divider */
-.sidebar .chapter li:not(.chapter-item):not(.spacer) > a {
+/* Pinned title ("Overview") above the divider.
+   Under the CI-pinned mdBook v0.4.40 (see .github/workflows/docs.yml), EVERY
+   prefix/affix chapter -- including "Overview" itself -- still carries the
+   `chapter-item` class (see the K-005 pitfall / docs/SUMMARY.md's comment), so a
+   `:not(.chapter-item)` selector never matches anything and is dead. There is
+   also no class that marks "Overview" alone: the implementation-switcher entries
+   (Rust version / Python wrapper) become `li.chapter-item.affix > a` too, once
+   theme/nav-links.js upgrades them into live links.
+   What IS unique to "Overview" is its position: docs/SUMMARY.md pins it as the
+   sole entry of its own un-numbered block, sandwiched between the implementation
+   switcher's divider and the numbered chapters' divider -- so it is the only
+   `li.chapter-item.affix` that is the immediate next sibling of a `li.spacer`.
+   (Regular numbered chapters also follow a `li.spacer`, but never carry the
+   `affix` class, so they are excluded by that class check.) Verified against the
+   real v0.4.40 DOM by scripts/check-sidebar-nav.py, wired into docs.yml. */
+.sidebar .chapter li.spacer + li.chapter-item.affix > a {
     font-size: 0.88em;
     opacity: 0.75;
     letter-spacing: 0.03em;
