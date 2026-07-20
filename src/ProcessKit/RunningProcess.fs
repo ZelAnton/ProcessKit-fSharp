@@ -928,7 +928,8 @@ type RunningProcess internal (host: RunningHost) =
                                     elapsed (),
                                     outBuf.Truncated || errBuf.Truncated,
                                     config.OkCodes,
-                                    ?configuredTimeoutDuration = configuredTimeoutDuration
+                                    ?configuredTimeoutDuration = configuredTimeoutDuration,
+                                    stdoutEncoding = config.StdoutEncoding
                                 )
                             )
             }
@@ -991,7 +992,8 @@ type RunningProcess internal (host: RunningHost) =
                                     elapsed (),
                                     stdoutCapture.Truncated || errBuf.Truncated,
                                     config.OkCodes,
-                                    ?configuredTimeoutDuration = configuredTimeoutDuration
+                                    ?configuredTimeoutDuration = configuredTimeoutDuration,
+                                    stdoutEncoding = config.StdoutEncoding
                                 )
                             )
             }
