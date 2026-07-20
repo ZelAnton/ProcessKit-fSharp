@@ -1729,6 +1729,34 @@ module internal Posix =
 
             fd
 
+        // `Command.StdoutToFile`/`StderrToFile`: open the redirect file ON THE PARENT and hand its fd to
+        // the child as a child-side fd (dup2'd onto the child's slot by a `posix_spawn` file action, then
+        // closed in the child; the parent's copy closed after spawn), exactly like the `/dev/null` fd from
+        // `openNul`. The open goes through .NET (`File.OpenHandle`), which sets the create/truncate/append
+        // flags and O_CLOEXEC portably across Linux and macOS (no variadic `open(…, mode)` P/Invoke — the
+        // AArch64 variadic-ABI hazard this port avoids for `fcntl`). Ownership is then released from the
+        // SafeFileHandle (`SetHandleAsInvalid` — it does NOT close the fd) so the raw fd is managed by the
+        // SAME single-close child-side machinery: one CLOEXEC fd, handed to the child with NO `dup(2)` of a
+        // second logical copy (which would drop O_CLOEXEC — K-029). `append = false` creates/truncates
+        // (`FileMode.Create`), `true` appends (`FileMode.Append`, O_APPEND on the open file description the
+        // child inherits, so every child write goes to EOF). A bad path/permission fails the spawn honestly.
+        let openRedirectFile (label: string) (path: string) (append: bool) : int =
+            try
+                let mode = if append then FileMode.Append else FileMode.Create
+                let handle = File.OpenHandle(path, mode, FileAccess.Write, FileShare.ReadWrite)
+                let fd = int (handle.DangerousGetHandle())
+                // Release .NET's ownership WITHOUT closing the fd; the raw fd is now ours to hand to the
+                // child and to close exactly once via `childSideFds` (parent) + a child-side addclose.
+                handle.SetHandleAsInvalid()
+                childSideFds.Add fd
+                fd
+            with ex ->
+                // A bad redirect path / denied access is an honest per-invocation spawn failure — symmetric
+                // to a failed `open(/dev/null)` (`openNul`) or `socketpair()` (`makeStdioChannel`) — never a
+                // silent downgrade to the parent's own stdout/stderr.
+                failure <- Some $"could not open the redirect file '{path}' for {label}: {ex.Message}"
+                -1
+
         // Both socketpair ends are bidirectional and interchangeable; the tuple keeps the pipe-era
         // (readFd, writeFd) = (fds[0], fds[1]) shape purely so the per-stream role assignment below
         // (child-read/parent-write for stdin, parent-read/child-write for stdout+stderr) reads the same.
@@ -1784,8 +1812,16 @@ module internal Posix =
             else
                 stdinChildFd <- openNul "stdin" O_RDONLY
 
-        // stdout (skipped under a PTY — its stdout is the merged pty master, wired above)
-        if failure.IsNone && config.Pty.IsNone then
+        // stdout (skipped under a PTY — its stdout is the merged pty master, wired above). A file redirect
+        // (`Command.StdoutToFile`) takes precedence over `StdoutMode`: the child's fd 1 is the file, so
+        // there is no parent read stream (`stdoutParentRead` stays `None` -> `Spawned.Stdout = None`), and
+        // the file outlives the parent (no pump). The builder rejected combining it with the parent-side
+        // stdout observation knobs / MergeStderr / Pty.
+        if failure.IsNone && config.Pty.IsNone && config.StdoutFile.IsSome then
+            match config.StdoutFile with
+            | Some(path, append) -> stdoutChildFd <- openRedirectFile "stdout" path append
+            | None -> ()
+        elif failure.IsNone && config.Pty.IsNone then
             match config.StdoutMode with
             | StdioMode.Piped ->
                 match makeStdioChannel "stdout" with
@@ -1815,6 +1851,13 @@ module internal Posix =
                 // stdout on Linux (`stdoutChildFd = -1`, no dup2) point fd 2 at fd 1 explicitly so stderr
                 // still follows the inherited stdout.
                 stderrChildFd <- if stdoutChildFd >= 0 then stdoutChildFd else 1
+            elif config.StderrFile.IsSome then
+                // `Command.StderrToFile`: the child's fd 2 is the file, so there is no parent read stream
+                // (`stderrParentRead` stays `None` -> `Spawned.Stderr = None`) and the file outlives the
+                // parent. Rejected at the builder alongside MergeStderr, so this is never reached under it.
+                match config.StderrFile with
+                | Some(path, append) -> stderrChildFd <- openRedirectFile "stderr" path append
+                | None -> ()
             else
                 match config.StderrMode with
                 | StdioMode.Piped ->

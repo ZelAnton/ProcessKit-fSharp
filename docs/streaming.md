@@ -266,6 +266,72 @@ child's stderr is folded into its stdout at the OS level, so `StdoutLinesAsync()
 yields every line in order and `OutputEventsAsync()` emits only `Stdout` events (there is
 no longer a separate stderr stream to tag).
 
+## Redirecting a stream straight to a file
+
+Everything above pumps output *through the parent*: a background pump drains the child's
+stdout/stderr pipe, and the log lives only as long as that pump does. For a long-running child
+whose output you just want on disk — a service's log file under a `Supervisor`, a build's full
+transcript — that is wasted work and an extra point of failure. `Command.StdoutToFile(path,
+append)` / `Command.StderrToFile(path, append)` instead redirect the stream **straight to a file
+at the OS level**: the child is handed the open file as its stdout/stderr handle/fd *on the spawn*
+(Windows: an inheritable file handle in `STARTUPINFO`; POSIX: a file fd via a `posix_spawn` file
+action), so the child writes the file directly, with **zero copying through the parent and no
+pump**. The file keeps growing even after the parent process — or a pump that would have drained a
+pipe — is gone. `append = false` creates the file (truncating an existing one); `append = true`
+appends.
+
+**F#**
+
+```fsharp
+// Both streams to their own log files; the parent captures neither. The child writes them
+// directly and they survive the parent.
+task {
+    let cmd =
+        Command.create "my-service"
+        |> Command.stdoutToFile "/var/log/my-service.out" true // append
+        |> Command.stderrToFile "/var/log/my-service.err" true
+
+    match! cmd.RunAsync() with
+    | Ok _ -> ()
+    | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+**C#**
+
+```csharp
+var cmd = new Command("my-service")
+    .StdoutToFile("/var/log/my-service.out", append: true)
+    .StderrToFile("/var/log/my-service.err", append: true);
+
+await cmd.RunAsync();
+```
+
+A redirected stream has **no parent-side stream at all** — `ProcessResult.Stdout`/`Stderr` is
+empty, the streaming stdout/stderr verbs yield nothing, and the matching `OutputEvent` is never
+produced, exactly like `StdioMode.Null`. Because of that, the knobs and verbs that *need* a
+parent-side view of the same stream are rejected at the builder boundary with an
+`ArgumentException` (in either chaining order), rather than silently never firing:
+
+| Combined with `StdoutToFile` (the stdout stream) | Combined with `StderrToFile` (the stderr stream) |
+|---|---|
+| `StdoutTee`, `OnStdoutLine` — rejected (no parent stdout to observe) | `StderrTee`, `OnStderrLine` — rejected (no parent stderr to observe) |
+| `MergeStderr` — rejected (it folds stderr into the observed stdout, which is absent) | `MergeStderr` — rejected (it removes the separate stderr this redirects) |
+| `Pty` — rejected (a terminal replaces all stdio with one device) | `Pty` — rejected (same) |
+
+What **is** allowed and useful:
+
+- **Redirect one stream to a file, capture the other normally.** `StdoutToFile` leaves stderr on
+  its ordinary pipe, so `ProcessResult.Stderr`, `OnStderrLine`, `StderrTee`, and the stderr
+  streaming verbs all still work — and vice versa for `StderrToFile`.
+- **Redirect both streams**, each to its own file (`StdoutToFile` + `StderrToFile`).
+- The buffered stdout/stderr *of the non-redirected stream* is captured exactly as always.
+
+`StdoutToFile`/`StderrToFile` and `Stdout(mode)`/`Stderr(mode)` are both *destination* setters for
+the same stream, so the **last one in the chain wins** — a later `Stdout(StdioMode.Null)` clears a
+prior `StdoutToFile`, and vice versa. A bad path (missing directory, denied permission) fails the
+spawn with `ProcessError.Spawn`, never a silent drop of the child's output.
+
 ## Bounding the streaming backlog
 
 By default, the channel that feeds `StdoutLinesAsync()` / `OutputEventsAsync()` / `WaitForLineAsync()`
