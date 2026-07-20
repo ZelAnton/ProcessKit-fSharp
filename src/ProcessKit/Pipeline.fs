@@ -333,7 +333,8 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                                     capture.Duration,
                                     capture.LastStdoutTruncated,
                                     stage.OkCodes,
-                                    ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None)
+                                    ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None),
+                                    stdoutEncoding = (List.last commands).Config.StdoutEncoding
                                 )
                             )
         }

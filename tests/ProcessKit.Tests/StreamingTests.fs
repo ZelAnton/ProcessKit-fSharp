@@ -1723,6 +1723,55 @@ type StreamingTests() =
         }
         :> Task
 
+    // --- ProcessResult text projections decode a byte[] capture with the configured StdoutEncoding,
+    //     not a hardcoded UTF-8 (T-165) ---
+
+    [<Test>]
+    member _.``OutputBytesAsync's ProcessResult.Combined decodes with a configured non-UTF-8 StdoutEncoding``() : Task =
+        task {
+            // "café" differs at the byte level between Latin-1 and UTF-8: 'é' is the single byte 0xE9 in
+            // Latin-1 but the two-byte sequence 0xC3 0xA9 in UTF-8. Decoding the Latin-1 bytes as UTF-8
+            // would surface a replacement character instead of "café" — proving the projection actually
+            // uses the configured encoding, not a hardcoded UTF-8 fallback that happens to work.
+            let text = "café"
+            let latin1Bytes = Encoding.Latin1.GetBytes text
+            use stdout = new MemoryStream(latin1Bytes)
+
+            let config =
+                (Command.create "test" |> Command.stdoutEncoding Encoding.Latin1).Config
+
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            match! running.OutputBytesAsync() with
+            | Ok result ->
+                Assert.That(
+                    result.Combined,
+                    Is.EqualTo text,
+                    "Combined must decode the byte[] stdout capture with the command's configured StdoutEncoding"
+                )
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputBytesAsync's ProcessResult.Combined still decodes UTF-8 by default (no regression)``() : Task =
+        task {
+            // Contrast case for the fix above: a command with no explicit StdoutEncoding keeps decoding
+            // its byte[] capture as UTF-8 (the Command default), so a multi-byte UTF-8 character still
+            // round-trips correctly.
+            let text = "café"
+            let utf8Bytes = Encoding.UTF8.GetBytes text
+            use stdout = new MemoryStream(utf8Bytes)
+
+            let config = (Command.create "test").Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            match! running.OutputBytesAsync() with
+            | Ok result -> Assert.That(result.Combined, Is.EqualTo text)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
     // --- Tee flush after pump completion (T-086): a buffered tee sink (here a real `BufferedStream`,
     //     which genuinely holds written bytes in its own buffer until `Flush`/a large-enough write/
     //     dispose) must see its last bytes as soon as the pump's read loop ends — not only once the
