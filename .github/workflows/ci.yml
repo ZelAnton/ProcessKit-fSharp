@@ -171,15 +171,16 @@ jobs:
       - name: Build samples
         run: dotnet build samples/Samples.slnx --no-restore --configuration Release
 
-      # The Stress category is a flaky-sensitive soak/leak suite (hundreds of concurrent spawns,
-      # thread-pool/handle/memory baselines) that would slow down and add noise to every ordinary
-      # PR/push run; it has its own scheduled/workflow_dispatch stage below instead (`stress`).
+      # The Stress and Interleaving categories are flaky-sensitive concurrency suites (hundreds of
+      # concurrent spawns / randomized lifecycle interleavings, thread-pool/handle/memory baselines)
+      # that would slow down and add noise to every ordinary PR/push run; they have their own
+      # scheduled/workflow_dispatch stages below instead (`stress`, `interleaving`).
       # Coverage is collected via the coverlet.collector data collector (visibility only —
       # no threshold gate is enforced here). The Cobertura report lands under
       # ./TestResults/<guid>/coverage.cobertura.xml.
       - name: Test
         run: >-
-          dotnet test --no-build --configuration Release --filter "Category!=Stress"
+          dotnet test --no-build --configuration Release --filter "Category!=Stress&Category!=Interleaving"
           --logger "trx;LogFileName=test-results.trx" --results-directory ./TestResults
           --collect:"XPlat Code Coverage"
 
@@ -264,7 +265,7 @@ jobs:
               dotnet build --configuration Release -p:TargetFrameworks=net10.0
               dotnet test --no-build --configuration Release --framework net10.0 \
                 tests/ProcessKit.Tests/ProcessKit.Tests.fsproj \
-                --filter "Category!=Stress" \
+                --filter "Category!=Stress&Category!=Interleaving" \
                 --logger "trx;LogFileName=test-results-alpine.trx" --results-directory ./TestResults
             '
 
@@ -396,5 +397,52 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: stress-test-results
+          path: ./TestResults/*.trx
+          if-no-files-found: ignore
+
+  # Randomized lifecycle interleaving search (`[<Category("Interleaving")>]` in
+  # tests/ProcessKit.Tests/InterleavingTests.fs): each seed drives a random sequence of CONCURRENT
+  # public RunningProcess/ProcessGroup operations against a real child and asserts the interleaving
+  # upheld its invariants (no unexpected exceptions, no zombies, no unobserved task faults, telemetry
+  # back to zero). Like `stress`, it is flaky-sensitive and adds real wall-clock time, so it is kept off
+  # the ordinary PR/push `test` job and run on the same weekly schedule / on demand. The generated plans
+  # are seeded (a failure replays from its logged seed); the concurrency timing varies each run, so this
+  # keeps exploring new interleavings. ubuntu-latest covers the cross-platform teardown/reap path (the
+  # POSIX zombie check is Linux-only); add more OSes here if a platform-specific interleaving shows up.
+  interleaving:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Directory.Packages.props', 'nuget.config', 'global.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Interleaving test
+        run: >-
+          dotnet test --no-build --configuration Release --filter "Category=Interleaving"
+          --logger "trx;LogFileName=interleaving-results.trx" --results-directory ./TestResults
+
+      - name: Upload interleaving test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: interleaving-test-results
           path: ./TestResults/*.trx
           if-no-files-found: ignore
