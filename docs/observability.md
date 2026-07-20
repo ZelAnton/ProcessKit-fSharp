@@ -42,6 +42,7 @@ concurrent fleet, and even in a sink that does not capture logging scopes.
 | Run retry | `4` `ProcessRetry` | `.ProcessRetry` | Debug | program, attempt, delay, run id |
 | Supervisor restart | `5` `SupervisorRestart` | `.SupervisorRestart` | Debug | program, restart #, delay |
 | Supervisor storm pause | `6` `SupervisorStormPause` | `.SupervisorStormPause` | Warning | program, pause |
+| Supervisor liveness restart | `7` `SupervisorLivenessRestart` | `.SupervisorLivenessRestart` | Warning | program, consecutive failures |
 
 The `RunId` is stamped once per logical run at the verb layer, so **a run and all its retries share one
 id**; a directly-spawned streaming run (`StartAsync`) gets a fresh per-incarnation id. It is a compact,
@@ -84,6 +85,7 @@ duration histogram is in **seconds** (the OTel norm for `*.duration`).
 | `processkit.retries` | Counter | `{retry}` | program |
 | `processkit.supervisor.restarts` | Counter | `{restart}` | program |
 | `processkit.supervisor.storm_pauses` | Counter | `{pause}` | program |
+| `processkit.supervisor.liveness_restarts` | Counter | `{restart}` | program |
 
 ```csharp
 services.AddOpenTelemetry().WithMetrics(m => m.AddMeter(ProcessKitDiagnostics.MeterName));

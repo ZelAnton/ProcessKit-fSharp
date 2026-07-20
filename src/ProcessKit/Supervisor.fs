@@ -2,6 +2,7 @@ namespace ProcessKit
 
 open System
 open System.Diagnostics
+open System.Net.Http
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
@@ -50,12 +51,28 @@ type StopReason =
     /// is the honest result of that last, deliberately-stopped incarnation.
     | Stopped
 
+/// Why the supervisor is restarting an incarnation — the `SupervisorRestartEvent.Cause` a live
+/// `OnRestart` handler can branch on to tell an ordinary exit/crash restart apart from one the
+/// liveness probe forced.
+[<RequireQualifiedAccess; NoComparison>]
+type RestartCause =
+
+    /// The incarnation ended on its own — a completed run the `RestartPolicy` chose to restart (a
+    /// crash, a timeout, or a retried transient runner error). The default cause for every restart
+    /// when no liveness probe is configured.
+    | Exit
+
+    /// A configured liveness probe (`Supervisor.LivenessHttp`/`LivenessCheck`) found the *live* child
+    /// unresponsive for the configured number of consecutive attempts, so the supervisor gracefully
+    /// stopped it and restarted it through the ordinary policy/backoff path.
+    | Liveness
+
 /// A single restart, reported live from the supervision loop (see `Supervisor.OnRestart`) — not to
 /// be confused with the final `SupervisionOutcome.Restarts` count.
 ///
 /// Sealed with an internal constructor so it can gain fields without breaking the frozen API.
 [<Sealed>]
-type SupervisorRestartEvent internal (program: string, restart: int, delay: TimeSpan) =
+type SupervisorRestartEvent internal (program: string, restart: int, delay: TimeSpan, cause: RestartCause) =
 
     /// The supervised command's program name.
     member _.Program = program
@@ -66,6 +83,11 @@ type SupervisorRestartEvent internal (program: string, restart: int, delay: Time
 
     /// The backoff delay the supervisor is about to sleep out before this restart.
     member _.Delay = delay
+
+    /// Why this restart is happening — `RestartCause.Exit` for an ordinary completed-run restart, or
+    /// `RestartCause.Liveness` when a liveness probe found the live child unresponsive. Lets a handler
+    /// alert on a hung service distinctly from an ordinary crash restart.
+    member _.Cause = cause
 
 /// A single failure-storm pause, reported live from the supervision loop (see
 /// `Supervisor.OnStormPause`) — not to be confused with the final `SupervisionOutcome.StormPauses`
@@ -174,6 +196,20 @@ module internal Supervision =
 
             if Double.IsFinite decayed then decayed + 1.0 else 1.0
 
+/// How the supervisor checks whether a *live* incarnation is still healthy: an HTTP endpoint (poll
+/// until a response satisfies the check) or an arbitrary async predicate. Internal — built through the
+/// `Supervisor.LivenessHttp`/`LivenessCheck` builder methods. Both funnel through the shared readiness
+/// poll/deadline core (`ReadinessProbe.waitForCoreUsing`), so a single liveness attempt is one bounded
+/// health-check window, never a duplicated polling loop.
+[<RequireQualifiedAccess; NoComparison>]
+type internal LivenessProbe =
+
+    /// Poll `uri` with HTTP GET each attempt; the child is healthy when a response satisfies the check.
+    | Http of uri: Uri * isSatisfactory: (HttpResponseMessage -> bool)
+
+    /// Evaluate an arbitrary async predicate each attempt; the child is healthy when it returns `true`.
+    | Custom of probe: (unit -> Task<bool>)
+
 /// The immutable configuration behind a `Supervisor`. Internal — built through the `Supervisor`
 /// builder.
 type internal SupervisorConfig =
@@ -193,6 +229,15 @@ type internal SupervisorConfig =
       OnRestart: (SupervisorRestartEvent -> unit) option
       OnStormPause: (SupervisorStormPauseEvent -> unit) option
       Capture: OutputBufferPolicy
+      // Liveness supervision (off unless `Liveness` is set): periodically probe the live incarnation and,
+      // after `LivenessFailures` consecutive failed attempts, gracefully stop it (with `LivenessGrace`)
+      // so the ordinary restart path takes over. `LivenessInterval` is the gap between attempts;
+      // `LivenessTimeout` bounds one attempt.
+      Liveness: LivenessProbe option
+      LivenessInterval: TimeSpan
+      LivenessFailures: int
+      LivenessTimeout: TimeSpan
+      LivenessGrace: TimeSpan
       // The clock seam: `Now` is a monotonic reading in seconds (only differences matter); `Sleep`
       // waits out a delay. Real implementations by default; tests inject a virtual clock that
       // advances `Now` when it `Sleep`s, so backoff/storm timing is deterministic.
@@ -232,6 +277,11 @@ module internal SupervisorConfig =
           OnRestart = None
           OnStormPause = None
           Capture = Supervision.defaultCapture command
+          Liveness = None
+          LivenessInterval = TimeSpan.FromSeconds 10.0
+          LivenessFailures = 3
+          LivenessTimeout = TimeSpan.FromSeconds 2.0
+          LivenessGrace = TimeSpan.FromSeconds 2.0
           Now = realNow
           Sleep = realSleep }
 
@@ -313,6 +363,13 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     // `CaptureStringAsync` — no live pid / graceful child-stop, but supervision itself is unaffected.
     let mutable spawnCapable = true
 
+    // Set by a per-incarnation liveness monitor the moment it decides the live child is unresponsive
+    // (before it gracefully stops it); read-and-reset once per incarnation by the loop, so the restart
+    // that follows is reported with `RestartCause.Liveness`. Guarded by `gate` for cross-thread
+    // visibility (the monitor runs on a background task, the loop on another). At most one write per
+    // incarnation, always ordered before the graceful stop that makes the loop observe the exit.
+    let mutable livenessTripped = false
+
     // The atomically-published snapshot. Seeded active-with-no-child; refreshed on every state change.
     let mutable status = SupervisionStatus(true, 0, false, None, None)
 
@@ -368,6 +425,131 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
         )
         |> ignore
 
+    let markLivenessTripped () =
+        lock gate (fun () -> livenessTripped <- true)
+
+    // Read the liveness flag and reset it in the same critical section, so each incarnation observes at
+    // most its own monitor's verdict and none leaks into the next incarnation.
+    let takeLivenessTripped () =
+        lock gate (fun () ->
+            let tripped = livenessTripped
+            livenessTripped <- false
+            tripped)
+
+    // A per-incarnation liveness monitor: while the live child runs, periodically ask a configured probe
+    // whether it is still healthy, and after `LivenessFailures` consecutive failed attempts, gracefully
+    // stop it so `captureIncarnation`'s output verb returns and the ORDINARY restart path (policy +
+    // backoff) takes over — never a second, parallel restart mechanism. A no-op (an already-completed
+    // task) when no liveness probe is configured.
+    //
+    // Started as a `backgroundTask` (KB K-009): the monitor is a fresh async loop that could, in a future
+    // caller shape, be blocked on synchronously; keeping it off any captured `SynchronizationContext`
+    // guarantees it never deadlocks a single-threaded UI/ASP.NET host — the same reasoning the `runLoop`
+    // itself is a `backgroundTask` for. Off any such context (tests, CI) `backgroundTask` is identical to
+    // `task`.
+    //
+    // Each attempt reuses the shared readiness poll/deadline core (`ReadinessProbe.waitForCoreUsing`, via
+    // its `waitForHttpUsing`/`waitFor` funnels — KB K-043) rather than re-implementing polling/deadline
+    // logic: `Ok ()` = healthy (reset the failure run), `NotReady` = this attempt failed, `Cancelled` =
+    // the incarnation ended / the monitor was torn down. The probe is handed `None`/`None` for the child's
+    // pipes: those belong to the incarnation's own `OutputStringAsync`, so the liveness probe only touches
+    // the external endpoint/predicate and never a second reader on the child (KB K-016/K-031 untouched).
+    let monitorLiveness
+        (running: RunningProcess)
+        (incarnation: Task<Result<ProcessResult<string>, ProcessError>>)
+        (token: CancellationToken)
+        : Task =
+        match config.Liveness with
+        | None -> Task.CompletedTask
+        | Some probe ->
+            let program = config.Command.Program
+            let probeTimeout = config.LivenessTimeout
+            let interval = config.LivenessInterval
+            let threshold = max 1 config.LivenessFailures
+            let grace = config.LivenessGrace
+
+            // Build the per-attempt health check and whatever it owns. An HTTP monitor holds ONE
+            // `HttpClient` for its whole lifetime and reuses it across attempts (a periodic probe must not
+            // churn a client/socket per tick); a predicate monitor owns nothing (a no-op disposable). Both
+            // feed `waitForCoreUsing` through an existing funnel, so there is no fifth copy of the poll/
+            // deadline logic.
+            let attempt, resources =
+                match probe with
+                | LivenessProbe.Http(uri, isSatisfactory) ->
+                    let client = new HttpClient(Timeout = Timeout.InfiniteTimeSpan)
+
+                    let check (probeToken: CancellationToken) =
+                        ReadinessProbe.waitForHttpUsing
+                            (fun requestUri ct -> client.GetAsync(requestUri, ct))
+                            (Func<HttpResponseMessage, bool> isSatisfactory)
+                            program
+                            uri
+                            probeTimeout
+                            probeToken
+
+                    check, (client :> IDisposable)
+                | LivenessProbe.Custom userProbe ->
+                    let check (probeToken: CancellationToken) =
+                        ReadinessProbe.waitFor program None None (Func<Task<bool>> userProbe) probeTimeout probeToken
+
+                    check,
+                    { new IDisposable with
+                        member _.Dispose() = () }
+
+            backgroundTask {
+                try
+                    let mutable consecutiveFailures = 0
+                    let mutable tripped = false
+
+                    while not tripped && not token.IsCancellationRequested && not incarnation.IsCompleted do
+                        let mutable waited = true
+
+                        try
+                            do! Task.Delay(interval, token)
+                        with :? OperationCanceledException ->
+                            // Torn down (incarnation ended, or the session is stopping) during the gap
+                            // between attempts; the loop guard ends the monitor.
+                            waited <- false
+
+                        if waited && not token.IsCancellationRequested && not incarnation.IsCompleted then
+                            let! outcome =
+                                task {
+                                    try
+                                        return! attempt token
+                                    with ex ->
+                                        // A liveness probe must never fault the monitor (which would leave
+                                        // the child unsupervised): treat any unexpected fault as a failed
+                                        // attempt. `waitForCoreUsing`/`waitForHttpUsing` already swallow the
+                                        // expected network/cancellation failures; this guards the rest.
+                                        return Error(ProcessError.Io ex.Message)
+                                }
+
+                            match outcome with
+                            | Ok() ->
+                                // Healthy: any prior failure run is forgiven (only CONSECUTIVE failures trip).
+                                consecutiveFailures <- 0
+                            | Error(ProcessError.Cancelled _) ->
+                                // Torn down mid-attempt; not a health failure. The loop guard ends the monitor.
+                                ()
+                            | Error _ ->
+                                consecutiveFailures <- consecutiveFailures + 1
+
+                                if consecutiveFailures >= threshold then
+                                    tripped <- true
+                                    // Record the liveness verdict BEFORE stopping the child, so the loop
+                                    // observes the flag once the graceful stop makes `OutputStringAsync`
+                                    // return (the write is ordered before the stop under `gate`).
+                                    markLivenessTripped ()
+                                    // Gracefully stop the live child through its own path; fire-and-forget
+                                    // with fault observation, exactly like the pending-graceful-stop path in
+                                    // `captureIncarnation`. Its exit makes the incarnation's output verb
+                                    // return, and the ordinary restart path takes over.
+                                    observeFault (running.StopAsync grace)
+                finally
+                    resources.Dispose()
+            }
+            :> Task
+
     // Drive one incarnation to a completion result. Prefer a spawn+track path so the session can expose
     // the live child's pid/StartTime and stop it through `RunningProcess.StopAsync`; a capture-only
     // runner (a scripted double with no live handle) latches onto its `CaptureStringAsync` primitive.
@@ -417,15 +599,43 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             | Some grace -> observeFault (running.StopAsync grace)
                             | None -> ()
 
-                            try
-                                let! result = running.OutputStringAsync()
+                            // Drive the incarnation's output verb while a per-incarnation liveness monitor
+                            // watches the live child (a no-op when no liveness probe is configured). If the
+                            // monitor decides the child is unresponsive it gracefully stops it, which makes
+                            // `OutputStringAsync` return so the ordinary restart path takes over. The monitor
+                            // is scoped to exactly this incarnation: cancelled and awaited once the output
+                            // verb returns, whatever its outcome. A task CE cannot `do!` inside `finally`, so
+                            // this uses the established capture-fault-then-single-cleanup shape (see
+                            // `ReadinessProbe.withBackgroundDrain`): capture any fault, always tear the
+                            // monitor down and clear the current child, then re-raise the captured fault.
+                            use livenessCts = CancellationTokenSource.CreateLinkedTokenSource effectiveToken
 
-                                if effectiveToken.IsCancellationRequested then
-                                    return Error(ProcessError.Cancelled command.Program)
-                                else
-                                    return result
-                            finally
-                                clearCurrent running
+                            let outputTask = running.OutputStringAsync()
+                            let monitorTask = monitorLiveness running outputTask livenessCts.Token
+
+                            let mutable captured =
+                                Unchecked.defaultof<Result<ProcessResult<string>, ProcessError>>
+
+                            let mutable fault: exn option = None
+
+                            try
+                                let! result = outputTask
+
+                                captured <-
+                                    if effectiveToken.IsCancellationRequested then
+                                        Error(ProcessError.Cancelled command.Program)
+                                    else
+                                        result
+                            with ex ->
+                                fault <- Some ex
+
+                            livenessCts.Cancel()
+                            do! monitorTask
+                            clearCurrent running
+
+                            match fault with
+                            | Some ex -> return! Task.FromException<Result<ProcessResult<string>, ProcessError>> ex
+                            | None -> return captured
             }
 
     // The supervision loop itself — one faithful copy of `Supervisor.RunAsync`'s former body, extended
@@ -528,7 +738,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 }
                 :> Task
 
-            let sleepBackoff (exponent: int) (restartNumber: int) : Task =
+            let sleepBackoff (exponent: int) (restartNumber: int) (cause: RestartCause) : Task =
                 task {
                     let delay =
                         Supervision.backoffDelay config.BackoffBase factor exponent config.MaxBackoff
@@ -537,8 +747,19 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                     Log.supervisorRestart config.Command.Config.Logger program restartNumber delay
                     Diag.supervisorRestarted program
 
+                    // A liveness-forced restart is additionally surfaced under its own event/metric, so an
+                    // operator can tell a "live-but-hung service" restart apart from an ordinary crash
+                    // restart without придумывания a parallel event system — same `ProcessKitDiagnostics`
+                    // taxonomy, one extra id. The generic restart telemetry above still fires (it IS a
+                    // restart and counts in `SupervisionOutcome.Restarts`).
+                    match cause with
+                    | RestartCause.Liveness ->
+                        Log.supervisorLivenessRestart config.Command.Config.Logger program config.LivenessFailures
+                        Diag.supervisorLivenessRestarted program
+                    | RestartCause.Exit -> ()
+
                     match config.OnRestart with
-                    | Some handler -> handler (SupervisorRestartEvent(program, restartNumber, delay))
+                    | Some handler -> handler (SupervisorRestartEvent(program, restartNumber, delay, cause))
                     | None -> ()
 
                     if delay > TimeSpan.Zero then
@@ -570,6 +791,10 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                         match! captureIncarnation command with
                         | Ok result ->
                             lastResult <- Some result
+
+                            // Read-and-reset once per incarnation whether its liveness monitor forced this
+                            // exit, so the restart below (if any) is attributed to `RestartCause.Liveness`.
+                            let livenessCausedExit = takeLivenessTripped ()
 
                             if isStopping () then
                                 // The current incarnation was gracefully stopped (or completed while a
@@ -632,7 +857,13 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                         if result.Duration >= config.MaxBackoff && not result.IsTimedOut then
                                             escalation <- 0
 
-                                        do! sleepBackoff escalation (restarts + 1)
+                                        let cause =
+                                            if livenessCausedExit then
+                                                RestartCause.Liveness
+                                            else
+                                                RestartCause.Exit
+
+                                        do! sleepBackoff escalation (restarts + 1) cause
                                         escalation <- escalation + 1
                                         bumpRestarts ()
                         | Error error ->
@@ -653,7 +884,9 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                     final <- Some(Error error)
                                 else
                                     do! stormGate ()
-                                    do! sleepBackoff escalation (restarts + 1)
+                                    // A run that never produced a result had no live child to probe, so a
+                                    // spawn/IO-error restart is always an ordinary `Exit`-cause restart.
+                                    do! sleepBackoff escalation (restarts + 1) RestartCause.Exit
                                     escalation <- escalation + 1
                                     bumpRestarts ()
 
@@ -881,10 +1114,12 @@ type Supervisor internal (config: SupervisorConfig) =
 
     /// Observe restarts live: `handler` runs synchronously, from the supervision loop, right before
     /// each restart's backoff delay is slept out — after the failed/finished incarnation, before the
-    /// next one starts. Invoked on every restart (a crash, a timeout, or a retried transient runner
-    /// error), never for the initial run. `handler` runs on the same async context driving
-    /// `RunAsync`, so keep it quick and non-blocking — a slow handler delays every restart. Purely
-    /// additive: does not change `SupervisionOutcome.Restarts` or any other final semantics.
+    /// next one starts. Invoked on every restart (a crash, a timeout, a retried transient runner
+    /// error, or a liveness-probe failure), never for the initial run. The event's
+    /// `SupervisorRestartEvent.Cause` distinguishes an ordinary `Exit` restart from a `Liveness` one
+    /// (a live-but-unresponsive child the probe stopped). `handler` runs on the same async context
+    /// driving `RunAsync`, so keep it quick and non-blocking — a slow handler delays every restart.
+    /// Purely additive: does not change `SupervisionOutcome.Restarts` or any other final semantics.
     /// Default: unset.
     member _.OnRestart(handler: Action<SupervisorRestartEvent>) =
         ArgumentNullException.ThrowIfNull handler
@@ -906,6 +1141,88 @@ type Supervisor internal (config: SupervisorConfig) =
             { config with
                 OnStormPause = Some(fun event -> handler.Invoke event) }
         )
+
+    /// Enable an **HTTP liveness probe**: every `interval`, poll `uri` with an HTTP GET and treat the
+    /// *live* child as healthy when the response passes the default 2xx check. After
+    /// `LivenessFailures` consecutive failed attempts (default 3) the supervisor **gracefully stops**
+    /// the child (with the `LivenessGrace` window) and restarts it through the ordinary
+    /// policy/backoff path — closing the "alive but no longer responding" gap that `RestartPolicy`
+    /// (exit-driven) and `Command.IdleTimeout` (stdout-silence-driven) miss. Off by default.
+    ///
+    /// The probe checks an *external* endpoint the child serves; it never reads the child's stdout/
+    /// stderr (those belong to the incarnation's own capture) and never appears in argv/env or a log.
+    /// The first attempt runs one `interval` after the child starts, giving a natural startup window.
+    /// Liveness needs a live child handle, so it applies only to a spawn-capable runner (the default),
+    /// not a capture-only test double. A single attempt reuses the same poll/deadline core as
+    /// `RunningProcess.WaitForHttpAsync`. `interval` must be positive.
+    member this.LivenessHttp(uri: Uri, interval: TimeSpan) =
+        ArgumentNullException.ThrowIfNull uri
+
+        this.LivenessHttp(
+            uri,
+            Func<HttpResponseMessage, bool>(fun response ->
+                let statusCode = int response.StatusCode
+                statusCode >= 200 && statusCode < 300),
+            interval
+        )
+
+    /// Like `LivenessHttp(uri, interval)`, but uses `isSatisfactory` to decide whether a response means
+    /// the child is healthy (e.g. accept only a specific health-endpoint status/body). `interval` must
+    /// be positive.
+    member _.LivenessHttp(uri: Uri, isSatisfactory: Func<HttpResponseMessage, bool>, interval: TimeSpan) =
+        ArgumentNullException.ThrowIfNull uri
+        ArgumentNullException.ThrowIfNull isSatisfactory
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero, nameof interval)
+
+        Supervisor(
+            { config with
+                Liveness = Some(LivenessProbe.Http(uri, (fun response -> isSatisfactory.Invoke response)))
+                LivenessInterval = interval }
+        )
+
+    /// Enable a **predicate liveness probe**: every `interval`, evaluate `probe` and treat the *live*
+    /// child as healthy when it returns `true`. After `LivenessFailures` consecutive failed attempts
+    /// the supervisor gracefully stops and restarts the child, exactly like `LivenessHttp`. Off by
+    /// default. `probe` is the caller's own health check (a custom RPC, a file/socket poke, a metric
+    /// read); a returned `false` or a raised exception both count as a failed attempt, and the API
+    /// cannot force a caller-owned `probe` to stop, so a hung probe is bounded by `LivenessTimeout` and
+    /// abandoned (its late outcome safely observed) rather than pinning the monitor. `interval` must be
+    /// positive.
+    member _.LivenessCheck(probe: Func<Task<bool>>, interval: TimeSpan) =
+        ArgumentNullException.ThrowIfNull probe
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero, nameof interval)
+
+        Supervisor(
+            { config with
+                Liveness = Some(LivenessProbe.Custom(fun () -> probe.Invoke()))
+                LivenessInterval = interval }
+        )
+
+    /// How many **consecutive** failed liveness attempts trip a restart (default `3`). A single healthy
+    /// attempt resets the run, so a flaky endpoint that recovers does not restart the child. `count`
+    /// must be at least `1`. No effect unless a liveness probe (`LivenessHttp`/`LivenessCheck`) is set.
+    member _.LivenessFailures(count: int) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(count, 1, nameof count)
+        Supervisor({ config with LivenessFailures = count })
+
+    /// The per-attempt timeout for a liveness probe (default 2 s): one attempt gives the endpoint/
+    /// predicate up to this long to prove healthy before it counts as a failure. `timeout` must be
+    /// positive. No effect unless a liveness probe is set.
+    member _.LivenessTimeout(timeout: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero, nameof timeout)
+
+        Supervisor(
+            { config with
+                LivenessTimeout = timeout }
+        )
+
+    /// The grace window passed to `RunningProcess.StopAsync` when a liveness failure forces a restart
+    /// (default 2 s): the unresponsive child is asked to stop softly and hard-killed only if it does not
+    /// exit within this window. `TimeSpan.Zero` escalates the kill immediately; a negative value is
+    /// rejected. No effect unless a liveness probe is set.
+    member _.LivenessGrace(grace: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(grace, TimeSpan.Zero, nameof grace)
+        Supervisor({ config with LivenessGrace = grace })
 
     /// Internal test seam: inject a virtual clock (advance-on-sleep) for deterministic timing tests.
     member internal _.WithClock(now: unit -> float, sleep: TimeSpan -> CancellationToken -> Task) =

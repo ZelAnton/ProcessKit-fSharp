@@ -40,6 +40,13 @@ module internal Diag =
     let private stormPausesCounter =
         meter.CreateCounter<int64>("processkit.supervisor.storm_pauses", "{pause}", "Supervisor failure-storm pauses.")
 
+    let private livenessRestartsCounter =
+        meter.CreateCounter<int64>(
+            "processkit.supervisor.liveness_restarts",
+            "{restart}",
+            "Supervisor liveness-probe restarts (a live-but-unresponsive child restarted)."
+        )
+
     // A monotonic, per-process run correlation id. Compact hex so it reads cleanly in a log line and
     // ties one run's events (spawn/exit/timeout/retry) together across a concurrent fleet. Per-process
     // (not globally unique): a log sink already scopes by process, and distributed correlation is the
@@ -193,3 +200,8 @@ module internal Diag =
         emitSafely (fun () ->
             let mutable tags = programTag program
             stormPausesCounter.Add(1L, &tags))
+
+    let supervisorLivenessRestarted (program: string) =
+        emitSafely (fun () ->
+            let mutable tags = programTag program
+            livenessRestartsCounter.Add(1L, &tags))

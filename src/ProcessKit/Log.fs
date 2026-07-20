@@ -74,6 +74,13 @@ module internal Log =
             "processkit: supervisor failure storm for {Program} — pausing restarts for {PauseMs}ms"
         )
 
+    let private supervisorLivenessRestartMessage =
+        LoggerMessage.Define<string, int>(
+            LogLevel.Warning,
+            Events.SupervisorLivenessRestart,
+            "processkit: supervisor liveness probe found {Program} unresponsive after {Failures} consecutive failures — restarting"
+        )
+
     // Every lifecycle event runs the consumer's `ILogger` synchronously (its `IsEnabled`/`Log`), so a
     // faulty sink must never derail the process operation that emitted the event — logging is strictly
     // observational. `emitSafely` is the single seam every event flows through: it short-circuits when no
@@ -128,3 +135,7 @@ module internal Log =
     /// A supervisor's failure-storm guard paused restarts.
     let stormPause (logger: ILogger option) (program: string) (pause: TimeSpan) =
         emitSafely logger (fun log -> stormPauseMessage.Invoke(log, program, pause.TotalMilliseconds, null))
+
+    /// A supervisor's liveness probe found the live child unresponsive and is restarting it.
+    let supervisorLivenessRestart (logger: ILogger option) (program: string) (failures: int) =
+        emitSafely logger (fun log -> supervisorLivenessRestartMessage.Invoke(log, program, failures, null))

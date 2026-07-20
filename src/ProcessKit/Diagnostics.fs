@@ -44,3 +44,7 @@ module ProcessKitDiagnostics =
 
         /// A supervisor's failure-storm guard paused restarts (Warning). Carries program, pause.
         let SupervisorStormPause = EventId(6, "SupervisorStormPause")
+
+        /// A supervisor's liveness probe found the live child unresponsive and restarted it (Warning).
+        /// Carries program and the consecutive-failure threshold that tripped.
+        let SupervisorLivenessRestart = EventId(7, "SupervisorLivenessRestart")

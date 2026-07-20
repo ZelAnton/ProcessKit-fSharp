@@ -231,6 +231,48 @@ type private GatedCaptureRunner() =
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             failwith "GatedCaptureRunner only scripts CaptureString"
 
+/// A spawn-capable runner whose every incarnation stays alive (a never-completing wait) until it is
+/// gracefully stopped — so a liveness probe has a live-but-running child to fail against (KB K-044:
+/// model a still-running child with a never-completing task, never an immediately-resolved one). Each
+/// incarnation reports `Signalled 15` when gracefully stopped. Tracks spawn and graceful-stop counts.
+type private LivenessChildRunner() =
+    let mutable spawns = 0
+    let mutable gracefulStops = 0
+    let alivePid = 7070
+
+    member _.AlivePid = alivePid
+    member _.Spawns = Volatile.Read(&spawns)
+    member _.GracefulStops = Volatile.Read(&gracefulStops)
+
+    interface IProcessRunner with
+        member _.SpawnAsync(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                Interlocked.Increment(&spawns) |> ignore
+
+                let wait =
+                    new TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                let running =
+                    buildRunningProcess
+                        command
+                        (Some alivePid)
+                        (fun () -> wait.Task)
+                        (fun _ ->
+                            Interlocked.Increment(&gracefulStops) |> ignore
+                            wait.TrySetResult(Outcome.Signalled(Some 15)) |> ignore
+                            Task.CompletedTask)
+                        (fun () -> wait.TrySetResult(Outcome.Signalled None) |> ignore)
+
+                Task.FromResult(Ok running)
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "LivenessChildRunner drives incarnations via SpawnAsync"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "LivenessChildRunner drives incarnations via SpawnAsync"))
+
 [<TestFixture>]
 type SupervisorTests() =
 
@@ -1180,6 +1222,152 @@ type SupervisorTests() =
                     Assert.That(viaStart.Stopped, Is.EqualTo viaRun.Stopped)
                     Assert.That(session.Status.IsActive, Is.False)
                 | Error error -> Assert.Fail $"{error}"
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // ----- liveness probe (restart a live-but-unresponsive child) -----
+
+    [<Test>]
+    member _.``liveness knobs validate their arguments``() =
+        let s = Supervisor(Command.create "x")
+        let uri = Uri "http://localhost:9/health"
+        let positive = TimeSpan.FromSeconds 1.0
+
+        // Every valid configuration builds without throwing.
+        s.LivenessHttp(uri, positive) |> ignore
+
+        s.LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult true), positive)
+        |> ignore
+
+        s.LivenessFailures 1 |> ignore
+        s.LivenessGrace TimeSpan.Zero |> ignore // zero grace = immediate escalation, a valid config
+
+        // A non-positive interval / timeout, a sub-1 failure count, and a negative grace are rejected.
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.LivenessHttp(uri, TimeSpan.Zero) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () ->
+                s.LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult true), TimeSpan.Zero)
+                |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.LivenessFailures 0 |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.LivenessTimeout TimeSpan.Zero |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> s.LivenessGrace(TimeSpan.FromSeconds -1.0) |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> s.LivenessHttp(Unchecked.defaultof<Uri>, positive) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``a live but unresponsive child triggers a graceful liveness restart after N failures``() : Task =
+        task {
+            let runner = LivenessChildRunner()
+            let events = ResizeArray<SupervisorRestartEvent>()
+
+            // The predicate is always unhealthy, so after 2 consecutive failed attempts the monitor
+            // gracefully stops the (still-alive) child and the ordinary OnCrash restart path takes over.
+            // `MaxRestarts(1)` bounds the otherwise-endless liveness restart loop so the test terminates.
+            let supervisor =
+                Supervisor(Command.create "hung")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .MaxRestarts(1)
+                    .LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult false), TimeSpan.FromMilliseconds 10.0)
+                    .LivenessFailures(2)
+                    .LivenessTimeout(TimeSpan.FromMilliseconds 40.0)
+                    .LivenessGrace(TimeSpan.FromMilliseconds 50.0)
+                    .OnRestart(fun e -> events.Add e)
+
+            match! supervisor.RunAsync() with
+            | Ok outcome ->
+                Assert.That(
+                    outcome.Restarts,
+                    Is.EqualTo 1,
+                    "exactly one liveness restart before the budget is exhausted"
+                )
+
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.RestartsExhausted)
+                Assert.That(runner.Spawns, Is.EqualTo 2, "the initial incarnation plus its one restart")
+                Assert.That(runner.GracefulStops, Is.EqualTo 2, "each unresponsive incarnation was gracefully stopped")
+                Assert.That(events.Count, Is.EqualTo 1, "OnRestart fires once for the liveness restart")
+
+                Assert.That(
+                    events[0].Cause,
+                    Is.EqualTo RestartCause.Liveness,
+                    "the restart cause is a liveness failure"
+                )
+
+                Assert.That(events[0].Program, Is.EqualTo "hung")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a responsive child is never restarted by the liveness probe``() : Task =
+        task {
+            let runner = LivenessChildRunner()
+            let events = ResizeArray<SupervisorRestartEvent>()
+
+            let supervisor =
+                Supervisor(Command.create "healthy")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult true), TimeSpan.FromMilliseconds 10.0)
+                    .LivenessFailures(2)
+                    .LivenessTimeout(TimeSpan.FromMilliseconds 50.0)
+                    .OnRestart(fun e -> events.Add e)
+
+            let! session = supervisor.StartAsync()
+            do! waitUntil "child alive" (fun () -> session.Status.Pid = Some runner.AlivePid)
+
+            // Let many liveness intervals elapse; a healthy probe must never restart the child.
+            do! Task.Delay 250
+
+            Assert.That(session.Status.Restarts, Is.EqualTo 0, "a healthy child is not restarted")
+            Assert.That(events.Count, Is.EqualTo 0, "no liveness restart events for a healthy child")
+            Assert.That(runner.Spawns, Is.EqualTo 1, "the single healthy incarnation is never respawned")
+
+            let! outcome = session.StopAsync(TimeSpan.FromMilliseconds 100.0)
+
+            match outcome with
+            | Ok result ->
+                Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+                Assert.That(result.Restarts, Is.EqualTo 0)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OnRestart reports RestartCause.Exit for an ordinary crash restart``() : Task =
+        task {
+            let events = ResizeArray<SupervisorRestartEvent>()
+
+            let sup = supervise([ failWith 1; ok () ]).OnRestart(fun e -> events.Add e)
+
+            match! sup.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 1)
+                Assert.That(events.Count, Is.EqualTo 1)
+
+                Assert.That(
+                    events[0].Cause,
+                    Is.EqualTo RestartCause.Exit,
+                    "an ordinary crash restart is not a liveness restart"
+                )
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task

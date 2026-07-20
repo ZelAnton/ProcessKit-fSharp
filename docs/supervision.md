@@ -26,6 +26,7 @@ The samples below run inside a `task { }` block and use `match!`; from C# the sa
 - [Policies: what counts as a crash](#policies-what-counts-as-a-crash)
 - [Backoff and jitter](#backoff-and-jitter)
 - [Failure storms](#failure-storms)
+- [Liveness probes](#liveness-probes)
 - [Capturing each incarnation](#capturing-each-incarnation)
 - [Stopping](#stopping)
 - [The outcome](#the-outcome)
@@ -222,6 +223,95 @@ The fine print:
 - Pauses taken are reported in [`SupervisionOutcome.StormPauses`](#the-outcome) (always `0` when
   the guard is off).
 
+## Liveness probes
+
+A `RestartPolicy` only ever reacts to a run that **ended** — a crash, a timeout, a signal. A process
+that is *alive but wedged* — still running, maybe still writing logs, but no longer answering
+requests — never trips it, and `Command.IdleTimeout` only catches the subset that also goes silent on
+stdout. The opt-in **liveness probe** closes that gap the way a systemd watchdog or a Kubernetes
+liveness probe does: it periodically asks whether the live child is still healthy and, after enough
+consecutive failures, restarts it. It is **off by default**.
+
+Point it at the child's own health surface — an HTTP endpoint it serves, or any async check of your
+own:
+
+**F#**
+
+```fsharp
+task {
+    let supervisor =
+        (Supervisor.create (Command.create "my-server" |> Command.args [ "--port"; "8080" ]))
+            .LivenessHttp(Uri "http://localhost:8080/healthz", TimeSpan.FromSeconds 10.0) // poll every 10s
+            .LivenessFailures(3)                     // restart after 3 consecutive failures (default 3)
+            .LivenessTimeout(TimeSpan.FromSeconds 2.0) // each probe waits at most 2s for a healthy reply
+            .LivenessGrace(TimeSpan.FromSeconds 5.0)   // give the wedged child 5s to stop before a hard kill
+
+    match! supervisor.RunAsync() with
+    | Ok outcome -> printfn $"ended: {outcome.Stopped}"
+    | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+**C#**
+
+```csharp
+var supervisor = new Supervisor(new Command("my-server").Args(["--port", "8080"]))
+    .LivenessHttp(new Uri("http://localhost:8080/healthz"), TimeSpan.FromSeconds(10)) // poll every 10s
+    .LivenessFailures(3)                       // restart after 3 consecutive failures (default 3)
+    .LivenessTimeout(TimeSpan.FromSeconds(2))  // each probe waits at most 2s for a healthy reply
+    .LivenessGrace(TimeSpan.FromSeconds(5));   // give the wedged child 5s to stop before a hard kill
+```
+
+For anything that is not a plain 2xx HTTP check, use a response predicate or your own async probe:
+
+**F#**
+
+```fsharp
+let byStatus =
+    (Supervisor.create (Command.create "worker"))
+        .LivenessHttp(Uri "http://localhost:9000/ready", (fun resp -> int resp.StatusCode = 204), TimeSpan.FromSeconds 5.0)
+
+let byPredicate =
+    (Supervisor.create (Command.create "worker"))
+        .LivenessCheck((fun () -> pingWorkerAsync ()), TimeSpan.FromSeconds 5.0) // returns Task<bool>
+```
+
+**C#**
+
+```csharp
+var byStatus = new Supervisor(new Command("worker"))
+    .LivenessHttp(new Uri("http://localhost:9000/ready"), resp => (int)resp.StatusCode == 204, TimeSpan.FromSeconds(5));
+
+var byPredicate = new Supervisor(new Command("worker"))
+    .LivenessCheck(() => PingWorkerAsync(), TimeSpan.FromSeconds(5)); // returns Task<bool>
+```
+
+How it behaves:
+
+- **When it restarts.** After `LivenessFailures` **consecutive** failed attempts, the supervisor
+  gracefully stops the child (a `LivenessGrace` soft-stop window, then a hard kill) and restarts it
+  through the **ordinary** restart path — the same `RestartPolicy`, backoff, jitter, `MaxRestarts`
+  budget, and storm guard apply. It is not a second, parallel restart mechanism. A single healthy
+  attempt resets the run, so a brief blip that recovers does not restart the child. The first attempt
+  runs one `LivenessInterval` after the child starts, a natural startup window.
+- **Each attempt is bounded.** One attempt gives the endpoint/predicate up to `LivenessTimeout` to
+  prove healthy (reusing the same poll/deadline core as `RunningProcess.WaitForHttpAsync`); a
+  `false` result, a network failure, a raised exception, or a hung probe all count as one failed
+  attempt.
+- **It probes the external surface only.** The probe hits the endpoint or runs your predicate — it
+  never reads the child's stdout/stderr (those stay yours to capture), and a URL/predicate never
+  appears in argv, environment, or a log line. It applies to a live child, so it has no effect on a
+  capture-only test double.
+- **It is distinguishable.** A liveness-forced restart reports `RestartCause.Liveness` on its
+  [`OnRestart`](#live-observability) event (an ordinary restart reports `RestartCause.Exit`), and
+  emits the `SupervisorLivenessRestart` log event plus the `processkit.supervisor.liveness_restarts`
+  metric — see [Observability](observability.md).
+
+`LivenessFailures`, `LivenessTimeout`, and `LivenessGrace` have **no effect** unless a probe
+(`LivenessHttp` / `LivenessCheck`) is set. `LivenessInterval` and `LivenessTimeout` must be positive;
+`LivenessFailures` must be at least `1`; `LivenessGrace` accepts `TimeSpan.Zero` (kill immediately)
+but rejects a negative value.
+
 ## Capturing each incarnation
 
 A supervised process can be long-lived and chatty, so capturing its *entire* output across many
@@ -389,9 +479,12 @@ var supervisor = new Supervisor(new Command("worker"))
 Both callbacks are invoked **synchronously**, from the supervision loop itself — the same async
 context driving `RunAsync` — right before the corresponding delay is slept out. Keep handlers quick
 and non-blocking: a slow handler delays every restart/pause. `OnRestart` fires on every restart (a
-crash, a timeout, or a retried transient runner error), never for the initial run; `OnStormPause`
-fires once per pause, only when `StormPause` is set. Both are purely additive — they never change
-`SupervisionOutcome`'s final `Restarts`/`StormPauses`/`Stopped` semantics.
+crash, a timeout, a retried transient runner error, or a [liveness](#liveness-probes) failure), never
+for the initial run; `OnStormPause` fires once per pause, only when `StormPause` is set. The restart
+event's `Cause` (`RestartCause.Exit` vs `RestartCause.Liveness`) tells an ordinary restart apart from
+one a liveness probe forced, so a health check can alert on a wedged service distinctly from an
+ordinary crash. Both callbacks are purely additive — they never change `SupervisionOutcome`'s final
+`Restarts`/`StormPauses`/`Stopped` semantics.
 
 ## Supervising inside a shared group
 
