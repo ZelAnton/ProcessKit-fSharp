@@ -1087,5 +1087,13 @@ module Command =
     /// `Command.Pty`.
     let pty (command: Command) = command.Pty()
 
+    /// Run the child under a pseudo-terminal (PTY) with a full `PtyConfig` (geometry, echo). See
+    /// `Command.Pty(PtyConfig)`.
+    let ptyConfig (pty: PtyConfig) (command: Command) = command.Pty pty
+
+    /// Run the child under a pseudo-terminal (PTY) with the given initial geometry (echo on). See
+    /// `Command.Pty(cols, rows)`.
+    let ptySize (cols: int) (rows: int) (command: Command) = command.Pty(cols, rows)
+
     /// Emit structured lifecycle events to `logger` (argv/env never logged).
     let logger (logger: ILogger) (command: Command) = command.Logger logger

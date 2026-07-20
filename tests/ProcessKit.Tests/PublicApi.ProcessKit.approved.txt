@@ -98,6 +98,8 @@ module ProcessKit.CommandModule
   static member outputBuffer(ProcessKit.OutputBufferPolicy, ProcessKit.Command) : ProcessKit.Command
   static member priority(ProcessKit.Priority, ProcessKit.Command) : ProcessKit.Command
   static member pty(ProcessKit.Command) : ProcessKit.Command
+  static member ptyConfig(ProcessKit.PtyConfig, ProcessKit.Command) : ProcessKit.Command
+  static member ptySize(System.Int32, System.Int32, ProcessKit.Command) : ProcessKit.Command
   static member retry(System.Int32, System.TimeSpan, Microsoft.FSharp.Core.FSharpFunc<ProcessKit.ProcessError, System.Boolean>, ProcessKit.Command) : ProcessKit.Command
   static member retryNever(ProcessKit.Command) : ProcessKit.Command
   static member setsid(ProcessKit.Command) : ProcessKit.Command
