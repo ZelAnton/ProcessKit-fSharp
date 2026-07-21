@@ -74,6 +74,18 @@ class Node:
                 return found
         return None
 
+    def find_direct_child(self, tag: str) -> "Node | None":
+        """Returns the first *direct* child with the given tag, or None.
+
+        Unlike `find_first`, this does not recurse into descendants -- it is
+        what CSS's `>` child combinator actually means, and is required to
+        validate `li.chapter-item.affix > a` (an `<a>` nested deeper, e.g.
+        inside a `<span>`, must NOT be treated as a match)."""
+        for child in self.children:
+            if child.tag == tag:
+                return child
+        return None
+
     def text_content(self) -> str:
         parts = [self.text]
         for child in self.children:
@@ -135,7 +147,12 @@ class ChapterTreeBuilder(HTMLParser):
 def pinned_title_matches(ol: Node) -> list[Node]:
     """Returns the <a> elements matched by
     `.sidebar .chapter li.spacer + li.chapter-item.affix > a`
-    against the given <ol class="chapter"> node's direct <li> children."""
+    against the given <ol class="chapter"> node's direct <li> children.
+
+    Uses `find_direct_child`, not `find_first`: the selector's `> a` combinator
+    requires an *immediate* child <a>, so a nested `<li><span><a>` must NOT be
+    treated as a match here -- that would let a broken (non-immediate-child)
+    selector pass validation by accident."""
     matches: list[Node] = []
     previous: Node | None = None
     for li in ol.children:
@@ -149,7 +166,7 @@ def pinned_title_matches(ol: Node) -> list[Node]:
             and "chapter-item" in classes
             and "affix" in classes
         ):
-            a = li.find_first("a")
+            a = li.find_direct_child("a")
             if a is not None:
                 matches.append(a)
         previous = li
@@ -177,7 +194,48 @@ def classify_entries(ol: Node) -> dict[str, list[str]]:
     return buckets
 
 
+def _self_test_rejects_nested_anchor() -> str | None:
+    """Negative fixture: builds a synthetic `<li class="spacer">` followed by
+    a `<li class="chapter-item affix">` whose `<a>` is nested one level deep
+    inside a `<span>` (i.e. NOT an immediate child), and asserts
+    `pinned_title_matches` does not match it.
+
+    This guards against a regression back to `find_first` (depth-first,
+    "anywhere in the subtree") in place of `find_direct_child` -- the CSS
+    selector under test requires `li.chapter-item.affix > a` (immediate
+    child), so a nested anchor must be rejected. Returns an error message on
+    failure, or None on success."""
+    ol = Node("ol", [("class", "chapter")])
+
+    spacer = Node("li", [("class", "spacer")])
+    ol.children.append(spacer)
+
+    affix_li = Node("li", [("class", "chapter-item affix")])
+    span = Node("span", [])
+    nested_a = Node("a", [("href", "overview.html")])
+    nested_a.text = "Overview"
+    span.children.append(nested_a)
+    affix_li.children.append(span)
+    ol.children.append(affix_li)
+
+    matches = pinned_title_matches(ol)
+    if matches:
+        return (
+            "self-test failed: pinned_title_matches() matched an <a> nested "
+            "inside a <span> (not an immediate child of the affix <li>) -- "
+            "the CSS selector's `> a` child combinator requires an immediate "
+            "child; use find_direct_child(), not find_first(), to validate it."
+        )
+    return None
+
+
 def main(argv: list[str]) -> int:
+    self_test_error = _self_test_rejects_nested_anchor()
+    if self_test_error is not None:
+        print(f"check-sidebar-nav: {self_test_error}", file=sys.stderr)
+        return 1
+
+
     html_path = Path(argv[1]) if len(argv) > 1 else Path("book/index.html")
     if not html_path.exists():
         print(
