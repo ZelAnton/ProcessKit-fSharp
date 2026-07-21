@@ -415,8 +415,28 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
 
     let isStopping () = lock gate (fun () -> stopping)
 
+    // Record a graceful-stop request and snapshot the current live child atomically under `gate` (closing
+    // the `StopAsync`-vs-spawn race, see `publishCurrent`), then interrupt any in-flight backoff / storm
+    // sleep so a stop taken *between* incarnations ends the loop promptly instead of waiting the delay out.
+    // Shared by the public `StopAsync` and the internal `StopActiveAsync` hosting seam.
+    let requestGracefulStop (gracePeriod: TimeSpan) : RunningProcess option =
+        let child =
+            lock gate (fun () ->
+                stopGrace <- gracePeriod
+                stopping <- true
+                current)
+
+        try
+            stopCts.Cancel()
+        with :? ObjectDisposedException ->
+            // Already disposed under a concurrent teardown; nothing further to cancel.
+            ()
+
+        child
+
     // Observe an abandoned graceful-stop task's eventual fault so it never surfaces as an unobserved
-    // task exception at finalization — mirrors `TrackingRunner.StopActiveAsync` / `RunningProcess`.
+    // task exception at finalization — shared by `StopActiveAsync` (the hosting stop seam) and the
+    // per-incarnation liveness monitor, mirroring `RunningProcess`'s own abandoned-stop fault observation.
     let observeFault (stopTask: Task<Outcome>) =
         stopTask.ContinueWith(
             Action<Task<Outcome>>(fun completed -> completed.Exception |> ignore),
@@ -925,20 +945,9 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     member _.StopAsync(gracePeriod: TimeSpan) : Task<Result<SupervisionOutcome, ProcessError>> =
         ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
 
-        // Record the request and snapshot the current child atomically under `gate` (see
-        // `publishCurrent` for the race this closes).
-        let child =
-            lock gate (fun () ->
-                stopGrace <- gracePeriod
-                stopping <- true
-                current)
-
-        // Interrupt any in-flight backoff / storm sleep so a between-incarnations loop ends promptly.
-        try
-            stopCts.Cancel()
-        with :? ObjectDisposedException ->
-            // Already disposed under a concurrent teardown; nothing further to cancel.
-            ()
+        // Record the request, snapshot the current child, and interrupt any in-flight backoff / storm
+        // sleep (see `requestGracefulStop`).
+        let child = requestGracefulStop gracePeriod
 
         task {
             match child with
@@ -955,6 +964,41 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
 
     /// `StopAsync` using the default 2-second grace window (matching `RunningProcess.StopAsync`).
     member this.StopAsync() : Task<Result<SupervisionOutcome, ProcessError>> = this.StopAsync defaultStopGrace
+
+    /// Internal seam for hosting-style wrappers (`ProcessKit.Extensions.Hosting`): request the same
+    /// graceful stop as `StopAsync` — set the `stopping` flag and interrupt the backoff / storm sleep so
+    /// the loop ends promptly, launching no further incarnation — but additionally report the honest
+    /// `Outcome` of the *live* child this call actually stopped (`Some outcome`), or `None` when there was
+    /// no live child to stop (a between-incarnations / storm-pause stop, or a capture-only runner). This
+    /// lets a wrapper honour a "publish a last-stop outcome only for a real child stop" contract without
+    /// racing the loop for the current child: the snapshot is taken atomically under `gate`, exactly as
+    /// the loop publishes each incarnation. Unlike `StopAsync`, this does **not** await `Completion` — the
+    /// caller awaits that separately (e.g. bounded by its own host-shutdown token). The live child's stop
+    /// wait honours `cancellationToken`, and if that token fires before the child's own stop completes,
+    /// the abandoned stop task's eventual fault is observed (via `observeFault`) so a late fault never
+    /// surfaces unobserved at finalization.
+    member internal _.StopActiveAsync
+        (gracePeriod: TimeSpan, cancellationToken: CancellationToken)
+        : Task<Outcome option> =
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
+
+        match requestGracefulStop gracePeriod with
+        | None -> Task.FromResult None
+        | Some running ->
+            task {
+                let stopTask = running.StopAsync gracePeriod
+
+                try
+                    let! outcome = stopTask.WaitAsync cancellationToken
+                    return Some outcome
+                with :? OperationCanceledException ->
+                    // The host `cancellationToken` fired before the child's own stop completed; the stop
+                    // keeps running detached (there is no way to force it to stop). Observe its eventual
+                    // fault so a late fault — e.g. a pump fault while finishing off the child — never
+                    // surfaces as an unobserved task exception at finalization.
+                    observeFault stopTask
+                    return None
+            }
 
 /// Keeps a `Command` alive: runs it, classifies every exit against the `RestartPolicy` and the
 /// `StopWhen` predicate, and restarts it after an exponential-backoff delay until supervision ends.

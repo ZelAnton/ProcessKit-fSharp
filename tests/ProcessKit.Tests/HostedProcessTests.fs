@@ -87,8 +87,9 @@ type private BlockingRunner() =
 /// An `IProcessRunner` whose spawned child's graceful stop (the internal `RunningProcess.StopAsync`'s
 /// underlying `host.GracefulKill`) resolves the process exit promptly but THEN faults on a delay —
 /// simulating a pump fault while finishing off the child, arriving well after the external caller's own
-/// wait on that stop has already been abandoned by an expired token (T-128 regression coverage for
-/// `TrackingRunner.StopActiveAsync` observing the abandoned internal stop task's late fault).
+/// wait on that stop has already been abandoned by an expired token (T-128 regression coverage, now for
+/// `SupervisionSession.StopActiveAsync` — the hosting stop seam — observing the abandoned internal stop
+/// task's late fault).
 type private LateFaultingStopRunner() =
     let started =
         new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -146,12 +147,18 @@ type private LateFaultingStopRunner() =
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "not used"))
 
-/// An `IProcessRunner` whose `SpawnAsync` throws instead of returning a `Result` error — simulating a
-/// failure that escapes an already-built `Supervisor.RunAsync` rather than one it classifies itself.
+/// An `IProcessRunner` whose `SpawnAsync` fails *asynchronously* (a faulted task) instead of returning a
+/// `Result` error — simulating a failure that escapes the already-built supervision run rather than one it
+/// classifies itself. A *synchronous* throw from `SpawnAsync` is, by `SupervisionSession`'s contract, the
+/// signal for a capture-only runner (the session latches onto its capture primitive); a real spawn-capable
+/// runner that genuinely fails does so by faulting its returned task, which is what must surface as an
+/// observable `LastOutcome` rather than being silently downgraded to the capture path.
 type private ThrowingRunner() =
     interface IProcessRunner with
         member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
-            raise (InvalidOperationException "boom from ThrowingRunner")
+            Task.FromException<Result<RunningProcess, ProcessError>>(
+                InvalidOperationException "boom from ThrowingRunner"
+            )
 
         member _.CaptureStringAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "not used"))
@@ -212,6 +219,67 @@ type private SlowSpawnRunner() =
                       GracefulKill =
                         fun _ ->
                             stopRequested.TrySetResult() |> ignore
+                            finished.TrySetResult(Outcome.Signalled None) |> ignore
+                            Task.CompletedTask
+                      ResizePty = None
+                      Teardown =
+                        fun () ->
+                            stdout.Dispose()
+                            stderr.Dispose()
+                            ValueTask.CompletedTask }
+
+                Task.FromResult(Ok(new RunningProcess(host)))
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used"))
+
+/// An `IProcessRunner` whose spawned child "crashes" immediately — it is already exited with a non-zero
+/// code the moment the supervisor awaits it — so an `OnCrash` policy schedules a restart. With a long
+/// backoff configured, the loop then parks in a between-incarnations backoff sleep with NO live child.
+/// Counts spawns so a test can prove a stop taken during that sleep ends supervision promptly without ever
+/// launching the next incarnation (T-180: the stale active-child tracking bug manifested exactly here —
+/// a stop between incarnations found a stale, already-dead handle and neither interrupted the backoff nor
+/// left `LastStopOutcome` untouched).
+type private CrashThenBackoffRunner() =
+    let mutable spawnCount = 0
+
+    /// Total `SpawnAsync` calls so far — one per incarnation actually launched.
+    member _.SpawnCount = Volatile.Read(&spawnCount)
+
+    interface IProcessRunner with
+        member _.SpawnAsync(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                Interlocked.Increment(&spawnCount) |> ignore
+                let stdout = new MemoryStream()
+                let stderr = new MemoryStream()
+
+                let finished =
+                    new TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                // Crash immediately: the child is "already exited" with a non-zero code the moment the
+                // supervisor's capture awaits it, so an `OnCrash` policy schedules a backoff + restart.
+                finished.TrySetResult(Outcome.Exited 1) |> ignore
+
+                let host: RunningHost =
+                    { Config = command.Config
+                      Pid = Some 4242
+                      Stdout = Some(stdout :> Stream)
+                      Stderr = Some(stderr :> Stream)
+                      Stdin = None
+                      StartTime = DateTime.UtcNow
+                      StartedTimestamp = Stopwatch.GetTimestamp()
+                      StartTimeIdentity = None
+                      Wait = fun () -> finished.Task
+                      StdinError = fun () -> None
+                      StdinFeedComplete = ignore
+                      StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
+                      GracefulKill =
+                        fun _ ->
                             finished.TrySetResult(Outcome.Signalled None) |> ignore
                             Task.CompletedTask
                       ResizePty = None
@@ -871,14 +939,90 @@ type HostedProcessTests() =
             Assert.That(
                 completed,
                 Is.True,
-                "the host stop flag should end supervision even though the user's own StopWhen never matches"
+                "the host stop should end supervision even though the user's own StopWhen never matches"
             )
 
+            // A host-driven graceful stop now ends supervision through the `SupervisionSession`'s own
+            // graceful path, so the reason is `StopReason.Stopped` — the honest reason for a deliberate
+            // stop — rather than the `StopReason.Predicate` the previous implementation reported as an
+            // artifact of folding the host stop into a combined `StopWhen` predicate. The user's own
+            // `StopWhen` (which never matches here) is preserved untouched and simply does not fire.
             match service.LastOutcome with
-            | Some(Ok outcome) -> Assert.That(outcome.Stopped, Is.EqualTo StopReason.Predicate)
-            | other ->
-                Assert.Fail
-                    $"expected a predicate-matched outcome (from the combined host-stop predicate), got %A{other}"
+            | Some(Ok outcome) -> Assert.That(outcome.Stopped, Is.EqualTo StopReason.Stopped)
+            | other -> Assert.Fail $"expected a graceful-stop outcome (StopReason.Stopped), got %A{other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync taken between incarnations during backoff ends supervision promptly without a new incarnation``
+        ()
+        : Task =
+        task {
+            let runner = CrashThenBackoffRunner()
+
+            let inBackoff =
+                new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let configure =
+                Func<Supervisor, Supervisor>(fun supervisor ->
+                    supervisor
+                        .Restart(RestartPolicy.OnCrash)
+                        // A long, jitter-free backoff so the loop parks in the sleep long enough for the
+                        // stop below to land firmly between incarnations, with no live child.
+                        .Backoff(TimeSpan.FromSeconds 30.0, 1.0)
+                        .Jitter(false)
+                        .OnRestart(Action<SupervisorRestartEvent>(fun _ -> inBackoff.TrySetResult() |> ignore)))
+
+            let provider, hosted, service =
+                startRegisteredServiceWithRunner
+                    "backoff-crasher"
+                    (Command.create "backoff-crasher")
+                    configure
+                    (Some(runner :> IProcessRunner))
+
+            use _provider = provider
+            do! hosted.StartAsync(CancellationToken.None)
+
+            // The first incarnation crashed and the loop is now parked in the 30s backoff sleep with no
+            // live child — `OnRestart` fires immediately before that sleep (see `Supervisor.sleepBackoff`).
+            do! inBackoff.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+
+            // A stop taken here (between incarnations) must interrupt the backoff and end supervision, NOT
+            // wait the 30s out and then launch another incarnation. `StopAsync` is given no deadline, so a
+            // regression that fails to interrupt the sleep leaves it pending past the guard below rather
+            // than merely returning early on an expired token.
+            let stopTask = hosted.StopAsync(CancellationToken.None)
+            let! firstDone = Task.WhenAny(stopTask, Task.Delay(TimeSpan.FromSeconds 10.0))
+
+            Assert.That(
+                Object.ReferenceEquals(firstDone, stopTask),
+                Is.True,
+                "StopAsync taken during a backoff sleep must interrupt it, not wait the full delay out"
+            )
+
+            do! stopTask
+
+            // No live child was stopped, so a StopAsync that found nothing active must not publish a
+            // LastStopOutcome (the previous stale-handle bug published the dead incarnation's outcome here).
+            Assert.That(
+                service.LastStopOutcome.IsNone,
+                Is.True,
+                "a between-incarnations stop stopped no live child, so it must not publish a LastStopOutcome"
+            )
+
+            // Supervision actually ended, rather than looping into another incarnation.
+            Assert.That(
+                service.LastOutcome.IsSome,
+                Is.True,
+                "supervision must end promptly, not launch another incarnation after the stop"
+            )
+
+            // Exactly one incarnation ever spawned: the crashed first one. The second never started.
+            Assert.That(
+                runner.SpawnCount,
+                Is.EqualTo 1,
+                "no new incarnation may spawn after a stop taken between incarnations"
+            )
         }
         :> Task
 

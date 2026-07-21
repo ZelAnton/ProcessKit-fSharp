@@ -8,104 +8,6 @@ open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Logging.Abstractions
 open ProcessKit
 
-type internal TrackingRunner(inner: IProcessRunner) =
-    let gate = obj ()
-    let mutable current: RunningProcess option = None
-
-    let setCurrent value = lock gate (fun () -> current <- value)
-
-    let clearCurrent running =
-        lock gate (fun () ->
-            match current with
-            | Some active when Object.ReferenceEquals(active, running) -> current <- None
-            | _ -> ())
-
-    member _.StopActiveAsync(gracePeriod: TimeSpan, cancellationToken: CancellationToken) : Task<Outcome option> =
-        let active = lock gate (fun () -> current)
-
-        match active with
-        | None -> Task.FromResult None
-        | Some running ->
-            task {
-                let stopTask = running.StopAsync(gracePeriod)
-
-                try
-                    let! outcome = stopTask.WaitAsync(cancellationToken)
-                    return Some outcome
-                with :? OperationCanceledException ->
-                    // The external `cancellationToken` (observed via `WaitAsync`) fired before
-                    // `stopTask` itself completed; `stopTask` is abandoned but keeps running in the
-                    // background (there is no way to force it to stop). Observe its eventual fault so
-                    // it never surfaces as an unobserved task exception at finalization if it later
-                    // completes faulted (e.g. a pump fault while finishing off the child) — mirrors
-                    // `observeFault` in `RunningProcess` / the `OnlyOnFaulted` continuation in
-                    // `ReadinessProbe`.
-                    stopTask.ContinueWith(
-                        Action<Task<Outcome>>(fun t -> t.Exception |> ignore),
-                        TaskContinuationOptions.OnlyOnFaulted
-                        ||| TaskContinuationOptions.ExecuteSynchronously
-                    )
-                    |> ignore
-
-                    return None
-            }
-
-    /// Fire-and-forget hard-kill of whatever child is currently active, without waiting for it to
-    /// exit — the synchronous half of `Dispose`'s hard teardown (a plain `IDisposable.Dispose()`
-    /// cannot await). A no-op when no child is running. `RunningProcess.Kill()` is itself idempotent
-    /// and race-safe with a concurrent `StopAsync`/`Dispose`/repeat `Kill()`.
-    member _.KillActive() =
-        let active = lock gate (fun () -> current)
-
-        match active with
-        | Some running -> running.Kill()
-        | None -> ()
-
-    interface IProcessRunner with
-        member _.SpawnAsync(command, cancellationToken) =
-            task {
-                match! inner.SpawnAsync(command, cancellationToken) with
-                | Ok running ->
-                    setCurrent (Some running)
-                    return Ok running
-                | Error error -> return Error error
-            }
-
-        member this.CaptureStringAsync(command, cancellationToken) =
-            // Reuse `CaptureVerbs.runToCompletion` rather than a hand-rolled spawn->consume->cancel-map
-            // loop, so hosted commands get the exact same contract every other runner gets: a `Command`
-            // `CancelOn` is linked into the effective token (not silently ignored), and a run cancelled
-            // through that effective token always resolves to `Error(ProcessError.Cancelled ...)` — never
-            // an `Ok` carrying the killed child's `Signalled`/non-zero result. `start` reuses this
-            // runner's own `SpawnAsync` so the active-child tracking (`setCurrent`) still registers the
-            // handle `StopActiveAsync`/`KillActive` rely on; `consume` clears it again in `finally`, once
-            // `OutputStringAsync` has actually finished, independent of the outcome.
-            CaptureVerbs.runToCompletion
-                command
-                cancellationToken
-                (fun () -> (this :> IProcessRunner).SpawnAsync(command, cancellationToken))
-                (fun running ->
-                    task {
-                        try
-                            return! running.OutputStringAsync()
-                        finally
-                            clearCurrent running
-                    })
-
-        member this.CaptureBytesAsync(command, cancellationToken) =
-            // See `CaptureStringAsync` above for the rationale.
-            CaptureVerbs.runToCompletion
-                command
-                cancellationToken
-                (fun () -> (this :> IProcessRunner).SpawnAsync(command, cancellationToken))
-                (fun running ->
-                    task {
-                        try
-                            return! running.OutputBytesAsync()
-                        finally
-                            clearCurrent running
-                    })
-
 /// Options for a ProcessKit hosted process registered with `AddProcessKitHostedProcess`.
 [<Sealed>]
 type HostedProcessOptions() =
@@ -119,6 +21,17 @@ type HostedProcessOptions() =
             shutdownGracePeriod <- value
 
 /// An `IHostedService` wrapper over `Supervisor` for one long-lived child process.
+///
+/// **Why a `SupervisionSession`, not a hand-rolled active-child tracker.** Supervision is driven through
+/// `Supervisor.StartAsync` → `SupervisionSession`, the interactive supervision primitive, rather than
+/// `Supervisor.RunAsync` plus a bespoke tracking runner. The session is the single, already-correct owner
+/// of "which incarnation is live right now": it publishes each freshly-spawned child and clears it the
+/// instant that incarnation ends (naturally, between incarnations during a backoff/storm pause, or once
+/// supervision concludes), and its graceful stop interrupts an in-flight backoff sleep so a stop taken
+/// *between* incarnations ends supervision promptly instead of waiting the delay out and launching another
+/// child. This service delegates its own graceful stop, live telemetry, and hard teardown to that one
+/// source of truth (`SupervisionSession.StopActiveAsync`/`Status`/`Completion`), so there is no second,
+/// divergent copy of the incarnation-tracking contract to drift out of step with the loop.
 [<Sealed>]
 type HostedProcessService
     internal
@@ -131,27 +44,32 @@ type HostedProcessService
         logger: ILogger
     ) =
 
-    // Serializes every state transition below: `disposed`, `supervisionTask` (check + reassign), and
-    // the publication of `lastOutcome`/`lastStopOutcome` — so `StartAsync`/`StopAsync`/`Dispose`, called
-    // concurrently or repeatedly, resolve to one unambiguous transition apiece rather than racing on the
-    // same mutable fields (e.g. two concurrent `StartAsync` calls starting two supervision tasks, or a
-    // `StopAsync` awaiting a `supervisionTask` reference a concurrent `StartAsync` has already replaced).
+    // Serializes every state transition below: `disposed`, `supervisionTask`/`sessionReady`/`currentSession`
+    // (check + reassign), and the publication of `lastOutcome`/`lastStopOutcome` — so `StartAsync`/
+    // `StopAsync`/`Dispose`, called concurrently or repeatedly, resolve to one unambiguous transition apiece
+    // rather than racing on the same mutable fields (e.g. two concurrent `StartAsync` calls starting two
+    // supervision tasks, or a `StopAsync` awaiting a `supervisionTask` reference a concurrent `StartAsync`
+    // has already replaced). Distinct from — and never held across — the `SupervisionSession`'s own gate
+    // (`Status` reads take that lock, off this one), so the two locks never nest.
     let gate = obj ()
-    let trackingRunner = TrackingRunner runner
+    // Cancelled by hard teardown (`Dispose`/`DisposeAsync`). Cancelling it ends the session's supervision
+    // loop and hard-kills the live incarnation through the session's own per-incarnation kill-on-cancel
+    // registration (`effectiveToken.Register(running.Kill)`), so a plain `Dispose()` initiates a full hard
+    // teardown even though it cannot await the loop's unwind.
     let lifetime = new CancellationTokenSource()
-    let mutable stopping = 0
     let mutable disposed = false
     let mutable supervisionTask: Task = Task.CompletedTask
+    // Resolves the instant the background wrapper has created this run's `SupervisionSession` (or decided it
+    // never will — a `configureSupervisor` failure yields `None`). A `StopAsync` racing session creation
+    // awaits this rather than reading a possibly-not-yet-published `currentSession`, so it can never miss a
+    // child that is about to spawn and hard-cancel it instead of stopping it gracefully.
+    let mutable sessionReady: Task<SupervisionSession option> = Task.FromResult None
+    // The current run's session, published by the wrapper for synchronous, non-blocking telemetry reads
+    // (`RestartCount`/`IsStormPaused`). `None` before the first `StartAsync`, in the brief window between a
+    // fresh `StartAsync` and the wrapper publishing the session, and after a `configureSupervisor` failure.
+    let mutable currentSession: SupervisionSession option = None
     let mutable lastOutcome: Result<SupervisionOutcome, ProcessError> option = None
     let mutable lastStopOutcome: Outcome option = None
-    // Live supervision telemetry, mirrored from `Supervisor.OnRestart`/`OnStormPause` (see
-    // `runSupervision` below) so a health check (or any other observer) can read "is it storm-paused
-    // right now" / "how many restarts so far" without waiting for the final `SupervisionOutcome` —
-    // which, for a long-lived service, may never arrive. Reset at the start of each fresh supervision
-    // run (see `StartAsync`), same as `stopping`, so a restarted hosted service does not carry over a
-    // prior run's counts.
-    let mutable restartCount = 0
-    let mutable stormPaused = false
 
     let logError (ex: exn) =
         logger.LogError(ex, "ProcessKit hosted process {Name} supervision failed.", name)
@@ -179,21 +97,12 @@ type HostedProcessService
                 disposed <- true
                 true)
 
-    // The synchronous half of hard teardown, shared by `Dispose` and `DisposeAsync`: forbids new
-    // starts, hard-kills whatever child is currently active, and cancels the supervision loop (and any
-    // in-flight backoff sleep). Only ever runs once `claimTeardown` has granted the transition.
-    let beginHardTeardown () =
-        // Prevent a restart-policy decision racing this teardown from restarting the child: once
-        // the active incarnation's kill below completes its run, `StopWhen` must end supervision
-        // rather than schedule another restart.
-        Volatile.Write(&stopping, 1)
-        // Hard-kill the active child directly (belt-and-suspenders: independent of whether a
-        // registration on `lifetime.Token` happens to be live right now) ...
-        trackingRunner.KillActive()
-        // ... and cancel the supervision loop itself — this also unblocks any in-flight backoff
-        // sleep and the `TrackingRunner.CaptureStringAsync` kill-on-cancel registration, so a
-        // child that starts running just as teardown runs is still torn down.
-        cancelLifetime ()
+    // Hard teardown, shared by `Dispose` and `DisposeAsync`: cancel `lifetime` so the session's supervision
+    // loop observes the cancelled token and ends without starting another incarnation, and its
+    // per-incarnation kill-on-cancel registration hard-kills whatever child is currently live. Only ever
+    // runs once `claimTeardown` has granted the transition. `disposed` (set by `claimTeardown`) already
+    // forbids new starts, so no restart-policy decision racing this teardown can spawn a fresh child.
+    let beginHardTeardown () = cancelLifetime ()
 
     // `configureSupervisor` is caller-supplied and may throw, or — since it is a `Func` callable from
     // C# — return null. Either would otherwise be silently swallowed by the catch-all below, leaving
@@ -201,8 +110,7 @@ type HostedProcessService
     // same way a real supervision failure is surfaced: as an observable `LastOutcome`, not only a log.
     let buildSupervisor () : Result<Supervisor, ProcessError> =
         try
-            let built =
-                configureSupervisor.Invoke(Supervisor(command).WithRunner(trackingRunner))
+            let built = configureSupervisor.Invoke(Supervisor(command).WithRunner runner)
 
             if obj.ReferenceEquals(built, null) then
                 Error(ProcessError.Io $"configureSupervisor for hosted process '{name}' returned null")
@@ -211,21 +119,22 @@ type HostedProcessService
         with ex ->
             Error(ProcessError.Io $"configureSupervisor for hosted process '{name}' threw: {ex.Message}")
 
-    let runSupervision () =
+    // The background supervision run, published by `StartAsync` under `gate`. `signal` is this run's own
+    // readiness `TaskCompletionSource` (passed in, not read from the field, so a concurrent restart's fresh
+    // signal can never be completed by a stale run).
+    let runSupervision (signal: TaskCompletionSource<SupervisionSession option>) : Task =
         task {
-            // Force the async boundary *before* any real work, so the whole synchronous supervision
-            // prefix runs off the caller's thread — i.e. off the `gate` that `StartAsync` holds while it
-            // publishes `supervisionTask`. Without this yield, `runSupervision ()`'s synchronous prefix
-            // (the caller-supplied `configureSupervisor` inside `buildSupervisor`, then the native
-            // first-incarnation spawn reached synchronously inside `Supervisor.RunAsync` —
-            // `ProcessGroup.Create()` + `StartInternal`, i.e. CreateProcessW/posix_spawnp) would execute
-            // inline under that lock: it would block every `gate` reader (`IsSupervisionActive`/
-            // `RestartCount`/`IsStormPaused`/`LastOutcome`, and transitively `HostedProcessHealthCheck`)
-            // for the full spawn, run caller code under the service's own lock (a deadlock risk if the
-            // callback touches this service from another thread), and make `StartAsync` slow against the
-            // spirit of `IHostedService`. Publishing the `Task` handle stays synchronous under the lock
-            // (so `StopAsync`/`Dispose`/`DisposeAsync` snapshot exactly this task); only the *run* is
-            // deferred past this point.
+            // Force the async boundary *before* any real work, so the whole synchronous supervision prefix
+            // runs off the caller's thread — i.e. off the `gate` that `StartAsync` holds while it publishes
+            // this task. Without this yield, the caller-supplied `configureSupervisor` (inside
+            // `buildSupervisor`) and the native first-incarnation spawn (reached synchronously inside the
+            // session's loop start) would execute inline under that lock: they would block every `gate`
+            // reader (`IsSupervisionActive`/`RestartCount`/`IsStormPaused`/`LastOutcome`, and transitively
+            // `HostedProcessHealthCheck`), run caller code under the service's own lock (a deadlock risk if
+            // the callback touches this service from another thread), and make `StartAsync` slow against the
+            // spirit of `IHostedService`. Publishing the `Task` handle stays synchronous under the lock (so
+            // `StopAsync`/`Dispose`/`DisposeAsync` snapshot exactly this task); only the *run* is deferred
+            // past this point.
             do! Task.Yield()
 
             try
@@ -237,69 +146,38 @@ type HostedProcessService
                         err.Message
                     )
 
+                    signal.TrySetResult None |> ignore
                     publishOutcome (Error err)
                 | Ok supervisor ->
-                    // Combine the host's own stop flag with whatever `StopWhen` predicate the caller
-                    // already configured via `configureSupervisor` — `Supervisor.StopWhen` *replaces*
-                    // `config.StopWhen`, so calling it again here without reading `CurrentStopWhen`
-                    // first would silently drop the caller's predicate.
-                    let userStopWhen = supervisor.CurrentStopWhen
+                    // Start the interactive session and publish it — both as the synchronous telemetry
+                    // snapshot (`currentSession`) and as the awaited readiness signal (`sessionReady`) —
+                    // BEFORE awaiting its completion, so a concurrent `StopAsync` racing session creation
+                    // still reaches the real session rather than missing a child about to spawn.
+                    // `Supervisor.StartAsync` returns synchronously (the session's loop yields before its
+                    // first spawn), so the session exists the instant this resumes.
+                    let! session = supervisor.StartAsync lifetime.Token
+                    lock gate (fun () -> currentSession <- Some session)
+                    signal.TrySetResult(Some session) |> ignore
 
-                    let supervisor =
-                        supervisor.StopWhen(
-                            Func<ProcessResult<string>, bool>(fun result ->
-                                Volatile.Read(&stopping) <> 0
-                                || (match userStopWhen with
-                                    | Some predicate -> predicate result
-                                    | None -> false))
-                        )
-
-                    // Same combine-don't-replace treatment for `OnRestart`/`OnStormPause`: track the
-                    // live restart count and storm-pause flag for `RestartCount`/`IsStormPaused`
-                    // without dropping whatever handler the caller already installed via
-                    // `configureSupervisor`. `OnStormPause` is always immediately followed — in the
-                    // same loop iteration, before the next incarnation — by an `OnRestart` call (a
-                    // storm pause only ever precedes that restart's own backoff), so clearing
-                    // `stormPaused` from the `OnRestart` handler exactly brackets the real pause
-                    // window without needing a dedicated "pause ended" event.
-                    let userOnRestart = supervisor.CurrentOnRestart
-                    let userOnStormPause = supervisor.CurrentOnStormPause
-
-                    let supervisor =
-                        supervisor
-                            .OnRestart(
-                                Action<SupervisorRestartEvent>(fun event ->
-                                    lock gate (fun () ->
-                                        restartCount <- event.Restart
-                                        stormPaused <- false)
-
-                                    match userOnRestart with
-                                    | Some handler -> handler event
-                                    | None -> ())
-                            )
-                            .OnStormPause(
-                                Action<SupervisorStormPauseEvent>(fun event ->
-                                    lock gate (fun () -> stormPaused <- true)
-
-                                    match userOnStormPause with
-                                    | Some handler -> handler event
-                                    | None -> ())
-                            )
-
-                    let! outcome = supervisor.RunAsync(lifetime.Token)
+                    // `SupervisionSession.Completion` never faults for an *expected* end (policy/predicate/
+                    // budget/stop/cancellation are all folded into its `Result`); it faults only for an
+                    // exception that escaped the run itself — e.g. the injected `IProcessRunner` threw
+                    // rather than returning a `Result` error — which the catch-all below turns into an
+                    // observable `LastOutcome` failure.
+                    let! outcome = session.Completion
                     publishOutcome outcome
             with
             | :? OperationCanceledException ->
-                // Host shutdown cancelled the background supervision wait; the child stop path has
-                // already observed the host token, so there is no further recovery to perform here.
-                ()
+                // Host shutdown cancelled the background supervision start; the child stop path has already
+                // observed the host token, so there is no further recovery to perform here.
+                signal.TrySetResult None |> ignore
             | ex ->
-                // An exception here is not a `configureSupervisor` failure (that is already handled
-                // above, via `buildSupervisor`) — it escaped the already-built `Supervisor.RunAsync`
-                // itself (e.g. the injected `IProcessRunner` threw instead of returning a `Result`
-                // error). Publish it the same way any other supervision failure is published: as an
-                // observable `LastOutcome`, not only a log — otherwise a caller reading `LastOutcome`
-                // sees `None` and believes supervision is still active when it has in fact crashed.
+                // An exception here escaped the already-built supervisor's own run (e.g. the injected
+                // `IProcessRunner` threw instead of returning a `Result` error). Publish it the same way any
+                // other supervision failure is published: as an observable `LastOutcome`, not only a log —
+                // otherwise a caller reading `LastOutcome` sees `None` and believes supervision is still
+                // active when it has in fact crashed.
+                signal.TrySetResult None |> ignore
                 logError ex
                 publishOutcome (Error(ProcessError.Io $"hosted process '{name}' supervision failed: {ex.Message}"))
         }
@@ -318,7 +196,8 @@ type HostedProcessService
     /// The logical service name supplied during registration.
     member _.Name = name
 
-    /// The last result returned by `Supervisor.RunAsync`, when supervision has ended.
+    /// The last result the supervision session reported through its `Completion`, when supervision has
+    /// ended.
     member _.LastOutcome = lock gate (fun () -> lastOutcome)
 
     /// The outcome returned by the child process stop operation during host shutdown, when one ran.
@@ -329,25 +208,31 @@ type HostedProcessService
 
     /// Whether the background supervision loop is currently running: `true` from a successful
     /// `StartAsync` until supervision ends (naturally, via `StopAsync`, or via `Dispose`/`DisposeAsync`)
-    /// — i.e. `LastOutcome` is still `None` and teardown has not begun. `false` before the first
-    /// `StartAsync`, once supervision has ended (`LastOutcome` is `Some`), or once `Dispose`/
-    /// `DisposeAsync` has claimed teardown (even if the loop has not quite finished unwinding yet — see
-    /// `IDisposable.Dispose`). The primary "is it alive" signal for a health check.
+    /// — i.e. teardown has not begun and the supervision `Task` has not yet completed. `false` before the
+    /// first `StartAsync`, once supervision has ended, or once `Dispose`/`DisposeAsync` has claimed
+    /// teardown (even if the loop has not quite finished unwinding yet — see `IDisposable.Dispose`). The
+    /// primary "is it alive" signal for a health check.
     member _.IsSupervisionActive =
         lock gate (fun () -> not disposed && not supervisionTask.IsCompleted)
 
-    /// How many restarts the current (or most recent) supervision run has made so far, live —
-    /// mirrors `SupervisionOutcome.Restarts` but updates as each restart happens (via
-    /// `Supervisor.OnRestart`), rather than only once supervision ends. Reset to `0` at the start of
-    /// each fresh `StartAsync`.
-    member _.RestartCount = lock gate (fun () -> restartCount)
+    /// How many restarts the current (or most recent) supervision run has made so far, live — mirrors
+    /// `SupervisionOutcome.Restarts` but updates as each restart happens, read straight from the
+    /// supervision session's live `Status`. `0` before the current run's session has been published (a
+    /// fresh `StartAsync` before the first spawn), and reset naturally by each fresh session.
+    member _.RestartCount =
+        match lock gate (fun () -> currentSession) with
+        | Some session -> session.Status.Restarts
+        | None -> 0
 
     /// Whether the supervised child is currently paused by the failure-storm guard
-    /// (`Supervisor.StormPause`), live — set from `Supervisor.OnStormPause` and cleared once the
-    /// paused restart actually happens (`Supervisor.OnRestart`). Always `false` when `StormPause` was
-    /// never configured. A reasonable "Degraded" signal for a health check: supervision is still
-    /// alive, but restarts are being throttled because failures are clustering.
-    member _.IsStormPaused = lock gate (fun () -> stormPaused)
+    /// (`Supervisor.StormPause`), live — read straight from the supervision session's `Status`. Always
+    /// `false` when `StormPause` was never configured, or before the current run's session is published.
+    /// A reasonable "Degraded" signal for a health check: supervision is still alive, but restarts are
+    /// being throttled because failures are clustering.
+    member _.IsStormPaused =
+        match lock gate (fun () -> currentSession) with
+        | Some session -> session.Status.IsStormPaused
+        | None -> false
 
     interface IHostedService with
         /// Starts (or restarts, once a prior supervision has ended) the background supervision loop.
@@ -357,73 +242,84 @@ type HostedProcessService
         /// starting supervision or spawning a child. A no-op once `Dispose` has run — `Dispose`
         /// permanently forbids new starts.
         ///
-        /// Fast and non-blocking: only the state transition (reset `stopping`/counters, publish the
-        /// supervision `Task` handle) runs under `gate`. The actual supervision start — the caller's
-        /// `configureSupervisor` and the native spawn of the first incarnation — is forced off the lock
-        /// by the leading `Task.Yield()` in `runSupervision`, so gate readers (`IsSupervisionActive`
-        /// et al.) are never blocked for the spawn and caller code never runs under the service's lock.
+        /// Fast and non-blocking: only the state transition (forget the prior run's session snapshot,
+        /// mint a fresh readiness signal, publish the supervision `Task` handle) runs under `gate`. The
+        /// actual supervision start — the caller's `configureSupervisor` and the native spawn of the first
+        /// incarnation — is forced off the lock by the leading `Task.Yield()` in `runSupervision`, so gate
+        /// readers (`IsSupervisionActive` et al.) are never blocked for the spawn and caller code never runs
+        /// under the service's lock.
         member _.StartAsync(cancellationToken) =
             if cancellationToken.IsCancellationRequested then
                 Task.FromCanceled cancellationToken
             else
                 lock gate (fun () ->
                     if not disposed && supervisionTask.IsCompleted then
-                        // A restart after a prior `StopAsync` must not inherit that stop's request —
-                        // otherwise the fresh supervision loop's `StopWhen` predicate would be true from
-                        // its very first run and it would immediately end supervision again.
-                        Interlocked.Exchange(&stopping, 0) |> ignore
-                        // Likewise, a fresh supervision run must not carry over a prior run's restart
-                        // count / storm-pause flag — this is a new lifetime, not a continuation.
-                        restartCount <- 0
-                        stormPaused <- false
-                        // `runSupervision ()` yields before any real work (see its leading `Task.Yield()`),
-                        // so this call returns an already-suspended, not-yet-completed task immediately:
-                        // the handle is published under `gate` here (so `StopAsync`/`Dispose`/`DisposeAsync`
+                        // A fresh run is a new lifetime, not a continuation: forget the previous run's
+                        // session so telemetry (`RestartCount`/`IsStormPaused`) reads its defaults until the
+                        // new session publishes, and hand the wrapper a fresh readiness signal that a racing
+                        // `StopAsync` can await. The session itself resets its own restart count / storm-pause
+                        // flag, so nothing carries over.
+                        currentSession <- None
+
+                        let signal =
+                            TaskCompletionSource<SupervisionSession option>(
+                                TaskCreationOptions.RunContinuationsAsynchronously
+                            )
+
+                        sessionReady <- signal.Task
+                        // `runSupervision` yields before any real work (see its leading `Task.Yield()`), so
+                        // this call returns an already-suspended, not-yet-completed task immediately: the
+                        // handle is published under `gate` here (so `StopAsync`/`Dispose`/`DisposeAsync`
                         // snapshot exactly it, with no "Stop saw a stale/null task" window), while the
                         // configure-and-spawn prefix runs off the lock. `IsCompleted` is therefore `false`
-                        // the instant the handle is assigned, so a racing second `StartAsync` sees an
-                        // active task and does not start a second supervision loop.
-                        supervisionTask <- runSupervision ()
+                        // the instant the handle is assigned, so a racing second `StartAsync` sees an active
+                        // task and does not start a second supervision loop.
+                        supervisionTask <- runSupervision signal
 
                     Task.CompletedTask)
 
-        /// Requests a graceful stop: signals the restart policy to end supervision after the active
-        /// child concludes, stops that active child (honouring `HostedProcessOptions.ShutdownGracePeriod`),
-        /// then awaits the supervision loop's own end. Race-safe with a concurrent `Dispose` — cancelling
-        /// an already-disposed `lifetime` is expected and swallowed, and the supervision task awaited
-        /// here is snapshotted once so a concurrent `StartAsync` reassigning it cannot be raced.
+        /// Requests a graceful stop: stops the current live incarnation through its own graceful path
+        /// (`RunningProcess.StopAsync`, honouring `HostedProcessOptions.ShutdownGracePeriod`) and interrupts
+        /// any in-flight backoff sleep, so the supervision loop ends promptly — with the current child's
+        /// honest result when one was live, or between incarnations with the last incarnation's — and
+        /// launches no further child. Then awaits the supervision loop's own end. Race-safe with a
+        /// concurrent `Dispose` and with session creation: the run's session is reached through the
+        /// `sessionReady` signal (so a stop that predates the first spawn still finds the real session),
+        /// and the supervision task awaited here is snapshotted once so a concurrent `StartAsync`
+        /// reassigning it cannot be raced.
         member _.StopAsync(cancellationToken) =
             task {
-                Volatile.Write(&stopping, 1)
+                let ready, toAwait = lock gate (fun () -> sessionReady, supervisionTask)
 
-                let! stopped = trackingRunner.StopActiveAsync(options.ShutdownGracePeriod, cancellationToken)
+                // Reach this run's session (if any) and stop it gracefully.
+                try
+                    let! session = ready.WaitAsync cancellationToken
 
-                // Only publish when a stop actually ran (`stopped.IsSome`) — see `LastStopOutcome`'s
-                // doc-comment. A repeat or lone `StopAsync` that finds no active child (`stopped =
-                // None`) must not stomp a previously published real outcome.
-                if stopped.IsSome then
-                    lock gate (fun () -> lastStopOutcome <- stopped)
+                    match session with
+                    | Some session ->
+                        let! stopped = session.StopActiveAsync(options.ShutdownGracePeriod, cancellationToken)
 
-                // Only cancel `lifetime` here when there was no active child to gracefully stop above
-                // (`stopped = None`): with an active child, `stopping` (set just above) already makes
-                // the combined `StopWhen` end the supervision loop on THAT child's own honest capture
-                // result once it returns (`CaptureVerbs.runToCompletion`'s post-consume check watches
-                // this very `lifetime.Token`) — cancelling it here as well would race that still-finishing
-                // capture and risk overwriting a legitimate graceful outcome with a bare `Cancelled`
-                // error, discarding the real exit/stdout/stderr the caller expects via `LastOutcome`.
-                // With no active child (e.g. supervision is mid-backoff-sleep, or hasn't spawned yet),
-                // there is nothing else to unblock the loop, so cancel `lifetime` to interrupt any
-                // in-flight backoff sleep and end supervision promptly.
-                if stopped.IsNone then
-                    cancelLifetime ()
-
-                let toAwait = lock gate (fun () -> supervisionTask)
+                        // Only publish when a live child was actually stopped (`stopped.IsSome`) — see
+                        // `LastStopOutcome`'s doc-comment. A stop that found no active child (a repeat/lone
+                        // stop, or one taken between incarnations during a backoff sleep) must not stomp a
+                        // previously published real outcome; the session's own `stopping` flag + interrupted
+                        // backoff still end supervision promptly without launching another incarnation.
+                        if stopped.IsSome then
+                            lock gate (fun () -> lastStopOutcome <- stopped)
+                    | None ->
+                        // No session for this run: supervision was never started, or `configureSupervisor`
+                        // failed and supervision already ended — nothing to stop.
+                        ()
+                with :? OperationCanceledException ->
+                    // The host stop token expired before the session was reachable / its child stop
+                    // completed; the child stop path already observed the same token, so returning lets the
+                    // host enforce its shutdown deadline.
+                    ()
 
                 try
-                    do! toAwait.WaitAsync(cancellationToken)
+                    do! toAwait.WaitAsync cancellationToken
                 with :? OperationCanceledException ->
-                    // The host stop token expired; the active child stop path already used the same
-                    // token, so returning lets the host enforce its shutdown deadline.
+                    // As above: the host stop token expired while awaiting the loop's end.
                     ()
             }
             :> Task
