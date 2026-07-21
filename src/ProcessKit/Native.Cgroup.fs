@@ -60,10 +60,11 @@ module internal Cgroup =
         let quota = CgroupCpuMax.calculateQuota cores
         CgroupCpuMax.formatCpuMax quota
 
-    // Enable the controllers the requested limits need (only the missing ones) in the parent's
-    // `cgroup.subtree_control`, then write the caps into the child cgroup. Raises on failure (notably
-    // EBUSY writing subtree_control when this process is not at the real cgroup root).
-    let private applyCgroupLimits (parent: string) (cgroupPath: string) (limits: ResourceLimits) =
+    // Enable the controllers the given limits need (only the missing ones) in the parent's
+    // `cgroup.subtree_control`. Shared by creation and the live update, so both enable exactly the
+    // controllers their cap set requires. Raises on failure (notably EBUSY writing subtree_control when
+    // this process is not at the real cgroup root).
+    let private enableNeededControllers (parent: string) (limits: ResourceLimits) =
         let needed =
             [ if limits.MemoryMax.IsSome then
                   "memory"
@@ -86,6 +87,12 @@ module internal Cgroup =
         if not (List.isEmpty toEnable) then
             let spec = toEnable |> List.map (fun c -> "+" + c) |> String.concat " "
             File.WriteAllText(subtreeFile, spec)
+
+    // Enable the controllers the requested limits need (only the missing ones) in the parent's
+    // `cgroup.subtree_control`, then write the caps into the child cgroup. Raises on failure (notably
+    // EBUSY writing subtree_control when this process is not at the real cgroup root).
+    let private applyCgroupLimits (parent: string) (cgroupPath: string) (limits: ResourceLimits) =
+        enableNeededControllers parent limits
 
         match limits.MemoryMax with
         | Some bytes -> File.WriteAllText(Path.Combine(cgroupPath, "memory.max"), string bytes)
@@ -132,6 +139,42 @@ module internal Cgroup =
                     Ok path
             with ex ->
                 Error ex.Message
+
+    /// Apply a new limit set to an EXISTING cgroup in place (the live `ProcessGroup.UpdateLimits` path),
+    /// without recreating the cgroup or restarting its members. Enables any controller the new caps
+    /// newly need in the parent's `cgroup.subtree_control`, then rewrites `memory.max`/`pids.max`/
+    /// `cpu.max`. REPLACE semantics, mirroring the Windows Job path: a dimension now `None` is reset to
+    /// the controller's unbounded `max` sentinel — but only where that controller's interface file
+    /// already exists (a controller never enabled at creation is already unbounded, and its `*.max` file
+    /// would not exist to write). Returns an error message on any write/delegation failure (e.g. EBUSY
+    /// when not at the real cgroup root), which the backend turns into `ProcessError.ResourceLimit`.
+    let updateCgroupLimits (cgroupPath: string) (limits: ResourceLimits) : Result<unit, string> =
+        try
+            // The cgroup is always a subdirectory of its parent (`.../<parent>/processkit-<pid>-<id>`),
+            // so `GetDirectoryName` yields the real parent; the null case (a root/empty path) can't arise
+            // for a tracked cgroup but is handled honestly rather than assumed away.
+            match Path.GetDirectoryName cgroupPath with
+            | null -> Error $"could not determine the parent cgroup of {cgroupPath}"
+            | parent ->
+                enableNeededControllers parent limits
+
+                // Some -> write the cap; None -> reset to unbounded, but only if the controller file
+                // exists (a never-enabled controller is already unbounded, with no file to reset).
+                let setOrClear (fileName: string) (value: string option) =
+                    let file = Path.Combine(cgroupPath, fileName)
+
+                    match value with
+                    | Some v -> File.WriteAllText(file, v)
+                    | None ->
+                        if File.Exists file then
+                            File.WriteAllText(file, "max")
+
+                setOrClear "memory.max" (limits.MemoryMax |> Option.map string)
+                setOrClear "pids.max" (limits.MaxProcesses |> Option.map string)
+                setOrClear "cpu.max" (limits.CpuQuota |> Option.map cpuMaxValue)
+                Ok()
+        with ex ->
+            Error ex.Message
 
     // Raw libc for the cgroup.procs write. Done via `open`/`write`/`close` rather than
     // `File.WriteAllText` so the exact errno is available (`Marshal.GetLastWin32Error`), which is what

@@ -227,6 +227,89 @@ type LimitsTests() =
         :> Task
 
     [<Test>]
+    member _.``UpdateLimits on the POSIX process-group backend is an honest typed ResourceLimit``() =
+        // The process-group mechanism has no whole-tree limit primitive, so a LIVE limit update must be
+        // refused the same typed way `Create` refuses to build a limited group over it — never a silent
+        // no-op pretending caps were applied. Backend-level, so it runs on every platform.
+        let backend: IContainmentBackend = ProcessGroupBackend()
+        let newLimits = ResourceLimits.None.WithMemoryMax(128L * 1024L * 1024L)
+
+        match backend.UpdateLimits newLimits with
+        | Error(ProcessError.ResourceLimit detail) -> Assert.That(detail, Is.Not.Empty)
+        | other -> Assert.Fail $"expected ProcessError.ResourceLimit, got {other}"
+
+    [<Test>]
+    member _.``UpdateLimits on a limit-free group (POSIX process-group mechanism) returns ResourceLimit``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "a limit-free group on Windows is still a Job Object, which CAN update limits"
+            else
+                // A no-limits group uses the POSIX process-group mechanism, which cannot enforce
+                // whole-tree limits — a live update is refused with the same typed error, through the
+                // public verb (not just the backend).
+                match ProcessGroup.Create() with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok group ->
+                    use group = group
+                    Assert.That(group.Mechanism, Is.EqualTo Mechanism.ProcessGroup)
+
+                    match group.UpdateLimits(ResourceLimits.None.WithMaxProcesses 32) with
+                    | Error(ProcessError.ResourceLimit _) -> ()
+                    | other -> Assert.Fail $"expected ResourceLimit updating a process-group group, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``UpdateLimits re-applies caps to a live limit-capable group and refreshes the Options snapshot``
+        ()
+        : Task =
+        task {
+            let options =
+                ProcessGroupOptions().WithMemoryMax(256L * 1024L * 1024L).WithMaxProcesses(64)
+
+            // Only meaningful where a real limit container exists: Windows (always a Job Object) and
+            // Linux at the real cgroup root. Elsewhere `Create` fails fast (macOS, unprivileged Linux),
+            // so there is nothing live to update and the test is not applicable.
+            match ProcessGroup.Create options with
+            | Error(ProcessError.ResourceLimit _) when not isWindows ->
+                Assert.Ignore "no live limit-capable container here (macOS, or Linux not at the real cgroup root)"
+            | Error error -> Assert.Fail $"{error}"
+            | Ok group ->
+                use group = group
+
+                // A different cap set: tighten memory, add a CPU quota, and DROP the process cap — so the
+                // None-clears-to-unbounded replace path is exercised alongside the applied caps.
+                let updated =
+                    ResourceLimits.None.WithMemoryMax(128L * 1024L * 1024L).WithCpuQuota(1.0)
+
+                match group.UpdateLimits updated with
+                | Ok() ->
+                    // The `Options` snapshot a consumer reads back reflects exactly the new set.
+                    Assert.That(group.Options.Limits.MemoryMax, Is.EqualTo(Some(128L * 1024L * 1024L)))
+                    Assert.That(group.Options.Limits.CpuQuota, Is.EqualTo(Some 1.0))
+                    Assert.That(group.Options.Limits.MaxProcesses, Is.EqualTo None)
+
+                    // The re-tuned group still runs children (the container was updated in place, not
+                    // torn down or recreated).
+                    match! runInGroup group with
+                    | Ok result -> Assert.That(result.Stdout, Does.Contain "limited")
+                    | Error error -> Assert.Fail $"{error}"
+                | Error error -> Assert.Fail $"UpdateLimits on a live limit-capable group failed: {error}"
+
+                // A second update that DROPS the CPU quota (Some -> None) — exercises clearing a
+                // previously-applied cap in place (Windows disables the live Job's CPU rate control; the
+                // cgroup resets cpu.max to unbounded). It must apply cleanly and the snapshot must show
+                // CPU gone, memory kept.
+                match group.UpdateLimits(ResourceLimits.None.WithMemoryMax(128L * 1024L * 1024L)) with
+                | Ok() ->
+                    Assert.That(group.Options.Limits.CpuQuota, Is.EqualTo None)
+                    Assert.That(group.Options.Limits.MemoryMax, Is.EqualTo(Some(128L * 1024L * 1024L)))
+                    Assert.That(group.Options.Limits.MaxProcesses, Is.EqualTo None)
+                | Error error -> Assert.Fail $"dropping the CPU quota on a live group failed: {error}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``a failed cgroup migration kills the child and returns an honest error``() : Task =
         task {
             if isWindows || isMacOs then

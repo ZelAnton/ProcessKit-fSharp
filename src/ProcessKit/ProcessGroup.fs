@@ -34,6 +34,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // one-shot teardown.
     let mutable releasedFlag = 0
 
+    // The group's live options snapshot. `options` is the CREATE-time value; `UpdateLimits` swaps in a
+    // new set here (under `sync`, only AFTER the backend applied the new limits) so `member _.Options`
+    // reads back the caps actually in force. A plain reference field: a read is atomic (a consumer sees
+    // either the old or the new immutable snapshot, never a torn one), and every write is serialized
+    // under the lifecycle lock alongside the backend call it reflects.
+    let mutable currentOptions = options
+
     let waitOutcome (handle: nativeint) : Task<Outcome> = backend.Wait handle
 
     // Spawn + track as one transaction. The caller runs this under `sync` (via `WhenLive`) so the whole
@@ -75,8 +82,9 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// The OS primitive containing this group on the current platform.
     member _.Mechanism = backend.Mechanism
 
-    /// The options the group was created with (shutdown grace, resource limits).
-    member _.Options = options
+    /// The options the group is currently configured with (shutdown grace, resource limits). The
+    /// resource limits reflect the latest successful `UpdateLimits`, not only the create-time set.
+    member _.Options = currentOptions
 
     /// Create a new, empty kill-on-dispose group on the current platform (no resource limits).
     static member Create() : Result<ProcessGroup, ProcessError> =
@@ -437,6 +445,33 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     member this.Resume() : Result<unit, ProcessError> =
         this.WhenLive(fun () -> backend.Resume())
 
+    /// Apply a new whole-tree resource-limit set to this **live** group, without recreating it or
+    /// restarting its children — adaptive resource control (tighten memory on a sagging batch, widen a
+    /// long-lived worker pool's CPU quota) at runtime. The `limits` are a full REPLACEMENT of the caps
+    /// in force: a dimension left `None` becomes unbounded again, not left at its previous cap.
+    ///
+    /// A limit-capable mechanism re-applies the caps to its live container — **Windows** re-issues
+    /// `SetInformationJobObject` on the Job, **Linux cgroup v2** rewrites `memory.max`/`pids.max`/
+    /// `cpu.max` — while the **POSIX process-group** mechanism (macOS/BSD, or Linux without cgroup v2)
+    /// has no whole-tree limit primitive and returns `ProcessError.ResourceLimit`, the same honest,
+    /// typed refusal `Create` gives for a limited group there — never a silent no-op.
+    ///
+    /// Routed through the same lifecycle gate as the other control verbs: the released-flag check AND
+    /// the native re-apply run in one critical section, so a call racing (or following) teardown either
+    /// applies fully on the live container or observes the flag and returns a non-transient
+    /// `ProcessError.Unsupported` BEFORE touching the closed/recycled native handle — never a
+    /// use-after-teardown. Only on a successful apply is the `Options` snapshot swapped to the new set,
+    /// under the same lock, so `Options.Limits` a consumer reads back matches what is actually enforced.
+    member this.UpdateLimits(limits: ResourceLimits) : Result<unit, ProcessError> =
+        this.WhenLive(fun () ->
+            match backend.UpdateLimits limits with
+            | Ok() ->
+                // Reflect the new caps only after the backend confirms they applied — a failed apply
+                // leaves both the container and the readable snapshot on the previous set.
+                currentOptions <- currentOptions.WithLimits limits
+                Ok()
+            | Error error -> Error error)
+
     /// A snapshot of the group's resource usage. On Windows this reads the Job Object's accounting
     /// (CPU + peak committed memory + active count); on cgroup v2 the cgroup accounting; on the POSIX
     /// fallback only the live group count (CPU/memory are `None`). Errors once the group is released.
@@ -529,7 +564,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// `ShutdownAsync` using the group's configured `Options.ShutdownTimeout`.
     member this.ShutdownAsync() : Task =
-        this.ShutdownAsync options.ShutdownTimeout
+        this.ShutdownAsync currentOptions.ShutdownTimeout
 
     // The finalizer is the GC-time safety net for a group that was never disposed: it reaps the
     // tree. Deterministic teardown still comes from `use`/`Dispose`.

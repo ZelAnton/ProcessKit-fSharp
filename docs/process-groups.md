@@ -574,6 +574,50 @@ if (created is { IsOk: false, ErrorValue: var err })
 using var group = created.GetValueOrThrow(); // ...
 ```
 
+### Updating limits on a live group
+
+Limits are not frozen at creation. `UpdateLimits(ResourceLimits)` re-applies a new
+cap set to a **live** group — no recreation, no restart of the children — for
+adaptive resource control: tighten memory on a batch that started sagging, widen a
+long-lived worker pool's CPU quota under load, or drop a cap you no longer need.
+The `ResourceLimits` you pass is a **full replacement** of the caps in force: a
+dimension left `None` is reset to *unbounded*, not left at its previous value.
+
+**F#**
+
+```fsharp
+// Halve the memory ceiling and drop the CPU cap on an already-running group.
+match group.UpdateLimits(ResourceLimits.None.WithMemoryMax(256L * 1024L * 1024L)) with
+| Ok() -> () // Options.Limits now reads back the new set
+| Error(ProcessError.ResourceLimit message) -> eprintfn $"cannot update limits here: {message}"
+| Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+var updated = group.UpdateLimits(ResourceLimits.None.WithMemoryMax(256L * 1024L * 1024L));
+if (updated is { IsOk: false, ErrorValue: var err })
+    Console.Error.WriteLine(err.Message);
+```
+
+Behaviour follows the mechanism, honestly and without a silent downgrade:
+
+| Mechanism | `UpdateLimits` |
+|---|---|
+| Windows Job Object | ✅ re-applies via `SetInformationJobObject` on the live job |
+| Linux cgroup v2 | ✅ rewrites `memory.max` / `pids.max` / `cpu.max` in place |
+| POSIX process group / macOS / BSD | ❌ `ProcessError.ResourceLimit` (no whole-tree limit primitive to update) |
+
+On the POSIX process-group mechanism there is no container to re-tune, so
+`UpdateLimits` returns `ProcessError.ResourceLimit` — the same typed refusal
+`Create` gives for a limited group there — rather than pretending the caps were
+applied. It is an **optional runtime operation**: a group that never needs to
+change its caps simply never calls it. After a successful update,
+`group.Options.Limits` reflects the new set; the call also passes through the
+group's lifecycle gate, so invoking it after the group has been disposed/torn down
+returns a typed error rather than touching the released container.
+
 ## Stats
 
 `Stats()` returns a point-in-time `ProcessGroupStats` snapshot of the group's

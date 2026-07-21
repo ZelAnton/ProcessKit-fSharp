@@ -128,10 +128,11 @@ type internal IContainmentBackend =
     abstract Suspend: unit -> Result<unit, ProcessError>
     abstract Resume: unit -> Result<unit, ProcessError>
     abstract Stats: unit -> Result<ProcessGroupStats, ProcessError>
+    abstract UpdateLimits: ResourceLimits -> Result<unit, ProcessError>
     abstract HardRelease: unit -> unit
 ```
 
-The current interface has 15 abstract members:
+The current interface has 16 abstract members:
 
 - `Mechanism` identifies the primitive honestly.
 - `Spawn` starts a child, initially not in the backend's tracking collection.
@@ -146,6 +147,7 @@ The current interface has 15 abstract members:
 - `Signal` broadcasts a signal.
 - `Suspend` and `Resume` control the tree.
 - `Stats` snapshots resource use.
+- `UpdateLimits` re-applies a full replacement resource-limit set to the live container (Job Object / cgroup v2); the process-group mechanism has no primitive to update and returns `ProcessError.ResourceLimit`.
 - `HardRelease` performs the once-only hard teardown and frees the container.
 
 `TrackedChildren<'T>` serializes `Add`, `Remove`, `Snapshot`, and `Drain` behind one lock. `Drain` is essential during teardown: it atomically transfers ownership of every recorded child to the teardown path. A mere snapshot would allow a racing cleanup to act twice on a recycled PID or handle.
@@ -156,7 +158,7 @@ The implementation is split across four files. `Native.Windows.fs`, `Native.Posi
 
 ### Windows Job Object
 
-`JobObjectBackend` owns one Job handle plus child process handles. `Native.Windows.spawnWindows` creates the process suspended, assigns it to the Job, and only then resumes it. This prevents a child from escaping by forking before assignment. The Job has `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; closing the Job is the final kill-on-drop guarantee. Requested memory, process-count, and CPU limits are applied through Job Object limit APIs.
+`JobObjectBackend` owns one Job handle plus child process handles. `Native.Windows.spawnWindows` creates the process suspended, assigns it to the Job, and only then resumes it. This prevents a child from escaping by forking before assignment. The Job has `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; closing the Job is the final kill-on-drop guarantee. Requested memory, process-count, and CPU limits are applied through Job Object limit APIs, and `UpdateLimits` re-issues the same `SetInformationJobObject` calls on the live Job to replace the caps in force (a dimension now `None` is written back as unbounded, and the CPU rate control is disabled when no quota is set) — run synchronously under the lifecycle lock like the other control verbs, so it needs no handle duplication.
 
 `Signal.Kill` terminates the Job atomically. `Signal.Int` and `Signal.Term` are not Unix signals: they map to a best-effort soft stop built from two complementary, individually pid-targeted deliveries. For children explicitly started with `Command.WindowsCtrlSignals()`, ProcessKit sends `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` — the child is created with `CREATE_NEW_PROCESS_GROUP`, so its PID is its console group ID and only CTRL+BREAK (not CTRL+C) can be group-targeted; this reaches *console* children. In addition, a `WM_CLOSE` is posted to the top-level windows of every member that has one (located by pid via `GetWindowThreadProcessId`, so no window outside the group is hit); this reaches *windowed* children (Electron/GUI tools) that have no console to signal. Delivery is a best-effort `Ok` when either mechanism reaches at least one member — delivery, not the child's compliance (a child may install a handler or a window may veto the close). It returns `Unsupported` only when the group has *neither* a CTRL-capable child *nor* any windowed member, and never silently becomes a hard kill. Other signals are unsupported.
 
@@ -172,7 +174,7 @@ The fallback has no kernel tree resource limits and its `Stats` can report only 
 
 ### Linux cgroup v2
 
-`CgroupBackend` is selected only on Linux when resource limits are requested. `Native.Cgroup` probes `/sys/fs/cgroup` and the hybrid `/sys/fs/cgroup/unified`, requiring a non-empty `cgroup.controllers`. Creation enables the required `memory`, `pids`, and/or `cpu` controllers and writes `memory.max`, `pids.max`, and `cpu.max`.
+`CgroupBackend` is selected only on Linux when resource limits are requested. `Native.Cgroup` probes `/sys/fs/cgroup` and the hybrid `/sys/fs/cgroup/unified`, requiring a non-empty `cgroup.controllers`. Creation enables the required `memory`, `pids`, and/or `cpu` controllers and writes `memory.max`, `pids.max`, and `cpu.max`. `UpdateLimits` rewrites those same controller files in place (enabling any controller the new caps newly need, resetting a now-`None` dimension to the unbounded `max` sentinel where its controller file already exists) to replace the caps on the live cgroup without recreating it.
 
 `posix_spawn` starts a child running immediately, so a bare parent-side write of the PID to `cgroup.procs` would land after the child had already executed — a spawn-to-migrate window where a descendant forked in that first instant is created in the parent cgroup and escapes the limits. ProcessKit closes it by launching the child through a small `/bin/sh` helper that writes its own PID into `cgroup.procs` and then `exec`s the real program in place (same PID): the target's first instruction already runs inside the cgroup, so any descendant it forks inherits the cgroup too. This mirrors the `setpriv` uid/gid helper — no managed code runs in a post-fork child — and a requested uid/gid drop is nested inside the launcher so the privileged cgroup join happens before the drop. `Track` still writes the PID to `cgroup.procs` as an idempotent confirmation: a genuine open/write failure (missing or unwritable cgroup) means the launcher's own self-migrate failed too, so `Track` removes the PID from tracking, kills its process group, reaps the leader, and returns `ResourceLimit`; running unconstrained is not an accepted fallback. A write that races a fast target's exit (`ESRCH`) is treated as success — the target ran inside the cgroup and is gone.
 
@@ -249,7 +251,7 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 | Graceful tree stop | Best-effort `WM_CLOSE` to members' windows, poll to grace, then hard Job kill | `SIGTERM`, poll, then `SIGKILL` | signal members with `SIGTERM`, poll, then cgroup hard kill |
 | General signals | Kill; Int/Term as best-effort CTRL+BREAK (`WindowsCtrlSignals()` child) and/or `WM_CLOSE` (windowed member) | `killpg` with mapped/raw signal | per-current-member signal sweep; Kill is atomic cgroup kill |
 | Suspend/resume | Best-effort per-thread; suspend counts stack | `SIGSTOP` / `SIGCONT` | `cgroup.freeze` best effort |
-| Resource controls | Job memory, active-process, CPU limits | None | `memory.max`, `pids.max`, `cpu.max` |
+| Resource controls | Job memory, active-process, CPU limits (live-updatable via `UpdateLimits`) | None (`UpdateLimits` → `ResourceLimit`) | `memory.max`, `pids.max`, `cpu.max` (live-updatable via `UpdateLimits`) |
 | Membership snapshot | All Job PIDs | Tracked group leaders, not every descendant PID | Current `cgroup.procs` PIDs |
 | Accounting | Active count, CPU, peak committed memory | Live group count only | Active members, CPU use, peak memory when files exist |
 | Reaping obligation | Handles close; Job kills on close | ProcessKit `waitpid`s direct leaders; other descendants reparent | cgroup kill plus `waitpid` of direct leaders |

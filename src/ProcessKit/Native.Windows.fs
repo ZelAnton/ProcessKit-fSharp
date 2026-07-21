@@ -104,6 +104,12 @@ module internal Windows =
     [<Literal>]
     let private ERROR_PATH_NOT_FOUND = 3
 
+    // Returned by SetInformationJobObject when asked to DISABLE CPU rate control (ControlFlags = 0) on a
+    // Job that has none enabled — there is nothing to turn off. Treated as the desired "no CPU cap" end
+    // state on the limit-replace path rather than a real failure.
+    [<Literal>]
+    let private ERROR_INVALID_PARAMETER = 87
+
     [<StructLayout(LayoutKind.Sequential)>]
     type private STARTUPINFO =
         struct
@@ -893,7 +899,37 @@ module internal Windows =
     /// Apply resource limits to a Job: a memory cap (`JobMemoryLimit`), an active-process cap, and a
     /// CPU hard cap (a fraction of *total* system CPU, so per-core quota is approximate). Preserves
     /// `KILL_ON_JOB_CLOSE`. Returns an error message on failure.
+    ///
+    /// This cleanly REPLACES the caps in force, so it serves both `ProcessGroup.Create` (a fresh Job)
+    /// and `ProcessGroup.UpdateLimits` (a live Job): `SetInformationJobObject` overwrites the whole
+    /// extended-limit block, so a dimension left `None` (its flag not set) is written back as unbounded.
+    /// The CPU rate control is enabled with the hard cap when a quota is set; when it is `None` the cap
+    /// is explicitly DISABLED (`ControlFlags = 0`) so an update that drops the CPU quota removes a
+    /// previously-applied cap rather than silently leaving it in force — and disabling on a Job that had
+    /// no CPU cap (a fresh Job, or a `None`→`None` update) reports `ERROR_INVALID_PARAMETER`, which is
+    /// exactly the desired "no CPU cap" end state and so is treated as success.
     let applyWindowsJobLimits (job: nativeint) (limits: ResourceLimits) : Result<unit, string> =
+        // (Re)write the Job's CPU rate control block. `controlFlags = 0` disables CPU rate control (the
+        // replace-semantics "no CPU cap" state); the enable+hard-cap flags with a rate arm the cap. The
+        // raw Win32 errno is returned on failure so the caller can classify it (see the `None` branch).
+        let writeCpuRate (controlFlags: uint32) (rate: uint32) : Result<unit, int> =
+            let mutable cpuInfo = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
+            cpuInfo.ControlFlags <- controlFlags
+            cpuInfo.CpuRate <- rate
+            let cpuSize = Marshal.SizeOf<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>()
+            let cpuBuffer = Marshal.AllocHGlobal cpuSize
+
+            try
+                Marshal.StructureToPtr<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>(cpuInfo, cpuBuffer, false)
+
+                if SetInformationJobObject(job, JobObjectCpuRateControlInformation, cpuBuffer, uint32 cpuSize) then
+                    Ok()
+                else
+                    // Captured inline, before the `finally` runs any further P/Invoke that could reset it.
+                    Error(Marshal.GetLastWin32Error())
+            finally
+                Marshal.FreeHGlobal cpuBuffer
+
         let mutable info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         let mutable flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 
@@ -920,29 +956,20 @@ module internal Windows =
                 Error(Win32Exception(Marshal.GetLastWin32Error()).Message)
             else
                 match limits.CpuQuota with
-                | None -> Ok()
                 | Some cores ->
                     let fraction = min 1.0 (cores / float Environment.ProcessorCount)
                     let rate = uint32 (max 1.0 (Math.Round(fraction * 10000.0)))
-                    let mutable cpuInfo = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
 
-                    cpuInfo.ControlFlags <- JOB_OBJECT_CPU_RATE_CONTROL_ENABLE ||| JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP
-
-                    cpuInfo.CpuRate <- rate
-                    let cpuSize = Marshal.SizeOf<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>()
-                    let cpuBuffer = Marshal.AllocHGlobal cpuSize
-
-                    try
-                        Marshal.StructureToPtr<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>(cpuInfo, cpuBuffer, false)
-
-                        if
-                            SetInformationJobObject(job, JobObjectCpuRateControlInformation, cpuBuffer, uint32 cpuSize)
-                        then
-                            Ok()
-                        else
-                            Error(Win32Exception(Marshal.GetLastWin32Error()).Message)
-                    finally
-                        Marshal.FreeHGlobal cpuBuffer
+                    writeCpuRate (JOB_OBJECT_CPU_RATE_CONTROL_ENABLE ||| JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP) rate
+                    |> Result.mapError (fun errno -> Win32Exception(errno).Message)
+                | None ->
+                    // Replace semantics: no CPU quota now, so disable any rate cap a prior apply set.
+                    // Disabling on a Job that has none enabled is rejected with ERROR_INVALID_PARAMETER —
+                    // the "no CPU cap" state already holds, so treat that as success; surface anything else.
+                    match writeCpuRate 0u 0u with
+                    | Ok() -> Ok()
+                    | Error errno when errno = ERROR_INVALID_PARAMETER -> Ok()
+                    | Error errno -> Error(Win32Exception(errno).Message)
         finally
             Marshal.FreeHGlobal buffer
 

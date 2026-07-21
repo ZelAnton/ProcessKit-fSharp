@@ -90,6 +90,15 @@ jobs:
       - name: Build guides (mdBook)
         run: mdbook build
 
+      # Regression check for theme/custom.css's pinned-title sidebar selector: it
+      # parses the just-built, CI-pinned-mdBook DOM and asserts the selector
+      # matches exactly the "Overview" entry (see the K-005 pitfall and
+      # scripts/check-sidebar-nav.py's own docstring for the underlying mdBook
+      # v0.4.40 DOM quirk). python3 is preinstalled on this runner image; no
+      # extra setup step needed.
+      - name: Check sidebar pinned-title selector
+        run: python3 scripts/check-sidebar-nav.py book/index.html
+
       # docs/internals/** and docs/planning/** are internal, non-public project
       # notes. They are absent from docs/SUMMARY.md so they never appear in the
       # book's navigation, but mdBook copies any non-chapter source file to the

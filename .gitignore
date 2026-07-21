@@ -58,6 +58,12 @@ TestResults/
 *.fsx.lock
 
 ## -------
+## Python (docs tooling — scripts/check-sidebar-nav.py)
+## -------
+__pycache__/
+*.pyc
+
+## -------
 ## Visual Studio
 ## -------
 .vs/

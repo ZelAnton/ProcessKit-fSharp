@@ -215,6 +215,14 @@ limit-capable container, the POSIX process-group mechanism cannot enforce any of
 limits where none can apply fails at creation with `ProcessError.ResourceLimit` rather than
 returning a silently-unbounded group.
 
+These caps are also updatable on a **live** group via `ProcessGroup.UpdateLimits(ResourceLimits)` —
+an optional runtime operation that re-applies a full replacement cap set without recreating the
+group or restarting its children. It follows the same platform matrix as creation: the Windows Job
+Object re-applies via `SetInformationJobObject`, the Linux cgroup v2 mechanism rewrites
+`memory.max` / `pids.max` / `cpu.max`, and the POSIX process-group mechanism (macOS/BSD, or Linux
+without cgroup v2) returns `ProcessError.ResourceLimit` — never a silent no-op. See
+[process-groups.md](process-groups.md) for the API and semantics.
+
 ### Pseudo-terminal (PTY) capabilities
 
 `Command.Pty` gives a child a controlling terminal and one merged stdout+stderr stream. Every
