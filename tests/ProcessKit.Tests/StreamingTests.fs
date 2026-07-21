@@ -56,6 +56,14 @@ module private DevNullExhaustion =
     [<Literal>]
     let O_RDONLY = 0
 
+    // O_WRONLY = 1 (standard POSIX value), matching the stdout Null open under test below.
+    [<Literal>]
+    let O_WRONLY = 1
+
+    // Linux errno for per-process file-descriptor exhaustion. This test is Linux-only.
+    [<Literal>]
+    let EMFILE = 24
+
 /// A stdout/stderr double whose read yields `chunks` (if any), in order, then throws `fault` on the
 /// next read — the `RunningProcess`-level analogue of `PumpTests.fs`'s `ErroringReadStream` (T-087),
 /// used to prove a genuine mid-stream OS read fault surfaces as `ProcessError.Io` from the
@@ -1018,6 +1026,10 @@ type StreamingTests() =
             // RLIMIT_NOFILE bounds the fd *number*, not the open fd *count*, so pre-existing gaps below
             // the high-water mark can be reused by open() for "free" without consuming the budget.
             // By filling them first, we ensure the "zero spare fds" assumption below is exact.
+            // `Directory.GetFileSystemEntries` itself opens /proc/self/fd, and Linux is allowed to omit
+            // that directory descriptor from its own listing. Rather than relying on which behavior a
+            // runner chooses, the post-limit O_WRONLY probe below must fail with EMFILE before spawn;
+            // that proves this budget is truly exhausted for the same open mode as stdout Null.
             let gapCount = (maxOpenFd + 1) - usedCount
             let fillerFds = ResizeArray<int>(gapCount)
 
@@ -1045,6 +1057,20 @@ type StreamingTests() =
                     Is.EqualTo 0,
                     "setrlimit failed"
                 )
+
+                let probeFd =
+                    DevNullExhaustion.openDevNull ("/dev/null", DevNullExhaustion.O_WRONLY)
+
+                if probeFd >= 0 then
+                    DevNullExhaustion.close probeFd |> ignore
+                    Assert.Fail "fd budget was not exhausted before spawn"
+
+                let probeErrno = Marshal.GetLastWin32Error()
+
+                let probeErrorMessage: string =
+                    "expected the pre-spawn open(/dev/null) probe to fail with EMFILE"
+
+                Assert.That(probeErrno, Is.EqualTo DevNullExhaustion.EMFILE, probeErrorMessage)
 
                 let command =
                     shell "true"

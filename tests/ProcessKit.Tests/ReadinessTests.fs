@@ -831,8 +831,8 @@ type ReadinessTests() =
             // `lateConnect` ignores the cancellation token it is handed (as a real, already-in-flight
             // `TcpClient.ConnectAsync` effectively does once the OS has committed to completing the
             // handshake) and only ever succeeds — 500ms after invocation, well past the 100ms shared
-            // deadline and past `deadlineOverrunBound` on every platform (raised from 300ms alongside
-            // the widened macOS bound below, K-038, so the two stay comfortably apart). Regression test
+            // deadline and past `deadlineOverrunBound` on every platform (400ms on macOS and 250ms
+            // elsewhere, K-038), so the two stay comfortably apart. Regression test
             // for two things at once: (1) the deadline is honored even though the connect itself never
             // observes cancellation — this must not block for the connect's own 500ms, only race it
             // against the deadline, and (2) once the abandoned connect does complete in the background,
@@ -844,15 +844,16 @@ type ReadinessTests() =
             // deadline firing and this call actually returning — K-038 measured a real 263ms against the
             // previous flat 250ms bound (a ~13ms overrun) on a macOS CI leg, with nothing in the diff
             // under review touching the deadline mechanism (`ReadinessProbe.waitForCoreUsing`'s
-            // `Task.WhenAny` race). Rather than a uniform, unbounded widening "on the eye", only the
-            // platform that has actually shown the variance gets a wider bound, with the connect fake's
-            // own completion delay raised in step so the bound still stays well clear of it — this keeps
-            // proving the deadline is genuinely raced, not silently waited out, on every platform.
+            // `Task.WhenAny` race). The K-038 CI history records no corresponding non-macOS deadline
+            // overrun, so those platforms retain the original 250ms bound instead of gaining an
+            // unobserved 50ms margin. Only the platform that has actually shown the variance gets a
+            // wider bound; the connect fake's completion delay stays well clear of it, so this still
+            // proves the deadline is genuinely raced rather than silently waited out on every platform.
             let deadlineOverrunBound =
                 if RuntimeInformation.IsOSPlatform OSPlatform.OSX then
                     TimeSpan.FromMilliseconds 400.0
                 else
-                    TimeSpan.FromMilliseconds 300.0
+                    TimeSpan.FromMilliseconds 250.0
 
             let mutable lateConnectTask: Task = Unchecked.defaultof<Task>
 
