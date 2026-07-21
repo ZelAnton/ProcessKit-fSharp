@@ -102,3 +102,10 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, limits: ResourceLi
     /// A copy capping the tree's CPU at `cores` cores' worth.
     member _.WithCpuQuota(cores: float) =
         ProcessGroupOptions(shutdownTimeout, limits.WithCpuQuota cores)
+
+    /// A copy carrying a wholesale-replaced `ResourceLimits` set, keeping the shutdown window.
+    /// Internal — used by `ProcessGroup.UpdateLimits` to refresh the `Options` snapshot a consumer
+    /// reads back after a live limit update, so the whole limit set is swapped atomically rather than
+    /// composed field-by-field.
+    member internal _.WithLimits(newLimits: ResourceLimits) =
+        ProcessGroupOptions(shutdownTimeout, newLimits)

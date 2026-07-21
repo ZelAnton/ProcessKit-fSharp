@@ -119,6 +119,14 @@ type internal IContainmentBackend =
     /// A snapshot of the group's resource usage.
     abstract Stats: unit -> Result<ProcessGroupStats, ProcessError>
 
+    /// Apply a new whole-tree resource-limit set to the LIVE container, replacing the caps in force
+    /// without recreating it or restarting its children. A limit-capable mechanism (Windows Job Object
+    /// / Linux cgroup v2) re-applies the caps to its live handle/controllers; a mechanism with no
+    /// whole-tree limit primitive (the POSIX process group) returns `ProcessError.ResourceLimit`, the
+    /// same honest, typed refusal `Create` gives — never a silent no-op. The `ResourceLimits` is a full
+    /// replacement: a dimension left `None` is reset to unbounded, not left at its previous cap.
+    abstract UpdateLimits: ResourceLimits -> Result<unit, ProcessError>
+
     /// The hard teardown, run exactly once by the owning `ProcessGroup`: reap the tree and free the
     /// container (close the Job handle / `cgroup.kill` + rmdir / SIGKILL the pgids).
     abstract HardRelease: unit -> unit
@@ -296,6 +304,19 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             | Some(active, cpu, peak) -> Ok(ProcessGroupStats(active, Some cpu, Some peak))
             | None -> Error(ProcessError.Io "failed to query Job Object accounting")
 
+        member _.UpdateLimits(limits) =
+            // Re-apply the whole limit set to the live Job via `SetInformationJobObject` (memory /
+            // active-process caps in one extended-limit write, then the CPU rate cap) — the same call
+            // `Create` uses, which cleanly REPLACES the caps in force: a dimension now `None` is written
+            // back as unbounded rather than left at its previous cap. This runs synchronously under the
+            // group's lifecycle lock (via `ProcessGroup.WhenLive`), so it works on the still-open
+            // `jobHandle` exactly like `Suspend`/`Resume`/`Stats`/`Members` — no handle duplication is
+            // needed here, unlike the OFF-lock graceful poll (K-025/T-162); a genuine apply failure is an
+            // honest `ProcessError.ResourceLimit`.
+            match Native.Windows.applyWindowsJobLimits jobHandle limits with
+            | Ok() -> Ok()
+            | Error message -> Error(ProcessError.ResourceLimit message)
+
         member _.HardRelease() =
             ctrlGroups.Clear()
 
@@ -471,6 +492,19 @@ type internal CgroupBackend(cgroupPath: string) =
                 let active = List.length members
                 let cpu, peak = Native.Cgroup.cgroupStats cgroupPath
                 Ok(ProcessGroupStats(active, cpu, peak))
+
+        member _.UpdateLimits(limits) =
+            // Rewrite the cgroup's controller files in place (`memory.max`/`pids.max`/`cpu.max`),
+            // enabling any controller the new caps newly need in the parent's `cgroup.subtree_control`
+            // first. REPLACE semantics: a dimension now `None` is reset to the controller's unbounded
+            // `max` sentinel (only where that controller file already exists — a never-enabled
+            // controller is already unbounded), never left at its previous cap. Runs under the group's
+            // lifecycle lock (via `ProcessGroup.WhenLive`), so the cgroup directory can't be removed by a
+            // concurrent teardown mid-write; a genuine write/delegation failure is an honest
+            // `ProcessError.ResourceLimit`.
+            match Native.Cgroup.updateCgroupLimits cgroupPath limits with
+            | Ok() -> Ok()
+            | Error message -> Error(ProcessError.ResourceLimit message)
 
         member _.HardRelease() =
             Native.Cgroup.killCgroup cgroupPath
@@ -673,6 +707,16 @@ type internal ProcessGroupBackend() =
         member _.Stats() =
             let active = children.Snapshot() |> List.filter stillOurs |> List.length
             Ok(ProcessGroupStats(active, None, None))
+
+        member _.UpdateLimits(_limits) =
+            // The POSIX process-group mechanism has no whole-tree limit primitive to update — the exact
+            // reason `ProcessGroup.Create` already refuses to build a limited group over it. Refuse the
+            // update the same honest, typed way rather than pretending to have applied caps that no
+            // kernel container is enforcing (a silent no-op would be a false success).
+            Error(
+                ProcessError.ResourceLimit
+                    "the POSIX process-group mechanism has no whole-tree resource-limit primitive to update (needs a Windows Job Object or Linux cgroup v2)"
+            )
 
         member _.HardRelease() =
             // Each pgid's leader is a child we posix_spawned, so we must waitpid it ourselves — `killpg`
