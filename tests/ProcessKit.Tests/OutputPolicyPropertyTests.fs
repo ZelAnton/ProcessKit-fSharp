@@ -92,9 +92,14 @@ type OutputPolicyPropertyTests() =
                     s
                 | [] ->
                     // Exhausted - cycle back to the start of the original list instead of dumping the
-                    // remaining bytes in one call.
-                    sizes <- chunkSizes
-                    List.head chunkSizes
+                    // remaining bytes in one call. `chunkSizes` is non-empty by construction (the
+                    // generator only ever produces at least one size), but guard explicitly rather than
+                    // relying on that invariant holding at every call site.
+                    match chunkSizes with
+                    | s :: rest ->
+                        sizes <- rest
+                        s
+                    | [] -> bytes.Length - pos
 
             let n = min chunk (bytes.Length - pos) |> max 1
             buf.Append(bytes, pos, n)
