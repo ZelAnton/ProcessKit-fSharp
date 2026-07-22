@@ -61,6 +61,35 @@
 		<ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
 	</PropertyGroup>
 
+	<!-- NuGet Package Validation (ApiCompat). On `dotnet pack`, each package is compared against its
+	     last published release (baseline 2.4.2) and pack FAILS on any breaking public-API change that
+	     is not explicitly, narrowly suppressed. This turns the SemVer promise in ROADMAP.md ("breaking
+	     changes land only in a new major version") from review discipline into a machine check, and
+	     complements the public-API snapshot test (tests/ProcessKit.Tests/ApiSurfaceTests.fs), which
+	     only catches change vs. the CURRENT tree — not incompatibility vs. the already-SHIPPED release.
+	     ApiCompat also cross-checks the two TFMs (net8.0/net10.0) inside each package.
+
+	     INVARIANT (deliberately load-bearing): removing or renaming ANY OTHER public member fails
+	     `dotnet pack` under this gate — that is the whole point, and it must not be defeated with a
+	     blanket suppression. The ONE known, pre-existing break carried from before this gate existed is
+	     the ProcessKit.Testing.CassetteEntry positional-constructor arity change (the Pty/PtyCols/PtyRows
+	     fields added in [Unreleased], cassette format v4). It is allowed by exactly one narrow, documented
+	     entry in src/ProcessKit.Testing/CompatibilitySuppressions.xml; no other package carries a
+	     suppression file, and no other break is suppressed. See ROADMAP.md "Versioning & stability" for
+	     the major-release baseline-bump / suppression-reset process.
+
+	     Scope: these properties are set here for the whole repo, but the SDK gates BOTH the baseline
+	     `PackageDownload` (Microsoft.NET.ApiCompat.targets) AND the `RunPackageValidation` target
+	     (Microsoft.NET.ApiCompat.ValidatePackage.targets) on '$(IsPackable)' == 'true'. The four
+	     non-packable projects (tests/benchmarks/samples, which set IsPackable=false) therefore never
+	     download a baseline nor run validation. The '$(IsPackable)' != 'false' condition below states
+	     that same packable-only scope at the property level; because Directory.Build.props is imported
+	     before a project body can set IsPackable, the SDK's own IsPackable guard is the effective gate. -->
+	<PropertyGroup Condition="'$(IsPackable)' != 'false'">
+		<EnablePackageValidation>true</EnablePackageValidation>
+		<PackageValidationBaselineVersion>2.4.2</PackageValidationBaselineVersion>
+	</PropertyGroup>
+
 	<ItemGroup>
 		<!-- SourceLink, repo-wide; PrivateAssets so it never flows to package consumers. -->
 		<PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />

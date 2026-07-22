@@ -128,6 +128,58 @@ jobs:
             --treat-as-error IONIDE-001 IONIDE-003 IONIDE-006 \
             --output-format github
 
+  # NuGet Package Validation (ApiCompat) gate. Packs all four packable packages and fails the workflow
+  # on any breaking public-API change vs. the last published release (baseline 2.4.2), unless it is the
+  # one documented narrow suppression (src/ProcessKit.Testing/CompatibilitySuppressions.xml — only the
+  # CassetteEntry positional-constructor arity change). This makes the SemVer promise in ROADMAP.md
+  # ("breaking changes land only in a new major version") a machine check, complementing the public-API
+  # snapshot test (which only guards vs. the current tree, not vs. the shipped release). ApiCompat also
+  # cross-checks the net8.0/net10.0 surfaces inside each package. EnablePackageValidation /
+  # PackageValidationBaselineVersion live in Directory.Build.props (packable projects only).
+  #
+  # Packs PER-PROJECT (not `dotnet pack ProcessKit.slnx`), matching .github/workflows/release.yml: the
+  # core is resolved as an assembly <Reference> (AGENTS.md), and the .slnx BuildDependency that orders a
+  # solution build injects a synthetic project-reference to the multi-targeted ProcessKit, which a
+  # solution-level `dotnet pack` (BuildProjectReferences=false) resolves via `GetTargetPath` on the
+  # cross-targeting outer project — an MSB4057 unrelated to validation. A per-project pack has no such
+  # synthetic reference: it resolves the real references and runs ApiCompat for both TFMs. Core is packed
+  # first so the companions' assembly <Reference> to ProcessKit.dll resolves from its build output.
+  pack:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          # The 10.0.x SDK builds and packs both TFMs; the net8.0 reference assemblies are restored as
+          # NuGet packages (no net8.0 runtime needed — a package is only built and packed here, not run).
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Directory.Packages.props', 'nuget.config', 'global.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: dotnet restore
+
+      # Any ApiCompat baseline violation fails `dotnet pack` (non-zero exit); `set -e` then fails the job.
+      - name: Pack all four packages with package validation (ApiCompat vs baseline 2.4.2)
+        run: |
+          set -euo pipefail
+          for proj in \
+            src/ProcessKit/ProcessKit.fsproj \
+            src/ProcessKit.Testing/ProcessKit.Testing.fsproj \
+            src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj \
+            src/ProcessKit.Extensions.Hosting/ProcessKit.Extensions.Hosting.fsproj; do
+            echo "::group::pack $proj"
+            dotnet pack "$proj" --configuration Release
+            echo "::endgroup::"
+          done
+
   test:
     if: github.event_name != 'schedule'
     strategy:

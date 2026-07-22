@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- https://learn.microsoft.com/dotnet/fundamentals/package-validation/diagnostic-ids -->
+<!--
+  NuGet Package Validation (ApiCompat) baseline suppression for ProcessKit.Testing.
+
+  WHAT is suppressed: exactly the CassetteEntry generated positional constructor, on BOTH target
+  frameworks (net8.0 + net10.0). Diagnostic CP0002 = "a member present in the baseline (2.4.2) is
+  absent in the current build": the F# record `ProcessKit.Testing.CassetteEntry` had its positional
+  constructor's arity change when the PTY-cassette fields `Pty` / `PtyCols` / `PtyRows` were added in
+  [Unreleased] (cassette format v4 — see src/ProcessKit.Testing/Cassette.fs). Adding a field to an F#
+  positional record replaces its 15-argument constructor with an 18-argument one, so ApiCompat
+  correctly reports the old-arity constructor as removed relative to the last published release.
+
+  WHY this specific break is allowed (a deliberate, narrow, documented exception — NOT a major bump,
+  NOT a field removal; the accumulated [Unreleased] release stays a minor):
+    1. `CassetteEntry` is a documented SERIALIZATION DTO, not a stable construction contract. Its own
+       doc comment says to "inspect a cassette file directly rather than depending on this shape"; it
+       is public only so System.Text.Json can (de)serialize it.
+    2. Real consumption is deserialization through the parameterless `[<CLIMutable>]` constructor +
+       property setters, which field additions do NOT break: old cassettes still load and the new
+       fields default (documented v1->v4 back-compat — a pre-v4 entry keys as a non-PTY run).
+    3. Fields were already added to `CassetteEntry` in earlier minor releases (`StdoutBase64`,
+       `EnvFingerprint`) the same non-breaking way.
+
+  INVARIANT — keep this suppression NARROW. It lists ONLY the CassetteEntry constructor. Removing or
+  renaming ANY OTHER public member (in ProcessKit.Testing or any other package) must still fail
+  `dotnet pack` under package validation; this is not a blanket suppression, and no other package
+  carries a suppression file. When the next MAJOR version is cut, bump
+  PackageValidationBaselineVersion (Directory.Build.props) to the new baseline and DELETE this file so
+  the arity change is absorbed into the new major line (see ROADMAP.md "Versioning & stability").
+-->
+<Suppressions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Suppression>
+    <DiagnosticId>CP0002</DiagnosticId>
+    <Target>M:ProcessKit.Testing.CassetteEntry.#ctor(System.String,System.String[],System.String,System.String,System.Boolean,System.String[],System.String,System.String,System.String,System.String,System.Nullable{System.Int32},System.Boolean,System.Nullable{System.Int32},System.Boolean,System.Double)</Target>
+    <Left>lib/net10.0/ProcessKit.Testing.dll</Left>
+    <Right>lib/net10.0/ProcessKit.Testing.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <DiagnosticId>CP0002</DiagnosticId>
+    <Target>M:ProcessKit.Testing.CassetteEntry.#ctor(System.String,System.String[],System.String,System.String,System.Boolean,System.String[],System.String,System.String,System.String,System.String,System.Nullable{System.Int32},System.Boolean,System.Nullable{System.Int32},System.Boolean,System.Double)</Target>
+    <Left>lib/net8.0/ProcessKit.Testing.dll</Left>
+    <Right>lib/net8.0/ProcessKit.Testing.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+</Suppressions>

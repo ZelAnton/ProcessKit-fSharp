@@ -75,6 +75,37 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
 ## Versioning & stability
 
 The public API follows [Semantic Versioning](https://semver.org/): breaking changes land only in a
-new major version, so upgrades within a major line are backward-compatible. A public-API snapshot
-test guards the surface against accidental change, and every user-visible change ships a
+new major version, so upgrades within a major line are backward-compatible. Two complementary
+mechanisms guard this: a public-API snapshot test
+([`tests/ProcessKit.Tests/ApiSurfaceTests.fs`](tests/ProcessKit.Tests/ApiSurfaceTests.fs)) catches any
+change relative to the *current* tree, and **NuGet Package Validation** (ApiCompat) mechanically checks
+every `dotnet pack` for backward compatibility against the *last published release* — so a breaking
+change cannot ship undetected. Every user-visible change also ships a
 [`CHANGELOG.md`](CHANGELOG.md) entry.
+
+**Package validation (ApiCompat).** `EnablePackageValidation` + `PackageValidationBaselineVersion` (in
+[`Directory.Build.props`](Directory.Build.props), scoped to the four packable projects) compare each
+packed package against its baseline — currently the last published release, **2.4.2** — for both
+`net8.0` and `net10.0`, and fail `dotnet pack` on any breaking public-API change that is not an
+explicit, narrow suppression. The CI `pack` leg
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs this per-project on every PR/push.
+Validation runs **per-project** (matching [`release.yml`](.github/workflows/release.yml)), not
+`dotnet pack ProcessKit.slnx`: the core is an assembly `<Reference>` and the `.slnx` build-order
+dependency makes a *solution-level* pack resolve `GetTargetPath` on the cross-targeting core project.
+Exactly one break is suppressed today — the `ProcessKit.Testing.CassetteEntry` positional-constructor
+arity change (a serialization DTO, not a construction contract; see
+[`src/ProcessKit.Testing/CompatibilitySuppressions.xml`](src/ProcessKit.Testing/CompatibilitySuppressions.xml)).
+Any *other* removed or renamed public member fails the gate — the suppression is deliberately not a
+blanket one.
+
+**Cutting a new major version — baseline bump & suppression reset.** A new major line is allowed to
+break compatibility, so when releasing one:
+
+1. Set `PackageValidationBaselineVersion` in [`Directory.Build.props`](Directory.Build.props) to the
+   new baseline — the last release of the *previous* major line (the version consumers upgrade *from*).
+2. Delete every now-stale `CompatibilitySuppressions.xml` (e.g.
+   `src/ProcessKit.Testing/CompatibilitySuppressions.xml`): each one suppresses a break relative to the
+   *old* baseline that the major bump legitimately absorbs. Starting the new line with a clean slate
+   means the gate again flags any *unintended* break within the new major line.
+3. If a package has no release on the new baseline yet (a brand-new package's first release), leave its
+   `PackageValidationBaselineVersion` unset until it has a published baseline to compare against.
