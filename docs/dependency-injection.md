@@ -85,7 +85,7 @@ services.AddProcessKitGroup();
 Both `AddProcessKitGroup()` and `AddProcessKit()` register `IProcessRunner` with `TryAdd`, so call **one
 or the other** — whichever runs first wins. If `AddProcessKit()` runs first, `IProcessRunner` stays the
 per-run `JobRunner`, and a later `AddProcessKitGroup()` still registers the `ProcessGroup` but **no runs
-go into it** — an easy-to-miss mis-wire. `AddProcessKitGroup(configure)` / `AddProcessKitGroup(configuration)`
+go into it** — an easy-to-miss wiring error. `AddProcessKitGroup(configure)` / `AddProcessKitGroup(configuration)`
 apply the same `ProcessKitOptions` defaults as the `AddProcessKit` overloads.
 
 ## Hosting a supervised child

@@ -1960,7 +1960,7 @@ module internal Posix =
                     envpAllocations <- envpStrings
 
                     // Every posix_spawn_file_actions_* / posix_spawnattr_* helper returns an errno-style
-                    // rc; a non-zero one is an honest spawn failure (a mis-wired stdio dup2/close, or a
+                    // rc; a non-zero one is an honest spawn failure (miswired stdio dup2/close, or a
                     // failed attr set that would silently drop SETPGROUP/CLOEXEC), NOT something to
                     // `|> ignore`. Record the FIRST failure and stop invoking further helpers — never
                     // operate a helper on a half-initialized struct.
@@ -2004,7 +2004,7 @@ module internal Posix =
 
                     // Also close the parent-kept ends in the child. This is what guarantees EOF: a
                     // child must never inherit a writer to its own stdin. We do it explicitly rather
-                    // than rely on FD_CLOEXEC, whose `fcntl` is variadic and is mis-passed by a
+                    // than rely on FD_CLOEXEC, whose `fcntl` is variadic and receives the wrong arguments from a
                     // fixed-signature P/Invoke on the AArch64 variadic ABI (Apple Silicon), so CLOEXEC
                     // never takes effect there and the child would block forever waiting for stdin.
                     stdinParentWrite
