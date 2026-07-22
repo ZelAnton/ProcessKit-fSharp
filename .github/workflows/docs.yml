@@ -77,7 +77,7 @@ jobs:
       # First checkout = the triggering ref (main HEAD on a push, the tag on a
       # release). This is what the mdBook GUIDES are built from, so a docs edit
       # goes live as soon as it lands.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # ── Guides book (mdBook) → site root ────────────────────────────────────
       # Pinned to the same mdBook version used by the sibling ProcessKit-rs docs
@@ -127,12 +127,12 @@ jobs:
       # Second checkout, into ./_released, pinned to that release tag. The fsdocs
       # build below runs entirely inside this tree so the reference reflects the
       # released source, independent of what is on main.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.apiref.outputs.tag }}
           path: _released
 
-      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           # Only the SDK band matters here (pinned by global.json) — this workflow
           # builds Release assemblies for fsdocs to read, it does not run tests, so
