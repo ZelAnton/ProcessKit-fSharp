@@ -267,6 +267,19 @@ does not expose a supported parent-side pre-spawn override, so a Windows credent
 suppress its own echo. This is documented rather than silently treating `Echo = false` as a Windows
 guarantee.
 
+**Windows `.cmd`/`.bat` shims launch through `cmd.exe`.** A Windows bare name whose only `PATH`
+match carries a non-`.exe` extension (the `.cmd`/`.bat` wrappers `npm`, `yarn`, `az`, and many
+dotnet-tool shims ship) is unreachable by the OS's own bare-name search, which appends only `.exe` —
+yet `Exec.which` locates it through the same `PATHEXT`-aware lookup. ProcessKit closes that
+`which`-vs-spawn gap: it substitutes the resolved absolute path into the launch, and routes a
+`.cmd`/`.bat` through `cmd.exe /d /c` (a batch file is not a directly-launchable image). Because a
+batch wrapper reintroduces a shell, arguments are quoted for `cmd.exe`'s own grammar, not just the
+ordinary argv rules — a metacharacter such as `&`, `|`, `<`, `>`, or `"` is delivered literally,
+never executed (the "BatBadBut" class, CVE-2024-24576). An argument `cmd.exe` cannot escape at all —
+a `%`, a `!`, or a line break — fails the spawn with a typed `ProcessError.Spawn` rather than
+launching unsafely. A `.exe` match, a path-form program, and anything on POSIX are unaffected (POSIX
+has no `PATHEXT`; the OS resolves them exactly as before).
+
 **POSIX process groups: a `setsid` child can escape.** The process-group mechanism tracks each
 child's pgid, and teardown signals those pgids. A descendant that deliberately starts a new
 session (a `setsid` call) gets a fresh process group that the parent group does not track, so it

@@ -275,3 +275,59 @@ module internal Common =
                 $"the OS reported the program as not found, but it resolves locally to '{resolved}' — check that it is directly executable (a .bat/.cmd match needs a shell to run; otherwise check its executable permissions)"
             )
         | Error error -> error
+
+    /// How a Windows spawn should launch `program` once the shared PATHEXT-aware resolver above has had
+    /// its say (T-181). It reconciles a `which`/spawn divergence: our `probeDir` finds a bare name under
+    /// ANY `PATHEXT` extension, but the OS's own bare-name `PATH` search only ever appends `.exe`, so a
+    /// bare name whose only match is a `.cmd`/`.bat`/`.com`/… is reported present by `Exec.which` yet
+    /// unreachable by a raw `CreateProcessW(lpApplicationName = NULL)`. Only meaningful on Windows; every
+    /// other case (a `.exe` match, a path-form program, a name that resolves to nothing) is `AsIs` — the
+    /// launch is left byte-for-byte as before and the OS resolves it exactly as it always did.
+    [<RequireQualifiedAccess; NoComparison; NoEquality>]
+    type WindowsLaunch =
+        /// Launch the program verbatim: a bare name goes to the OS's own `PATH` search (whose richer
+        /// application/current/system-directory lookup this `PATH`-only model must not override), and a
+        /// path-form program is handed to the OS unchanged.
+        | AsIs
+        /// Substitute the resolved absolute path directly into the launch — a bare name whose only match
+        /// carries a non-`.exe`, non-batch executable extension (`.com`/…). It is a real image the OS can
+        /// spawn directly; it just needs the resolved path because the OS would never find it by bare name.
+        | DirectPath of ResolvedPath: string
+        /// Route the resolved batch file through `cmd.exe /d /c` — a `.cmd`/`.bat` match, which is not a
+        /// PE image and cannot be handed to `CreateProcessW` directly. The caller must apply cmd.exe-safe
+        /// argument quoting (BatBadBut / CVE-2024-24576).
+        | BatchWrapper of ResolvedPath: string
+
+    /// Decide how a Windows spawn should launch `program`, reusing the SAME `findInPath`/`probeDir`
+    /// resolution the preflight (`Exec.which`/`resolveProgram`) goes through — no second copy — so the
+    /// substitution can never disagree with what `which` reports. `AsIs` on every non-Windows platform
+    /// (there is no `PATHEXT`) and for a path-form program or a name that resolves to nothing; a `.exe`
+    /// match is deliberately left `AsIs` so the OS's own bare-name search still applies.
+    let resolveWindowsLaunch (program: string) : WindowsLaunch =
+        if
+            not (RuntimeInformation.IsOSPlatform OSPlatform.Windows)
+            || not (isBareName program)
+        then
+            // POSIX has no PATHEXT (the OS resolves a bare name exactly as `probeDir` models it), and a
+            // path-form program is handed to the OS verbatim — never rewritten. Both stay byte-for-byte.
+            WindowsLaunch.AsIs
+        else
+            match findInPath program |> fst with
+            | None ->
+                // Not found by our resolver either: leave it to the OS, whose failure still flows through
+                // `notFoundFromSpawnFailure` for an honest, `which`-consistent `NotFound`.
+                WindowsLaunch.AsIs
+            | Some resolved ->
+                let ext = Path.GetExtension resolved
+
+                let isExt (candidate: string) =
+                    String.Equals(ext, candidate, StringComparison.OrdinalIgnoreCase)
+
+                if isExt ".exe" then
+                    // The one extension the OS's bare-name search appends itself: leave the bare name so
+                    // that richer OS lookup (application/current/system directories) is never overridden.
+                    WindowsLaunch.AsIs
+                elif isExt ".cmd" || isExt ".bat" then
+                    WindowsLaunch.BatchWrapper resolved
+                else
+                    WindowsLaunch.DirectPath resolved

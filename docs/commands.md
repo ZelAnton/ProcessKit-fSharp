@@ -89,11 +89,27 @@ so there is no quoting, no word-splitting, and no injection surface. (When you
 actually want `a | b | c`, use a [pipeline](pipelines.md), which connects the
 stages in-process instead of invoking a shell.)
 
-The program name reaches the OS verbatim: a bare name is resolved on `PATH` by
-the OS, and setting a working directory does **not** re-anchor a *relative*
-program path against it (a relative path resolves against the current platform's
-rules — on Windows the parent's directory may win). Pass an absolute program
-path when you combine a relative tool with `currentDir`.
+The program name normally reaches the OS verbatim: a bare name is resolved on
+`PATH` by the OS, and setting a working directory does **not** re-anchor a
+*relative* program path against it (a relative path resolves against the current
+platform's rules — on Windows the parent's directory may win). Pass an absolute
+program path when you combine a relative tool with `currentDir`.
+
+**Windows PATHEXT shims (`.cmd`/`.bat`).** The one exception is a Windows bare
+name whose only `PATH` match carries a non-`.exe` extension — the `.cmd`/`.bat`
+shims that `npm`, `yarn`, `az`, and many dotnet-tool wrappers ship. The OS's own
+bare-name search appends only `.exe`, so it would report such a program as *not
+found* even though `Exec.which` locates it (both use the same `PATHEXT`-aware
+lookup). ProcessKit closes that gap: for a bare name it substitutes the resolved
+absolute path into the launch, and routes a `.cmd`/`.bat` through `cmd.exe /d /c`
+(a batch file is not a directly-launchable image). A `.exe` match, a path-form
+program, and a name that resolves to nothing are all launched exactly as before —
+the OS's richer bare-name search is never overridden. Arguments to a `.cmd`/`.bat`
+wrapper are quoted for `cmd.exe`'s own grammar (not just the ordinary argv rules),
+so a metacharacter like `&`, `|`, `<`, `>`, or `"` in an argument is delivered as
+a literal, never executed (the "BatBadBut" class, CVE-2024-24576). An argument
+carrying a character `cmd.exe` cannot escape at all — a `%`, a `!`, or a line
+break — is an honest `ProcessError.Spawn` refusal rather than an unsafe launch.
 
 ### Preflight: is a program installed?
 
@@ -1033,7 +1049,7 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 
 | Variant | Fields | Meaning |
 |---|---|---|
-| `ProcessError.Spawn` | `program, detail` | The program was located but the OS couldn't start it (permissions, a bad working directory, a Windows `.cmd`/`.bat` needing `cmd.exe`, …). **Not** `isNotFound`. |
+| `ProcessError.Spawn` | `program, detail` | The program was located but the OS couldn't start it (permissions, a bad working directory, or a `.cmd`/`.bat` argument that can't be safely quoted for the `cmd.exe` wrapper — a `%`/`!`/newline, see [Program, arguments, working directory](#program-arguments-working-directory)). **Not** `isNotFound`. |
 | `ProcessError.NotFound` | `program, Searched: string option` | The program couldn't be located (`isNotFound` is `true`); `searched` is the probed path when known. |
 | `ProcessError.Exit` | `program, code, stdout, stderr` | A success-requiring verb saw a non-zero exit; both streams attached in full. |
 | `ProcessError.Signalled` | `program, signal: int option, stdout, stderr` | Killed by a signal with no exit code; `signal` carries the number on Unix, `None` elsewhere; the partial streams captured before the kill are attached. |

@@ -328,3 +328,137 @@ type WhichResolutionTests() =
                     ()
 
                 Directory.Delete(dir, true)
+
+    [<Test>]
+    member _.``Windows: a bare name whose only PATH match is a .cmd shim launches, agreeing with which (T-181)``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "PATHEXT / .cmd shim substitution is a Windows-only concept; POSIX has no PATHEXT."
+            else
+                let dir =
+                    Path.Combine(Path.GetTempPath(), "processkit-cmdshim-" + Guid.NewGuid().ToString "N")
+
+                Directory.CreateDirectory dir |> ignore
+                let toolName = "pk181-cmd-shim"
+
+                // A `.cmd` shim (like the `npm`/`yarn`/`az` wrappers) reachable ONLY by its `.cmd`
+                // extension — no `.exe` sibling — so the OS's own bare-name PATH search, which appends only
+                // `.exe`, would miss it entirely. Batch files require CRLF line endings.
+                let cmdPath = Path.Combine(dir, toolName + ".cmd")
+                File.WriteAllText(cmdPath, "@echo off\r\necho SHIM-OK\r\n")
+
+                let originalPath = Environment.GetEnvironmentVariable "PATH"
+
+                try
+                    Environment.SetEnvironmentVariable("PATH", dir + ";" + originalPath)
+
+                    // Preflight resolves the shim to its `.cmd`.
+                    match Exec.which toolName with
+                    | Error error -> Assert.Fail $"expected which to resolve the .cmd shim, got {error}"
+                    | Ok resolved -> Assert.That(resolved, Is.EqualTo(cmdPath).IgnoreCase)
+
+                    // The invariant this task closes: the SAME bare name which resolved must actually
+                    // launch — not `ProcessError.NotFound` — because the spawn now substitutes the resolved
+                    // absolute `.cmd` path and routes it through `cmd.exe /d /c`.
+                    let! result = (Command.create toolName).OutputStringAsync()
+
+                    match result with
+                    | Error error -> Assert.Fail $"expected the .cmd shim to launch, got {error}"
+                    | Ok output ->
+                        Assert.That(output.Code, Is.EqualTo(Some 0))
+                        Assert.That(output.Stdout, Does.Contain "SHIM-OK")
+                finally
+                    Environment.SetEnvironmentVariable("PATH", originalPath)
+                    Directory.Delete(dir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: a cmd metacharacter argument reaches a .cmd child as one literal argument, with no injection (T-181)``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "cmd.exe argument quoting is only exercised on the Windows .cmd/.bat launch path."
+            else
+                let dir =
+                    Path.Combine(Path.GetTempPath(), "processkit-cmdquote-" + Guid.NewGuid().ToString "N")
+
+                Directory.CreateDirectory dir |> ignore
+                let toolName = "pk181-cmd-quote"
+
+                // Echo the first argument back, keeping its surrounding quotes (`%1`, not `%~1`) so any
+                // metacharacter the argument carries stays inside cmd's quotes when the batch itself
+                // re-parses the echo — the batch is a faithful mirror, never a second injection site.
+                let cmdPath = Path.Combine(dir, toolName + ".cmd")
+                File.WriteAllText(cmdPath, "@echo off\r\necho ARG=[%1]\r\n")
+
+                let originalPath = Environment.GetEnvironmentVariable "PATH"
+
+                try
+                    Environment.SetEnvironmentVariable("PATH", dir + ";" + originalPath)
+
+                    // An argument packed with cmd command-chaining metacharacters AND an `exit 9` that, if
+                    // cmd interpreted it instead of passing it through, would break out and exit the wrapper
+                    // with code 9. BatBadBut / CVE-2024-24576 in one string.
+                    let hostileArg = "x && exit 9 && y"
+
+                    let! result = (Command.create toolName |> Command.args [ hostileArg ]).OutputStringAsync()
+
+                    match result with
+                    | Error error -> Assert.Fail $"expected the quoted .cmd launch to succeed, got {error}"
+                    | Ok output ->
+                        // No injection: the wrapper exits with the batch's own success (0), NOT the injected
+                        // `exit 9`.
+                        Assert.That(
+                            output.Code,
+                            Is.EqualTo(Some 0),
+                            "a cmd metacharacter argument must not inject a command"
+                        )
+                        // Literal delivery: the child received the whole string as one argument.
+                        Assert.That(output.Stdout, Does.Contain hostileArg)
+                finally
+                    Environment.SetEnvironmentVariable("PATH", originalPath)
+                    Directory.Delete(dir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: a .cmd argument that cannot be safely quoted for cmd.exe is an honest typed refusal (T-181)``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The cmd.exe quoting refusal only applies to the Windows .cmd/.bat launch path."
+            else
+                let dir =
+                    Path.Combine(Path.GetTempPath(), "processkit-cmdrefuse-" + Guid.NewGuid().ToString "N")
+
+                Directory.CreateDirectory dir |> ignore
+                let toolName = "pk181-cmd-refuse"
+                let cmdPath = Path.Combine(dir, toolName + ".cmd")
+                File.WriteAllText(cmdPath, "@echo off\r\necho REACHED\r\n")
+
+                let originalPath = Environment.GetEnvironmentVariable "PATH"
+
+                try
+                    Environment.SetEnvironmentVariable("PATH", dir + ";" + originalPath)
+
+                    // A percent sign expands on a cmd command line regardless of any caret/quote escaping,
+                    // so it cannot be passed safely to a batch wrapper. The contract is an honest typed
+                    // refusal, never a 'run it anyway'.
+                    let! result = (Command.create toolName |> Command.args [ "hello%world" ]).OutputStringAsync()
+
+                    match result with
+                    | Ok output ->
+                        Assert.Fail
+                            $"expected a typed refusal for a percent-bearing batch argument, but the run succeeded: {output.Stdout}"
+                    | Error(ProcessError.Spawn _) -> ()
+                    | Error other -> Assert.Fail $"expected a ProcessError.Spawn refusal, got {other}"
+                finally
+                    Environment.SetEnvironmentVariable("PATH", originalPath)
+                    Directory.Delete(dir, true)
+        }
+        :> Task

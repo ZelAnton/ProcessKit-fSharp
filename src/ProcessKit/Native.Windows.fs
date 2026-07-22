@@ -63,9 +63,146 @@ module internal Windows =
 
             sb.Append('"').ToString()
 
-    let private buildWindowsCommandLine (command: Command) =
-        let parts = command.Program :: List.ofSeq command.Config.Args
-        parts |> List.map quoteWindowsArg |> String.concat " "
+    // ----------------------------------------------------------------------------------
+    // Windows: cmd.exe (.cmd/.bat) launch wrapping — BatBadBut / CVE-2024-24576-safe quoting
+    // ----------------------------------------------------------------------------------
+    //
+    // A `.cmd`/`.bat` is not a PE image, so `CreateProcessW` cannot launch it directly; it must run
+    // THROUGH `cmd.exe /d /c`. But `cmd.exe` re-parses its command tail with its OWN grammar before the
+    // batch script's `%*`/`%1` reconstruction ever sees it — two parsing layers, not one. Quoting an
+    // argument by the ordinary `CommandLineToArgvW` rules (`quoteWindowsArg`) is correct for the batch's
+    // argv reconstruction but NOT for cmd's command parser: an unescaped metacharacter (`&`, `|`, `<`,
+    // `>`, `(`, `)`) or `"` in an argument can break out and run attacker-chosen commands — the
+    // "BatBadBut" class, CVE-2024-24576. So each argument is escaped for BOTH layers: first the ordinary
+    // argv quoting (so the batch recovers the exact argument), then every cmd metacharacter in that
+    // result is caret-escaped (`^x`) so cmd's command parser consumes the caret and passes the literal
+    // character straight to the script instead of acting on it.
+    //
+    // `%` (environment expansion), `!` (delayed expansion), and CR/LF cannot be represented safely on a
+    // cmd command line at all — percent/`!` expansion runs regardless of carets or quoting, and CR/LF
+    // truncate the line — so an argument (or a resolved script path) carrying one is an honest typed
+    // refusal (`ProcessError.Spawn`), never a "launch it anyway". The whole command is wrapped in one
+    // extra outer quote pair so cmd's `/c` quote-stripping (which removes the first and last quote of the
+    // tail) peels exactly that pair, leaving the real-quoted script path and the caret-escaped arguments
+    // to be re-parsed verbatim. `/d` disables AutoRun so a per-user registry command can't run first.
+
+    /// The absolute path to the system `cmd.exe`, taken from the Windows system directory rather than
+    /// `PATH`/`%ComSpec%` so a `cmd.exe` planted earlier on `PATH` can never become the shell for a batch
+    /// wrapper — this is a security fix, so the shell itself must not be hijackable.
+    let private systemCmdExe =
+        lazy (Path.Combine(Environment.SystemDirectory, "cmd.exe"))
+
+    /// The `cmd.exe` command-parser metacharacters neutralized by a leading caret when NOT inside cmd's
+    /// own quotes: the quote itself, the caret, command chaining, redirection, and grouping.
+    let private isCmdMetacharacter (c: char) =
+        c = '"'
+        || c = '^'
+        || c = '&'
+        || c = '|'
+        || c = '<'
+        || c = '>'
+        || c = '('
+        || c = ')'
+
+    /// Characters that cannot be safely represented on a `cmd.exe` command line at all (see the section
+    /// comment): environment/delayed-variable expansion (`%`/`!`) runs regardless of any escaping, and
+    /// CR/LF truncate the command line.
+    let private isCmdUnescapable (c: char) =
+        c = '%' || c = '!' || c = '\r' || c = '\n'
+
+    /// Quote one argument for a `cmd.exe /d /c` batch wrapper (see the section comment). `Ok` carries the
+    /// doubly-escaped token — the ordinary argv quoting the batch's own reconstruction expects, then a
+    /// caret before every cmd metacharacter so cmd's command parser passes each through literally. `Error`
+    /// is the honest refusal (its reason) when the argument holds a character cmd.exe cannot escape.
+    let private quoteCmdArgument (arg: string) : Result<string, string> =
+        if arg |> Seq.exists isCmdUnescapable then
+            Error
+                "it contains a percent sign, an exclamation mark, or a line break, none of which cmd.exe can escape without risking command injection"
+        else
+            // First the ordinary argv quoting so the batch script's `%*`/`%1` reconstruction recovers the
+            // exact argument; then caret-escape every cmd metacharacter in that result (including the
+            // quotes it just added) so cmd's command parser passes each through literally.
+            let argv = quoteWindowsArg arg
+            let sb = StringBuilder(argv.Length + 8)
+
+            for c in argv do
+                if isCmdMetacharacter c then
+                    sb.Append('^') |> ignore
+
+                sb.Append(c) |> ignore
+
+            Ok(sb.ToString())
+
+    /// Build the full `cmd.exe /d /c "…"` command line that launches the resolved `.cmd`/`.bat` at
+    /// `script` with `args`, with BatBadBut-safe quoting (see the section comment). `program` is the
+    /// original bare name, carried only for a refusal error's identity. The script path is placed in a
+    /// REAL quote pair (Windows file names cannot contain `"`, and inside cmd's quotes `&|<>()^` are
+    /// literal, so cmd locates the program correctly); a path carrying `%`/`!`/`"`/CR/LF is refused, since
+    /// those would still expand or truncate even quoted.
+    let private buildBatchCommandLine
+        (program: string)
+        (script: string)
+        (args: string list)
+        : Result<string, ProcessError> =
+        if script |> Seq.exists (fun c -> isCmdUnescapable c || c = '"') then
+            Error(
+                ProcessError.Spawn(
+                    program,
+                    "the resolved batch file path contains a character that cannot be safely passed to cmd.exe (a percent sign, exclamation mark, quote, or line break)"
+                )
+            )
+        else
+            let rec quoteAll acc remaining =
+                match remaining with
+                | [] -> Ok(List.rev acc)
+                | arg :: rest ->
+                    match quoteCmdArgument arg with
+                    | Ok quoted -> quoteAll (quoted :: acc) rest
+                    | Error reason ->
+                        Error(
+                            ProcessError.Spawn(
+                                program,
+                                $"argument '{arg}' cannot be safely quoted for the cmd.exe batch wrapper: {reason}"
+                            )
+                        )
+
+            match quoteAll [] args with
+            | Error error -> Error error
+            | Ok quotedArgs ->
+                let sb = StringBuilder()
+                // The (absolute, non-`PATH`) system cmd.exe as the program token, then `/d /c` and the
+                // outer opening quote cmd's `/c` parsing strips together with the final closing quote.
+                sb.Append('"').Append(systemCmdExe.Value).Append('"') |> ignore
+                sb.Append(" /d /c \"") |> ignore
+                // The real-quoted script path (cmd uses these quotes to find the program), then each
+                // caret-escaped argument.
+                sb.Append('"').Append(script).Append('"') |> ignore
+
+                for quoted in quotedArgs do
+                    sb.Append(' ').Append(quoted) |> ignore
+
+                sb.Append('"') |> ignore
+                Ok(sb.ToString())
+
+    /// The `CreateProcessW` command line for `command`, honouring the Windows PATHEXT launch substitution
+    /// (T-181). A bare name whose only match under our own PATHEXT-aware resolver (`Common.resolveProgram`/
+    /// `probeDir`, reused via `resolveWindowsLaunch` — no second copy) carries a non-`.exe` extension is
+    /// launched via that resolved absolute path instead of the bare name, because the OS's own bare-name
+    /// `PATH` search appends only `.exe` and would miss it — the `which`-vs-spawn divergence this closes. A
+    /// `.cmd`/`.bat` match additionally routes through `cmd.exe /d /c` with BatBadBut-safe quoting. A
+    /// `.exe` match, a path-form program, and a name that resolves to nothing are all left verbatim (the
+    /// OS resolves them exactly as before). Fails only when a batch-wrapper argument (or script path)
+    /// cannot be safely quoted for cmd.exe.
+    let private buildWindowsCommandLine (command: Command) : Result<string, ProcessError> =
+        match resolveWindowsLaunch command.Program with
+        | WindowsLaunch.AsIs ->
+            let parts = command.Program :: List.ofSeq command.Config.Args
+            Ok(parts |> List.map quoteWindowsArg |> String.concat " ")
+        | WindowsLaunch.DirectPath resolved ->
+            let parts = resolved :: List.ofSeq command.Config.Args
+            Ok(parts |> List.map quoteWindowsArg |> String.concat " ")
+        | WindowsLaunch.BatchWrapper resolved ->
+            buildBatchCommandLine command.Program resolved (List.ofSeq command.Config.Args)
 
     // ----------------------------------------------------------------------------------
     // Windows: Job Object + CREATE_SUSPENDED → assign → resume
@@ -1273,223 +1410,241 @@ module internal Windows =
         // after CreatePseudoConsole succeeds still tears the sidecar down rather than leaking it.
         let mutable pendingPseudoConsole = IntPtr.Zero
 
-        try
-            // Two async pipe pairs. Parent keeps the input WRITE end (pty master stdin) and the output READ
-            // end (the single merged terminal stream); the child-side ends are handed to CreatePseudoConsole
-            // and closed once it has duplicated them into the conhost sidecar.
-            let inServer, inClient = createAsyncPipePair PipeDirection.Out
-            createdPipes.Add inServer
-            createdPipes.Add inClient
-            let outServer, outClient = createAsyncPipePair PipeDirection.In
-            createdPipes.Add outServer
-            createdPipes.Add outClient
+        // Decide the launch (PATHEXT substitution / cmd.exe batch wrapper — T-181) and build the command
+        // line up front: an unsafe batch argument is refused here, BEFORE the pseudoconsole or any pipe is
+        // allocated, so a refusal leaks nothing.
+        match buildWindowsCommandLine command with
+        | Error error -> Error error
+        | Ok commandLine ->
 
-            let mutable hPC = IntPtr.Zero
+            try
+                // Two async pipe pairs. Parent keeps the input WRITE end (pty master stdin) and the output READ
+                // end (the single merged terminal stream); the child-side ends are handed to CreatePseudoConsole
+                // and closed once it has duplicated them into the conhost sidecar.
+                let inServer, inClient = createAsyncPipePair PipeDirection.Out
+                createdPipes.Add inServer
+                createdPipes.Add inClient
+                let outServer, outClient = createAsyncPipePair PipeDirection.In
+                createdPipes.Add outServer
+                createdPipes.Add outClient
 
-            let hr =
-                CreatePseudoConsole(
-                    packCoord pty.Cols pty.Rows,
-                    inClient.SafePipeHandle.DangerousGetHandle(),
-                    outClient.SafePipeHandle.DangerousGetHandle(),
-                    0u,
-                    &hPC
-                )
+                let mutable hPC = IntPtr.Zero
 
-            if hr <> 0 then
-                disposeCreatedPipes ()
-                let hrHex = hr.ToString("X8")
-                Error(ProcessError.Spawn(command.Program, $"CreatePseudoConsole failed (HRESULT 0x{hrHex})"))
-            else
-                pendingPseudoConsole <- hPC
-                // ConPTY duplicated the child-side ends into the sidecar; drop our copies so only the parent
-                // ends (kept below) remain. (Still listed in `createdPipes`; `Stream.Dispose` is safe to
-                // call twice, so a later failure's unwind is harmless.)
-                inClient.Dispose()
-                outClient.Dispose()
-
-                // A STARTUPINFOEX attribute list carrying ONE attribute: the pseudoconsole. Containment
-                // (Job membership) is done the proven way — CREATE_SUSPENDED, AssignProcessToJobObject while
-                // still suspended, then resume — NOT via a PROC_THREAD_ATTRIBUTE_JOB_LIST in the same list.
-                // The ADR (D7) preferred the job-list attribute, but empirically a job-list attribute
-                // alongside PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE leaves the child attached to the PARENT's
-                // console instead of the pseudoconsole — its output then escapes the captured merged stream.
-                // The suspended->assign->resume flow is D7's explicitly-permitted fallback: it keeps the
-                // kill-on-dispose guarantee intact (the child is contained before it runs a single
-                // instruction) and composes cleanly with the pseudoconsole, exactly as `spawnWindowsCore`.
-                let mutable listSize = IntPtr.Zero
-                // First call sizes the list (returns FALSE with ERROR_INSUFFICIENT_BUFFER — expected).
-                InitializeProcThreadAttributeList(IntPtr.Zero, 1u, 0u, &listSize) |> ignore
-                let attrList = Marshal.AllocHGlobal listSize
-
-                // Release the initialized attribute list (post-CreateProcess or on error).
-                let cleanupInitializedScratch () =
-                    DeleteProcThreadAttributeList attrList
-                    Marshal.FreeHGlobal attrList
-
-                if not (InitializeProcThreadAttributeList(attrList, 1u, 0u, &listSize)) then
-                    let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-                    // The list was never initialized — free the raw buffer WITHOUT DeleteProcThreadAttributeList.
-                    Marshal.FreeHGlobal attrList
-                    ClosePseudoConsole hPC
-                    pendingPseudoConsole <- IntPtr.Zero
-                    disposeCreatedPipes ()
-                    Error(ProcessError.Spawn(command.Program, $"InitializeProcThreadAttributeList failed: {message}"))
-                // PSEUDOCONSOLE's value is the HPCON handle itself (passed by value in the lpValue slot),
-                // cbSize = pointer size.
-                elif
-                    not (
-                        UpdateProcThreadAttribute(
-                            attrList,
-                            0u,
-                            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                            hPC,
-                            nativeint IntPtr.Size,
-                            IntPtr.Zero,
-                            IntPtr.Zero
-                        )
+                let hr =
+                    CreatePseudoConsole(
+                        packCoord pty.Cols pty.Rows,
+                        inClient.SafePipeHandle.DangerousGetHandle(),
+                        outClient.SafePipeHandle.DangerousGetHandle(),
+                        0u,
+                        &hPC
                     )
-                then
-                    let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-                    cleanupInitializedScratch ()
-                    ClosePseudoConsole hPC
-                    pendingPseudoConsole <- IntPtr.Zero
+
+                if hr <> 0 then
                     disposeCreatedPipes ()
-                    Error(ProcessError.Spawn(command.Program, $"UpdateProcThreadAttribute failed: {message}"))
+                    let hrHex = hr.ToString("X8")
+                    Error(ProcessError.Spawn(command.Program, $"CreatePseudoConsole failed (HRESULT 0x{hrHex})"))
                 else
-                    let mutable startup = STARTUPINFOEX()
-                    startup.StartupInfo.cb <- Marshal.SizeOf<STARTUPINFOEX>()
-                    // Deliberately NO STARTF_USESTDHANDLES and no std handles — a ConPTY child's std handles
-                    // come from the pseudoconsole. The fundamental divergence from the pipe path.
-                    startup.lpAttributeList <- attrList
+                    pendingPseudoConsole <- hPC
+                    // ConPTY duplicated the child-side ends into the sidecar; drop our copies so only the parent
+                    // ends (kept below) remain. (Still listed in `createdPipes`; `Stream.Dispose` is safe to
+                    // call twice, so a later failure's unwind is harmless.)
+                    inClient.Dispose()
+                    outClient.Dispose()
 
-                    let mutable info = PROCESS_INFORMATION()
-                    let commandLine = buildWindowsCommandLine command
+                    // A STARTUPINFOEX attribute list carrying ONE attribute: the pseudoconsole. Containment
+                    // (Job membership) is done the proven way — CREATE_SUSPENDED, AssignProcessToJobObject while
+                    // still suspended, then resume — NOT via a PROC_THREAD_ATTRIBUTE_JOB_LIST in the same list.
+                    // The ADR (D7) preferred the job-list attribute, but empirically a job-list attribute
+                    // alongside PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE leaves the child attached to the PARENT's
+                    // console instead of the pseudoconsole — its output then escapes the captured merged stream.
+                    // The suspended->assign->resume flow is D7's explicitly-permitted fallback: it keeps the
+                    // kill-on-dispose guarantee intact (the child is contained before it runs a single
+                    // instruction) and composes cleanly with the pseudoconsole, exactly as `spawnWindowsCore`.
+                    let mutable listSize = IntPtr.Zero
+                    // First call sizes the list (returns FALSE with ERROR_INSUFFICIENT_BUFFER — expected).
+                    InitializeProcThreadAttributeList(IntPtr.Zero, 1u, 0u, &listSize) |> ignore
+                    let attrList = Marshal.AllocHGlobal listSize
 
-                    let workingDirectory =
-                        config.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
+                    // Release the initialized attribute list (post-CreateProcess or on error).
+                    let cleanupInitializedScratch () =
+                        DeleteProcThreadAttributeList attrList
+                        Marshal.FreeHGlobal attrList
 
-                    let environment = buildWindowsEnvironment command
+                    if not (InitializeProcThreadAttributeList(attrList, 1u, 0u, &listSize)) then
+                        let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                        // The list was never initialized — free the raw buffer WITHOUT DeleteProcThreadAttributeList.
+                        Marshal.FreeHGlobal attrList
+                        ClosePseudoConsole hPC
+                        pendingPseudoConsole <- IntPtr.Zero
+                        disposeCreatedPipes ()
 
-                    let flags =
-                        // Spawn SUSPENDED so the child is assigned to the Job before it runs (proven
-                        // containment). EXTENDED_STARTUPINFO_PRESENT selects the STARTUPINFOEX form.
-                        EXTENDED_STARTUPINFO_PRESENT
-                        ||| CREATE_SUSPENDED
-                        ||| (if environment = IntPtr.Zero then
-                                 0u
-                             else
-                                 CREATE_UNICODE_ENVIRONMENT)
-                        ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
-                        ||| (if config.WindowsCtrlSignals then
-                                 CREATE_NEW_PROCESS_GROUP
-                             else
-                                 0u)
-                        ||| (match config.Priority with
-                             | Some priority -> PriorityMapping.windowsCreationFlag priority
-                             | None -> 0u)
-
-                    let created =
-                        CreateProcessExtended(
-                            IntPtr.Zero,
-                            commandLine,
-                            IntPtr.Zero,
-                            IntPtr.Zero,
-                            // A ConPTY child inherits no handles; its stdio comes from the pseudoconsole.
-                            false,
-                            flags,
-                            environment,
-                            workingDirectory,
-                            &startup,
-                            &info
+                        Error(
+                            ProcessError.Spawn(command.Program, $"InitializeProcThreadAttributeList failed: {message}")
                         )
-
-                    let lastError = Marshal.GetLastWin32Error()
-
-                    if environment <> IntPtr.Zero then
-                        Marshal.FreeHGlobal environment
-
-                    cleanupInitializedScratch ()
-
-                    if not created then
-                        ClosePseudoConsole hPC
-                        pendingPseudoConsole <- IntPtr.Zero
-                        disposeCreatedPipes ()
-
-                        if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
-                            Error(notFoundFromSpawnFailure command.Program)
-                        else
-                            Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
-                    elif not (AssignProcessToJobObject(job, info.hProcess)) then
-                        // Suspended but uncontained — kill it rather than let it run free (mirrors
-                        // `spawnWindowsCore`), and tear down the pseudoconsole + pipes.
+                    // PSEUDOCONSOLE's value is the HPCON handle itself (passed by value in the lpValue slot),
+                    // cbSize = pointer size.
+                    elif
+                        not (
+                            UpdateProcThreadAttribute(
+                                attrList,
+                                0u,
+                                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                                hPC,
+                                nativeint IntPtr.Size,
+                                IntPtr.Zero,
+                                IntPtr.Zero
+                            )
+                        )
+                    then
                         let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-                        TerminateProcess(info.hProcess, 1u) |> ignore
-                        CloseHandle info.hThread |> ignore
-                        CloseHandle info.hProcess |> ignore
+                        cleanupInitializedScratch ()
                         ClosePseudoConsole hPC
                         pendingPseudoConsole <- IntPtr.Zero
                         disposeCreatedPipes ()
-                        Error(ProcessError.Spawn(command.Program, $"could not assign process to job object: {message}"))
-                    elif resumeThreadHook info.hThread = UInt32.MaxValue then
-                        // `ResumeThread` returned its `(DWORD)-1` failure sentinel: the child is contained
-                        // but stuck SUSPENDED and would never run. Kill it and report honestly.
-                        let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-                        TerminateProcess(info.hProcess, 1u) |> ignore
-                        CloseHandle info.hThread |> ignore
-                        CloseHandle info.hProcess |> ignore
-                        ClosePseudoConsole hPC
-                        pendingPseudoConsole <- IntPtr.Zero
-                        disposeCreatedPipes ()
-                        Error(ProcessError.Spawn(command.Program, $"could not resume the suspended child: {message}"))
+                        Error(ProcessError.Spawn(command.Program, $"UpdateProcThreadAttribute failed: {message}"))
                     else
-                        CloseHandle info.hThread |> ignore
+                        let mutable startup = STARTUPINFOEX()
+                        startup.StartupInfo.cb <- Marshal.SizeOf<STARTUPINFOEX>()
+                        // Deliberately NO STARTF_USESTDHANDLES and no std handles — a ConPTY child's std handles
+                        // come from the pseudoconsole. The fundamental divergence from the pipe path.
+                        startup.lpAttributeList <- attrList
 
-                        if not (closePseudoConsoleOnChildExit info.hProcess hPC) then
-                            // Near-impossible (duplicating a just-created process handle failed): fail
-                            // honestly rather than leak the conhost sidecar. The child is a Job member, so
-                            // terminate it, close the pseudoconsole, and release the pipes.
+                        let mutable info = PROCESS_INFORMATION()
+
+                        let workingDirectory =
+                            config.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
+
+                        let environment = buildWindowsEnvironment command
+
+                        let flags =
+                            // Spawn SUSPENDED so the child is assigned to the Job before it runs (proven
+                            // containment). EXTENDED_STARTUPINFO_PRESENT selects the STARTUPINFOEX form.
+                            EXTENDED_STARTUPINFO_PRESENT
+                            ||| CREATE_SUSPENDED
+                            ||| (if environment = IntPtr.Zero then
+                                     0u
+                                 else
+                                     CREATE_UNICODE_ENVIRONMENT)
+                            ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
+                            ||| (if config.WindowsCtrlSignals then
+                                     CREATE_NEW_PROCESS_GROUP
+                                 else
+                                     0u)
+                            ||| (match config.Priority with
+                                 | Some priority -> PriorityMapping.windowsCreationFlag priority
+                                 | None -> 0u)
+
+                        let created =
+                            CreateProcessExtended(
+                                IntPtr.Zero,
+                                commandLine,
+                                IntPtr.Zero,
+                                IntPtr.Zero,
+                                // A ConPTY child inherits no handles; its stdio comes from the pseudoconsole.
+                                false,
+                                flags,
+                                environment,
+                                workingDirectory,
+                                &startup,
+                                &info
+                            )
+
+                        let lastError = Marshal.GetLastWin32Error()
+
+                        if environment <> IntPtr.Zero then
+                            Marshal.FreeHGlobal environment
+
+                        cleanupInitializedScratch ()
+
+                        if not created then
                             ClosePseudoConsole hPC
                             pendingPseudoConsole <- IntPtr.Zero
+                            disposeCreatedPipes ()
+
+                            if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
+                                Error(notFoundFromSpawnFailure command.Program)
+                            else
+                                Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
+                        elif not (AssignProcessToJobObject(job, info.hProcess)) then
+                            // Suspended but uncontained — kill it rather than let it run free (mirrors
+                            // `spawnWindowsCore`), and tear down the pseudoconsole + pipes.
+                            let message = Win32Exception(Marshal.GetLastWin32Error()).Message
                             TerminateProcess(info.hProcess, 1u) |> ignore
+                            CloseHandle info.hThread |> ignore
                             CloseHandle info.hProcess |> ignore
+                            ClosePseudoConsole hPC
+                            pendingPseudoConsole <- IntPtr.Zero
                             disposeCreatedPipes ()
 
                             Error(
                                 ProcessError.Spawn(
                                     command.Program,
-                                    "could not register the pseudoconsole teardown wait"
+                                    $"could not assign process to job object: {message}"
                                 )
                             )
-                        else
-                            // Ownership of `hPC` is now the exit-wait's; it closes it exactly once.
+                        elif resumeThreadHook info.hThread = UInt32.MaxValue then
+                            // `ResumeThread` returned its `(DWORD)-1` failure sentinel: the child is contained
+                            // but stuck SUSPENDED and would never run. Kill it and report honestly.
+                            let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                            TerminateProcess(info.hProcess, 1u) |> ignore
+                            CloseHandle info.hThread |> ignore
+                            CloseHandle info.hProcess |> ignore
+                            ClosePseudoConsole hPC
                             pendingPseudoConsole <- IntPtr.Zero
+                            disposeCreatedPipes ()
 
-                            let stdinStream =
-                                if stdinPipeKept then
-                                    Some(inServer :> Stream)
-                                else
-                                    // No feeder/interactive writer: close the pty master input end.
-                                    inServer.Dispose()
-                                    None
+                            Error(
+                                ProcessError.Spawn(command.Program, $"could not resume the suspended child: {message}")
+                            )
+                        else
+                            CloseHandle info.hThread |> ignore
 
-                            Ok
-                                { Handle = info.hProcess
-                                  // One merged terminal stream (D3): stdout carries all output, no stderr.
-                                  Stdout = Some(outServer :> Stream)
-                                  Stderr = None
-                                  Stdin = stdinStream
-                                  WindowsCtrlGroup = config.WindowsCtrlSignals
-                                  // Retain the pseudoconsole handle so `RunningProcess.ResizeAsync` can
-                                  // `ResizePseudoConsole` it (Stage 4 / D6). The exit-wait still owns closing it
-                                  // exactly once on child exit; a resize after that returns a typed error, never
-                                  // a crash. Its value stays valid for the child's whole running lifetime.
-                                  PtyControl = Some hPC }
-        with ex ->
-            if pendingPseudoConsole <> IntPtr.Zero then
-                ClosePseudoConsole pendingPseudoConsole
+                            if not (closePseudoConsoleOnChildExit info.hProcess hPC) then
+                                // Near-impossible (duplicating a just-created process handle failed): fail
+                                // honestly rather than leak the conhost sidecar. The child is a Job member, so
+                                // terminate it, close the pseudoconsole, and release the pipes.
+                                ClosePseudoConsole hPC
+                                pendingPseudoConsole <- IntPtr.Zero
+                                TerminateProcess(info.hProcess, 1u) |> ignore
+                                CloseHandle info.hProcess |> ignore
+                                disposeCreatedPipes ()
 
-            disposeCreatedPipes ()
-            Error(ProcessError.Spawn(command.Program, ex.Message))
+                                Error(
+                                    ProcessError.Spawn(
+                                        command.Program,
+                                        "could not register the pseudoconsole teardown wait"
+                                    )
+                                )
+                            else
+                                // Ownership of `hPC` is now the exit-wait's; it closes it exactly once.
+                                pendingPseudoConsole <- IntPtr.Zero
+
+                                let stdinStream =
+                                    if stdinPipeKept then
+                                        Some(inServer :> Stream)
+                                    else
+                                        // No feeder/interactive writer: close the pty master input end.
+                                        inServer.Dispose()
+                                        None
+
+                                Ok
+                                    { Handle = info.hProcess
+                                      // One merged terminal stream (D3): stdout carries all output, no stderr.
+                                      Stdout = Some(outServer :> Stream)
+                                      Stderr = None
+                                      Stdin = stdinStream
+                                      WindowsCtrlGroup = config.WindowsCtrlSignals
+                                      // Retain the pseudoconsole handle so `RunningProcess.ResizeAsync` can
+                                      // `ResizePseudoConsole` it (Stage 4 / D6). The exit-wait still owns closing it
+                                      // exactly once on child exit; a resize after that returns a typed error, never
+                                      // a crash. Its value stays valid for the child's whole running lifetime.
+                                      PtyControl = Some hPC }
+            with ex ->
+                if pendingPseudoConsole <> IntPtr.Zero then
+                    ClosePseudoConsole pendingPseudoConsole
+
+                disposeCreatedPipes ()
+                Error(ProcessError.Spawn(command.Program, ex.Message))
 
     /// Spawn `command` suspended, assign it to `job` while still suspended (so no
     /// grandchild can escape the container), then resume it. Returns the process handle and
@@ -1522,251 +1677,261 @@ module internal Windows =
                     // report, not a secondary problem tearing down an already-broken pipe.
                     ()
 
-        try
-            // stdin: with `InheritStdin` the child is handed a duplicated inheritable copy of the
-            // parent's own STD_INPUT_HANDLE directly (no pipe, no feeder). Otherwise it is always a
-            // pipe so we control EOF; the write end is kept (feeder/interactive) or closed. `stdinChild`
-            // is what goes to `STARTUPINFO.hStdInput`; `inStreams` is `Some (server, client)` only for
-            // the pipe path (the parent write end + the child read end); both paths register their
-            // handles in `createdPipes` for the exception unwind and drop the child's copy after spawn.
-            let stdinChild, inStreams =
-                if stdinInherit then
-                    let handle = inheritableStdHandle STD_INPUT_HANDLE
+        // Decide the launch (PATHEXT substitution / cmd.exe batch wrapper — T-181) and build the command
+        // line up front: an unsafe batch argument is refused here, BEFORE any pipe/handle is allocated.
+        match buildWindowsCommandLine command with
+        | Error error -> Error error
+        | Ok commandLine ->
 
-                    if not (isValidHandle handle) then
-                        // Same rationale as `setupOut`'s Inherit branch: a failed `GetStdHandle`/
-                        // `DuplicateHandle` (e.g. no console and stdin not redirected) must fail the
-                        // spawn, not silently hand the child a broken std input handle.
-                        let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-
-                        failwith
-                            $"could not duplicate an inheritable copy of the parent's standard input handle: {message}"
-
-                    createdPipes.Add(disposableHandle handle)
-                    handle, None
-                else
-                    let inServer, inClient = createAsyncPipePair PipeDirection.Out
-                    createdPipes.Add inServer
-                    createdPipes.Add inClient
-                    inClient.SafePipeHandle.DangerousGetHandle(), Some(inServer, inClient)
-
-            // For an output stream: the inheritable child-side handle, the parent read stream
-            // (`Some` only when piped), and a cleanup that drops the parent's copy of the child handle
-            // after spawn (the child has its own inherited copy by then). `fileRedirect` (`Command.
-            // StdoutToFile`/`StderrToFile`) takes precedence over `mode`: the child is handed an
-            // inheritable file handle directly, so there is no parent read stream (`None`, like NUL) and
-            // the file lives beyond the parent — the builder already rejected combining it with the
-            // parent-side observation knobs.
-            let setupOut
-                (fileRedirect: (string * bool) option)
-                (mode: StdioMode)
-                (stdHandleId: int)
-                : nativeint * Stream option * (unit -> unit) =
-                match fileRedirect with
-                | Some(path, append) ->
-                    let handle = inheritableFile path append
-
-                    if not (isValidHandle handle) then
-                        // A bad redirect path / denied access is validated at the source, before it could
-                        // reach `STARTUPINFO.hStdOutput`/`hStdError`; the outer `with` turns this into an
-                        // honest `ProcessError.Spawn` rather than a child handed a broken handle.
-                        let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-                        failwith $"could not open the redirect file '{path}' for the child's output: {message}"
-
-                    // Registered in the unwind list immediately (like the NUL branch): if a LATER step in
-                    // this spawn throws, this handle has not been handed to a child yet and must not leak.
-                    createdPipes.Add(disposableHandle handle)
-                    handle, None, (fun () -> closeHandleIfValid handle)
-                | None ->
-                    match mode with
-                    | StdioMode.Piped ->
-                        let server, client = createAsyncPipePair PipeDirection.In
-                        createdPipes.Add server
-                        createdPipes.Add client
-                        client.SafePipeHandle.DangerousGetHandle(), Some(server :> Stream), (fun () -> client.Dispose())
-                    | StdioMode.Null ->
-                        let handle = inheritableNul GENERIC_WRITE
+            try
+                // stdin: with `InheritStdin` the child is handed a duplicated inheritable copy of the
+                // parent's own STD_INPUT_HANDLE directly (no pipe, no feeder). Otherwise it is always a
+                // pipe so we control EOF; the write end is kept (feeder/interactive) or closed. `stdinChild`
+                // is what goes to `STARTUPINFO.hStdInput`; `inStreams` is `Some (server, client)` only for
+                // the pipe path (the parent write end + the child read end); both paths register their
+                // handles in `createdPipes` for the exception unwind and drop the child's copy after spawn.
+                let stdinChild, inStreams =
+                    if stdinInherit then
+                        let handle = inheritableStdHandle STD_INPUT_HANDLE
 
                         if not (isValidHandle handle) then
-                            // Validated at the source, before this ever reaches `STARTUPINFO.hStdOutput`/
-                            // `hStdError` — a NUL-device handle is not the sort of thing that should be
-                            // handed to the child silently broken. Caught by the outer `with` below, which
-                            // turns it into an honest `ProcessError.Spawn` instead of a fabricated success.
+                            // Same rationale as `setupOut`'s Inherit branch: a failed `GetStdHandle`/
+                            // `DuplicateHandle` (e.g. no console and stdin not redirected) must fail the
+                            // spawn, not silently hand the child a broken std input handle.
                             let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-                            failwith $"could not open an inheritable handle to the NUL device: {message}"
 
-                        // Registered in the unwind list immediately: if the NEXT step in this same spawn
-                        // (the `setupOut` call for stderr, when this was stdout's) throws afterwards, this
-                        // handle has not been handed to a child yet and must not leak.
+                            failwith
+                                $"could not duplicate an inheritable copy of the parent's standard input handle: {message}"
+
                         createdPipes.Add(disposableHandle handle)
-                        handle, None, (fun () -> closeHandleIfValid handle)
-                    | StdioMode.Inherit ->
-                        let handle = inheritableStdHandle stdHandleId
+                        handle, None
+                    else
+                        let inServer, inClient = createAsyncPipePair PipeDirection.Out
+                        createdPipes.Add inServer
+                        createdPipes.Add inClient
+                        inClient.SafePipeHandle.DangerousGetHandle(), Some(inServer, inClient)
+
+                // For an output stream: the inheritable child-side handle, the parent read stream
+                // (`Some` only when piped), and a cleanup that drops the parent's copy of the child handle
+                // after spawn (the child has its own inherited copy by then). `fileRedirect` (`Command.
+                // StdoutToFile`/`StderrToFile`) takes precedence over `mode`: the child is handed an
+                // inheritable file handle directly, so there is no parent read stream (`None`, like NUL) and
+                // the file lives beyond the parent — the builder already rejected combining it with the
+                // parent-side observation knobs.
+                let setupOut
+                    (fileRedirect: (string * bool) option)
+                    (mode: StdioMode)
+                    (stdHandleId: int)
+                    : nativeint * Stream option * (unit -> unit) =
+                    match fileRedirect with
+                    | Some(path, append) ->
+                        let handle = inheritableFile path append
 
                         if not (isValidHandle handle) then
-                            // Same rationale as the `Null` branch above: `GetStdHandle`/`DuplicateHandle`
-                            // failing (e.g. no console and this stream not redirected) must fail the spawn,
-                            // not silently hand the child a broken std handle.
+                            // A bad redirect path / denied access is validated at the source, before it could
+                            // reach `STARTUPINFO.hStdOutput`/`hStdError`; the outer `with` turns this into an
+                            // honest `ProcessError.Spawn` rather than a child handed a broken handle.
                             let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-                            failwith $"could not duplicate an inheritable copy of the parent's std handle: {message}"
+                            failwith $"could not open the redirect file '{path}' for the child's output: {message}"
 
+                        // Registered in the unwind list immediately (like the NUL branch): if a LATER step in
+                        // this spawn throws, this handle has not been handed to a child yet and must not leak.
                         createdPipes.Add(disposableHandle handle)
                         handle, None, (fun () -> closeHandleIfValid handle)
+                    | None ->
+                        match mode with
+                        | StdioMode.Piped ->
+                            let server, client = createAsyncPipePair PipeDirection.In
+                            createdPipes.Add server
+                            createdPipes.Add client
 
-            let outChild, outStream, outCleanup =
-                setupOut config.StdoutFile config.StdoutMode STD_OUTPUT_HANDLE
+                            client.SafePipeHandle.DangerousGetHandle(),
+                            Some(server :> Stream),
+                            (fun () -> client.Dispose())
+                        | StdioMode.Null ->
+                            let handle = inheritableNul GENERIC_WRITE
 
-            let errChild, errStream, errCleanup =
-                if config.MergeStderr then
-                    // `Command.MergeStderr` (2>&1): the child's stderr shares the SAME inherited handle as
-                    // its stdout (`hStdError` = `hStdOutput` below), so both write into the one stdout
-                    // destination (pipe / NUL / inherited) and interleave honestly. No separate stderr
-                    // pipe is set up, so there is no separate parent stream (`errStream = None`) and
-                    // nothing extra to close — `outCleanup` already drops the parent's copy of `outChild`,
-                    // so `errCleanup` is a no-op (a second `CloseHandle` on that same handle would be a
-                    // double-close).
-                    outChild, None, (fun () -> ())
-                else
-                    setupOut config.StderrFile config.StderrMode STD_ERROR_HANDLE
+                            if not (isValidHandle handle) then
+                                // Validated at the source, before this ever reaches `STARTUPINFO.hStdOutput`/
+                                // `hStdError` — a NUL-device handle is not the sort of thing that should be
+                                // handed to the child silently broken. Caught by the outer `with` below, which
+                                // turns it into an honest `ProcessError.Spawn` instead of a fabricated success.
+                                let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                                failwith $"could not open an inheritable handle to the NUL device: {message}"
 
-            let mutable startup = STARTUPINFO()
-            startup.cb <- Marshal.SizeOf<STARTUPINFO>()
-            startup.dwFlags <- STARTF_USESTDHANDLES
-            startup.hStdInput <- stdinChild
-            startup.hStdOutput <- outChild
-            startup.hStdError <- errChild
+                            // Registered in the unwind list immediately: if the NEXT step in this same spawn
+                            // (the `setupOut` call for stderr, when this was stdout's) throws afterwards, this
+                            // handle has not been handed to a child yet and must not leak.
+                            createdPipes.Add(disposableHandle handle)
+                            handle, None, (fun () -> closeHandleIfValid handle)
+                        | StdioMode.Inherit ->
+                            let handle = inheritableStdHandle stdHandleId
 
-            let mutable info = PROCESS_INFORMATION()
-            let commandLine = buildWindowsCommandLine command
+                            if not (isValidHandle handle) then
+                                // Same rationale as the `Null` branch above: `GetStdHandle`/`DuplicateHandle`
+                                // failing (e.g. no console and this stream not redirected) must fail the spawn,
+                                // not silently hand the child a broken std handle.
+                                let message = Win32Exception(Marshal.GetLastWin32Error()).Message
 
-            let workingDirectory =
-                config.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
+                                failwith
+                                    $"could not duplicate an inheritable copy of the parent's std handle: {message}"
 
-            let environment = buildWindowsEnvironment command
+                            createdPipes.Add(disposableHandle handle)
+                            handle, None, (fun () -> closeHandleIfValid handle)
 
-            let flags =
-                CREATE_SUSPENDED
-                ||| (if environment = IntPtr.Zero then
-                         0u
-                     else
-                         CREATE_UNICODE_ENVIRONMENT)
-                ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
-                // Opt-in: make the child the root of its own console process group so a later
-                // `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` can soft-signal it (and the tree it
-                // shares a console with) without touching the caller's own group. `Spawned.WindowsCtrlGroup`
-                // records this so `ProcessGroup.Signal` knows which children can receive the event.
-                ||| (if config.WindowsCtrlSignals then
-                         CREATE_NEW_PROCESS_GROUP
-                     else
-                         0u)
-                // The requested CPU priority becomes a priority-class creation flag on the direct child,
-                // set atomically at creation (unlike the POSIX post-spawn nudge), so no window. It is
-                // honored on the immediate child for every level, but Windows only *inherits* a class to
-                // grandchildren when it is lowered: Idle/BelowNormal (and Normal) reach the whole tree,
-                // while a grandchild spawned with no flag defaults to NORMAL unless its creator is
-                // idle/below-normal — so grandchildren of an AboveNormal/High child run at Normal. This is
-                // the honest divergence documented on `Priority`; a job-wide class is not used here because
-                // the Job Object is a per-group container shared across commands, not per-command.
-                ||| (match config.Priority with
-                     | Some priority -> PriorityMapping.windowsCreationFlag priority
-                     | None -> 0u)
+                let outChild, outStream, outCleanup =
+                    setupOut config.StdoutFile config.StdoutMode STD_OUTPUT_HANDLE
 
-            let created =
-                CreateProcessW(
-                    IntPtr.Zero,
-                    commandLine,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    true,
-                    flags,
-                    environment,
-                    workingDirectory,
-                    &startup,
-                    &info
-                )
+                let errChild, errStream, errCleanup =
+                    if config.MergeStderr then
+                        // `Command.MergeStderr` (2>&1): the child's stderr shares the SAME inherited handle as
+                        // its stdout (`hStdError` = `hStdOutput` below), so both write into the one stdout
+                        // destination (pipe / NUL / inherited) and interleave honestly. No separate stderr
+                        // pipe is set up, so there is no separate parent stream (`errStream = None`) and
+                        // nothing extra to close — `outCleanup` already drops the parent's copy of `outChild`,
+                        // so `errCleanup` is a no-op (a second `CloseHandle` on that same handle would be a
+                        // double-close).
+                        outChild, None, (fun () -> ())
+                    else
+                        setupOut config.StderrFile config.StderrMode STD_ERROR_HANDLE
 
-            let lastError = Marshal.GetLastWin32Error()
+                let mutable startup = STARTUPINFO()
+                startup.cb <- Marshal.SizeOf<STARTUPINFO>()
+                startup.dwFlags <- STARTF_USESTDHANDLES
+                startup.hStdInput <- stdinChild
+                startup.hStdOutput <- outChild
+                startup.hStdError <- errChild
 
-            if environment <> IntPtr.Zero then
-                Marshal.FreeHGlobal environment
+                let mutable info = PROCESS_INFORMATION()
 
-            let releaseStdio () =
-                outCleanup ()
-                errCleanup ()
-                outStream |> Option.iter (fun s -> s.Dispose())
-                errStream |> Option.iter (fun s -> s.Dispose())
+                let workingDirectory =
+                    config.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
 
-                match inStreams with
-                | Some(inServer, inClient) ->
-                    inClient.Dispose()
-                    inServer.Dispose()
-                | None ->
-                    // Inherit: no pipe — just close the inheritable duplicate of the parent's std input.
-                    closeHandleIfValid stdinChild
+                let environment = buildWindowsEnvironment command
 
-            if not created then
-                releaseStdio ()
+                let flags =
+                    CREATE_SUSPENDED
+                    ||| (if environment = IntPtr.Zero then
+                             0u
+                         else
+                             CREATE_UNICODE_ENVIRONMENT)
+                    ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
+                    // Opt-in: make the child the root of its own console process group so a later
+                    // `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` can soft-signal it (and the tree it
+                    // shares a console with) without touching the caller's own group. `Spawned.WindowsCtrlGroup`
+                    // records this so `ProcessGroup.Signal` knows which children can receive the event.
+                    ||| (if config.WindowsCtrlSignals then
+                             CREATE_NEW_PROCESS_GROUP
+                         else
+                             0u)
+                    // The requested CPU priority becomes a priority-class creation flag on the direct child,
+                    // set atomically at creation (unlike the POSIX post-spawn nudge), so no window. It is
+                    // honored on the immediate child for every level, but Windows only *inherits* a class to
+                    // grandchildren when it is lowered: Idle/BelowNormal (and Normal) reach the whole tree,
+                    // while a grandchild spawned with no flag defaults to NORMAL unless its creator is
+                    // idle/below-normal — so grandchildren of an AboveNormal/High child run at Normal. This is
+                    // the honest divergence documented on `Priority`; a job-wide class is not used here because
+                    // the Job Object is a per-group container shared across commands, not per-command.
+                    ||| (match config.Priority with
+                         | Some priority -> PriorityMapping.windowsCreationFlag priority
+                         | None -> 0u)
 
-                if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
-                    Error(notFoundFromSpawnFailure command.Program)
-                else
-                    Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
-            elif not (AssignProcessToJobObject(job, info.hProcess)) then
-                // Suspended but uncontained — kill it rather than let it run free.
-                let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-                TerminateProcess(info.hProcess, 1u) |> ignore
-                CloseHandle info.hThread |> ignore
-                CloseHandle info.hProcess |> ignore
-                releaseStdio ()
-                Error(ProcessError.Spawn(command.Program, $"could not assign process to job object: {message}"))
-            elif resumeThreadHook info.hThread = UInt32.MaxValue then
-                // `ResumeThread` returned its `(DWORD)-1` failure sentinel: the child is assigned to the
-                // job but still SUSPENDED and will never run. Leaving it would masquerade as a healthy
-                // spawn while the child hangs forever, so terminate it inside the job, release every
-                // handle and stream, and report an honest `ProcessError.Spawn` — the same shape as the
-                // `AssignProcessToJobObject` failure just above.
-                let message = Win32Exception(Marshal.GetLastWin32Error()).Message
-                TerminateProcess(info.hProcess, 1u) |> ignore
-                CloseHandle info.hThread |> ignore
-                CloseHandle info.hProcess |> ignore
-                releaseStdio ()
-                Error(ProcessError.Spawn(command.Program, $"could not resume the suspended child: {message}"))
-            else
-                CloseHandle info.hThread |> ignore
-                // Drop the parent's copies of the child-side handles now that the child has inherited
-                // them, so reads see EOF when the child exits.
-                outCleanup ()
-                errCleanup ()
+                let created =
+                    CreateProcessW(
+                        IntPtr.Zero,
+                        commandLine,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        true,
+                        flags,
+                        environment,
+                        workingDirectory,
+                        &startup,
+                        &info
+                    )
 
-                let stdinStream =
+                let lastError = Marshal.GetLastWin32Error()
+
+                if environment <> IntPtr.Zero then
+                    Marshal.FreeHGlobal environment
+
+                let releaseStdio () =
+                    outCleanup ()
+                    errCleanup ()
+                    outStream |> Option.iter (fun s -> s.Dispose())
+                    errStream |> Option.iter (fun s -> s.Dispose())
+
                     match inStreams with
                     | Some(inServer, inClient) ->
-                        // Drop the parent's copy of the child's read end, then keep the write end only
-                        // for a feeder/interactive stdin; otherwise close it so the child sees EOF.
                         inClient.Dispose()
-
-                        if stdinPipeKept then
-                            Some(inServer :> Stream)
-                        else
-                            inServer.Dispose() // close stdin write end -> child sees EOF
-                            None
+                        inServer.Dispose()
                     | None ->
-                        // Inherit: the child now has its own inherited copy of the parent's std input, so
-                        // drop the parent's inheritable duplicate. There is no parent-side stdin stream.
+                        // Inherit: no pipe — just close the inheritable duplicate of the parent's std input.
                         closeHandleIfValid stdinChild
-                        None
 
-                Ok
-                    { Handle = info.hProcess
-                      Stdout = outStream
-                      Stderr = errStream
-                      Stdin = stdinStream
-                      WindowsCtrlGroup = config.WindowsCtrlSignals
-                      // Not a PTY run — no pseudoconsole to resize (`ResizeAsync` → typed Unsupported).
-                      PtyControl = None }
-        with ex ->
-            disposeCreatedPipes ()
-            Error(ProcessError.Spawn(command.Program, ex.Message))
+                if not created then
+                    releaseStdio ()
+
+                    if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
+                        Error(notFoundFromSpawnFailure command.Program)
+                    else
+                        Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
+                elif not (AssignProcessToJobObject(job, info.hProcess)) then
+                    // Suspended but uncontained — kill it rather than let it run free.
+                    let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                    TerminateProcess(info.hProcess, 1u) |> ignore
+                    CloseHandle info.hThread |> ignore
+                    CloseHandle info.hProcess |> ignore
+                    releaseStdio ()
+                    Error(ProcessError.Spawn(command.Program, $"could not assign process to job object: {message}"))
+                elif resumeThreadHook info.hThread = UInt32.MaxValue then
+                    // `ResumeThread` returned its `(DWORD)-1` failure sentinel: the child is assigned to the
+                    // job but still SUSPENDED and will never run. Leaving it would masquerade as a healthy
+                    // spawn while the child hangs forever, so terminate it inside the job, release every
+                    // handle and stream, and report an honest `ProcessError.Spawn` — the same shape as the
+                    // `AssignProcessToJobObject` failure just above.
+                    let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+                    TerminateProcess(info.hProcess, 1u) |> ignore
+                    CloseHandle info.hThread |> ignore
+                    CloseHandle info.hProcess |> ignore
+                    releaseStdio ()
+                    Error(ProcessError.Spawn(command.Program, $"could not resume the suspended child: {message}"))
+                else
+                    CloseHandle info.hThread |> ignore
+                    // Drop the parent's copies of the child-side handles now that the child has inherited
+                    // them, so reads see EOF when the child exits.
+                    outCleanup ()
+                    errCleanup ()
+
+                    let stdinStream =
+                        match inStreams with
+                        | Some(inServer, inClient) ->
+                            // Drop the parent's copy of the child's read end, then keep the write end only
+                            // for a feeder/interactive stdin; otherwise close it so the child sees EOF.
+                            inClient.Dispose()
+
+                            if stdinPipeKept then
+                                Some(inServer :> Stream)
+                            else
+                                inServer.Dispose() // close stdin write end -> child sees EOF
+                                None
+                        | None ->
+                            // Inherit: the child now has its own inherited copy of the parent's std input, so
+                            // drop the parent's inheritable duplicate. There is no parent-side stdin stream.
+                            closeHandleIfValid stdinChild
+                            None
+
+                    Ok
+                        { Handle = info.hProcess
+                          Stdout = outStream
+                          Stderr = errStream
+                          Stdin = stdinStream
+                          WindowsCtrlGroup = config.WindowsCtrlSignals
+                          // Not a PTY run — no pseudoconsole to resize (`ResizeAsync` → typed Unsupported).
+                          PtyControl = None }
+            with ex ->
+                disposeCreatedPipes ()
+                Error(ProcessError.Spawn(command.Program, ex.Message))
 
     let spawnWindows (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
         // `Command.Umask`/`Uid`/`Gid`/`Groups`/`Setsid` are Unix-only primitives with no Windows
