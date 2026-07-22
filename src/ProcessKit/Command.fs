@@ -57,6 +57,13 @@ type internal CommandConfig =
     { Program: string
       Args: ImmutableList<string>
       WorkingDirectory: string option
+      // Priority directories searched (in the order they were added) BEFORE `PATH` when resolving a
+      // bare-name program — see `Command.PreferLocal`. A match here is always launched by its resolved
+      // ABSOLUTE path (the OS never searches these directories itself, on any platform). Empty (the
+      // default) is the ordinary PATH-only resolution, byte-for-byte as before. A relative entry
+      // resolves against `WorkingDirectory` when one is set. `ImmutableList` (like `Args`) so a
+      // repeated `.PreferLocal(dir)` chain appends in O(log n) while readers see forward (added) order.
+      PreferLocal: ImmutableList<string>
       EnvOverrides: ImmutableList<string * string option>
       ClearEnv: bool
       StdinSource: Stdin option
@@ -183,6 +190,7 @@ module internal CommandConfig =
         { Program = program
           Args = ImmutableList<string>.Empty
           WorkingDirectory = None
+          PreferLocal = ImmutableList<string>.Empty
           EnvOverrides = ImmutableList<string * string option>.Empty
           ClearEnv = false
           StdinSource = None
@@ -519,6 +527,35 @@ type Command internal (config: CommandConfig) =
         Command(
             { config with
                 WorkingDirectory = Some directory }
+        )
+
+    /// Add `directory` to a priority search list consulted **before** `PATH` when resolving this
+    /// command's **bare-name** program: the prefer-local directories are searched first, in the order
+    /// they were added, and only then the inherited `PATH`. The canonical use is preferring a
+    /// project-local tool — `node_modules/.bin`, `.venv/bin`, `tools/`, a binary next to the solution —
+    /// over a global one of the same name, without hand-building the path and losing cross-platform
+    /// executable resolution.
+    ///
+    /// The lookup in each directory is the SAME `PATHEXT`-aware (Windows) / executable-bit (POSIX) probe
+    /// the `PATH` walk itself uses, so a Windows `.cmd`/`.bat` shim resolves — and launches through
+    /// `cmd.exe /d /c` — exactly as it would on `PATH`, and a POSIX file without an executable bit is
+    /// skipped just the same. A **relative** `directory` resolves against this command's `CurrentDir`
+    /// when one is set (so a project-relative `tools/` anchors to where the child will actually run, not
+    /// the parent's current directory); otherwise it resolves against the process's current directory. A
+    /// prefer-local match is ALWAYS handed to the OS as its resolved **absolute** path, whatever its
+    /// extension — the OS never searches these directories on its own. Only a **bare name** is affected:
+    /// a path-form program (`./tool`, `/usr/bin/tool`, `C:\tools\tool.exe`) is launched directly and
+    /// ignores prefer-local, exactly as it ignores `PATH`. `Exec.which` is deliberately unchanged — it
+    /// answers "is this installed on the host", a preflight question, whereas prefer-local is a launch
+    /// concern. `directory` must not contain an embedded NUL (`'\000'`). Repeatable: each call appends
+    /// one more directory to the end of the priority list.
+    member _.PreferLocal(directory: string) =
+        ArgumentNullException.ThrowIfNull directory
+        CommandConfig.rejectEmbeddedNul (nameof directory) directory
+
+        Command(
+            { config with
+                PreferLocal = config.PreferLocal.Add directory }
         )
 
     /// Set an environment variable for the child. `key` must be non-empty, must not contain `=`, and
@@ -1112,6 +1149,11 @@ module Command =
 
     /// Set the working directory for the run.
     let currentDir (directory: string) (command: Command) = command.CurrentDir directory
+
+    /// Add `directory` to the prefer-local search list, consulted before `PATH` when resolving the
+    /// command's bare-name program (searched in the order added; a match is launched by its resolved
+    /// absolute path). See `Command.PreferLocal`.
+    let preferLocal (directory: string) (command: Command) = command.PreferLocal directory
 
     /// Set an environment variable for the child.
     let env (key: string) (value: string) (command: Command) = command.Env(key, value)

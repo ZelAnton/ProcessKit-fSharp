@@ -1,0 +1,79 @@
+[files]
+# Keep generated output and opaque test data out of the source spell-check.
+extend-exclude = [
+	"**/bin/**",
+	"**/obj/**",
+	"BenchmarkDotNet.Artifacts/**",
+	"apidocs/_*/**",
+	"apidocs/output/**",
+	"**/fixtures/**",
+	"**/Fixtures/**",
+	"**/testdata/**",
+	"**/TestData/**",
+	"**/*fixture*",
+	"**/*Fixture*",
+]
+
+[default]
+# URLs and opaque hashes/base64 payloads are not natural-language source.
+extend-ignore-re = [
+	'(?i)https?://[^\s)>]+',
+	'(?i)\b(?:[0-9a-f]{32,}|[A-Za-z0-9+/]{40,}={0,2})\b',
+]
+
+[default.extend-identifiers]
+# Win32 and POSIX API names are externally defined identifiers, not prose.
+CreateProcessW = "CreateProcessW"
+CreatePseudoConsole = "CreatePseudoConsole"
+ClosePseudoConsole = "ClosePseudoConsole"
+GetProcessId = "GetProcessId"
+TerminateJobObject = "TerminateJobObject"
+AssignProcessToJobObject = "AssignProcessToJobObject"
+SetInformationJobObject = "SetInformationJobObject"
+GenerateConsoleCtrlEvent = "GenerateConsoleCtrlEvent"
+posix_openpt = "posix_openpt"
+grantpt = "grantpt"
+unlockpt = "unlockpt"
+ptsname = "ptsname"
+posix_spawn = "posix_spawn"
+posix_spawnp = "posix_spawnp"
+posix_spawn_file_actions_addclose = "posix_spawn_file_actions_addclose"
+posix_spawn_file_actions_adddup2 = "posix_spawn_file_actions_adddup2"
+posix_spawnattr_setflags = "posix_spawnattr_setflags"
+posix_spawnattr_setpgroup = "posix_spawnattr_setpgroup"
+pidfd_open = "pidfd_open"
+pidfd_send_signal = "pidfd_send_signal"
+
+# Project, toolchain, and package identifiers use their ecosystem spelling.
+ProcessKit = "ProcessKit"
+ProcessKitOptions = "ProcessKitOptions"
+IProcessRunner = "IProcessRunner"
+BenchmarkDotNet = "BenchmarkDotNet"
+CliWrap = "CliWrap"
+FSharp = "FSharp"
+Fantomas = "Fantomas"
+Ionide = "Ionide"
+NUnit = "NUnit"
+NuGet = "NuGet"
+NativeAOT = "NativeAOT"
+OpenTelemetry = "OpenTelemetry"
+SourceLink = "SourceLink"
+ConPTY = "ConPTY"
+ReSharper = "ReSharper"
+
+[default.extend-words]
+# Intentional fragments and technical compounds reported by the baseline scan.
+elease = "elease"
+shemas = "shemas"
+unparseable = "unparseable"
+pidfd = "pidfd"
+cgroup = "cgroup"
+fsdocs = "fsdocs"
+mdBook = "mdBook"
+NDJSON = "NDJSON"
+POSIX = "POSIX"
+Win32 = "Win32"
+libc = "libc"
+glibc = "glibc"
+musl = "musl"
+util-linux = "util-linux"

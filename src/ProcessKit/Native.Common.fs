@@ -276,6 +276,43 @@ module internal Common =
             )
         | Error error -> error
 
+    /// Resolve `command`'s program against its prefer-local directories (`Command.PreferLocal`), searched
+    /// in the order they were added, BEFORE any `PATH` lookup (T-182). Only a **bare name** is resolved
+    /// this way — a path-form program is handed to the OS verbatim (exactly as `resolveProgram`/the OS
+    /// resolve it), so prefer-local never applies to one, mirroring how `PATH` never applies either. Each
+    /// directory is probed with the SAME `probeDir` the `PATH` walk uses (PATHEXT on Windows, the
+    /// executable bit on POSIX) — no second copy of the search, so preflight/launch can never disagree on
+    /// what a directory contains. A **relative** directory resolves against the command's `CurrentDir`
+    /// (`WorkingDirectory`) when set — so a project-relative `tools/` anchors to where the child will run
+    /// rather than the parent's current directory — otherwise against the process's current directory
+    /// (the same base `probeDir`'s `File.Exists` uses). The first match is returned as an **absolute**
+    /// path: the OS never searches these directories itself, so a prefer-local hit must be substituted
+    /// into the launch as a full path, regardless of its extension. `None` when there are no prefer-local
+    /// directories, the program is path-form, or none of them holds the program — the caller then falls
+    /// back to the ordinary `PATH` launch.
+    let resolvePreferLocal (command: Command) : string option =
+        let program = command.Program
+
+        if command.Config.PreferLocal.IsEmpty || not (isBareName program) then
+            None
+        else
+            let baseDir = command.Config.WorkingDirectory
+
+            command.Config.PreferLocal
+            |> Seq.tryPick (fun dir ->
+                let effectiveDir =
+                    if Path.IsPathRooted dir then
+                        dir
+                    else
+                        match baseDir with
+                        | Some cwd -> Path.Combine(cwd, dir)
+                        | None -> dir
+
+                // `Path.GetFullPath` makes the found candidate absolute (rooted `effectiveDir` is
+                // normalized; a relative one resolves against the same process cwd `probeDir` already
+                // used), so the OS is handed a full path it can launch without searching for it.
+                probeDir effectiveDir program |> Option.map Path.GetFullPath)
+
     /// How a Windows spawn should launch `program` once the shared PATHEXT-aware resolver above has had
     /// its say (T-181). It reconciles a `which`/spawn divergence: our `probeDir` finds a bare name under
     /// ANY `PATHEXT` extension, but the OS's own bare-name `PATH` search only ever appends `.exe`, so a
@@ -298,12 +335,18 @@ module internal Common =
         /// argument quoting (BatBadBut / CVE-2024-24576).
         | BatchWrapper of ResolvedPath: string
 
-    /// Decide how a Windows spawn should launch `program`, reusing the SAME `findInPath`/`probeDir`
-    /// resolution the preflight (`Exec.which`/`resolveProgram`) goes through — no second copy — so the
-    /// substitution can never disagree with what `which` reports. `AsIs` on every non-Windows platform
-    /// (there is no `PATHEXT`) and for a path-form program or a name that resolves to nothing; a `.exe`
-    /// match is deliberately left `AsIs` so the OS's own bare-name search still applies.
-    let resolveWindowsLaunch (program: string) : WindowsLaunch =
+    /// Decide how a Windows spawn should launch `command`'s program, reusing the SAME
+    /// `resolvePreferLocal`/`findInPath`/`probeDir` resolution the preflight (`Exec.which`/
+    /// `resolveProgram`) goes through — no second copy — so the substitution can never disagree with what
+    /// `which` reports. `AsIs` on every non-Windows platform (there is no `PATHEXT`) and for a path-form
+    /// program or a name that resolves to nothing; a `PATH` `.exe` match is deliberately left `AsIs` so
+    /// the OS's own bare-name search still applies. A **prefer-local** match (`Command.PreferLocal`,
+    /// T-182) is consulted first and is ALWAYS substituted as its resolved absolute path — even a `.exe`,
+    /// unlike a `PATH` `.exe`, because the OS would never find it in a prefer-local directory on its own —
+    /// with a `.cmd`/`.bat` still routed through the batch wrapper.
+    let resolveWindowsLaunch (command: Command) : WindowsLaunch =
+        let program = command.Program
+
         if
             not (RuntimeInformation.IsOSPlatform OSPlatform.Windows)
             || not (isBareName program)
@@ -312,22 +355,32 @@ module internal Common =
             // path-form program is handed to the OS verbatim — never rewritten. Both stay byte-for-byte.
             WindowsLaunch.AsIs
         else
-            match findInPath program |> fst with
-            | None ->
-                // Not found by our resolver either: leave it to the OS, whose failure still flows through
-                // `notFoundFromSpawnFailure` for an honest, `which`-consistent `NotFound`.
-                WindowsLaunch.AsIs
-            | Some resolved ->
+            // Classify a resolved match by extension. `.cmd`/`.bat` is not a PE image and always routes
+            // through `cmd.exe /d /c`. A `PATH` `.exe` stays `AsIs` (the OS appends `.exe` itself, so its
+            // richer application/current/system-directory search is preserved); every prefer-local match
+            // is instead substituted by absolute path — the OS never searches those directories, so even
+            // a `.exe` there must be handed over as a full path.
+            let classify (resolved: string) (preferLocal: bool) : WindowsLaunch =
                 let ext = Path.GetExtension resolved
 
                 let isExt (candidate: string) =
                     String.Equals(ext, candidate, StringComparison.OrdinalIgnoreCase)
 
-                if isExt ".exe" then
-                    // The one extension the OS's bare-name search appends itself: leave the bare name so
-                    // that richer OS lookup (application/current/system directories) is never overridden.
-                    WindowsLaunch.AsIs
-                elif isExt ".cmd" || isExt ".bat" then
+                if isExt ".cmd" || isExt ".bat" then
                     WindowsLaunch.BatchWrapper resolved
+                elif preferLocal then
+                    WindowsLaunch.DirectPath resolved
+                elif isExt ".exe" then
+                    WindowsLaunch.AsIs
                 else
                     WindowsLaunch.DirectPath resolved
+
+            match resolvePreferLocal command with
+            | Some resolved -> classify resolved true
+            | None ->
+                match findInPath program |> fst with
+                | None ->
+                    // Not found by our resolver either: leave it to the OS, whose failure still flows
+                    // through `notFoundFromSpawnFailure` for an honest, `which`-consistent `NotFound`.
+                    WindowsLaunch.AsIs
+                | Some resolved -> classify resolved false

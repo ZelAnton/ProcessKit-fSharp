@@ -43,6 +43,7 @@ class ProcessKit.Command
   member OnStderrLine(System.Action<System.String>) : ProcessKit.Command
   member OnStdoutLine(System.Action<System.String>) : ProcessKit.Command
   member OutputBuffer(ProcessKit.OutputBufferPolicy) : ProcessKit.Command
+  member PreferLocal(System.String) : ProcessKit.Command
   member Priority(ProcessKit.Priority) : ProcessKit.Command
   member Pty() : ProcessKit.Command
   member Pty(ProcessKit.PtyConfig) : ProcessKit.Command
@@ -100,6 +101,7 @@ module ProcessKit.CommandModule
   static member onStderrLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command
   static member onStdoutLine(Microsoft.FSharp.Core.FSharpFunc<System.String, Microsoft.FSharp.Core.Unit>, ProcessKit.Command) : ProcessKit.Command
   static member outputBuffer(ProcessKit.OutputBufferPolicy, ProcessKit.Command) : ProcessKit.Command
+  static member preferLocal(System.String, ProcessKit.Command) : ProcessKit.Command
   static member priority(ProcessKit.Priority, ProcessKit.Command) : ProcessKit.Command
   static member pty(ProcessKit.Command) : ProcessKit.Command
   static member ptyConfig(ProcessKit.PtyConfig, ProcessKit.Command) : ProcessKit.Command

@@ -29,6 +29,14 @@ type WhichResolutionTests() =
     // PATHEXT concept).
     let presentBareProgram = if isWindows then "cmd" else "sh"
 
+    // A fresh, unique temp directory for a prefer-local test (`Command.PreferLocal`, T-182).
+    let freshDir (tag: string) =
+        let dir =
+            Path.Combine(Path.GetTempPath(), "processkit-preferlocal-" + tag + "-" + Guid.NewGuid().ToString "N")
+
+        Directory.CreateDirectory dir |> ignore
+        dir
+
     [<Test>]
     member _.``which reports NotFound with Searched for a bare name absent from PATH``() =
         match Exec.which missingProgram with
@@ -460,5 +468,276 @@ type WhichResolutionTests() =
                 finally
                     Environment.SetEnvironmentVariable("PATH", originalPath)
                     Directory.Delete(dir, true)
+        }
+        :> Task
+
+    // ---- Command.PreferLocal (T-182): prefer-local program resolution ---------------------------------
+    //
+    // A marker tool named `baseName` in `dir` (created if absent) that prints `marker`, then its own
+    // resolved program path (POSIX `$0` / Windows `%~f0`) so a test can observe BOTH which tool ran and
+    // the absolute path the OS was handed. Returns the bare name used to launch it. A Windows tool is a
+    // `.cmd` shim (routed through cmd.exe, exactly the `node_modules/.bin` shape); a POSIX tool is an
+    // executable `/bin/sh` script. The `%~f0` / `$0` lines are plain string literals, not interpolated,
+    // so the `%`/`$` reach the batch/shell verbatim.
+    member private _.WriteMarkerTool(dir: string, baseName: string, marker: string) : string =
+        Directory.CreateDirectory dir |> ignore
+
+        if isWindows then
+            let cmdPath = Path.Combine(dir, baseName + ".cmd")
+            File.WriteAllText(cmdPath, "@echo off\r\necho " + marker + "\r\necho ARGV0=%~f0\r\n")
+        else
+            let path = Path.Combine(dir, baseName)
+            File.WriteAllText(path, "#!/bin/sh\necho " + marker + "\necho ARGV0=$0\n")
+
+            File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+
+        baseName
+
+    [<Test>]
+    member this.``PreferLocal resolves a bare name absent from PATH and launches it (T-182)``() : Task =
+        task {
+            let dir = freshDir "absent"
+            let toolName = "pk182-absent-tool"
+
+            try
+                this.WriteMarkerTool(dir, toolName, "LOCAL-HIT") |> ignore
+
+                // Control: the bare name is NOT on PATH, so a plain launch is NotFound — proving the tool is
+                // reachable ONLY through the prefer-local directory, not by any ambient PATH entry.
+                let! control = (Command.create toolName).OutputStringAsync()
+
+                match control with
+                | Error error ->
+                    Assert.That(error.IsNotFound, Is.True, $"expected NotFound without prefer-local, got {error}")
+                | Ok output -> Assert.Fail $"expected NotFound without prefer-local, but it ran: {output.Stdout}"
+
+                // With the prefer-local directory the same bare name resolves and launches.
+                let! result = (Command.create toolName |> Command.preferLocal dir).OutputStringAsync()
+
+                match result with
+                | Error error -> Assert.Fail $"expected the prefer-local tool to launch, got {error}"
+                | Ok output ->
+                    Assert.That(output.Code, Is.EqualTo(Some 0))
+                    Assert.That(output.Stdout, Does.Contain "LOCAL-HIT")
+            finally
+                Directory.Delete(dir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member this.``PreferLocal takes priority over a same-named program on PATH (T-182)``() : Task =
+        task {
+            let localDir = freshDir "prio-local"
+            let pathDir = freshDir "prio-path"
+            let toolName = "pk182-prio-tool"
+            let originalPath = Environment.GetEnvironmentVariable "PATH"
+
+            try
+                this.WriteMarkerTool(localDir, toolName, "FROM-LOCAL") |> ignore
+                this.WriteMarkerTool(pathDir, toolName, "FROM-PATH") |> ignore
+                Environment.SetEnvironmentVariable("PATH", pathDir + string Path.PathSeparator + originalPath)
+
+                // Without prefer-local, PATH wins — proving the two directories hold genuinely different
+                // tools, so the prefer-local win below is a real override, not an artefact.
+                let! viaPath = (Command.create toolName).OutputStringAsync()
+
+                match viaPath with
+                | Ok output -> Assert.That(output.Stdout, Does.Contain "FROM-PATH")
+                | Error error -> Assert.Fail $"expected the PATH tool to launch, got {error}"
+
+                // With prefer-local, the local directory wins even though the name is also on PATH.
+                let! viaLocal = (Command.create toolName |> Command.preferLocal localDir).OutputStringAsync()
+
+                match viaLocal with
+                | Ok output ->
+                    Assert.That(output.Stdout, Does.Contain "FROM-LOCAL")
+                    Assert.That(output.Stdout, Does.Not.Contain "FROM-PATH", "prefer-local must win over PATH")
+                | Error error -> Assert.Fail $"expected the prefer-local tool to launch, got {error}"
+            finally
+                Environment.SetEnvironmentVariable("PATH", originalPath)
+                Directory.Delete(localDir, true)
+                Directory.Delete(pathDir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member this.``PreferLocal searches multiple directories in the order added (T-182)``() : Task =
+        task {
+            let dir1 = freshDir "order-1"
+            let dir2 = freshDir "order-2"
+            let toolName = "pk182-order-tool"
+
+            try
+                this.WriteMarkerTool(dir1, toolName, "DIR-ONE") |> ignore
+                this.WriteMarkerTool(dir2, toolName, "DIR-TWO") |> ignore
+
+                // dir1 added first -> dir1 wins.
+                let! firstWins =
+                    (Command.create toolName |> Command.preferLocal dir1 |> Command.preferLocal dir2)
+                        .OutputStringAsync()
+
+                match firstWins with
+                | Ok output -> Assert.That(output.Stdout, Does.Contain "DIR-ONE")
+                | Error error -> Assert.Fail $"expected dir1 (added first) to win, got {error}"
+
+                // Reversed order -> dir2 wins, proving order IS priority, not mere set membership.
+                let! secondWins =
+                    (Command.create toolName |> Command.preferLocal dir2 |> Command.preferLocal dir1)
+                        .OutputStringAsync()
+
+                match secondWins with
+                | Ok output -> Assert.That(output.Stdout, Does.Contain "DIR-TWO")
+                | Error error -> Assert.Fail $"expected dir2 (added first) to win, got {error}"
+            finally
+                Directory.Delete(dir1, true)
+                Directory.Delete(dir2, true)
+        }
+        :> Task
+
+    [<Test>]
+    member this.``PreferLocal resolves a relative directory against CurrentDir and substitutes an absolute path (T-182)``
+        ()
+        : Task =
+        task {
+            let baseDir = freshDir "relbase"
+            let toolsDir = Path.Combine(baseDir, "tools")
+            let toolName = "pk182-rel-tool"
+
+            try
+                this.WriteMarkerTool(toolsDir, toolName, "REL-HIT") |> ignore
+
+                // A RELATIVE prefer-local dir ("tools") with CurrentDir set to baseDir: it must resolve
+                // against baseDir (where the child runs), not the parent's current directory, and the OS
+                // must be handed the resolved ABSOLUTE path (argv0 / %~f0 rooted under baseDir/tools). The
+                // tool lives under a random temp path, unreachable from the parent's cwd, so it can ONLY
+                // resolve via the CurrentDir anchoring.
+                let command =
+                    Command.create toolName
+                    |> Command.currentDir baseDir
+                    |> Command.preferLocal "tools"
+
+                let! result = command.OutputStringAsync()
+
+                match result with
+                | Error error -> Assert.Fail $"expected the relative prefer-local tool to launch, got {error}"
+                | Ok output ->
+                    Assert.That(output.Code, Is.EqualTo(Some 0))
+                    Assert.That(output.Stdout, Does.Contain "REL-HIT")
+
+                    let argv0 =
+                        output.Stdout.Split('\n')
+                        |> Array.tryFind (fun l -> l.StartsWith "ARGV0=")
+                        |> Option.map (fun l -> l.Substring("ARGV0=".Length).Trim())
+
+                    match argv0 with
+                    | Some path ->
+                        let rootedMessage = $"the substituted program path must be absolute, got '{path}'"
+
+                        Assert.That(Path.IsPathRooted path, Is.True, rootedMessage)
+
+                        let expectedPrefix = Path.GetFullPath toolsDir
+
+                        let comparison =
+                            if isWindows then
+                                StringComparison.OrdinalIgnoreCase
+                            else
+                                StringComparison.Ordinal
+
+                        let underMessage =
+                            $"the program path '{path}' must be rooted under the CurrentDir-anchored '{expectedPrefix}'"
+
+                        Assert.That(path.StartsWith(expectedPrefix, comparison), Is.True, underMessage)
+                    | None -> Assert.Fail $"the tool did not report its argv0; stdout was: {output.Stdout}"
+            finally
+                Directory.Delete(baseDir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member this.``PreferLocal honours probeDir semantics: Windows PATHEXT / POSIX executable bit (T-182)``() : Task =
+        task {
+            let dir = freshDir "probe"
+            let toolName = "pk182-probe-tool"
+
+            try
+                if isWindows then
+                    // A `.cmd` shim in the prefer-local directory with NO `.exe` sibling: `probeDir` appends
+                    // the PATHEXT extension to find it, and the launch routes it through `cmd.exe /d /c`
+                    // exactly as it would on PATH — the same shared probe, not a second copy.
+                    let cmdPath = Path.Combine(dir, toolName + ".cmd")
+                    File.WriteAllText(cmdPath, "@echo off\r\necho PROBE-CMD\r\n")
+
+                    let! result = (Command.create toolName |> Command.preferLocal dir).OutputStringAsync()
+
+                    match result with
+                    | Error error -> Assert.Fail $"expected the prefer-local .cmd shim to launch, got {error}"
+                    | Ok output ->
+                        Assert.That(output.Code, Is.EqualTo(Some 0))
+                        Assert.That(output.Stdout, Does.Contain "PROBE-CMD")
+                else
+                    // A file WITHOUT an executable bit must be skipped (`probeDir` requires one on POSIX), so
+                    // the bare name does not resolve prefer-local and falls through to a NotFound; adding the
+                    // bit makes the very same file resolve and launch.
+                    let toolPath = Path.Combine(dir, toolName)
+                    File.WriteAllText(toolPath, "#!/bin/sh\necho PROBE-EXEC\n")
+                    File.SetUnixFileMode(toolPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+
+                    let! notExecutable = (Command.create toolName |> Command.preferLocal dir).OutputStringAsync()
+
+                    match notExecutable with
+                    | Error error ->
+                        Assert.That(
+                            error.IsNotFound,
+                            Is.True,
+                            $"a non-executable file must not resolve prefer-local, got {error}"
+                        )
+                    | Ok output ->
+                        Assert.Fail
+                            $"expected NotFound for a non-executable prefer-local file, but it ran: {output.Stdout}"
+
+                    File.SetUnixFileMode(
+                        toolPath,
+                        UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute
+                    )
+
+                    let! executable = (Command.create toolName |> Command.preferLocal dir).OutputStringAsync()
+
+                    match executable with
+                    | Error error -> Assert.Fail $"expected the now-executable prefer-local tool to launch, got {error}"
+                    | Ok output -> Assert.That(output.Stdout, Does.Contain "PROBE-EXEC")
+            finally
+                Directory.Delete(dir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member this.``Command.preferLocal mirrors the instance PreferLocal, launching the same tool (T-182)``() : Task =
+        task {
+            let dir = freshDir "parity"
+            let toolName = "pk182-parity-tool"
+
+            try
+                this.WriteMarkerTool(dir, toolName, "PARITY-OK") |> ignore
+
+                let build (applyPreferLocal: Command -> Command) =
+                    Command.create toolName |> applyPreferLocal
+
+                let! viaModule = (build (Command.preferLocal dir)).OutputStringAsync()
+                let! viaInstance = (build (fun c -> c.PreferLocal dir)).OutputStringAsync()
+
+                match viaModule, viaInstance with
+                | Ok m, Ok i ->
+                    Assert.That(m.Stdout, Does.Contain "PARITY-OK")
+
+                    Assert.That(
+                        i.Stdout,
+                        Is.EqualTo m.Stdout,
+                        "Command.preferLocal must produce output identical to the instance .PreferLocal"
+                    )
+                | _ ->
+                    Assert.Fail
+                        $"expected both prefer-local paths to launch, got module={viaModule}, instance={viaInstance}"
+            finally
+                Directory.Delete(dir, true)
         }
         :> Task

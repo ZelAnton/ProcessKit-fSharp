@@ -34,6 +34,28 @@ type CommandTests() =
         Assert.That(command.WorkingDirectory, Is.EqualTo(Some "/tmp"))
 
     [<Test>]
+    member _.``preferLocal accumulates directories in the order added``() =
+        let command =
+            Command.create "eslint"
+            |> Command.preferLocal "node_modules/.bin"
+            |> Command.preferLocal "tools"
+
+        Assert.That(command.Config.PreferLocal |> Seq.toArray, Is.EqualTo(box [| "node_modules/.bin"; "tools" |]))
+
+    [<Test>]
+    member _.``preferLocal is empty by default, immutable, and the instance method matches the module``() =
+        let baseCommand = Command.create "eslint"
+        Assert.That(baseCommand.Config.PreferLocal, Is.Empty)
+
+        let viaModule = baseCommand |> Command.preferLocal "bin"
+        let viaInstance = baseCommand.PreferLocal "bin"
+
+        // The base command is untouched (immutability); both paths record the same single directory.
+        Assert.That(baseCommand.Config.PreferLocal, Is.Empty)
+        Assert.That(viaModule.Config.PreferLocal |> Seq.toArray, Is.EqualTo(box [| "bin" |]))
+        Assert.That(viaInstance.Config.PreferLocal |> Seq.toArray, Is.EqualTo(box [| "bin" |]))
+
+    [<Test>]
     member _.``instance methods match the module functions``() =
         let command = Command("git").Arg("rev-parse").Args([ "--short"; "HEAD" ])
         Assert.That(command.Program, Is.EqualTo "git")

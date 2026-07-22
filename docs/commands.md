@@ -111,6 +111,51 @@ a literal, never executed (the "BatBadBut" class, CVE-2024-24576). An argument
 carrying a character `cmd.exe` cannot escape at all — a `%`, a `!`, or a line
 break — is an honest `ProcessError.Spawn` refusal rather than an unsafe launch.
 
+### Preferring a project-local tool (`PreferLocal`)
+
+`PreferLocal` adds a directory to a priority search list consulted **before**
+`PATH` when resolving a **bare-name** program — the way you reach for a
+project-local tool (`node_modules/.bin`, `.venv/bin`, `tools/`, a binary next to
+the solution) over a global one of the same name, without hand-building the path
+and losing cross-platform executable resolution.
+
+**F#**
+
+```fsharp
+let cmd =
+    Command.create "eslint" // a bare name…
+    |> Command.preferLocal "node_modules/.bin" // …looked up here first,
+    |> Command.preferLocal "tools" // then here,
+    |> Command.currentDir "/path/to/project" // then finally on PATH
+```
+
+**C#**
+
+```csharp
+var cmd =
+    new Command("eslint")
+        .PreferLocal("node_modules/.bin")
+        .PreferLocal("tools")
+        .CurrentDir("/path/to/project");
+```
+
+The directories are searched **in the order added**, and only then the inherited
+`PATH`. Each lookup uses the *same* `PATHEXT`-aware (Windows) / executable-bit
+(POSIX) probe the `PATH` walk itself uses, so a Windows `.cmd`/`.bat` shim
+resolves — and launches through `cmd.exe /d /c` — exactly as it would on `PATH`,
+and a POSIX file without an executable bit is skipped just the same. A
+prefer-local match is **always** handed to the OS as its resolved **absolute**
+path, whatever its extension — the OS never searches these directories on its own.
+
+A **relative** prefer-local directory resolves against the command's `CurrentDir`
+when one is set (so a project-relative `tools/` anchors to where the child will
+actually run, not the parent's current directory); otherwise it resolves against
+the process's current directory. Only a **bare name** is affected: a path-form
+program (`./tool`, `/usr/bin/tool`, `C:\tools\tool.exe`) is launched directly and
+ignores prefer-local, exactly as it ignores `PATH`. `Exec.which` is deliberately
+unchanged — it answers "is this installed on the host", a preflight question,
+whereas prefer-local is a per-command launch concern.
+
 ### Preflight: is a program installed?
 
 `Exec.which` resolves a program to a full path **without running it** — a

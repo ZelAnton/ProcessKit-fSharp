@@ -20,6 +20,7 @@ Thanks for your interest in improving **ProcessKit**.
 dotnet tool restore
 dotnet build ProcessKit.slnx
 dotnet test  ProcessKit.slnx
+pwsh ./scripts/check-spelling.ps1
 ```
 
 The build treats **warnings as errors**, so a clean local build is required

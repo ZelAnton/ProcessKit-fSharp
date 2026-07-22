@@ -1960,7 +1960,7 @@ module internal Posix =
                     envpAllocations <- envpStrings
 
                     // Every posix_spawn_file_actions_* / posix_spawnattr_* helper returns an errno-style
-                    // rc; a non-zero one is an honest spawn failure (a mis-wired stdio dup2/close, or a
+                    // rc; a non-zero one is an honest spawn failure (miswired stdio dup2/close, or a
                     // failed attr set that would silently drop SETPGROUP/CLOEXEC), NOT something to
                     // `|> ignore`. Record the FIRST failure and stop invoking further helpers — never
                     // operate a helper on a half-initialized struct.
@@ -2004,7 +2004,7 @@ module internal Posix =
 
                     // Also close the parent-kept ends in the child. This is what guarantees EOF: a
                     // child must never inherit a writer to its own stdin. We do it explicitly rather
-                    // than rely on FD_CLOEXEC, whose `fcntl` is variadic and is mis-passed by a
+                    // than rely on FD_CLOEXEC, whose `fcntl` is variadic and receives the wrong arguments from a
                     // fixed-signature P/Invoke on the AArch64 variadic ABI (Apple Silicon), so CLOEXEC
                     // never takes effect there and the child would block forever waiting for stdin.
                     stdinParentWrite
@@ -2454,6 +2454,25 @@ module internal Posix =
                 else
                     proceed ()
 
+    /// Substitute a prefer-local match into `command`'s program (T-182). When `Command.PreferLocal`
+    /// resolves the (bare-name) program to an absolute path in one of the prefer-local directories,
+    /// rewrite the command to launch that absolute path directly: `posix_spawnp` execs a path-form
+    /// program verbatim, with **no** `PATH` search — exactly the substitution a prefer-local hit needs,
+    /// since the OS would never look in those directories itself. Applied ONCE at each POSIX spawn entry
+    /// point, BEFORE the `setpriv`/`setsid --ctty`/cgroup-launcher rewrites embed `config.Program` into
+    /// their helper argv, so the resolved absolute path flows through every one of them unchanged (and an
+    /// absolute path is immune to the child's later `chdir` to `CurrentDir`). A no-op — returns `command`
+    /// untouched — when nothing resolves prefer-local (no directories, a path-form program, or no match),
+    /// so the ordinary OS `PATH` resolution is preserved byte-for-byte.
+    let private applyPreferLocal (command: Command) : Command =
+        match resolvePreferLocal command with
+        | Some resolved ->
+            Command(
+                { command.Config with
+                    Program = resolved }
+            )
+        | None -> command
+
     /// Spawn `command` as a contained POSIX child. A command requesting a privilege drop (`Uid`/`Gid`) is
     /// rewritten to run through the `setpriv` helper and spawned on the ordinary `posix_spawn` path — the
     /// drop runs in `setpriv` before it `exec`s the real program, so no managed code runs in a forked
@@ -2461,6 +2480,9 @@ module internal Posix =
     /// directly. A refused drop by a non-root caller is rejected up front; a missing `setpriv` helper
     /// becomes a typed `ProcessError.Spawn`, never a silently un-dropped child.
     let spawnPosix (command: Command) : Result<Spawned, ProcessError> =
+        // Resolve any prefer-local program to its absolute path first, so every downstream helper rewrite
+        // (setpriv / setsid --ctty) carries the substituted path (T-182).
+        let command = applyPreferLocal command
         let config = command.Config
 
         if config.Pty.IsSome then
@@ -2536,6 +2558,9 @@ module internal Posix =
     /// non-root rejection as `spawnPosix`. `/bin/sh` missing (pathological on Linux) surfaces as an honest
     /// `ProcessError.ResourceLimit`, never a silent unconstrained run.
     let spawnPosixIntoCgroup (command: Command) (cgroupProcs: string) : Result<Spawned, ProcessError> =
+        // Resolve any prefer-local program to its absolute path first, so the cgroup launcher's inner argv
+        // (and any nested setpriv/setsid drop) `exec`s the substituted path (T-182).
+        let command = applyPreferLocal command
         let config = command.Config
 
         let launch () =
