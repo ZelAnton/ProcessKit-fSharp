@@ -185,16 +185,19 @@ module internal Windows =
                 Ok(sb.ToString())
 
     /// The `CreateProcessW` command line for `command`, honouring the Windows PATHEXT launch substitution
-    /// (T-181). A bare name whose only match under our own PATHEXT-aware resolver (`Common.resolveProgram`/
-    /// `probeDir`, reused via `resolveWindowsLaunch` — no second copy) carries a non-`.exe` extension is
-    /// launched via that resolved absolute path instead of the bare name, because the OS's own bare-name
-    /// `PATH` search appends only `.exe` and would miss it — the `which`-vs-spawn divergence this closes. A
-    /// `.cmd`/`.bat` match additionally routes through `cmd.exe /d /c` with BatBadBut-safe quoting. A
-    /// `.exe` match, a path-form program, and a name that resolves to nothing are all left verbatim (the
-    /// OS resolves them exactly as before). Fails only when a batch-wrapper argument (or script path)
-    /// cannot be safely quoted for cmd.exe.
+    /// (T-181) and the prefer-local search (T-182). A bare name whose only match under our own
+    /// PATHEXT-aware resolver (`Common.resolveProgram`/`probeDir`, reused via `resolveWindowsLaunch` — no
+    /// second copy) carries a non-`.exe` extension is launched via that resolved absolute path instead of
+    /// the bare name, because the OS's own bare-name `PATH` search appends only `.exe` and would miss it —
+    /// the `which`-vs-spawn divergence this closes. A prefer-local match (`Command.PreferLocal`) is
+    /// searched first and is likewise substituted by absolute path (even a `.exe`, since the OS never
+    /// searches those directories). A `.cmd`/`.bat` match — on `PATH` or prefer-local — additionally
+    /// routes through `cmd.exe /d /c` with BatBadBut-safe quoting. A `PATH` `.exe` match, a path-form
+    /// program, and a name that resolves to nothing are all left verbatim (the OS resolves them exactly as
+    /// before). Fails only when a batch-wrapper argument (or script path) cannot be safely quoted for
+    /// cmd.exe.
     let private buildWindowsCommandLine (command: Command) : Result<string, ProcessError> =
-        match resolveWindowsLaunch command.Program with
+        match resolveWindowsLaunch command with
         | WindowsLaunch.AsIs ->
             let parts = command.Program :: List.ofSeq command.Config.Args
             Ok(parts |> List.map quoteWindowsArg |> String.concat " ")

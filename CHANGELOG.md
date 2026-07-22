@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `Command.PreferLocal(directory)` (and the pipe-friendly `Command.preferLocal`) adds a directory to a priority search list consulted **before** `PATH` when resolving a **bare-name** program — the way you reach for a project-local tool (`node_modules/.bin`, `.venv/bin`, `tools/`, a binary next to the solution) over a global one of the same name, without hand-building the path and losing cross-platform executable resolution. Directories are searched **in the order added**, then `PATH`, each through the *same* `PATHEXT`-aware (Windows) / executable-bit (POSIX) probe the `PATH` walk uses — so a Windows `.cmd`/`.bat` shim resolves and launches through `cmd.exe /d /c` exactly as on `PATH`, and a non-executable POSIX file is skipped just the same. A prefer-local match is always handed to the OS as its resolved **absolute** path, whatever its extension (the OS never searches these directories itself). A **relative** directory resolves against the command's `CurrentDir` when set (else the process's current directory); only a bare name is affected (a path-form program ignores prefer-local, as it ignores `PATH`), and `Exec.which` is unchanged (prefer-local is a launch concern, not a preflight one).
 
 ### Changed
 -
