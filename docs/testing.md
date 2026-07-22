@@ -532,7 +532,7 @@ hand-edited, truncated by a failed write, corrupted on disk, or crafted. Loading
 one is guaranteed to either succeed or fail with a typed `ProcessError` — never an unhandled
 exception, a hang, or runaway memory: a truncated or bit-flipped file, invalid JSON or base64,
 missing/inconsistent fields, out-of-range sizes, or a format version from the future all resolve to
-a typed error (a future version is rejected rather than mis-read). This is enforced by an
+a typed error (a future version is rejected rather than misread). This is enforced by an
 adversarial, randomized (FsCheck) parsing-robustness suite (`CassetteRobustnessTests.fs`) alongside
 the example-based cassette tests.
 

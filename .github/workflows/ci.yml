@@ -127,7 +127,8 @@ jobs:
             exit 1
           fi
 
-          fx_version="$(dotnet --list-runtimes | awk '/^Microsoft\.NETCore\.App 10\./ { print $2 }' | sort -V | tail -1)"
+          fx_version="$(dotnet --list-runtimes |
+            awk '/^Microsoft\.NETCore\.App 10\./ { print $2 }' | sort -V | tail -1)"
           if [ -z "$fx_version" ]; then
             echo "::error::No installed net10.0 Microsoft.NETCore.App runtime found"
             exit 1

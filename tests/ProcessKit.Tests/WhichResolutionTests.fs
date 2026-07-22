@@ -9,6 +9,20 @@ open NUnit.Framework
 open ProcessKit
 open ProcessKit.Native
 
+/// The real POSIX bare-name launch is `posix_spawnp`, whose libc `PATH` search reads the native
+/// `environ` (via `getenv`). .NET's managed `Environment.SetEnvironmentVariable` updates only the
+/// runtime's own environment view — `Environment.GetEnvironmentVariable`/`GetEnvironmentVariables`, and
+/// therefore `Exec.which`/`findInPath`, all observe it — but it does NOT write the native `environ`, so a
+/// `PATH` entry added only through the managed API is invisible to `posix_spawnp`'s own search. A test
+/// that needs the OS's real bare-name launch to find a tool on a temporarily-augmented `PATH` must set
+/// the native `environ` directly with `setenv(3)`. POSIX-only: declared here but called solely under
+/// `not isWindows` (Windows `CreateProcessW` reads the managed-updated block, so the managed set alone
+/// suffices there, and there is no libc `setenv` to bind).
+module private NativeEnv =
+
+    [<DllImport("libc", CharSet = CharSet.Ansi, SetLastError = true)>]
+    extern int setenv(string name, string value, int overwrite)
+
 /// Covers `Exec.which` / `CliClient.EnsureAvailableAsync` — the no-spawn preflight helper — and its
 /// contract with the real spawn path: both go through the SAME PATH/PATHEXT-aware resolution
 /// (`Common.resolveProgram`), so for the same program name they must always agree on
@@ -532,10 +546,33 @@ type WhichResolutionTests() =
             let toolName = "pk182-prio-tool"
             let originalPath = Environment.GetEnvironmentVariable "PATH"
 
+            // `GetEnvironmentVariable` is nullable; keep a non-null form for the native `setenv` restore
+            // in `finally` (its `value` parameter is a non-nullable string, unlike managed
+            // `SetEnvironmentVariable`, which accepts null to remove the variable).
+            let restorePath =
+                match originalPath with
+                | null -> ""
+                | value -> value
+
             try
                 this.WriteMarkerTool(localDir, toolName, "FROM-LOCAL") |> ignore
                 this.WriteMarkerTool(pathDir, toolName, "FROM-PATH") |> ignore
-                Environment.SetEnvironmentVariable("PATH", pathDir + string Path.PathSeparator + originalPath)
+
+                // Put `pathDir` on the process `PATH` for BOTH the managed resolver AND the OS's own
+                // bare-name launch. On Windows the managed set is enough — `CreateProcessW` reads the
+                // updated block, and here the `.cmd` tool is resolved by ProcessKit's own `PATH` walk
+                // (which reads the managed `Environment`) and substituted. On POSIX the real launch of the
+                // plain executable is `posix_spawnp`, whose libc `PATH` search reads the native `environ`
+                // that `Environment.SetEnvironmentVariable` does NOT update (it touches only the managed
+                // view) — so `setenv(3)` writes it directly, making the tool genuinely reachable on the
+                // `PATH` the spawn actually searches (see the `NativeEnv` note). Without the native write
+                // the `viaPath` baseline below cannot find the tool on POSIX even though `which` resolves
+                // it against the managed `PATH` — the exact managed/native divergence this test sets up.
+                let augmentedPath = pathDir + string Path.PathSeparator + originalPath
+                Environment.SetEnvironmentVariable("PATH", augmentedPath)
+
+                if not isWindows then
+                    NativeEnv.setenv ("PATH", augmentedPath, 1) |> ignore
 
                 // Without prefer-local, PATH wins — proving the two directories hold genuinely different
                 // tools, so the prefer-local win below is a real override, not an artefact.
@@ -555,6 +592,10 @@ type WhichResolutionTests() =
                 | Error error -> Assert.Fail $"expected the prefer-local tool to launch, got {error}"
             finally
                 Environment.SetEnvironmentVariable("PATH", originalPath)
+
+                if not isWindows then
+                    NativeEnv.setenv ("PATH", restorePath, 1) |> ignore
+
                 Directory.Delete(localDir, true)
                 Directory.Delete(pathDir, true)
         }

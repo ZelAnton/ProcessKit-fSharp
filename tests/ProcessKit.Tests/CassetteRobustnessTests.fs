@@ -395,7 +395,7 @@ type CassetteRobustnessTests() =
     // A minimal valid entry is loaded at each version. Every supported version (1..current) must load
     // successfully and replay the recorded stdout (back-compat for EVERY past version, not just the
     // newest); a version < 1 or > current must be a typed rejection — never a crash, never a silent
-    // mis-read of a future format. ---
+    // misread of a future format. ---
 
     [<Test>]
     member _.``every declared version resolves: supported loads and replays, out-of-range is a typed error``() =
