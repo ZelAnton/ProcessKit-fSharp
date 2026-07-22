@@ -31,6 +31,7 @@
 		<Compile Include="StatsTests.fs" />
 		<Compile Include="LimitsTests.fs" />
 		<Compile Include="CassetteTests.fs" />
+		<Compile Include="CassetteRobustnessTests.fs" />
 		<Compile Include="DryRunRunnerTests.fs" />
 		<Compile Include="LoggingTests.fs" />
 		<Compile Include="DependencyInjectionTests.fs" />

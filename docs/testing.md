@@ -527,6 +527,15 @@ Semantics worth knowing before you commit a cassette:
 | Format | a versioned JSON envelope — `{ "Version", "Entries" }` (current version **4**); a cassette **newer** than this build understands is rejected on load, while an older compatible one (a v1/v2/v3 cassette) still loads (missing fields default — a pre-v3 entry with no env fingerprint keys as the default, un-customized environment; a pre-v4 entry with no `Pty` flag loads as a non-PTY recording). A partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
 | PTY | a [`Command.Pty`](#pseudo-terminal-pty-doubles) recording carries a `Pty` flag and its geometry (`PtyCols`/`PtyRows`) and replays as a **merged-stream** handle (only `OutputEvent.Stdout`). Because a PTY captures one merged stream, the [`WithRedaction`](#record-and-replay) hook scrubs that whole stream — an echoed credential is scrubbed before it lands in the cassette |
 
+**Robust against a corrupt or hostile cassette.** A cassette is untrusted input — it may be
+hand-edited, truncated by a failed write, corrupted on disk, or crafted. Loading (and replaying)
+one is guaranteed to either succeed or fail with a typed `ProcessError` — never an unhandled
+exception, a hang, or runaway memory: a truncated or bit-flipped file, invalid JSON or base64,
+missing/inconsistent fields, out-of-range sizes, or a format version from the future all resolve to
+a typed error (a future version is rejected rather than mis-read). This is enforced by an
+adversarial, randomized (FsCheck) parsing-robustness suite (`CassetteRobustnessTests.fs`) alongside
+the example-based cassette tests.
+
 Only env *values* are redacted. `program`, `args`, `stdout`, and `stderr` are
 stored **verbatim** and can carry secrets (a `--password=…` flag, a token echoed
 to output), so review a fixture before committing it. On Unix the file is written
