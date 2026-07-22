@@ -1000,7 +1000,7 @@ type ReadinessTests() =
                 // elapses. Cancel it so it can never create/start a listener after this teardown runs —
                 // without this, the listener assignment below would race a background task that outlives
                 // the test, orphaning a bound socket. Swallow the resulting `OperationCanceledException`
-                // from `startLate` itself; it only signals that teardown pre-empted it.
+                // from `startLate` itself; it only signals that teardown preempted it.
                 startLateCts.Cancel()
 
                 try

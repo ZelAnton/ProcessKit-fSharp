@@ -325,7 +325,7 @@ apply. See [Running in containers](containers.md) for the container-specific con
 `PID 1`, minimal/shell-less images, and container-level limits vs `ProcessGroupOptions` limits.
 
 **Output is decoded as UTF-8 by default.** Captured stdout/stderr text is decoded as UTF-8 unless
-you say otherwise. A Windows console program that emits a legacy OEM code page will mis-decode;
+you say otherwise. A Windows console program that emits a legacy OEM code page will decode incorrectly;
 set the encoding explicitly per stream with `Command.StdoutEncoding` / `Command.StderrEncoding`
 (or `Command.Encoding` for both). For legacy code pages, register the code-page provider first
 (`System.Text.Encoding.RegisterProvider(CodePagesEncodingProvider.Instance)`), then pass the
