@@ -808,6 +808,107 @@ module internal Windows =
 
         loop 1024 1
 
+    // ----------------------------------------------------------------------------------
+    // Windows: enriched member snapshot (ProcessGroup.MembersInfo) — parent pid + image name
+    // ----------------------------------------------------------------------------------
+
+    // The ToolHelp process-snapshot flag (`CreateToolhelp32Snapshot` returns the shared module-level
+    // `INVALID_HANDLE_VALUE` sentinel on failure).
+    [<Literal>]
+    let private TH32CS_SNAPPROCESS = 0x00000002u
+
+    // PROCESSENTRY32W — the ToolHelp per-process record. Only `th32ProcessID`, `th32ParentProcessID`, and
+    // the base image name `szExeFile` are consumed; the command line and environment are NOT part of this
+    // structure at all, so the member snapshot cannot leak them. `szExeFile` is a fixed MAX_PATH (260)
+    // WCHAR buffer marshalled by value; the `CharSet.Unicode` layout drives the `W` entry points below.
+    [<StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)>]
+    type private ProcessEntry32 =
+        struct
+            val mutable dwSize: uint32
+            val mutable cntUsage: uint32
+            val mutable th32ProcessID: uint32
+            val mutable th32DefaultHeapID: unativeint
+            val mutable th32ModuleID: uint32
+            val mutable cntThreads: uint32
+            val mutable th32ParentProcessID: uint32
+            val mutable pcPriClassBase: int32
+            val mutable dwFlags: uint32
+
+            [<MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)>]
+            val mutable szExeFile: string
+        end
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern nativeint private CreateToolhelp32Snapshot(uint32 dwFlags, uint32 th32ProcessID)
+
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern bool private Process32FirstW(nativeint hSnapshot, nativeint lppe)
+
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern bool private Process32NextW(nativeint hSnapshot, nativeint lppe)
+
+    /// A single whole-system process snapshot as a `pid -> (parentPid, imageName)` map, or `None` when the
+    /// snapshot could not be taken. One `CreateToolhelp32Snapshot` walk backs the enrichment of every
+    /// member, so a group of N members costs one snapshot, not N. Never throws.
+    let private snapshotProcesses () : System.Collections.Generic.Dictionary<int, int * string option> option =
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0u)
+
+        if snapshot = nativeint INVALID_HANDLE_VALUE then
+            None
+        else
+            let size = Marshal.SizeOf<ProcessEntry32>()
+            let buffer = Marshal.AllocHGlobal size
+
+            try
+                // dwSize must be set before the first `Process32FirstW`; the API reads it and never
+                // overwrites it, so it stays valid for the subsequent `Process32NextW` calls on the buffer.
+                Marshal.WriteInt32(buffer, 0, size)
+                let map = System.Collections.Generic.Dictionary<int, int * string option>()
+                let mutable more = Process32FirstW(snapshot, buffer)
+
+                while more do
+                    let entry = Marshal.PtrToStructure<ProcessEntry32> buffer
+
+                    // `szExeFile` is a non-null marshalled string (empty at worst); report a real image
+                    // name, `None` for the empty case — never argv, which this record does not carry.
+                    let exeName =
+                        if String.IsNullOrEmpty entry.szExeFile then
+                            None
+                        else
+                            Some entry.szExeFile
+
+                    map[int entry.th32ProcessID] <- (int entry.th32ParentProcessID, exeName)
+                    more <- Process32NextW(snapshot, buffer)
+
+                Some map
+            finally
+                Marshal.FreeHGlobal buffer
+                closeWindowsHandle snapshot
+
+    /// Enrich the Job's member `pids` with each member's parent pid and executable image name from ONE
+    /// system process snapshot, plus its OS-reported start time. A member absent from the snapshot has
+    /// exited between the group's enumeration and this read and is OMITTED — never fabricated. The
+    /// member's command line and environment are never read on any path (the snapshot structure does not
+    /// carry them). If the snapshot itself is unavailable (a rare query failure), every member is still
+    /// reported with a best-effort start time and `None` parent/image rather than dropping the whole
+    /// group. Never throws.
+    let readMembersInfo (pids: int list) : MemberInfo list =
+        match snapshotProcesses () with
+        | None ->
+            // No system snapshot: parent pid and image name are honestly unavailable; keep each member
+            // with a best-effort start time rather than emptying the group over a transient query failure.
+            pids
+            |> List.map (fun pid -> MemberInfo(pid, None, None, readProcessStartTime pid))
+        | Some byPid ->
+            pids
+            |> List.choose (fun pid ->
+                match byPid.TryGetValue pid with
+                | true, (ppid, exeName) -> Some(MemberInfo(pid, Some ppid, exeName, readProcessStartTime pid))
+                | false, _ ->
+                    // Enumerated as a group member but not present in the whole-system snapshot: it exited
+                    // between the two reads — omit it, never fabricate its metadata.
+                    None)
+
     // Suspend / resume every member process of a Job over the COMPLETE `membersWindows` snapshot (the
     // buffer grows to fit the whole job, so no member is dropped by an artificial cap). Best-effort and
     // not atomic: a process can still spawn between the snapshot and the suspend — the only documented

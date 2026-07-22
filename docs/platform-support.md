@@ -190,6 +190,25 @@ then a grace window, then `SIGKILL`.
 |---|:---:|:---:|:---:|
 | `Members()` snapshot | ✅ whole tree | ✅ whole tree | 🟡 tracked group leaders only |
 
+`MembersInfo()` returns that same membership enriched per pid (`MemberInfo`: `Pid`, `Ppid`, `ExeName`,
+`StartTime`). Enrichment follows the **OS**, not the mechanism — on Linux both the cgroup v2 and the
+process-group backend read `/proc` identically. Every enriching field is an `option`, `None` where the
+platform cannot honestly report it (never a fabricated value); a member that exits between enumeration
+and its metadata read is omitted, not invented; and the member's command line and environment are never
+included on any platform.
+
+| `MemberInfo` field | Windows (Job Object) | Linux (cgroup v2 or process group) | macOS | other BSD |
+|---|:---:|:---:|:---:|:---:|
+| `Pid` | ✅ | ✅ | ✅ | ✅ |
+| `Ppid` | ✅ process snapshot | ✅ `/proc/<pid>/stat` | ✅ `proc_pidinfo` | ❌ |
+| `ExeName` | ✅ image file name (`foo.exe`) | ✅ `/proc` `comm` (~15 chars) | ✅ `proc_pidinfo` | ❌ |
+| `StartTime` | ✅ | ✅ | ✅ | 🟡 best-effort |
+
+`ExeName` is a base **image name**, never an argv — Windows reports the full `foo.exe`; Linux/macOS the
+kernel `comm` (truncated to ~15 chars). `StartTime` is `System.Diagnostics.Process.StartTime`; on a BSD
+other than macOS, where no per-pid parent/image reader exists, only the pid and a best-effort start time
+are reported.
+
 **Stats (`Stats` / `SampleStatsAsync`)**
 
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |

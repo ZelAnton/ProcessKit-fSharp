@@ -237,6 +237,12 @@ module ProcessKit.Mechanism+Tags
   field literal JobObject : System.Int32
   field literal ProcessGroup : System.Int32
 
+class ProcessKit.MemberInfo
+  property ExeName : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property Pid : System.Int32 { get }
+  property Ppid : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property StartTime : Microsoft.FSharp.Core.FSharpOption<System.DateTime> { get }
+
 class ProcessKit.Outcome
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.Outcome>
@@ -674,6 +680,7 @@ class ProcessKit.ProcessGroup
   member Finalize() : System.Void
   member KillAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member Members() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<System.Int32>, ProcessKit.ProcessError>
+  member MembersInfo() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<ProcessKit.MemberInfo>, ProcessKit.ProcessError>
   member Resume() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member SampleStatsAsync(System.TimeSpan) : System.Collections.Generic.IAsyncEnumerable<ProcessKit.ProcessGroupStats>
   member ShutdownAsync() : System.Threading.Tasks.Task

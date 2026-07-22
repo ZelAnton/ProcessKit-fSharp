@@ -411,6 +411,32 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         this.WhenLive(fun () -> backend.Members())
         |> Result.map (fun pids -> List.toArray pids :> IReadOnlyList<int>)
 
+    /// An enriched, point-in-time snapshot of the group's members: the same pids `Members` reports, in
+    /// the same platform matrix (the whole Job tree on Windows, the whole cgroup on cgroup v2, the tracked
+    /// group leaders on the POSIX fallback), each carrying its parent pid, executable image name, and
+    /// OS-reported start time **where the platform can honestly report them** — every enriching field is
+    /// `option` and is `None` otherwise, never a fabricated value. A member that exits between the
+    /// enumeration and its metadata read is **omitted** rather than filled with invented fields. The
+    /// member's command line and environment are **never** included on any platform — argv routinely
+    /// carries secrets and redaction is the consumer's policy — the same exclusion the logging / tracing /
+    /// metrics paths enforce. Enumeration errors the same typed way as `Members` once the group is released.
+    member this.MembersInfo() : Result<IReadOnlyList<MemberInfo>, ProcessError> =
+        // Take the pid snapshot under the lifecycle lock exactly like `Members` does, but ENRICH off the
+        // lock (in `Result.map`, after `WhenLive` has returned): the per-pid metadata reads (`/proc`, a
+        // Toolhelp process snapshot, `proc_pidinfo`) touch no container handle, so they must not hold
+        // `sync` across potentially many reads. Each pid is read point-in-time and dropped if it has since
+        // vanished. The platform split mirrors `Create`'s: Windows enriches from ONE system snapshot,
+        // every POSIX target (cgroup v2 and the process-group fallback alike) reads per pid.
+        this.WhenLive(fun () -> backend.Members())
+        |> Result.map (fun pids ->
+            let infos =
+                if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                    Native.Windows.readMembersInfo pids
+                else
+                    pids |> List.choose Native.Posix.readMemberInfo
+
+            List.toArray infos :> IReadOnlyList<MemberInfo>)
+
     /// Broadcast `signal` to every process in the group. A member that has already exited (or an
     /// already-empty group) is a best-effort success — that races the target's own exit, not a
     /// caller error. `Signal.Other 0` (a liveness *probe* that delivers nothing) and a negative

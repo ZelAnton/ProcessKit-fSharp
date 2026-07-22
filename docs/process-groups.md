@@ -465,6 +465,42 @@ and killed with the group, just not enumerated. An exited child still counts unt
 it is reaped, and because the snapshot is point-in-time, a tree that is actively
 forking races it.
 
+### Enriched members
+
+`MembersInfo()` returns the **same membership** as `Members()`, but each pid comes
+as a `MemberInfo` carrying its parent pid, executable image name, and OS-reported
+start time — the "who is in this tree, who is whose parent, what image, since when"
+snapshot, without hand-rolling `System.Diagnostics.Process` / `/proc` reads and
+racing process exit yourself:
+
+**F#**
+
+```fsharp
+match group.MembersInfo() with
+| Ok members ->
+    for m in members do
+        printfn $"pid={m.Pid} ppid={m.Ppid} exe={m.ExeName} started={m.StartTime}"
+| Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+if (group.MembersInfo() is { IsOk: true, ResultValue: var members })
+    foreach (var m in members)
+        Console.WriteLine($"pid={m.Pid} ppid={m.Ppid} exe={m.ExeName} started={m.StartTime}");
+```
+
+`Pid` is always present; `Ppid`, `ExeName`, and `StartTime` are each an `option`
+and are `None` wherever the platform cannot honestly report them — never a
+fabricated value. A member that exits between the enumeration and its metadata read
+is **omitted** rather than filled with invented fields, so under an actively
+forking-and-exiting tree the result is a subset of `Members()`. The member's
+**command line and environment are never included on any platform** — argv
+routinely carries secrets and redaction is your policy, the same exclusion the
+logging / tracing / metrics paths make. Which enriching fields each platform can
+supply is in [platform-support.md](platform-support.md).
+
 To *wait* on members rather than list them, race the started handles with
 `RunningProcess.WaitAny` — see [streaming.md](streaming.md).
 

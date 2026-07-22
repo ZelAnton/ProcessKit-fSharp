@@ -41,6 +41,23 @@ module internal Common =
             PtyControl: nativeint option
         }
 
+    /// The OS-reported start time of `pid` (`System.Diagnostics.Process.StartTime`, local kind), or
+    /// `None` when the process has exited between enumeration and this read, or its start time is
+    /// inaccessible on this platform/timing. The single cross-platform start-time read shared by the
+    /// enriched member snapshot on every platform (`ProcessGroup.MembersInfo`, via `Native.Windows`/
+    /// `Native.Posix`). Never throws; never reads the process's command line or environment.
+    let readProcessStartTime (pid: int) : DateTime option =
+        try
+            use proc = System.Diagnostics.Process.GetProcessById pid
+            Some proc.StartTime
+        with _ ->
+            // The process exited between enumeration and this read, or its start time is inaccessible on
+            // this platform/timing (a protected/system process, or an unsupported platform) — honestly
+            // `None` rather than a fabricated timestamp. `GetProcessById` throws `ArgumentException` for a
+            // dead pid and can throw `InvalidOperationException`/`Win32Exception` for `StartTime`; none is
+            // recoverable here and each means the same "no readable start time".
+            None
+
     /// The effective environment for the child: the inherited set (unless cleared) with the
     /// command's overrides applied (`Some` sets, `None` removes).
     let effectiveEnvironment (command: Command) =

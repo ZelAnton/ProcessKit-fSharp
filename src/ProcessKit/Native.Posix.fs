@@ -504,6 +504,100 @@ module internal Posix =
             else
                 None
 
+    // ----------------------------------------------------------------------------------
+    // Enriched member snapshot (ProcessGroup.MembersInfo): parent pid + image name, per pid
+    // ----------------------------------------------------------------------------------
+
+    /// Parse `(comm, ppid)` from a `/proc/<pid>/stat` line. The comm field (2) sits between the FIRST '('
+    /// and the LAST ')', and may itself contain spaces and ')'; ppid (field 4) is the SECOND
+    /// whitespace-separated token after that final ')' (index 1: state, ppid, pgrp, ...). Internal (not
+    /// private) so it is unit-testable with synthetic `stat` lines. Either half is `None` when it cannot
+    /// be parsed. Never reads the process's command line or environment (the `stat` `comm` is the image
+    /// name, not argv).
+    let parseLinuxCommAndPpid (stat: string) : string option * int option =
+        let openParen = stat.IndexOf '('
+        let closeParen = stat.LastIndexOf ')'
+
+        let comm =
+            if openParen >= 0 && closeParen > openParen then
+                Some(stat.Substring(openParen + 1, closeParen - openParen - 1))
+            else
+                None
+
+        let ppid =
+            if closeParen < 0 then
+                None
+            else
+                let fields =
+                    stat.Substring(closeParen + 1).Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)
+
+                if fields.Length > 1 then
+                    match Int32.TryParse fields.[1] with
+                    | true, value -> Some value
+                    | _ -> None
+                else
+                    None
+
+        comm, ppid
+
+    let private tryReadProcFile (path: string) : string option =
+        try
+            Some(File.ReadAllText path)
+        with
+        | :? IOException ->
+            // The /proc entry vanished (the process exited) or could not be read — no readable metadata.
+            None
+        | :? UnauthorizedAccessException ->
+            // Denied by permissions — likewise no readable metadata for this member.
+            None
+
+    let private readLinuxMemberInfo (pid: int) : MemberInfo option =
+        match tryReadProcFile $"/proc/{pid}/stat" with
+        | None -> None // the process vanished between enumeration and this read — omit it, never fabricate
+        | Some stat ->
+            let comm, ppid = parseLinuxCommAndPpid stat
+            Some(MemberInfo(pid, ppid, comm, readProcessStartTime pid))
+
+    let private readMacMemberInfo (pid: int) : MemberInfo option =
+        let buffer = Marshal.AllocHGlobal procBsdInfoSize
+
+        try
+            let got = proc_pidinfo (pid, PROC_PIDTBSDINFO, 0UL, buffer, procBsdInfoSize)
+
+            if got = procBsdInfoSize then
+                // pbi_ppid @16 (uint32); pbi_comm @48, a NUL-terminated command name (MAXCOMLEN+1 bytes).
+                let ppid = Marshal.ReadInt32(buffer, 16)
+
+                let exeName =
+                    match Marshal.PtrToStringUTF8(buffer + nativeint 48) with
+                    | null
+                    | "" -> None
+                    | name -> Some name
+
+                Some(MemberInfo(pid, Some ppid, exeName, readProcessStartTime pid))
+            else
+                // 0 / -1 (gone, EPERM) or a short read — the process vanished or is inaccessible; omit it.
+                None
+        finally
+            Marshal.FreeHGlobal buffer
+
+    /// Enrich one member pid with its parent pid and executable image name — read point-in-time from the
+    /// platform's own process metadata (Linux `/proc/<pid>/stat`, macOS `proc_pidinfo`) — plus its
+    /// OS-reported start time. Returns `None` when the process has vanished between the group's
+    /// enumeration and this read (its metadata can no longer be read), so the member is OMITTED rather
+    /// than fabricated. On a POSIX target with no metadata reader (a BSD other than macOS) the member is
+    /// still reported with just its pid and a best-effort start time — parent pid and image name are
+    /// honestly `None`, since there is no per-pid existence probe there to prove it gone (the group's own
+    /// liveness gate already filtered the members). The command line and environment are never read on any
+    /// path. Never throws.
+    let readMemberInfo (pid: int) : MemberInfo option =
+        if RuntimeInformation.IsOSPlatform OSPlatform.Linux then
+            readLinuxMemberInfo pid
+        elif isMacOs then
+            readMacMemberInfo pid
+        else
+            Some(MemberInfo(pid, None, None, readProcessStartTime pid))
+
     // Positive proof a tracked number was recycled: the identity captured at track time and the one read
     // now are BOTH known and they differ. A `None` on either side is never proof (the caller then defers
     // to the liveness verdict), so a target without an identity reader (the BSDs) is not weakened.
