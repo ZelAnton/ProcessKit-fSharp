@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [2.5.0] - 2026-07-22
+
+### Added
 - `ProcessGroup.UpdateLimits(ResourceLimits)` applies a new whole-tree resource-limit set to a **live** group without recreating it or restarting its children — adaptive resource control at runtime (tighten memory on a sagging batch, widen a long-lived worker pool's CPU quota). The `ResourceLimits` fully **replaces** the caps in force (a dimension left `None` becomes unbounded again): **Windows** re-issues `SetInformationJobObject` on the live Job, **Linux cgroup v2** rewrites `memory.max` / `pids.max` / `cpu.max`, and the **POSIX process-group** mechanism (macOS/BSD, or Linux without cgroup v2) returns `ProcessError.ResourceLimit` — the same honest, typed refusal `Create` gives, never a silent no-op. The update runs through the group's lifecycle gate (a call after teardown returns a non-transient error rather than touching a closed container), and on success `Options.Limits` reads back the newly enforced set.
 - `Command.StdoutToFile(path, append)` / `Command.StderrToFile(path, append)` (and the pipe-friendly `Command.stdoutToFile` / `Command.stderrToFile`) redirect a child's stdout/stderr **straight to a file at the OS level** — the child is handed the open file as its std handle/fd on the spawn (Windows: an inheritable file handle in `STARTUPINFO`; POSIX: a file fd via a `posix_spawn` file action), with zero copying through the parent and no parent pump. The file therefore keeps growing even after the parent process (or a pump that would have drained a pipe) is gone — ideal for a long-lived service's log file under a `Supervisor`. `append = false` creates/truncates, `true` appends. There is then no parent-side view of that stream (`ProcessResult.Stdout`/`Stderr` empty, the streaming verbs yield nothing, the matching `OutputEvent` is never produced, exactly like `StdioMode.Null`), so the knobs that need one — `StdoutTee`/`StderrTee`, `OnStdoutLine`/`OnStderrLine` — plus `MergeStderr` and `Pty` are rejected at the builder boundary with `ArgumentException` (in either chaining order); redirecting one stream to a file while capturing the other normally, or redirecting both streams to separate files, is fully supported.
 - `Supervisor` liveness probes (`LivenessHttp` / `LivenessCheck`, off by default) restart a *live but unresponsive* child — closing the gap that `RestartPolicy` (exit-driven) and `Command.IdleTimeout` (stdout-silence-driven) miss for a "jammed" service that keeps running but stops answering. Every `LivenessInterval`, the supervisor polls an HTTP endpoint (with 2xx or response-predicate overloads) or an arbitrary async predicate; after `LivenessFailures` consecutive failed attempts (each bounded by `LivenessTimeout`) it gracefully stops the child (with the `LivenessGrace` window) and restarts it through the ordinary restart policy + backoff — no parallel restart mechanism. The probe checks the child's *external* health surface only and never reads its stdout/stderr or leaks a URL/predicate into argv/env/logs. A liveness-forced restart is distinguishable in `Supervisor.OnRestart` via the new `SupervisorRestartEvent.Cause` (`RestartCause.Exit` vs `RestartCause.Liveness`) and in observability via a dedicated `ProcessKitDiagnostics.Events.SupervisorLivenessRestart` log event and `processkit.supervisor.liveness_restarts` metric.
@@ -375,7 +386,8 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - POSIX: the SIGCHLD dispatch callback no longer blocks on a `Thread.Sleep` spin while resolving a reap race against a concurrent `reapLeader` (group teardown) — the same bounded grace period now runs on the thread pool instead of the shared signal-dispatch thread, so it can no longer delay reaping every other pending child. A race that genuinely can't be resolved within the grace period now reports `Outcome.Unobserved` rather than a fabricated clean exit; the far more common case — the concurrent reap actually landing the real status — is unaffected.
 - Linux cgroup v2: a child that cannot be migrated into the cgroup (the write to `cgroup.procs` fails) is now killed and reaped, and the spawn fails with `ProcessError.ResourceLimit`, instead of being silently left to run in the parent cgroup entirely outside the requested resource limits. The `Mechanism.CgroupV2` / `ProcessGroup.Create` docs now also state the spawn→migrate window honestly: the limits apply to the child and every descendant it forks *after* migration, while a grandchild forked in the brief window before the migration write completes stays in the parent cgroup — still reaped by kill-on-drop teardown, but outside the resource limits.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.4.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.5.0...HEAD
+[2.5.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.4.2...v2.5.0
 [2.4.2]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.3.0...v2.4.0
