@@ -109,3 +109,23 @@ type CommandVerbs =
         =
         ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine CommandVerbs.DefaultRunner cancellationToken predicate.Invoke command
+
+    /// Resolve this command's program to a full path WITHOUT spawning it — a preflight/`doctor` check
+    /// ("will this command find its program?"), synchronous and side-effect-free (a few `stat`s, no
+    /// process), unlike probing availability by actually launching it (`ProbeAsync`). Resolution is
+    /// against the **effective child** `PATH`: the command's own `Env`/`EnvRemove`/`EnvClear` (a `PATH`
+    /// override) applied to the inherited environment, with its `PreferLocal` directories consulted first
+    /// — exactly the `PATH`/PATHEXT/executable-bit resolution the real spawn goes through (one shared
+    /// resolver, no second copy). On success it returns the resolved absolute path; on a miss it returns
+    /// the SAME typed `ProcessError.NotFound` — with the SAME `Searched` diagnostic — a real spawn of this
+    /// command would fail with.
+    ///
+    /// **Differs from `Exec.which`.** `Exec.which` (and `CliClient.EnsureAvailableAsync`) resolves against
+    /// the CURRENT PROCESS's `PATH`, with no prefer-local — "is this tool installed on the host". This
+    /// resolves against THIS command's effective environment and prefer-local — "will this command, as
+    /// configured, find its program". Use `which` for a host-wide install check; use `ResolveProgram` when
+    /// the command overrides `PATH` (`Env`) or leans on `PreferLocal`.
+    [<Extension>]
+    static member ResolveProgram(command: Command) : Result<string, ProcessError> =
+        ArgumentNullException.ThrowIfNull command
+        Native.Common.resolveCommandProgram command

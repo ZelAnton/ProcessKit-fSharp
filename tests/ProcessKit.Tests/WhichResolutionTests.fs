@@ -338,7 +338,9 @@ type WhichResolutionTests() =
                 // runs on (Linux/macOS) without making the test slow; the assertion is simply that none
                 // of them throws, regardless of which candidate state `probeDir` happens to observe.
                 for _ in 1..5000 do
-                    Common.probeDir dir program |> ignore
+                    // POSIX-only test (Ignored on Windows), so the PATHEXT source is irrelevant here — pass
+                    // "" (the resolver's "unset" form) as the explicit PATHEXT the probe now takes.
+                    Common.probeDir "" dir program |> ignore
             finally
                 stop.Cancel()
                 churner.Wait()
@@ -782,3 +784,184 @@ type WhichResolutionTests() =
                 Directory.Delete(dir, true)
         }
         :> Task
+
+    // ---- Command.ResolveProgram / CliClient.ResolveProgram (T-183): resolve against the EFFECTIVE CHILD
+    // PATH ------------------------------------------------------------------------------------------------
+    //
+    // These preflight the program a command WOULD launch, against its effective child PATH (its
+    // Env/EnvRemove/EnvClear plus PreferLocal) — the same resolver the real spawn uses — WITHOUT spawning.
+    // They deliberately do NOT touch the process environment (only `Command.Env`), so no native `setenv`
+    // (K-064) is needed: nothing here relies on the real OS bare-name search seeing an augmented PATH.
+
+    /// Whether `path`, made absolute, sits under `dir` (also made absolute) — case-insensitively on
+    /// Windows, case-sensitively on POSIX, matching how the resolver compares paths.
+    member private _.IsUnder(dir: string, path: string) : bool =
+        let comparison =
+            if isWindows then
+                StringComparison.OrdinalIgnoreCase
+            else
+                StringComparison.Ordinal
+
+        Path.GetFullPath(path).StartsWith(Path.GetFullPath dir, comparison)
+
+    [<Test>]
+    member this.``ResolveProgram resolves against the command's Env PATH override, where Exec.which does not (T-183)``
+        ()
+        =
+        let dir = freshDir "env-path"
+        let toolName = "pk183-env-tool"
+
+        try
+            this.WriteMarkerTool(dir, toolName, "ENV-HIT") |> ignore
+
+            // The tool lives only in `dir`, which is NOT on the process PATH — so the process-scoped
+            // `Exec.which` cannot find it...
+            match Exec.which toolName with
+            | Ok resolved ->
+                Assert.Fail $"expected '{toolName}' to be absent from the process PATH, but which found '{resolved}'"
+            | Error error -> Assert.That(error.IsNotFound, Is.True)
+
+            // ...but the command carries `Env "PATH" dir`, so ResolveProgram — against the effective child
+            // PATH — resolves it. This which-vs-ResolveProgram distinction is the crux of T-183.
+            let command = Command.create toolName |> Command.env "PATH" dir
+
+            match command.ResolveProgram() with
+            | Error error -> Assert.Fail $"expected ResolveProgram to resolve via the Env PATH override, got {error}"
+            | Ok resolved ->
+                Assert.That(File.Exists resolved, Is.True)
+
+                Assert.That(
+                    this.IsUnder(dir, resolved),
+                    Is.True,
+                    $"'{resolved}' must be under the override dir '{dir}'"
+                )
+        finally
+            Directory.Delete(dir, true)
+
+    [<Test>]
+    member this.``ResolveProgram honours EnvClear plus a fresh Env PATH (T-183)``() =
+        let dir = freshDir "envclear"
+        let toolName = "pk183-envclear-tool"
+
+        try
+            this.WriteMarkerTool(dir, toolName, "CLEAR-HIT") |> ignore
+
+            // EnvClear wipes the inherited environment (PATH and, on Windows, PATHEXT); a fresh Env "PATH"
+            // then supplies the only PATH the child — and ResolveProgram — will see. On Windows the resolver
+            // falls back to the default PATHEXT set when PATHEXT is absent, so a `.cmd` shim still resolves.
+            let command = Command.create toolName |> Command.envClear |> Command.env "PATH" dir
+
+            match command.ResolveProgram() with
+            | Error error -> Assert.Fail $"expected ResolveProgram to resolve under EnvClear + fresh PATH, got {error}"
+            | Ok resolved ->
+                Assert.That(File.Exists resolved, Is.True)
+                Assert.That(this.IsUnder(dir, resolved), Is.True, $"'{resolved}' must be under '{dir}'")
+        finally
+            Directory.Delete(dir, true)
+
+    [<Test>]
+    member this.``ResolveProgram consults PreferLocal before the effective PATH (T-183)``() =
+        let localDir = freshDir "rp-local"
+        let pathDir = freshDir "rp-path"
+        let toolName = "pk183-prio-tool"
+
+        try
+            this.WriteMarkerTool(localDir, toolName, "FROM-LOCAL") |> ignore
+            this.WriteMarkerTool(pathDir, toolName, "FROM-PATH") |> ignore
+
+            // The same bare name is reachable via BOTH the effective PATH (`Env "PATH" pathDir`) and a
+            // prefer-local directory (`localDir`). Prefer-local is consulted first, so it wins — the order
+            // the real launch uses, verified here without spawning.
+            let command =
+                Command.create toolName
+                |> Command.env "PATH" pathDir
+                |> Command.preferLocal localDir
+
+            match command.ResolveProgram() with
+            | Error error -> Assert.Fail $"expected ResolveProgram to resolve prefer-local, got {error}"
+            | Ok resolved ->
+                Assert.That(this.IsUnder(localDir, resolved), Is.True, $"prefer-local must win: '{resolved}'")
+
+                Assert.That(
+                    this.IsUnder(pathDir, resolved),
+                    Is.False,
+                    "prefer-local must be consulted before the effective PATH"
+                )
+        finally
+            Directory.Delete(localDir, true)
+            Directory.Delete(pathDir, true)
+
+    [<Test>]
+    member _.``ResolveProgram and a real spawn agree on NotFound/Searched for the same command config (T-183)``
+        ()
+        : Task =
+        task {
+            let dir = freshDir "miss"
+
+            try
+                // A genuinely-absent program, with an `Env "PATH"` override naming an (empty) directory.
+                // Both the no-spawn ResolveProgram and a real spawn of the SAME command must fail NotFound,
+                // and — since both derive the diagnostic from the one shared effective-PATH resolver — must
+                // report the identical `Searched`. No native `setenv` (K-064) is needed: the OS search
+                // failing is the point, and the diagnostic is derived from the command's effective env, not
+                // from whatever PATH `posix_spawnp` actually walked.
+                let command = Command.create missingProgram |> Command.env "PATH" dir
+
+                let resolveResult = command.ResolveProgram()
+                let! spawnResult = command.OutputStringAsync()
+
+                match resolveResult, spawnResult with
+                | Error resolveError, Error spawnError ->
+                    Assert.That(
+                        resolveError.IsNotFound,
+                        Is.True,
+                        $"ResolveProgram should be NotFound, got {resolveError}"
+                    )
+
+                    Assert.That(spawnError.IsNotFound, Is.True, $"spawn should be NotFound, got {spawnError}")
+
+                    match resolveError, spawnError with
+                    | ProcessError.NotFound(resolveProgram, resolveSearched),
+                      ProcessError.NotFound(spawnProgram, spawnSearched) ->
+                        Assert.That(spawnProgram, Is.EqualTo resolveProgram)
+                        Assert.That(spawnSearched, Is.EqualTo resolveSearched)
+                        // And the `Searched` names the command's EFFECTIVE (overridden) PATH — `dir` — not
+                        // the process's own PATH, the whole point of a command-level resolve.
+                        Assert.That(resolveSearched, Is.EqualTo(Some dir))
+                    | _ -> Assert.Fail "expected both errors to be NotFound"
+                | other -> Assert.Fail $"expected both ResolveProgram and spawn to fail NotFound, got {other}"
+            finally
+                Directory.Delete(dir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member this.``CliClient.ResolveProgram mirrors Command.ResolveProgram for the template command (T-183)``() =
+        let dir = freshDir "cli"
+        let toolName = "pk183-cli-tool"
+
+        try
+            this.WriteMarkerTool(dir, toolName, "CLI-HIT") |> ignore
+
+            let viaCommand =
+                (Command.create toolName |> Command.env "PATH" dir).ResolveProgram()
+
+            // The client's template carries the same `Env "PATH"` default, so its ResolveProgram resolves
+            // the client's own program the same way — the parity `CliClient.EnsureAvailableAsync` has with
+            // `Exec.which`, but for the effective-child-PATH resolver.
+            let client = (CliClient.create toolName).WithDefaults(fun t -> t.Env("PATH", dir))
+
+            let viaClient = client.ResolveProgram()
+
+            match viaCommand, viaClient with
+            | Ok fromCommand, Ok fromClient ->
+                Assert.That(this.IsUnder(dir, fromClient), Is.True, $"'{fromClient}' must be under '{dir}'")
+
+                Assert.That(
+                    fromClient,
+                    Is.EqualTo fromCommand,
+                    "CliClient.ResolveProgram must match Command.ResolveProgram for the template command"
+                )
+            | _ -> Assert.Fail $"expected both to resolve, got command={viaCommand}, client={viaClient}"
+        finally
+            Directory.Delete(dir, true)

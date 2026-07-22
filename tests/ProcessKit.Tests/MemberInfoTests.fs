@@ -28,12 +28,19 @@ type MemberInfoTests() =
         else
             Command.create "/bin/sh" |> Command.args [ "-c"; script ]
 
-    // Sleeps ~3s; every test kills it well before that.
+    // A single-process sleeper that spawns NO grandchildren, so the group's membership is a stable,
+    // one-element set for the whole test. The earlier `cmd.exe /c ping ...` wrapper launched a transient
+    // `ping.exe` grandchild that could join the Job Object between two independent member reads, making
+    // `MembersInfo` a superset of a just-taken `Members` snapshot under load (F-05); invoking the sleeper
+    // directly removes that transient child entirely. Windows `ping`'s stdout is discarded to the null
+    // device so no pipe/console is touched. Both sleep ~3s; every test kills it well before that.
     let sleeper =
         if isWindows then
-            shell "ping -n 4 127.0.0.1 >nul"
+            Command.create "ping"
+            |> Command.args [ "-n"; "4"; "127.0.0.1" ]
+            |> Command.stdout StdioMode.Null
         else
-            shell "sleep 3"
+            Command.create "sleep" |> Command.args [ "3" ]
 
     let create () =
         match ProcessGroup.Create() with
@@ -58,9 +65,11 @@ type MemberInfoTests() =
                     | Ok infos -> infos |> Seq.map (fun i -> i.Pid) |> Set.ofSeq
                     | Error error -> failwith $"MembersInfo failed: {error}"
 
-                // Same composition: MembersInfo never fabricates a member Members didn't report (a pid may
-                // legitimately drop out if it exits mid-read, so it is a subset, never a superset).
-                Assert.That(Set.isSubset infoPids members, Is.True, "MembersInfo reported a pid not in Members")
+                // The single-process child spawns no grandchildren, so the group is a stable one-element set
+                // and the two independent snapshots (Members, then MembersInfo) observe EXACTLY the same pids
+                // — no TOCTOU window for a transient child to join or drop between the reads. MembersInfo
+                // reports precisely the membership Members does, never a fabricated or divergent set.
+                Assert.That((infoPids = members), Is.True, "MembersInfo membership diverged from Members")
                 Assert.That(infoPids, Is.Not.Empty)
 
                 match running.Pid with
