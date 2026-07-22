@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - On Windows, a bare-name program whose only `PATH` match carries a non-`.exe` extension — the `.cmd`/`.bat` shims `npm`, `yarn`, `az`, and many dotnet-tool wrappers install — now **launches** instead of failing with `ProcessError.NotFound`. Previously `Exec.which` located such a shim (its `PATHEXT`-aware lookup finds any extension) but the actual spawn handed the bare name to the OS, whose own search appends only `.exe`, so the run couldn't reach it — preflight and launch disagreed. The spawn now substitutes the resolved absolute path (the same one `which` reports) and routes a `.cmd`/`.bat` through `cmd.exe /d /c`, quoting its arguments for `cmd.exe`'s own grammar so a metacharacter (`&`, `|`, `<`, `>`, `"`, …) is delivered literally rather than executed (the "BatBadBut" class, CVE-2024-24576); an argument `cmd.exe` cannot escape at all (a `%`, `!`, or newline) is refused with a typed `ProcessError.Spawn` instead of an unsafe launch. A `.exe` match, a path-form program, and all POSIX behaviour are unchanged.
+- `Supervisor.LivenessHttp` and `Supervisor.LivenessCheck` now clamp zero or negative probe intervals to
+  a 1 ms minimum, preserving the first-probe startup delay and preventing a hot monitor loop.
 
 ## [2.5.0] - 2026-07-22
 

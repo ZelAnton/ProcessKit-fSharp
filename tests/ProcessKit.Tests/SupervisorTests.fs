@@ -273,6 +273,49 @@ type private LivenessChildRunner() =
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "LivenessChildRunner drives incarnations via SpawnAsync"))
 
+/// A deterministic liveness-delay seam: the first requested delay is held until the test releases it,
+/// while later delays remain cancellable. This makes startup-delay and no-hot-loop assertions independent
+/// of wall-clock scheduling.
+type private LivenessDelayGate() =
+    let syncRoot = obj ()
+    let delays = ResizeArray<TimeSpan>()
+
+    let firstRequested =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let firstRelease =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    member _.Delays = delays
+    member _.FirstRequested = firstRequested.Task
+    member _.ReleaseFirst() = firstRelease.TrySetResult() |> ignore
+
+    member _.Delay(delay: TimeSpan, cancellationToken: CancellationToken) : Task =
+        let isFirst =
+            lock syncRoot (fun () ->
+                let first = delays.Count = 0
+                delays.Add delay
+                first)
+
+        if isFirst then
+            firstRequested.TrySetResult() |> ignore
+
+            task {
+                try
+                    do! firstRelease.Task.WaitAsync cancellationToken
+                with :? OperationCanceledException ->
+                    ()
+            }
+            :> Task
+        else
+            task {
+                try
+                    do! Task.Delay(Timeout.Infinite, cancellationToken)
+                with :? OperationCanceledException ->
+                    ()
+            }
+            :> Task
+
 [<TestFixture>]
 type SupervisorTests() =
 
@@ -1243,21 +1286,25 @@ type SupervisorTests() =
         s.LivenessFailures 1 |> ignore
         s.LivenessGrace TimeSpan.Zero |> ignore // zero grace = immediate escalation, a valid config
 
-        // A non-positive interval / timeout, a sub-1 failure count, and a negative grace are rejected.
-        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.LivenessHttp(uri, TimeSpan.Zero) |> ignore))
+        // A non-positive interval is clamped so a configuration typo does not reject startup.
+        s.LivenessHttp(uri, TimeSpan.Zero) |> ignore
+        s.LivenessHttp(uri, TimeSpan.FromMilliseconds -1.0) |> ignore
+
+        s.LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult true), TimeSpan.Zero)
         |> ignore
 
-        Assert.Throws<ArgumentOutOfRangeException>(
-            Action(fun () ->
-                s.LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult true), TimeSpan.Zero)
-                |> ignore)
-        )
+        s.LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult true), TimeSpan.FromMilliseconds -1.0)
         |> ignore
 
         Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.LivenessFailures 0 |> ignore))
         |> ignore
 
-        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.LivenessTimeout TimeSpan.Zero |> ignore))
+        // Zero timeout is a meaningful fail-fast attempt; only negative timeout is invalid.
+        s.LivenessTimeout TimeSpan.Zero |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> s.LivenessTimeout(TimeSpan.FromSeconds -1.0) |> ignore)
+        )
         |> ignore
 
         Assert.Throws<ArgumentOutOfRangeException>(
@@ -1269,6 +1316,49 @@ type SupervisorTests() =
             Action(fun () -> s.LivenessHttp(Unchecked.defaultof<Uri>, positive) |> ignore)
         )
         |> ignore
+
+    [<Test>]
+    member _.``non-positive liveness intervals use a deterministic 1 ms startup delay``() : Task =
+        task {
+            let intervals = [ TimeSpan.Zero; TimeSpan.FromMilliseconds -1.0 ]
+
+            for interval in intervals do
+                let runner = LivenessChildRunner()
+                let delay = LivenessDelayGate()
+                let mutable probes = 0
+
+                let supervisor =
+                    Supervisor(Command.create "clamped")
+                        .WithRunner(runner)
+                        .MaxRestarts(0)
+                        .LivenessCheck(
+                            Func<Task<bool>>(fun () ->
+                                Interlocked.Increment(&probes) |> ignore
+                                Task.FromResult true),
+                            interval
+                        )
+                        .WithLivenessDelay(fun span cancellationToken -> delay.Delay(span, cancellationToken))
+
+                let! session = supervisor.StartAsync()
+                do! waitUntil "clamped liveness child" (fun () -> runner.Spawns = 1)
+                do! delay.FirstRequested
+
+                Assert.That(delay.Delays[0], Is.EqualTo Liveness.minimumLivenessInterval)
+                Assert.That(Volatile.Read(&probes), Is.EqualTo 0)
+
+                // Releasing the first delay permits exactly the first probe; the next delay remains
+                // gated, proving the monitor cannot spin through probe calls without a pause.
+                delay.ReleaseFirst()
+                do! waitUntil "first clamped liveness probe" (fun () -> Volatile.Read(&probes) = 1)
+                Assert.That(delay.Delays |> Seq.forall ((=) Liveness.minimumLivenessInterval), Is.True)
+
+                let! outcome = session.StopAsync(TimeSpan.FromMilliseconds 100.0)
+
+                match outcome with
+                | Ok result -> Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+                | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
 
     [<Test>]
     member _.``a live but unresponsive child triggers a graceful liveness restart after N failures``() : Task =
