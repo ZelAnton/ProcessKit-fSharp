@@ -74,8 +74,12 @@ type OutputPolicyPropertyTests() =
         else
             Encoding.UTF8.GetByteCount buf.Text
 
-    // Feed `bytes` to `buf` split across `chunkSizes` (cycling back to whatever remains once the list
-    // is exhausted) — the `RawBuffer` analogue of `PumpPropertyTests`' `ChunkedStream`.
+    // Feed `bytes` to `buf` split across `chunkSizes`, cycling back to the start of the size list once
+    // it is exhausted (rather than falling back to a single "rest of the bytes" chunk) — the `RawBuffer`
+    // analogue of `PumpPropertyTests`' `ChunkedStream`. Cycling keeps the chunking pattern consistent for
+    // the whole input regardless of how many sizes were generated, which matters for Property 4
+    // (chunk-independence): without it, a short generated size list exhausts early and degrades to a
+    // single large `Append`, masking eviction/accounting bugs that only manifest across many small calls.
     static let feedRawChunked (buf: Pump.RawBuffer) (bytes: byte[]) (chunkSizes: int list) =
         let mutable pos = 0
         let mutable sizes = chunkSizes
@@ -86,7 +90,11 @@ type OutputPolicyPropertyTests() =
                 | s :: rest ->
                     sizes <- rest
                     s
-                | [] -> bytes.Length - pos
+                | [] ->
+                    // Exhausted - cycle back to the start of the original list instead of dumping the
+                    // remaining bytes in one call.
+                    sizes <- chunkSizes
+                    List.head chunkSizes
 
             let n = min chunk (bytes.Length - pos) |> max 1
             buf.Append(bytes, pos, n)
@@ -179,10 +187,12 @@ type OutputPolicyPropertyTests() =
 
     // --- Property 3: the raw-byte-capture analogue of Properties 1-2 — `RawBuffer` (the accumulator
     // behind `OutputBytesAsync`/pipeline stdout capture) never retains more bytes than its cap, and its
-    // overflow signal is set if and only if fewer bytes were retained than were fed in.
-    // `OutputBufferPolicy.MaxBytes` governs both this raw path and `LineBuffer` above, so the same
-    // contract must hold on both — a divergence here would mean the byte verb and the text verbs
-    // silently disagree about what "MaxBytes" means. ---
+    // overflow signal is set if and only if fewer bytes were retained than were actually fed in (the
+    // input's own length, not the internally accounted `TotalBytes` — comparing against `TotalBytes`
+    // alone would let an under-counting bug in `TotalBytes` itself mask a real overflow-flag mismatch, so
+    // `TotalBytes` accuracy is asserted separately as a baseline). `OutputBufferPolicy.MaxBytes` governs
+    // both this raw path and `LineBuffer` above, so the same contract must hold on both — a divergence
+    // here would mean the byte verb and the text verbs silently disagree about what "MaxBytes" means. ---
 
     [<Test>]
     member _.``RawBuffer never retains more than its byte cap, and its overflow flag is set iff a byte was actually dropped``
@@ -209,14 +219,15 @@ type OutputPolicyPropertyTests() =
 
                 let retainedLen = buf.ToArray().Length
                 let capOk = retainedLen <= case.Cap
+                let totalBytesOk = buf.TotalBytes = case.Bytes.Length
 
                 let overflowFlag =
                     match case.Overflow with
                     | OverflowMode.Error -> buf.TooLarge
                     | _ -> buf.Truncated
 
-                let somethingDropped = retainedLen < buf.TotalBytes
-                capOk && overflowFlag = somethingDropped)
+                let somethingDropped = retainedLen < case.Bytes.Length
+                capOk && totalBytesOk && overflowFlag = somethingDropped)
 
         Check.QuickThrowOnFailure property
 
