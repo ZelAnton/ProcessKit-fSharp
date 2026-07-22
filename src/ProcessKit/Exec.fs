@@ -20,6 +20,12 @@ module Exec =
     /// `PATH` value that was probed when `program` is a bare name (e.g. `"git"`), and is `None` when
     /// `program` already names a path (e.g. `"./tool"`, `"/usr/bin/tool"`), since a path-form program
     /// is checked directly and never searched.
+    ///
+    /// **Resolves against the CURRENT PROCESS's `PATH`** (and no prefer-local) — the host-wide "is this
+    /// tool installed" question. For "will THIS command find its program", against a command's effective
+    /// child `PATH` (its `Env` override) and `PreferLocal`, use `Command.ResolveProgram` /
+    /// `CliClient.ResolveProgram` instead; both share this same resolver, differing only in whose `PATH`
+    /// is searched.
     let which (program: string) : Result<string, ProcessError> =
         ArgumentNullException.ThrowIfNull program
         Native.Common.resolveProgram program

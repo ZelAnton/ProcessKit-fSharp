@@ -167,6 +167,23 @@ type CliClient internal (config: CliClientConfig) =
     member _.EnsureAvailableAsync() : Task<Result<string, ProcessError>> =
         Task.FromResult(Native.Common.resolveProgram config.Template.Program)
 
+    /// Resolve this client's program to a full path WITHOUT spawning it — the same no-spawn, synchronous,
+    /// side-effect-free preflight as `Command.ResolveProgram`, for the template command behind the client
+    /// (its shared `WithDefaults` environment and `PreferLocal` applied). Resolution is against the
+    /// **effective child** `PATH` — the client's own `Env`/`EnvRemove`/`EnvClear` (a `PATH` override) plus
+    /// its prefer-local directories, searched exactly as a real run of the client would — and on a miss it
+    /// returns the SAME typed `ProcessError.NotFound`/`Searched` a real run of the client would fail with
+    /// (one shared resolver, never a separate copy).
+    ///
+    /// **Differs from `EnsureAvailableAsync`.** `EnsureAvailableAsync` is a thin `Exec.which` over the
+    /// CURRENT PROCESS's `PATH` (no prefer-local) — "is this tool installed on the host". `ResolveProgram`
+    /// reflects the client's OWN configured environment/prefer-local — "will this client find its program".
+    /// Like `EnsureAvailableAsync`, resolution is always **local**, never delegated to `Runner`:
+    /// availability is a fact about the host's `PATH`/filesystem, independent of which `IProcessRunner` a
+    /// command eventually runs through, so a test double injected via `WithRunner` has no bearing on it.
+    member _.ResolveProgram() : Result<string, ProcessError> =
+        Native.Common.resolveCommandProgram config.Template
+
 /// Pipe-friendly entry point for `CliClient`.
 [<RequireQualifiedAccess>]
 module CliClient =

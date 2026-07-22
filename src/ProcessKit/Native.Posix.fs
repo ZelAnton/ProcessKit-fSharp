@@ -2147,7 +2147,7 @@ module internal Posix =
                             closeParentEnds ()
 
                             if rc = ENOENT then
-                                Error(notFoundFromSpawnFailure command.Program)
+                                Error(notFoundFromSpawnFailure command)
                             else
                                 Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
                         else

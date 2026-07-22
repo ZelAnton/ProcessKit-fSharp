@@ -192,6 +192,51 @@ never delegated to the client's `Runner` — since availability is a fact about 
 host's `PATH`/filesystem, not about how a command eventually runs; a test double
 injected via `WithRunner` has no bearing on the result.
 
+#### `which` (process `PATH`) vs `ResolveProgram` (the command's own `PATH`)
+
+`Exec.which` and `CliClient.EnsureAvailableAsync` answer a host-wide question — *is
+this tool installed?* — so they resolve against the **current process's** `PATH`,
+with no prefer-local. That is the right check for a `doctor` step, but it is the
+**wrong** answer for a command that carries a different environment: if you set
+`Command.Env("PATH", …)` (or `EnvClear` then a fresh `Env("PATH", …)`), or lean on
+`PreferLocal`, the child searches a `PATH` the process's own does not describe, so
+`which` can say *found* where the run fails `NotFound`, or vice versa.
+
+`Command.ResolveProgram()` (and `CliClient.ResolveProgram()` for the client's
+template) closes that gap: it resolves against the **effective child `PATH`** — the
+command's `Env`/`EnvRemove`/`EnvClear` applied, `PreferLocal` directories consulted
+first — through the *same* resolver the real spawn uses. It never spawns and has no
+side effects (a few `stat`s), and on a miss it returns the **identical**
+`ProcessError.NotFound` / `Searched` a real run of the same command would fail with.
+Reach for `which` to ask "is it on the host"; reach for `ResolveProgram` to ask
+"will *this* command, with its environment and prefer-local, find its program".
+
+**F#**
+
+```fsharp
+let build =
+    Command.create "eslint"
+    |> Command.env "PATH" "/opt/project/node_modules/.bin" // the child's PATH, not the process's
+
+match build.ResolveProgram() with
+| Ok path -> printfn $"the run will launch {path}"
+| Error(ProcessError.NotFound(program, searched)) -> eprintfn $"'{program}' not found (searched {searched})"
+| Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+var build = new Command("eslint")
+    .Env("PATH", "/opt/project/node_modules/.bin"); // the child's PATH, not the process's
+
+Console.WriteLine(build.ResolveProgram() switch
+{
+    { IsOk: true, ResultValue: var path } => $"the run will launch {path}",
+    { IsOk: false, ErrorValue: var err }  => err.Message,
+});
+```
+
 For one-liners the top-level helpers skip the builder entirely:
 
 **F#**

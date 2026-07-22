@@ -9,6 +9,7 @@ class ProcessKit.CliClient
   member OutputStringAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   member ParseAsync<T>(System.Collections.Generic.IEnumerable<System.String>, System.Func<System.String, T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   member ProbeAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
+  member ResolveProgram() : Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>
   member RunAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
   member RunUnitAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member StartAsync(System.Collections.Generic.IEnumerable<System.String>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
@@ -138,6 +139,7 @@ class ProcessKit.CommandVerbs
   static member OutputStringAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   static member ParseAsync<T>(ProcessKit.Command, System.Func<System.String, T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
   static member ProbeAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>>
+  static member ResolveProgram(ProcessKit.Command) : Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>
   static member RunAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
   static member RunUnitAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   static member StartAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
