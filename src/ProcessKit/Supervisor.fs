@@ -196,6 +196,19 @@ module internal Supervision =
 
             if Double.IsFinite decayed then decayed + 1.0 else 1.0
 
+module internal Liveness =
+
+    /// A non-positive interval is a configuration typo, but rejecting it would prevent supervisor
+    /// startup; clamp it to a real timer tick so the monitor keeps its startup-delay contract instead
+    /// of spinning on `Task.Delay(TimeSpan.Zero)`.
+    let minimumLivenessInterval = TimeSpan.FromMilliseconds 1.0
+
+    let clampInterval (interval: TimeSpan) =
+        if interval <= TimeSpan.Zero then
+            minimumLivenessInterval
+        else
+            interval
+
 /// How the supervisor checks whether a *live* incarnation is still healthy: an HTTP endpoint (poll
 /// until a response satisfies the check) or an arbitrary async predicate. Internal — built through the
 /// `Supervisor.LivenessHttp`/`LivenessCheck` builder methods. Both funnel through the shared readiness
@@ -238,6 +251,7 @@ type internal SupervisorConfig =
       LivenessFailures: int
       LivenessTimeout: TimeSpan
       LivenessGrace: TimeSpan
+      LivenessDelay: TimeSpan -> CancellationToken -> Task
       // The clock seam: `Now` is a monotonic reading in seconds (only differences matter); `Sleep`
       // waits out a delay. Real implementations by default; tests inject a virtual clock that
       // advances `Now` when it `Sleep`s, so backoff/storm timing is deterministic.
@@ -282,6 +296,7 @@ module internal SupervisorConfig =
           LivenessFailures = 3
           LivenessTimeout = TimeSpan.FromSeconds 2.0
           LivenessGrace = TimeSpan.FromSeconds 2.0
+          LivenessDelay = fun delay cancellationToken -> Task.Delay(delay, cancellationToken)
           Now = realNow
           Sleep = realSleep }
 
@@ -484,9 +499,10 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
         | Some probe ->
             let program = config.Command.Program
             let probeTimeout = config.LivenessTimeout
-            let interval = config.LivenessInterval
+            let interval = Liveness.clampInterval config.LivenessInterval
             let threshold = max 1 config.LivenessFailures
             let grace = config.LivenessGrace
+            let livenessDelay = config.LivenessDelay
 
             // Build the per-attempt health check and whatever it owns. An HTTP monitor holds ONE
             // `HttpClient` for its whole lifetime and reuses it across attempts (a periodic probe must not
@@ -525,7 +541,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                         let mutable waited = true
 
                         try
-                            do! Task.Delay(interval, token)
+                            do! livenessDelay interval token
                         with :? OperationCanceledException ->
                             // Torn down (incarnation ended, or the session is stopping) during the gap
                             // between attempts; the loop guard ends the monitor.
@@ -1198,7 +1214,8 @@ type Supervisor internal (config: SupervisorConfig) =
     /// The first attempt runs one `interval` after the child starts, giving a natural startup window.
     /// Liveness needs a live child handle, so it applies only to a spawn-capable runner (the default),
     /// not a capture-only test double. A single attempt reuses the same poll/deadline core as
-    /// `RunningProcess.WaitForHttpAsync`. `interval` must be positive.
+    /// `RunningProcess.WaitForHttpAsync`. A zero or negative `interval` is clamped to a safe 1 ms
+    /// minimum so a configuration typo does not reject supervisor startup or create a hot loop.
     member this.LivenessHttp(uri: Uri, interval: TimeSpan) =
         ArgumentNullException.ThrowIfNull uri
 
@@ -1211,17 +1228,16 @@ type Supervisor internal (config: SupervisorConfig) =
         )
 
     /// Like `LivenessHttp(uri, interval)`, but uses `isSatisfactory` to decide whether a response means
-    /// the child is healthy (e.g. accept only a specific health-endpoint status/body). `interval` must
-    /// be positive.
+    /// the child is healthy (e.g. accept only a specific health-endpoint status/body). A zero or
+    /// negative `interval` is clamped to a safe 1 ms minimum.
     member _.LivenessHttp(uri: Uri, isSatisfactory: Func<HttpResponseMessage, bool>, interval: TimeSpan) =
         ArgumentNullException.ThrowIfNull uri
         ArgumentNullException.ThrowIfNull isSatisfactory
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero, nameof interval)
 
         Supervisor(
             { config with
                 Liveness = Some(LivenessProbe.Http(uri, (fun response -> isSatisfactory.Invoke response)))
-                LivenessInterval = interval }
+                LivenessInterval = Liveness.clampInterval interval }
         )
 
     /// Enable a **predicate liveness probe**: every `interval`, evaluate `probe` and treat the *live*
@@ -1230,16 +1246,15 @@ type Supervisor internal (config: SupervisorConfig) =
     /// default. `probe` is the caller's own health check (a custom RPC, a file/socket poke, a metric
     /// read); a returned `false` or a raised exception both count as a failed attempt, and the API
     /// cannot force a caller-owned `probe` to stop, so a hung probe is bounded by `LivenessTimeout` and
-    /// abandoned (its late outcome safely observed) rather than pinning the monitor. `interval` must be
-    /// positive.
+    /// abandoned (its late outcome safely observed) rather than pinning the monitor. A zero or negative
+    /// `interval` is clamped to a safe 1 ms minimum.
     member _.LivenessCheck(probe: Func<Task<bool>>, interval: TimeSpan) =
         ArgumentNullException.ThrowIfNull probe
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero, nameof interval)
 
         Supervisor(
             { config with
                 Liveness = Some(LivenessProbe.Custom(fun () -> probe.Invoke()))
-                LivenessInterval = interval }
+                LivenessInterval = Liveness.clampInterval interval }
         )
 
     /// How many **consecutive** failed liveness attempts trip a restart (default `3`). A single healthy
@@ -1250,10 +1265,11 @@ type Supervisor internal (config: SupervisorConfig) =
         Supervisor({ config with LivenessFailures = count })
 
     /// The per-attempt timeout for a liveness probe (default 2 s): one attempt gives the endpoint/
-    /// predicate up to this long to prove healthy before it counts as a failure. `timeout` must be
-    /// positive. No effect unless a liveness probe is set.
+    /// predicate up to this long to prove healthy before it counts as a failure. `TimeSpan.Zero` is a
+    /// meaningful fail-fast timeout: the attempt is immediately `NotReady` without invoking the probe;
+    /// a negative value is rejected. No effect unless a liveness probe is set.
     member _.LivenessTimeout(timeout: TimeSpan) =
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero, nameof timeout)
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero, nameof timeout)
 
         Supervisor(
             { config with
@@ -1262,8 +1278,8 @@ type Supervisor internal (config: SupervisorConfig) =
 
     /// The grace window passed to `RunningProcess.StopAsync` when a liveness failure forces a restart
     /// (default 2 s): the unresponsive child is asked to stop softly and hard-killed only if it does not
-    /// exit within this window. `TimeSpan.Zero` escalates the kill immediately; a negative value is
-    /// rejected. No effect unless a liveness probe is set.
+    /// exit within this window. `TimeSpan.Zero` intentionally escalates the kill immediately; a negative
+    /// value is rejected. No effect unless a liveness probe is set.
     member _.LivenessGrace(grace: TimeSpan) =
         ArgumentOutOfRangeException.ThrowIfLessThan(grace, TimeSpan.Zero, nameof grace)
         Supervisor({ config with LivenessGrace = grace })
@@ -1271,6 +1287,11 @@ type Supervisor internal (config: SupervisorConfig) =
     /// Internal test seam: inject a virtual clock (advance-on-sleep) for deterministic timing tests.
     member internal _.WithClock(now: unit -> float, sleep: TimeSpan -> CancellationToken -> Task) =
         Supervisor({ config with Now = now; Sleep = sleep })
+
+    /// Internal test seam: replace the liveness monitor's delay without changing its background-task
+    /// execution model, so interval and startup-delay tests can be deterministic.
+    member internal _.WithLivenessDelay(delay: TimeSpan -> CancellationToken -> Task) =
+        Supervisor({ config with LivenessDelay = delay })
 
     /// Internal seam for hosting-style wrappers (e.g. `ProcessKit.Extensions.Hosting`) that need to
     /// combine an already-configured `StopWhen` with their own host-driven stop condition, without

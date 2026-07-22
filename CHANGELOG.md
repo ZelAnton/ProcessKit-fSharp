@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `Supervisor.LivenessHttp` and `Supervisor.LivenessCheck` now clamp zero or negative probe intervals to
+  a 1 ms minimum, preserving the first-probe startup delay and preventing a hot monitor loop.
 
 ## [2.5.0] - 2026-07-22
 
