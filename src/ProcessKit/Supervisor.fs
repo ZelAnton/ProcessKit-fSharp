@@ -785,7 +785,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
 
                     // A liveness-forced restart is additionally surfaced under its own event/metric, so an
                     // operator can tell a "live-but-hung service" restart apart from an ordinary crash
-                    // restart without придумывания a parallel event system — same `ProcessKitDiagnostics`
+                    // restart without inventing a parallel event system — same `ProcessKitDiagnostics`
                     // taxonomy, one extra id. The generic restart telemetry above still fires (it IS a
                     // restart and counts in `SupervisionOutcome.Restarts`).
                     match cause with
