@@ -412,4 +412,4 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 [2.3.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.0.0...v2.1.0
-[2.0.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v0.0.0...v2.0.0
+[2.0.0]: https://github.com/ZelAnton/ProcessKit-fSharp/releases/tag/v2.0.0
