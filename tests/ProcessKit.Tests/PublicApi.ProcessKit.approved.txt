@@ -500,6 +500,7 @@ class ProcessKit.ProcessError
   member GetHashCode() : System.Int32
   member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
   member ToString() : System.String
+  member get_IsAdopt() : System.Boolean
   member get_IsCancelled() : System.Boolean
   member get_IsCassetteMiss() : System.Boolean
   member get_IsExit() : System.Boolean
@@ -518,6 +519,7 @@ class ProcessKit.ProcessError
   member get_Tag() : System.Int32
   property Code : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property Combined : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property IsAdopt : System.Boolean { get }
   property IsCancelled : System.Boolean { get }
   property IsCassetteMiss : System.Boolean { get }
   property IsExit : System.Boolean { get }
@@ -540,6 +542,7 @@ class ProcessKit.ProcessError
   property Stderr : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
   property Stdout : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
   property Tag : System.Int32 { get }
+  static member NewAdopt(System.Int32, System.String) : ProcessKit.ProcessError
   static member NewCancelled(System.String) : ProcessKit.ProcessError
   static member NewCassetteMiss(System.String) : ProcessKit.ProcessError
   static member NewExit(System.String, System.Int32, System.String, System.String) : ProcessKit.ProcessError
@@ -555,6 +558,14 @@ class ProcessKit.ProcessError
   static member NewTimeout(System.String, System.TimeSpan, System.String, System.String) : ProcessKit.ProcessError
   static member NewUnobserved(System.String, System.String) : ProcessKit.ProcessError
   static member NewUnsupported(System.String) : ProcessKit.ProcessError
+
+class ProcessKit.ProcessError+Adopt : ProcessKit.ProcessError
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_Detail() : System.String
+  member get_Pid() : System.Int32
+  property Detail : System.String { get }
+  property Pid : System.Int32 { get }
 
 class ProcessKit.ProcessError+Cancelled : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
@@ -659,6 +670,7 @@ class ProcessKit.ProcessError+Stdin : ProcessKit.ProcessError
   property Program : System.String { get }
 
 module ProcessKit.ProcessError+Tags
+  field literal Adopt : System.Int32
   field literal Cancelled : System.Int32
   field literal CassetteMiss : System.Int32
   field literal Exit : System.Int32
@@ -713,6 +725,7 @@ class ProcessKit.ProcessGroup
   :> ProcessKit.IProcessRunner
   :> System.IAsyncDisposable
   :> System.IDisposable
+  member Adopt(System.Diagnostics.Process) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member Finalize() : System.Void
   member KillAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member Members() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<System.Int32>, ProcessKit.ProcessError>

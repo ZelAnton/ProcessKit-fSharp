@@ -396,6 +396,93 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     return Ok running
         }
 
+    /// Adopt an already-running **external** process — one this group did not start (created by other
+    /// code, inherited from another layer, or located by pid) — into the container, so from now on it
+    /// obeys the same whole-tree rules as a process started with `StartAsync`: kill-on-dispose, and
+    /// participation in `Signal`/`Suspend`/`Resume`/`Members`/`MembersInfo`/`Stats` and any resource
+    /// limits. This restores the "kill the whole tree" guarantee for a wrapper whose child was not
+    /// launched through ProcessKit.
+    ///
+    /// **The argument is a `System.Diagnostics.Process`, not a bare pid — deliberately.** A raw pid is
+    /// subject to number reuse: between the caller obtaining it and the adopt landing, the OS may have
+    /// recycled it onto an unrelated process, which the adopt would then contain by mistake. A live
+    /// `Process` holds an open OS handle to the target, which on **Windows** pins the pid (the OS will not
+    /// reuse it while a handle is open), so the adopt cannot race a recycle; this call keeps the `Process`
+    /// alive across the native adopt for exactly that reason. On **Linux** there is no handle that pins a
+    /// pid, so the `Process` gives the pre-adopt `HasExited` guard and a narrower window, but a pid
+    /// recycled in the residual window cannot be fully ruled out by number alone — the honest limitation
+    /// is documented, not hidden.
+    ///
+    /// **Per-platform behaviour** (honest and typed, never a silent no-op):
+    ///  * **Windows (Job Object)** — `AssignProcessToJobObject`; supported with or without limits.
+    ///  * **Linux cgroup v2** — writes the pid to the group's `cgroup.procs`; available only on a group
+    ///    created **with** resource limits (which is what selects the cgroup mechanism). A plain,
+    ///    limit-free Linux group uses the POSIX process-group mechanism and cannot adopt (below).
+    ///  * **POSIX process group (macOS/BSD, or Linux without limits)** — `ProcessError.Unsupported`:
+    ///    `setpgid` only relocates our own children before they `exec`, so a foreign process cannot be
+    ///    moved into our group at all.
+    ///
+    /// **Edge cases**, each a distinct typed failure rather than a fabricated success:
+    ///  * a `null` argument throws `ArgumentNullException` (a programming error, surfaced eagerly);
+    ///  * a process that has already exited, or a pid that no longer exists (a TOCTOU race lost to the
+    ///    target's own exit), returns `ProcessError.Adopt`;
+    ///  * missing rights to the foreign process returns `ProcessError.Adopt` (a typed error, not an
+    ///    escaping exception);
+    ///  * a Windows process already assigned to a Job that does not permit nesting on this OS
+    ///    configuration returns `ProcessError.Adopt` — never a "looks like it worked" no-op.
+    ///
+    /// **The adopted process is not our child**, so ProcessKit does **not** reap it via `waitpid` and does
+    /// **not** signal its process group (which it does not own): the container primitive alone contains and
+    /// kills it — the Job's `KILL_ON_JOB_CLOSE` / a cgroup `cgroup.kill` at teardown — while its real
+    /// parent (or `init`, once reparented) reaps it. The **exit-observation (wait) path is the caller's
+    /// own `Process`** (`Process.WaitForExitAsync` / `HasExited`); this method adds containment, and returns
+    /// `Result<unit, _>` rather than a `RunningProcess`, because the external process's stdio is not ours
+    /// to stream.
+    ///
+    /// Routed through the same lifecycle gate as the other control verbs: adopting into a released group
+    /// returns a non-transient `ProcessError.Unsupported` before touching the closed/removed native
+    /// container, never a use-after-teardown.
+    member this.Adopt(externalProcess: Process) : Result<unit, ProcessError> =
+        ArgumentNullException.ThrowIfNull externalProcess
+
+        // Read the pid + liveness OFF the lifecycle lock (they touch the caller's Process, not our
+        // container). Both throw for a Process with no associated OS process (never started / already
+        // disposed); such a caller gets an honest typed refusal, not an escaping exception. A live
+        // external process reports HasExited = false.
+        let pidResult =
+            try
+                let pid = externalProcess.Id
+
+                if externalProcess.HasExited then
+                    Error(
+                        ProcessError.Adopt(
+                            pid,
+                            "the process has already exited; a concluded process cannot be adopted (adopt it while it is live)"
+                        )
+                    )
+                else
+                    Ok pid
+            with
+            | :? InvalidOperationException ->
+                Error(
+                    ProcessError.Adopt(
+                        0,
+                        "the argument is not a started, live process (no OS process is associated with it)"
+                    )
+                )
+            | :? System.ComponentModel.Win32Exception as ex ->
+                Error(ProcessError.Adopt(0, $"could not determine the process's liveness: {ex.Message}"))
+
+        match pidResult with
+        | Error error -> Error error
+        | Ok pid ->
+            // Adopt on the LIVE backend, serialized against teardown exactly like every other control verb.
+            // Keep the caller's Process alive across the whole native adopt: on Windows its open OS handle
+            // pins the pid, so `adoptIntoJob`'s OpenProcess(pid) cannot race a recycle onto a stranger.
+            let result = this.WhenLive(fun () -> backend.Adopt pid)
+            GC.KeepAlive externalProcess
+            result
+
     /// Immediately hard-kill every process currently in the group (the honest name for the tree kill —
     /// no graceful signal). Idempotent; the group stays usable for further spawns. Returns `Result` for
     /// parity with the other tree-control verbs (a future backend can report an undrained tree); the

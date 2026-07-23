@@ -170,6 +170,23 @@ terminates the Job — so a child with no window (or one that vetoes the close) 
 as before, and the kill-on-dispose guarantee is never weakened. On the Unix mechanisms it is `SIGTERM`,
 then a grace window, then `SIGKILL`.
 
+**Adopting an external process (`Adopt`)**
+
+| Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
+|---|:---:|:---:|:---:|
+| `Adopt(process)` an already-running external process | ✅ `AssignProcessToJobObject` | 🟡 write pid to `cgroup.procs` — **limited groups only** | ❌ `ProcessError.Unsupported` |
+
+`Adopt` brings a process ProcessKit did *not* start into the container, so kill-on-dispose and every
+whole-tree control/stat/limit thereafter covers it. It takes a `System.Diagnostics.Process` (not a raw
+pid) so the caller's open handle pins the pid against recycling on Windows. **Linux** can adopt only into
+a group created **with resource limits** (which is what selects the cgroup v2 mechanism); a limit-free
+Linux group and every macOS/BSD group use the POSIX process-group mechanism, which cannot relocate a
+foreign process (`setpgid` moves only our own children, before `exec`) and refuses honestly with
+`ProcessError.Unsupported` — never a silent no-op. A dead/gone pid, missing rights, or a process already
+in an incompatible Job returns the typed `ProcessError.Adopt`. The adopted process is not ProcessKit's
+child: it is contained and killed through the OS primitive alone (`KILL_ON_JOB_CLOSE` / `cgroup.kill`) and
+never `waitpid`ed, so its exit is observed through the caller's own `Process`, not a `RunningProcess`.
+
 **Reaping on sudden parent death (`Command.KillOnParentDeath`)**
 
 Kill-on-dispose covers the parent tearing the group down; it cannot cover the parent being killed

@@ -707,6 +707,23 @@ module internal Windows =
     [<Literal>]
     let private PROCESS_QUERY_LIMITED_INFORMATION = 0x1000u
 
+    // The two access rights `AssignProcessToJobObject` requires on the target process handle: it must be
+    // able to set the process's quota (Job limits are quotas) and to terminate it (the Job owns its
+    // lifetime once assigned). `adoptIntoJob` opens a foreign process with exactly these (plus
+    // PROCESS_QUERY_LIMITED_INFORMATION for the `IsProcessInJob` disambiguation on failure) — no more.
+    [<Literal>]
+    let private PROCESS_TERMINATE = 0x0001u
+
+    [<Literal>]
+    let private PROCESS_SET_QUOTA = 0x0100u
+
+    // Win32 error code distinguished when an adopt fails, so the typed error can name the real cause
+    // rather than a bare number: the caller lacks rights to the foreign process, or an assign was refused
+    // because the process is already in a Job that does not allow nesting on this OS configuration.
+    // (ERROR_INVALID_PARAMETER — the "pid does not exist" case — is already defined once above.)
+    [<Literal>]
+    let private ERROR_ACCESS_DENIED = 5
+
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private QueryInformationJobObject(
         nativeint hJob,
@@ -957,6 +974,65 @@ module internal Windows =
 
     let resumeWindows (job: nativeint) : Result<unit, ProcessError> =
         forEachMemberHandle job (fun handle -> NtResumeProcess handle |> ignore)
+
+    /// Adopt an already-running external process into `job` via `AssignProcessToJobObject`. Opens our own
+    /// least-privilege handle to `pid` (PROCESS_SET_QUOTA + PROCESS_TERMINATE — the two rights the assign
+    /// requires — plus PROCESS_QUERY_LIMITED_INFORMATION for the failure disambiguation), assigns it, then
+    /// closes that handle: Job membership persists independently of the handle we assigned through, so the
+    /// process stays contained (and visible to `membersWindows`, killed by `KILL_ON_JOB_CLOSE` at teardown)
+    /// without us holding or tracking anything — it is not our child and needs no reap ledger entry.
+    ///
+    /// Every failure is a typed refusal, never a fabricated success:
+    ///  * `OpenProcess` fails — ERROR_INVALID_PARAMETER (the pid does not exist: a lost adopt-vs-exit race)
+    ///    or ERROR_ACCESS_DENIED (no rights to the foreign process) — both `ProcessError.Adopt`.
+    ///  * `AssignProcessToJobObject` fails — if `IsProcessInJob` then reports the process is already in a
+    ///    job, that is the "already in an incompatible Job (nested jobs not permitted here)" case; else it
+    ///    is a generic assign failure (e.g. the target exited between open and assign). Either way
+    ///    `ProcessError.Adopt` with the specific detail.
+    let adoptIntoJob (job: nativeint) (pid: int) : Result<unit, ProcessError> =
+        let handle =
+            OpenProcess(
+                PROCESS_SET_QUOTA ||| PROCESS_TERMINATE ||| PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                uint32 pid
+            )
+
+        if handle = IntPtr.Zero then
+            let errno = Marshal.GetLastWin32Error()
+
+            let detail =
+                if errno = ERROR_INVALID_PARAMETER then
+                    "the process does not exist (it exited before it could be adopted, or its pid was never valid)"
+                elif errno = ERROR_ACCESS_DENIED then
+                    "access denied opening the process; the caller lacks the rights to adopt it into a Job"
+                else
+                    $"OpenProcess failed: {Win32Exception(errno).Message}"
+
+            Error(ProcessError.Adopt(pid, detail))
+        else
+            try
+                if AssignProcessToJobObject(job, handle) then
+                    Ok()
+                else
+                    let errno = Marshal.GetLastWin32Error()
+                    let mutable alreadyInJob = false
+
+                    let detail =
+                        if IsProcessInJob(handle, IntPtr.Zero, &alreadyInJob) && alreadyInJob then
+                            // Assigned to SOME job already (IsProcessInJob with a null job asks "in ANY job?").
+                            // On a Windows configuration without nested-job support this is why the assign was
+                            // refused (ERROR_ACCESS_DENIED); report it honestly rather than as "adopted".
+                            "the process is already assigned to another Job that does not permit nesting on this Windows configuration"
+                        elif errno = ERROR_ACCESS_DENIED then
+                            "access denied assigning the process to the Job"
+                        else
+                            $"AssignProcessToJobObject failed: {Win32Exception(errno).Message}"
+
+                    Error(ProcessError.Adopt(pid, detail))
+            finally
+                // The assign (on success) or its failure is complete; Job membership does not depend on
+                // this handle, so drop it — we track nothing for an adopted, non-child process.
+                CloseHandle handle |> ignore
 
     // Job-Object accounting for `stats`: cumulative CPU + active count (basic accounting) and peak
     // committed memory (extended limit info).

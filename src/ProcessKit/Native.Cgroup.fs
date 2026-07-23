@@ -261,6 +261,50 @@ module internal Cgroup =
             finally
                 closeFd fd |> ignore
 
+    /// Adopt an already-running EXTERNAL process into this cgroup by writing its pid to `cgroup.procs`.
+    /// Shares the raw `open`/`write`/`close` shape with `migrateToCgroup`, but classifies the outcome for
+    /// ADOPTION rather than confirmation — the ESRCH case is the crucial difference:
+    ///
+    ///  * write succeeds → the foreign process is now a member of the cgroup (and thereby bound by its
+    ///    limits and reachable by `cgroup.kill`/`cgroup.freeze`/the per-member signal sweep) → `Ok`.
+    ///  * ESRCH on write → the pid no longer exists: the process we were asked to adopt exited before the
+    ///    write landed. For a spawn confirmation `migrateToCgroup` treats this as success (the launcher had
+    ///    already migrated it); for an ADOPTION it is an honest FAILURE — there was nothing live to adopt,
+    ///    a lost adopt-vs-exit race, never a silent success.
+    ///  * open fails (ENOENT/EACCES — missing or unwritable cgroup, e.g. the group was torn down) or any
+    ///    other write error → a genuine failure → `Error`.
+    ///
+    /// Note the residual Linux hazard the caller documents: unlike Windows (where the caller's open process
+    /// handle pins the pid), Linux has no handle to pin a foreign pid, so in the small window between the
+    /// caller's liveness check and this write a pid could in principle be recycled to a different process.
+    /// `ProcessGroup.Adopt`'s pre-write `HasExited` guard plus this ESRCH check catch the common
+    /// dead-pid race; the recycled-to-a-stranger window cannot be fully closed by number alone.
+    let adoptIntoCgroup (cgroupPath: string) (pid: int) : Result<unit, string> =
+        let procs = Path.Combine(cgroupPath, "cgroup.procs")
+        let fd = openWrite (procs, O_WRONLY)
+
+        if fd < 0 then
+            let errno = Marshal.GetLastWin32Error()
+            Error $"could not open {procs} to adopt the process (errno {errno})"
+        else
+            try
+                let payload = System.Text.Encoding.ASCII.GetBytes(string pid)
+                let written = writeAll (fd, payload, nativeint payload.Length)
+
+                if written >= 0n && written = nativeint payload.Length then
+                    Ok()
+                elif written >= 0n then
+                    Error $"short write adopting pid {pid} into {procs} ({written} of {payload.Length} bytes)"
+                else
+                    let errno = Marshal.GetLastWin32Error()
+
+                    if errno = ESRCH then
+                        Error $"the process (pid {pid}) no longer exists; there is nothing live to adopt"
+                    else
+                        Error $"writing pid {pid} to {procs} to adopt it failed (errno {errno})"
+            finally
+                closeFd fd |> ignore
+
     /// The live member pids of a cgroup (`cgroup.procs`), distinguishing "read, and it's empty" from
     /// "the read itself failed" (EACCES/EIO, a race with teardown removing the directory, …). Folding
     /// both into `[]` (the previous behaviour) made a transient read failure indistinguishable from a

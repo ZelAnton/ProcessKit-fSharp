@@ -57,6 +57,16 @@ type ProcessError =
     /// controllers could not be enabled (this process is not at the real cgroup root).
     | ResourceLimit of Detail: string
 
+    /// An external process could not be adopted into a `ProcessGroup` (`ProcessGroup.Adopt`). This is
+    /// the honest, typed refusal for a *runtime* adoption failure of a specific process — as opposed to
+    /// `Unsupported`, which reports a mechanism that cannot adopt at all (the POSIX process group). The
+    /// distinguishable causes all live in `Detail`: the target had already exited or its pid does not
+    /// exist (a TOCTOU race — never a silent success), the caller lacks the rights to place a foreign
+    /// process into the container, or the process is already assigned to a Job that does not permit
+    /// nesting on this Windows configuration. `Pid` is the target's pid, or `0` when no live process was
+    /// associated with the argument.
+    | Adopt of Pid: int * Detail: string
+
     /// A `RecordReplayRunner` in replay mode found no recorded entry matching the invocation.
     | CassetteMiss of Program: string
 
@@ -92,6 +102,7 @@ type ProcessError =
             $"'{program}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
         | ProcessError.Stdin(program, detail) -> $"could not read the stdin source for '{program}': {detail}"
         | ProcessError.ResourceLimit detail -> $"resource limit could not be enforced: {detail}"
+        | ProcessError.Adopt(pid, detail) -> $"could not adopt process {pid} into the group: {detail}"
         | ProcessError.CassetteMiss program -> $"no recorded cassette entry for '{program}'"
         | ProcessError.Io detail -> $"I/O error: {detail}"
         | ProcessError.Unsupported operation -> $"unsupported: {operation}"
@@ -127,6 +138,7 @@ type ProcessError =
         | ProcessError.OutputTooLarge(program, _, _, _, _)
         | ProcessError.Stdin(program, _)
         | ProcessError.CassetteMiss program -> Some program
+        | ProcessError.Adopt _
         | ProcessError.ResourceLimit _
         | ProcessError.Io _
         | ProcessError.Unsupported _ -> None

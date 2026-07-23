@@ -33,6 +33,27 @@ type ProcessControlTests() =
         | Ok group -> group
         | Error error -> failwith $"ProcessGroup.Create failed: {error}"
 
+    // Start a childless, long-running EXTERNAL process (started OUTSIDE ProcessKit) suitable for
+    // `ProcessGroup.Adopt`. `ping -n N` (Windows) and `sleep N` (POSIX) both outlast every test here and
+    // fork no children, so the adopted process itself is the entire tree — killing it is the whole effect.
+    let startExternalSleeper () : Process =
+        let psi =
+            if isWindows then
+                let p = ProcessStartInfo("ping.exe", "-n 30 127.0.0.1")
+                // Swallow ping's slow, tiny output into an unread pipe so it neither spams the test host
+                // nor (in the few seconds before the group kills it) fills the buffer and blocks.
+                p.RedirectStandardOutput <- true
+                p
+            else
+                ProcessStartInfo("/bin/sh", "-c \"sleep 30\"")
+
+        psi.UseShellExecute <- false
+        psi.CreateNoWindow <- true
+
+        match Process.Start psi with
+        | null -> failwith "failed to start the external test process"
+        | p -> p
+
     [<Test>]
     member _.``Members lists a child started into the group``() : Task =
         task {
@@ -561,3 +582,107 @@ type ProcessControlTests() =
                 |> ignore)
         )
         |> ignore
+
+    // --- ProcessGroup.Adopt: bring an already-running EXTERNAL process into the container (T-187) ---
+
+    [<Test>]
+    member _.``Adopt of an already-exited process is an honest typed error, never a silent success``() : Task =
+        task {
+            // The dead-pid / TOCTOU guard, cross-platform: a concluded process cannot be adopted.
+            // `ProcessGroup.Adopt`'s pre-adopt liveness check refuses it with a typed `ProcessError.Adopt`
+            // BEFORE the mechanism is even consulted — so this holds on every platform, adopting or not.
+            let psi =
+                if isWindows then
+                    ProcessStartInfo("cmd.exe", "/c exit 0")
+                else
+                    ProcessStartInfo("/bin/sh", "-c \"exit 0\"")
+
+            psi.UseShellExecute <- false
+            psi.CreateNoWindow <- true
+
+            use external =
+                match Process.Start psi with
+                | null -> failwith "failed to start the external test process"
+                | p -> p
+
+            do! external.WaitForExitAsync()
+
+            use group = create ()
+
+            match group.Adopt external with
+            | Error(ProcessError.Adopt _) -> ()
+            | other -> Assert.Fail $"expected ProcessError.Adopt for an already-exited process, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Adopt places an external process into the group and kill-on-dispose reaps it (Windows)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows Job Object adopts an external process; the POSIX refusal is covered separately"
+            else
+                let external = startExternalSleeper ()
+
+                try
+                    use group = create ()
+
+                    match group.Adopt external with
+                    | Error error -> Assert.Fail $"adopt should succeed on the Job Object mechanism, got {error}"
+                    | Ok() ->
+                        // Now a full Job member: it shows up in the membership snapshot...
+                        match group.Members() with
+                        | Ok pids -> Assert.That(pids, Does.Contain external.Id)
+                        | Error error -> Assert.Fail $"Members failed: {error}"
+
+                        // ...and disposing the group (kill-on-dispose) terminates it, even though we never
+                        // started it — the whole point of adoption.
+                        (group :> IDisposable).Dispose()
+
+                        let! _ = Task.WhenAny(external.WaitForExitAsync(), Task.Delay 5000)
+
+                        Assert.That(
+                            external.HasExited,
+                            Is.True,
+                            "kill-on-dispose should have reaped the adopted process"
+                        )
+                finally
+                    try
+                        if not external.HasExited then
+                            external.Kill true
+                    with _ ->
+                        // Best-effort test cleanup: the process was likely already killed by group dispose,
+                        // or the handle is racing teardown — nothing to recover here.
+                        ()
+
+                    external.Dispose()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Adopt on the POSIX process-group mechanism is an honest Unsupported (non-Windows)``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX process-group mechanism only; Windows adopts via the Job Object"
+            else
+                let external = startExternalSleeper ()
+
+                try
+                    // A limit-free group on POSIX uses the process-group backend, which cannot relocate a
+                    // foreign process (setpgid only moves our own children, before exec) — an honest typed
+                    // refusal, never a silent no-op that would leave the process uncontained.
+                    use group = create ()
+
+                    match group.Adopt external with
+                    | Error(ProcessError.Unsupported _) -> ()
+                    | other -> Assert.Fail $"expected Unsupported adopting into a POSIX process group, got {other}"
+                finally
+                    try
+                        if not external.HasExited then
+                            external.Kill true
+                    with _ ->
+                        // Best-effort cleanup; the sleeper exits on its own if the test outlives it.
+                        ()
+
+                    external.Dispose()
+        }
+        :> Task

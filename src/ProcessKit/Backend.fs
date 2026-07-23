@@ -86,6 +86,27 @@ type internal IContainmentBackend =
     /// process-group backends always succeed (the child is contained by spawn itself).
     abstract Track: Native.Common.Spawned -> Result<unit, ProcessError>
 
+    /// Place an already-running EXTERNAL process (started by someone else — never spawned by us) into
+    /// the container, so it thereafter obeys the same whole-tree rules as a `Track`ed child: kill-on-
+    /// dispose, `Signal`/`Suspend`/`Resume`/`Members`/`MembersInfo`/`Stats`, and any resource limits.
+    /// The argument is the target pid; the caller (`ProcessGroup.Adopt`) holds a live `Process` around
+    /// this call, whose open OS handle pins the pid on Windows so the adopt cannot race a recycle.
+    ///
+    /// Unlike `Track`, the adopted process is NOT our child, so it is deliberately NOT recorded in the
+    /// per-child reap ledger `Track` feeds (see K-016): we must never `waitpid` it (it would `ECHILD`)
+    /// nor `killpg` its process group (which we do not own — a wrong-target kill). The container
+    /// primitive alone contains and reaps it — the Windows Job's `KILL_ON_JOB_CLOSE` / a cgroup
+    /// `cgroup.kill` at teardown — and the caller keeps their own `Process` as the exit-observation
+    /// (wait) path. It joins `Members`/`Stats` for free because those read the live Job / `cgroup.procs`,
+    /// not our tracking set.
+    ///
+    /// A backend whose mechanism genuinely cannot move a foreign process into its container returns
+    /// `ProcessError.Unsupported` (the POSIX process group: `setpgid` only relocates our own children,
+    /// and only before their `exec`) — never a silent no-op. A supported backend returns a typed
+    /// `ProcessError.Adopt` on a runtime failure (a target that has already exited, missing rights, or a
+    /// process already in an incompatible Job), never a fabricated success.
+    abstract Adopt: int -> Result<unit, ProcessError>
+
     /// Stop tracking a reaped child (close its handle / drop it from the container's view).
     abstract Release: Native.Common.Spawned -> unit
 
@@ -164,6 +185,14 @@ type internal JobObjectBackend(jobHandle: nativeint) =
                 | None -> ()
 
             Ok()
+
+        member _.Adopt(pid) =
+            // Assign the external process into the Job. Once assigned it is a full Job member — killed by
+            // KILL_ON_JOB_CLOSE at teardown, enumerated by `membersWindows`, swept by suspend/resume,
+            // bound by the Job's limits — with NO per-child tracking here: it is not our child, so it has
+            // no reap ledger entry and no `ctrlGroups` mapping (a foreign process was not started with
+            // `Command.WindowsCtrlSignals()`, so it is not CTRL+BREAK-targetable through us).
+            Native.Windows.adoptIntoJob jobHandle pid
 
         member _.Release(spawned) =
             // Remove the handle before closing so the teardown drain can't double-close a reused
@@ -408,6 +437,19 @@ type internal CgroupBackend(cgroupPath: string) =
                         $"the child could not be migrated into the cgroup (write to cgroup.procs failed): {detail}"
                 )
 
+        member _.Adopt(pid) =
+            // Write the foreign pid into cgroup.procs. It then joins the cgroup for every whole-tree op —
+            // cgroup.kill at teardown, cgroup.freeze, the per-member signal sweep, the resource limits —
+            // and shows up in `Members`/`Stats` automatically because those read cgroup.procs (the kernel's
+            // own membership view), not our `children` set. Crucially it is NOT added to `children`: that
+            // ledger exists so teardown can `waitpid`/`killpg` OUR OWN spawned leaders, and an adopted
+            // process is neither our child (a `waitpid` would `ECHILD`) nor the leader of a pgid we own (a
+            // `killpg` would be a wrong-target kill) — see K-016. cgroup.kill alone SIGKILLs it at teardown;
+            // its real parent/init reaps it.
+            match Native.Cgroup.adoptIntoCgroup cgroupPath pid with
+            | Ok() -> Ok()
+            | Error detail -> Error(ProcessError.Adopt(pid, detail))
+
         member _.Release(spawned) =
             // A run verb has reaped this child; stop tracking so teardown does not waitpid it again.
             // (The kernel already removed it from cgroup.procs.)
@@ -575,6 +617,19 @@ type internal ProcessGroupBackend() =
             children.Add pgid
             identities[pgid] <- Native.Posix.readProcessIdentity pgid
             Ok()
+
+        member _.Adopt(_pid) =
+            // The POSIX process-group mechanism CANNOT move a foreign process into our group: `setpgid`
+            // only changes the process group of one of OUR OWN children, and only before it `exec`s. There
+            // is no kernel primitive to relocate an unrelated, already-`exec`ed process into another
+            // process group. Refuse honestly and typed — never a silent no-op that would pretend the
+            // process is contained when the kill-on-dispose guarantee could not actually reach it. (On
+            // Linux, adoption needs a cgroup v2-backed group — one created WITH resource limits; a plain,
+            // limit-free group falls back to this mechanism and cannot adopt.)
+            Error(
+                ProcessError.Unsupported
+                    "adopting an external process into a POSIX process group is not possible (setpgid only relocates our own children, and only before exec); adoption needs a Windows Job Object or a Linux cgroup v2 group (created with resource limits)"
+            )
 
         member _.Release(spawned) =
             // A pgid is a whole group; the reaped leader may have left backgrounded members behind, so

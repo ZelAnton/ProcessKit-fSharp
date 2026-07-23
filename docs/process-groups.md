@@ -242,6 +242,63 @@ the runner to `Exec.outputAll` / `Exec.outputAllBytes`, or to
 `Supervisor.WithRunner` so every restarted incarnation stays in the same group
 (see [supervision.md](supervision.md)).
 
+### Adopting an already-running external process
+
+Sometimes the process you need to contain was **not** started through ProcessKit —
+another library launched it, you inherited it from a different layer, or you only
+have its pid. `Adopt(process)` brings such a process into the group so it obeys the
+same whole-tree rules as one started with `StartAsync`: kill-on-dispose, and
+participation in `Signal` / `Suspend` / `Resume` / `Members` / `MembersInfo` /
+`Stats` and any resource limits. It restores the "kill the whole tree" guarantee for
+a wrapper whose child runs outside ProcessKit.
+
+**F#**
+
+```fsharp
+// `external` is a live System.Diagnostics.Process started by someone else.
+use group = (ProcessGroup.Create() |> function Ok g -> g | Error e -> failwith e.Message)
+
+match group.Adopt external with
+| Ok() -> ()                       // now a Job/cgroup member: disposing `group` kills it too
+| Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+using var group = ProcessGroup.Create().GetValueOrThrow();
+
+if (group.Adopt(external) is { IsOk: false, ErrorValue: var err })
+    Console.Error.WriteLine(err.Message);
+```
+
+A few deliberate contract points:
+
+- **The argument is a `System.Diagnostics.Process`, not a bare pid.** A raw pid can be
+  recycled onto an unrelated process between when you read it and when the adopt lands;
+  a live `Process` holds an open OS handle that on **Windows** pins the pid, so the adopt
+  cannot race a recycle. On **Linux** there is no handle that pins a pid, so the residual
+  (tiny) recycle window between the liveness check and the `cgroup.procs` write cannot be
+  fully closed by number alone — an honest limitation, documented rather than hidden.
+- **The group keeps only containment; you keep the wait.** Adoption returns
+  `Result<unit, _>` — not a `RunningProcess` — because the external process's stdio is not
+  ours to stream. The adopted process is **not** ProcessKit's child, so ProcessKit never
+  `waitpid`s it or signals its process group; it is contained and killed purely by the OS
+  primitive (the Job's `KILL_ON_JOB_CLOSE` / a cgroup `cgroup.kill`), and its real parent
+  (or `init`, once reparented) reaps it. **Observe its exit through your own `Process`**
+  (`Process.WaitForExitAsync()` / `HasExited`).
+- **Honest, typed failures — never a silent success.** Adopting a process that has already
+  exited (or whose pid no longer exists — a lost race), one you lack the rights to, or one
+  already assigned to an incompatible Windows Job returns `ProcessError.Adopt`. On a
+  mechanism that fundamentally cannot adopt — the POSIX process group — you get
+  `ProcessError.Unsupported` (see the platform note next).
+- **Platform availability.** Windows (Job Object) adopts with or without limits; **Linux**
+  can adopt only into a group created **with resource limits** (that is what selects the
+  cgroup v2 mechanism). A plain, limit-free group on Linux, and every group on macOS/BSD,
+  uses the POSIX process-group mechanism, which cannot relocate a foreign process and
+  refuses with `ProcessError.Unsupported`. See
+  [platform-support.md](platform-support.md#capability-matrices).
+
 ## Tearing down: dispose, terminate, shutdown
 
 There are three ways out, from blunt to graceful:

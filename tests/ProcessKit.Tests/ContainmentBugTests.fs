@@ -1,6 +1,7 @@
 namespace ProcessKit.Tests
 
 open System
+open System.Diagnostics
 open System.IO
 open System.Runtime.InteropServices
 open System.Threading
@@ -28,6 +29,7 @@ type internal SyntheticBackend() =
     let mutable killTreeCount = 0
     let mutable gracefulKillTreeCount = 0
     let mutable updateLimitsCount = 0
+    let mutable adoptCount = 0
 
     let note (message: string) =
         lock gate (fun () -> violations.Add message)
@@ -74,6 +76,9 @@ type internal SyntheticBackend() =
     /// How many times a live limit re-apply actually reached the backend (a gated update that is
     /// refused on a released group before touching native never increments this).
     member _.UpdateLimitsCount = lock gate (fun () -> updateLimitsCount)
+    /// How many times an adopt actually reached the backend (a gated adopt refused on a released group
+    /// before touching native never increments this).
+    member _.AdoptCount = lock gate (fun () -> adoptCount)
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.ProcessGroup
@@ -94,6 +99,14 @@ type internal SyntheticBackend() =
         member _.Track(spawned) =
             requireLive "Track"
             lock gate (fun () -> tracked.Add spawned.Handle |> ignore)
+            Ok()
+
+        member _.Adopt(_pid) =
+            // An adopt must never reach the backend after teardown; count the ones that do so a live adopt
+            // is still observable and a post-release one is a flagged violation. Adopted processes are not
+            // our children, so — like the real backends — nothing is added to `tracked`/`reaped`.
+            requireLive "Adopt"
+            lock gate (fun () -> adoptCount <- adoptCount + 1)
             Ok()
 
         member _.Release(spawned) =
@@ -422,6 +435,52 @@ type ContainmentBugTests() =
         | Error err -> Assert.Fail $"a live update on the synthetic backend should succeed, got {err}"
 
         Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+
+    [<Test>]
+    member _.``Adopt after the group is released is non-transient and never touches the backend``() =
+        // Adopting into a released group must be refused the same way every other control verb is: the
+        // lifecycle gate returns a non-transient error BEFORE the backend is reached, so no
+        // AssignProcessToJobObject / cgroup.procs write can ever land on a closed/removed native container.
+        // Uses the current process as a convenient live external process — the guard bails before any
+        // native adopt is even attempted, so nothing actually happens to it.
+        let backend = SyntheticBackend()
+        let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+        (group :> IDisposable).Dispose()
+
+        use self = Process.GetCurrentProcess()
+
+        match group.Adopt self with
+        | Error err -> Assert.That(ProcessError.isTransient err, Is.False)
+        | Ok() -> Assert.Fail "Adopt into a released group must fail, not silently succeed"
+
+        Assert.That(backend.AdoptCount, Is.EqualTo 0, "an adopt reached the backend after release")
+        Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+
+    [<Test>]
+    member _.``Adopt of a live process on a live group reaches the backend exactly once``() =
+        // The happy path through the lifecycle gate: a live external process (the test process itself)
+        // reaches the live backend's adopt exactly once. The synthetic backend records nothing beyond the
+        // count — an adopted process is not our child, so it is deliberately not tracked/reaped.
+        let backend = SyntheticBackend()
+        let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+        use self = Process.GetCurrentProcess()
+
+        match group.Adopt self with
+        | Ok() -> Assert.That(backend.AdoptCount, Is.EqualTo 1)
+        | Error err -> Assert.Fail $"a live adopt on the synthetic backend should succeed, got {err}"
+
+        Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+
+    [<Test>]
+    member _.``Adopt of a null process throws ArgumentNullException eagerly``() =
+        // A null argument is a programming error, surfaced eagerly as an exception (like the other eager
+        // argument guards on the type), not folded into the Result channel.
+        let backend = SyntheticBackend()
+        use group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+        Assert.Throws<ArgumentNullException>(Action(fun () -> group.Adopt(Unchecked.defaultof<Process>) |> ignore))
+        |> ignore
 
     [<Test>]
     member _.``concurrent Dispose, DisposeAsync, and ShutdownAsync tear down exactly once``() : Task =

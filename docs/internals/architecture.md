@@ -117,6 +117,7 @@ type internal IContainmentBackend =
     abstract Mechanism: Mechanism
     abstract Spawn: Command -> Result<Native.Common.Spawned, ProcessError>
     abstract Track: Native.Common.Spawned -> Result<unit, ProcessError>
+    abstract Adopt: int -> Result<unit, ProcessError>
     abstract Release: Native.Common.Spawned -> unit
     abstract Wait: nativeint -> Task<Outcome>
     abstract PidOf: Native.Common.Spawned -> int option
@@ -132,11 +133,12 @@ type internal IContainmentBackend =
     abstract HardRelease: unit -> unit
 ```
 
-The current interface has 16 abstract members:
+The current interface has 17 abstract members:
 
 - `Mechanism` identifies the primitive honestly.
 - `Spawn` starts a child, initially not in the backend's tracking collection.
 - `Track` completes containment/tracking; on error it is responsible for killing and reaping the child.
+- `Adopt` places an already-running **external** process (started outside ProcessKit) into the container by pid, so it obeys the same whole-tree rules as a `Track`ed child. Because it is *not* our child it is deliberately kept out of the reap ledger `Track` feeds (never `waitpid`ed, never `killpg`ed — see K-016); the container primitive alone contains and kills it (Windows `AssignProcessToJobObject` → `KILL_ON_JOB_CLOSE`; cgroup v2 write to `cgroup.procs` → `cgroup.kill`), and it joins `Members`/`Stats` for free because those read the live Job / `cgroup.procs`. The POSIX process-group backend cannot relocate a foreign process (`setpgid` only moves our own children before `exec`) and returns `ProcessError.Unsupported`; a supported backend returns a typed `ProcessError.Adopt` on a runtime failure (dead/gone pid, missing rights, or a process already in an incompatible Job).
 - `Release` stops tracking a child already reaped by a normal run.
 - `Wait` waits for and decodes one child outcome.
 - `PidOf` retrieves a known PID.
@@ -253,6 +255,7 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 |---|---|---|---|
 | Selection | Windows, with or without limits | macOS/BSD; Linux without requested limits | Linux when limits are requested |
 | Containment timing | Child suspended, assigned to Job, then resumed | Group created atomically by `posix_spawn` attributes | POSIX group at spawn; `/bin/sh` launcher joins the cgroup before `exec`ing the target (already contained on its first instruction) |
+| Adopt external process (`Adopt`) | `AssignProcessToJobObject` (opens a least-privilege handle, assigns, closes it — Job membership persists) | `ProcessError.Unsupported` — `setpgid` cannot relocate a foreign, already-`exec`ed process | Write the pid to `cgroup.procs` (limited groups only; the plain POSIX fallback is the middle column) |
 | Whole-tree hard kill | Terminate Job or close kill-on-close Job handle | `killpg(SIGKILL)` for each tracked pgid | `cgroup.kill`; freeze-and-SIGKILL sweep fallback |
 | Graceful tree stop | Best-effort `WM_CLOSE` to members' windows, poll to grace, then hard Job kill | `SIGTERM`, poll, then `SIGKILL` | signal members with `SIGTERM`, poll, then cgroup hard kill |
 | General signals | Kill; Int/Term as best-effort CTRL+BREAK (`WindowsCtrlSignals()` child) and/or `WM_CLOSE` (windowed member) | `killpg` with mapped/raw signal | per-current-member signal sweep; Kill is atomic cgroup kill |
