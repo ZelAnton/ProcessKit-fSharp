@@ -167,6 +167,17 @@ type internal CommandConfig =
       // than combining with it; the kill-on-drop `killpg(pid)` teardown still reaches the whole session,
       // so containment is preserved (see `Native.Posix`).
       Setsid: bool
+      // Opt-in reaping of the child if the PARENT process dies SUDDENLY (SIGKILL / crash /
+      // `TerminateProcess`) — a case the deterministic `Dispose`/`DisposeAsync` kill-on-drop cannot
+      // cover because no managed teardown runs. `false` (the default) leaves the behaviour unchanged.
+      // Linux: armed as `PR_SET_PDEATHSIG(SIGKILL)` through the `setpriv --pdeathsig` helper on the
+      // ordinary `posix_spawn` path (see `Native.Posix`) — reaches the direct child only, and is reset
+      // by the kernel across an `execve` of a set-uid/set-gid image. Windows: no extra action — every
+      // child already lives in a Job Object with `KILL_ON_JOB_CLOSE`, whose sole handle the parent owns,
+      // so the kernel's handle rundown on parent death terminates the whole Job tree. macOS/BSD: a set
+      // value fails the spawn with `ProcessError.Unsupported` (no `pdeathsig` analog), never a silent
+      // no-op. The platform-fixed *scope* of this cleanup is reported by `Command.KillOnParentDeathScope`.
+      KillOnParentDeath: bool
       // Opt-in pseudo-terminal (PTY) mode: run the child under a real controlling terminal on a single
       // merged stdout+stderr stream, instead of the default parent/child pipes. `None` (the default) is
       // the plain pipe run, byte-identical to before PTY existed. A PTY implies OS-level merge semantics
@@ -226,6 +237,7 @@ module internal CommandConfig =
           Gid = None
           Groups = None
           Setsid = false
+          KillOnParentDeath = false
           Pty = None
           Logger = None
           RunId = None }
@@ -1077,6 +1089,40 @@ type Command internal (config: CommandConfig) =
         CommandConfig.ensureNoPtyForSetsid config
         Command({ config with Setsid = true })
 
+    /// Opt in to reaping this child when the **parent process dies suddenly** — a SIGKILL, a crash, or a
+    /// Windows `TerminateProcess` — the one case the deterministic kill-on-drop tree guarantee cannot
+    /// cover, because it relies on a `Dispose`/`DisposeAsync` (or the finalizer) that a hard-killed parent
+    /// never runs. Off by default; setting it changes nothing unless the parent actually dies unexpectedly.
+    ///
+    /// **What the platform actually guarantees differs — query it with `KillOnParentDeathScope`.**
+    ///
+    /// - **Windows — the whole tree, already, with no extra action.** Every child ProcessKit starts lives
+    ///   in a Job Object created with `KILL_ON_JOB_CLOSE`, and the parent process owns the only handle to
+    ///   that Job. When the parent dies for *any* reason the kernel closes its handles during process
+    ///   rundown; closing the last Job handle terminates every process in the Job. So the guarantee holds
+    ///   tree-wide and unconditionally — this method is a documented no-op on Windows, not a silent one.
+    /// - **Linux — the direct child only.** The child is armed with `PR_SET_PDEATHSIG(SIGKILL)` via the
+    ///   `setpriv --pdeathsig` helper (util-linux) on the ordinary `posix_spawn` path, so it is killed when
+    ///   its parent dies. **Known limits (not silent):** the parent-death signal is **not inherited** across
+    ///   a `fork`, so a **grandchild** the child spawns is *not* covered — with the child's parent gone
+    ///   nothing reaps its cgroup/pgroup. The kernel also **resets** `PR_SET_PDEATHSIG` when the child
+    ///   `execve`s a **set-uid/set-gid** image, so for a `sudo`-like child the signal only holds up to that
+    ///   `exec`. And because the signal is delivered when the **spawning thread** (not merely the process)
+    ///   exits, and ProcessKit spawns on a thread-pool thread that .NET may retire while the process lives,
+    ///   the reap is best-effort: it can fire early if that thread is reclaimed. Where `setpriv` is absent
+    ///   (a minimal image) the spawn fails with a typed `ProcessError.Spawn` naming the helper, never a
+    ///   silently un-armed child.
+    /// - **macOS/BSD — unsupported.** There is no `PR_SET_PDEATHSIG` analog, so a set value fails the spawn
+    ///   with `ProcessError.Unsupported` rather than pretending the cleanup will happen.
+    member _.KillOnParentDeath() =
+        Command({ config with KillOnParentDeath = true })
+
+    /// The **scope** of `KillOnParentDeath` cleanup the current platform actually guarantees —
+    /// `WholeTree` (Windows Job Object), `DirectChildOnly` (Linux `PR_SET_PDEATHSIG`), or `Nothing`
+    /// (macOS/BSD). Fixed per platform and **independent of whether `KillOnParentDeath()` was called**:
+    /// this reports what the OS *can* do, the same honest-report principle as `ProcessGroup.Mechanism`.
+    member _.KillOnParentDeathScope() : KillOnParentDeathScope = KillOnParentDeathScope.Current
+
     /// Run the child under an opt-in **pseudo-terminal (PTY)** with `pty`'s initial geometry and flags:
     /// the child gets a real controlling terminal (`isatty` true) on a **single merged stdout+stderr
     /// stream**, for tools that demand a tty — an interactive `ssh`/`sudo` password prompt, a credential
@@ -1295,6 +1341,17 @@ module Command =
     /// Detach the child into a new session (`setsid()`). Unix-only: a set request fails a Windows spawn
     /// with `ProcessError.Unsupported`. Containment is preserved. See `Command.Setsid`.
     let setsid (command: Command) = command.Setsid()
+
+    /// Opt in to reaping this child when the parent process dies suddenly (SIGKILL/crash/`TerminateProcess`).
+    /// Windows reaps the whole Job tree with no extra action; Linux the direct child only via
+    /// `PR_SET_PDEATHSIG` (`setpriv --pdeathsig`); macOS/BSD fail the spawn with `ProcessError.Unsupported`.
+    /// Query the platform-fixed scope with `Command.KillOnParentDeathScope`. See `Command.KillOnParentDeath`.
+    let killOnParentDeath (command: Command) = command.KillOnParentDeath()
+
+    /// The platform-fixed scope of `KillOnParentDeath` cleanup — `WholeTree` (Windows), `DirectChildOnly`
+    /// (Linux), or `Nothing` (macOS/BSD) — independent of whether the verb was set. See
+    /// `Command.KillOnParentDeathScope`.
+    let killOnParentDeathScope (command: Command) = command.KillOnParentDeathScope()
 
     /// Run the child under a pseudo-terminal (PTY) with the default 80×24 geometry (echo on) — a single
     /// merged stdout+stderr terminal stream, for tools that demand a tty. Windows: ConPTY (Win10 1809+);

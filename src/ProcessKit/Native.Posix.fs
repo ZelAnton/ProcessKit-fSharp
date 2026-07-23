@@ -1630,7 +1630,8 @@ module internal Posix =
                     completePending pid (decodeWaitStatus status)
 
     // ----------------------------------------------------------------------------------
-    // POSIX privilege drop / session detach (Command.Uid / Gid / Setsid)
+    // POSIX privilege drop / session detach / parent-death signal
+    // (Command.Uid / Gid / Setsid / KillOnParentDeath)
     // ----------------------------------------------------------------------------------
     //
     // `Setsid` is a native `posix_spawn` attribute (`POSIX_SPAWN_SETSID`, applied by `spawnPosixViaSpawn`
@@ -1661,6 +1662,17 @@ module internal Posix =
     // `setpriv` exiting non-zero (carrying its own stderr); the common "not privileged" case is caught
     // up-front as `ProcessError.Spawn` by `privilegeDropPrecheck` (a non-root caller cannot change to a
     // different uid/gid).
+    //
+    // `Command.KillOnParentDeath` (Linux) rides the SAME helper for the SAME reason: `PR_SET_PDEATHSIG`
+    // must be armed by a process that then `exec`s the target in place (not by managed .NET code in an
+    // unsafe forked child), and `setpriv --pdeathsig=SIGKILL` does exactly that — it sets the signal and
+    // survives its own `execve` of a non-set-uid/set-gid target. It composes with (or, requested alone,
+    // stands in for) the uid/gid drop through `needsSetpriv`/`setprivFlags`; because every POSIX helper
+    // chain here `exec`s in place with NO intervening `fork` (setpriv, setsid --ctty, and the /bin/sh
+    // cgroup launcher all keep the same pid), the target stays the parent's DIRECT child, which is what
+    // `PR_SET_PDEATHSIG` tracks — hence `KillOnParentDeathScope.DirectChildOnly` (grandchildren, forked
+    // AFTER the signal is set, do not inherit it). macOS/BSD have no analog, so `spawnPosix` refuses the
+    // request there with `ProcessError.Unsupported` before any helper rewrite (`KillOnParentDeathScope.Nothing`).
 
     // `POSIX_SPAWN_SETSID` differs per libc: 0x0400 on macOS, 0x80 on Linux glibc/musl. Not a `[<Literal>]`
     // because it is resolved from `isMacOs` at load. Used by `spawnPosixViaSpawn`'s flag block above.
@@ -1710,31 +1722,59 @@ module internal Posix =
             else
                 None
 
-    // The `setpriv` flags for the requested drop: set the gid and the uid (setpriv sequences them
-    // correctly), and handle the child's supplementary groups. By default (or an explicit empty
+    // The `setpriv` flags for the requested drop AND/OR the parent-death signal. The drop flags — set the
+    // gid and the uid (setpriv sequences them correctly) and handle the child's supplementary groups — are
+    // emitted ONLY when a uid/gid drop is actually requested. By default (or an explicit empty
     // `Command.Groups []`) the parent's set is cleared with `--clear-groups` so the child never keeps
     // root's; a non-empty `Command.Groups gids` instead sets EXACTLY those groups with `--groups`
     // (a comma-separated numeric list — `setpriv` applies them verbatim, no `/etc/group` lookup). The
     // group flag is mutually exclusive on the wire, so at most one of `--clear-groups`/`--groups` is
     // emitted. `Command.Groups` only reaches here alongside a uid/gid drop (`spawnPosix`'s up-front
     // `groupsRequireDropError` guard refuses it without one), so it always composes with a real drop.
+    //
+    // `Command.KillOnParentDeath` (Linux only) appends `--pdeathsig=SIGKILL`, which arms
+    // `PR_SET_PDEATHSIG(SIGKILL)` in the `setpriv` process. setpriv applies it AFTER any credential
+    // change and it SURVIVES setpriv's `execve` of a non-set-uid/set-gid target — so it composes with a
+    // drop and, when requested alone, `setpriv` is used purely to arm it (no `--clear-groups`, which would
+    // need privilege and silently change the child's groups). The kernel resets it on an `execve` of a
+    // set-uid/set-gid image, and it reaches only the direct child (not grandchildren) — see
+    // `KillOnParentDeathScope`/`Command.KillOnParentDeath` for the documented limits.
     let private setprivFlags (config: CommandConfig) : string list =
-        let regid =
-            match config.Gid with
-            | Some g -> [ $"--regid={g}" ]
-            | None -> []
+        let dropFlags =
+            if config.Uid.IsSome || config.Gid.IsSome then
+                let regid =
+                    match config.Gid with
+                    | Some g -> [ $"--regid={g}" ]
+                    | None -> []
 
-        let reuid =
-            match config.Uid with
-            | Some u -> [ $"--reuid={u}" ]
-            | None -> []
+                let reuid =
+                    match config.Uid with
+                    | Some u -> [ $"--reuid={u}" ]
+                    | None -> []
 
-        let groups =
-            match config.Groups with
-            | Some(_ :: _ as gids) -> [ "--groups=" + String.concat "," (gids |> List.map string) ]
-            | _ -> [ "--clear-groups" ]
+                let groups =
+                    match config.Groups with
+                    | Some(_ :: _ as gids) -> [ "--groups=" + String.concat "," (gids |> List.map string) ]
+                    | _ -> [ "--clear-groups" ]
 
-        regid @ reuid @ groups
+                regid @ reuid @ groups
+            else
+                []
+
+        let pdeathsig =
+            if config.KillOnParentDeath then
+                [ "--pdeathsig=SIGKILL" ]
+            else
+                []
+
+        dropFlags @ pdeathsig
+
+    // A command routes through the `setpriv` helper when it requests a uid/gid privilege drop OR (Linux
+    // only) `Command.KillOnParentDeath` — the latter uses `setpriv --pdeathsig` to arm the parent-death
+    // signal. Consulted only on the POSIX spawn path; `spawnPosix` refuses `KillOnParentDeath` off Linux
+    // up front, and the cgroup path is Linux-only, so a `true` here from `KillOnParentDeath` implies Linux.
+    let private needsSetpriv (config: CommandConfig) : bool =
+        config.Uid.IsSome || config.Gid.IsSome || config.KillOnParentDeath
 
     /// A `Command.Groups` (supplementary groups) request is applied only along the `setpriv`
     /// privilege-drop path, which is entered exclusively by a `Uid`/`Gid` drop. Set WITHOUT either it
@@ -1755,10 +1795,10 @@ module internal Posix =
             None
 
     /// Rewrite `command` to run through the `setpriv` helper: `setpriv <flags> <program> <args...>`. The
-    /// uid/gid/groups are cleared on the rewritten command (so the `spawnPosix` dispatcher does not
-    /// recurse), and every other knob — stdio, env, CurrentDir, Priority, Umask, Setsid — is preserved and
-    /// applied by `posix_spawn` to the `setpriv` process, which inherits them across its `exec` of the
-    /// real program.
+    /// flags carry the uid/gid/groups drop and/or `--pdeathsig=SIGKILL` (`Command.KillOnParentDeath`); those
+    /// knobs are cleared on the rewritten command (so the `spawnPosix` dispatcher does not recurse), and
+    /// every other knob — stdio, env, CurrentDir, Priority, Umask, Setsid — is preserved and applied by
+    /// `posix_spawn` to the `setpriv` process, which inherits them across its `exec` of the real program.
     let private setprivCommand (command: Command) : Command =
         let config = command.Config
         let prefix = setprivFlags config @ [ config.Program ]
@@ -1769,7 +1809,10 @@ module internal Posix =
                 Args = config.Args.InsertRange(0, prefix)
                 Uid = None
                 Gid = None
-                Groups = None }
+                Groups = None
+                // Cleared with the drop knobs: the `--pdeathsig=SIGKILL` is already baked into `prefix`, so
+                // the rewritten command must not re-trigger `needsSetpriv` and wrap a second `setpriv` layer.
+                KillOnParentDeath = false }
         )
 
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
@@ -2504,7 +2547,7 @@ module internal Posix =
         let config = command.Config
 
         let target =
-            if config.Uid.IsSome || config.Gid.IsSome then
+            if needsSetpriv config then
                 "setpriv" :: (setprivFlags config @ (config.Program :: List.ofSeq config.Args))
             else
                 config.Program :: List.ofSeq config.Args
@@ -2515,7 +2558,11 @@ module internal Posix =
                 Args = System.Collections.Immutable.ImmutableList.CreateRange("--ctty" :: target)
                 Uid = None
                 Gid = None
-                Groups = None }
+                Groups = None
+                // Baked into `target` when set (nested inside `setsid --ctty`, after the in-place `setsid()`
+                // and before the final program `exec` — no `fork` clears the parent-death signal); cleared
+                // here so the rewritten `setsid` command does not re-trigger `needsSetpriv`.
+                KillOnParentDeath = false }
         )
 
     /// Spawn `command` (which requests `Command.Pty`) as a contained POSIX child with a real controlling
@@ -2567,43 +2614,77 @@ module internal Posix =
             )
         | None -> command
 
-    /// Spawn `command` as a contained POSIX child. A command requesting a privilege drop (`Uid`/`Gid`) is
-    /// rewritten to run through the `setpriv` helper and spawned on the ordinary `posix_spawn` path — the
-    /// drop runs in `setpriv` before it `exec`s the real program, so no managed code runs in a forked
-    /// child (see the section comment above). Everything else — including a lone `Setsid` — spawns
-    /// directly. A refused drop by a non-root caller is rejected up front; a missing `setpriv` helper
-    /// becomes a typed `ProcessError.Spawn`, never a silently un-dropped child.
+    /// Rewrite a `setpriv`-helper `NotFound` (the helper is off PATH) into a typed `ProcessError.Spawn`
+    /// against the ORIGINAL program, so a caller who never mentioned `setpriv` gets a message naming what
+    /// their request actually needs. The reason is tailored to whichever knob(s) routed through `setpriv` —
+    /// a `Uid`/`Gid` drop, `Command.KillOnParentDeath`, or both.
+    let private remapSetprivNotFound (command: Command) (result: Result<Spawned, ProcessError>) =
+        match result with
+        | Error(ProcessError.NotFound _) ->
+            let config = command.Config
+
+            let reason =
+                match (config.Uid.IsSome || config.Gid.IsSome), config.KillOnParentDeath with
+                | true, true -> "a Uid/Gid privilege drop and KillOnParentDeath both need"
+                | true, false -> "a Uid/Gid privilege drop needs"
+                | false, true -> "KillOnParentDeath needs"
+                // Unreachable: `remapSetprivNotFound` only wraps a spawn that routed through `setpriv`.
+                | false, false -> "this command needs"
+
+            Error(
+                ProcessError.Spawn(
+                    command.Program,
+                    $"{reason} the 'setpriv' helper (util-linux) on PATH; it was not found (available on mainstream Linux; absent on macOS/BSD)"
+                )
+            )
+        | other -> other
+
+    /// Spawn `command` as a contained POSIX child. A command requesting a privilege drop (`Uid`/`Gid`) or
+    /// `Command.KillOnParentDeath` (Linux) is rewritten to run through the `setpriv` helper and spawned on
+    /// the ordinary `posix_spawn` path — the drop / `--pdeathsig` arming runs in `setpriv` before it
+    /// `exec`s the real program, so no managed code runs in a forked child (see the section comment above).
+    /// Everything else — including a lone `Setsid` — spawns directly. `KillOnParentDeath` off Linux
+    /// (macOS/BSD have no `PR_SET_PDEATHSIG`) is a typed `ProcessError.Unsupported`; a refused drop by a
+    /// non-root caller is rejected up front; a missing `setpriv` helper becomes a typed `ProcessError.Spawn`,
+    /// never a silently un-dropped / un-armed child.
     let spawnPosix (command: Command) : Result<Spawned, ProcessError> =
         // Resolve any prefer-local program to its absolute path first, so every downstream helper rewrite
         // (setpriv / setsid --ctty) carries the substituted path (T-182).
         let command = applyPreferLocal command
         let config = command.Config
 
-        if config.Pty.IsSome then
+        if
+            config.KillOnParentDeath
+            && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux)
+        then
+            // macOS/BSD have no `PR_SET_PDEATHSIG` analog to reap a child on sudden parent death. Refuse the
+            // request honestly rather than silently ignoring it (matching `KillOnParentDeathScope.Nothing`).
+            Error(
+                ProcessError.Unsupported
+                    "KillOnParentDeath needs Linux's PR_SET_PDEATHSIG (armed via setpriv); macOS/BSD have no parent-death-signal analog"
+            )
+        elif config.Pty.IsSome then
             // A PTY gives the child a real controlling pseudo-terminal via the `setsid --ctty` helper (see
-            // `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe (D9).
+            // `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe (D9). A
+            // `KillOnParentDeath` request is armed inside the ctty shim (`cttyShimCommand`, via `setpriv`).
             spawnPosixPty command
         else
 
             match groupsRequireDropError command with
             | Some error -> Error error
             | None ->
-                if config.Uid.IsSome || config.Gid.IsSome then
-                    match privilegeDropPrecheck command with
+                if needsSetpriv config then
+                    // A uid/gid drop needs the non-root precheck; a lone `KillOnParentDeath` (no credential
+                    // change) does not, so the precheck runs only when a drop is actually requested.
+                    let precheck =
+                        if config.Uid.IsSome || config.Gid.IsSome then
+                            privilegeDropPrecheck command
+                        else
+                            None
+
+                    match precheck with
                     | Some error -> Error error
-                    | None ->
-                        match spawnPosixViaSpawn (setprivCommand command) with
-                        | Error(ProcessError.NotFound _) ->
-                            // `posix_spawn` could not find `setpriv` on PATH — report it against the ORIGINAL
-                            // program (not the helper), so a caller who never mentioned `setpriv` gets a
-                            // message that explains what a `Uid`/`Gid` drop needs on this host.
-                            Error(
-                                ProcessError.Spawn(
-                                    command.Program,
-                                    "a Uid/Gid privilege drop needs the 'setpriv' helper (util-linux) on PATH; it was not found (available on mainstream Linux; absent on macOS/BSD)"
-                                )
-                            )
-                        | other -> other
+                    | None -> spawnPosixViaSpawn (setprivCommand command) |> remapSetprivNotFound command
                 else
                     spawnPosixViaSpawn command
 
@@ -2659,10 +2740,11 @@ module internal Posix =
 
         let launch () =
             // The argv the launcher `exec`s after migrating: the real program (and its args), or — when a
-            // uid/gid drop is requested — the `setpriv` helper wrapping it, so the drop happens AFTER the
-            // privileged cgroup join. Mirrors `setprivCommand`'s `setpriv <flags> <program> <args...>`.
+            // uid/gid drop and/or `Command.KillOnParentDeath` is requested — the `setpriv` helper wrapping
+            // it, so the drop (and the in-place `--pdeathsig` arming) happens AFTER the privileged cgroup
+            // join. Mirrors `setprivCommand`'s `setpriv <flags> <program> <args...>`.
             let dropOrPlain =
-                if config.Uid.IsSome || config.Gid.IsSome then
+                if needsSetpriv config then
                     "setpriv" :: (setprivFlags config @ (config.Program :: List.ofSeq config.Args))
                 else
                     config.Program :: List.ofSeq config.Args
@@ -2690,7 +2772,10 @@ module internal Posix =
                     Args = System.Collections.Immutable.ImmutableList.CreateRange launcherArgs
                     Uid = None
                     Gid = None
-                    Groups = None }
+                    Groups = None
+                    // `--pdeathsig=SIGKILL` (when requested) is nested in `innerArgv` via `setpriv` above;
+                    // cleared here so `spawnPosixViaSpawn` does not wrap the `/bin/sh` launcher in another one.
+                    KillOnParentDeath = false }
 
             match spawnPosixViaSpawn (Command launcherConfig) with
             | Error(ProcessError.NotFound _) ->

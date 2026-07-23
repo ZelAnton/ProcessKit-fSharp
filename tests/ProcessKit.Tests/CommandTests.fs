@@ -1,6 +1,7 @@
 namespace ProcessKit.Tests
 
 open System
+open System.Runtime.InteropServices
 open NUnit.Framework
 open ProcessKit
 
@@ -395,6 +396,54 @@ type CommandTests() =
         Assert.That(dropped.Config.Uid, Is.EqualTo(Some 1000))
         Assert.That(dropped.Config.Gid, Is.EqualTo(Some 1000))
         Assert.That(dropped.Config.Groups, Is.EqualTo(Some [ 27; 44 ]))
+
+    // ---- KillOnParentDeath (reap on sudden parent death) + platform scope report ---------------
+
+    [<Test>]
+    member _.``KillOnParentDeath is unset by default``() =
+        Assert.That(Command.create("git").Config.KillOnParentDeath, Is.False)
+
+    [<Test>]
+    member _.``KillOnParentDeath records the flag and the instance method matches the module function``() =
+        let viaModule = Command.create "git" |> Command.killOnParentDeath
+        let viaInstance = Command("git").KillOnParentDeath()
+        Assert.That(viaModule.Config.KillOnParentDeath, Is.True)
+        Assert.That(viaInstance.Config.KillOnParentDeath, Is.True)
+
+    [<Test>]
+    member _.``KillOnParentDeath is immutable - setting it returns a new command``() =
+        let baseCommand = Command.create "git"
+        let armed = baseCommand |> Command.killOnParentDeath
+        Assert.That(baseCommand.Config.KillOnParentDeath, Is.False)
+        Assert.That(armed.Config.KillOnParentDeath, Is.True)
+
+    [<Test>]
+    member _.``KillOnParentDeathScope reports the platform-fixed cleanup scope``() =
+        // Honest report, like ProcessGroup.Mechanism: whole tree (Windows Job Object), the direct child
+        // only (Linux PR_SET_PDEATHSIG), or nothing (macOS/BSD — no pdeathsig analog).
+        let expected =
+            if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                KillOnParentDeathScope.WholeTree
+            elif RuntimeInformation.IsOSPlatform OSPlatform.Linux then
+                KillOnParentDeathScope.DirectChildOnly
+            else
+                KillOnParentDeathScope.Nothing
+
+        let viaInstance = Command.create("git").KillOnParentDeathScope()
+        let viaModule = Command.create "git" |> Command.killOnParentDeathScope
+        Assert.That(viaInstance, Is.EqualTo expected)
+        Assert.That(viaModule, Is.EqualTo expected)
+
+    [<Test>]
+    member _.``KillOnParentDeathScope is independent of whether KillOnParentDeath was called``() =
+        // The scope describes what the OS can do, not what this command asked for, so arming (or not
+        // arming) the verb must not change it.
+        let unset = Command.create("git").KillOnParentDeathScope()
+
+        let armed =
+            (Command.create "git" |> Command.killOnParentDeath).KillOnParentDeathScope()
+
+        Assert.That(armed, Is.EqualTo unset)
 
     // ---- Pty + InheritStdin builder-boundary conflict (T-159) ---------------------------------
     // A PTY replaces the child's stdin with its own pty slave/ConPTY input pipe, so InheritStdin

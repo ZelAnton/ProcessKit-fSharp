@@ -280,3 +280,71 @@ type PosixSpawnCleanupTests() =
             Native.Posix.streamWrapFaultForTests <- None
 
         assertFaultedSpawnIsClean install reset (shell "sleep 10" |> Command.keepStdinOpen)
+
+    // ---- Command.KillOnParentDeath (reap the child on sudden parent death) --------------------
+    //
+    // A FULL "parent dies -> child reaped" test is deliberately NOT attempted here: ProcessKit arms the
+    // child's parent-death signal relative to THIS process (the test runner is the child's real parent),
+    // so actually triggering it would require killing the runner itself. Instead the Linux test below
+    // verifies the OBSERVABLE contract the wiring produces — the spawned child really carries
+    // pdeath_signal == SIGKILL — which proves the exact primitive KillOnParentDeath relies on
+    // (`setpriv --pdeathsig=SIGKILL`, then an `execve` that must PRESERVE the signal) is present and
+    // correctly wired on the host. The macOS/BSD and Windows tests pin the honest platform divergence.
+
+    [<Test>]
+    member _.``KillOnParentDeath on Linux arms the child's parent-death signal to SIGKILL``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: PR_SET_PDEATHSIG is armed via the util-linux 'setpriv --pdeathsig' helper"
+
+            match Exec.which "setpriv", Exec.which "python3" with
+            | Error _, _ -> Assert.Ignore "requires the util-linux 'setpriv' helper on PATH"
+            | _, Error _ -> Assert.Ignore "requires 'python3' on PATH to read PR_GET_PDEATHSIG"
+            | Ok _, Ok _ ->
+                // The child reads its OWN parent-death signal (PR_GET_PDEATHSIG = 2) and prints it. If
+                // ProcessKit wired KillOnParentDeath correctly it must be SIGKILL (9): setpriv armed it and
+                // the signal survived setpriv's execve of (non-set-uid) python3.
+                let script =
+                    "import ctypes,sys; libc=ctypes.CDLL(None,use_errno=True); sig=ctypes.c_int(-1); "
+                    + "libc.prctl(2,ctypes.byref(sig),0,0,0); sys.stdout.write(str(sig.value))"
+
+                let cmd =
+                    Command.create "python3"
+                    |> Command.args [ "-c"; script ]
+                    |> Command.killOnParentDeath
+
+                let expected: string = "9"
+
+                match! cmd.OutputStringAsync() with
+                | Ok result -> Assert.That(result.Stdout.Trim(), Is.EqualTo expected)
+                | Error err -> Assert.Fail $"KillOnParentDeath spawn failed on Linux: {err.Message}"
+        }
+
+    [<Test>]
+    member _.``KillOnParentDeath on macOS or BSD is a typed Unsupported, not a silent no-op``() : Task =
+        task {
+            if isWindows || isLinux then
+                Assert.Ignore "macOS/BSD-only: they have no PR_SET_PDEATHSIG analog to reap on parent death"
+
+            let cmd = shell "echo hi" |> Command.killOnParentDeath
+
+            match! cmd.OutputStringAsync() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Unsupported on macOS/BSD, got {other}"
+            | Ok _ -> Assert.Fail "KillOnParentDeath should be Unsupported on macOS/BSD, not silently accepted"
+        }
+
+    [<Test>]
+    member _.``KillOnParentDeath on Windows leaves the run unaffected (KILL_ON_JOB_CLOSE already covers it)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: KillOnParentDeath is a documented no-op there (the Job Object handles it)"
+
+            // Every Windows child already lives in a Job Object with KILL_ON_JOB_CLOSE whose sole handle
+            // the parent owns, so no extra spawn action is needed — the run must be identical to not asking.
+            let cmd = shell "echo hi" |> Command.killOnParentDeath
+
+            match! cmd.OutputStringAsync() with
+            | Ok result -> Assert.That(result.Stdout.Trim(), Is.EqualTo "hi")
+            | Error err -> Assert.Fail $"KillOnParentDeath must not affect a Windows run: {err.Message}"
+        }

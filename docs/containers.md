@@ -185,24 +185,50 @@ your `PID 1` (and, on Linux/macOS mechanisms, the whole tree with it) before `Sh
 run its own escalation, which is a much blunter stop than the one this library is trying to give
 you.
 
+## When the parent is killed outright: `Command.KillOnParentDeath`
+
+The graceful path above assumes your app *gets* to run its shutdown. It might not: if your own grace
+window overruns, the orchestrator escalates to `SIGKILL`, and a `SIGKILL`ed parent runs no
+`Dispose`/finalizer — so `ProcessGroup` teardown never fires. On the **Windows** Job Object and
+**Linux cgroup v2** mechanisms the container still reaps the tree (kernel-enforced membership, not
+parent bookkeeping), but on the **POSIX process-group** mechanism a hard-killed parent can leave its
+children running, reparented to `PID 1`.
+
+`Command.KillOnParentDeath()` opts a child in to being reaped when its parent dies *suddenly*. It is a
+best-effort backstop, not a replacement for `ShutdownAsync`, and the guarantee is platform-specific —
+`Command.KillOnParentDeathScope()` reports the honest scope (fixed per platform, whether or not the
+verb was set):
+
+- **Windows** — the whole tree, already, with no opt-in (the Job Object's `KILL_ON_JOB_CLOSE` fires
+  when the kernel closes the dead parent's last Job handle during process rundown).
+- **Linux** — the **direct child only**, via `PR_SET_PDEATHSIG(SIGKILL)` armed through the
+  `setpriv --pdeathsig` helper. A **grandchild** is not covered (the signal is not inherited across a
+  `fork`), and the kernel resets it across an `execve` of a **set-uid/set-gid** image.
+- **macOS/BSD** — no `PR_SET_PDEATHSIG` analog; a set value fails the spawn with
+  `ProcessError.Unsupported`, never a silent no-op.
+
+See [platform-support.md](platform-support.md#caveats) for the full caveats.
+
 ## Minimal images: musl/Alpine and shell-less images
 
 ProcessKit's baseline path needs neither a shell nor any extra binary: spawning, capturing,
 streaming, timeouts, pipelines, and POSIX-process-group / Job Object containment are all direct
-`posix_spawn(3)` / Win32 calls. Two **opt-in** Unix features are the exception, and each needs a
+`posix_spawn(3)` / Win32 calls. A few **opt-in** Unix features are the exception, and each needs a
 specific external helper:
 
-- **`Command.Uid` / `Command.Gid` (privilege dropping)** rewrite the spawn to run through
-  [`setpriv`](https://man7.org/linux/man-pages/man1/setpriv.1.html) (util-linux), because
-  `posix_spawn` has no uid/gid attribute of its own. `setpriv` ships on mainstream
-  glibc-based Linux (Debian/Ubuntu, the distributions ProcessKit's own CI runs on) but is
-  **commonly absent from a minimal musl image** (a bare Alpine base, or `FROM scratch` /
-  distroless-style images) — where it's missing, the drop fails with a typed
-  `ProcessError.Spawn` naming the missing helper, never a silent unprivileged run. If your image
-  needs `Uid`/`Gid` dropping, install `util-linux` (`apk add util-linux` on Alpine) — or drop
-  privileges another way (a distroless multi-stage image copying only the published output as a
-  non-root `USER`, so the *container* never runs as root in the first place and `Uid`/`Gid` is
-  unnecessary).
+- **`Command.Uid` / `Command.Gid` (privilege dropping)** and **`Command.KillOnParentDeath`** both
+  rewrite the spawn to run through [`setpriv`](https://man7.org/linux/man-pages/man1/setpriv.1.html)
+  (util-linux): a `Uid`/`Gid` drop because `posix_spawn` has no uid/gid attribute of its own, and
+  `KillOnParentDeath` because `PR_SET_PDEATHSIG` must be armed by a process that then `exec`s the
+  target in place (`setpriv --pdeathsig`) rather than by managed .NET code in an unsafe forked child.
+  `setpriv` ships on mainstream glibc-based Linux (Debian/Ubuntu, the distributions ProcessKit's own
+  CI runs on) but is **commonly absent from a minimal musl image** (a bare Alpine base, or
+  `FROM scratch` / distroless-style images) — where it's missing, the spawn fails with a typed
+  `ProcessError.Spawn` naming the missing helper, never a silent unprivileged / un-armed run. If your
+  image needs `Uid`/`Gid` dropping or `KillOnParentDeath`, install `util-linux` (`apk add util-linux`
+  on Alpine) — or, for privilege dropping, drop another way (a distroless multi-stage image copying
+  only the published output as a non-root `USER`, so the *container* never runs as root in the first
+  place and `Uid`/`Gid` is unnecessary).
 - **`ProcessGroupOptions` resource limits on Linux** are enforced through a private cgroup v2 whose
   self-migrating launcher is [a tiny `/bin/sh` script](platform-support.md#containment-mechanisms)
   that joins the cgroup and then `exec`s the real target in place. A shell-less image (no
@@ -220,9 +246,9 @@ WORKDIR /src
 COPY . .
 RUN dotnet publish MyApp/MyApp.fsproj -c Release -o /app
 
-# musl-based runtime image. Add util-linux only if the app calls Command.Uid/Gid.
+# musl-based runtime image. Add util-linux only if the app calls Command.Uid/Gid or KillOnParentDeath.
 FROM mcr.microsoft.com/dotnet/runtime:10.0-alpine AS final
-# RUN apk add --no-cache util-linux   # only needed for Command.Uid / Command.Gid
+# RUN apk add --no-cache util-linux   # only needed for Command.Uid / Command.Gid / KillOnParentDeath
 WORKDIR /app
 COPY --from=build /app .
 USER 10001:10001

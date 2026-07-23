@@ -170,6 +170,28 @@ terminates the Job — so a child with no window (or one that vetoes the close) 
 as before, and the kill-on-dispose guarantee is never weakened. On the Unix mechanisms it is `SIGTERM`,
 then a grace window, then `SIGKILL`.
 
+**Reaping on sudden parent death (`Command.KillOnParentDeath`)**
+
+Kill-on-dispose covers the parent tearing the group down; it cannot cover the parent being killed
+*outright* (SIGKILL, a crash, a Windows `TerminateProcess`), because no `Dispose`/finalizer runs.
+`Command.KillOnParentDeath()` opts a child in to being reaped in that case, and
+`Command.KillOnParentDeathScope()` reports the honest, platform-fixed scope (independent of whether
+the verb was set):
+
+| Capability | Windows (Job Object) | Linux | macOS/BSD |
+|---|:---:|:---:|:---:|
+| `KillOnParentDeathScope()` | `WholeTree` | `DirectChildOnly` | `Nothing` |
+| Reap child on sudden parent death | ✅ whole tree, no opt-in needed | 🟡 direct child only | ❌ `ProcessError.Unsupported` |
+
+- **Windows** already reaps the **whole tree** with no extra action: every child lives in a Job Object
+  created with `KILL_ON_JOB_CLOSE` whose sole handle the parent owns, so the kernel's handle rundown on
+  parent death closes that last handle and terminates the Job. `KillOnParentDeath()` is a documented
+  no-op there, not a silent one.
+- **Linux** arms `PR_SET_PDEATHSIG(SIGKILL)` on the child through the `setpriv --pdeathsig` helper,
+  reaching the **direct child only** (see the caveat below for what that excludes).
+- **macOS/BSD** have no `PR_SET_PDEATHSIG` analog, so a set value fails the spawn with
+  `ProcessError.Unsupported` — never a silent no-op.
+
 **Signals (`Signal`)**
 
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
@@ -317,6 +339,21 @@ silently ignored. The whole family is **Unix-only**: on Windows `Uid`/`Gid`/`Gro
 each fail the spawn with `ProcessError.Unsupported`, never a silent no-op. `setpriv` ships on mainstream
 Linux; where it is absent (macOS/BSD) a `Uid`/`Gid`/`Groups` drop fails with a typed `ProcessError.Spawn`
 naming the missing helper.
+
+**`KillOnParentDeath` reaps only the direct child on Linux, and only up to a set-uid `exec`.** The
+opt-in `Command.KillOnParentDeath()` reaps a child when its parent dies *suddenly*, but the guarantee is
+platform-specific — `Command.KillOnParentDeathScope()` reports the honest scope. On **Linux** it is
+armed as `PR_SET_PDEATHSIG(SIGKILL)` via the `setpriv --pdeathsig` helper (util-linux; a missing helper
+is a typed `ProcessError.Spawn`, like the privilege drop) and reaches the **direct child only**: the
+parent-death signal is **not inherited** across a `fork`, so a **grandchild** the child spawns is not
+covered — with the child's parent gone, nothing reaps its cgroup/pgroup. The kernel also **resets** the
+signal when the child `execve`s a **set-uid/set-gid** image, so for a `sudo`-like child it holds only up
+to that `exec`. And because the parent-death signal fires when the **spawning thread** (not merely the
+process) exits — and ProcessKit spawns on a thread-pool thread .NET may retire while the process lives —
+the reap is best-effort and can, in principle, fire early if that thread is reclaimed. On **Windows**
+the whole tree is reaped with no opt-in (the Job Object's `KILL_ON_JOB_CLOSE` fires when the kernel
+closes the dead parent's last Job handle during process rundown). On **macOS/BSD** there is no analog,
+so a request fails the spawn with `ProcessError.Unsupported` rather than pretending the cleanup happens.
 
 **Windows delivers only `Signal.Kill`.** Windows has no general signal abstraction. `Signal.Kill`
 maps to the Job Object terminate; every other `Signal` value (`Term`, `Int`, `Hup`, `Quit`,

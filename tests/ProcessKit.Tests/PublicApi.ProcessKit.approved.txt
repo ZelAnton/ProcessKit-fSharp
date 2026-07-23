@@ -37,6 +37,8 @@ class ProcessKit.Command
   member IdleTimeout(System.TimeSpan) : ProcessKit.Command
   member InheritStdin() : ProcessKit.Command
   member KeepStdinOpen() : ProcessKit.Command
+  member KillOnParentDeath() : ProcessKit.Command
+  member KillOnParentDeathScope() : ProcessKit.KillOnParentDeathScope
   member LineTerminator(ProcessKit.LineTerminator) : ProcessKit.Command
   member Logger(Microsoft.Extensions.Logging.ILogger) : ProcessKit.Command
   member MergeStderr() : ProcessKit.Command
@@ -95,6 +97,8 @@ module ProcessKit.CommandModule
   static member idleTimeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member inheritStdin(ProcessKit.Command) : ProcessKit.Command
   static member keepStdinOpen(ProcessKit.Command) : ProcessKit.Command
+  static member killOnParentDeath(ProcessKit.Command) : ProcessKit.Command
+  static member killOnParentDeathScope(ProcessKit.Command) : ProcessKit.KillOnParentDeathScope
   static member lineTerminator(ProcessKit.LineTerminator, ProcessKit.Command) : ProcessKit.Command
   static member logger(Microsoft.Extensions.Logging.ILogger, ProcessKit.Command) : ProcessKit.Command
   static member mergeStderr(ProcessKit.Command) : ProcessKit.Command
@@ -173,6 +177,36 @@ interface ProcessKit.IProcessRunner
 class ProcessKit.JobRunner
   :> ProcessKit.IProcessRunner
   new()
+
+class ProcessKit.KillOnParentDeathScope
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.KillOnParentDeathScope>
+  member Equals(ProcessKit.KillOnParentDeathScope) : System.Boolean
+  member Equals(ProcessKit.KillOnParentDeathScope, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsDirectChildOnly() : System.Boolean
+  member get_IsNothing() : System.Boolean
+  member get_IsWholeTree() : System.Boolean
+  member get_Tag() : System.Int32
+  property DirectChildOnly : ProcessKit.KillOnParentDeathScope { get }
+  property IsDirectChildOnly : System.Boolean { get }
+  property IsNothing : System.Boolean { get }
+  property IsWholeTree : System.Boolean { get }
+  property Nothing : ProcessKit.KillOnParentDeathScope { get }
+  property Tag : System.Int32 { get }
+  property WholeTree : ProcessKit.KillOnParentDeathScope { get }
+  static member get_DirectChildOnly() : ProcessKit.KillOnParentDeathScope
+  static member get_Nothing() : ProcessKit.KillOnParentDeathScope
+  static member get_WholeTree() : ProcessKit.KillOnParentDeathScope
+
+module ProcessKit.KillOnParentDeathScope+Tags
+  field literal DirectChildOnly : System.Int32
+  field literal Nothing : System.Int32
+  field literal WholeTree : System.Int32
 
 class ProcessKit.LineTerminator
   :> System.Collections.IStructuralEquatable

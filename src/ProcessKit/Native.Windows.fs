@@ -545,6 +545,15 @@ module internal Windows =
     /// (`KILL_ON_JOB_CLOSE`). This is how kill-on-drop maps to .NET: the owning
     /// `ProcessGroup` holds the only handle, and disposing it (or GC finalizing it) reaps
     /// the tree.
+    ///
+    /// This same flag is ALSO what makes `Command.KillOnParentDeath` a no-op on Windows (verified, not
+    /// assumed): the parent process owns the only handle to this Job, and when the parent dies for ANY
+    /// reason — including a hard `TerminateProcess` or a crash, where no managed `Dispose`/finalizer runs
+    /// — the kernel closes all of that process's handles during rundown. Closing the last Job handle then
+    /// terminates every process in the Job, so a sudden parent death already reaps the whole tree with no
+    /// extra opt-in (`KillOnParentDeathScope.WholeTree`). The guarantee holds as long as the Job's handles
+    /// live only in the parent (they do: the only other handle is `duplicateJobHandle`'s short-lived
+    /// graceful-teardown duplicate, also owned by the parent).
     let createWindowsJob () : Result<nativeint, ProcessError> =
         let job = CreateJobObjectW(IntPtr.Zero, IntPtr.Zero)
 
