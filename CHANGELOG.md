@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- The stdout streaming session's stderr capture (`StdoutLinesAsync()` + `FinishAsync().Stderr`) now honours `OutputBufferPolicy.MaxBytes` as an in-flight cap the same way the buffered verbs do, so a newline-free stderr flood can no longer grow the pump's assembly buffer past the configured cap.
 
 ## [2.6.0] - 2026-07-23
 

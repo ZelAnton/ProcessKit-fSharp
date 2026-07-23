@@ -1148,6 +1148,7 @@ type RunningProcess internal (host: RunningHost) =
                                             readStdoutLineCount
                                             bumpDroppedStreamLine
                                             line)
+                                    None
                                     (fun () -> disposalCts.Token.IsCancellationRequested)
 
                             stdoutChannel.Writer.Complete()
@@ -1178,6 +1179,7 @@ type RunningProcess internal (host: RunningHost) =
                                         bumpStderrLine ()
                                         stderrBuffer.Add line
                                         ValueTask.CompletedTask)
+                                    config.OutputBuffer.MaxBytes
                                     (fun () -> disposalCts.Token.IsCancellationRequested)
                         with ex ->
                             // A genuine OS read fault is reclassified into `ProcessError.Io` (T-087) before
@@ -1346,6 +1348,7 @@ type RunningProcess internal (host: RunningHost) =
                                             countSoFar
                                             bumpDroppedStreamLine
                                             (wrap (OutputLine line)))
+                                    None
                                     (fun () -> disposalCts.Token.IsCancellationRequested)
                         with ex ->
                             // A genuine OS read fault is reclassified into `ProcessError.Io` (T-087)
