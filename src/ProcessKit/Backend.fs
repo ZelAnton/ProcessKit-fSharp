@@ -602,6 +602,30 @@ type internal ProcessGroupBackend() =
     let anyChildAlive () =
         children.Snapshot() |> List.exists stillOurs
 
+    // Broadcast to every tracked pgid that is still ours; a recycled pgid is pruned instead, so a
+    // control operation can never target an unrelated process group. Continue after failures to give
+    // every remaining group a chance to receive the operation, then report the first delivery failure.
+    let sweep
+        (deliver: int -> Native.Common.SignalDelivery)
+        (describeFailure: int -> string -> string)
+        : Result<unit, ProcessError> =
+        let mutable firstFailure: (int * string) option = None
+
+        for pgid in children.Snapshot() do
+            if stillOurs pgid then
+                match deliver pgid with
+                | Native.Common.SignalDelivery.Delivered
+                | Native.Common.SignalDelivery.TargetGone -> ()
+                | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
+                    if firstFailure.IsNone then
+                        firstFailure <- Some(errno, message)
+            else
+                untrack pgid |> ignore
+
+        match firstFailure with
+        | None -> Ok()
+        | Some(errno, message) -> Error(ProcessError.Io(describeFailure errno message))
+
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.ProcessGroup
         member _.Spawn(command) = Native.Posix.spawnPosix command
@@ -695,69 +719,16 @@ type internal ProcessGroupBackend() =
             match Native.Posix.ensureDeliverable signalNum with
             | Error error -> Error error
             | Ok() ->
-                let mutable firstFailure: (int * string) option = None
-
-                // Broadcast to every tracked pgid that is still ours; a pgid recycled since it was tracked
-                // (the choke reports it gone) is pruned and never signalled — the wrong-target delivery this
-                // closes. A member that has already exited (ESRCH) must not abort delivery to the rest, and
-                // only the first genuine delivery failure (e.g. EINVAL for an invalid signal number) is
-                // reported.
-                for pgid in children.Snapshot() do
-                    if stillOurs pgid then
-                        match Native.Posix.signalProcessGroup pgid signalNum with
-                        | Native.Common.SignalDelivery.Delivered
-                        | Native.Common.SignalDelivery.TargetGone -> ()
-                        | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
-                            if firstFailure.IsNone then
-                                firstFailure <- Some(errno, message)
-                    else
-                        untrack pgid |> ignore
-
-                match firstFailure with
-                | None -> Ok()
-                | Some(errno, message) ->
-                    Error(
-                        ProcessError.Io
-                            $"failed to deliver signal {signalNum} to process group: {message} (errno {errno})"
-                    )
+                sweep (fun pgid -> Native.Posix.signalProcessGroup pgid signalNum) (fun errno message ->
+                    $"failed to deliver signal {signalNum} to process group: {message} (errno {errno})")
 
         member _.Suspend() =
-            let mutable firstFailure: (int * string) option = None
-
-            for pgid in children.Snapshot() do
-                if stillOurs pgid then
-                    match Native.Posix.suspendProcessGroup pgid with
-                    | Native.Common.SignalDelivery.Delivered
-                    | Native.Common.SignalDelivery.TargetGone -> ()
-                    | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
-                        if firstFailure.IsNone then
-                            firstFailure <- Some(errno, message)
-                else
-                    untrack pgid |> ignore
-
-            match firstFailure with
-            | None -> Ok()
-            | Some(errno, message) ->
-                Error(ProcessError.Io $"failed to suspend process group: {message} (errno {errno})")
+            sweep Native.Posix.suspendProcessGroup (fun errno message ->
+                $"failed to suspend process group: {message} (errno {errno})")
 
         member _.Resume() =
-            let mutable firstFailure: (int * string) option = None
-
-            for pgid in children.Snapshot() do
-                if stillOurs pgid then
-                    match Native.Posix.resumeProcessGroup pgid with
-                    | Native.Common.SignalDelivery.Delivered
-                    | Native.Common.SignalDelivery.TargetGone -> ()
-                    | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
-                        if firstFailure.IsNone then
-                            firstFailure <- Some(errno, message)
-                else
-                    untrack pgid |> ignore
-
-            match firstFailure with
-            | None -> Ok()
-            | Some(errno, message) ->
-                Error(ProcessError.Io $"failed to resume process group: {message} (errno {errno})")
+            sweep Native.Posix.resumeProcessGroup (fun errno message ->
+                $"failed to resume process group: {message} (errno {errno})")
 
         member _.Stats() =
             let active = children.Snapshot() |> List.filter stillOurs |> List.length
