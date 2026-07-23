@@ -1,5 +1,6 @@
 namespace ProcessKit.Testing
 
+open System
 open ProcessKit
 
 /// A scripted reply for `ScriptedRunner`: how a matched command should appear to have run. A reply
@@ -17,10 +18,12 @@ type Reply private (outcome: Outcome, stdout: string, stderr: string, error: Pro
 
     /// Exit 0 with the given stdout.
     static member Ok(stdout: string) =
+        ArgumentNullException.ThrowIfNull(stdout, nameof stdout)
         Reply(Outcome.Exited 0, stdout, "", None)
 
     /// Exit with a non-zero code and the given stderr.
     static member Fail(code: int, stderr: string) =
+        ArgumentNullException.ThrowIfNull(stderr, nameof stderr)
         Reply(Outcome.Exited code, "", stderr, None)
 
     /// Exit with an explicit code (empty stdout/stderr).
@@ -40,15 +43,21 @@ type Reply private (outcome: Outcome, stdout: string, stderr: string, error: Pro
 
     /// Concluded, but its exit status could not be observed (`Outcome.Unobserved`).
     static member Unobserved(reason: string) =
+        ArgumentNullException.ThrowIfNull(reason, nameof reason)
         Reply(Outcome.Unobserved reason, "", "", None)
 
     /// A runner-level failure: the verb returns this `ProcessError` (e.g. a spawn/IO failure or a
     /// missing program) instead of a completed result — so the error branch can be tested.
     static member Error(error: ProcessError) =
+        ArgumentNullException.ThrowIfNull(error, nameof error)
         Reply(Outcome.Exited 0, "", "", Some error)
 
     /// A copy of this reply with stdout replaced.
-    member _.WithStdout(stdout: string) = Reply(outcome, stdout, stderr, error)
+    member _.WithStdout(stdout: string) =
+        ArgumentNullException.ThrowIfNull(stdout, nameof stdout)
+        Reply(outcome, stdout, stderr, error)
 
     /// A copy of this reply with stderr replaced.
-    member _.WithStderr(stderr: string) = Reply(outcome, stdout, stderr, error)
+    member _.WithStderr(stderr: string) =
+        ArgumentNullException.ThrowIfNull(stderr, nameof stderr)
+        Reply(outcome, stdout, stderr, error)
