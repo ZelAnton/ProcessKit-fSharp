@@ -969,12 +969,14 @@ module internal Pump =
                     // nothing and reaching EOF is the only safe behaviour should it ever be reached.
                     ()
                 | StdinSource.Bytes bytes -> do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
-                | StdinSource.File path ->
-                    // `File.OpenRead` through `sourceStep`, so ANY open failure (not just the three
-                    // types on `genuineStdinFault`'s allow-list) surfaces as a genuine source fault
-                    // instead of being mistaken for a benign broken pipe.
-                    use file = sourceStep (fun () -> File.OpenRead path)
-                    do! pumpStream file stdinStream cancellationToken
+                | StdinSource.File _ ->
+                    // Unreachable in practice: `feedStdinSource` below always intercepts
+                    // `StdinSource.File` first, opening the file eagerly (so a fast child can't lose a
+                    // missing file behind an otherwise-successful outcome) and rewriting it to
+                    // `StdinSource.Reader` before ever calling `feedStdin`. Handled explicitly rather
+                    // than via a wildcard so this stays exhaustive if a new source is added; there is no
+                    // safe independent implementation to fall back to here, so this case never runs.
+                    ()
                 | StdinSource.Reader reader -> do! pumpStream reader stdinStream cancellationToken
                 | StdinSource.Lines lines ->
                     // `GetEnumerator`/`Current` through `sourceStep` (as `MoveNext` already goes through
