@@ -781,6 +781,80 @@ type HostedProcessTests() =
         :> Task
 
     [<Test>]
+    member _.``Dispose racing the start of supervision reports a clean cancellation, not an ObjectDisposedException outcome``
+        ()
+        : Task =
+        task {
+            // The window this stresses: `Dispose()` disposes the lifetime `CancellationTokenSource` without
+            // awaiting the background supervision task, while that task sits *between* being published and
+            // reading the lifetime token. A `configureSupervisor` gate parks the background task at exactly
+            // that point, so every iteration lands in the window deterministically (rather than hoping a
+            // single unsynchronised run happens to interleave just so); repeating it many times additionally
+            // guards against any residual nondeterminism.
+            //
+            // Had the spurious `ObjectDisposedException` occurred (reading the disposed `lifetime.Token`
+            // getter from the background task), `runSupervision`'s catch-all would have turned it into BOTH a
+            // "supervision failed" `LogError` AND a `LastOutcome = Error(Io ...)` in the *same* handler — so
+            // proving the settled outcome is the ordinary clean-cancellation `Error(Cancelled ...)` (the very
+            // outcome a non-racing `Dispose()` produces) also proves the spurious log never fired.
+            for _ in 1..30 do
+                let runner = BlockingRunner()
+
+                let configureEntered =
+                    new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                use releaseConfigure = new ManualResetEventSlim(false)
+
+                let configure =
+                    Func<Supervisor, Supervisor>(fun supervisor ->
+                        // Now on the background supervision task, past its opening `Task.Yield()` and BEFORE
+                        // it reads the lifetime token — exactly the window a racing `Dispose()` exploits.
+                        configureEntered.TrySetResult() |> ignore
+                        releaseConfigure.Wait()
+                        supervisor)
+
+                let provider, hosted, service =
+                    startRegisteredServiceWithRunner
+                        "worker"
+                        (Command.create "worker")
+                        configure
+                        (Some(runner :> IProcessRunner))
+
+                try
+                    // Kick supervision off; `StartAsync` returns immediately (the background task yields).
+                    do! hosted.StartAsync CancellationToken.None
+
+                    // Wait until the background task is parked in `configureSupervisor`, then dispose — this
+                    // cancels AND disposes the lifetime CTS while the background task has not yet read its
+                    // token.
+                    do! configureEntered.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+                    (service :> IDisposable).Dispose()
+
+                    // Release the background task so it proceeds to use the (now-disposed) lifetime token.
+                    releaseConfigure.Set()
+
+                    let! settled = waitUntil (fun () -> service.LastOutcome.IsSome)
+
+                    Assert.That(settled, Is.True, "supervision should settle an outcome after the racing dispose")
+
+                    match service.LastOutcome with
+                    | Some(Error(ProcessError.Cancelled program)) ->
+                        // The intended clean-cancellation outcome — identical to a non-racing Dispose, and
+                        // NOT the spurious `ObjectDisposedException`-derived `Error(Io "...supervision
+                        // failed...")` the pre-fix code published from this race.
+                        Assert.That(program, Is.EqualTo "worker")
+                    | other ->
+                        Assert.Fail
+                            $"Dispose racing supervision start must report a clean Cancelled outcome, not a spurious ObjectDisposedException-derived error; got %A{other}"
+                finally
+                    // Unblock the gate on any assertion failure/exception, then dispose the provider (a
+                    // second, idempotent teardown of the already-disposed service).
+                    releaseConfigure.Set()
+                    provider.Dispose()
+        }
+        :> Task
+
+    [<Test>]
     member _.``DisposeAsync awaits supervision to actually finish before returning``() : Task =
         task {
             let runner = BlockingRunner()

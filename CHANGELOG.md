@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- A `HostedProcessService.Dispose()` that races the very start of its background supervision no longer publishes a spurious `LastOutcome = Error` (nor logs "supervision failed"). `Dispose()` disposes its lifetime `CancellationTokenSource` without awaiting the supervision task; the background start now reads a snapshot of that token taken before disposal instead of the live getter, so a routine teardown that overlaps startup is reported as a clean cancellation, exactly like a non-racing `Dispose()`.
 
 ## [2.6.0] - 2026-07-23
 

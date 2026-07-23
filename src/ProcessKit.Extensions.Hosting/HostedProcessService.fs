@@ -121,8 +121,20 @@ type HostedProcessService
 
     // The background supervision run, published by `StartAsync` under `gate`. `signal` is this run's own
     // readiness `TaskCompletionSource` (passed in, not read from the field, so a concurrent restart's fresh
-    // signal can never be completed by a stale run).
-    let runSupervision (signal: TaskCompletionSource<SupervisionSession option>) : Task =
+    // signal can never be completed by a stale run). `lifetimeToken` is a *snapshot* of `lifetime.Token`
+    // taken by `StartAsync` under `gate` while `disposed` is still `false` — never the disposable
+    // `lifetime.Token` getter read live from this background task. Reading that getter here would race a
+    // concurrent `Dispose()`, whose `lifetime.Dispose()` runs without awaiting this task: after disposal the
+    // getter throws `ObjectDisposedException`, which the catch-all below would turn into a spurious
+    // `LastOutcome = Error` + a "supervision failed" log for what is really a routine teardown. A snapshot
+    // struct stays valid after the source is disposed — its `IsCancellationRequested` still reports the
+    // cancelled state `beginHardTeardown` set, so the session observes the cancellation and ends through the
+    // ordinary clean-cancellation path (a `ProcessError.Cancelled` outcome), identical to a non-racing
+    // `Dispose()`. This is the whole fix: the background task no longer touches `lifetime` at all.
+    let runSupervision
+        (signal: TaskCompletionSource<SupervisionSession option>)
+        (lifetimeToken: CancellationToken)
+        : Task =
         task {
             // Force the async boundary *before* any real work, so the whole synchronous supervision prefix
             // runs off the caller's thread — i.e. off the `gate` that `StartAsync` holds while it publishes
@@ -154,8 +166,11 @@ type HostedProcessService
                     // BEFORE awaiting its completion, so a concurrent `StopAsync` racing session creation
                     // still reaches the real session rather than missing a child about to spawn.
                     // `Supervisor.StartAsync` returns synchronously (the session's loop yields before its
-                    // first spawn), so the session exists the instant this resumes.
-                    let! session = supervisor.StartAsync lifetime.Token
+                    // first spawn), so the session exists the instant this resumes. `lifetimeToken` is the
+                    // snapshot taken under `gate` in `StartAsync` (see this function's header), never the
+                    // live `lifetime.Token` getter — so a concurrent `Dispose()` disposing `lifetime` here
+                    // cannot make this throw `ObjectDisposedException`.
+                    let! session = supervisor.StartAsync lifetimeToken
                     lock gate (fun () -> currentSession <- Some session)
                     signal.TrySetResult(Some session) |> ignore
 
@@ -267,6 +282,14 @@ type HostedProcessService
                             )
 
                         sessionReady <- signal.Task
+                        // Snapshot `lifetime.Token` here, under `gate`, while `disposed` is still `false`.
+                        // This is the only safe point to read the disposable getter: `Dispose`/`DisposeAsync`
+                        // dispose `lifetime` only *after* `claimTeardown` has set `disposed <- true` under
+                        // this same `gate`, so holding it with `not disposed` proves `lifetime` is not
+                        // disposed right now. The background task then uses this immutable snapshot instead of
+                        // re-reading the getter (which a concurrent `Dispose()` could have disposed by the
+                        // time the background task runs — the race this task fixes).
+                        let lifetimeToken = lifetime.Token
                         // `runSupervision` yields before any real work (see its leading `Task.Yield()`), so
                         // this call returns an already-suspended, not-yet-completed task immediately: the
                         // handle is published under `gate` here (so `StopAsync`/`Dispose`/`DisposeAsync`
@@ -274,7 +297,7 @@ type HostedProcessService
                         // configure-and-spawn prefix runs off the lock. `IsCompleted` is therefore `false`
                         // the instant the handle is assigned, so a racing second `StartAsync` sees an active
                         // task and does not start a second supervision loop.
-                        supervisionTask <- runSupervision signal
+                        supervisionTask <- runSupervision signal lifetimeToken
 
                     Task.CompletedTask)
 
