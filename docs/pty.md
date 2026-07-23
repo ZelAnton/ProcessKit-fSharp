@@ -1,5 +1,7 @@
 # Pseudo-terminal (PTY)
 
+[Previous: Overview](./)
+
 A pseudo-terminal (PTY) gives a child process a real terminal instead of the usual stdin/stdout/stderr pipes. Use it for programs that change behaviour when `isatty` is true: password prompts, SSH-style authentication, terminal UIs, and tools that refuse to prompt without a terminal.
 
 `Command.Pty()` enables a PTY with the default `PtyConfig` (80 columns, 24 rows, echo on). `Command.Pty(config)` lets you choose the initial terminal geometry and whether typed input is echoed. A PTY has **one merged terminal stream**: stdout and stderr are interleaved in `Stdout`, `OutputEvent.Stderr` is never produced, and `ProcessResult.Stderr` is empty.
@@ -124,3 +126,7 @@ Calling it on a non-PTY `RunningProcess` returns `Error (ProcessError.Unsupporte
 ## Platform support
 
 PTY support is available on Windows through ConPTY (Windows 10 1809+) and on Linux through `openpty` plus `setsid --ctty`; unsupported hosts return `ProcessError.Unsupported` rather than falling back to pipes. See the full [platform capability matrix](platform-support.md#pseudo-terminal-pty-capabilities), including macOS/BSD helper requirements and containment caveats.
+
+---
+
+Next: [Pipelines](pipelines.md)

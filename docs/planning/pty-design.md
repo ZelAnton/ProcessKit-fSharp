@@ -1,13 +1,10 @@
 # ProcessKit — pseudo-terminal (PTY) design
 
-> **Internal engineering design/ADR, not a consumer guide.** This document ratifies the
-> architecture of an opt-in PTY mode *before* any code is written, the same way
-> [`post-2.0-plan.md`](post-2.0-plan.md) framed the post-2.0 items. It is deliberately kept out
-> of the consumer-facing [`docs/`](../README.md) guide index. Nothing here has shipped: PTY is
-> still listed under **Not currently supported → Pseudo-terminal (PTY)** in
-> [`ROADMAP.md`](../../ROADMAP.md) (lines 71-75). When a stage below ships, it moves that bullet
-> into "What the library covers" and adds a consumer guide (`docs/pty.md`) plus the
-> matrix rows in [`platform-support.md`](../platform-support.md) — see *Implementation staging*.
+> **Historical internal engineering design/ADR, not a consumer guide.** This document records
+> the design that preceded the PTY implementation. PTY shipped in **2.5.0**; the authoritative
+> current contract is [Pseudo-terminal (PTY)](../pty.md), its [platform matrix](../platform-support.md#pseudo-terminal-pty-capabilities), and the
+> [roadmap](../../ROADMAP.md). The staged plan below remains as implementation history and may
+> deliberately describe work in the future tense.
 
 Each decision below is **ratified**, not left open — the point of an ADR is to settle the
 platform mechanism, the public-API vocabulary, and the honest-result contract before the

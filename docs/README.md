@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ZelAnton/ProcessKit-fSharp/actions/workflows/ci.yml/badge.svg)](https://github.com/ZelAnton/ProcessKit-fSharp/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/ProcessKit.svg)](https://www.nuget.org/packages/ProcessKit)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/ZelAnton/ProcessKit-fSharp/blob/main/LICENSE)
 [![.NET](https://img.shields.io/badge/.NET-8.0%20%7C%2010.0-512BD4.svg)](https://dotnet.microsoft.com/)
 
 Async child-process management for .NET with a kernel-backed **no-orphan guarantee**: every
@@ -103,8 +103,8 @@ one place. Deploying to Docker/Kubernetes? [Running in containers](containers.md
 container-specific consequences of that fine print — mechanism selection, `PID 1`, graceful
 shutdown, and minimal images.
 
-The repository also includes runnable sample projects under [`../samples/`](../samples/) for F#
-and C# users who want compiled examples instead of Markdown snippets.
+The repository also includes [runnable sample projects](https://github.com/ZelAnton/ProcessKit-fSharp/tree/main/samples)
+for F# and C# users who want compiled examples instead of Markdown snippets.
 
 | Guide | Covers |
 |---|---|

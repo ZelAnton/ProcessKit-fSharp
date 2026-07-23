@@ -64,7 +64,7 @@ unmodified against musl — it was confirmed green end-to-end (`Category!=Stress
 against this exact image before the CI leg below was added.
 
 CI runs the same combination in the `test-alpine` job
-([.github/workflows/ci.yml](../.github/workflows/ci.yml)), by the same raw
+([CI workflow](https://github.com/ZelAnton/ProcessKit-fSharp/blob/main/.github/workflows/ci.yml)), by the same raw
 `docker run` pattern as the `test-cgroup-limits` job (rather than the OS matrix
 in `test`, since it needs the `util-linux` install step first): full suite,
 `Category!=Stress`, `net10.0` only (the `-alpine` image, like the default

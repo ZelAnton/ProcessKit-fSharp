@@ -1,5 +1,7 @@
 # Observability — logging, tracing & metrics
 
+[Previous: Overview](./)
+
 ProcessKit reports its run lifecycle through the three standard .NET diagnostic channels, all **opt-in
 and free when nothing is listening**:
 

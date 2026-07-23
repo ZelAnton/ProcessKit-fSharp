@@ -1,5 +1,7 @@
 # Dependency injection
 
+[Previous: Overview](./)
+
 The `ProcessKit.Extensions.DependencyInjection` package wires ProcessKit into
 `Microsoft.Extensions.DependencyInjection`. It stays **dependency-light** — only the DI, Logging,
 Options, and Configuration extension packages that a DI-integration package inevitably needs, and **no

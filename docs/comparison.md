@@ -1,5 +1,7 @@
 # Comparison and migration guide
 
+[Previous: Overview](./)
+
 How ProcessKit compares to `System.Diagnostics.Process` and three widely-used
 third-party process-running libraries for .NET — [CliWrap](https://github.com/Tyrrrz/CliWrap),
 [Medallion.Shell](https://github.com/madelson/MedallionShell), and

@@ -139,9 +139,9 @@ application surfaces `IL2104`/`IL3053` warnings **attributed to `FSharp.Core`**,
 Those are a known F# baseline, not a ProcessKit defect; warnings attributed to a `ProcessKit*` assembly would
 be. ProcessKit's own assemblies publish warning-free.
 
-**How this is validated.** [`samples/FSharp.NativeAot`](../samples/FSharp.NativeAot) is a minimal consumer of
+**How this is validated.** [`samples/FSharp.NativeAot`](https://github.com/ZelAnton/ProcessKit-fSharp/tree/main/samples/FSharp.NativeAot) is a minimal consumer of
 `ProcessKit` **and** `ProcessKit.Extensions.DependencyInjection`, published with `PublishAot=true` and run by
-the `aot-smoke` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) on both `linux-x64` (POSIX
+the `aot-smoke` job in the [CI workflow](https://github.com/ZelAnton/ProcessKit-fSharp/blob/main/.github/workflows/ci.yml) on both `linux-x64` (POSIX
 process-group backend) and `win-x64` (Windows Job Object backend). It spawns a child, captures a non-zero
 exit as an honest result, runs a child inside a kill-on-dispose `ProcessGroup`, and runs a child through a
 DI-resolved `IProcessRunner` (`AddProcessKit`); the job fails if ilc attributes any warning to a `ProcessKit*`
@@ -430,7 +430,7 @@ pipes, a second, conflicting one is refused rather than racing two readers on th
 
 **Concurrency-friendly I/O.** Waiting on a running child no longer blocks a dedicated thread on either
 platform — Windows uses a thread-pool registered wait, and POSIX uses an event-driven `SIGCHLD`
-registration (see [`CHANGELOG.md`](../CHANGELOG.md)) — and the parent side of a child's pipes is now
+registration (see the [changelog](https://github.com/ZelAnton/ProcessKit-fSharp/blob/main/CHANGELOG.md)) — and the parent side of a child's pipes is now
 genuinely asynchronous on both: Windows uses overlapped named pipes over IOCP, and Linux/macOS wrap
 each stdio channel's parent end (an `AF_UNIX` socketpair) in a `Socket`/`NetworkStream` whose reads
 and writes complete through the runtime's epoll/kqueue event loop — no thread-pool thread parked per

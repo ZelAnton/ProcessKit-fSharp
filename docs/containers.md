@@ -37,7 +37,7 @@ real root:
   --cgroupns=host`, or an equivalent host-cgroup-namespace setup) does expose the real root, so
   requesting limits there succeeds and grants `Mechanism.CgroupV2`. This is exactly the shape this
   repository's own CI uses to exercise the cgroup v2 backend for real (the `test-cgroup-limits` job
-  in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs `docker run --rm --privileged
+  in the [CI workflow](https://github.com/ZelAnton/ProcessKit-fSharp/blob/main/.github/workflows/ci.yml) runs `docker run --rm --privileged
   --cgroupns=host …`); ordinary CI containers (and ordinary production containers) do not have this
   and are not expected to.
 

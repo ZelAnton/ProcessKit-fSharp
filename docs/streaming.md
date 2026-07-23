@@ -768,8 +768,8 @@ Probe semantics are deliberately uniform:
 `WaitForAsync` takes a function returning `Task<bool>` (`Func<Task<bool>>` from C#), so any
 async health check fits — re-evaluated until it returns `true` or the deadline elapses.
 
-WaitForHttpAsync sends GET requests every 50ms until it receives a 2xx response. Pass a
-seq<int> of acceptable status codes or a Func<HttpResponseMessage, bool> overload when a
+`WaitForHttpAsync` sends GET requests every 50ms until it receives a 2xx response. Pass a
+`seq&lt;int&gt;` of acceptable status codes or a `Func<HttpResponseMessage, bool>` overload when a
 non-2xx response or response-specific validation defines readiness.
 ## Racing several children
 
@@ -894,4 +894,4 @@ cgroup backend, and `None` where the kernel doesn't account per-process cheaply 
 
 ---
 
-Next: [Pipelines](pipelines.md)
+Next: [Pseudo-terminal (PTY)](pty.md)
