@@ -85,13 +85,34 @@ type internal Consumption =
     | EventStreaming
     | Interactive
 
+/// What one look at an `ExpectWindow` tells a pattern waiter (`PtySession.ExpectAsync`): the pattern
+/// matched, nothing matched yet, or nothing matched and no more output can come. Deliberately ONE
+/// verdict rather than a matched-then-ended pair of questions — see `ExpectWindow.TryConsume`, which
+/// decides all three under a single lock so a match arriving with the end of output can never be lost
+/// to it.
+[<RequireQualifiedAccess; NoComparison>]
+type internal ExpectStep =
+
+    /// The pattern matched: the output that preceded it, and the text it matched. Both are consumed
+    /// from the window by the same step that reports them.
+    | Matched of before: string * text: string
+
+    /// Nothing matched, and the child's output has not ended — the pattern may still arrive.
+    | Waiting
+
+    /// Nothing matched, and the child's output has ended: cleanly (`None`), or with the genuine read
+    /// fault that ended it (`Some ex`).
+    | Ended of fault: exn option
+
 /// The shared state behind an interactive expect-style session (`PtySession`): a bounded sliding
 /// window of the child's raw merged output that pattern waits are matched against, plus the optional
 /// session transcript. Deliberately unframed — a terminal prompt (`Password: `, `> `) carries no line
 /// terminator, so the line pumps' framing is exactly what a pattern waiter must NOT go through.
 ///
 /// Filled by the session's raw pumps (`Pump.readTextUntilDone`, one per piped stream) and drained by
-/// `TryConsume` on the caller's thread, so every operation runs under one `gate`. Waiters are woken
+/// `TryConsume` on the caller's thread, so every operation runs under one `gate` — including a
+/// waiter's whole verdict, which `TryConsume` answers as a single `ExpectStep` rather than as
+/// separately locked questions a producer could slip between. Waiters are woken
 /// through `Changed`, a `TaskCompletionSource` replaced on every publish: capture it BEFORE testing
 /// the window, and an append landing between the capture and the test either shows up in that test or
 /// completes the captured task, so a wake-up can never be lost. Continuations run asynchronously, so
@@ -158,19 +179,29 @@ type internal ExpectWindow(maxWindowChars: int, maxTranscriptChars: int option) 
                 readFault <- fault
                 publish ())
 
-    /// Test `matcher` against the whole current window; on a match, CONSUME everything up to and
-    /// including it (so the next wait starts after this match, and a prompt is never matched twice) and
-    /// return `(before, matched)`. `before` is the output that preceded the match, which the sliding
-    /// window may already have truncated (see `WindowTruncated`).
-    member _.TryConsume(matcher: string -> (int * int) option) : (string * string) option =
+    /// The one step a pattern waiter takes: test `matcher` against the whole current window and, on a
+    /// match, CONSUME everything up to and including it (so the next wait starts after this match, and a
+    /// prompt is never matched twice), reporting `Matched(before, text)`. `before` is the output that
+    /// preceded the match, which the sliding window may already have truncated (see `WindowTruncated`).
+    /// With no match, the same step reports whether more output can still come (`Waiting`) or the
+    /// readers have already finished (`Ended`, carrying any genuine read fault).
+    ///
+    /// Match and end-of-output are decided under ONE `gate` acquisition, and that is load-bearing: the
+    /// last chunk of a conversation and the readers finishing arrive back to back (a child prints its
+    /// final answer, then closes the terminal), so a waiter that asked the two questions separately
+    /// could be preempted between them and report "ended, no match" for a match already sitting in the
+    /// window. A match always wins over the end that came with it — including over a read fault, since
+    /// output the child did produce is still honest output.
+    member _.TryConsume(matcher: string -> (int * int) option) : ExpectStep =
         lock gate (fun () ->
             let text = window.ToString()
 
             match matcher text with
             | Some(start, length) ->
                 window.Remove(0, start + length) |> ignore
-                Some(text.Substring(0, start), text.Substring(start, length))
-            | None -> None)
+                ExpectStep.Matched(text.Substring(0, start), text.Substring(start, length))
+            | None when completed -> ExpectStep.Ended readFault
+            | None -> ExpectStep.Waiting)
 
     /// The buffered output no pattern has consumed yet.
     member _.Pending = lock gate (fun () -> window.ToString())
@@ -184,10 +215,6 @@ type internal ExpectWindow(maxWindowChars: int, maxTranscriptChars: int option) 
 
     /// Whether the match window has dropped any output to stay within its cap.
     member _.WindowTruncated = lock gate (fun () -> windowTruncated)
-
-    /// Whether the child's output has ended, and the genuine read fault that ended it (if any). Read as
-    /// one snapshot so a waiter can never see "ended" without the fault that came with it.
-    member _.Completion: bool * exn option = lock gate (fun () -> completed, readFault)
 
 /// The `IAsyncEnumerator<'T>` behind `RunningProcess.StdoutJsonLinesAsync`: projects a line-based
 /// `IAsyncEnumerator<string>` (the shape `StdoutLinesAsync` already returns) into a typed

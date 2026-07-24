@@ -195,26 +195,29 @@ type PtySession(running: RunningProcess, options: PtySessionOptions) =
                 // never be lost (see `ExpectWindow.Changed`).
                 let changed = window.Changed
 
+                // One atomic look at the window decides all three cases. Asking "did it match?" and
+                // "has the output ended?" as two separate window operations would be a race: a child's
+                // final answer and the end of its terminal arrive back to back, so the pumps could
+                // append the match AND finish in between, leaving the second question to report a false
+                // end for a match already in the window (see `ExpectWindow.TryConsume`).
                 match window.TryConsume matcher with
-                | Some(before, matched) -> result <- ValueSome(Ok(ExpectMatch(before, matched)))
-                | None ->
-                    match window.Completion with
-                    // The child's output has ended (it closed the terminal, or exited) and the pattern
-                    // never arrived: report it now rather than burning the rest of the timeout on output
-                    // that can no longer come.
-                    | true, Some fault -> result <- ValueSome(readFaultError fault)
-                    | true, None -> result <- ValueSome(Error(ProcessError.NotReady(program, armed)))
-                    | false, _ ->
-                        try
-                            do! changed.WaitAsync linked.Token
-                        with :? OperationCanceledException ->
-                            // The caller's token wins over the deadline: a cancelled wait is an error, a
-                            // timed-out one is "the pattern has not arrived yet". Either way the window is
-                            // left untouched, so a retry — or the next pattern — still sees this output.
-                            if cancellationToken.IsCancellationRequested then
-                                result <- ValueSome(Error(ProcessError.Cancelled program))
-                            else
-                                result <- ValueSome(Error(ProcessError.NotReady(program, armed)))
+                | ExpectStep.Matched(before, matched) -> result <- ValueSome(Ok(ExpectMatch(before, matched)))
+                // The child's output has ended (it closed the terminal, or exited) and the pattern
+                // never arrived: report it now rather than burning the rest of the timeout on output
+                // that can no longer come.
+                | ExpectStep.Ended(Some fault) -> result <- ValueSome(readFaultError fault)
+                | ExpectStep.Ended None -> result <- ValueSome(Error(ProcessError.NotReady(program, armed)))
+                | ExpectStep.Waiting ->
+                    try
+                        do! changed.WaitAsync linked.Token
+                    with :? OperationCanceledException ->
+                        // The caller's token wins over the deadline: a cancelled wait is an error, a
+                        // timed-out one is "the pattern has not arrived yet". Either way the window is
+                        // left untouched, so a retry — or the next pattern — still sees this output.
+                        if cancellationToken.IsCancellationRequested then
+                            result <- ValueSome(Error(ProcessError.Cancelled program))
+                        else
+                            result <- ValueSome(Error(ProcessError.NotReady(program, armed)))
 
             match result with
             | ValueSome outcome -> return outcome

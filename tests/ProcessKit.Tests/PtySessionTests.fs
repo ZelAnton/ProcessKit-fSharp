@@ -2,6 +2,7 @@ namespace ProcessKit.Tests
 
 open System
 open System.Diagnostics
+open System.IO
 open System.Net
 open System.Runtime.InteropServices
 open System.Text
@@ -39,6 +40,26 @@ type PtySessionTests() =
                 Command.create "/bin/sh" |> Command.args [ "-c"; "sleep 5" ]
 
         command |> Command.timeout (TimeSpan.FromSeconds 60.0)
+
+    // A child that stays quiet long enough for a pattern wait to park, then prints `text` and exits at
+    // once — so its last chunk and the end of its output reach the session back to back, which is the
+    // interleaving a final prompt/answer of a real conversation actually has.
+    let lastWordThenExit (text: string) =
+        let command =
+            if isWindows then
+                Command.create "cmd.exe"
+                |> Command.args [ "/c"; $"ping -n 2 127.0.0.1 >NUL & echo {text}" ]
+            else
+                Command.create "/bin/sh" |> Command.args [ "-c"; $"sleep 0.3; printf '{text}'" ]
+
+        command |> Command.timeout (TimeSpan.FromSeconds 60.0)
+
+    // The matcher shape `ExpectAsync(string, ...)` builds: an ordinal substring search over the raw,
+    // unframed window.
+    let literal (pattern: string) (text: string) =
+        match text.IndexOf(pattern, StringComparison.Ordinal) with
+        | -1 -> None
+        | index -> Some(index, pattern.Length)
 
     // ----------------------------------------------------------------------------------
     // Pattern waiting + sending, against the PTY double
@@ -210,6 +231,80 @@ type PtySessionTests() =
                 Is.LessThan(TimeSpan.FromSeconds 30.0),
                 "end-of-output must end the wait, not the 60-second deadline"
             )
+        }
+
+    // ----------------------------------------------------------------------------------
+    // A match arriving WITH the end of output beats the end (the R-01 ordering)
+    // ----------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``a match that landed with the end of output is reported as a match, not as the end``() =
+        // The ordering a two-question waiter ("did it match?", then "has it ended?") could be preempted
+        // in the middle of: the last chunk carrying the pattern AND the readers finishing both land
+        // before the waiter looks. One step must give one verdict — a match sitting in the window always
+        // outranks the end that arrived with it.
+        let window = ExpectWindow(1024, Some 1024)
+        window.Append "answer=42"
+        window.Complete None
+
+        match window.TryConsume(literal "answer=42") with
+        | ExpectStep.Matched(before, text) ->
+            Assert.That(text, Is.EqualTo "answer=42")
+            Assert.That(before, Is.Empty)
+        | other -> Assert.Fail $"a match that arrived with the end of output must win over it, got {other}"
+
+        // Only once the pattern is genuinely absent does the ended window say so — promptly, so a wait
+        // does not burn its whole deadline on output that can no longer come.
+        match window.TryConsume(literal "answer=42") with
+        | ExpectStep.Ended None -> ()
+        | other -> Assert.Fail $"an ended window with nothing left to match must report Ended, got {other}"
+
+    [<Test>]
+    member _.``a match that landed with a read fault is reported first, and the fault after it``() =
+        // Output the child genuinely produced stays honest output even when reading the rest of it
+        // failed; the fault is what the NEXT unmatched look reports.
+        let fault = IOException "the terminal went away"
+        let window = ExpectWindow(1024, None)
+        window.Append "LEN=7"
+        window.Complete(Some fault)
+
+        match window.TryConsume(literal "LEN=7") with
+        | ExpectStep.Matched(_, text) -> Assert.That(text, Is.EqualTo "LEN=7")
+        | other -> Assert.Fail $"the delivered output must be matchable before the fault is reported, got {other}"
+
+        match window.TryConsume(literal "LEN=7") with
+        | ExpectStep.Ended(Some reported) -> Assert.That(reported, Is.SameAs fault)
+        | other -> Assert.Fail $"the fault that ended the output must reach the waiter, got {other}"
+
+    [<Test>]
+    member _.``a half-arrived prompt on a live window tells the waiter to keep waiting``() =
+        let window = ExpectWindow(1024, None)
+        window.Append "Passwo"
+
+        match window.TryConsume(literal "Password: ") with
+        | ExpectStep.Waiting -> ()
+        | other -> Assert.Fail $"a partially arrived prompt is neither a match nor an end, got {other}"
+
+    [<Test>]
+    member _.``a pattern printed just before the child exits is matched, never a false NotReady``() : Task =
+        task {
+            // End to end through the real loop: the wait is parked well before the child speaks, and what
+            // wakes it is the final chunk of the conversation immediately followed by end-of-output —
+            // exactly the shape of a script's last prompt/answer. A `NotReady` here would be a flaky
+            // expect script in the wild.
+            match! runner.StartAsync(lastWordThenExit "Done.", CancellationToken.None) with
+            | Error error -> Assert.Fail $"spawn failed: {error}"
+            | Ok running ->
+                use running = running
+                let session = PtySession running
+
+                match! session.ExpectAsync("Done.", TimeSpan.FromSeconds 30.0) with
+                | Ok matched -> Assert.That(matched.Text, Is.EqualTo "Done.")
+                | Error error -> Assert.Fail $"the child's final output should have matched: {error}"
+
+                match! session.WaitForExitAsync() with
+                | Outcome.Exited 0 -> ()
+                | other -> Assert.Fail $"expected a clean exit after the final pattern, got {other}"
         }
 
     // ----------------------------------------------------------------------------------
