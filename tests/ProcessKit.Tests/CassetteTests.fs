@@ -26,7 +26,8 @@ type private FixedBytesRunner(stdout: byte[], stderr: string, code: int) =
                         Outcome.Exited code,
                         TimeSpan.Zero,
                         false,
-                        [ 0 ]
+                        [ 0 ],
+                        stdoutEncoding = command.Config.StdoutEncoding
                     )
                 )
             )
@@ -499,6 +500,71 @@ type CassetteTests() =
                         Assert.That(result.Stderr, Is.EqualTo "warn")
                         Assert.That(result.Code, Is.EqualTo(Some 3))
                     | Error error -> Assert.Fail $"bytes replay failed: {error}"
+            })
+
+    [<Test>]
+    member _.``a bytes cassette replay preserves configured stdout decoding in text projections``() : Task =
+        withCassette (fun path ->
+            task {
+                // A Latin-1 byte capture is deliberately not valid UTF-8: replay must carry the command's
+                // encoding into ProcessResult so both its text helpers and Exit error keep agreeing with live.
+                let text = "café"
+                let command = Command.create "tool" |> Command.stdoutEncoding Encoding.Latin1
+                let expectedCombined = text + "\nwarning"
+
+                let assertTextProjections (source: string) (result: ProcessResult<byte[]>) =
+                    Assert.That(result.Combined, Is.EqualTo expectedCombined, $"{source} Combined")
+                    Assert.That(result.OutputContainsAny [ "CAFÉ" ], Is.True, $"{source} OutputContainsAny")
+
+                    match result.EnsureSuccess() with
+                    | Error(ProcessError.Exit(_, 7, stdout, stderr)) ->
+                        Assert.That(stdout, Is.EqualTo text, $"{source} Exit stdout")
+                        Assert.That(stderr, Is.EqualTo "warning", $"{source} Exit stderr")
+                    | other -> Assert.Fail $"{source} must preserve the non-zero Exit error text, got {other}"
+
+                do!
+                    task {
+                        use recorder =
+                            RecordReplayRunner.Record(
+                                path,
+                                FixedBytesRunner(Encoding.Latin1.GetBytes text, "warning", 7)
+                            )
+
+                        match! (runner recorder).OutputBytesAsync(command, CancellationToken.None) with
+                        | Ok result -> assertTextProjections "live recording" result
+                        | Error error -> Assert.Fail $"live recording failed: {error}"
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    match! (runner replayer).OutputBytesAsync(command, CancellationToken.None) with
+                    | Ok result -> assertTextProjections "replay" result
+                    | Error error -> Assert.Fail $"replay failed: {error}"
+            })
+
+    [<Test>]
+    member _.``a bytes cassette replay keeps UTF-8 text projections by default``() : Task =
+        withCassette (fun path ->
+            task {
+                let text = "café"
+                let command = Command.create "tool"
+
+                do!
+                    task {
+                        use recorder =
+                            RecordReplayRunner.Record(path, FixedBytesRunner(Encoding.UTF8.GetBytes text, "", 0))
+
+                        let! _ = (runner recorder).OutputBytesAsync(command, CancellationToken.None)
+                        ()
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    match! (runner replayer).OutputBytesAsync(command, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Combined, Is.EqualTo text)
+                    | Error error -> Assert.Fail $"replay failed: {error}"
             })
 
     [<Test>]

@@ -8,6 +8,7 @@ open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+open ProcessKit.Testing
 
 /// Tests for `Command.MergeStderr` (T-053): an OS-level `2>&1` that folds the child's stderr into its
 /// stdout at spawn (POSIX `dup2`, Windows shared `STARTUPINFO.hStdError`), so the two streams interleave
@@ -234,6 +235,75 @@ type MergeStderrTests() =
                 |> ignore)
         )
         |> ignore
+
+    [<Test>]
+    member _.``FakeProcess folds MergeStderr into stdout with no stderr events``() : Task =
+        task {
+            let command = Command.create "fake" |> Command.mergeStderr
+
+            use captured =
+                FakeProcess.OfCommand(command).WithStdout("out").WithStderr("err").Build()
+
+            match! captured.OutputStringAsync() with
+            | Error error -> Assert.Fail $"{error.Message}"
+            | Ok result ->
+                Assert.That(result.Stdout, Is.EqualTo "out\nerr")
+                Assert.That(result.Stderr, Is.Empty, "MergeStderr has no separate stderr result")
+
+            use streaming =
+                FakeProcess.OfCommand(command).WithStdout("out").WithStderr("err").Build()
+
+            let! events = collect (streaming.OutputEventsAsync())
+
+            Assert.That(
+                events
+                |> Seq.forall (fun event ->
+                    match event with
+                    | OutputEvent.Stdout _ -> true
+                    | OutputEvent.Stderr _ -> false),
+                Is.True,
+                "MergeStderr must not emit OutputEvent.Stderr"
+            )
+
+            Assert.That(events |> Seq.map (fun event -> event.Text), Does.Contain "out")
+            Assert.That(events |> Seq.map (fun event -> event.Text), Does.Contain "err")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ScriptedRunner folds MergeStderr into stdout with no stderr events``() : Task =
+        task {
+            let runner: IProcessRunner =
+                ScriptedRunner().On([ "fake" ], (Reply.Ok "out").WithStderr "err")
+
+            let command = Command.create "fake" |> Command.mergeStderr
+
+            match! runner.OutputStringAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error.Message}"
+            | Ok result ->
+                Assert.That(result.Stdout, Is.EqualTo "out\nerr")
+                Assert.That(result.Stderr, Is.Empty, "MergeStderr has no separate stderr result")
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error.Message}"
+            | Ok streaming ->
+                use streaming = streaming
+                let! events = collect (streaming.OutputEventsAsync())
+
+                Assert.That(
+                    events
+                    |> Seq.forall (fun event ->
+                        match event with
+                        | OutputEvent.Stdout _ -> true
+                        | OutputEvent.Stderr _ -> false),
+                    Is.True,
+                    "MergeStderr must not emit OutputEvent.Stderr"
+                )
+
+                Assert.That(events |> Seq.map (fun event -> event.Text), Does.Contain "out")
+                Assert.That(events |> Seq.map (fun event -> event.Text), Does.Contain "err")
+        }
+        :> Task
 
     [<Test>]
     member _.``repeated MergeStderr spawns do not leak file descriptors``() : Task =
