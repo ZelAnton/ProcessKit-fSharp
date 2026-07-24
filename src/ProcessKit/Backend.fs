@@ -615,9 +615,6 @@ type internal ProcessGroupBackend() =
         identities.TryRemove pgid |> ignore
         children.Remove pgid
 
-    let anyChildAlive () =
-        children.Snapshot() |> List.exists stillOurs
-
     // Broadcast to every tracked pgid that is still ours; a recycled pgid is pruned instead, so a
     // control operation can never target an unrelated process group. Continue after failures to give
     // every remaining group a chance to receive the operation, then report the first delivery failure.
