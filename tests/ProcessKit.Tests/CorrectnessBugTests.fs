@@ -156,6 +156,57 @@ type CorrectnessBugTests() =
     let missingStdinPath () =
         System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"pk-missing-{Guid.NewGuid():N}.txt")
 
+    // ---- T-198: CreateProcessW must never mutate a managed command-line string -----------------
+    //
+    // Win32 documents that `CreateProcessW` may modify `lpCommandLine` IN PLACE while probing
+    // executable candidates. Marshalling that parameter as a managed `string` (pinned, not copied,
+    // under `CharSet.Unicode`) therefore handed the OS a writable pointer into managed string memory —
+    // and for a single-token, argument-less command the builder forwards `command.Program` itself,
+    // frequently an INTERNED literal shared by every use of that literal in the process. A native write
+    // into it is a memory-corruption-class bug visible to arbitrary unrelated readers of the same
+    // literal. The fix copies the command line into a private unmanaged buffer, so no managed string is
+    // ever exposed to the OS as writable.
+    //
+    // Provoking the kernel's transient in-place patch deterministically across Windows versions is not
+    // portable (and our own argument quoting defeats the classic space-ambiguity trigger), so this test
+    // guards the invariant behaviourally: after real spawn attempts driven by an interned literal
+    // program name, that literal must stay byte-for-byte identical to an independent, non-interned copy
+    // taken before the spawns. It never false-fails with the fix in place, and catches a regression
+    // that lets the OS persist a write back into the managed literal.
+    [<Test>]
+    member _.``spawning does not mutate the interned program-name string (T-198)``() =
+        if not isWindows then
+            Assert.Ignore "CreateProcessW lpCommandLine aliasing is a Windows-only concern"
+
+        // An interned string literal used verbatim as a single-token, argument-less program — the exact
+        // shape whose whole command line IS `command.Program`. It does not resolve on PATH, so every
+        // spawn takes the CreateProcess candidate-probing / not-found path without hanging.
+        let program = "pk_t198_intern_canary_program"
+
+        // An INDEPENDENT, non-interned copy of the same text, captured before any spawn. Comparing the
+        // interned literal against this copy detects a native write into the literal; comparing the
+        // literal against its own source literal could not — both would be the same, equally corrupted
+        // instance.
+        let reference = String(program.ToCharArray())
+
+        Assert.That(
+            Object.ReferenceEquals(program, reference),
+            Is.False,
+            "the reference copy must be a distinct instance"
+        )
+
+        for _ in 1..50 do
+            match (Command.create program).ExitCodeAsync().GetAwaiter().GetResult() with
+            | Error(ProcessError.NotFound _) -> ()
+            | Error other -> Assert.Fail $"expected a NotFound error for a missing program, got: {other.Message}"
+            | Ok code -> Assert.Fail $"a non-existent program must not spawn (exit {code})"
+
+        Assert.That(
+            String.Equals(program, reference, StringComparison.Ordinal),
+            Is.True,
+            "CreateProcessW must not mutate the managed program-name string"
+        )
+
     [<Test>]
     member _.``a negative command timeout is rejected at configuration time``() =
         Assert.Throws<ArgumentOutOfRangeException>(
