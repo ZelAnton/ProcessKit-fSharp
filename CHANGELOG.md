@@ -21,8 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chain (e.g. `Encoding.GetBytes`, `List.ofSeq`).
 
 ### Fixed
-- `ProcessKitOptions.DefaultWorkingDirectory` now rejects empty, whitespace-only, and outer-whitespace
-  values during DI setup/binding instead of stamping an invalid directory onto a command and failing later at spawn.
+- `ProcessKitOptions.DefaultWorkingDirectory` now rejects empty or whitespace-only values during DI setup/binding instead of stamping an invalid directory onto a command and failing later at spawn.
 - `Exec.outputAll` and `Exec.outputAllBytes` now reject a null runner, command sequence, or command
   element immediately with a correctly named argument exception, before they start any command or
   report invalid input as an I/O failure.
