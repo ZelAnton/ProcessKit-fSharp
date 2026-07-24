@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `ProcessKit.Testing` now replays `Command.MergeStderr()` with one merged stdout stream, matching the real runner's empty stderr result and stdout-only streaming events.
 
 ### Changed
 - `ProcessKit.Testing`'s public API (`FakeProcess`, `Reply`, `ScriptedRunner`) now validates null

@@ -460,6 +460,15 @@ tool switching from line-buffered "dumb" output to full-screen TUI mode, a shell
 a prompt suppressing echo — is not reproducible with a fake or a cassette; only the *observable
 merged-stream shape* is. Test that child-tty behaviour against a real `Command.Pty` run.
 
+## Merged-stderr doubles
+
+A command built with `Command.MergeStderr()` (or F# `Command.mergeStderr`) is replayed by
+`ScriptedRunner` with the same observable contract as a real OS-level `2>&1`: scripted stderr is
+folded into stdout, `ProcessResult.Stderr` is empty, and `OutputEventsAsync()` emits only
+`OutputEvent.Stdout`. The fake places scripted stderr after scripted stdout, adding a newline when
+needed; it cannot reproduce the operating system's real byte interleaving. This is independent of
+PTY mode, so a merged-stderr command does not acquire PTY-only `ResizeAsync` support.
+
 ## Record and replay
 
 `RecordReplayRunner` (also in `ProcessKit.Testing`) closes the loop: record real
