@@ -24,6 +24,19 @@ type internal PtyResizeRecorder() =
     /// The last `(cols, rows)` requested, or `None` if no resize has been requested yet.
     member _.Last = lock gate (fun () -> last)
 
+/// Stores the bytes written to a `FakeProcess`'s interactive stdin. The backing `MemoryStream` stays
+/// inspectable through `ToArray` after the built `RunningProcess` has disposed it, matching a test's
+/// natural write-then-assert flow.
+[<Sealed>]
+type internal FakeStdinRecorder() =
+    let stream = new MemoryStream()
+
+    /// The writable in-memory stdin stream for a built keep-open fake.
+    member _.Stream = stream :> Stream
+
+    /// A snapshot of all bytes written so far, including after the stream has been disposed.
+    member _.Bytes = stream.ToArray()
+
 /// Builds an in-memory `RunningProcess` for unit-testing code that consumes a live handle —
 /// `StdoutLinesAsync` / `OutputEventsAsync` / `FinishAsync` / the readiness probes / the buffered verbs — without
 /// spawning a real process. Immutable and fluent; `Build()` returns a real `RunningProcess` whose
@@ -37,13 +50,20 @@ type internal PtyResizeRecorder() =
 [<Sealed>]
 type FakeProcess
     private
-    (template: Command, stdout: string, stderr: string, outcome: Outcome, pid: int option, pty: PtyResizeRecorder option)
-    =
+    (
+        template: Command,
+        stdout: string,
+        stderr: string,
+        outcome: Outcome,
+        pid: int option,
+        pty: PtyResizeRecorder option,
+        stdin: FakeStdinRecorder
+    ) =
 
     /// A fake of `program` that exits 0 with no output.
     static member Create(program: string) =
         ArgumentNullException.ThrowIfNull(program, nameof program)
-        FakeProcess(Command.create program, "", "", Outcome.Exited 0, None, None)
+        FakeProcess(Command.create program, "", "", Outcome.Exited 0, None, None, FakeStdinRecorder())
 
     /// A fake (named `"fake"`) that exits 0 with no output.
     static member Create() = FakeProcess.Create "fake"
@@ -52,37 +72,37 @@ type FakeProcess
     /// buffer, line handlers — so it behaves like a real run of that command. Internal: `ScriptedRunner`
     /// uses it so `SpawnAsync` and the capture verbs agree on success/encoding semantics.
     static member internal OfCommand(command: Command) =
-        FakeProcess(command, "", "", Outcome.Exited 0, None, None)
+        FakeProcess(command, "", "", Outcome.Exited 0, None, None, FakeStdinRecorder())
 
     /// The captured stdout the fake replays (split on `\n` into lines for the streaming verbs).
     member _.WithStdout(text: string) =
         ArgumentNullException.ThrowIfNull(text, nameof text)
-        FakeProcess(template, text, stderr, outcome, pid, pty)
+        FakeProcess(template, text, stderr, outcome, pid, pty, stdin)
 
     /// The captured stdout as a sequence of lines (joined with `\n`).
     member _.WithStdoutLines(lines: seq<string>) =
         ArgumentNullException.ThrowIfNull(lines, nameof lines)
-        FakeProcess(template, String.Join('\n', lines), stderr, outcome, pid, pty)
+        FakeProcess(template, String.Join('\n', lines), stderr, outcome, pid, pty, stdin)
 
     /// The captured stderr. On a PTY fake (see `WithPty`) or a `Command.MergeStderr()` fake there is no
     /// separate stderr stream: this text is folded into the single merged stdout stream rather than
     /// surfaced as `OutputEvent.Stderr`.
     member _.WithStderr(text: string) =
         ArgumentNullException.ThrowIfNull(text, nameof text)
-        FakeProcess(template, stdout, text, outcome, pid, pty)
+        FakeProcess(template, stdout, text, outcome, pid, pty, stdin)
 
     /// Make the fake exit with `code`.
     member _.WithExit(code: int) =
-        FakeProcess(template, stdout, stderr, Outcome.Exited code, pid, pty)
+        FakeProcess(template, stdout, stderr, Outcome.Exited code, pid, pty, stdin)
 
     /// Make the fake conclude with an explicit `Outcome` (e.g. `Outcome.TimedOut` or `Signalled`).
     member _.WithOutcome(value: Outcome) =
         ArgumentNullException.ThrowIfNull(value, nameof value)
-        FakeProcess(template, stdout, stderr, value, pid, pty)
+        FakeProcess(template, stdout, stderr, value, pid, pty, stdin)
 
     /// Set the pid the handle reports.
     member _.WithPid(value: int) =
-        FakeProcess(template, stdout, stderr, outcome, Some value, pty)
+        FakeProcess(template, stdout, stderr, outcome, Some value, pty, stdin)
 
     /// Model a pseudo-terminal (`Command.Pty`) run, so the built handle mirrors the observable
     /// merged-stream contract (ADR D3/D10):
@@ -103,7 +123,7 @@ type FakeProcess
     /// not reproducible here — only the *observable merged-stream shape* is. Test that child-tty
     /// behaviour against a real `Command.Pty` run. See `docs/testing.md`.
     member _.WithPty() =
-        FakeProcess(template, stdout, stderr, outcome, pid, Some(PtyResizeRecorder()))
+        FakeProcess(template, stdout, stderr, outcome, pid, Some(PtyResizeRecorder()), stdin)
 
     /// The last `(cols, rows)` requested via `ResizeAsync` on this fake's built PTY handle, or `None`
     /// if this is not a PTY fake (see `WithPty`) or no resize has been requested. Shared across the
@@ -112,6 +132,12 @@ type FakeProcess
         match pty with
         | Some recorder -> recorder.Last
         | None -> None
+
+    /// A snapshot of bytes written through `TakeStdin()` on built `KeepStdinOpen` handles. The fake
+    /// records raw bytes so tests can assert a command's exact stdin payload without an encoding assumption.
+    /// The recorder is shared across this fake's fluent chain and remains readable after `FinishAsync` or
+    /// process teardown closes the in-memory stream.
+    member _.StdinBytes: byte[] = stdin.Bytes
 
     /// Build a real `RunningProcess` over in-memory streams.
     member _.Build() : RunningProcess =
@@ -143,12 +169,17 @@ type FakeProcess
             else
                 Some(new MemoryStream(config.StderrEncoding.GetBytes stderr) :> Stream)
 
+        // Match the real spawn's capability boundary: `TakeStdin` has a writable pipe exactly for a
+        // KeepStdinOpen run. A fake does not feed `Command.Stdin` sources, so this in-memory sink is ready
+        // immediately and `StdinFeedComplete` below remains a no-op.
+        let stdinStream = if config.KeepStdinOpen then Some stdin.Stream else None
+
         let host: RunningHost =
             { Config = config
               Pid = pid
               Stdout = Some stdoutStream
               Stderr = stderrStream
-              Stdin = None
+              Stdin = stdinStream
               StartTime = DateTime.UtcNow
               StartedTimestamp = Stopwatch.GetTimestamp()
               // No real process backs a fake's pid (arbitrary via `WithPid`, or none), so there is no
@@ -156,8 +187,8 @@ type FakeProcess
               // read, leaving this fake's existing behaviour unchanged.
               StartTimeIdentity = None
               Wait = fun () -> Task.FromResult outcome
-              // A fake process feeds no stdin, so it never has a source failure to surface, and there is
-              // no source feeder for `TakeStdin` to wait on.
+              // A fake process feeds no stdin source, so it never has a source failure to surface. Its
+              // keep-open in-memory sink is ready immediately, with no feeder for `TakeStdin` to wait on.
               StdinError = fun () -> None
               StdinFeedComplete = ignore
               StartKill = fun () -> ()
@@ -178,6 +209,7 @@ type FakeProcess
                 fun () ->
                     stdoutStream.Dispose()
                     stderrStream |> Option.iter (fun s -> s.Dispose())
+                    stdinStream |> Option.iter (fun s -> s.Dispose())
                     ValueTask.CompletedTask }
 
         new RunningProcess(host)

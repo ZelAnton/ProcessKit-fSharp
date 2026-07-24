@@ -1518,6 +1518,59 @@ type PipelineTests() =
         :> Task
 
     [<Test>]
+    member _.``StartAsync preserves a timeout that expires between stage spawns``() : Task =
+        // Regression (T-200): delay the staging thread immediately after stage 0 has spawned, long enough
+        // for the pipeline deadline to fire before stage 1 can start. The staging gate must halt stage 1,
+        // reap stage 0, and return the deadline's typed error rather than silently reporting Cancelled.
+        task {
+            let configured = TimeSpan.FromMilliseconds 100.0
+            let pipeline = slowSilentStage.Pipe(slowSilentStage).Timeout configured
+
+            PipelineRunner.stageSpawnedTestHook <-
+                Some(fun index ->
+                    if index = 0 then
+                        Thread.Sleep 500)
+
+            try
+                let start = pipeline.StartAsync()
+                do! assertFinishesPromptly start
+
+                match! start with
+                | Error(ProcessError.Timeout(_, actual, _, _)) -> Assert.That(actual, Is.EqualTo configured)
+                | Error(ProcessError.Cancelled _) ->
+                    Assert.Fail "a staging deadline must not be downgraded to Cancelled"
+                | other -> Assert.Fail $"expected Timeout, got {other}"
+            finally
+                PipelineRunner.stageSpawnedTestHook <- None
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StartAsync reports external cancellation between stage spawns as Cancelled``() : Task =
+        // The same staging gate also receives `Pipeline.CancelOn`; it remains an external cancellation,
+        // not a timeout, even though the abort branch handles both after the common partial-chain teardown.
+        task {
+            use cts = new CancellationTokenSource()
+            let pipeline = slowSilentStage.Pipe(slowSilentStage).CancelOn cts.Token
+
+            PipelineRunner.stageSpawnedTestHook <-
+                Some(fun index ->
+                    if index = 0 then
+                        cts.Cancel())
+
+            try
+                let start = pipeline.StartAsync()
+                do! assertFinishesPromptly start
+
+                match! start with
+                | Error(ProcessError.Cancelled _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected Cancelled, got {other}"
+            finally
+                PipelineRunner.stageSpawnedTestHook <- None
+        }
+        :> Task
+
+    [<Test>]
     member _.``a streamed pipeline preserves the buffered pipefail outcome classification``() : Task =
         // The classification-parity criterion: the streaming `FinishAsync` reports the SAME pipefail
         // representative outcome the buffering `OutputStringAsync` does. Stage 0 exits 3 (a checked

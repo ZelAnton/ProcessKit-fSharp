@@ -49,6 +49,7 @@ type CliClient internal (config: CliClientConfig) =
         ArgumentNullException.ThrowIfNull configure
 
         let template = configure.Invoke config.Template
+        ArgumentNullException.ThrowIfNull(template, nameof configure)
 
         if Stdin.isOneShot template.Config.StdinSource then
             raise (

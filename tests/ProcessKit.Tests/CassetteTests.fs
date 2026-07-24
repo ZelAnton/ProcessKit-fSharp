@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.IO
 open System.Runtime.InteropServices
+open System.Security.Cryptography
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -320,6 +321,32 @@ type CassetteTests() =
                 match! recordThenProbe path inheritCmd plainCmd with
                 | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
                 | other -> Assert.Fail $"a no-stdin probe of an inherited-stdin recording should miss, got {other}"
+            })
+
+    [<Test>]
+    member _.``inherited stdin never aliases text that was the legacy inherit sentinel``() : Task =
+        withCassette (fun path ->
+            task {
+                let text =
+                    Command.create "prompt-tool" |> Command.stdin (Stdin.FromString "inherit-stdin")
+
+                let inherited = Command.create "prompt-tool" |> Command.inheritStdin
+
+                match! recordThenProbe path text inherited with
+                | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
+                | other -> Assert.Fail $"inherited stdin must not replay an in-memory sentinel string, got {other}"
+            })
+
+    [<Test>]
+    member _.``path-only file stdin never aliases text that was the legacy path sentinel``() : Task =
+        withCassette (fun path ->
+            task {
+                let text = Command.create "tool" |> Command.stdin (Stdin.FromString "file:/x")
+                let file = Command.create "tool" |> Command.stdin (Stdin.FromFile "/x")
+
+                match! recordThenProbe path text file with
+                | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
+                | other -> Assert.Fail $"path-only file stdin must not replay an in-memory path string, got {other}"
             })
 
     [<Test>]
@@ -1235,10 +1262,10 @@ type CassetteTests() =
                 | other -> Assert.Fail $"expected a rejected load for a missing Program, got {other}"
             })
 
-    // --- PTY recordings (Stage 5 — D3 merged stream, v4 schema bump, back-compat load) -------------
+    // --- PTY recordings and v5 stdin-key migration ---------------------------------------------------
 
     [<Test>]
-    member _.``recording a Command.Pty run writes a v4 cassette with the Pty flag and geometry``() : Task =
+    member _.``recording a Command.Pty run writes a v5 cassette with the Pty flag and geometry``() : Task =
         withCassette (fun path ->
             task {
                 do!
@@ -1253,7 +1280,7 @@ type CassetteTests() =
                     }
 
                 let onDisk = File.ReadAllText path
-                Assert.That(onDisk, Does.Contain "\"Version\": 4", "a PTY recording writes the v4 format")
+                Assert.That(onDisk, Does.Contain "\"Version\": 5", "a PTY recording writes the v5 format")
                 Assert.That(onDisk, Does.Contain "\"Pty\": true")
                 // PtyConfig.Default geometry is 80x24.
                 Assert.That(onDisk, Does.Contain "\"PtyCols\": 80")
@@ -1261,10 +1288,10 @@ type CassetteTests() =
             })
 
     [<Test>]
-    member _.``pre-v4 cassettes v1 v2 and v3 still load and replay as non-PTY under the v4 build``() : Task =
+    member _.``pre-v5 cassettes v1 v2 v3 and v4 still load and replay as non-PTY under the v5 build``() : Task =
         task {
-            // One hand-crafted fixture per legacy version. Each must load under the v4 build (a missing
-            // Pty field defaults to false / non-PTY) and replay its recorded stdout, proving the v1→v4
+            // One hand-crafted fixture per legacy version. Each must load under the v5 build (a missing
+            // Pty field defaults to false / non-PTY) and replay its recorded stdout, proving the v1→v5
             // back-compat load path, not just v1/v2.
             let fixtures =
                 [ 1,
@@ -1278,7 +1305,11 @@ type CassetteTests() =
                   3,
                   "legacy3",
                   "three",
-                  """{ "Version": 3, "Entries": [ { "Program": "legacy3", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "three", "Stderr": "" } ] }""" ]
+                  """{ "Version": 3, "Entries": [ { "Program": "legacy3", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "three", "Stderr": "" } ] }"""
+                  4,
+                  "legacy4",
+                  "four",
+                  """{ "Version": 4, "Entries": [ { "Program": "legacy4", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "four", "Stderr": "", "Pty": false } ] }""" ]
 
             for version, program, expected, json in fixtures do
                 let path = Path.GetTempFileName()
@@ -1287,7 +1318,7 @@ type CassetteTests() =
                     File.WriteAllText(path, json)
 
                     match RecordReplayRunner.Replay path with
-                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v4 build: {error}"
+                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v5 build: {error}"
                     | Ok replayer ->
                         match! (runner replayer).OutputStringAsync(Command.create program, CancellationToken.None) with
                         | Ok result ->
@@ -1298,6 +1329,28 @@ type CassetteTests() =
                     if File.Exists path then
                         File.Delete path
         }
+
+    [<Test>]
+    member _.``a v4 cassette with a legacy stdin digest still replays``() : Task =
+        withCassette (fun path ->
+            task {
+                let legacyDigest =
+                    SHA256.HashData(Encoding.UTF8.GetBytes "inherit-stdin") |> Convert.ToHexString
+
+                File.WriteAllText(
+                    path,
+                    $"""{{ "Version": 4, "Entries": [ {{ "Program": "legacy-stdin", "Args": [], "HasStdin": true, "StdinDigest": "{legacyDigest}", "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "old", "Stderr": "" }} ] }}"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a v4 cassette must load: {error}"
+                | Ok replayer ->
+                    let command = Command.create "legacy-stdin" |> Command.inheritStdin
+
+                    match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "old")
+                    | Error error -> Assert.Fail $"a v4 legacy stdin digest must replay: {error}"
+            })
 
     [<Test>]
     member _.``a redaction hook scrubs the merged PTY stream (an echoed credential) before it is stored``() : Task =

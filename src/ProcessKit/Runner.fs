@@ -177,7 +177,7 @@ module internal CaptureVerbs =
 
 /// The run verbs, expressed over any `IProcessRunner`. One verb, one meaning:
 ///
-/// - `run` — require a zero exit; return stdout, trailing whitespace trimmed.
+/// - `run` — require a zero/accepted exit; return stdout, trailing whitespace trimmed.
 /// - `outputString` / `outputBytes` — the full `ProcessResult`; a non-zero exit is data.
 /// - `exitCode` — the exit code; a signal kill or timeout errors instead of inventing one.
 /// - `probe` — read the exit code as a yes/no: 0 -> true, 1 -> false, anything else errors.
@@ -294,7 +294,7 @@ module Runner =
     let outputBytes (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
         withRetry command cancellationToken (fun command -> runner.CaptureBytesAsync(command, cancellationToken))
 
-    /// Require a zero exit and return stdout with trailing whitespace trimmed.
+    /// Require a zero/accepted exit and return stdout with trailing whitespace trimmed.
     let run
         (runner: IProcessRunner)
         (cancellationToken: CancellationToken)
