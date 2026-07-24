@@ -77,7 +77,12 @@ type CassetteEntry =
         Code: Nullable<int>
         /// Whether the run was terminated by a timeout.
         TimedOut: bool
-        /// The terminating signal number on POSIX, or `null` if the process was not signalled.
+        /// Whether the run was terminated by a signal. This distinguishes a signal whose number was
+        /// unavailable from a cassette entry with no recorded terminal state. Absent in a pre-v6 cassette
+        /// — defaults to `false`; a legacy non-null `Signal` still represents a signalled process.
+        Signalled: bool
+        /// The terminating signal number on POSIX, or `null` when the process was not signalled or its
+        /// signal number was unavailable.
         Signal: Nullable<int>
         /// Whether the captured output was truncated by an output-buffer policy (so a bounded-policy
         /// recording replays as truncated). Absent in a pre-1.x cassette — defaults to `false`.
@@ -236,8 +241,9 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // `Pty`/`PtyCols`/`PtyRows` (the merged-stream pseudo-terminal recording — D3). v5 prefixes stdin
     // digests by source domain, preventing an in-memory value from aliasing inherited stdin or a
     // path-only file source. v1-v4 digests still replay through the legacy key fallback. A pre-v4 entry
-    // with no `Pty` flag loads as a non-PTY recording (`Pty` defaults `false`, the geometry `null`).
-    static let currentFormatVersion = 5
+    // with no `Pty` flag loads as a non-PTY recording (`Pty` defaults `false`, the geometry `null`). v6
+    // adds `Signalled` so a signal with an unavailable number remains distinct from no terminal state.
+    static let currentFormatVersion = 6
 
     static let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
@@ -397,22 +403,24 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         slots
 
     // Reject an entry whose terminal-state fields are self-contradictory (more than one of
-    // TimedOut/Signal/Code set) or that is missing its required `Program` — a corrupted or hand-edited
-    // cassette, not a value a real recording ever produces. Absence of ALL THREE terminal-state fields
-    // is deliberately NOT rejected here: it is a legitimate (if degenerate) partial cassette and replays
-    // honestly as `Outcome.Unobserved` (see `outcomeOf`) rather than being rejected or fabricating a
-    // clean exit. The index identifies the offending entry without echoing any of its (possibly secret)
-    // content — `Program`/`Args`/`Stdout`/`Stderr` never appear in this message.
+    // TimedOut/(Signalled or Signal)/Code set) or that is missing its required `Program` — a corrupted
+    // or hand-edited cassette, not a value a real recording ever produces. Absence of every terminal
+    // state is deliberately NOT rejected here: it is a legitimate (if degenerate) partial cassette and
+    // replays honestly as `Outcome.Unobserved` (see `outcomeOf`) rather than being rejected or
+    // fabricating a clean exit. The index identifies the offending entry without echoing any of its
+    // (possibly secret) content — `Program`/`Args`/`Stdout`/`Stderr` never appear in this message.
     static let validateEntry (index: int) (entry: CassetteEntry) : Result<CassetteEntry, ProcessError> =
         let terminalStatesSet =
-            [ entry.TimedOut; entry.Signal.HasValue; entry.Code.HasValue ]
+            [ entry.TimedOut
+              entry.Signalled || entry.Signal.HasValue
+              entry.Code.HasValue ]
             |> List.filter id
             |> List.length
 
         if terminalStatesSet > 1 then
             Error(
                 ProcessError.Io
-                    $"cassette entry {index} has a contradictory terminal state (more than one of TimedOut/Signal/Code is set)"
+                    $"cassette entry {index} has a contradictory terminal state (more than one of TimedOut/Signalled/Signal/Code is set)"
             )
         elif String.IsNullOrWhiteSpace entry.Program then
             Error(ProcessError.Io $"cassette entry {index} is missing its required 'Program' field")
@@ -614,10 +622,11 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         |> Seq.sort
         |> Seq.toArray
 
-    let signalOf (outcome: Outcome) : Nullable<int> =
+    let signalOf (outcome: Outcome) : bool * Nullable<int> =
         match outcome with
-        | Outcome.Signalled(Some s) -> Nullable s
-        | _ -> Nullable()
+        | Outcome.Signalled(Some s) -> true, Nullable s
+        | Outcome.Signalled None -> true, Nullable()
+        | _ -> false, Nullable()
 
     let codeOf (code: int option) : Nullable<int> =
         match code with
@@ -639,6 +648,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // stderr to leak through.
     let entryOfText (command: Command) (result: ProcessResult<string>) (digest: string option) : CassetteEntry =
         let pty, ptyCols, ptyRows = ptyFieldsOf command
+        let signalled, signal = signalOf result.Outcome
 
         { Program = command.Program
           Args = Seq.toArray command.Config.Args
@@ -652,7 +662,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           StdoutBase64 = null
           Code = codeOf result.Code
           TimedOut = result.IsTimedOut
-          Signal = signalOf result.Outcome
+          Signalled = signalled
+          Signal = signal
           Truncated = result.Truncated
           DurationMs = result.Duration.TotalMilliseconds
           Pty = pty
@@ -663,6 +674,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // replay decodes the base64); stderr is text (redacted). The opaque bytes are not redacted.
     let entryOfBytes (command: Command) (result: ProcessResult<byte[]>) (digest: string option) : CassetteEntry =
         let pty, ptyCols, ptyRows = ptyFieldsOf command
+        let signalled, signal = signalOf result.Outcome
 
         { Program = command.Program
           Args = Seq.toArray command.Config.Args
@@ -676,30 +688,35 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           StdoutBase64 = Convert.ToBase64String result.Stdout
           Code = codeOf result.Code
           TimedOut = result.IsTimedOut
-          Signal = signalOf result.Outcome
+          Signalled = signalled
+          Signal = signal
           Truncated = result.Truncated
           DurationMs = result.Duration.TotalMilliseconds
           Pty = pty
           PtyCols = ptyCols
           PtyRows = ptyRows }
 
-    // The cassette schema records exactly the three "normal" outcomes (`TimedOut`/`Signal`/`Code`) a
-    // live run can be recorded as via `entryOfText`/`entryOfBytes`. `loadEntries`/`validateEntry` already
-    // rejected any entry setting more than one of them, so by the time an entry reaches here at most one
-    // is set. If NONE is set (an omitted / hand-crafted / pre-1.x entry, or a partial cassette the caller
-    // is still growing by hand) this is honestly `Outcome.Unobserved` — never a fabricated `Exited 0`.
-    // (`Outcome.Unobserved` itself is not one of the three recordable states, so a *live* one degrades to
-    // this same fallback on replay — an astronomically rare native-race edge case, not something a
+    // A v6 cassette explicitly records every signal through `Signalled`; `Signal` carries its optional
+    // number. A pre-v6 cassette lacks that marker, so a non-null legacy `Signal` still means a known
+    // signal. `loadEntries`/`validateEntry` rejected contradictory state before an entry reaches here.
+    // If none is set (an omitted / hand-crafted / pre-1.x entry, or a partial cassette the caller is
+    // still growing by hand) this is honestly `Outcome.Unobserved` — never a fabricated `Exited 0`.
+    // (`Outcome.Unobserved` itself is not one of the recordable states, so a *live* one degrades to this
+    // same fallback on replay — an astronomically rare native-race edge case, not something a
     // deterministic test fixture would ever intentionally set up.)
     let outcomeOf (entry: CassetteEntry) : Outcome =
         if entry.TimedOut then
             Outcome.TimedOut
-        elif entry.Signal.HasValue then
-            Outcome.Signalled(Some entry.Signal.Value)
+        elif entry.Signalled || entry.Signal.HasValue then
+            if entry.Signal.HasValue then
+                Outcome.Signalled(Some entry.Signal.Value)
+            else
+                Outcome.Signalled None
         elif entry.Code.HasValue then
             Outcome.Exited entry.Code.Value
         else
-            Outcome.Unobserved "cassette entry has no recorded terminal state (TimedOut/Signal/Code all absent)"
+            Outcome.Unobserved
+                "cassette entry has no recorded terminal state (TimedOut/Signalled/Signal/Code all absent)"
 
     // Decode a cassette entry's base64 stdout, reporting corruption as the SAME `ProcessError.Io` shape
     // regardless of which verb (string capture, bytes capture, or replayed `SpawnAsync`) is asking — a

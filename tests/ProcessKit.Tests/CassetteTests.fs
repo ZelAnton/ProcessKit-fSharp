@@ -1215,6 +1215,65 @@ type CassetteTests() =
             })
 
     [<Test>]
+    member _.``a v5 entry without the v6 signal marker keeps a missing terminal state Unobserved``() : Task =
+        withCassette (fun path ->
+            task {
+                // A v5 cassette predates `Signalled`; when every terminal-state member is absent it must
+                // retain the old, honest partial-cassette behavior rather than infer a signal.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 5, "Entries": [ { "Program": "legacy-partial", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "out", "Stderr": "" } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a v5 cassette must load: {error}"
+                | Ok replayer ->
+                    match!
+                        (runner replayer).CaptureStringAsync(Command.create "legacy-partial", CancellationToken.None)
+                    with
+                    | Ok result ->
+                        match result.Outcome with
+                        | Outcome.Unobserved _ -> ()
+                        | other ->
+                            Assert.Fail $"expected Outcome.Unobserved for a v5 missing terminal state, got {other}"
+                    | Error error -> Assert.Fail $"a v5 missing terminal state must still replay: {error}"
+            })
+
+    [<Test>]
+    member _.``recording and replaying Reply.Signalled preserves an unknown signal number``() : Task =
+        withCassette (fun path ->
+            task {
+                let scripted: IProcessRunner = ScriptedRunner().Fallback(Reply.Signalled())
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, scripted)
+
+                        match!
+                            (runner recorder).CaptureStringAsync(Command.create "signal-tool", CancellationToken.None)
+                        with
+                        | Ok result -> Assert.That(result.Outcome, Is.EqualTo(Outcome.Signalled None))
+                        | Error error -> Assert.Fail $"recording Reply.Signalled failed: {error}"
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                let onDisk = File.ReadAllText path
+                Assert.That(onDisk, Does.Contain "\"Signalled\": true", "the v6 marker must be persisted")
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    match!
+                        (runner replayer).CaptureStringAsync(Command.create "signal-tool", CancellationToken.None)
+                    with
+                    | Ok result -> Assert.That(result.Outcome, Is.EqualTo(Outcome.Signalled None))
+                    | Error error -> Assert.Fail $"replaying Reply.Signalled failed: {error}"
+            })
+
+    [<Test>]
     member _.``a contradictory terminal state is rejected at load, naming the offending entry's index``() : Task =
         withCassette (fun path ->
             task {
@@ -1262,10 +1321,10 @@ type CassetteTests() =
                 | other -> Assert.Fail $"expected a rejected load for a missing Program, got {other}"
             })
 
-    // --- PTY recordings and v5 stdin-key migration ---------------------------------------------------
+    // --- PTY recordings and cassette schema migrations -----------------------------------------------
 
     [<Test>]
-    member _.``recording a Command.Pty run writes a v5 cassette with the Pty flag and geometry``() : Task =
+    member _.``recording a Command.Pty run writes a v6 cassette with the Pty flag and geometry``() : Task =
         withCassette (fun path ->
             task {
                 do!
@@ -1280,7 +1339,7 @@ type CassetteTests() =
                     }
 
                 let onDisk = File.ReadAllText path
-                Assert.That(onDisk, Does.Contain "\"Version\": 5", "a PTY recording writes the v5 format")
+                Assert.That(onDisk, Does.Contain "\"Version\": 6", "a PTY recording writes the v6 format")
                 Assert.That(onDisk, Does.Contain "\"Pty\": true")
                 // PtyConfig.Default geometry is 80x24.
                 Assert.That(onDisk, Does.Contain "\"PtyCols\": 80")
@@ -1288,10 +1347,11 @@ type CassetteTests() =
             })
 
     [<Test>]
-    member _.``pre-v5 cassettes v1 v2 v3 and v4 still load and replay as non-PTY under the v5 build``() : Task =
+    member _.``pre-v6 cassettes v1 through v5 still load and replay as non-PTY under the v6 build``() : Task =
         task {
-            // One hand-crafted fixture per legacy version. Each must load under the v5 build (a missing
-            // Pty field defaults to false / non-PTY) and replay its recorded stdout, proving the v1→v5
+            // One hand-crafted fixture per legacy version. Each must load under the v6 build (a missing
+            // Pty field defaults to false / non-PTY, and a missing Signalled field preserves legacy
+            // signal behavior) and replay its recorded stdout, proving the v1→v6
             // back-compat load path, not just v1/v2.
             let fixtures =
                 [ 1,
@@ -1309,7 +1369,11 @@ type CassetteTests() =
                   4,
                   "legacy4",
                   "four",
-                  """{ "Version": 4, "Entries": [ { "Program": "legacy4", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "four", "Stderr": "", "Pty": false } ] }""" ]
+                  """{ "Version": 4, "Entries": [ { "Program": "legacy4", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "four", "Stderr": "", "Pty": false } ] }"""
+                  5,
+                  "legacy5",
+                  "five",
+                  """{ "Version": 5, "Entries": [ { "Program": "legacy5", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "five", "Stderr": "", "Pty": false } ] }""" ]
 
             for version, program, expected, json in fixtures do
                 let path = Path.GetTempFileName()
@@ -1318,7 +1382,7 @@ type CassetteTests() =
                     File.WriteAllText(path, json)
 
                     match RecordReplayRunner.Replay path with
-                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v5 build: {error}"
+                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v6 build: {error}"
                     | Ok replayer ->
                         match! (runner replayer).OutputStringAsync(Command.create program, CancellationToken.None) with
                         | Ok result ->

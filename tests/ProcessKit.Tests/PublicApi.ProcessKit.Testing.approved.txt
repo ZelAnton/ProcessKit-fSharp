@@ -9,7 +9,7 @@ class ProcessKit.Testing.CassetteEntry
   member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
   member ToString() : System.String
   new()
-  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double, System.Boolean, System.Nullable<System.Int32>, System.Nullable<System.Int32>)
+  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double, System.Boolean, System.Nullable<System.Int32>, System.Nullable<System.Int32>)
   property Args : System.String[] { get; set }
   property Code : System.Nullable<System.Int32> { get; set }
   property Cwd : System.String { get; set }
@@ -22,6 +22,7 @@ class ProcessKit.Testing.CassetteEntry
   property PtyCols : System.Nullable<System.Int32> { get; set }
   property PtyRows : System.Nullable<System.Int32> { get; set }
   property Signal : System.Nullable<System.Int32> { get; set }
+  property Signalled : System.Boolean { get; set }
   property Stderr : System.String { get; set }
   property StdinDigest : System.String { get; set }
   property Stdout : System.String { get; set }

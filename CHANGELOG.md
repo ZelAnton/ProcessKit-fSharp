@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `CliClient.WithDefaults` now rejects one-shot stdin sources (`FromStream`, `FromLines`, and
   `FromAsyncLines`) with `ArgumentException`; attach them to an individual `client.Command(...)` instead.
+- `RecordReplayRunner` now writes cassette format **v6**, which explicitly records a signal whose number
+  is unavailable. Existing v1–v5 cassettes remain readable.
 - `RecordReplayRunner` now writes cassette format **v5**: stdin digests are source-domain-prefixed, so a literal in-memory input can no longer alias inherited stdin or a path-only file source. Existing v1–v4 cassettes still replay with their legacy key scheme.
 - `ProcessKit.Testing`'s public API (`FakeProcess`, `Reply`, `ScriptedRunner`) now validates null
   arguments at the entry point with `ArgumentNullException`, matching the main package's convention —
@@ -24,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `ProcessKitOptions.DefaultWorkingDirectory` now rejects empty or whitespace-only values during DI setup/binding instead of stamping an invalid directory onto a command and failing later at spawn.
+- `RecordReplayRunner` now preserves `Outcome.Signalled None` when recording and replaying a cassette,
+  instead of degrading it to an unobserved terminal state.
 - `CliClient.WithDefaults` now rejects a `configure` callback that returns `null` at the API boundary,
   with a correctly named `ArgumentNullException` instead of a later `NullReferenceException`.
 - `RecordReplayRunner` now keeps inherited stdin, path-only file stdin, and in-memory stdin in distinct
