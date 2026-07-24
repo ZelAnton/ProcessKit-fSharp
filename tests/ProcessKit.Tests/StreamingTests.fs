@@ -1283,6 +1283,45 @@ type StreamingTests() =
         }
         :> Task
 
+    [<Test>]
+    member _.``StdoutLinesAsync stderr capture bounds a newline-free flood under a byte cap (T-191)``() : Task =
+        task {
+            // T-191: the stdout streaming session's stderr capture (`FinishAsync`'s `Stderr`, backed by
+            // `stderrStreamBuffer`, a `Pump.LineBuffer` under `config.OutputBuffer`) must share
+            // `pumpToBuffer`'s in-flight byte cap — `StreamChannel.pumpLines` passes
+            // `config.OutputBuffer.MaxBytes` into the stderr pump so a newline-free stderr flood
+            // force-flushes segments into that `LineBuffer`'s policy instead of growing the pump's
+            // in-flight `StringBuilder` without bound. The stdout channel itself stays uncapped (a
+            // consumer-paced whole-line contract, unaffected by this fix) — this test only exercises
+            // the stderr side, through `StdoutLinesAsync()` + `FinishAsync()` exactly as a real consumer
+            // would use them.
+            let cap = 64
+            let stdoutPayload = "out-line\n"
+            let stderrPayload = String('x', 100_000)
+
+            let config =
+                (Command.create "test"
+                 |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes cap))
+                    .Config
+
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes stdoutPayload) :> Stream
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes stderrPayload) :> Stream
+            use running = syntheticProcessOverStreams config (Some stdout) (Some stderr)
+
+            let! lines = collect (running.StdoutLinesAsync())
+            Assert.That(lines, Does.Contain "out-line")
+
+            match! running.FinishAsync() with
+            | Ok finished ->
+                Assert.That(
+                    Encoding.UTF8.GetByteCount finished.Stderr,
+                    Is.LessThanOrEqualTo cap,
+                    "the in-flight cap must bound the reassembled stderr, not just the streamed stdout"
+                )
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
     // --- OutputBytesAsync honours the OutputBuffer byte cap + overflow (T-011) ---
 
     [<Test>]
