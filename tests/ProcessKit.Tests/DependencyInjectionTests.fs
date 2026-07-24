@@ -168,6 +168,44 @@ type DependencyInjectionTests() =
         Assert.That(options.DefaultTimeout.HasValue, Is.False)
 
     [<Test>]
+    member _.``ProcessKitOptions.DefaultWorkingDirectory validates and applies a default``() : Task =
+        let options = ProcessKitOptions()
+
+        for invalidDirectory in [ ""; "   "; " /app"; "/app " ] do
+            let thrown =
+                match
+                    Assert.Throws<ArgumentException>(
+                        Action(fun () -> options.DefaultWorkingDirectory <- invalidDirectory)
+                    )
+                with
+                | null -> failwith "Expected DefaultWorkingDirectory validation to throw ArgumentException."
+                | exceptionThrown -> exceptionThrown
+
+            Assert.That(thrown.ParamName, Is.EqualTo "DefaultWorkingDirectory")
+            Assert.That(thrown.Message, Does.Contain "DefaultWorkingDirectory")
+
+        options.DefaultWorkingDirectory <- null
+        Assert.That(options.DefaultWorkingDirectory, Is.Null)
+
+        options.DefaultWorkingDirectory <- "/app"
+        options.DefaultWorkingDirectory <- null
+        Assert.That(options.DefaultWorkingDirectory, Is.Null)
+
+        task {
+            let inner = DiCapturingRunner()
+            options.DefaultWorkingDirectory <- "/app"
+            let runner = DefaultsRunner(inner, options) :> IProcessRunner
+
+            let! _ = runner.CaptureStringAsync(Command.create "tool", CancellationToken.None)
+            Assert.That(inner.Last.Value.Config.WorkingDirectory, Is.EqualTo(Some "/app"))
+
+            let own = Command.create "tool" |> Command.currentDir "/command-directory"
+            let! _ = runner.CaptureStringAsync(own, CancellationToken.None)
+            Assert.That(inner.Last.Value.Config.WorkingDirectory, Is.EqualTo(Some "/command-directory"))
+        }
+        :> Task
+
+    [<Test>]
     member _.``AddProcessKit(configure) applies the default timeout to a resolved run``() : Task =
         task {
             let services = ServiceCollection()

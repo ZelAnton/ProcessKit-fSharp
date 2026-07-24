@@ -14,6 +14,7 @@ open System
 [<Sealed>]
 type ProcessKitOptions() =
     let mutable defaultTimeout: Nullable<TimeSpan> = Nullable()
+    let mutable defaultWorkingDirectory: string | null = null
 
     /// A default run timeout applied when a command sets none. `null` (the default) means no timeout.
     /// A negative value is rejected at assignment (`ArgumentOutOfRangeException`) — validated here,
@@ -28,5 +29,20 @@ type ProcessKitOptions() =
             defaultTimeout <- value
 
     /// A default working directory applied when a command sets none. `null` (the default) means the
-    /// process inherits the current directory.
-    member val DefaultWorkingDirectory: string | null = null with get, set
+    /// process inherits the current directory. Empty, whitespace-only, and outer-whitespace values are
+    /// rejected at assignment (`ArgumentException`), so configuration mistakes surface during setup.
+    member _.DefaultWorkingDirectory
+        with get () = defaultWorkingDirectory
+        and set (value: string | null) =
+            match value with
+            | null -> defaultWorkingDirectory <- null
+            | nonNull ->
+                if String.IsNullOrWhiteSpace nonNull || nonNull <> nonNull.Trim() then
+                    raise (
+                        ArgumentException(
+                            "DefaultWorkingDirectory must not be empty, whitespace-only, or contain leading or trailing whitespace.",
+                            "DefaultWorkingDirectory"
+                        )
+                    )
+
+                defaultWorkingDirectory <- nonNull
