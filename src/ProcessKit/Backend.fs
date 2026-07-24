@@ -703,20 +703,36 @@ type internal ProcessGroupBackend() =
                     untrack pgid |> ignore
 
         member _.GracefulKillTree(grace) =
-            // Snapshot the pgids once so terminate and the final force-kill act on the same set; each
-            // delivery is gated through the choke, so a pgid recycled since it was tracked gets neither
-            // the SIGTERM nor the SIGKILL (the poll's `anyChildAlive` is choke-gated too).
+            // Snapshot the pgids and their identity tokens together. The poll runs off the lifecycle lock,
+            // so concurrent HardRelease may remove live entries from `identities`; all three poll phases
+            // must keep using the token captured while this graceful shutdown owned the pgid snapshot.
             let pgids = children.Snapshot()
+
+            let identitySnapshot =
+                pgids
+                |> List.map (fun pgid ->
+                    pgid,
+                    match identities.TryGetValue pgid with
+                    | true, token -> token
+                    | false, _ -> None)
+                |> Map.ofList
+
+            let stillOursSnap (pgid: int) : bool =
+                match Map.tryFind pgid identitySnapshot with
+                | Some token -> Native.Posix.processGroupStillTracked pgid token
+                | None -> false
+
+            let anyChildAliveSnap () = pgids |> List.exists stillOursSnap
 
             GracefulTeardown.poll
                 (fun () ->
                     for pgid in pgids do
-                        if stillOurs pgid then
+                        if stillOursSnap pgid then
                             Native.Posix.terminateProcessGroup pgid)
-                anyChildAlive
+                anyChildAliveSnap
                 (fun () ->
                     for pgid in pgids do
-                        if stillOurs pgid then
+                        if stillOursSnap pgid then
                             Native.Posix.killProcessGroup pgid)
                 grace
 

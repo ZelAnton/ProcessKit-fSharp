@@ -170,7 +170,7 @@ Tracked process handles pin PID identity until release, preventing a stored cons
 
 ### POSIX process groups
 
-`ProcessGroupBackend` is used on macOS/BSD and on Linux when limits are not requested. Every `posix_spawn` child becomes leader of its own process group (`pgid = pid`); one ProcessKit group may therefore track several pgids. `killpg` reaches descendants that remain in each group. Signals, `SIGSTOP`, and `SIGCONT` are broadcast per tracked pgid.
+`ProcessGroupBackend` is used on macOS/BSD and on Linux when limits are not requested. Every `posix_spawn` child becomes leader of its own process group (`pgid = pid`); one ProcessKit group may therefore track several pgids. `killpg` reaches descendants that remain in each group. Signals, `SIGSTOP`, and `SIGCONT` are broadcast per tracked pgid. Tracking records each leader's start-time identity so a recycled pgid is never signalled; graceful shutdown snapshots both the pgids and those identity tokens before its off-lock `SIGTERM` → poll → `SIGKILL` sequence, preserving that guard if concurrent teardown removes the live tracking entry.
 
 `Native.Posix` maintains a process-wide pending-wait registry keyed by PID and lazily installs one managed `SIGCHLD` registration. The handler performs non-blocking `waitpid(..., WNOHANG)` scans and completes the corresponding waiter. `reapLeader` uses a short bounded non-blocking retry loop for teardown, avoiding a permanently blocked teardown thread if a child is stuck in uninterruptible kernel sleep.
 
