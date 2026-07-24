@@ -319,6 +319,14 @@ module internal Posix =
     /// `resolveProgram "setsid"` PATH probe.
     let mutable ptyCttyHelperAvailableForTests: (unit -> bool) option = None
 
+    /// Test seams (internal, not public API): replace the raw pty reads/writes so `PtyStream` can be
+    /// exercised without a real descriptor. Production leaves both `None` and calls libc directly.
+    let mutable ptyReadForTests: (int -> nativeint -> nativeint -> nativeint) option =
+        None
+
+    let mutable ptyWriteForTests: (int -> nativeint -> nativeint -> nativeint) option =
+        None
+
     // Fire the group-delivery test observer (if installed) with the target pgid BEFORE the syscall, so a
     // test can record exactly which pgids a signal/kill path delivered to — and so it can never perturb
     // the errno a delivery classification reads immediately after the call. A single `Option` check in
@@ -764,6 +772,18 @@ module internal Posix =
     type internal PtyStream(handle: Microsoft.Win32.SafeHandles.SafeFileHandle) =
         inherit Stream()
 
+        // Match Stream.ValidateBufferArguments before pinning the caller's buffer or calculating a native
+        // pointer. `buffer.Length - offset` avoids an overflowing `offset + count` check.
+        let validateBufferArguments (buffer: byte[]) (offset: int) (count: int) =
+            if offset < 0 then
+                raise (ArgumentOutOfRangeException(nameof offset, "Offset must be non-negative."))
+
+            if count < 0 then
+                raise (ArgumentOutOfRangeException(nameof count, "Count must be non-negative."))
+
+            if offset > buffer.Length - count then
+                raise (ArgumentException("Offset and count must refer to a location within the buffer."))
+
         // Run one libc read/write (`op`) against the owned fd with the caller's buffer pinned at `offset`,
         // holding a ref on the SafeHandle so `Dispose` cannot close the fd underneath the syscall.
         let withPinnedFd (buffer: byte[]) (offset: int) (op: int -> nativeint -> nativeint) : nativeint =
@@ -799,12 +819,17 @@ module internal Posix =
             raise (NotSupportedException "a pty master stream has no length")
 
         override _.Read(buffer, offset, count) =
+            validateBufferArguments buffer offset count
+
             if count = 0 then
                 0
             else
                 let rec attempt () =
                     let n =
-                        withPinnedFd buffer offset (fun fd ptr -> ptyReadRaw (fd, ptr, nativeint count))
+                        withPinnedFd buffer offset (fun fd ptr ->
+                            match ptyReadForTests with
+                            | Some read -> read fd ptr (nativeint count)
+                            | None -> ptyReadRaw (fd, ptr, nativeint count))
 
                     if n >= 0n then
                         int n
@@ -821,16 +846,23 @@ module internal Posix =
                 attempt ()
 
         override _.Write(buffer, offset, count) =
+            validateBufferArguments buffer offset count
+
             let mutable written = 0
 
             while written < count do
                 let remaining = count - written
 
                 let n =
-                    withPinnedFd buffer (offset + written) (fun fd ptr -> ptyWriteRaw (fd, ptr, nativeint remaining))
+                    withPinnedFd buffer (offset + written) (fun fd ptr ->
+                        match ptyWriteForTests with
+                        | Some write -> write fd ptr (nativeint remaining)
+                        | None -> ptyWriteRaw (fd, ptr, nativeint remaining))
 
-                if n >= 0n then
+                if n > 0n then
                     written <- written + int n
+                elif n = 0n then
+                    raise (IOException "write to the pty master made no progress")
                 else
                     let errno = Marshal.GetLastWin32Error()
 

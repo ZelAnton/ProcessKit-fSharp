@@ -6,6 +6,7 @@ open System.IO
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
+open Microsoft.Win32.SafeHandles
 open NUnit.Framework
 open ProcessKit
 
@@ -34,6 +35,9 @@ type PtyTests() =
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
     let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
     let runner: IProcessRunner = JobRunner()
+
+    let ptyStreamForTests () =
+        new Native.Posix.PtyStream(new SafeFileHandle(IntPtr.Zero, ownsHandle = false))
 
     // Collect an async sequence (the streaming event/line verbs) into a list for assertions.
     let collect (items: IAsyncEnumerable<'T>) =
@@ -69,6 +73,72 @@ type PtyTests() =
         (Command.create "cmd").Pty(100, 40) |> ignore
         (Command.create "cmd").Pty({ Cols = 120; Rows = 30; Echo = false }) |> ignore
         (Command.create "cmd" |> Command.pty) |> ignore
+
+    [<Test>]
+    member _.``PtyStream rejects invalid buffer ranges before native I/O``() =
+        let mutable readCalls = 0
+        let mutable writeCalls = 0
+
+        Native.Posix.ptyReadForTests <-
+            Some(fun _ _ _ ->
+                readCalls <- readCalls + 1
+                0n)
+
+        Native.Posix.ptyWriteForTests <-
+            Some(fun _ _ _ ->
+                writeCalls <- writeCalls + 1
+                1n)
+
+        try
+            use stream = ptyStreamForTests ()
+            let buffer = Array.zeroCreate<byte> 2
+
+            Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> stream.Read(buffer, -1, 1) |> ignore))
+            |> ignore
+
+            Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> stream.Read(buffer, 0, -1) |> ignore))
+            |> ignore
+
+            Assert.Throws<ArgumentException>(Action(fun () -> stream.Read(buffer, 1, 2) |> ignore))
+            |> ignore
+
+            Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> stream.Write(buffer, -1, 1)))
+            |> ignore
+
+            Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> stream.Write(buffer, 0, -1)))
+            |> ignore
+
+            Assert.Throws<ArgumentException>(Action(fun () -> stream.Write(buffer, 1, 2)))
+            |> ignore
+        finally
+            Native.Posix.ptyReadForTests <- None
+            Native.Posix.ptyWriteForTests <- None
+
+        Assert.That(readCalls, Is.Zero, "invalid reads must not reach native I/O")
+        Assert.That(writeCalls, Is.Zero, "invalid writes must not reach native I/O")
+
+    [<Test>]
+    member _.``PtyStream turns a zero-byte write into an I/O error``() =
+        let mutable writeCalls = 0
+
+        Native.Posix.ptyWriteForTests <-
+            Some(fun _ _ _ ->
+                writeCalls <- writeCalls + 1
+                0n)
+
+        try
+            use stream = ptyStreamForTests ()
+
+            let checkException() =
+                let ex = Assert.Throws<IOException>(Action(fun () -> stream.Write([| 1uy |], 0, 1)))
+                match ex with
+                | null -> failwith "expected a zero-byte write to throw IOException"
+                | ex -> Assert.That(ex.Message, Does.Contain "made no progress")
+            checkException()
+        finally
+            Native.Posix.ptyWriteForTests <- None
+
+        Assert.That(writeCalls, Is.EqualTo 1, "a zero-byte write must fail instead of retrying indefinitely")
 
     [<Test>]
     member _.``Pty rejects a non-positive number of columns``() =
