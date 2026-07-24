@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- Fixed latent masking of the original read/write stream error when cancellation interrupted a tee-sink flush.
 
 ## [2.7.0] - 2026-07-24
 
