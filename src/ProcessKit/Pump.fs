@@ -722,7 +722,7 @@ module internal Pump =
             with ex ->
                 fault <- Some ex
 
-            do! flushTeeQuietly tee cancellationToken
+            do! flushTeeQuietly tee
 
             match fault with
             | Some ex -> ExceptionDispatchInfo.Throw ex
