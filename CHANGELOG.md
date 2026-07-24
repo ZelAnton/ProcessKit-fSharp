@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chain (e.g. `Encoding.GetBytes`, `List.ofSeq`).
 
 ### Fixed
+- `Exec.outputAll` and `Exec.outputAllBytes` now reject a null runner, command sequence, or command
+  element immediately with a correctly named argument exception, before they start any command or
+  report invalid input as an I/O failure.
 - A `HostedProcessService.Dispose()` that races the very start of its background supervision no longer publishes a spurious `LastOutcome = Error` (nor logs "supervision failed"). `Dispose()` disposes its lifetime `CancellationTokenSource` without awaiting the supervision task; the background start now reads a snapshot of that token taken before disposal instead of the live getter, so a routine teardown that overlaps startup is reported as a clean cancellation, exactly like a non-racing `Dispose()`.
 - The stdout streaming session's stderr capture (`StdoutLinesAsync()` + `FinishAsync().Stderr`) now honours `OutputBufferPolicy.MaxBytes` as an in-flight cap the same way the buffered verbs do, so a newline-free stderr flood can no longer grow the pump's assembly buffer past the configured cap.
 

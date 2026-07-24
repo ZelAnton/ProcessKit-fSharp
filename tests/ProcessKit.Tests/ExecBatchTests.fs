@@ -58,8 +58,136 @@ type private CaptureCancellingRunner() =
         member _.SpawnAsync(_command, _cancellationToken) =
             failwith "this test runner only supports text capture"
 
+/// Records capture attempts so batch argument validation can prove it ran before any command started.
+type private BoundaryValidationRunner() =
+    let mutable captureCount = 0
+
+    member _.CaptureCount = Volatile.Read(&captureCount)
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Interlocked.Increment(&captureCount) |> ignore
+            failwith "invalid batch input must fail before text capture starts"
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Interlocked.Increment(&captureCount) |> ignore
+            failwith "invalid batch input must fail before bytes capture starts"
+
+        member _.SpawnAsync(_command, _cancellationToken) =
+            failwith "this test runner only supports capture"
+
 [<TestFixture>]
 type ExecBatchTests() =
+
+    [<Test>]
+    member _.``outputAll rejects a null runner at the boundary``() =
+        let runner = Unchecked.defaultof<IProcessRunner>
+
+        let ex =
+            Assert.Throws<ArgumentNullException>(
+                Action(fun () ->
+                    Exec.outputAll 1 runner [ Command.create "must-not-run" ] CancellationToken.None
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail("Assert.Throws did not return an exception.")
+        | ex -> Assert.That(ex.ParamName, Is.EqualTo "runner")
+
+    [<Test>]
+    member _.``outputAll rejects null commands before starting capture``() =
+        let runner = BoundaryValidationRunner()
+        let commands = Unchecked.defaultof<seq<Command>>
+
+        let ex =
+            Assert.Throws<ArgumentNullException>(
+                Action(fun () ->
+                    Exec.outputAll 1 (runner :> IProcessRunner) commands CancellationToken.None
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail("Assert.Throws did not return an exception.")
+        | ex -> Assert.That(ex.ParamName, Is.EqualTo "commands")
+
+        Assert.That(runner.CaptureCount, Is.Zero)
+
+    [<Test>]
+    member _.``outputAll rejects a null command before starting capture``() =
+        let runner = BoundaryValidationRunner()
+        let nullCommand = Unchecked.defaultof<Command>
+
+        let ex =
+            Assert.Throws<ArgumentException>(
+                Action(fun () ->
+                    Exec.outputAll
+                        1
+                        (runner :> IProcessRunner)
+                        [| Command.create "must-not-run"; nullCommand |]
+                        CancellationToken.None
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail("Assert.Throws did not return an exception.")
+        | ex -> Assert.That(ex.ParamName, Is.EqualTo "commands")
+
+        Assert.That(runner.CaptureCount, Is.Zero)
+
+    [<Test>]
+    member _.``outputAllBytes rejects a null runner at the boundary``() =
+        let runner = Unchecked.defaultof<IProcessRunner>
+
+        let ex =
+            Assert.Throws<ArgumentNullException>(
+                Action(fun () ->
+                    Exec.outputAllBytes 1 runner [ Command.create "must-not-run" ] CancellationToken.None
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail("Assert.Throws did not return an exception.")
+        | ex -> Assert.That(ex.ParamName, Is.EqualTo "runner")
+
+    [<Test>]
+    member _.``outputAllBytes rejects null commands before starting capture``() =
+        let runner = BoundaryValidationRunner()
+        let commands = Unchecked.defaultof<seq<Command>>
+
+        let ex =
+            Assert.Throws<ArgumentNullException>(
+                Action(fun () ->
+                    Exec.outputAllBytes 1 (runner :> IProcessRunner) commands CancellationToken.None
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail("Assert.Throws did not return an exception.")
+        | ex -> Assert.That(ex.ParamName, Is.EqualTo "commands")
+
+        Assert.That(runner.CaptureCount, Is.Zero)
+
+    [<Test>]
+    member _.``outputAllBytes rejects a null command before starting capture``() =
+        let runner = BoundaryValidationRunner()
+        let nullCommand = Unchecked.defaultof<Command>
+
+        let ex =
+            Assert.Throws<ArgumentException>(
+                Action(fun () ->
+                    Exec.outputAllBytes
+                        1
+                        (runner :> IProcessRunner)
+                        [| Command.create "must-not-run"; nullCommand |]
+                        CancellationToken.None
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail("Assert.Throws did not return an exception.")
+        | ex -> Assert.That(ex.ParamName, Is.EqualTo "commands")
+
+        Assert.That(runner.CaptureCount, Is.Zero)
 
     [<Test>]
     member _.``outputAll cancels queued commands without changing completed results``() : Task =

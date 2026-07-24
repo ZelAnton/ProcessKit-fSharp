@@ -44,18 +44,30 @@ module Exec =
     let outputBytes (program: string) (args: seq<string>) =
         (Command.create program |> Command.args args).OutputBytesAsync()
 
+    // Validate and materialize a batch before starting any capture. This keeps programmer errors out
+    // of the per-command exception boundary, where they would otherwise be misreported as `Io`.
+    let private prepareBatch (runner: IProcessRunner) (commands: seq<Command>) : Command[] =
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(commands, nameof commands)
+
+        let items = Seq.toArray commands
+
+        if items |> Array.exists (fun command -> obj.ReferenceEquals(command, null)) then
+            raise (ArgumentException("commands must not contain a null element", nameof commands))
+
+        items
+
     // Run every command through `runner`, capping how many are live at once, and collect ALL results
     // in input order — the batch never short-circuits. `capture` selects the text / bytes verb.
     let private runAll
         (concurrency: int)
         (runner: IProcessRunner)
-        (commands: seq<Command>)
+        (items: Command[])
         (cancellationToken: CancellationToken)
         (capture: IProcessRunner -> Command -> Task<Result<ProcessResult<'T>, ProcessError>>)
         : Task<Result<ProcessResult<'T>, ProcessError>[]> =
         task {
             let limit = max 1 concurrency
-            let items = Seq.toArray commands
             use gate = new SemaphoreSlim(limit, limit)
 
             let runOne (command: Command) =
@@ -102,7 +114,8 @@ module Exec =
         // Route through the verb layer (not the raw seam) so each command's own `Retry` policy applies,
         // matching `cmd.OutputStringAsync()` / `CliClient.OutputStringAsync` — retry still fires only on a genuine
         // error, never on a non-zero exit (which stays data).
-        runAll concurrency runner commands cancellationToken (fun r c -> Runner.outputString r cancellationToken c)
+        let items = prepareBatch runner commands
+        runAll concurrency runner items cancellationToken (fun r c -> Runner.outputString r cancellationToken c)
 
     /// The raw-bytes companion to `outputAll` — captures each command's stdout as bytes.
     let outputAllBytes
@@ -111,4 +124,5 @@ module Exec =
         (commands: seq<Command>)
         (cancellationToken: CancellationToken)
         =
-        runAll concurrency runner commands cancellationToken (fun r c -> Runner.outputBytes r cancellationToken c)
+        let items = prepareBatch runner commands
+        runAll concurrency runner items cancellationToken (fun r c -> Runner.outputBytes r cancellationToken c)
