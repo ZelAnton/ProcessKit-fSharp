@@ -267,20 +267,41 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
             // The pty-resize closure, built ONLY for a `Command.Pty` run — a retained pseudoconsole
             // handle / pty master fd survives in `spawned.PtyControl`; a non-PTY run leaves it `None`, so
-            // `RunningProcess.ResizeAsync` reports a typed `Unsupported` (D6). The resize touches neither the
-            // container's release state nor the exit-wait/reap ledger, so — unlike the kill closures — it
-            // needs no `sync`/`killWhenLive` gating. `spawned.Handle` is the child pid on POSIX (the
-            // `SIGWINCH` target); on Windows the resize goes through the pseudoconsole handle alone.
+            // `RunningProcess.ResizeAsync` reports a typed `Unsupported` (D6). `spawned.Handle` is the child
+            // pid on POSIX (the `SIGWINCH` target); on Windows the resize goes through the pseudoconsole
+            // handle alone.
+            //
+            // Gated through the SAME `sync`/`releasedFlag` + `runTornDown` lifecycle gate as the kill
+            // closures above (T-203, mirroring T-093). `RunningProcess.ResizeAsync` is a fire-and-forget
+            // verb a caller can invoke at ANY time — after a terminal verb's `reapGuard` has concluded and
+            // reaped this run, or after the handle was disposed. Either teardown's `closeStreams` closes the
+            // pty master fd (POSIX) / pseudoconsole handle (Windows) held in `spawned.PtyControl`. Unlike a
+            // recycled *pid*, an fd NUMBER is reused IMMEDIATELY by the same process, so a late UNGATED
+            // resize would `ioctl(TIOCSWINSZ)` a STRANGER's fd — a concurrent run's socketpair/pty/redirect
+            // that inherited the number (a wrong-target mutation, or a misleading `Io` failure) — and
+            // deliver `SIGWINCH` to a possibly-recycled pid: exactly the wrong-target class T-083/T-084/
+            // T-093/T-097 closed for the kill/signal/metrics paths. On Windows the `hPC` can likewise be
+            // closed and its value recycled onto an unrelated object (a use-after-close). Running the
+            // released/torn-down check AND the native resize in ONE critical section refuses a post-teardown
+            // resize with a typed, non-transient `Unsupported` (as `WhenLive` does for a released group)
+            // BEFORE touching native — the resize either fires fully on the live pty or observes the flag and
+            // no-ops before native, never half of each. A live run resizes exactly as before, and this keeps
+            // `ResizeAsync` non-consuming (K-031). Bounded native work under the lock — an `ioctl` + best-
+            // effort `SIGWINCH`, or one `ResizePseudoConsole` — exactly like `killWhenLive`/`Signal`.
             let resizePty =
                 spawned.PtyControl
                 |> Option.map (fun control ->
                     let childHandle = spawned.Handle
 
                     fun (cols: int, rows: int) ->
-                        if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
-                            Native.Windows.resizePseudoConsole control cols rows
-                        else
-                            Native.Posix.resizePty control childHandle cols rows)
+                        lock sync (fun () ->
+                            if releasedFlag = 0 && not runTornDown then
+                                if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                                    Native.Windows.resizePseudoConsole control cols rows
+                                else
+                                    Native.Posix.resizePty control childHandle cols rows
+                            else
+                                Error(ProcessError.Unsupported "the run has been torn down")))
 
             { Config = command.Config
               Pid = pid
