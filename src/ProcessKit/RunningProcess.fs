@@ -413,14 +413,29 @@ type RunningProcess internal (host: RunningHost) =
         | Some cb -> cb.Invoke line
         | None -> ()
 
-    // Reclassify a fault escaping a stdout/stderr pump into a typed `ProcessError.Io` when it is one
-    // of the two exception types that only ever reach a pump's caller as a GENUINE read fault —
-    // `Pump.readLinesUntilDone`'s `genuineReadFault` already filtered out the routine teardown-race
-    // case for the streaming pumps below, and the buffered pumps (`pumpToBuffer` / the discard drains
-    // in `WaitAsync`/`ProfileAsync`) never race this handle's own teardown at all (`reapGuard`'s
-    // load-bearing invariant: every verb awaits its pumps before disposing). Any other pump fault (a
-    // throwing line handler, a decoder failure, an already-typed `ProcessException` from
-    // `StreamChannel`'s fail-loud bounded-channel mode) passes through unchanged — T-087.
+    // True once THIS handle's own teardown has begun — `disposalCts` is cancelled (synchronously) by
+    // `reapGuard`/`DisposeAsync` immediately before `host.Teardown()` disposes the pipe streams (the
+    // same happens-before the streaming pumps' `isTearingDown` relies on, see `Pump.genuineReadFault`).
+    // The buffered pumps below poll it before reclassifying a caught `IOException`/`ObjectDisposedException`:
+    // one caught while this reports `true` is the routine dispose/broken-pipe race a CONCURRENT
+    // `StopAsync`/`Dispose` sharing this handle triggers by design — it disposes the pipes a still
+    // in-flight buffered verb's pumps are draining — not a genuine OS read failure.
+    let isTearingDown () =
+        disposalCts.Token.IsCancellationRequested
+
+    // Reclassify a fault escaping a stdout/stderr pump into a typed `ProcessError.Io` when it is one of
+    // the two exception types a genuine OS read fault surfaces as. Only ever reached once the routine
+    // teardown-race case has already been excluded: the streaming pumps route through
+    // `Pump.readLinesUntilDone`'s `genuineReadFault` (`isTearingDown` by `disposalCts`) first, and the
+    // buffered pumps (`pumpToBuffer` / the discard drains in `WaitAsync`/`ProfileAsync` / the raw stdout
+    // capture in `OutputBytesAsync`) now gate on `isTearingDown ()` themselves before calling this. That
+    // gate is load-bearing: a buffered verb awaits its OWN pumps before its `reapGuard` tears down, but a
+    // CONCURRENT `StopAsync`/`Dispose` on the same handle can dispose the pipes while those pumps are
+    // still draining a large tail — reclassifying that routine race as a genuine `ProcessError.Io` used
+    // to falsely fault the verb (and, through the supervision layer, `SupervisionSession.Completion`).
+    // Any other pump fault (a throwing line handler, a decoder failure, an already-typed
+    // `ProcessException` from `StreamChannel`'s fail-loud bounded-channel mode) passes through unchanged
+    // — T-087.
     let reportedPumpFault (ex: exn) : exn =
         match ex with
         | :? IOException
@@ -454,6 +469,13 @@ type RunningProcess internal (host: RunningHost) =
                         config.OutputBuffer.MaxBytes
                         CancellationToken.None
             with
+            | (:? IOException | :? ObjectDisposedException) when isTearingDown () ->
+                // A concurrent `StopAsync`/`Dispose` on this handle disposed the pipe streams while this
+                // pump was still draining the tail — the buffered-pump teardown race. Stop quietly and
+                // return what was captured so far, rather than mis-reporting the routine race as a genuine
+                // `ProcessError.Io` that would fault the verb (and, via supervision, the session). A real
+                // mid-run read fault (teardown not begun) still surfaces below — T-087.
+                ()
             | :? IOException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
             | :? ObjectDisposedException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
 
@@ -467,10 +489,32 @@ type RunningProcess internal (host: RunningHost) =
             try
                 do! Pump.drainDiscardOrEmpty stream CancellationToken.None
             with
+            | (:? IOException | :? ObjectDisposedException) when isTearingDown () ->
+                // Same buffered-pump teardown race as `pumpToBuffer`: a concurrent `StopAsync`/`Dispose`
+                // disposed the pipe mid-drain — stop quietly instead of surfacing a false `ProcessError.Io`.
+                ()
             | :? IOException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
             | :? ObjectDisposedException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
         }
         :> Task
+
+    // The raw stdout capture backing `OutputBytesAsync` shares the buffered-pump teardown race above, but
+    // through the shared `Pump.captureRawOrEmpty`/`drainRaw` primitive, which discards its in-flight buffer
+    // on ANY fault. So the bytes read before a concurrent `StopAsync`/`Dispose` disposed the pipe can't be
+    // recovered here — on that routine teardown race report an honest, incomplete empty capture rather than
+    // faulting the verb. A genuine mid-run read fault (teardown not begun) is left to propagate unchanged,
+    // exactly as before — T-087.
+    let captureRawStdout () : Task<Pump.RawCapture> =
+        task {
+            try
+                return! Pump.captureRawOrEmpty stdoutStream config.StdoutTee config.OutputBuffer CancellationToken.None
+            with (:? IOException | :? ObjectDisposedException) when isTearingDown () ->
+                return
+                    { Pump.RawCapture.Bytes = Array.empty<byte>
+                      Truncated = false
+                      TooLarge = false
+                      TotalBytes = 0 }
+        }
 
     let pumpStdoutBuffer () =
         match stdoutStream with
@@ -700,10 +744,14 @@ type RunningProcess internal (host: RunningHost) =
     // idempotent (the group's release runs once), so the redundant call on `RunningProcess` disposal
     // is harmless.
     //
-    // Load-bearing invariant: a verb must await ALL of its pumps before this guard's scope exits,
+    // Load-bearing invariant: a verb must await ALL of its OWN pumps before this guard's scope exits,
     // because `Teardown` disposes the pipe streams the pumps read — a pump still in-flight at teardown
     // would race a stream `Dispose`. Every verb satisfies this (it awaits the pumps / `streamOutcome`
-    // before returning); keep it that way when editing.
+    // before returning); keep it that way when editing. A CONCURRENT verb's teardown is the exception the
+    // invariant can't cover: a `StopAsync`/`Dispose` on the same handle reaps as soon as the shared exit
+    // wait resolves, without waiting for an in-flight buffered verb's pumps — so it can dispose the pipes
+    // mid-drain. `disposalCts.Cancel()` below (before `Teardown`) is what the buffered pumps read via
+    // `isTearingDown` to tell that routine race apart from a genuine read fault (see `reportedPumpFault`).
     let reapGuard () =
         { new IAsyncDisposable with
             member _.DisposeAsync() =
@@ -968,9 +1016,10 @@ type RunningProcess internal (host: RunningHost) =
 
                 // The raw stdout capture now honours the byte cap + overflow of `config.OutputBuffer`
                 // (unbounded when `MaxBytes = None`, exactly as before); `MaxLines` does not apply to a
-                // byte stream, so it is ignored here — it still governs the line-pumped stderr below.
-                let stdoutTask =
-                    Pump.captureRawOrEmpty stdoutStream config.StdoutTee config.OutputBuffer CancellationToken.None
+                // byte stream, so it is ignored here — it still governs the line-pumped stderr below. Goes
+                // through `captureRawStdout` so a concurrent `StopAsync`/`Dispose` teardown race ends as an
+                // honest incomplete capture rather than faulting the verb (see its comment) — T-087.
+                let stdoutTask = captureRawStdout ()
 
                 let stderrTask = pumpStderrBuffer ()
                 // Observe both pumps before reading either, so a throwing stderr handler (or a raw-drain

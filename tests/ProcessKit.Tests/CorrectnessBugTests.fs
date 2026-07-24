@@ -115,6 +115,62 @@ type private QueueingSyncContext() =
 
     override this.CreateCopy() = this :> SynchronizationContext
 
+/// A stdout double for the T-197 teardown-race tests: its first `ReadAsync` yields `firstChunk`, its
+/// second parks until the stream is disposed, and the parked read then throws `ObjectDisposedException`
+/// — exactly as a real parent-side pipe stream does when this handle's own teardown (a concurrent
+/// `StopAsync`/`Dispose`) disposes it while a buffered pump is still draining the tail. Whether that
+/// dispose comes THROUGH the handle's teardown (which cancels `disposalCts` first — the buffered pump
+/// swallows it) or DIRECTLY from the test (leaving `disposalCts` un-cancelled — a genuine fault surfaced
+/// as `ProcessError.Io`) is what the two sides of the classification turn on.
+type private ParkThenFaultOnDisposeStream(firstChunk: byte[]) =
+    inherit Stream()
+
+    let mutable served = false
+
+    let entered =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let released =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    /// Completes once the pump has served the first chunk and parked on the tail read.
+    member _.ParkedOnTail: Task = entered.Task :> Task
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = int64 firstChunk.Length
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = raise (NotSupportedException())
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) : int = raise (NotSupportedException())
+
+    override _.ReadAsync(buffer: Memory<byte>, _cancellationToken: CancellationToken) : ValueTask<int> =
+        let run =
+            task {
+                if not served then
+                    served <- true
+                    firstChunk.AsSpan().CopyTo(buffer.Span)
+                    return firstChunk.Length
+                else
+                    // The tail read: park until disposed, then fault exactly like a real disposed pipe.
+                    entered.TrySetResult() |> ignore
+                    do! released.Task
+                    return raise (ObjectDisposedException "Stream")
+            }
+
+        ValueTask<int>(run)
+
+    override _.Dispose(disposing: bool) =
+        released.TrySetResult() |> ignore
+        base.Dispose disposing
+
 /// Regression tests for the correctness & robustness fixes: timeout validation/clamping, the
 /// single-consumption guard on `RunningProcess`, pipeline per-stage `OkCodes`, and pipeline wiring
 /// of a stage whose stdout was set non-piped.
@@ -1166,3 +1222,156 @@ type CorrectnessBugTests() =
 
         assertIo "Suspend" (backend.Suspend())
         assertIo "Resume" (backend.Resume())
+
+    // --- T-197: a concurrent StopAsync teardown during an in-flight buffered verb must not fault the
+    // verb with a false ProcessError.Io (the supervision path drives exactly this: `monitorLiveness`
+    // fires `running.StopAsync grace` while `captureIncarnation`'s `OutputStringAsync` is in flight), yet
+    // a GENUINE mid-run read fault (no teardown) must still surface as ProcessError.Io — T-087. ---
+
+    // Build a synthetic handle whose `Wait` resolves only when `waitTcs` is set and whose `Teardown`
+    // disposes `stdout` (the pipe close a real reap performs), plus the stream itself. Used by the three
+    // teardown-race tests below; the stream is disposed through `Teardown`, so `disposalCts` is cancelled
+    // first and the buffered pump reads that as this handle's own teardown.
+    member private _.RaceHost(stdout: ParkThenFaultOnDisposeStream, waitTcs: TaskCompletionSource<Outcome>) =
+        { baseHost (Command.create "test").Config with
+            Stdout = Some(stdout :> Stream)
+            Wait = fun () -> waitTcs.Task
+            GracefulKill = fun _ -> Task.CompletedTask
+            Teardown =
+                fun () ->
+                    (stdout :> IDisposable).Dispose()
+                    ValueTask() }
+
+    [<Test>]
+    member this.``a concurrent StopAsync during OutputStringAsync does not fault with a false ProcessError.Io``
+        ()
+        : Task =
+        task {
+            let stdout =
+                new ParkThenFaultOnDisposeStream(Encoding.UTF8.GetBytes "captured-tail\n")
+
+            let waitTcs =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use running = new RunningProcess(this.RaceHost(stdout, waitTcs))
+
+            // The buffered verb's stdout pump serves the first line, then parks mid-read on the tail —
+            // provably still in flight when StopAsync fires next on the very same handle.
+            let outputTask = running.OutputStringAsync()
+            let! parked = Task.WhenAny(stdout.ParkedOnTail, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(parked, stdout.ParkedOnTail), Is.True, "the stdout pump never parked")
+
+            // StopAsync reuses the shared exit wait; once it resolves, StopAsync's reapGuard tears down —
+            // disposing the pipe out from under the still-reading pump. That dispose used to be
+            // reclassified as a genuine ProcessError.Io, faulting the verb.
+            let stopTask = running.StopAsync TimeSpan.Zero
+            waitTcs.SetResult(Outcome.Exited 0)
+
+            let! outputResult = outputTask
+            let! stopOutcome = stopTask
+
+            match outputResult with
+            | Ok result -> Assert.That(result.Stdout, Does.Contain "captured-tail", "the captured output was lost")
+            | Error err -> Assert.Fail $"expected an honest capture, got a false fault: {err.Message}"
+
+            Assert.That(stopOutcome, Is.EqualTo(Outcome.Exited 0))
+        }
+        :> Task
+
+    [<Test>]
+    member this.``a concurrent StopAsync during WaitAsync does not fault with a false ProcessError.Io``() : Task =
+        task {
+            let stdout = new ParkThenFaultOnDisposeStream(Encoding.UTF8.GetBytes "tail\n")
+
+            let waitTcs =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use running = new RunningProcess(this.RaceHost(stdout, waitTcs))
+
+            let waitTask = running.WaitAsync()
+            let! parked = Task.WhenAny(stdout.ParkedOnTail, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(parked, stdout.ParkedOnTail), Is.True, "the stdout drain never parked")
+
+            let stopTask = running.StopAsync TimeSpan.Zero
+            waitTcs.SetResult(Outcome.Exited 0)
+
+            // WaitAsync throws on a genuine pump fault; a clean Outcome proves the race was not misreported.
+            let! waitOutcome = waitTask
+            let! stopOutcome = stopTask
+            Assert.That(waitOutcome, Is.EqualTo(Outcome.Exited 0))
+            Assert.That(stopOutcome, Is.EqualTo(Outcome.Exited 0))
+        }
+        :> Task
+
+    [<Test>]
+    member this.``a concurrent StopAsync during OutputBytesAsync does not fault``() : Task =
+        task {
+            let stdout = new ParkThenFaultOnDisposeStream(Encoding.UTF8.GetBytes "tail-bytes")
+
+            let waitTcs =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use running = new RunningProcess(this.RaceHost(stdout, waitTcs))
+
+            let outputTask = running.OutputBytesAsync()
+            let! parked = Task.WhenAny(stdout.ParkedOnTail, Task.Delay 5000)
+
+            Assert.That(
+                obj.ReferenceEquals(parked, stdout.ParkedOnTail),
+                Is.True,
+                "the raw stdout capture never parked"
+            )
+
+            let stopTask = running.StopAsync TimeSpan.Zero
+            waitTcs.SetResult(Outcome.Exited 0)
+
+            let! outputResult = outputTask
+            let! stopOutcome = stopTask
+
+            match outputResult with
+            | Ok _ -> ()
+            | Error err -> Assert.Fail $"expected an honest capture, got a false fault: {err.Message}"
+
+            Assert.That(stopOutcome, Is.EqualTo(Outcome.Exited 0))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a genuine mid-run read fault (no teardown) still surfaces as ProcessError.Io``() : Task =
+        task {
+            // The other side of the classification (T-087): the SAME stream fault, but the stream is
+            // disposed DIRECTLY (not through the handle's teardown), so `disposalCts` stays un-cancelled
+            // and the buffered pump must report the read failure honestly rather than swallow it.
+            let stdout = new ParkThenFaultOnDisposeStream(Encoding.UTF8.GetBytes "line1\n")
+
+            let waitTcs =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let host =
+                { baseHost (Command.create "test").Config with
+                    Stdout = Some(stdout :> Stream)
+                    Wait = fun () -> waitTcs.Task
+                    // Teardown does NOT dispose the stream here — the test triggers the fault itself below,
+                    // outside teardown, so it is a genuine external read fault, not this handle's own race.
+                    Teardown = fun () -> ValueTask() }
+
+            use running = new RunningProcess(host)
+
+            let outputTask = running.OutputStringAsync()
+            let! parked = Task.WhenAny(stdout.ParkedOnTail, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(parked, stdout.ParkedOnTail), Is.True, "the stdout pump never parked")
+
+            // Resolve the exit wait so the verb reaches the pump await, then fault the read OUTSIDE any
+            // teardown (disposalCts un-cancelled) — a genuine mid-run read failure.
+            waitTcs.SetResult(Outcome.Exited 0)
+            (stdout :> IDisposable).Dispose()
+
+            try
+                let! _ = outputTask
+                Assert.Fail "expected the genuine read fault to surface"
+            with :? ProcessException as pe ->
+                match pe.Error with
+                | ProcessError.Io _ -> ()
+                | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+        }
+        :> Task
