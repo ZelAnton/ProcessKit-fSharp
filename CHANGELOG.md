@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chain (e.g. `Encoding.GetBytes`, `List.ofSeq`).
 
 ### Fixed
+- `CliClient.WithDefaults` now rejects a `configure` callback that returns `null` at the API boundary,
+  with a correctly named `ArgumentNullException` instead of a later `NullReferenceException`.
 - `Exec.outputAll` and `Exec.outputAllBytes` now reject a null runner, command sequence, or command
   element immediately with a correctly named argument exception, before they start any command or
   report invalid input as an I/O failure.
