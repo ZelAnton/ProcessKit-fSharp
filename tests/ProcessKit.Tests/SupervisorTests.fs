@@ -1223,6 +1223,26 @@ type SupervisorTests() =
         :> Task
 
     [<Test>]
+    member _.``a StopAsync call racing the loop's own teardown never surfaces an unhandled exception``() : Task =
+        task {
+            // A capture-only, zero-backoff session completes almost immediately, so repeatedly racing a
+            // fresh `StopAsync()` call against the loop's own natural completion (which disposes the stop
+            // source, see `runLoop`'s `finally`) is the closest a deterministic test gets to landing inside
+            // the `Cancel()`-vs-`Dispose()` window both now serialize under `gate`. Before that lock, an
+            // unlucky interleaving could let `stopCts.Cancel()`'s linked-token callback throw against an
+            // already-disposing `sleepCts`, escaping `requestGracefulStop`'s direct-`ObjectDisposedException`
+            // guard as an unhandled `AggregateException`; awaiting `stopTask` below would surface that.
+            for _ in 1..200 do
+                let! session = supervise([ ok () ]).StartAsync()
+
+                let stopTask = Task.Run(fun () -> session.StopAsync(TimeSpan.Zero) :> Task)
+
+                do! session.Completion :> Task
+                do! stopTask
+        }
+        :> Task
+
+    [<Test>]
     member _.``a session's status reflects an in-progress storm pause``() : Task =
         task {
             let runner = CrashLoopRunner()
