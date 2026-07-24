@@ -1162,7 +1162,9 @@ module internal Windows =
     /// enumeration (e.g. a session with no interactive desktop), or a failed post is just reported as
     /// zero-or-fewer windows closed, never an exception that could derail the graceful-kill path that
     /// calls it. Windows are collected first and posted to afterwards, so posting can never perturb the
-    /// enumeration in flight.
+    /// enumeration in flight. Before each post, the owning pid is re-opened and verified to still belong
+    /// to this Job; a member that exited and whose pid was recycled can therefore never close a foreign
+    /// application's window.
     let postCloseToJobWindows (job: nativeint) : int =
         try
             let memberPids =
@@ -1173,7 +1175,7 @@ module internal Windows =
             if Set.isEmpty memberPids then
                 0
             else
-                let targets = ResizeArray<nativeint>()
+                let targets = ResizeArray<nativeint * uint32>()
 
                 let collect =
                     EnumWindowsProc(fun hWnd _ ->
@@ -1182,7 +1184,7 @@ module internal Windows =
                         // `owningPid = 0` is the documented "could not determine the owner" result — never a
                         // real pid, so it can't spuriously match a member and is skipped.
                         if owningPid <> 0u && Set.contains (int owningPid) memberPids then
-                            targets.Add hWnd
+                            targets.Add((hWnd, owningPid))
 
                         true) // keep enumerating every remaining top-level window
 
@@ -1192,12 +1194,24 @@ module internal Windows =
                 EnumWindows(collect, IntPtr.Zero) |> ignore
                 GC.KeepAlive collect
 
-                for hWnd in targets do
-                    // A REQUEST, not a guarantee: the window's own close handler may prompt or veto. That
-                    // is why the post-grace `TerminateJobObject` is the unconditional backstop.
-                    PostMessageW(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero) |> ignore
+                let mutable postedCount = 0
 
-                targets.Count
+                for hWnd, owningPid in targets do
+                    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, owningPid)
+
+                    if handle <> IntPtr.Zero then
+                        try
+                            let mutable stillMember = false
+
+                            if IsProcessInJob(handle, job, &stillMember) && stillMember then
+                                // A REQUEST, not a guarantee: the window's own close handler may prompt or veto.
+                                // That is why the post-grace `TerminateJobObject` is the unconditional backstop.
+                                PostMessageW(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero) |> ignore
+                                postedCount <- postedCount + 1
+                        finally
+                            CloseHandle handle |> ignore
+
+                postedCount
         with _ ->
             // Best-effort by contract (see the section comment): enumeration/post failing on a host with
             // no usable desktop must never throw into the graceful-kill path — report "nothing closed" and
