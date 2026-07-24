@@ -703,6 +703,7 @@ module internal PipelineRunner =
                             // External cancellation keeps its priority over the returned result — even one
                             // that landed during the drain/tee above — but only after every relay/pump task
                             // was awaited, so none is left unobserved (T-071).
+                            stopStage0Feed ()
                             return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
                         else
                             let stageResults =
