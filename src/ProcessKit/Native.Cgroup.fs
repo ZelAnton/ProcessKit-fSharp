@@ -148,6 +148,14 @@ module internal Cgroup =
     /// already exists (a controller never enabled at creation is already unbounded, and its `*.max` file
     /// would not exist to write). Returns an error message on any write/delegation failure (e.g. EBUSY
     /// when not at the real cgroup root), which the backend turns into `ProcessError.ResourceLimit`.
+    ///
+    /// The caps are written one controller file at a time, so a later write could fail after an earlier
+    /// one already landed. To keep the honest `UpdateLimits` contract — a failed apply leaves the live
+    /// cgroup on the PREVIOUS set — each file's prior content is captured just before it is overwritten,
+    /// and a mid-sequence failure best-effort restores the files already changed back to exactly what the
+    /// kernel had. So an `Error` return means the cgroup is back on the previous set (nothing net changed),
+    /// never a silent mix that `Options.Limits` would misreport (T-207). Only if even that restore fails is
+    /// the state genuinely indeterminate, and the error says so distinctly.
     let updateCgroupLimits (cgroupPath: string) (limits: ResourceLimits) : Result<unit, string> =
         try
             // The cgroup is always a subdirectory of its parent (`.../<parent>/processkit-<pid>-<id>`),
@@ -158,21 +166,51 @@ module internal Cgroup =
             | parent ->
                 enableNeededControllers parent limits
 
-                // Some -> write the cap; None -> reset to unbounded, but only if the controller file
-                // exists (a never-enabled controller is already unbounded, with no file to reset).
-                let setOrClear (fileName: string) (value: string option) =
-                    let file = Path.Combine(cgroupPath, fileName)
+                // The controller files to (re)write, in apply order, each paired with the content the new
+                // set wants: `Some v` writes the cap; `None` resets to the unbounded `max` sentinel — but
+                // only where the controller file already exists (a never-enabled controller is already
+                // unbounded, with no file to reset).
+                let plan =
+                    [ "memory.max", (limits.MemoryMax |> Option.map string)
+                      "pids.max", (limits.MaxProcesses |> Option.map string)
+                      "cpu.max", (limits.CpuQuota |> Option.map cpuMaxValue) ]
 
-                    match value with
-                    | Some v -> File.WriteAllText(file, v)
-                    | None ->
-                        if File.Exists file then
-                            File.WriteAllText(file, "max")
+                // Files already overwritten, with their PRIOR content, so a later failure can undo them.
+                let applied = System.Collections.Generic.List<string * string>()
 
-                setOrClear "memory.max" (limits.MemoryMax |> Option.map string)
-                setOrClear "pids.max" (limits.MaxProcesses |> Option.map string)
-                setOrClear "cpu.max" (limits.CpuQuota |> Option.map cpuMaxValue)
-                Ok()
+                try
+                    for (fileName, value) in plan do
+                        let file = Path.Combine(cgroupPath, fileName)
+
+                        let content =
+                            match value with
+                            | Some v -> Some v
+                            | None -> if File.Exists file then Some "max" else None
+
+                        match content with
+                        | None -> ()
+                        | Some text ->
+                            // Capture the current kernel value BEFORE overwriting it, so a rollback restores
+                            // exactly this file's prior state.
+                            let prior = File.ReadAllText file
+                            File.WriteAllText(file, text)
+                            applied.Add(file, prior)
+
+                    Ok()
+                with writeEx ->
+                    // A cap write failed partway. Put the already-changed files back to their prior kernel
+                    // values so the live cgroup and the readable Options snapshot both stay on the previous
+                    // set — the file that failed changed nothing, so it is not among `applied` and is left
+                    // untouched. If even the restore throws, the state is genuinely indeterminate; surface
+                    // that distinctly so the caller never treats `Options.Limits` as authoritative.
+                    try
+                        for (file, prior) in Seq.rev applied do
+                            File.WriteAllText(file, prior)
+
+                        Error writeEx.Message
+                    with restoreEx ->
+                        Error
+                            $"failed to apply the cgroup limits ({writeEx.Message}) and could not roll the already-written controller files back to the previous set ({restoreEx.Message}); the cgroup's limits may be partially applied"
         with ex ->
             Error ex.Message
 

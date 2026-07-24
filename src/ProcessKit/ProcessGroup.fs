@@ -648,15 +648,29 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// `ProcessError.Unsupported` BEFORE touching the closed/recycled native handle — never a
     /// use-after-teardown. Only on a successful apply is the `Options` snapshot swapped to the new set,
     /// under the same lock, so `Options.Limits` a consumer reads back matches what is actually enforced.
+    ///
+    /// The caps land through several sequential native writes, so a later write can fail after an earlier
+    /// one applied. A failed apply is honest about that: a limit-capable mechanism best-effort **restores
+    /// the previous set** to its live container before returning the error, so a failed `UpdateLimits`
+    /// leaves BOTH the container and the `Options` snapshot on the previous set (nothing net changed) —
+    /// the container and `Options.Limits` never silently diverge. In the rare case the restore itself also
+    /// fails, the returned `ProcessError.ResourceLimit` says so explicitly (its message notes the limits
+    /// may be partially applied) and `Options.Limits` keeps reporting the previous set: the error is the
+    /// explicit signal that the container's state is uncertain, so a consumer must not treat the snapshot
+    /// as authoritative there — never a silent divergence.
     member this.UpdateLimits(limits: ResourceLimits) : Result<unit, ProcessError> =
         this.WhenLive(fun () ->
             match backend.UpdateLimits limits with
             | Ok() ->
-                // Reflect the new caps only after the backend confirms they applied — a failed apply
-                // leaves both the container and the readable snapshot on the previous set.
+                // Reflect the new caps only after the backend confirms they fully applied.
                 currentOptions <- currentOptions.WithLimits limits
                 Ok()
-            | Error error -> Error error)
+            | Error error ->
+                // The backend failed to apply the new set and best-effort restored the previous one, so
+                // the snapshot must stay on the previous set — leaving `currentOptions` untouched keeps
+                // the container and `Options.Limits` consistent (or, in the rare unrecoverable case, the
+                // error itself is the explicit signal that the snapshot is no longer authoritative).
+                Error error)
 
     /// A snapshot of the group's resource usage. On Windows this reads the Job Object's accounting
     /// (CPU + peak committed memory + active count); on cgroup v2 the cgroup accounting; on the POSIX

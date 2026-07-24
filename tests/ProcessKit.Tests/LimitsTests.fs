@@ -14,6 +14,55 @@ open ProcessKit
 /// instead of a real file descriptor.
 type private FakePidfd = FakeHandle
 
+/// A synthetic `IContainmentBackend` that models a limit-capable backend's honest `UpdateLimits`
+/// contract without any real OS container (T-207). It tracks the caps actually "in force" (`InForce`,
+/// the container stand-in) and, on `UpdateLimits`, consults `shouldFail`: a set that trips it models a
+/// partial native apply that then best-effort restores the previous set — `InForce` is left unchanged
+/// and a typed `ProcessError.ResourceLimit` is returned; any other set is applied and becomes the new
+/// `InForce`. It exists to prove `ProcessGroup.UpdateLimits` keeps `Options.Limits` in lockstep with
+/// what the backend reports as in force — swapping the snapshot only on a real apply, never reporting
+/// caps a failed apply did not leave enforced. Every other verb is an unused book-keeping no-op.
+type internal LimitContractBackend(initial: ResourceLimits, shouldFail: ResourceLimits -> bool) =
+    let mutable inForce = initial
+
+    /// The caps currently enforced on the container stand-in — what `Options.Limits` must always match.
+    member _.InForce = inForce
+
+    interface IContainmentBackend with
+        member _.Mechanism = Mechanism.JobObject
+
+        member _.Spawn(_command) =
+            Error(ProcessError.Unsupported "LimitContractBackend does not spawn")
+
+        member _.Track(_spawned) = Ok()
+
+        member _.Adopt(_pid) =
+            Error(ProcessError.Unsupported "LimitContractBackend does not adopt")
+
+        member _.Release(_spawned) = ()
+        member _.Wait(_handle) = task { return Outcome.Exited 0 }
+        member _.PidOf(_spawned) = None
+        member _.KillChild(_spawned) = ()
+        member _.KillTree() = ()
+        member _.GracefulKillTree(_grace) = Task.CompletedTask
+        member _.Members() = Ok []
+        member _.Signal(_signal) = Ok()
+        member _.Suspend() = Ok()
+        member _.Resume() = Ok()
+        member _.Stats() = Ok(ProcessGroupStats(0, None, None))
+
+        member _.UpdateLimits(limits) =
+            if shouldFail limits then
+                // Model a limit-capable backend whose native apply failed partway and then best-effort
+                // restored the previous set: nothing net changed (InForce stays put), and it surfaces the
+                // honest typed refusal — exactly what the real Windows/cgroup backends now do (T-207).
+                Error(ProcessError.ResourceLimit "simulated partial apply failure (previous set restored)")
+            else
+                inForce <- limits
+                Ok()
+
+        member _.HardRelease() = ()
+
 [<TestFixture>]
 type LimitsTests() =
 
@@ -308,6 +357,94 @@ type LimitsTests() =
                 | Error error -> Assert.Fail $"dropping the CPU quota on a live group failed: {error}"
         }
         :> Task
+
+    [<Test>]
+    member _.``a failed UpdateLimits leaves Options on the previous set, never reporting caps that did not apply``() =
+        // The honest partial-failure contract (T-207), exercised through the public verb over a synthetic
+        // limit-capable backend so it runs on every platform. A backend whose native apply fails partway
+        // best-effort restores the previous set (nothing net changes) and returns a typed error;
+        // `ProcessGroup` must then NOT swap its `Options` snapshot — so `Options.Limits` never advertises
+        // caps that a failed apply did not actually leave in force, and the container (the backend's
+        // `InForce`) and the readable snapshot stay consistent.
+        let oneGb = 1024L * 1024L * 1024L
+        let initial = ResourceLimits.None.WithMemoryMax oneGb
+
+        // The backend refuses any set requesting exactly 999 processes (the injected "poison" that models a
+        // pids.max EACCES-style late write failure), restoring the previous set instead.
+        let backend = LimitContractBackend(initial, (fun l -> l.MaxProcesses = Some 999))
+
+        use group =
+            ProcessGroup.FromBackend(backend :> IContainmentBackend, ProcessGroupOptions().WithMemoryMax oneGb)
+
+        // Baseline: Options and the container agree on the create-time set.
+        Assert.That(group.Options.Limits.MemoryMax, Is.EqualTo(Some oneGb))
+        Assert.That(backend.InForce.MemoryMax, Is.EqualTo(Some oneGb))
+
+        // A successful update advances BOTH the container and the snapshot to the new set.
+        let applied =
+            ResourceLimits.None.WithMemoryMax(256L * 1024L * 1024L).WithMaxProcesses 8
+
+        match group.UpdateLimits applied with
+        | Ok() ->
+            Assert.That(group.Options.Limits.MemoryMax, Is.EqualTo(Some(256L * 1024L * 1024L)))
+            Assert.That(group.Options.Limits.MaxProcesses, Is.EqualTo(Some 8))
+            Assert.That(backend.InForce.MemoryMax, Is.EqualTo(Some(256L * 1024L * 1024L)))
+            Assert.That(backend.InForce.MaxProcesses, Is.EqualTo(Some 8))
+        | Error error -> Assert.Fail $"the non-poison update should apply: {error}"
+
+        // A partial-failure update (the poison set) is refused with a typed error AND leaves BOTH the
+        // container and the Options snapshot on the previous ({256 MB, 8}) set — never the caps it tried
+        // and failed to apply.
+        let poison =
+            ResourceLimits.None.WithMemoryMax(512L * 1024L * 1024L).WithMaxProcesses 999
+
+        match group.UpdateLimits poison with
+        | Error(ProcessError.ResourceLimit detail) -> Assert.That(detail, Is.Not.Empty)
+        | other -> Assert.Fail $"expected ProcessError.ResourceLimit for the partial-failure update, got {other}"
+
+        Assert.That(group.Options.Limits.MemoryMax, Is.EqualTo(Some(256L * 1024L * 1024L)))
+        Assert.That(group.Options.Limits.MaxProcesses, Is.EqualTo(Some 8))
+        // The snapshot never advertises the failed 512 MB / 999-process caps, and stays consistent with
+        // what the container reports as in force.
+        Assert.That(group.Options.Limits.MemoryMax, Is.EqualTo backend.InForce.MemoryMax)
+        Assert.That(group.Options.Limits.MaxProcesses, Is.EqualTo backend.InForce.MaxProcesses)
+
+    [<Test>]
+    member _.``updateCgroupLimits rolls an already-written controller file back to its prior value when a later write fails``
+        ()
+        =
+        // The cgroup half of the T-207 partial-failure contract, driven directly at the native helper with
+        // pure file I/O so it runs on every platform (no real cgroup mount). A cgroup directory with real
+        // controller files: `memory.max` is writable, but `pids.max` is a DIRECTORY so writing the pids cap
+        // fails partway — AFTER `memory.max` has already been rewritten to the new cap. `updateCgroupLimits`
+        // must roll `memory.max` back to exactly its prior content and return `Error`, leaving the cgroup on
+        // the PREVIOUS set rather than a silent mix the Options snapshot would misreport.
+        let root = Directory.CreateTempSubdirectory("pk-limit-rollback-").FullName
+
+        try
+            let cgroupPath = Path.Combine(root, "child")
+            Directory.CreateDirectory cgroupPath |> ignore
+
+            let memoryMax = Path.Combine(cgroupPath, "memory.max")
+            let priorMemory = "1073741824"
+            File.WriteAllText(memoryMax, priorMemory)
+
+            // `pids.max` as a directory: File I/O on it throws, forcing the pids write to fail after
+            // `memory.max` was already rewritten to the new cap.
+            Directory.CreateDirectory(Path.Combine(cgroupPath, "pids.max")) |> ignore
+
+            let newLimits =
+                ResourceLimits.None.WithMemoryMax(256L * 1024L * 1024L).WithMaxProcesses 8
+
+            match Native.Cgroup.updateCgroupLimits cgroupPath newLimits with
+            | Ok() -> Assert.Fail "the pids.max write should fail, so updateCgroupLimits must return Error"
+            | Error detail ->
+                Assert.That(detail, Is.Not.Empty)
+                // memory.max was rewritten to the new cap, then rolled back to exactly its prior content:
+                // the cgroup is left on the previous set, not the partially-applied new one.
+                Assert.That(File.ReadAllText memoryMax, Is.EqualTo priorMemory)
+        finally
+            Directory.Delete(root, true)
 
     [<Test>]
     member _.``a failed cgroup migration kills the child and returns an honest error``() : Task =
