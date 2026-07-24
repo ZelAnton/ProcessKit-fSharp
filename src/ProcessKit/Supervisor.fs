@@ -934,6 +934,11 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 // that awaits `Completion` then reads `Status` never sees `IsActive = true` on a finished
                 // (or faulted) session.
                 markInactive ()
+
+                // The loop is the only consumer of this source's token. Once it has ended, release the
+                // cancellation registrations it owns; a late concurrent `StopAsync` is handled by
+                // `requestGracefulStop`'s ObjectDisposedException guard.
+                stopCts.Dispose()
         }
 
     // Launch the loop in the background as the constructor's last step. `runLoop` yields before any real

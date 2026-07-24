@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.Diagnostics
 open System.IO
+open System.Reflection
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -1189,6 +1190,30 @@ type SupervisorTests() =
             | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
 
             Assert.That(session.Status.IsActive, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a naturally completed session releases its stop source and accepts a late StopAsync``() : Task =
+        task {
+            let! session = supervise([ ok () ]).StartAsync()
+            let! completed = session.Completion
+
+            let stopSourceField =
+                typeof<SupervisionSession>.GetField("stopCts", BindingFlags.Instance ||| BindingFlags.NonPublic)
+
+            Assert.That(stopSourceField, Is.Not.Null, "the session retains its private stop source until completion")
+
+            let stopSource = stopSourceField.GetValue(session) :?> CancellationTokenSource
+
+            Assert.Throws<ObjectDisposedException>(Action(fun () -> stopSource.Cancel()))
+            |> ignore
+
+            // A late caller can still await the already-final outcome: `requestGracefulStop` treats the
+            // disposed source as normal concurrent teardown rather than leaking ObjectDisposedException.
+            let! repeated = session.StopAsync(TimeSpan.Zero)
+
+            Assert.That(repeated, Is.EqualTo completed)
         }
         :> Task
 
