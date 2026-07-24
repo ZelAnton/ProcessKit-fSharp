@@ -159,10 +159,16 @@ type internal JobObjectBackend(jobHandle: nativeint) =
 
     // Children spawned with `Command.WindowsCtrlSignals()` (CREATE_NEW_PROCESS_GROUP), mapped by their
     // process HANDLE to their console process-group id (= pid), so `Signal.Int`/`Signal.Term` can
-    // `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, groupId)` each of them. Keyed by handle, not pid, so
-    // it stays in lockstep with `children`: while we hold a child's handle open the OS cannot recycle
-    // its pid, so a stored group id is never stale (no wrong-target CTRL+BREAK). Entries are added at
-    // `Track` and removed at exactly the same points the handle is closed.
+    // `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, groupId)` each of them. Keyed by handle, not pid, so it
+    // stays in lockstep with `children`: while a child's handle is open the OS cannot recycle its pid, so
+    // its stored group id cannot become a wrong target. Entries are added at `Track` and removed at exactly
+    // the points the handle is closed — `Release` and `HardRelease`. That non-staleness holds only because
+    // BOTH the removal AND the delivery run under the owning `ProcessGroup`'s `sync` lifecycle lock:
+    // `Signal` snapshots `ctrlGroups.Values` and delivers every CTRL+BREAK while holding `sync`, and every
+    // removal holds `sync` too (`HardRelease` via teardown, and the per-run shared `Release` since T-204),
+    // so no entry can be dropped and its handle closed midway through a delivery — which would let a
+    // CTRL+BREAK land on a recycled pid (the wrong-target class T-084 closed for POSIX kill / T-162 for the
+    // Windows Job handle).
     let ctrlGroups = ConcurrentDictionary<nativeint, int>()
 
     interface IContainmentBackend with

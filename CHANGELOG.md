@@ -8,9 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `ProcessKit.Testing` now replays `Command.MergeStderr()` with one merged stdout stream, matching the real runner's empty stderr result and stdout-only streaming events.
 
 ### Changed
+- `CliClient.WithDefaults` now rejects one-shot stdin sources (`FromStream`, `FromLines`, and
+  `FromAsyncLines`) with `ArgumentException`; attach them to an individual `client.Command(...)` instead.
 - `ProcessKit.Testing`'s public API (`FakeProcess`, `Reply`, `ScriptedRunner`) now validates null
   arguments at the entry point with `ArgumentNullException`, matching the main package's convention —
   a `null` stdout/stderr text, line sequence, `Outcome`/`Reply`/`ProcessError`, token sequence, or
@@ -19,8 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chain (e.g. `Encoding.GetBytes`, `List.ofSeq`).
 
 ### Fixed
+- `Exec.outputAll` and `Exec.outputAllBytes` now reject a null runner, command sequence, or command
+  element immediately with a correctly named argument exception, before they start any command or
+  report invalid input as an I/O failure.
+- On Windows, `ProcessGroup.Signal(Signal.Int)` / `Signal(Signal.Term)` can no longer deliver a console **CTRL+BREAK** to an unrelated process in a narrow race: when a run in a shared group was torn down concurrently with the signal, that run's console process-group id (its pid) could be released and reused by the OS midway through the signal's delivery loop, so the CTRL+BREAK landed on whatever process had recycled the pid on the same console. The per-run teardown now runs under the same group lock the signal-delivery loop holds, so the two are serialized and a targeted console-group id can never go stale mid-delivery. Delivery to live members, and teardown timing, are otherwise unchanged.
+- `Command.CancelOn` now interrupts a pending retry backoff immediately, returning `ProcessError.Cancelled` instead of waiting for the configured delay to elapse.
+- On Windows, spawning a process no longer risks corrupting the managed command-line string. `CreateProcessW` may modify its `lpCommandLine` argument in place while probing executable candidates; the binding now hands the OS a private, writable unmanaged copy of the command line instead of a marshalled managed `string`. Previously a single-token, argument-less command (e.g. `Command.Create("ping")`) forwarded its program name — often an interned literal shared process-wide — directly to the OS as a writable buffer, so a native write could corrupt that literal for every unrelated reader of it (a memory-corruption-class bug). Spawn behaviour (quoting, `.cmd`/`.bat` BatBadBut wrapping, PATHEXT resolution) is unchanged.
+- Calling `StopAsync` concurrently with an in-flight capturing verb (`OutputStringAsync`/`OutputBytesAsync`/`WaitAsync`/`ProfileAsync`) on the same handle no longer fails that verb with a spurious `ProcessError.Io` when the child still has a large buffered output tail. `StopAsync` reaps as soon as the shared exit wait resolves and then disposes the pipes, which could race a buffered pump still draining the tail; that routine teardown dispose is now told apart from a genuine mid-run read failure (the streaming verbs already drew this distinction), so the verb returns its honestly-captured output instead of a false error — and, through the supervision layer, a liveness-triggered graceful stop no longer faults `SupervisionSession.Completion`. A genuine mid-run I/O read fault still surfaces as `ProcessError.Io`.
 - A `HostedProcessService.Dispose()` that races the very start of its background supervision no longer publishes a spurious `LastOutcome = Error` (nor logs "supervision failed"). `Dispose()` disposes its lifetime `CancellationTokenSource` without awaiting the supervision task; the background start now reads a snapshot of that token taken before disposal instead of the live getter, so a routine teardown that overlaps startup is reported as a clean cancellation, exactly like a non-racing `Dispose()`.
 - The stdout streaming session's stderr capture (`StdoutLinesAsync()` + `FinishAsync().Stderr`) now honours `OutputBufferPolicy.MaxBytes` as an in-flight cap the same way the buffered verbs do, so a newline-free stderr flood can no longer grow the pump's assembly buffer past the configured cap.
+- `ProcessKit.Testing` cassette replay for `OutputBytesAsync` now decodes its text projections (`Combined`, `OutputContainsAny`, and error text in `Exit`/`Signalled`/`Timeout`) with the command's configured `StdoutEncoding` instead of hardcoded UTF-8, restoring record/replay parity for non-UTF-8 byte captures and matching `RunningProcess.OutputBytesAsync`.
+- Cancelling a fully spawned pipeline now stops a pending stage-0 asynchronous stdin source, disposing its enumerator instead of leaving it parked after the run completes.
 
 ## [2.6.0] - 2026-07-23
 

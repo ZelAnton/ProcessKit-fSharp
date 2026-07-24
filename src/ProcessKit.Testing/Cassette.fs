@@ -751,7 +751,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                         outcomeOf entry,
                         TimeSpan.FromMilliseconds entry.DurationMs,
                         entry.Truncated,
-                        command.Config.OkCodes
+                        command.Config.OkCodes,
+                        stdoutEncoding = command.Config.StdoutEncoding
                     )
                 )
 

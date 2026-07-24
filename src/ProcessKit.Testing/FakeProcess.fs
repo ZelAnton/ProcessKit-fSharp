@@ -32,7 +32,8 @@ type internal PtyResizeRecorder() =
 ///
 /// Call `WithPty()` to model a pseudo-terminal (`Command.Pty`) run: the built handle then exposes a
 /// **single merged stream** (`OutputEvent.Stderr` is never produced) and `ResizeAsync` is a recorded
-/// no-op success — see that method for the merged-stream and `isatty` caveats.
+/// no-op success — see that method for the merged-stream and `isatty` caveats. A fake built from a
+/// `Command.MergeStderr()` configuration likewise exposes a single merged stream, without PTY resizing.
 [<Sealed>]
 type FakeProcess
     private
@@ -63,8 +64,9 @@ type FakeProcess
         ArgumentNullException.ThrowIfNull(lines, nameof lines)
         FakeProcess(template, String.Join('\n', lines), stderr, outcome, pid, pty)
 
-    /// The captured stderr. On a PTY fake (see `WithPty`) there is no separate stderr stream: this text
-    /// is folded into the single merged stdout stream rather than surfaced as `OutputEvent.Stderr`.
+    /// The captured stderr. On a PTY fake (see `WithPty`) or a `Command.MergeStderr()` fake there is no
+    /// separate stderr stream: this text is folded into the single merged stdout stream rather than
+    /// surfaced as `OutputEvent.Stderr`.
     member _.WithStderr(text: string) =
         ArgumentNullException.ThrowIfNull(text, nameof text)
         FakeProcess(template, stdout, text, outcome, pid, pty)
@@ -115,14 +117,14 @@ type FakeProcess
     member _.Build() : RunningProcess =
         let config = template.Config
         let isPty = pty.IsSome
+        let hasMergedStderr = isPty || config.MergeStderr
 
-        // Under a PTY there is ONE physical terminal stream (D3): the child's stdout and stderr are the
-        // same device. A PTY fake therefore folds any scripted stderr into the single merged stdout
-        // stream (rather than surfacing a separate `OutputEvent.Stderr`), joining on a newline so the
-        // folded text forms its own line. A fake cannot reproduce real OS interleaving, so folded stderr
-        // simply follows the stdout text.
+        // A PTY or MergeStderr has one observable stdout stream: the child's stdout and stderr share a
+        // terminal device or the OS folds stderr into stdout. The fake joins scripted stderr on a newline
+        // so it forms its own line. A fake cannot reproduce real OS interleaving, so folded stderr simply
+        // follows the stdout text.
         let stdoutText =
-            if isPty && stderr.Length > 0 then
+            if hasMergedStderr && stderr.Length > 0 then
                 match stdout with
                 | "" -> stderr
                 | s when s.EndsWith '\n' -> s + stderr
@@ -133,10 +135,10 @@ type FakeProcess
         let stdoutStream =
             new MemoryStream(config.StdoutEncoding.GetBytes stdoutText) :> Stream
 
-        // A PTY has no separate stderr channel (D3), exactly like a real `Command.Pty` spawn whose
-        // `Spawned.Stderr` is `None`; a non-PTY fake keeps its own stderr stream.
+        // PTY and MergeStderr runs have no separate stderr channel, exactly like a real spawn whose
+        // `Spawned.Stderr` is `None`; a normal fake keeps its own stderr stream.
         let stderrStream =
-            if isPty then
+            if hasMergedStderr then
                 None
             else
                 Some(new MemoryStream(config.StderrEncoding.GetBytes stderr) :> Stream)

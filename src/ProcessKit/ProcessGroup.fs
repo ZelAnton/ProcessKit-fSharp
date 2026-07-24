@@ -343,20 +343,36 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     stdinFeeder.Stop()
                     closeStreams ()
 
-                    // Mark this run torn down (under `sync`) BEFORE detaching/reaping, so a `Kill()`/
-                    // `StopAsync()` that races or follows this teardown observes the flag and no-ops rather
-                    // than signalling a child this run no longer owns (see `runTornDown`).
-                    lock sync (fun () -> runTornDown <- true)
-
                     if ownsGroup then
+                        // Mark this run torn down (under `sync`) BEFORE reaping, so a `Kill()`/`StopAsync()`
+                        // that races or follows this teardown observes the flag and no-ops rather than
+                        // signalling a child this run no longer owns (see `runTornDown`).
+                        lock sync (fun () -> runTornDown <- true)
                         // Owned group: closing the run reaps the whole tree.
                         (this :> IDisposable).Dispose()
                     else
-                        // Shared group: detach this run's I/O only — the GROUP owns the child's
-                        // lifetime (Shutdown/Dispose reaps it). Stop tracking it — POSIX only
-                        // once its group is empty, so a still-live child stays reapable by the
-                        // group; Windows closes the handle (the Job still contains the tree).
-                        backend.Release spawned
+                        // Shared group: detach this run's I/O only — the GROUP owns the child's lifetime
+                        // (Shutdown/Dispose reaps it). Mark this run torn down AND stop tracking the child in
+                        // the SAME `sync` critical section, in that order (T-204). Both must serialize against
+                        // the control verbs: `runTornDown` fends off a later `Kill()`/`StopAsync()`, and
+                        // `backend.Release` must not race `Signal`. On Windows `Release` drops the child's
+                        // `ctrlGroups` entry AND closes its process handle, freeing its pid for OS reuse; the
+                        // console process-group id in that entry is exactly what `Signal(Int/Term)` targets.
+                        // `Signal` snapshots `ctrlGroups.Values` and delivers every `GenerateConsoleCtrlEvent`
+                        // CTRL+BREAK while holding `sync` — so running this `Release` OFF the lock (as before)
+                        // let it drop the entry and close the handle midway through that delivery loop, after
+                        // which a CTRL+BREAK could land on a pid the OS had already recycled onto an unrelated
+                        // console process group (the wrong-target class T-084 closed for POSIX kill and T-162
+                        // for the Windows Job handle, left open on this path). Serializing `Release` under
+                        // `sync` restores the documented `ctrlGroups` invariant: an entry's handle stays open
+                        // for the whole of any concurrent `Signal` delivery. It is bounded native work — a
+                        // handle close on Windows, a pgid liveness probe on POSIX — exactly the release work it
+                        // already did, now merely under the lock like `KillChild`/`hardRelease`, so teardown is
+                        // not lengthened beyond it. POSIX stops tracking only once the child's group is empty,
+                        // so a still-live child stays reapable by the group.
+                        lock sync (fun () ->
+                            runTornDown <- true
+                            backend.Release spawned)
 
                     ValueTask.CompletedTask })
 

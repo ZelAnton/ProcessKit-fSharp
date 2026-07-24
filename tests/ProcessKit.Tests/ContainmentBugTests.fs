@@ -166,6 +166,108 @@ type internal SyntheticBackend() =
                 released <- true
                 hardReleaseCount <- hardReleaseCount + 1)
 
+/// A synthetic backend that models the Windows `ctrlGroups` stale-snapshot delivery race (T-204). Its
+/// `Signal` mirrors `JobObjectBackend.Signal(Int/Term)`: it snapshots the set of still-tracked children
+/// (the `ctrlGroups.Values` analogue), waits at a barrier that widens the delivery window, then
+/// "delivers" a by-number Ctrl event to each snapshot member — recording a WRONG-TARGET delivery for any
+/// member a concurrent `Release` has already dropped (exactly where the real backend would
+/// `GenerateConsoleCtrlEvent` a pid the OS may have recycled). `Release` — the shared-run per-teardown
+/// detach — stops tracking the child (dropping its `ctrlGroups` entry and closing its handle in the real
+/// backend). With the fix, `ProcessGroup` runs `Release` under the same `sync` lock `Signal` holds, so
+/// the two can never interleave: at delivery time every snapshot member is still tracked and no
+/// wrong-target delivery is recorded. `SnapshotTaken` lets the test start the racing `Release` only once
+/// `Signal` has taken its snapshot; `proceedToDeliver` lets an off-lock `Release` (the pre-fix behaviour)
+/// unblock delivery immediately, so the wrong-target window is exercised deterministically rather than by
+/// luck.
+type internal CtrlSignalRaceBackend() =
+    let gate = obj ()
+    let tracked = System.Collections.Generic.HashSet<nativeint>()
+    let wrongTargets = System.Collections.Generic.List<nativeint>()
+    let snapshotTaken = new ManualResetEventSlim(false)
+    let proceedToDeliver = new ManualResetEventSlim(false)
+    let mutable nextHandle = 0
+
+    /// Set once `Signal` has snapshotted the tracked children and is about to deliver — the point after
+    /// which a racing `Release` must not be able to make the snapshot stale.
+    member _.SnapshotTaken = snapshotTaken
+
+    /// Reset the per-iteration barrier state so the backend can be re-raced.
+    member _.ResetBarriers() =
+        snapshotTaken.Reset()
+        proceedToDeliver.Reset()
+
+    /// The snapshot members a delivery hit after they had already left tracking — must stay empty.
+    member _.WrongTargetDeliveries = lock gate (fun () -> List.ofSeq wrongTargets)
+
+    interface IContainmentBackend with
+        member _.Mechanism = Mechanism.JobObject
+
+        member _.Spawn(_command) =
+            let handle =
+                lock gate (fun () ->
+                    nextHandle <- nextHandle + 1
+                    nativeint nextHandle)
+
+            Ok
+                { Native.Common.Spawned.Handle = handle
+                  Stdout = None
+                  Stderr = None
+                  Stdin = None
+                  WindowsCtrlGroup = true
+                  PtyControl = None }
+
+        member _.Track(spawned) =
+            lock gate (fun () -> tracked.Add spawned.Handle |> ignore)
+            Ok()
+
+        member _.Adopt(_pid) = Ok()
+
+        member _.Release(spawned) =
+            // The shared-run teardown detach: stop tracking this child (drops its ctrlGroups entry and
+            // closes its handle in the real backend), then let a delivery blocked at the barrier proceed —
+            // so if this ran OFF the lock (the pre-fix behaviour) the delivery would immediately see a
+            // now-untracked member and misfire.
+            lock gate (fun () -> tracked.Remove spawned.Handle |> ignore)
+            proceedToDeliver.Set()
+
+        member _.Wait(_handle) = task { return Outcome.Exited 0 }
+        member _.PidOf(spawned) = Some(int spawned.Handle)
+        member _.KillChild(_spawned) = ()
+        member _.KillTree() = ()
+        member _.GracefulKillTree(_grace) = Task.CompletedTask
+
+        member _.Members() =
+            lock gate (fun () -> Ok(tracked |> Seq.map int |> List.ofSeq))
+
+        member _.Signal(_signal) =
+            // Snapshot the still-tracked children (the `ctrlGroups.Values` analogue), announce the
+            // snapshot, then wait briefly at the barrier before delivering — widening the window a racing
+            // `Release` would need to make the snapshot stale. A member no longer tracked at delivery is a
+            // wrong-target Ctrl event, exactly what the fix must make impossible.
+            let snapshot = lock gate (fun () -> List.ofSeq tracked)
+            snapshotTaken.Set()
+            // Bounded wait: an off-lock `Release` sets this the instant it drops the child (pre-fix). Under
+            // the fix `Release` is blocked on `sync` behind this very call, so this simply times out and
+            // delivery then finds every member still tracked.
+            proceedToDeliver.Wait 250 |> ignore
+
+            for handle in snapshot do
+                let stillTracked = lock gate (fun () -> tracked.Contains handle)
+
+                if not stillTracked then
+                    lock gate (fun () -> wrongTargets.Add handle)
+
+            Ok()
+
+        member _.Suspend() = Ok()
+        member _.Resume() = Ok()
+
+        member _.Stats() =
+            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None))
+
+        member _.UpdateLimits(_limits) = Ok()
+        member _.HardRelease() = lock gate (fun () -> tracked.Clear())
+
 /// Regression tests for containment-integrity fixes: spawning into a released group, pipeline
 /// mid-chain spawn failures, inherited stdio, and teardown reaping (no zombie leaders).
 [<TestFixture>]
@@ -638,4 +740,54 @@ type ContainmentBugTests() =
 
             Assert.That(backend.HardReleaseCount, Is.EqualTo 1, "StopAsync must reap the owned group once")
             Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+        }
+
+    [<Test>]
+    member _.``Signal racing a shared run's teardown never delivers a Ctrl event to a released group (T-204)``
+        ()
+        : Task =
+        task {
+            // The Windows `ctrlGroups` stale-snapshot wrong-target race. `Signal(Int/Term)` snapshots the
+            // console-group ids and delivers a CTRL+BREAK to each while holding the group's `sync` lock; a
+            // shared run's teardown detaches that run by calling `backend.Release`, which drops the child's
+            // `ctrlGroups` entry and closes its process handle (freeing its pid for OS reuse). Running that
+            // `Release` OFF the lock let it strike between the snapshot and a delivery, so a CTRL+BREAK could
+            // land on a pid the OS had already recycled onto an unrelated console group. The fix serializes
+            // the shared-run `Release` under the same `sync` lock `Signal` holds, so at delivery time every
+            // snapshot member is still tracked. The synthetic backend flags any delivery to a member that
+            // left tracking; with the fix there is none. The barrier makes the (pre-fix) wrong-target window
+            // deterministic rather than timing-dependent.
+            for _ in 1..5 do
+                let backend = CtrlSignalRaceBackend()
+                backend.ResetBarriers()
+                let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+                let! started = group.StartAsync(Command.create "synthetic")
+
+                let running =
+                    match started with
+                    | Ok r -> r
+                    | Error e -> failwith $"shared start failed: {e}"
+
+                // Deliver the signal on one thread; it snapshots, announces, then waits at the barrier.
+                let signalTask = Task.Run(fun () -> group.Signal Signal.Int |> ignore)
+
+                // Only start the racing teardown once `Signal` has taken its snapshot — the exact instant a
+                // stale-snapshot delivery could misfire if `Release` were not serialized against it.
+                backend.SnapshotTaken.Wait()
+
+                let disposeTask: Task =
+                    Task.Run(fun () -> (running :> IAsyncDisposable).DisposeAsync().AsTask())
+
+                do! Task.WhenAll(signalTask, disposeTask)
+
+                Assert.That(
+                    backend.WrongTargetDeliveries,
+                    Is.Empty,
+                    "a CTRL+BREAK was delivered to a child whose Release had already dropped it — the "
+                    + "wrong-target race is open"
+                )
+
+                GC.KeepAlive running
+                (group :> IDisposable).Dispose()
         }
