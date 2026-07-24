@@ -1,0 +1,521 @@
+namespace ProcessKit.Tests
+
+open System
+open System.Diagnostics
+open System.Net
+open System.Runtime.InteropServices
+open System.Text
+open System.Text.RegularExpressions
+open System.Threading
+open System.Threading.Tasks
+open NUnit.Framework
+open ProcessKit
+open ProcessKit.Testing
+
+/// Tests for the expect-style interaction layer (`PtySession`, T-226): waiting for a pattern in the
+/// child's RAW merged terminal output — a prompt such as `Password: ` carries no line terminator, so it
+/// is exactly what the line-framed `WaitForLineAsync` cannot see — sending input back through the
+/// existing interactive stdin, and the optional session transcript.
+///
+/// The double-backed tests run everywhere (`FakeProcess.WithPty` models the merged-stream shape, and
+/// `WithStdinOpen` gives the session a stdin to record). The genuine expect/send round trip is
+/// Linux-gated exactly like the rest of `PtyTests`: the POSIX ctty helper (util-linux `setsid --ctty`)
+/// is absent on macOS/BSD, and a real ConPTY round trip needs a console-less parent.
+[<TestFixture>]
+type PtySessionTests() =
+
+    let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
+    let runner: IProcessRunner = JobRunner()
+
+    // A child that stays alive for a few seconds and prints nothing at all, on either platform — so a
+    // pattern wait against it can only ever end at its own deadline, never at an early end-of-output.
+    let silentSleeper () =
+        let command =
+            if isWindows then
+                // `ping` (not `timeout`, which needs a console) with its output discarded.
+                Command.create "cmd.exe" |> Command.args [ "/c"; "ping -n 6 127.0.0.1 >NUL" ]
+            else
+                Command.create "/bin/sh" |> Command.args [ "-c"; "sleep 5" ]
+
+        command |> Command.timeout (TimeSpan.FromSeconds 60.0)
+
+    // ----------------------------------------------------------------------------------
+    // Pattern waiting + sending, against the PTY double
+    // ----------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``expect matches a prompt with no line terminator, and send answers it``() : Task =
+        task {
+            // The scripted conversation: a banner, then a prompt that does NOT end its line (the shape a
+            // line-framed wait cannot deliver), then the child's confirmation.
+            let fake =
+                FakeProcess
+                    .Create("fake-installer")
+                    .WithPty()
+                    .WithStdinOpen()
+                    .WithStdout("Welcome to the installer\r\nPassword: LEN=6\r\n")
+
+            use running = fake.Build()
+            let session = PtySession running
+
+            match! session.ExpectAsync("Password: ", TimeSpan.FromSeconds 10.0) with
+            | Ok matched ->
+                Assert.That(matched.Text, Is.EqualTo "Password: ")
+                Assert.That(matched.Before, Does.Contain "Welcome to the installer")
+            | Error error -> Assert.Fail $"the unterminated prompt should have matched: {error}"
+
+            match! session.SendLineAsync "secret" with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"sending the answer failed: {error}"
+
+            // Consumed up to and including the prompt, so the follow-up is matched from what came after.
+            match! session.ExpectAsync("LEN=6", TimeSpan.FromSeconds 10.0) with
+            | Ok matched -> Assert.That(matched.Text, Is.EqualTo "LEN=6")
+            | Error error -> Assert.Fail $"the confirmation should have matched: {error}"
+
+            // The answer went through the ordinary interactive stdin, terminated with the carriage
+            // return a terminal sends for Enter (PtyLineEnding.Auto on a pty-backed run).
+            Assert.That(Encoding.UTF8.GetString fake.StdinBytes, Is.EqualTo "secret\r")
+        }
+
+    [<Test>]
+    member _.``expect accepts a Regex and consumes only up to the match``() : Task =
+        task {
+            let fake =
+                FakeProcess
+                    .Create("fake-repl")
+                    .WithPty()
+                    .WithStdinOpen()
+                    .WithStdout("banner\r\nrepl v2.7.0> answer=42\r\n")
+
+            use running = fake.Build()
+            let session = PtySession running
+
+            match! session.ExpectAsync(Regex @"repl v\d+\.\d+\.\d+> ", TimeSpan.FromSeconds 10.0) with
+            | Ok matched ->
+                Assert.That(matched.Text, Is.EqualTo "repl v2.7.0> ")
+                Assert.That(matched.Before, Does.Contain "banner")
+            | Error error -> Assert.Fail $"the regex prompt should have matched: {error}"
+
+            // Everything after the match is still pending for the next pattern.
+            match! session.ExpectAsync("answer=42", TimeSpan.FromSeconds 10.0) with
+            | Ok matched -> Assert.That(matched.Text, Is.EqualTo "answer=42")
+            | Error error -> Assert.Fail $"the text after the regex match should still be pending: {error}"
+        }
+
+    [<Test>]
+    member _.``a send on a run with no interactive stdin is a typed Unsupported``() : Task =
+        task {
+            // No `WithStdinOpen`, so the built handle has no stdin pipe at all — the send verbs must say
+            // so, never silently drop the bytes.
+            let fake = FakeProcess.Create("fake-tool").WithPty().WithStdout("ready> ")
+            use running = fake.Build()
+            let session = PtySession running
+
+            match! session.SendLineAsync "hello" with
+            | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "KeepStdinOpen")
+            | Error other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+            | Ok() -> Assert.Fail "sending without an interactive stdin must not report success"
+
+            match! session.CloseStdinAsync() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+            | Ok() -> Assert.Fail "closing an absent stdin must not report success"
+
+            Assert.That(fake.StdinBytes, Is.Empty)
+        }
+
+    // ----------------------------------------------------------------------------------
+    // The per-pattern deadline is the session's own, separate from the run's
+    // ----------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``an expect deadline is per pattern, reported as NotReady, and leaves the run alive``() : Task =
+        task {
+            // A live child that prints nothing: the only way this wait can end is its OWN deadline —
+            // there is no early end-of-output to short-circuit it, and the run-wide `Command.Timeout`
+            // (60s, above) is two orders of magnitude away.
+            match! runner.StartAsync(silentSleeper (), CancellationToken.None) with
+            | Error error -> Assert.Fail $"spawn failed: {error}"
+            | Ok running ->
+                use running = running
+                let session = PtySession running
+                let waited = TimeSpan.FromMilliseconds 400.0
+                let started = Stopwatch.GetTimestamp()
+
+                match! session.ExpectAsync("this-never-arrives", waited) with
+                | Error(ProcessError.NotReady(_, reported)) ->
+                    // The reported budget is the per-pattern one, not the run's 60-second timeout.
+                    Assert.That(reported, Is.EqualTo waited)
+                | Error other -> Assert.Fail $"expected ProcessError.NotReady, got {other}"
+                | Ok matched -> Assert.Fail $"nothing should have matched, got {matched.Text}"
+
+                // It genuinely waited for its own deadline rather than returning early (a generous lower
+                // bound: this asserts "not instant", not a tight timing threshold).
+                let elapsed = Stopwatch.GetElapsedTime started
+
+                Assert.That(
+                    elapsed,
+                    Is.GreaterThanOrEqualTo(TimeSpan.FromMilliseconds 250.0),
+                    "the pattern wait must burn its own deadline, not return immediately"
+                )
+
+                // The run itself was untouched by that deadline: the session is still usable, and a
+                // second wait is budgeted independently of the first.
+                match! session.ExpectAsync("still-never-arrives", TimeSpan.FromMilliseconds 200.0) with
+                | Error(ProcessError.NotReady(_, reported)) ->
+                    Assert.That(reported, Is.EqualTo(TimeSpan.FromMilliseconds 200.0))
+                | Error other -> Assert.Fail $"expected a second independent NotReady, got {other}"
+                | Ok _ -> Assert.Fail "nothing should have matched the second pattern either"
+        }
+
+    [<Test>]
+    member _.``an expect whose caller token fires reports Cancelled, not NotReady``() : Task =
+        task {
+            match! runner.StartAsync(silentSleeper (), CancellationToken.None) with
+            | Error error -> Assert.Fail $"spawn failed: {error}"
+            | Ok running ->
+                use running = running
+                let session = PtySession running
+                use cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds 200.0)
+
+                // The caller's token fires long before the pattern's own (generous) deadline: a cancelled
+                // wait is an error, a timed-out one is only "not ready yet".
+                match! session.ExpectAsync("never", TimeSpan.FromSeconds 30.0, cancellation.Token) with
+                | Error(ProcessError.Cancelled _) -> ()
+                | Error other -> Assert.Fail $"expected ProcessError.Cancelled, got {other}"
+                | Ok _ -> Assert.Fail "nothing should have matched"
+        }
+
+    [<Test>]
+    member _.``an expect ends promptly with NotReady once the child's output has ended``() : Task =
+        task {
+            // The scripted output is exhausted immediately, so a pattern that is not in it must be
+            // refused at once rather than waiting out the (very long) deadline.
+            let fake = FakeProcess.Create("fake-tool").WithPty().WithStdout("all there is")
+            use running = fake.Build()
+            let session = PtySession running
+            let started = Stopwatch.GetTimestamp()
+
+            match! session.ExpectAsync("absent", TimeSpan.FromSeconds 60.0) with
+            | Error(ProcessError.NotReady _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.NotReady, got {other}"
+            | Ok _ -> Assert.Fail "nothing should have matched"
+
+            let elapsed = Stopwatch.GetElapsedTime started
+
+            Assert.That(
+                elapsed,
+                Is.LessThan(TimeSpan.FromSeconds 30.0),
+                "end-of-output must end the wait, not the 60-second deadline"
+            )
+        }
+
+    // ----------------------------------------------------------------------------------
+    // Transcript
+    // ----------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``the transcript keeps the whole session's output after a series of expect and send``() : Task =
+        task {
+            let fake =
+                FakeProcess
+                    .Create("fake-installer")
+                    .WithPty()
+                    .WithStdinOpen()
+                    .WithStdout("step one\r\nContinue? step two\r\nDone.\r\n")
+
+            use running = fake.Build()
+            let session = PtySession running
+
+            match! session.ExpectAsync("Continue? ", TimeSpan.FromSeconds 10.0) with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"the prompt should have matched: {error}"
+
+            match! session.SendLineAsync "y" with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"sending the answer failed: {error}"
+
+            match! session.ExpectAsync("Done.", TimeSpan.FromSeconds 10.0) with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"the final marker should have matched: {error}"
+
+            // Consuming a match removes it from the WINDOW, never from the transcript: everything the
+            // child emitted this session is still there, in order.
+            let transcript = session.Transcript
+            Assert.That(transcript, Does.Contain "step one")
+            Assert.That(transcript, Does.Contain "Continue? ")
+            Assert.That(transcript, Does.Contain "step two")
+            Assert.That(transcript, Does.Contain "Done.")
+            Assert.That(session.TranscriptTruncated, Is.False)
+            // Input is the caller's, not the child's output: it is never recorded here.
+            Assert.That(transcript, Does.Not.Contain "y\r")
+        }
+
+    [<Test>]
+    member _.``a session with the transcript off still matches but records nothing``() : Task =
+        task {
+            let fake =
+                FakeProcess.Create("fake-tool").WithPty().WithStdout("secret-banner ready> ")
+
+            use running = fake.Build()
+
+            let session =
+                PtySession(
+                    running,
+                    { PtySessionOptions.Default with
+                        CaptureTranscript = false }
+                )
+
+            match! session.ExpectAsync("ready> ", TimeSpan.FromSeconds 10.0) with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"the prompt should still match with no transcript: {error}"
+
+            Assert.That(session.Transcript, Is.Empty)
+            Assert.That(session.TranscriptTruncated, Is.False)
+        }
+
+    [<Test>]
+    member _.``the match window slides, dropping the oldest output and saying so``() : Task =
+        task {
+            let filler = String('x', 200)
+
+            let fake = FakeProcess.Create("fake-chatty").WithPty().WithStdout(filler + "TAIL")
+
+            use running = fake.Build()
+
+            let session =
+                PtySession(
+                    running,
+                    { PtySessionOptions.Default with
+                        WindowChars = 16 }
+                )
+
+            // The tail is still matchable; the evicted head is not, and the session reports the eviction
+            // rather than silently pretending the output never existed.
+            match! session.ExpectAsync("TAIL", TimeSpan.FromSeconds 10.0) with
+            | Ok matched -> Assert.That(matched.Text, Is.EqualTo "TAIL")
+            | Error error -> Assert.Fail $"the tail of the window should still match: {error}"
+
+            Assert.That(session.WindowTruncated, Is.True)
+            // The transcript is bounded separately and much larger, so it still has the whole output.
+            Assert.That(session.Transcript, Does.StartWith "xxx")
+            Assert.That(session.Transcript.Length, Is.EqualTo(filler.Length + 4))
+        }
+
+    // ----------------------------------------------------------------------------------
+    // Claim gate + options validation
+    // ----------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``a session owns the pipes: a second session and a streaming verb are both refused``() : Task =
+        task {
+            let fake = FakeProcess.Create("fake-tool").WithPty().WithStdout("ready> ")
+            use running = fake.Build()
+            let _session = PtySession running
+
+            // Two matchers over one window would silently consume each other's output.
+            Assert.Throws<InvalidOperationException>(Action(fun () -> PtySession running |> ignore))
+            |> ignore
+
+            // And the ordinary streaming verbs see the handle as already consumed, exactly as they do
+            // after `OutputEventsAsync`.
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutLinesAsync() |> ignore))
+            |> ignore
+
+            match! running.OutputStringAsync() with
+            | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "consumed")
+            | Error other -> Assert.Fail $"expected the already-consumed error, got {other}"
+            | Ok _ -> Assert.Fail "a capture verb must not run alongside an interactive session"
+        }
+
+    [<Test>]
+    member _.``a session over an already-consumed handle throws rather than half-attaching``() : Task =
+        task {
+            let fake = FakeProcess.Create("fake-tool").WithStdout("line one\n")
+            use running = fake.Build()
+            let _ = running.StdoutLinesAsync()
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> PtySession running |> ignore))
+            |> ignore
+        }
+
+    [<Test>]
+    member _.``session options are validated at construction``() =
+        let fake = FakeProcess.Create("fake-tool").WithPty()
+
+        let build (options: PtySessionOptions) =
+            task {
+                use running = fake.Build()
+                PtySession(running, options) |> ignore
+            }
+            |> fun t -> t.GetAwaiter().GetResult()
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () ->
+                build
+                    { PtySessionOptions.Default with
+                        WindowChars = 0 })
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () ->
+                build
+                    { PtySessionOptions.Default with
+                        TranscriptChars = 0 })
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``a session started after a readiness probe still reports the real exit (K-016)``() : Task =
+        task {
+            // The probe starts the handle's ONE shared exit wait while deliberately leaving the pipes
+            // unclaimed, and a session claims them right afterwards. On POSIX that wait reaps the child,
+            // so a session that started its own second wait would see the pid already gone and fabricate
+            // an `Unobserved` outcome instead of the real exit code.
+            let command =
+                if isWindows then
+                    Command.create "cmd.exe" |> Command.args [ "/c"; "exit 7" ]
+                else
+                    Command.create "/bin/sh" |> Command.args [ "-c"; "exit 7" ]
+
+            match!
+                runner.StartAsync(command |> Command.timeout (TimeSpan.FromSeconds 60.0), CancellationToken.None)
+            with
+            | Error error -> Assert.Fail $"spawn failed: {error}"
+            | Ok running ->
+                use running = running
+                // Port 1 on loopback is never listening; the child exits at once, so the probe's own
+                // early-exit race ends it well before its deadline.
+                let endpoint = IPEndPoint(IPAddress.Loopback, 1)
+
+                match! running.WaitForPortAsync(endpoint, TimeSpan.FromSeconds 10.0) with
+                | Error(ProcessError.NotReady _) -> ()
+                | Error other -> Assert.Fail $"expected the probe to report NotReady, got {other}"
+                | Ok() -> Assert.Fail "nothing should be listening on loopback port 1"
+
+                let session = PtySession running
+
+                match! session.WaitForExitAsync() with
+                | Outcome.Exited 7 -> ()
+                | other -> Assert.Fail $"expected the child's real exit code after the probe, got {other}"
+        }
+
+    [<Test>]
+    member _.``WaitForExitAsync reports the child's outcome without reaping it``() : Task =
+        task {
+            let fake = FakeProcess.Create("fake-tool").WithPty().WithStdout("bye").WithExit 3
+
+            use running = fake.Build()
+            let session = PtySession running
+
+            match! session.ExpectAsync("bye", TimeSpan.FromSeconds 10.0) with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"the scripted output should have matched: {error}"
+
+            match! session.WaitForExitAsync() with
+            | Outcome.Exited 3 -> ()
+            | other -> Assert.Fail $"expected the scripted exit code, got {other}"
+        }
+
+    // ----------------------------------------------------------------------------------
+    // The real thing: a POSIX pty conversation end to end
+    // ----------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``a real PTY conversation expects a prompt, answers it, and keeps the secret out``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: the POSIX ctty helper is util-linux setsid --ctty"
+            else
+                // `printf 'Password: '` leaves the prompt UNTERMINATED — the child then blocks in `read`,
+                // so no newline can ever arrive to flush a line-framed wait. Only a raw pattern wait can
+                // see it. The child reports the answer's LENGTH, so the secret itself is never printed.
+                let secret = "hunter2"
+
+                let script = "printf 'Password: '; IFS= read -r pw; printf 'LEN=%s\\n' \"${#pw}\""
+
+                let command =
+                    (Command.create "/bin/sh" |> Command.args [ "-c"; script ])
+                        .Pty({ PtyConfig.Default with Echo = false })
+                    |> Command.keepStdinOpen
+                    |> Command.timeout (TimeSpan.FromSeconds 60.0)
+
+                match! runner.StartAsync(command, CancellationToken.None) with
+                | Error(ProcessError.Unsupported message) -> Assert.Ignore $"host lacks a PTY: {message}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok running ->
+                    use running = running
+                    let session = PtySession running
+
+                    match! session.ExpectAsync("Password: ", TimeSpan.FromSeconds 30.0) with
+                    | Ok matched -> Assert.That(matched.Text, Is.EqualTo "Password: ")
+                    | Error error -> Assert.Fail $"the live pty prompt should have matched: {error}"
+
+                    match! session.SendLineAsync secret with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"sending the credential failed: {error}"
+
+                    match! session.ExpectAsync("LEN=7", TimeSpan.FromSeconds 30.0) with
+                    | Ok matched -> Assert.That(matched.Text, Is.EqualTo "LEN=7")
+                    | Error error -> Assert.Fail $"the child should have read the whole answer: {error}"
+
+                    // Echo=false plus "input is never transcribed" means the credential appears nowhere in
+                    // the session's own record of the conversation.
+                    Assert.That(session.Transcript, Does.Contain "Password: ")
+                    Assert.That(session.Transcript, Does.Not.Contain secret)
+
+                    match! session.WaitForExitAsync() with
+                    | Outcome.Exited 0 -> ()
+                    | other -> Assert.Fail $"expected a clean exit from the pty child, got {other}"
+        }
+
+    [<Test>]
+    member _.``a real PTY session drives a multi-step conversation through one handle``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                // Two prompts in a row: the second is only printed after the first answer arrives, so the
+                // test can only pass if expect and send genuinely interleave against a live child.
+                let script =
+                    "printf 'name> '; IFS= read -r name; printf 'city> '; IFS= read -r city; "
+                    + "printf 'HELLO %s OF %s\\n' \"$name\" \"$city\""
+
+                let command =
+                    (Command.create "/bin/sh" |> Command.args [ "-c"; script ])
+                        .Pty({ PtyConfig.Default with Echo = false })
+                    |> Command.keepStdinOpen
+                    |> Command.timeout (TimeSpan.FromSeconds 60.0)
+
+                match! runner.StartAsync(command, CancellationToken.None) with
+                | Error(ProcessError.Unsupported message) -> Assert.Ignore $"host lacks a PTY: {message}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok running ->
+                    use running = running
+                    let session = PtySession running
+
+                    let step (prompt: string) (answer: string) =
+                        task {
+                            match! session.ExpectAsync(prompt, TimeSpan.FromSeconds 30.0) with
+                            | Ok _ -> ()
+                            | Error error -> Assert.Fail $"prompt '{prompt}' never arrived: {error}"
+
+                            match! session.SendLineAsync answer with
+                            | Ok() -> ()
+                            | Error error -> Assert.Fail $"answering '{prompt}' failed: {error}"
+                        }
+
+                    do! step "name> " "ada"
+                    do! step "city> " "london"
+
+                    match! session.ExpectAsync("HELLO ada OF london", TimeSpan.FromSeconds 30.0) with
+                    | Ok _ -> ()
+                    | Error error -> Assert.Fail $"the child should have combined both answers: {error}"
+
+                    match! session.WaitForExitAsync() with
+                    | Outcome.Exited 0 -> ()
+                    | other -> Assert.Fail $"expected a clean exit from the pty child, got {other}"
+        }

@@ -17,7 +17,9 @@ Shipped changes are in [`CHANGELOG.md`](CHANGELOG.md).
 - **Pseudo-terminals (PTYs)** via `Command.Pty` / `PtyConfig` and `RunningProcess.ResizeAsync`: Windows
   ConPTY and POSIX `openpty` + `setsid --ctty`, with unsupported hosts returning
   `ProcessError.Unsupported`; test doubles model the merged stream and resize, and v4 cassettes record
-  the PTY geometry.
+  the PTY geometry. **`PtySession`** turns that into the expect-style automation loop — wait for a
+  prompt (text or `Regex`) in the raw terminal stream with a per-pattern timeout, answer it through the
+  interactive stdin, and keep an optional transcript.
 - Shell-free **`Pipeline`s** with pipefail semantics.
 - **`Supervisor`** — restart policies, exponential backoff + jitter, and a failure-storm guard.
 - Tree control on **`ProcessGroup`** (`Signal` / `Suspend` / `Resume` / `Members` / `KillAll` /

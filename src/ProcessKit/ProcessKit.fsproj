@@ -74,6 +74,7 @@
 		<Compile Include="ProcessStdin.fs" />
 		<Compile Include="ReadinessProbe.fs" />
 		<Compile Include="RunningProcess.fs" />
+		<Compile Include="PtySession.fs" />
 		<Compile Include="IProcessRunner.fs" />
 		<Compile Include="Runner.fs" />
 		<Compile Include="ProcessRunnerExtensions.fs" />

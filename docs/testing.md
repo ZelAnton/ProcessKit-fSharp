@@ -454,6 +454,37 @@ task {
 }
 ```
 
+### Expect-style sessions against the double
+
+A [`PtySession`](pty.md#automating-an-interactive-cli-expect-and-send) works over the built handle
+just as it does over a real run: it reads the same merged stream raw, so `ExpectAsync` finds a
+scripted prompt that carries **no** line terminator, and `SendAsync`/`SendLineAsync` record their
+bytes into `FakeProcess.StdinBytes`. Add **`WithStdinOpen()`** to give the fake the interactive
+stdin the send verbs need (a fake built from your own `Command.KeepStdinOpen` command through
+`ScriptedRunner` already has it).
+
+```fsharp
+task {
+    let fake =
+        FakeProcess.Create("installer").WithPty().WithStdinOpen()
+            .WithStdout("Welcome\r\nPassword: LEN=6\r\n")
+
+    use proc = fake.Build()
+    let session = PtySession proc
+
+    // The prompt has no newline — exactly what WaitForLineAsync cannot deliver.
+    let! _ = session.ExpectAsync("Password: ", TimeSpan.FromSeconds 10.0)
+    let! _ = session.SendLineAsync "secret"
+    let! _ = session.ExpectAsync("LEN=6", TimeSpan.FromSeconds 10.0)
+
+    Assert.That(Encoding.UTF8.GetString fake.StdinBytes, Is.EqualTo "secret\r")
+}
+```
+
+The scripted output is complete before the first `ExpectAsync` runs, so a fake cannot model a child
+that *reacts* to what was sent: script the whole conversation's output up front and expect its parts
+in order. A genuine request/response exchange needs a real `Command.Pty` run.
+
 **Inherent limitation (not papered over).** A double has no real terminal, so it **cannot** make
 the child observe `isatty = true`. Any behaviour that depends on the *child* seeing a tty — a
 tool switching from line-buffered "dumb" output to full-screen TUI mode, a shell enabling colour,

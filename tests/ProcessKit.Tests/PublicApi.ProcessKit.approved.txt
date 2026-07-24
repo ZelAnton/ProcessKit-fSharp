@@ -165,6 +165,10 @@ module ProcessKit.Exec
   static member run(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
   static member which(System.String) : Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>
 
+class ProcessKit.ExpectMatch
+  property Before : System.String { get }
+  property Text : System.String { get }
+
 class ProcessKit.Finished
   property Outcome : ProcessKit.Outcome { get }
   property Stderr : System.String { get }
@@ -828,6 +832,72 @@ class ProcessKit.PtyConfig
   property Default : ProcessKit.PtyConfig { get }
   property Echo : System.Boolean { get }
   property Rows : System.Int32 { get }
+
+class ProcessKit.PtyLineEnding
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.PtyLineEnding>
+  member Equals(ProcessKit.PtyLineEnding) : System.Boolean
+  member Equals(ProcessKit.PtyLineEnding, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsAuto() : System.Boolean
+  member get_IsCr() : System.Boolean
+  member get_IsCrLf() : System.Boolean
+  member get_IsLf() : System.Boolean
+  member get_Tag() : System.Int32
+  property Auto : ProcessKit.PtyLineEnding { get }
+  property Cr : ProcessKit.PtyLineEnding { get }
+  property CrLf : ProcessKit.PtyLineEnding { get }
+  property IsAuto : System.Boolean { get }
+  property IsCr : System.Boolean { get }
+  property IsCrLf : System.Boolean { get }
+  property IsLf : System.Boolean { get }
+  property Lf : ProcessKit.PtyLineEnding { get }
+  property Tag : System.Int32 { get }
+  static member get_Auto() : ProcessKit.PtyLineEnding
+  static member get_Cr() : ProcessKit.PtyLineEnding
+  static member get_CrLf() : ProcessKit.PtyLineEnding
+  static member get_Lf() : ProcessKit.PtyLineEnding
+
+module ProcessKit.PtyLineEnding+Tags
+  field literal Auto : System.Int32
+  field literal Cr : System.Int32
+  field literal CrLf : System.Int32
+  field literal Lf : System.Int32
+
+class ProcessKit.PtySession
+  member CloseStdinAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member ExpectAsync(System.String, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ExpectMatch, ProcessKit.ProcessError>>
+  member ExpectAsync(System.Text.RegularExpressions.Regex, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ExpectMatch, ProcessKit.ProcessError>>
+  member SendAsync(System.String, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member SendLineAsync(System.String, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member WaitForExitAsync() : System.Threading.Tasks.Task<ProcessKit.Outcome>
+  new(ProcessKit.RunningProcess)
+  new(ProcessKit.RunningProcess, ProcessKit.PtySessionOptions)
+  property Pending : System.String { get }
+  property Transcript : System.String { get }
+  property TranscriptTruncated : System.Boolean { get }
+  property WindowTruncated : System.Boolean { get }
+
+class ProcessKit.PtySessionOptions
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.PtySessionOptions>
+  member Equals(ProcessKit.PtySessionOptions) : System.Boolean
+  member Equals(ProcessKit.PtySessionOptions, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  new(System.Int32, System.Boolean, System.Int32, ProcessKit.PtyLineEnding)
+  property CaptureTranscript : System.Boolean { get }
+  property Default : ProcessKit.PtySessionOptions { get }
+  property LineEnding : ProcessKit.PtyLineEnding { get }
+  property TranscriptChars : System.Int32 { get }
+  property WindowChars : System.Int32 { get }
 
 class ProcessKit.ResourceLimits
   member WithCpuQuota(System.Double) : ProcessKit.ResourceLimits

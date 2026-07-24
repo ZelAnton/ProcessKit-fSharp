@@ -10,6 +10,7 @@ open System.Net.Http
 open System.Net.Sockets
 open System.Runtime.ExceptionServices
 open System.Runtime.InteropServices
+open System.Text
 open System.Text.Json
 open System.Text.Json.Serialization.Metadata
 open System.Threading
@@ -82,6 +83,111 @@ type internal Consumption =
     | Buffered
     | StdoutStreaming
     | EventStreaming
+    | Interactive
+
+/// The shared state behind an interactive expect-style session (`PtySession`): a bounded sliding
+/// window of the child's raw merged output that pattern waits are matched against, plus the optional
+/// session transcript. Deliberately unframed — a terminal prompt (`Password: `, `> `) carries no line
+/// terminator, so the line pumps' framing is exactly what a pattern waiter must NOT go through.
+///
+/// Filled by the session's raw pumps (`Pump.readTextUntilDone`, one per piped stream) and drained by
+/// `TryConsume` on the caller's thread, so every operation runs under one `gate`. Waiters are woken
+/// through `Changed`, a `TaskCompletionSource` replaced on every publish: capture it BEFORE testing
+/// the window, and an append landing between the capture and the test either shows up in that test or
+/// completes the captured task, so a wake-up can never be lost. Continuations run asynchronously, so
+/// no waiter's continuation executes while `gate` is held.
+///
+/// Both buffers are bounded, and both bound by DROPPING THE OLDEST text — the tail is what an expect
+/// script is about to match, and what a failed session's diagnosis needs. Neither ever grows past its
+/// cap, so a chatty child cannot turn a long-lived session into an unbounded memory leak; a pattern
+/// that needs more context than `maxWindowChars` simply cannot match, which `PtySession` documents
+/// rather than papering over.
+type internal ExpectWindow(maxWindowChars: int, maxTranscriptChars: int option) =
+
+    let gate = obj ()
+    let window = StringBuilder()
+    let transcript = StringBuilder()
+    let mutable transcriptTruncated = false
+    let mutable windowTruncated = false
+    let mutable completed = false
+    let mutable readFault: exn option = None
+
+    // Completed (and replaced) on every append and once the readers finish. `RunContinuationsAsynchronously`
+    // keeps a woken waiter's continuation off this thread, so it never runs while `gate` is held below.
+    let mutable changed =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    // Callers hold `gate`.
+    let publish () =
+        let current = changed
+        changed <- TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+        current.TrySetResult() |> ignore
+
+    /// Completes the next time the window changes — an append, or the readers finishing. Capture this
+    /// BEFORE testing the window, then await it, so no change is missed between the two.
+    member _.Changed: Task = lock gate (fun () -> changed.Task)
+
+    /// Append freshly decoded child output, evicting the oldest text past either cap.
+    member _.Append(text: string) =
+        if text.Length > 0 then
+            lock gate (fun () ->
+                window.Append text |> ignore
+
+                if window.Length > maxWindowChars then
+                    window.Remove(0, window.Length - maxWindowChars) |> ignore
+                    windowTruncated <- true
+
+                match maxTranscriptChars with
+                | Some cap ->
+                    transcript.Append text |> ignore
+
+                    if transcript.Length > cap then
+                        transcript.Remove(0, transcript.Length - cap) |> ignore
+                        transcriptTruncated <- true
+                | None -> ()
+
+                publish ())
+
+    /// Mark the child's output as ended — cleanly (`None`) or with a genuine read fault (`Some ex`) —
+    /// and wake every waiter. Idempotent: the first completion wins, so a second reader finishing (or a
+    /// late teardown) can't overwrite a genuine fault with a clean end.
+    member _.Complete(fault: exn option) =
+        lock gate (fun () ->
+            if not completed then
+                completed <- true
+                readFault <- fault
+                publish ())
+
+    /// Test `matcher` against the whole current window; on a match, CONSUME everything up to and
+    /// including it (so the next wait starts after this match, and a prompt is never matched twice) and
+    /// return `(before, matched)`. `before` is the output that preceded the match, which the sliding
+    /// window may already have truncated (see `WindowTruncated`).
+    member _.TryConsume(matcher: string -> (int * int) option) : (string * string) option =
+        lock gate (fun () ->
+            let text = window.ToString()
+
+            match matcher text with
+            | Some(start, length) ->
+                window.Remove(0, start + length) |> ignore
+                Some(text.Substring(0, start), text.Substring(start, length))
+            | None -> None)
+
+    /// The buffered output no pattern has consumed yet.
+    member _.Pending = lock gate (fun () -> window.ToString())
+
+    /// Everything the child has emitted this session (empty when the transcript is off), oldest text
+    /// dropped once the cap is reached.
+    member _.Transcript = lock gate (fun () -> transcript.ToString())
+
+    /// Whether the transcript has dropped any output to stay within its cap.
+    member _.TranscriptTruncated = lock gate (fun () -> transcriptTruncated)
+
+    /// Whether the match window has dropped any output to stay within its cap.
+    member _.WindowTruncated = lock gate (fun () -> windowTruncated)
+
+    /// Whether the child's output has ended, and the genuine read fault that ended it (if any). Read as
+    /// one snapshot so a waiter can never see "ended" without the fault that came with it.
+    member _.Completion: bool * exn option = lock gate (fun () -> completed, readFault)
 
 /// The `IAsyncEnumerator<'T>` behind `RunningProcess.StdoutJsonLinesAsync`: projects a line-based
 /// `IAsyncEnumerator<string>` (the shape `StdoutLinesAsync` already returns) into a typed
@@ -272,6 +378,11 @@ type RunningProcess internal (host: RunningHost) =
     // racing set of drains on the same streams.
     let mutable eventOutcome = Unchecked.defaultof<Task<Outcome>>
 
+    // The interactive (expect-style) session's single combined outcome — the exit wait plus both raw
+    // readers draining, the unframed analogue of `eventOutcome` above. `ExitTask` reuses it for an
+    // `Interactive` handle so it does not start a second, racing set of readers on the same streams.
+    let mutable interactiveOutcome = Unchecked.defaultof<Task<Outcome>>
+
     // A buffered verb's single exit wait (`OutputStringAsync`/`OutputBytesAsync`/`WaitAsync`/
     // `ProfileAsync`, via `ensureBufferedWait`). ExitTask reuses it for an already-`Buffered` handle —
     // the "verb, then WaitAny/WaitAll" order — so it does not start a second `host.Wait()` racing the
@@ -285,7 +396,8 @@ type RunningProcess internal (host: RunningHost) =
     // Single-consumption guard: the output pipes are pumped exactly once. A buffered one-shot verb
     // (OutputString/OutputBytes/Wait/Profile) consumes them whole; the streaming verbs form one
     // session (`StdoutStreaming`: StdoutLines/WaitForLine/Finish share the stdout channel;
-    // `EventStreaming`: OutputEvents owns the event channel). A second, different consumer would race
+    // `EventStreaming`: OutputEvents owns the event channel; `Interactive`: a `PtySession` owns the
+    // pipes as UNFRAMED text, matched through `ExpectWindow`). A second, different consumer would race
     // two readers on the same pipe — splitting/losing output — so it is refused. Every transition of
     // this field runs under `stateLock`, so concurrent verbs (or a verb racing `ExitTask`) resolve to
     // exactly one winning consumer rather than both observing `Fresh` and double-pumping.
@@ -1507,6 +1619,114 @@ type RunningProcess internal (host: RunningHost) =
 
         eventChannel.Reader.ReadAllAsync()
 
+    // Claim the pipes for an interactive expect-style session (`PtySession`) and start its raw readers,
+    // returning the shared `ExpectWindow` they fill. Unlike `StartStdoutStreaming`/`StartEventStreaming`
+    // this is deliberately NOT reentrant: a second session over one handle would give two matchers one
+    // window, each silently consuming the other's output, so it is refused with the same
+    // already-consumed error every other verb reports. The whole check + claim + setup runs under
+    // `stateLock`, so a concurrent second call observes a fully-constructed session or is refused.
+    //
+    // The readers are raw (`Pump.readTextUntilDone`), not line pumps: an interactive prompt carries no
+    // line terminator, so framing the stream is precisely what must not happen here. That also means
+    // `LineTerminator`, `Command.OnStdoutLine`/`OnStderrLine` and the streaming line counters have
+    // nothing to observe on this path — the byte-exact tees (`StdoutTee`/`StderrTee`) still do, and are
+    // fed exactly as the line pumps feed them.
+    member internal _.StartInteractiveSession
+        (windowChars: int, transcriptChars: int option)
+        : Result<ExpectWindow, ProcessError> =
+        lock stateLock (fun () ->
+            if consumption <> Consumption.Fresh then
+                Error(alreadyConsumedError ())
+            else
+                consumption <- Consumption.Interactive
+                let window = ExpectWindow(windowChars, transcriptChars)
+
+                let rawPump (stream: Stream option) encoding tee : Task =
+                    match stream with
+                    | None -> Task.CompletedTask
+                    | Some s ->
+                        task {
+                            try
+                                do!
+                                    Pump.readTextUntilDone
+                                        s
+                                        encoding
+                                        tee
+                                        (fun text -> window.Append text)
+                                        isTearingDown
+                                        CancellationToken.None
+                            with ex ->
+                                // A genuine OS read fault is reclassified into `ProcessError.Io` (T-087)
+                                // before it reaches `Complete`/`interactiveOutcome` below.
+                                ExceptionDispatchInfo.Throw(reportedPumpFault ex)
+                        }
+                        :> Task
+
+                // A PTY run has ONE terminal device, so `stderrStream` is `None` there and only the
+                // merged reader runs; a plain (piped) run keeps both, and both feed the one window in
+                // arrival order — an interactive session is about what the terminal shows, so the two
+                // are deliberately not tagged apart here (`OutputEventsAsync` is the verb that tags).
+                let stdoutPump = rawPump stdoutStream config.StdoutEncoding config.StdoutTee
+                let stderrPump = rawPump stderrStream config.StderrEncoding config.StderrTee
+                let pumps = [| stdoutPump; stderrPump |]
+
+                // A fault in either reader kills the tree at once, so a still-producing child can't wedge
+                // `waitWithTimeout()` (below) by blocking on a pipe its dead reader no longer drains.
+                killTreeOnPumpFault stdoutPump
+                killTreeOnPumpFault stderrPump
+
+                // Close the window as soon as BOTH readers finish, independently of the exit wait, so a
+                // pattern wait ends promptly on the child's end-of-output instead of burning its whole
+                // timeout. Never faults (it stashes the reader fault into the window instead), so
+                // awaiting it below can't mask the pump fault `interactiveOutcome` re-raises.
+                let drained =
+                    task {
+                        let mutable fault: exn option = None
+
+                        try
+                            do! Task.WhenAll pumps
+                        with ex ->
+                            fault <- Some ex
+
+                        window.Complete fault
+                    }
+                    :> Task
+
+                interactiveOutcome <-
+                    task {
+                        // `ensureBufferedWait()`, not a raw `waitWithTimeout()`: a readiness probe can
+                        // already own the one shared exit wait while deliberately leaving `consumption`
+                        // at `Fresh` (see `raceReadinessAgainstExit`), which is exactly the state this
+                        // session claims from — so a probe-then-session sequence must join that wait
+                        // rather than start a second `host.Wait()` racing its reap (KB K-016). It is
+                        // reentrant on `stateLock`, which this setup already holds.
+                        let! outcome = ensureBufferedWait ()
+                        do! drained
+                        // Re-await the readers themselves so a genuine read fault still surfaces to
+                        // whoever awaits this outcome (`ExitTask`/`StopAsync`), exactly as it does for
+                        // the streaming sessions.
+                        do! Task.WhenAll pumps
+                        conclude outcome
+                        return outcome
+                    }
+
+                // Observe any fault on this otherwise fire-and-forget task (the expect-only case, where
+                // the caller never awaits the exit).
+                observeFault interactiveOutcome
+
+                Ok window)
+
+    /// The `CommandConfig` this handle was started from. Internal: `PtySession` reads the program name
+    /// and the terminal encoding from it.
+    member internal _.Config: CommandConfig = config
+
+    /// Whether this run actually has a live pseudo-terminal behind it — what `PtySession` asks before
+    /// choosing the carriage return a terminal expects for Enter over a plain pipe's line feed. Read
+    /// from the spawned host (`ResizePty` is `Some` exactly for a pty-backed run) as well as the
+    /// config, so a test double that models a PTY (`FakeProcess.WithPty`) answers the same as the real
+    /// spawn it stands in for, rather than diverging on a config field it never set.
+    member internal _.HasPseudoTerminal: bool = config.Pty.IsSome || host.ResizePty.IsSome
+
     /// Wait until a stdout line satisfies `predicate`, or fail with `NotReady` after `timeout`
     /// (or `Cancelled` if `cancellationToken` fires first). Consumed lines are not re-delivered; a
     /// later `StdoutLinesAsync`/`FinishAsync` sees the rest.
@@ -1686,7 +1906,7 @@ type RunningProcess internal (host: RunningHost) =
     /// the racing primitive behind `WaitAnyAsync`/`WaitAllAsync`. Built exactly once under `stateLock`
     /// (so concurrent `WaitAnyAsync`/`WaitAllAsync` on the same handle can't create two racing waits),
     /// reusing whichever consumption already owns the pipes instead of ever starting a second reader:
-    /// - `StdoutStreaming`/`EventStreaming`: the session's own combined outcome.
+    /// - `StdoutStreaming`/`EventStreaming`/`Interactive`: the session's own combined outcome.
     /// - `Buffered` (a capture verb already started — the "verb, then WaitAny/WaitAll" order): the
     ///   verb's own single wait, shared via `ensureBufferedWait` (memoized under the same lock, so it
     ///   is observed here regardless of which of the two reached it first).
@@ -1711,6 +1931,10 @@ type RunningProcess internal (host: RunningHost) =
                         // The event pumps already drain both pipes; reuse their shared outcome rather than
                         // starting our own drains here, which would race a second reader on the same streams.
                         eventOutcome
+                    elif consumption = Consumption.Interactive then
+                        // An expect-style session's raw readers already drain the pipes; reuse their shared
+                        // outcome for the same reason as the event session above.
+                        interactiveOutcome
                     elif consumption = Consumption.Buffered then
                         // A buffered verb already claimed the pipes; share its single wait (memoized under
                         // this same lock) rather than starting a second pair of readers and a second

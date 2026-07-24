@@ -256,7 +256,8 @@ await foreach (var ev in proc.OutputEventsAsync())
 
 From C#, `await foreach (var ev in proc.OutputEventsAsync()) { ... }`. Choose `OutputEventsAsync()`
 *or* `StdoutLinesAsync()` for a given run — both consume stdout, so they are alternatives,
-not companions.
+not companions. A [`PtySession`](pty.md#automating-an-interactive-cli-expect-and-send), which reads
+the same output unframed to wait for terminal prompts, is a third alternative to those two.
 
 `OutputEventsAsync()` tags each line with the stream it *came from*, keeping the two
 channels distinguishable. When you instead want them merged into one stream — with the

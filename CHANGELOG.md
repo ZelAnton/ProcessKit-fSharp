@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `PtySession` drives an interactive program the way an expect script does: wait for a pattern (text or `Regex`) in the child's raw terminal output — including a prompt such as `Password: ` that no line-based wait can see — with a per-pattern timeout, answer it through `SendAsync`/`SendLineAsync`, and read the whole exchange back from `Transcript`.
+- `ProcessKit.Testing.FakeProcess.WithStdinOpen()` keeps a fake's stdin open (like `Command.KeepStdinOpen()`), so a `PtySession` can be driven against the PTY double with no real process.
 
 ### Changed
 -

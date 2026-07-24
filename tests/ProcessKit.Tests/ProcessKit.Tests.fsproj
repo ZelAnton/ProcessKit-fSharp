@@ -42,6 +42,7 @@
 		<Compile Include="MergeStderrTests.fs" />
 		<Compile Include="RedirectToFileTests.fs" />
 		<Compile Include="PtyTests.fs" />
+		<Compile Include="PtySessionTests.fs" />
 		<Compile Include="StdinInheritTests.fs" />
 		<Compile Include="CorrectnessBugTests.fs" />
 		<Compile Include="ApiParityTests.fs" />

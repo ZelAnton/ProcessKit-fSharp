@@ -58,6 +58,7 @@ class ProcessKit.Testing.FakeProcess
   member WithPid(System.Int32) : ProcessKit.Testing.FakeProcess
   member WithPty() : ProcessKit.Testing.FakeProcess
   member WithStderr(System.String) : ProcessKit.Testing.FakeProcess
+  member WithStdinOpen() : ProcessKit.Testing.FakeProcess
   member WithStdout(System.String) : ProcessKit.Testing.FakeProcess
   member WithStdoutLines(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Testing.FakeProcess
   property LastResize : Microsoft.FSharp.Core.FSharpOption<System.Tuple<System.Int32, System.Int32>> { get }

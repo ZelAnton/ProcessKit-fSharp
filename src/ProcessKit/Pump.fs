@@ -645,6 +645,121 @@ module internal Pump =
         }
         :> Task
 
+    /// Read `stream` to EOF as raw decoded TEXT — no line splitting at all — handing each decoded chunk
+    /// to `onText` the instant it arrives, and teeing the raw bytes first if a sink is set. The
+    /// unframed counterpart of `readLinesBody`, for the interactive expect-style session
+    /// (`PtySession`): a terminal prompt such as `Password: ` or `> ` carries **no** line terminator,
+    /// so a line pump holds it in its in-flight buffer until a newline (or EOF) finally arrives and a
+    /// pattern waiter would never see it. Chunk boundaries are whatever the OS read returned and carry
+    /// no meaning — the caller reassembles them into its own sliding window.
+    ///
+    /// Decoding is incremental through one `Decoder`, so a multi-byte character split across two OS
+    /// reads is decoded correctly rather than turning into replacement characters; the decoder's
+    /// remaining state is flushed at EOF. A leading byte-order mark is stripped from the decoded text
+    /// exactly as `readLinesBody` strips it, so the two paths agree on what the child's text is; the
+    /// raw `tee` stays byte-exact.
+    let private readTextBody
+        (stream: Stream)
+        (encoding: Encoding)
+        (tee: Stream option)
+        (onText: string -> unit)
+        (cancellationToken: CancellationToken)
+        : Task =
+        task {
+            let decoder = encoding.GetDecoder()
+            let byteBuffer = Array.zeroCreate<byte> 8192
+            let charBuffer = Array.zeroCreate<char> (encoding.GetMaxCharCount byteBuffer.Length)
+            let mutable reading = true
+            // A leading BOM of the chosen encoding is content-free framing, not child output — dropped
+            // once, at index 0 of the first non-empty decode (same rule as `readLinesBody`).
+            let mutable atStreamStart = true
+
+            let emit (chars: int) =
+                let start =
+                    if atStreamStart && chars > 0 then
+                        atStreamStart <- false
+                        if charBuffer[0] = char 0xFEFF then 1 else 0
+                    else
+                        0
+
+                if chars > start then
+                    onText (String(charBuffer, start, chars - start))
+
+            while reading do
+                let! read = stream.ReadAsync(byteBuffer.AsMemory(0, byteBuffer.Length), cancellationToken)
+
+                if read = 0 then
+                    // EOF: flush whatever the decoder still holds (an incomplete trailing sequence
+                    // surfaces as the encoding's replacement character rather than vanishing).
+                    emit (decoder.GetChars(byteBuffer, 0, 0, charBuffer, 0, true))
+                    reading <- false
+                else
+                    match tee with
+                    | Some sink -> do! sink.WriteAsync(byteBuffer.AsMemory(0, read), cancellationToken)
+                    | None -> ()
+
+                    emit (decoder.GetChars(byteBuffer, 0, read, charBuffer, 0))
+        }
+        :> Task
+
+    /// `readTextBody` plus the same unconditional tee flush `readLines` performs — on the clean-EOF
+    /// path and on a read-loop failure alike (see `flushTeeQuietly`).
+    let readText
+        (stream: Stream)
+        (encoding: Encoding)
+        (tee: Stream option)
+        (onText: string -> unit)
+        (cancellationToken: CancellationToken)
+        : Task =
+        task {
+            // Hand-rolled "flush on every exit path", for the same reason `readLines` hand-rolls it:
+            // the F# `task` builder has no async `finally` (FS0750).
+            let mutable fault: exn option = None
+
+            try
+                do! readTextBody stream encoding tee onText cancellationToken
+            with ex ->
+                fault <- Some ex
+
+            do! flushTeeQuietly tee cancellationToken
+
+            match fault with
+            | Some ex -> ExceptionDispatchInfo.Throw ex
+            | None -> ()
+        }
+        :> Task
+
+    /// `readText` for a background pump — the raw-text twin of `readLinesUntilDone`: a teardown race
+    /// (the stream disposed underneath an in-flight read once `isTearingDown` reports `true`) ends the
+    /// read quietly, while the identical exception types caught before teardown began are a genuine
+    /// OS-level read failure and are re-raised with their original stack (see `genuineReadFault`).
+    let readTextUntilDone
+        (stream: Stream)
+        (encoding: Encoding)
+        (tee: Stream option)
+        (onText: string -> unit)
+        (isTearingDown: unit -> bool)
+        (cancellationToken: CancellationToken)
+        : Task =
+        task {
+            try
+                do! readText stream encoding tee onText cancellationToken
+            with
+            | :? ObjectDisposedException as ex ->
+                match genuineReadFault isTearingDown ex with
+                | Some fault -> ExceptionDispatchInfo.Throw fault
+                | None ->
+                    // The stream was torn down (early dispose) while reading. Stop quietly.
+                    ()
+            | :? IOException as ex ->
+                match genuineReadFault isTearingDown ex with
+                | Some fault -> ExceptionDispatchInfo.Throw fault
+                | None ->
+                    // The pipe broke during teardown. Stop; the run's outcome reflects the child.
+                    ()
+        }
+        :> Task
+
     /// Read `stream` to EOF, discarding everything (so the child never blocks on a full pipe).
     let drainDiscard (stream: Stream) (cancellationToken: CancellationToken) : Task =
         task {

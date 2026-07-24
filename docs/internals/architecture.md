@@ -53,18 +53,19 @@ The files currently compile in this exact order. The headings are architectural 
 
 ### Runner and verbs
 
-33. `IProcessRunner.fs` — injectable runner seam.
-34. `Runner.fs` — capture primitives and reusable verbs.
-35. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
-36. `DelegatingProcessRunner.fs` — runner decorator base.
-37. `ProcessGroup.fs` — containment owner and shared-group runner.
-38. `JobRunner.fs` — default private-group runner.
-39. `CommandVerbs.fs` — default-runner `Command` extensions.
-40. `PipelineRunner.fs` — internal pipeline execution.
-41. `Pipeline.fs` — pipeline public API.
-42. `Supervisor.fs` — restart supervision.
-43. `CliClient.fs` — configured command client.
-44. `Exec.fs` — concise execution entry points.
+33. `PtySession.fs` — expect-style interaction over a live handle.
+34. `IProcessRunner.fs` — injectable runner seam.
+35. `Runner.fs` — capture primitives and reusable verbs.
+36. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
+37. `DelegatingProcessRunner.fs` — runner decorator base.
+38. `ProcessGroup.fs` — containment owner and shared-group runner.
+39. `JobRunner.fs` — default private-group runner.
+40. `CommandVerbs.fs` — default-runner `Command` extensions.
+41. `PipelineRunner.fs` — internal pipeline execution.
+42. `Pipeline.fs` — pipeline public API.
+43. `Supervisor.fs` — restart supervision.
+44. `CliClient.fs` — configured command client.
+45. `Exec.fs` — concise execution entry points.
 
 When adding a file, place it after everything it consumes and before everything that consumes it. Alphabetical sorting or SDK globbing would silently destroy this ordering model.
 
@@ -103,6 +104,8 @@ termination: timeout/cancel/dispose -> KillChild or KillTree -> Wait/reap -> Rel
 `Spawn` returns OS handles and optional pipe streams but does not finish the ownership transaction. `Track` establishes the backend's teardown record (and, for cgroup v2, migrates the PID). Only then may `RunningProcess` expose the child. A track failure must leave no live uncontained child.
 
 Output pumps run concurrently with the wait. They must continuously drain piped stdout and stderr, even when capture retention is full, or the child can block in an OS pipe and never reach exit. Capture verbs accumulate output in `LineBuffer` or `RawBuffer`; streaming verbs feed channels. A channel configured for backpressure is the deliberate exception: it lets the consumer pace the pump and therefore may eventually pace the child.
+
+One consumption is deliberately unframed. `RunningProcess.StartInteractiveSession` — the claim behind `PtySession`, and a fourth `Consumption` state alongside the buffered and the two streaming ones — drains the same pipes through `Pump.readTextUntilDone` instead of `readLines`, feeding decoded chunks into an `ExpectWindow` (a bounded sliding window plus an optional transcript, both evicting oldest-first). Framing is what such a session must *not* do: a terminal prompt carries no line terminator, so a line pump would hold it until a newline that only arrives after the input the prompt is waiting for. The session's readers share every other invariant of the streaming ones — the single claim, the one memoized exit wait reused by `ExitTask`, the kill-on-pump-fault, the teardown-race classification — and the byte-exact tees are fed identically; only the line-shaped observers (`LineTerminator`, `OnStdoutLine`/`OnStderrLine`, the line counters) have nothing to observe on this path.
 
 A stream is *not* always a parent pipe. `StdioMode.Null`/`Inherit`, and `Command.StdoutToFile`/`StderrToFile`, hand the child a std handle/fd that never round-trips through the parent — for a file redirect it is an inheritable file handle in `STARTUPINFO` (Windows) or a file fd installed by a `posix_spawn` file action (POSIX), opened on the parent and dropped there right after the spawn, so the child owns it alone and writes the file directly with **no** parent pump. `Spawn` returns `None` for that stream, so no pump, capture buffer, or channel is created for it, and its capture verbs observe nothing — the redirected output lives only in the file, which keeps growing after the parent (or a pump draining a pipe) is gone. The builder rejects combining a file redirect with anything that needs a parent-side view of the same stream (the tees, per-line handlers, `MergeStderr`, `Pty`).
 

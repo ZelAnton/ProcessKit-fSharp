@@ -117,6 +117,15 @@ type FakeProcess
     ///   returns `Ok ()` (not the typed `Unsupported` a non-PTY fake returns) and stores the geometry —
     ///   read the last requested `(cols, rows)` back through `LastResize` for assertions.
     ///
+    /// **Expect-style sessions work against it.** A `PtySession` over the built handle reads the same
+    /// merged stream raw, so `ExpectAsync` finds a scripted prompt that carries no line terminator
+    /// (`"Password: "`) exactly as it would against a real PTY, and `SendAsync`/`SendLineAsync` record
+    /// their bytes into `StdinBytes` (pair this with `WithStdinOpen()`, or a `Command.KeepStdinOpen`
+    /// command through `ScriptedRunner`). Within the merged-stream limits above: the scripted text is
+    /// replayed from a buffer that is complete before the first `ExpectAsync` runs, so a fake cannot
+    /// model a child that *reacts* to what was sent — script the whole conversation's output up front
+    /// and expect its parts in order.
+    ///
     /// **Inherent limitation (not papered over).** A double has no real terminal, so it **cannot** make
     /// the child observe `isatty = true`: any behaviour that depends on the *child* seeing a tty (a tool
     /// switching from line-buffered "dumb" output to full-screen TUI mode, a shell enabling colour) is
@@ -124,6 +133,16 @@ type FakeProcess
     /// behaviour against a real `Command.Pty` run. See `docs/testing.md`.
     member _.WithPty() =
         FakeProcess(template, stdout, stderr, outcome, pid, Some(PtyResizeRecorder()), stdin)
+
+    /// Keep the built handle's stdin open, exactly as `Command.KeepStdinOpen()` does on a real run, so
+    /// `TakeStdin()` hands back a writable pipe — and so a `PtySession` built over this fake can
+    /// actually send. Everything written lands in `StdinBytes` for assertions.
+    ///
+    /// Needed only for a fake built through `FakeProcess.Create`; one built from a caller's own
+    /// `Command` (through `ScriptedRunner`) already inherits that command's `KeepStdinOpen`. Applying
+    /// it twice is harmless.
+    member _.WithStdinOpen() =
+        FakeProcess(template.KeepStdinOpen(), stdout, stderr, outcome, pid, pty, stdin)
 
     /// The last `(cols, rows)` requested via `ResizeAsync` on this fake's built PTY handle, or `None`
     /// if this is not a PTY fake (see `WithPty`) or no resize has been requested. Shared across the
