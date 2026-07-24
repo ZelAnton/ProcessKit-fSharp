@@ -43,14 +43,22 @@ type CliClient internal (config: CliClientConfig) =
     /// Configure the shared defaults by transforming the template `Command` with the full builder,
     /// e.g. `client.WithDefaults(fun c -> c.CurrentDir(repo).Timeout(ts).Env("K", "V"))`. Composable.
     /// Use the builder to set options; don't return a fresh `Command.create` (it would re-point the
-    /// client at a different program and drop the accumulated defaults).
+    /// client at a different program and drop the accumulated defaults). One-shot stdin sources
+    /// (`FromStream`/`FromLines`/`FromAsyncLines`) are rejected: attach those to an individual command.
     member _.WithDefaults(configure: Func<Command, Command>) =
         ArgumentNullException.ThrowIfNull configure
 
-        CliClient(
-            { config with
-                Template = configure.Invoke config.Template }
-        )
+        let template = configure.Invoke config.Template
+
+        if Stdin.isOneShot template.Config.StdinSource then
+            raise (
+                ArgumentException(
+                    $"'{template.Program}' has a one-shot stdin source and cannot be used as a CliClient default: a later invocation would find the source already exhausted",
+                    nameof configure
+                )
+            )
+
+        CliClient({ config with Template = template })
 
     /// The runner every command is run through.
     member _.Runner = config.Runner

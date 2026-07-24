@@ -333,10 +333,16 @@ module internal Windows =
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private TerminateProcess(nativeint hProcess, uint32 uExitCode)
 
+    // `lpCommandLine` is a `nativeint` pointer to a WRITABLE unmanaged buffer, NOT a managed `string`.
+    // `CreateProcessW` may modify `lpCommandLine` in place while probing executable candidates (Win32
+    // documents this), so passing a marshalled `string` (pinned, not copied, under `CharSet.Unicode`)
+    // would let the OS write into a managed string's memory — a possibly interned literal shared
+    // process-wide (T-198). The call site hands over a private `Marshal.StringToHGlobalUni` copy and frees
+    // it after the call.
     [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
     extern bool private CreateProcessW(
         nativeint lpApplicationName,
-        string lpCommandLine,
+        nativeint lpCommandLine,
         nativeint lpProcessAttributes,
         nativeint lpThreadAttributes,
         bool bInheritHandles,
@@ -1475,11 +1481,12 @@ module internal Windows =
     extern void private DeleteProcThreadAttributeList(nativeint lpAttributeList)
 
     // A second binding of `CreateProcessW` whose `lpStartupInfo` is a `STARTUPINFOEX&` (for
-    // EXTENDED_STARTUPINFO_PRESENT + the attribute list). Distinct F# name, same entry point.
+    // EXTENDED_STARTUPINFO_PRESENT + the attribute list). Distinct F# name, same entry point. `lpCommandLine`
+    // is a writable unmanaged-buffer `nativeint`, not a managed `string` — see `CreateProcessW` above (T-198).
     [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "CreateProcessW")>]
     extern bool private CreateProcessExtended(
         nativeint lpApplicationName,
-        string lpCommandLine,
+        nativeint lpCommandLine,
         nativeint lpProcessAttributes,
         nativeint lpThreadAttributes,
         bool bInheritHandles,
@@ -1723,10 +1730,15 @@ module internal Windows =
                                  | Some priority -> PriorityMapping.windowsCreationFlag priority
                                  | None -> 0u)
 
+                        // A PRIVATE, writable copy of the command line: `CreateProcessW` may patch this buffer
+                        // in place while probing executable candidates, so it must never be the memory of a
+                        // managed `string` (a possibly interned literal) — see the binding above (T-198).
+                        let commandLineBuffer = Marshal.StringToHGlobalUni commandLine
+
                         let created =
                             CreateProcessExtended(
                                 IntPtr.Zero,
-                                commandLine,
+                                commandLineBuffer,
                                 IntPtr.Zero,
                                 IntPtr.Zero,
                                 // A ConPTY child inherits no handles; its stdio comes from the pseudoconsole.
@@ -1739,6 +1751,11 @@ module internal Windows =
                             )
 
                         let lastError = Marshal.GetLastWin32Error()
+
+                        // Free the writable command-line copy now: `CreateProcess` has finished reading (and
+                        // restoring) it by the time it returns, and no throwing code runs between its
+                        // allocation and here, so there is nothing to leak.
+                        Marshal.FreeHGlobal commandLineBuffer
 
                         if environment <> IntPtr.Zero then
                             Marshal.FreeHGlobal environment
@@ -2025,10 +2042,15 @@ module internal Windows =
                          | Some priority -> PriorityMapping.windowsCreationFlag priority
                          | None -> 0u)
 
+                // A PRIVATE, writable copy of the command line: `CreateProcessW` may patch this buffer in
+                // place while probing executable candidates, so it must never be the memory of a managed
+                // `string` (a possibly interned literal) — see the binding above (T-198).
+                let commandLineBuffer = Marshal.StringToHGlobalUni commandLine
+
                 let created =
                     CreateProcessW(
                         IntPtr.Zero,
-                        commandLine,
+                        commandLineBuffer,
                         IntPtr.Zero,
                         IntPtr.Zero,
                         true,
@@ -2040,6 +2062,11 @@ module internal Windows =
                     )
 
                 let lastError = Marshal.GetLastWin32Error()
+
+                // Free the writable command-line copy now: `CreateProcess` has finished reading (and
+                // restoring) it by the time it returns, and no throwing code runs between its allocation and
+                // here, so there is nothing to leak.
+                Marshal.FreeHGlobal commandLineBuffer
 
                 if environment <> IntPtr.Zero then
                     Marshal.FreeHGlobal environment
