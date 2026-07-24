@@ -1131,8 +1131,36 @@ type ReadinessTests() =
     // creates the wait, so the fault is marked observed for the CLR unconditionally — before this fix,
     // it would surface here as `TaskScheduler.UnobservedTaskException` once the faulted task was
     // finalized.
+    //
+    // Runs the probe-only scenario (probe, which resolves to `NotReady` well before `exitFaultsLate`'s
+    // ~300ms fault, then dispose, with no consuming verb ever touching the memoized exit wait) and hands
+    // back only a `WeakReference` to the handle — never `running` itself. Isolated in a `NoInlining`
+    // helper (and not returning the strong reference) so nothing in the calling test method's frame can
+    // keep `running` — and, through its memoized `bufferedOutcome` field, the faulted task itself —
+    // rooted for the rest of the method body. Before this split, `running` stayed reachable through the
+    // enclosing `task { }` state machine across the `GC.Collect()` calls below (it was still in lexical
+    // scope, `use`-bound or not), so the faulted task could never actually be collected and the
+    // assertion passed trivially regardless of whether `observeFault` did anything (R-01).
+    [<MethodImpl(MethodImplOptions.NoInlining)>]
+    member private _.RunProbeOnlyHandleAndGetWeakRef(port: int) : Task<WeakReference> =
+        task {
+            let running = syntheticProcess (exitFaultsLate ())
+            let endpoint = IPEndPoint(IPAddress.Loopback, port)
+
+            match! running.WaitForPortAsync(endpoint, TimeSpan.FromMilliseconds 100.0) with
+            | Error(ProcessError.NotReady _) -> ()
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+
+            // No consuming verb ever touches the memoized exit wait from here on — dispose the handle
+            // (which does not await it either, see `RunningProcess.DisposeAsync`) and let the still-
+            // pending fault land with nothing else watching it.
+            do! (running :> IAsyncDisposable).DisposeAsync()
+
+            return WeakReference(box running)
+        }
+
     [<Test>]
-    member _.``A late fault on the memoized buffered exit wait does not surface as unobserved on a probe-only handle``
+    member this.``A late fault on the memoized buffered exit wait does not surface as unobserved on a probe-only handle``
         ()
         : Task =
         task {
@@ -1154,17 +1182,7 @@ type ReadinessTests() =
                 let port = (probeListener.LocalEndpoint :?> IPEndPoint).Port
                 probeListener.Stop()
 
-                let running = syntheticProcess (exitFaultsLate ())
-                let endpoint = IPEndPoint(IPAddress.Loopback, port)
-
-                match! running.WaitForPortAsync(endpoint, TimeSpan.FromMilliseconds 100.0) with
-                | Error(ProcessError.NotReady _) -> ()
-                | other -> Assert.Fail $"expected NotReady, got {other}"
-
-                // No consuming verb ever touches the memoized exit wait from here on — dispose the
-                // handle (which does not await it either, see `RunningProcess.DisposeAsync`) and let
-                // the still-pending fault land with nothing else watching it.
-                do! (running :> IAsyncDisposable).DisposeAsync()
+                let! weakHandle = this.RunProbeOnlyHandleAndGetWeakRef port
 
                 // Let the exit wait's fault actually happen, then force a GC pass: an unobserved faulted
                 // task reports itself from the finalizer once collected.
@@ -1172,6 +1190,16 @@ type ReadinessTests() =
                 GC.Collect()
                 GC.WaitForPendingFinalizers()
                 GC.Collect()
+
+                // Verify the test's own methodology is sound first: if the handle — and with it the
+                // memoized `bufferedOutcome` field holding the faulted task — was never actually
+                // collected, the absence of `UnobservedTaskException` below would be a false pass rather
+                // than proof that the implementation observed the fault (R-01).
+                Assert.That(
+                    weakHandle.IsAlive,
+                    Is.False,
+                    "probe-only handle was not collected — GC-based verification is inconclusive"
+                )
 
                 Assert.That(unobserved, Is.False)
             finally
