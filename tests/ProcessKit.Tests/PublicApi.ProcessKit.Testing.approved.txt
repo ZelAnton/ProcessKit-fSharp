@@ -60,6 +60,7 @@ class ProcessKit.Testing.FakeProcess
   member WithStdout(System.String) : ProcessKit.Testing.FakeProcess
   member WithStdoutLines(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Testing.FakeProcess
   property LastResize : Microsoft.FSharp.Core.FSharpOption<System.Tuple<System.Int32, System.Int32>> { get }
+  property StdinBytes : System.Byte[] { get }
   static member Create() : ProcessKit.Testing.FakeProcess
   static member Create(System.String) : ProcessKit.Testing.FakeProcess
 

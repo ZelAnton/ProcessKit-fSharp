@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ProcessKit.Testing.FakeProcess` now honours `Command.KeepStdinOpen()`: its built handle returns one writable stdin sink through `TakeStdin()`, and `StdinBytes` exposes the bytes written for assertions.
 - `ProcessKit.Testing` now replays `Command.MergeStderr()` with one merged stdout stream, matching the real runner's empty stderr result and stdout-only streaming events.
 
 ### Changed
