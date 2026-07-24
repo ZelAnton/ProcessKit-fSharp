@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [2.7.0] - 2026-07-24
+
+### Added
 - `ProcessKit.Testing.FakeProcess` now honours `Command.KeepStdinOpen()`: its built handle returns one writable stdin sink through `TakeStdin()`, and `StdinBytes` exposes the bytes written for assertions.
 - `ProcessKit.Testing` now replays `Command.MergeStderr()` with one merged stdout stream, matching the real runner's empty stderr result and stdout-only streaming events.
 
@@ -439,7 +450,8 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - POSIX: the SIGCHLD dispatch callback no longer blocks on a `Thread.Sleep` spin while resolving a reap race against a concurrent `reapLeader` (group teardown) — the same bounded grace period now runs on the thread pool instead of the shared signal-dispatch thread, so it can no longer delay reaping every other pending child. A race that genuinely can't be resolved within the grace period now reports `Outcome.Unobserved` rather than a fabricated clean exit; the far more common case — the concurrent reap actually landing the real status — is unaffected.
 - Linux cgroup v2: a child that cannot be migrated into the cgroup (the write to `cgroup.procs` fails) is now killed and reaped, and the spawn fails with `ProcessError.ResourceLimit`, instead of being silently left to run in the parent cgroup entirely outside the requested resource limits. The `Mechanism.CgroupV2` / `ProcessGroup.Create` docs now also state the spawn→migrate window honestly: the limits apply to the child and every descendant it forks *after* migration, while a grandchild forked in the brief window before the migration write completes stays in the parent cgroup — still reaped by kill-on-drop teardown, but outside the resource limits.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.6.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.7.0...HEAD
+[2.7.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.6.0...v2.7.0
 [2.6.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.5.0...v2.6.0
 [2.5.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.4.2...v2.5.0
 [2.4.2]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.4.1...v2.4.2

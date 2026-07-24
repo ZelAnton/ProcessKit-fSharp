@@ -6,7 +6,7 @@
 
 		<!-- Package identity only; shared metadata is hoisted to Directory.Build.props. -->
 		<PackageId>ProcessKit</PackageId>
-		<Version>2.6.0</Version>
+		<Version>2.7.0</Version>
 		<Description>F# async child-process management: whole-tree kill-on-drop (no orphans), streaming, pipelines, timeouts, and supervision.</Description>
 		<PackageTags>fsharp;dotnet;process;subprocess;child-process;process-management;process-tree;kill-on-drop;async;pipeline;supervision;job-object;cgroups</PackageTags>
 		<!-- A short pointer, not the full text: NuGet.org caps PackageReleaseNotes at 35000
