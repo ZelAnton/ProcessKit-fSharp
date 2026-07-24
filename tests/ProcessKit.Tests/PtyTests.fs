@@ -99,7 +99,7 @@ type PtyTests() =
             Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> stream.Read(buffer, 0, -1) |> ignore))
             |> ignore
 
-            Assert.Throws<ArgumentException>(Action(fun () -> stream.Read(buffer, 1, 2) |> ignore))
+            Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> stream.Read(buffer, 1, 2) |> ignore))
             |> ignore
 
             Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> stream.Write(buffer, -1, 1)))
@@ -108,7 +108,7 @@ type PtyTests() =
             Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> stream.Write(buffer, 0, -1)))
             |> ignore
 
-            Assert.Throws<ArgumentException>(Action(fun () -> stream.Write(buffer, 1, 2)))
+            Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> stream.Write(buffer, 1, 2)))
             |> ignore
         finally
             Native.Posix.ptyReadForTests <- None
@@ -129,12 +129,14 @@ type PtyTests() =
         try
             use stream = ptyStreamForTests ()
 
-            let checkException() =
+            let checkException () =
                 let ex = Assert.Throws<IOException>(Action(fun () -> stream.Write([| 1uy |], 0, 1)))
+
                 match ex with
                 | null -> failwith "expected a zero-byte write to throw IOException"
                 | ex -> Assert.That(ex.Message, Does.Contain "made no progress")
-            checkException()
+
+            checkException ()
         finally
             Native.Posix.ptyWriteForTests <- None
 

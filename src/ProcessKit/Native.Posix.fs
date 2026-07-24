@@ -775,6 +775,8 @@ module internal Posix =
         // Match Stream.ValidateBufferArguments before pinning the caller's buffer or calculating a native
         // pointer. `buffer.Length - offset` avoids an overflowing `offset + count` check.
         let validateBufferArguments (buffer: byte[]) (offset: int) (count: int) =
+            ArgumentNullException.ThrowIfNull buffer
+
             if offset < 0 then
                 raise (ArgumentOutOfRangeException(nameof offset, "Offset must be non-negative."))
 
@@ -782,7 +784,12 @@ module internal Posix =
                 raise (ArgumentOutOfRangeException(nameof count, "Count must be non-negative."))
 
             if offset > buffer.Length - count then
-                raise (ArgumentException("Offset and count must refer to a location within the buffer."))
+                raise (
+                    ArgumentOutOfRangeException(
+                        nameof count,
+                        "Offset and count must refer to a location within the buffer."
+                    )
+                )
 
         // Run one libc read/write (`op`) against the owned fd with the caller's buffer pinned at `offset`,
         // holding a ref on the SafeHandle so `Dispose` cannot close the fd underneath the syscall.
@@ -862,6 +869,11 @@ module internal Posix =
                 if n > 0n then
                     written <- written + int n
                 elif n = 0n then
+                    // POSIX write(2) on a pty master with count > 0 should not return 0 in normal operation.
+                    // We treat a zero return as an unrecoverable error (IOException) to prevent the
+                    // `while written < count` loop from spinning indefinitely without progress.
+                    // This differs from EINTR (where the kernel guarantees retrying is meaningful) —
+                    // zero means the pty master has refused any progress at all.
                     raise (IOException "write to the pty master made no progress")
                 else
                     let errno = Marshal.GetLastWin32Error()
