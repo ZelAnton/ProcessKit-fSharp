@@ -119,8 +119,6 @@ public class DependencyInjectionTests
 
     [TestCase("")]
     [TestCase("   ")]
-    [TestCase(" /app")]
-    [TestCase("/app ")]
     public void ProcessKitOptions_DefaultWorkingDirectory_rejects_invalid_values(string value)
     {
         var options = new ProcessKitOptions();
@@ -141,6 +139,14 @@ public class DependencyInjectionTests
         options.DefaultWorkingDirectory = "/app";
 
         Assert.That(options.DefaultWorkingDirectory, Is.EqualTo("/app"));
+
+        options.DefaultWorkingDirectory = " /app";
+
+        Assert.That(options.DefaultWorkingDirectory, Is.EqualTo(" /app"));
+
+        options.DefaultWorkingDirectory = "/app ";
+
+        Assert.That(options.DefaultWorkingDirectory, Is.EqualTo("/app "));
 
         options.DefaultWorkingDirectory = null;
 

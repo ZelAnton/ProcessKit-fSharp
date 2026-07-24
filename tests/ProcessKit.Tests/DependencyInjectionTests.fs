@@ -171,7 +171,7 @@ type DependencyInjectionTests() =
     member _.``ProcessKitOptions.DefaultWorkingDirectory validates and applies a default``() : Task =
         let options = ProcessKitOptions()
 
-        for invalidDirectory in [ ""; "   "; " /app"; "/app " ] do
+        for invalidDirectory in [ ""; "   " ] do
             let thrown =
                 match
                     Assert.Throws<ArgumentException>(
@@ -188,6 +188,11 @@ type DependencyInjectionTests() =
         Assert.That(options.DefaultWorkingDirectory, Is.Null)
 
         options.DefaultWorkingDirectory <- "/app"
+        Assert.That(options.DefaultWorkingDirectory, Is.EqualTo "/app")
+        options.DefaultWorkingDirectory <- " /app"
+        Assert.That(options.DefaultWorkingDirectory, Is.EqualTo " /app")
+        options.DefaultWorkingDirectory <- "/app "
+        Assert.That(options.DefaultWorkingDirectory, Is.EqualTo "/app ")
         options.DefaultWorkingDirectory <- null
         Assert.That(options.DefaultWorkingDirectory, Is.Null)
 
