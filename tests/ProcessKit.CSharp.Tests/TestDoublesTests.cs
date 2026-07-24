@@ -76,7 +76,7 @@ public class TestDoublesTests
     }
 
     /// A null `stdout` passed to `Reply.Ok` must fail at the public entry point, not resurface later
-    /// as a `NullReferenceException`/mis-named `ArgumentNullException` from deep inside the runner.
+    /// as a `NullReferenceException`/misnamed `ArgumentNullException` from deep inside the runner.
     [Test]
     public void Reply_Ok_null_stdout_throws_ArgumentNullException_naming_stdout()
     {
