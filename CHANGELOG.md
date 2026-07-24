@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - A `HostedProcessService.Dispose()` that races the very start of its background supervision no longer publishes a spurious `LastOutcome = Error` (nor logs "supervision failed"). `Dispose()` disposes its lifetime `CancellationTokenSource` without awaiting the supervision task; the background start now reads a snapshot of that token taken before disposal instead of the live getter, so a routine teardown that overlaps startup is reported as a clean cancellation, exactly like a non-racing `Dispose()`.
 - The stdout streaming session's stderr capture (`StdoutLinesAsync()` + `FinishAsync().Stderr`) now honours `OutputBufferPolicy.MaxBytes` as an in-flight cap the same way the buffered verbs do, so a newline-free stderr flood can no longer grow the pump's assembly buffer past the configured cap.
+- `ProcessKit.Testing` cassette replay for `OutputBytesAsync` now decodes its text projections (`Combined`, `OutputContainsAny`, and error text in `Exit`/`Signalled`/`Timeout`) with the command's configured `StdoutEncoding` instead of hardcoded UTF-8, restoring record/replay parity for non-UTF-8 byte captures and matching `RunningProcess.OutputBytesAsync`.
 
 ## [2.6.0] - 2026-07-23
 
