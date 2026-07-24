@@ -35,7 +35,7 @@ module internal Pump =
         let retained = LinkedList<struct (string * int)>()
         let mutable retainedBytes = 0
         let mutable totalLines = 0
-        let mutable totalBytes = 0
+        let mutable totalBytes = 0L
         let mutable truncated = false
         let mutable tooLarge = false
         // DropNewest must retain a contiguous prefix: once its byte cap rejects a line (or is
@@ -58,7 +58,7 @@ module internal Pump =
             | None -> false
 
         member _.TotalLines = totalLines
-        member _.TotalBytes = totalBytes
+        member _.TotalBytes = int (min totalBytes (int64 Int32.MaxValue))
         member _.Truncated = truncated
         member _.TooLarge = tooLarge
 
@@ -69,7 +69,13 @@ module internal Pump =
         member _.Add(line: string) =
             let bytes = if needBytes then Encoding.UTF8.GetByteCount line + 1 else 0
             totalLines <- totalLines + 1
-            totalBytes <- totalBytes + bytes
+            let byteCount = int64 bytes
+
+            totalBytes <-
+                if totalBytes > Int64.MaxValue - byteCount then
+                    Int64.MaxValue
+                else
+                    totalBytes + byteCount
 
             let full =
                 overLineCap ()

@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chain (e.g. `Encoding.GetBytes`, `List.ofSeq`).
 
 ### Fixed
+- LineBuffer cumulative byte counters and OutputTooLarge diagnostics now saturate at Int32.MaxValue instead of wrapping to negative on overflow.
 - `ProcessKitOptions.DefaultWorkingDirectory` now rejects empty or whitespace-only values during DI setup/binding instead of stamping an invalid directory onto a command and failing later at spawn.
 - `CliClient.WithDefaults` now rejects a `configure` callback that returns `null` at the API boundary,
   with a correctly named `ArgumentNullException` instead of a later `NullReferenceException`.

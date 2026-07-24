@@ -2,6 +2,7 @@ namespace ProcessKit.Tests
 
 open System
 open System.IO
+open System.Reflection
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -467,6 +468,21 @@ type PumpTests() =
         Assert.That(buf.Text, Is.EqualTo "ab\nc")
         Assert.That(buf.TooLarge, Is.True)
         Assert.That(buf.TotalBytes, Is.EqualTo 7)
+
+    [<Test>]
+    member _.``LineBuffer TotalBytes saturates at Int32 MaxValue``() =
+        let buf =
+            Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithOverflow OverflowMode.Error)
+
+        let totalBytesField =
+            match typeof<Pump.LineBuffer>.GetField("totalBytes", BindingFlags.Instance ||| BindingFlags.NonPublic) with
+            | null -> failwith "Pump.LineBuffer.totalBytes field was not found"
+            | field -> field
+
+        totalBytesField.SetValue(buf, int64 Int32.MaxValue)
+        buf.Add ""
+
+        Assert.That(buf.TotalBytes, Is.EqualTo Int32.MaxValue)
 
     [<Test>]
     member _.``LineBuffer Error with MaxLines 0 errors from the first line``() =
