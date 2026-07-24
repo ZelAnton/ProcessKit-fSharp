@@ -8,11 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ProcessKit.Testing.FakeProcess` now honours `Command.KeepStdinOpen()`: its built handle returns one writable stdin sink through `TakeStdin()`, and `StdinBytes` exposes the bytes written for assertions.
 - `ProcessKit.Testing` now replays `Command.MergeStderr()` with one merged stdout stream, matching the real runner's empty stderr result and stdout-only streaming events.
 
 ### Changed
 - `CliClient.WithDefaults` now rejects one-shot stdin sources (`FromStream`, `FromLines`, and
   `FromAsyncLines`) with `ArgumentException`; attach them to an individual `client.Command(...)` instead.
+- `RecordReplayRunner` now writes cassette format **v5**: stdin digests are source-domain-prefixed, so a literal in-memory input can no longer alias inherited stdin or a path-only file source. Existing v1–v4 cassettes still replay with their legacy key scheme.
 - `ProcessKit.Testing`'s public API (`FakeProcess`, `Reply`, `ScriptedRunner`) now validates null
   arguments at the entry point with `ArgumentNullException`, matching the main package's convention —
   a `null` stdout/stderr text, line sequence, `Outcome`/`Reply`/`ProcessError`, token sequence, or
@@ -23,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `CliClient.WithDefaults` now rejects a `configure` callback that returns `null` at the API boundary,
   with a correctly named `ArgumentNullException` instead of a later `NullReferenceException`.
+- `RecordReplayRunner` now keeps inherited stdin, path-only file stdin, and in-memory stdin in distinct
+  cassette-key domains, preventing a literal input from silently replaying a recording made with a
+  different stdin source. Existing v1–v4 cassettes keep their legacy-key replay compatibility.
+- `Pipeline.StartAsync` now preserves a pipeline deadline that fires while its stages are being spawned: the call returns `ProcessError.Timeout` with the configured duration instead of silently downgrading the failure to `ProcessError.Cancelled`.
 - `Exec.outputAll` and `Exec.outputAllBytes` now reject a null runner, command sequence, or command
   element immediately with a correctly named argument exception, before they start any command or
   report invalid input as an I/O failure.
@@ -34,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The stdout streaming session's stderr capture (`StdoutLinesAsync()` + `FinishAsync().Stderr`) now honours `OutputBufferPolicy.MaxBytes` as an in-flight cap the same way the buffered verbs do, so a newline-free stderr flood can no longer grow the pump's assembly buffer past the configured cap.
 - `ProcessKit.Testing` cassette replay for `OutputBytesAsync` now decodes its text projections (`Combined`, `OutputContainsAny`, and error text in `Exit`/`Signalled`/`Timeout`) with the command's configured `StdoutEncoding` instead of hardcoded UTF-8, restoring record/replay parity for non-UTF-8 byte captures and matching `RunningProcess.OutputBytesAsync`.
 - Cancelling a fully spawned pipeline now stops a pending stage-0 asynchronous stdin source, disposing its enumerator instead of leaving it parked after the run completes.
+- `RunningProcess.ResizeAsync` on a **torn-down** PTY run — one whose handle was disposed, or whose child a terminal verb (`WaitAsync`/`OutputStringAsync`/…) already reaped — now returns a typed, non-transient `ProcessError.Unsupported` instead of resizing through the closed pty master fd / pseudoconsole handle. On POSIX the fd number is reusable the instant the run is torn down, so a late resize could `ioctl(TIOCSWINSZ)` a concurrent run's pty/socketpair and deliver `SIGWINCH` to a recycled pid — a wrong-target mutation of an unrelated process; on Windows the pseudoconsole handle could likewise be reused. The resize now passes through the same lifecycle gate the kill/signal verbs use, so it fires only while the run is live and refuses cleanly afterward. Resizing a live PTY run is unchanged.
 
 ## [2.6.0] - 2026-07-23
 

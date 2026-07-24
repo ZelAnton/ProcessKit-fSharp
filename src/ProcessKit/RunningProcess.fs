@@ -863,9 +863,14 @@ type RunningProcess internal (host: RunningHost) =
     /// (a terminal `COORD`/`winsize` is a `SHORT`), rejected with `ArgumentOutOfRangeException` at the
     /// boundary, matching the `Command.Pty` builder's geometry validation.
     ///
-    /// A **pure** verb: it neither consumes the output pipes nor touches the exit-wait/reap path, so it is
-    /// callable at any time — before or after a capturing/streaming/`WaitAsync` verb has claimed the
-    /// handle — and never trips the "already consumed by another verb" gate.
+    /// A **pure**, non-consuming verb: it neither consumes the output pipes nor touches the exit-wait/reap
+    /// path, so it never trips the "already consumed by another verb" gate and can run alongside a
+    /// capturing/streaming/`WaitAsync` verb that has claimed the handle. It is honest about lifecycle,
+    /// though: once the run has been **torn down** — a terminal verb has concluded and reaped it, or the
+    /// handle has been disposed — the pty master fd / pseudoconsole handle behind the resize is closed, and
+    /// its number is reusable by another run, so a resize then returns `Error(ProcessError.Unsupported ...)`
+    /// rather than risk `ioctl`/`SIGWINCH`/`ResizePseudoConsole` landing on an unrelated run through a
+    /// recycled fd/pid/handle. Resize a run while it is live.
     member _.ResizeAsync(cols: int, rows: int) : Task<Result<unit, ProcessError>> =
         ArgumentOutOfRangeException.ThrowIfLessThan(cols, 1, nameof cols)
         ArgumentOutOfRangeException.ThrowIfGreaterThan(cols, int Int16.MaxValue, nameof cols)

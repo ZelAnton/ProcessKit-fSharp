@@ -417,7 +417,7 @@ The subprocess-free doubles center on the **bulk** primitives. `ScriptedRunner` 
 `RecordReplayRunner` in record mode returns `Error(ProcessError.Unsupported …)` from
 `SpawnAsync`, because a live stream can't be captured without racing the consumer — record a
 streaming call through a capture verb, then replay it as a stream. The full live
-[`RunningProcess`](streaming.md) surface (`WaitForPortAsync`, `TakeStdin`, `ProfileAsync`, …)
+[`RunningProcess`](streaming.md) surface (`WaitForPortAsync`, `ProfileAsync`, …)
 and a [`Pipeline`](pipelines.md) are best tested against a real (possibly trivial) child
 process; keep the scripted/cassette doubles for everything that flows through the capture
 primitives.
@@ -468,6 +468,14 @@ folded into stdout, `ProcessResult.Stderr` is empty, and `OutputEventsAsync()` e
 `OutputEvent.Stdout`. The fake places scripted stderr after scripted stdout, adding a newline when
 needed; it cannot reproduce the operating system's real byte interleaving. This is independent of
 PTY mode, so a merged-stderr command does not acquire PTY-only `ResizeAsync` support.
+
+## Interactive stdin doubles
+
+`FakeProcess` and `ScriptedRunner` model interactive stdin for a command built with
+`Command.KeepStdinOpen`. `TakeStdin()` then returns a working `Some` backed by an in-memory
+sink; assert the exact bytes written through it with `FakeProcess.StdinBytes`. This works both
+when building a `FakeProcess` directly with `Build()` and when `ScriptedRunner` replays a
+keep-open command.
 
 ## Record and replay
 
