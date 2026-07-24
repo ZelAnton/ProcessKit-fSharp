@@ -122,8 +122,9 @@ type ProcessError =
     // `ProcessError` without pattern-matching each case — the only practical way to do it from C#, which
     // can't destructure an F# union. Each returns the field for the cases that carry it, `None` otherwise.
 
-    /// The program the error is about, when it carries one — `None` for `ResourceLimit` / `Io` /
-    /// `Unsupported`, which are not tied to a specific program.
+    /// The program the error is about, when it carries one — `None` for `Adopt` (which carries a pid
+    /// rather than a program) / `ResourceLimit` / `Io` / `Unsupported`, which are not tied to a specific
+    /// program.
     member this.Program: string option =
         match this with
         | ProcessError.Spawn(program, _)

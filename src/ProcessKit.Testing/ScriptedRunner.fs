@@ -72,6 +72,8 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
 
     /// Reply when every one of `tokens` appears in the command's program-and-arguments.
     member _.On(tokens: seq<string>, reply: Reply) =
+        ArgumentNullException.ThrowIfNull(tokens, nameof tokens)
+        ArgumentNullException.ThrowIfNull(reply, nameof reply)
         let wanted = List.ofSeq tokens
 
         let predicate (command: Command) =
@@ -82,10 +84,14 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
 
     /// Reply when the predicate matches the command.
     member _.When(predicate: Func<Command, bool>, reply: Reply) =
+        ArgumentNullException.ThrowIfNull(predicate, nameof predicate)
+        ArgumentNullException.ThrowIfNull(reply, nameof reply)
         ScriptedRunner(rules @ [ predicate.Invoke, reply ], fallback)
 
     /// Reply to any command not matched by a rule.
-    member _.Fallback(reply: Reply) = ScriptedRunner(rules, Some reply)
+    member _.Fallback(reply: Reply) =
+        ArgumentNullException.ThrowIfNull(reply, nameof reply)
+        ScriptedRunner(rules, Some reply)
 
     /// A snapshot, in call order, of every command routed through **this** runner so far — safe to read
     /// while another verb is still recording concurrently. Each entry is the secret-free shape of one
@@ -99,6 +105,7 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
     /// with `RecordedInvocation.Matches` for token matching, e.g.
     /// `runner.CountReceived(fun inv -> inv.Matches [ "git"; "commit" ])`.
     member _.CountReceived(predicate: Func<RecordedInvocation, bool>) : int =
+        ArgumentNullException.ThrowIfNull(predicate, nameof predicate)
         lock receivedGate (fun () -> received |> Seq.filter predicate.Invoke |> Seq.length)
 
     interface IProcessRunner with

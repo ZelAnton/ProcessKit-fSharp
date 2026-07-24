@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -61,5 +62,36 @@ public class TestDoublesTests
 
         Assert.That(lines, Is.EqualTo(new[] { "first", "second" }));
         Assert.That(finished.Outcome.IsExited, Is.True);
+    }
+
+    /// A null `stdout` from a C# call site must fail loudly at the public entry point with
+    /// `ArgumentNullException` naming the actual parameter - not deep inside `Encoding.GetBytes`/
+    /// `.Length` with an unrelated parameter name (the bug T-195 fixes).
+    [Test]
+    public void FakeProcess_WithStdout_null_throws_ArgumentNullException_naming_text()
+    {
+        var ex = Assert.Throws<ArgumentNullException>(() => FakeProcess.Create("stub").WithStdout(null!));
+
+        Assert.That(ex!.ParamName, Is.EqualTo("text"));
+    }
+
+    /// A null `stdout` passed to `Reply.Ok` must fail at the public entry point, not resurface later
+    /// as a `NullReferenceException`/mis-named `ArgumentNullException` from deep inside the runner.
+    [Test]
+    public void Reply_Ok_null_stdout_throws_ArgumentNullException_naming_stdout()
+    {
+        var ex = Assert.Throws<ArgumentNullException>(() => Reply.Ok(null!));
+
+        Assert.That(ex!.ParamName, Is.EqualTo("stdout"));
+    }
+
+    /// A null `tokens` sequence passed to `ScriptedRunner.On` must fail immediately, rather than
+    /// falling all the way through to a deep `NullReferenceException` inside `List.ofSeq`.
+    [Test]
+    public void ScriptedRunner_On_null_tokens_throws_ArgumentNullException_naming_tokens()
+    {
+        var ex = Assert.Throws<ArgumentNullException>(() => new ScriptedRunner().On(null!, Reply.Ok("")));
+
+        Assert.That(ex!.ParamName, Is.EqualTo("tokens"));
     }
 }

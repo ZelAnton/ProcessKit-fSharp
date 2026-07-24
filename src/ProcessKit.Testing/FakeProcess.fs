@@ -41,6 +41,7 @@ type FakeProcess
 
     /// A fake of `program` that exits 0 with no output.
     static member Create(program: string) =
+        ArgumentNullException.ThrowIfNull(program, nameof program)
         FakeProcess(Command.create program, "", "", Outcome.Exited 0, None, None)
 
     /// A fake (named `"fake"`) that exits 0 with no output.
@@ -54,15 +55,18 @@ type FakeProcess
 
     /// The captured stdout the fake replays (split on `\n` into lines for the streaming verbs).
     member _.WithStdout(text: string) =
+        ArgumentNullException.ThrowIfNull(text, nameof text)
         FakeProcess(template, text, stderr, outcome, pid, pty)
 
     /// The captured stdout as a sequence of lines (joined with `\n`).
     member _.WithStdoutLines(lines: seq<string>) =
+        ArgumentNullException.ThrowIfNull(lines, nameof lines)
         FakeProcess(template, String.Join('\n', lines), stderr, outcome, pid, pty)
 
     /// The captured stderr. On a PTY fake (see `WithPty`) there is no separate stderr stream: this text
     /// is folded into the single merged stdout stream rather than surfaced as `OutputEvent.Stderr`.
     member _.WithStderr(text: string) =
+        ArgumentNullException.ThrowIfNull(text, nameof text)
         FakeProcess(template, stdout, text, outcome, pid, pty)
 
     /// Make the fake exit with `code`.
@@ -71,6 +75,7 @@ type FakeProcess
 
     /// Make the fake conclude with an explicit `Outcome` (e.g. `Outcome.TimedOut` or `Signalled`).
     member _.WithOutcome(value: Outcome) =
+        ArgumentNullException.ThrowIfNull(value, nameof value)
         FakeProcess(template, stdout, stderr, value, pid, pty)
 
     /// Set the pid the handle reports.

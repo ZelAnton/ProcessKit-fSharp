@@ -11,10 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Changed
--
+- `ProcessKit.Testing`'s public API (`FakeProcess`, `Reply`, `ScriptedRunner`) now validates null
+  arguments at the entry point with `ArgumentNullException`, matching the main package's convention —
+  a `null` stdout/stderr text, line sequence, `Outcome`/`Reply`/`ProcessError`, token sequence, or
+  predicate now fails immediately with the correct parameter name instead of surfacing later as a
+  `NullReferenceException` or a misleadingly-named `ArgumentNullException` from deep inside the call
+  chain (e.g. `Encoding.GetBytes`, `List.ofSeq`).
 
 ### Fixed
--
+- A `HostedProcessService.Dispose()` that races the very start of its background supervision no longer publishes a spurious `LastOutcome = Error` (nor logs "supervision failed"). `Dispose()` disposes its lifetime `CancellationTokenSource` without awaiting the supervision task; the background start now reads a snapshot of that token taken before disposal instead of the live getter, so a routine teardown that overlaps startup is reported as a clean cancellation, exactly like a non-racing `Dispose()`.
+- The stdout streaming session's stderr capture (`StdoutLinesAsync()` + `FinishAsync().Stderr`) now honours `OutputBufferPolicy.MaxBytes` as an in-flight cap the same way the buffered verbs do, so a newline-free stderr flood can no longer grow the pump's assembly buffer past the configured cap.
 
 ## [2.6.0] - 2026-07-23
 
