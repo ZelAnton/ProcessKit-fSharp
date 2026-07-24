@@ -268,6 +268,70 @@ jobs:
           path: ./TestResults/**/coverage.cobertura.xml
           if-no-files-found: ignore
 
+  coverage-summary:
+    name: Coverage summary
+    if: ${{ always() && github.event_name != 'schedule' }}
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      # Pattern download succeeds when one or more matrix legs did not publish coverage. Keeping
+      # artifacts in separate directories avoids overwriting their identically named Cobertura files.
+      - name: Download available coverage reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-*
+          path: coverage
+
+      - name: Install ReportGenerator
+        run: >-
+          dotnet tool install --tool-path ./.tools
+          dotnet-reportgenerator-globaltool --version 5.5.10
+
+      # This remains visualization-only: a baseline-relative coverage ratchet is intentionally
+      # deferred until a follow-up can define and validate its main-branch comparison semantics.
+      - name: Publish merged coverage summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p coverage
+          mapfile -d '' coverage_reports < <(
+            find coverage -type f -name 'coverage.cobertura.xml' -print0
+          )
+
+          {
+            echo "## Cross-platform coverage"
+            echo
+            echo "Merged ${#coverage_reports[@]} available Cobertura report(s) from the test matrix."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( ${#coverage_reports[@]} == 0 )); then
+            echo "> No coverage reports were produced; see the matrix test jobs for details." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          assembly_filters="+ProcessKit;+ProcessKit.Testing"
+          assembly_filters+=";+ProcessKit.Extensions.DependencyInjection"
+          assembly_filters+=";+ProcessKit.Extensions.Hosting"
+          report_files=$(printf '%s;' "${coverage_reports[@]}")
+          report_files=${report_files%;}
+
+          ./.tools/reportgenerator \
+            "-reports:$report_files" \
+            "-targetdir:coverage-report" \
+            "-reporttypes:MarkdownSummaryGithub" \
+            "-assemblyfilters:$assembly_filters" \
+            "-title:ProcessKit cross-platform coverage"
+
+          cat coverage-report/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+
   # The Linux cgroup v2 `limits` backend can only enable controllers at the real cgroup root, so
   # it never engages under the unprivileged matrix legs (a systemd scope / private cgroup
   # namespace). This leg runs the limits tests in a privileged container with the host cgroup
