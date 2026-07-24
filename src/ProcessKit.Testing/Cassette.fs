@@ -41,9 +41,11 @@ type CassetteEntry =
         /// The working directory, or `null` if the command did not set one.
         Cwd: string | null
         /// Digest of the stdin source; part of the replay match key (`null` when there was no stdin).
-        /// For an in-memory stdin source this is a SHA-256 of the content — a low-entropy stdin secret
-        /// (a short password/PIN) can be recovered from it by brute force, so treat a cassette with
-        /// stdin as sensitive and review it before committing.
+        /// Version 5 prefixes it by source domain (`inherit|`, `path|`, or `bytes|`) so an in-memory
+        /// value cannot alias inherited stdin or a path-only file source. For an in-memory stdin source
+        /// this contains a SHA-256 of the content — a low-entropy stdin secret (a short password/PIN)
+        /// can be recovered from it by brute force, so treat a cassette with stdin as sensitive and
+        /// review it before committing.
         StdinDigest: string | null
         /// Whether the invocation supplied a stdin source.
         HasStdin: bool
@@ -231,9 +233,11 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // fields default); a version newer than this is rejected. Bump when the on-disk schema changes.
     // v2 added `StdoutBase64` (exact bytes for the bytes capture verb); v3 added `EnvFingerprint` (the
     // effective-environment fingerprint that folds env semantics into the replay match key); v4 added
-    // `Pty`/`PtyCols`/`PtyRows` (the merged-stream pseudo-terminal recording — D3). A pre-v4 entry with
-    // no `Pty` flag loads as a non-PTY recording (`Pty` defaults `false`, the geometry `null`).
-    static let currentFormatVersion = 4
+    // `Pty`/`PtyCols`/`PtyRows` (the merged-stream pseudo-terminal recording — D3). v5 prefixes stdin
+    // digests by source domain, preventing an in-memory value from aliasing inherited stdin or a
+    // path-only file source. v1-v4 digests still replay through the legacy key fallback. A pre-v4 entry
+    // with no `Pty` flag loads as a non-PTY recording (`Pty` defaults `false`, the geometry `null`).
+    static let currentFormatVersion = 5
 
     static let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
@@ -551,9 +555,15 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             if obj.ReferenceEquals(scrubbed, null) then "" else scrubbed
 
     // The stdin-source digest used for matching, computed WITHOUT consuming the source: in-memory
-    // bytes hash their content, a file source hashes its path (or, opt-in, its contents). A one-shot
-    // streaming source can't be keyed without consuming it, so it is rejected.
-    let stdinDigest (command: Command) : Result<string option, ProcessError> =
+    // bytes hash their content, a file source hashes its path (or, opt-in, its contents). In the v5
+    // scheme, prefixes make the source domains structurally disjoint: `inherit|`, `path|<sha256>`, and
+    // `bytes|<sha256>`. A one-shot streaming source can't be keyed without consuming it, so it is
+    // rejected. Legacy is used only as a read fallback for v1-v4 cassette entries.
+    let stdinDigest (legacy: bool) (command: Command) : Result<string option, ProcessError> =
+        let bytesDigest (bytes: byte[]) =
+            let digest = hashBytes bytes
+            if legacy then digest else $"bytes|{digest}"
+
         match command.Config.StdinSource with
         | None -> Ok None
         | Some stdin ->
@@ -565,16 +575,20 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 // "inherit" marker, distinct from `Empty`/`None` (no stdin) so two inherited-stdin
                 // invocations match each other but not a no-stdin one. Recording still spawns for real
                 // (the inner runner inherits the parent's stdin); replay just returns the recorded result.
-                Ok(Some(hashBytes (Encoding.UTF8.GetBytes "inherit-stdin")))
-            | StdinSource.Bytes bytes -> Ok(Some(hashBytes bytes))
+                if legacy then
+                    Ok(Some(hashBytes (Encoding.UTF8.GetBytes "inherit-stdin")))
+                else
+                    Ok(Some "inherit|")
+            | StdinSource.Bytes bytes -> Ok(Some(bytesDigest bytes))
             | StdinSource.File filePath ->
                 if options.HashFileStdinContents then
                     try
-                        Ok(Some(hashBytes (File.ReadAllBytes filePath)))
+                        Ok(Some(bytesDigest (File.ReadAllBytes filePath)))
                     with ex ->
                         Error(ProcessError.Stdin(command.Program, ex.Message))
                 else
-                    Ok(Some(hashBytes (Encoding.UTF8.GetBytes("file:" + filePath))))
+                    let pathDigest = hashBytes (Encoding.UTF8.GetBytes("file:" + filePath))
+                    Ok(Some(if legacy then pathDigest else $"path|{pathDigest}"))
             | StdinSource.Lines _
             | StdinSource.Reader _
             | StdinSource.AsyncLines _ ->
@@ -788,6 +802,20 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         | true, slot -> slot.Entries <- Array.append slot.Entries [| entry |]
         | _ -> slots[key] <- { Entries = [| entry |]; Next = 0 }
 
+    // New cassettes use the v5 domain-separated key. A v1-v4 entry has an unprefixed digest, so only a
+    // second legacy lookup can find it; this also lets Auto safely retain old rows while adding v5 rows.
+    let replayEntry
+        (slots: Dictionary<Key, ReplaySlot>)
+        (command: Command)
+        (digest: string option)
+        : Result<CassetteEntry option, ProcessError> =
+        match lock gate (fun () -> play slots (keyOf command digest)) with
+        | Some entry -> Ok(Some entry)
+        | None ->
+            match stdinDigest true command with
+            | Error error -> Error error
+            | Ok legacyDigest -> Ok(lock gate (fun () -> play slots (keyOf command legacyDigest)))
+
     /// Start recording real runs (delegated to `inner`) to a cassette at `path`.
     static member Record(path: string, inner: IProcessRunner) =
         RecordReplayRunner.Record(path, inner, RecordReplayOptions())
@@ -909,7 +937,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 // token entirely, and record should not capture a run the caller cancelled up front.
                 return Error(ProcessError.Cancelled command.Program)
             else
-                match stdinDigest command with
+                match stdinDigest false command with
                 | Error error -> return Error error
                 | Ok digest ->
                     match mode with
@@ -923,15 +951,17 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
                             return Ok result
                     | ReplayMode slots ->
-                        match lock gate (fun () -> play slots (keyOf command digest)) with
-                        | Some entry -> return resultOf command entry
-                        | None -> return Error(ProcessError.CassetteMiss command.Program)
+                        match replayEntry slots command digest with
+                        | Error error -> return Error error
+                        | Ok(Some entry) -> return resultOf command entry
+                        | Ok None -> return Error(ProcessError.CassetteMiss command.Program)
                     | AutoMode(inner, slots, recorded, dirty) ->
                         let key = keyOf command digest
 
-                        match lock gate (fun () -> play slots key) with
-                        | Some entry -> return resultOf command entry
-                        | None ->
+                        match replayEntry slots command digest with
+                        | Error error -> return Error error
+                        | Ok(Some entry) -> return resultOf command entry
+                        | Ok None ->
                             match! captureInner inner command cancellationToken with
                             | Error error -> return Error error
                             | Ok result ->
@@ -979,12 +1009,13 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 )
             | ReplayMode slots
             | AutoMode(_, slots, _, _) ->
-                match stdinDigest command with
+                match stdinDigest false command with
                 | Error error -> Error error
                 | Ok digest ->
-                    match lock gate (fun () -> play slots (keyOf command digest)) with
-                    | Some entry -> spawnFromEntry command entry
-                    | None ->
+                    match replayEntry slots command digest with
+                    | Error error -> Error error
+                    | Ok(Some entry) -> spawnFromEntry command entry
+                    | Ok None ->
                         // Auto cannot auto-record a live stream any more than record mode can; both surface
                         // a miss rather than a surprise subprocess or a silently uncaptured recording.
                         match mode with
