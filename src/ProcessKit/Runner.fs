@@ -220,6 +220,15 @@ module Runner =
             )
         | false, Some(maxAttempts, delay, shouldRetry) ->
             task {
+                // A command-scoped `CancelOn` covers the whole retrying run, including a pending
+                // backoff where no individual attempt is active.
+                use retryCts =
+                    match command.Config.CancelOn with
+                    | Some extra -> CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, extra)
+                    | None -> CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+
+                let retryToken = retryCts.Token
+
                 // `maxAttempts` is the TOTAL number of runs (the initial run plus retries), so the
                 // command always runs at least once: `0`/`1` (and any non-positive value) mean a single
                 // run, `3` means one run and up to two retries. (Matches the vocabulary of the source
@@ -244,7 +253,7 @@ module Runner =
                         if
                             attempt < maxRetries
                             && shouldRetry.Invoke error
-                            && not cancellationToken.IsCancellationRequested
+                            && not retryToken.IsCancellationRequested
                             && not isCancelled
                         then
                             attempt <- attempt + 1
@@ -257,7 +266,7 @@ module Runner =
                                 // (negative / `InfiniteTimeSpan` / over-long) can't throw synchronously out
                                 // of `Task.Delay` — which would break the honest-result contract — the same
                                 // guard `Timeouts` applies to `Command.Timeout`.
-                                do! Task.Delay(Timeouts.clampArmable delay, cancellationToken)
+                                do! Task.Delay(Timeouts.clampArmable delay, retryToken)
                             with :? System.OperationCanceledException ->
                                 // Cancelled mid-backoff: don't sleep out the rest of the delay. Report it
                                 // as `Cancelled` (not the prior attempt's error), consistent with every

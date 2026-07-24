@@ -1,7 +1,10 @@
 namespace ProcessKit.Tests
 
 open System
+open System.Collections.Generic
+open System.IO
 open System.Runtime.InteropServices
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
@@ -93,6 +96,61 @@ type ErgonomicsTests() =
 
         let command = client.Command [ shellFlag; "echo hi" ]
         Assert.That(command.ConfiguredTimeout, Is.EqualTo(Some(TimeSpan.FromSeconds 7.0)))
+
+    [<Test>]
+    member _.``CliClient defaults reject one-shot stdin while individual commands allow it``() : Task =
+        task {
+            let client = CliClient.create shellProgram
+
+            let assertOneShotDefaultIsRejected (source: Stdin) =
+                let error =
+                    Assert.Throws<ArgumentException>(
+                        Action(fun () -> client.WithDefaults(fun command -> command.Stdin source) |> ignore)
+                    )
+
+                match error with
+                | null -> Assert.Fail "Expected WithDefaults to reject one-shot stdin source."
+                | exception' ->
+                    Assert.That(exception'.ParamName, Is.EqualTo "configure")
+                    Assert.That(exception'.Message, Does.Contain "one-shot stdin source")
+                    Assert.That(exception'.Message, Does.Contain "cannot be used as a CliClient default")
+
+            use defaultStream = new MemoryStream(Encoding.UTF8.GetBytes "default")
+            assertOneShotDefaultIsRejected (Stdin.FromStream defaultStream)
+            assertOneShotDefaultIsRejected (Stdin.FromLines [ "default" ])
+
+            let asyncLines: IAsyncEnumerable<string> =
+                { new IAsyncEnumerable<string> with
+                    member _.GetAsyncEnumerator(_) =
+                        { new IAsyncEnumerator<string> with
+                            member _.Current = ""
+                            member _.MoveNextAsync() = ValueTask<bool>(false)
+                            member _.DisposeAsync() = ValueTask() } }
+
+            assertOneShotDefaultIsRejected (Stdin.FromAsyncLines asyncLines)
+
+            client.WithDefaults(fun command -> command.Stdin(Stdin.FromString "default"))
+            |> ignore
+
+            client.WithDefaults(fun command -> command.Stdin(Stdin.FromBytes [| 1uy |]))
+            |> ignore
+
+            client.WithDefaults(fun command -> command.Stdin(Stdin.FromFile "default.txt"))
+            |> ignore
+
+            use invocationStream =
+                new MemoryStream(Encoding.UTF8.GetBytes "per-invocation stdin")
+
+            let stdinEcho = if isWindows then "more" else "cat"
+
+            let command =
+                (client.Command [ shellFlag; stdinEcho ]).Stdin(Stdin.FromStream invocationStream)
+
+            match! command.RunAsync() with
+            | Ok output -> Assert.That(output, Does.Contain "per-invocation stdin")
+            | Error error -> Assert.Fail $"expected per-invocation stdin to run, got {error}"
+        }
+        :> Task
 
     [<Test>]
     member _.``CliClient runs commands through its runner``() : Task =

@@ -818,7 +818,11 @@ Console.WriteLine(await git.RunAsync(["rev-parse", "HEAD"]) switch
 });
 ```
 
-*Deeper: [Testing your code → CliClient](docs/testing.md#cliclient).*
+`WithDefaults` is shared by every client invocation, so its stdin source must be replayable
+(`FromString`, `FromBytes`, or `FromFile`). Attach a one-shot `FromStream`, `FromLines`, or
+`FromAsyncLines` source to the individual command returned by `client.Command(...)` instead.
+
+*Deeper: [Testing your code → CliClient](docs/testing.md#cliclient).* 
 
 ## Recording and replaying runs
 

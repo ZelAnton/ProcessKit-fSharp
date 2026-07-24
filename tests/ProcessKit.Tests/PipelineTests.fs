@@ -1021,6 +1021,41 @@ type PipelineTests() =
         :> Task
 
     [<Test>]
+    member _.``a full-spawn cancelled pipeline stops a hung stage-0 async stdin feed``() : Task =
+        task {
+            // The terminal stdout tee holds the post-reap drain open. Cancellation therefore reaches the
+            // full-spawn completion branch rather than the mid-staging abort path, while the stage-0 feed
+            // remains parked in its source's MoveNextAsync.
+            use cts = new CancellationTokenSource()
+            use tee = new BlockingTee()
+            let source = HangingStdinAsyncLines()
+
+            let first =
+                (shell "echo ready")
+                |> Command.stdin (Stdin.FromAsyncLines source)
+
+            let last = sortStage |> Command.stdoutTee tee
+            let run = first.Pipe(last).RunAsync cts.Token
+
+            do! source.Started
+            do! tee.FirstWrite
+            cts.Cancel()
+            tee.Release()
+
+            match! run with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected Cancelled after the completed pipeline drain, got {other}"
+
+            let! completed = Task.WhenAny(source.Disposed, Task.Delay 5000)
+            Assert.That(
+                completed,
+                Is.SameAs source.Disposed,
+                "the cancelled pipeline left the async enumerator undisposed"
+            )
+        }
+        :> Task
+
+    [<Test>]
     member _.``a pipeline surfaces a stage-0 async source that faults at GetAsyncEnumerator as ProcessError.Stdin``
         ()
         : Task =
