@@ -472,7 +472,7 @@ type RunningProcess internal (host: RunningHost) =
             | (:? IOException | :? ObjectDisposedException) when isTearingDown () ->
                 // A concurrent `StopAsync`/`Dispose` on this handle disposed the pipe streams while this
                 // pump was still draining the tail — the buffered-pump teardown race. Stop quietly and
-                // return what was captured so far, rather than mis-reporting the routine race as a genuine
+                // return what was captured so far, rather than misreporting the routine race as a genuine
                 // `ProcessError.Io` that would fault the verb (and, via supervision, the session). A real
                 // mid-run read fault (teardown not begun) still surfaces below — T-087.
                 ()

@@ -1030,9 +1030,7 @@ type PipelineTests() =
             use tee = new BlockingTee()
             let source = HangingStdinAsyncLines()
 
-            let first =
-                (shell "echo ready")
-                |> Command.stdin (Stdin.FromAsyncLines source)
+            let first = (shell "echo ready") |> Command.stdin (Stdin.FromAsyncLines source)
 
             let last = sortStage |> Command.stdoutTee tee
             let run = first.Pipe(last).RunAsync cts.Token
@@ -1047,6 +1045,7 @@ type PipelineTests() =
             | other -> Assert.Fail $"expected Cancelled after the completed pipeline drain, got {other}"
 
             let! completed = Task.WhenAny(source.Disposed, Task.Delay 5000)
+
             Assert.That(
                 completed,
                 Is.SameAs source.Disposed,
