@@ -112,21 +112,35 @@ module internal StreamChannel =
     // Pump one stream's lines through `onLine` until the stream ends — the streaming-verb analogue
     // of `Pump`'s buffered capture (which captures to a `LineBuffer` instead). No-op when the stream
     // isn't piped. The caller owns the sink (a channel writer, a buffer) and any completion signal.
-    // No in-flight line cap for streaming: it is consumer-paced and applies no buffer policy, so a
-    // consumer receives whole lines (the in-flight cap is a buffered-verb concern). `isTearingDown`
-    // is threaded straight through to `Pump.readLinesUntilDone`'s genuine-vs-teardown-race
-    // classification (T-087) — the caller reports whether ITS handle's own teardown has begun.
+    // `maxLineLength` is the in-flight byte cap for a NEWLINE-FREE flood, threaded straight through to
+    // `Pump.readLinesUntilDone` — pass `None` for a genuinely consumer-paced channel (a consumer
+    // receives whole lines, e.g. the stdout streaming channel and the event channels), or
+    // `config.OutputBuffer.MaxBytes` for a call site that captures into a `Pump.LineBuffer` under that
+    // same policy (the stderr side of the stdout streaming session), so the assembly buffer can't grow
+    // unbounded on that flood — same reasoning as `pumpToBuffer`'s buffered capture. `isTearingDown` is
+    // threaded straight through to `Pump.readLinesUntilDone`'s genuine-vs-teardown-race classification
+    // (T-087) — the caller reports whether ITS handle's own teardown has begun.
     let pumpLines
         (stream: Stream option)
         encoding
         terminator
         tee
         (onLine: string -> ValueTask)
+        (maxLineLength: int option)
         (isTearingDown: unit -> bool)
         =
         task {
             match stream with
             | Some s ->
-                do! Pump.readLinesUntilDone s encoding terminator tee onLine None isTearingDown CancellationToken.None
+                do!
+                    Pump.readLinesUntilDone
+                        s
+                        encoding
+                        terminator
+                        tee
+                        onLine
+                        maxLineLength
+                        isTearingDown
+                        CancellationToken.None
             | None -> ()
         }
