@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Changed
+- `CliClient.WithDefaults` now rejects one-shot stdin sources (`FromStream`, `FromLines`, and
+  `FromAsyncLines`) with `ArgumentException`; attach them to an individual `client.Command(...)` instead.
 - `ProcessKit.Testing`'s public API (`FakeProcess`, `Reply`, `ScriptedRunner`) now validates null
   arguments at the entry point with `ArgumentNullException`, matching the main package's convention —
   a `null` stdout/stderr text, line sequence, `Outcome`/`Reply`/`ProcessError`, token sequence, or
