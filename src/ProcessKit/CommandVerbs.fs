@@ -22,12 +22,12 @@ type CommandVerbs =
     static member StartAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
         Runner.start CommandVerbs.DefaultRunner cancellationToken command
 
-    /// Require a zero exit and return stdout, trailing whitespace trimmed.
+    /// Require a zero/accepted exit and return stdout, trailing whitespace trimmed.
     [<Extension>]
     static member RunAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
         Runner.run CommandVerbs.DefaultRunner cancellationToken command
 
-    /// Require a zero exit, discarding the captured output.
+    /// Require a zero/accepted exit, discarding the captured output.
     [<Extension>]
     static member RunUnitAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
         Runner.runUnit CommandVerbs.DefaultRunner cancellationToken command
