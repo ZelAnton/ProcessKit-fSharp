@@ -284,10 +284,17 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // closed and its value recycled onto an unrelated object (a use-after-close). Running the
             // released/torn-down check AND the native resize in ONE critical section refuses a post-teardown
             // resize with a typed, non-transient `Unsupported` (as `WhenLive` does for a released group)
-            // BEFORE touching native — the resize either fires fully on the live pty or observes the flag and
-            // no-ops before native, never half of each. A live run resizes exactly as before, and this keeps
-            // `ResizeAsync` non-consuming (K-031). Bounded native work under the lock — an `ioctl` + best-
-            // effort `SIGWINCH`, or one `ResizePseudoConsole` — exactly like `killWhenLive`/`Signal`.
+            // BEFORE touching native. The gate is only as tight as the ORDER in which teardown raises the
+            // flag versus releasing the resource: `Teardown` sets `runTornDown` UNDER `sync` BEFORE
+            // `closeStreams` closes the POSIX master fd (T-203, R-01), so on POSIX a concurrent resize either
+            // fires fully on the live pty or observes the flag and no-ops — never half of each. On WINDOWS
+            // the `hPC` is instead closed by the child-exit callback (`closePseudoConsoleOnChildExit`), a
+            // different lifecycle event this gate cannot lead; that leaves a documented, strictly WEAKER
+            // residual window (an `HPCON` is not recycled with an fd's immediacy, and `ResizePseudoConsole`
+            // returns a typed `Io` failure on a stale handle, never a silent wrong-target) — see `Teardown`.
+            // A live run resizes exactly as before, and this keeps `ResizeAsync` non-consuming (K-031).
+            // Bounded native work under the lock — an `ioctl` + best-effort `SIGWINCH`, or one
+            // `ResizePseudoConsole` — exactly like `killWhenLive`/`Signal`.
             let resizePty =
                 spawned.PtyControl
                 |> Option.map (fun control ->
@@ -362,38 +369,67 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     // redundant call on a second Teardown (verb reapGuard, then handle disposal) is
                     // harmless. Closing the stdin stream below still covers a write-parked feed.
                     stdinFeeder.Stop()
+
+                    // Mark this run torn down (under `sync`) BEFORE `closeStreams` releases the pipe fds —
+                    // "flag first, then release the resource", mirroring the kill path (T-093, whose flag
+                    // precedes `Dispose`) and the shared-group `Release` below (T-204). `closeStreams` closes
+                    // the pty master fd held in `spawned.PtyControl` (POSIX: `closeSpawned` disposes
+                    // `spawned.Stdout`, the sole owner that closes the master fd), and an fd NUMBER is recycled
+                    // IMMEDIATELY by a concurrent spawn of an UNRELATED run — unlike a pid. Were the flag raised
+                    // only AFTER `closeStreams` (as before this fix), a `ResizeAsync` that took `sync` in the
+                    // gap between the fd close and the flag would see `releasedFlag = 0 && not runTornDown` and
+                    // `ioctl(TIOCSWINSZ)` + `kill(pid, SIGWINCH)` a closed-and-recycled fd/pid: the wrong-target
+                    // mutation of a STRANGER's run this task exists to close, merely NARROWED but not shut. With
+                    // the flag first, a concurrent resize either fires fully on the still-live pty (flag not yet
+                    // observed) or sees `runTornDown` and returns `Unsupported` — never half of each. Hoisting
+                    // it is safe for both arms: reaping (`Dispose` / `backend.Release`) does not depend on the
+                    // flag's value — the flag gates only the fire-and-forget kill/resize closures, which are a
+                    // no-op during teardown regardless.
+                    //
+                    // WINDOWS residual window (documented, not closed — R-01). The pseudoconsole `hPC` is NOT
+                    // closed by `closeStreams`; it is closed by `closePseudoConsoleOnChildExit`'s thread-pool
+                    // wait callback the instant the CHILD EXITS (Native.Windows.fs), which MUST fire to flush
+                    // conhost and let the parent's merged-output pump reach EOF — it cannot be deferred to this
+                    // gate without hanging capture/streaming. That close is driven by child exit, a DIFFERENT
+                    // lifecycle event than teardown, so it races `runTornDown` and a concurrent `ResizeAsync`
+                    // can still reach `ResizePseudoConsole` on a just-closed `hPC`. This is a strictly WEAKER
+                    // exposure than the POSIX fd case: an `HPCON` value is not recycled with the immediacy of an
+                    // fd number, and `ResizePseudoConsole` type-checks its handle and surfaces a non-zero
+                    // HRESULT as a typed `Io` failure (Native.Windows.fs) — a bounded typed error, never a
+                    // silent wrong-target success. Fully closing it would require threading `sync`/the flag into
+                    // that native child-exit callback — a second, independent lifecycle primitive (K-016 warns
+                    // against exactly that) disproportionate to the residual risk.
+                    lock sync (fun () -> runTornDown <- true)
                     closeStreams ()
 
                     if ownsGroup then
-                        // Mark this run torn down (under `sync`) BEFORE reaping, so a `Kill()`/`StopAsync()`
-                        // that races or follows this teardown observes the flag and no-ops rather than
-                        // signalling a child this run no longer owns (see `runTornDown`).
-                        lock sync (fun () -> runTornDown <- true)
-                        // Owned group: closing the run reaps the whole tree.
+                        // Owned group: closing the run reaps the whole tree. `runTornDown` is already set
+                        // (above), so a `Kill()`/`StopAsync()` that races or follows this teardown observes the
+                        // flag and no-ops rather than signalling a child this run no longer owns.
                         (this :> IDisposable).Dispose()
                     else
                         // Shared group: detach this run's I/O only — the GROUP owns the child's lifetime
-                        // (Shutdown/Dispose reaps it). Mark this run torn down AND stop tracking the child in
-                        // the SAME `sync` critical section, in that order (T-204). Both must serialize against
-                        // the control verbs: `runTornDown` fends off a later `Kill()`/`StopAsync()`, and
-                        // `backend.Release` must not race `Signal`. On Windows `Release` drops the child's
-                        // `ctrlGroups` entry AND closes its process handle, freeing its pid for OS reuse; the
-                        // console process-group id in that entry is exactly what `Signal(Int/Term)` targets.
-                        // `Signal` snapshots `ctrlGroups.Values` and delivers every `GenerateConsoleCtrlEvent`
-                        // CTRL+BREAK while holding `sync` — so running this `Release` OFF the lock (as before)
-                        // let it drop the entry and close the handle midway through that delivery loop, after
-                        // which a CTRL+BREAK could land on a pid the OS had already recycled onto an unrelated
-                        // console process group (the wrong-target class T-084 closed for POSIX kill and T-162
-                        // for the Windows Job handle, left open on this path). Serializing `Release` under
-                        // `sync` restores the documented `ctrlGroups` invariant: an entry's handle stays open
-                        // for the whole of any concurrent `Signal` delivery. It is bounded native work — a
-                        // handle close on Windows, a pgid liveness probe on POSIX — exactly the release work it
-                        // already did, now merely under the lock like `KillChild`/`hardRelease`, so teardown is
-                        // not lengthened beyond it. POSIX stops tracking only once the child's group is empty,
-                        // so a still-live child stays reapable by the group.
-                        lock sync (fun () ->
-                            runTornDown <- true
-                            backend.Release spawned)
+                        // (Shutdown/Dispose reaps it). `runTornDown` was set above (before `closeStreams`); here
+                        // we only stop tracking the child, still under `sync` and still AFTER the flag (T-204's
+                        // required order is preserved — the flag now merely leads by a wider margin). Both must
+                        // serialize against the control verbs: `runTornDown` fends off a later `Kill()`/
+                        // `StopAsync()`, and `backend.Release` must not race `Signal`. On Windows `Release` drops
+                        // the child's `ctrlGroups` entry AND closes its process handle, freeing its pid for OS
+                        // reuse; the console process-group id in that entry is exactly what `Signal(Int/Term)`
+                        // targets. `Signal` snapshots `ctrlGroups.Values` and delivers every
+                        // `GenerateConsoleCtrlEvent` CTRL+BREAK while holding `sync` — so running this `Release`
+                        // OFF the lock (as the original pre-T-204 code did) let it drop the entry and close the
+                        // handle midway through that delivery loop, after which a CTRL+BREAK could land on a pid
+                        // the OS had already recycled onto an unrelated console process group (the wrong-target
+                        // class T-084 closed for POSIX kill and T-162 for the Windows Job handle, left open on
+                        // this path). Serializing `Release` under `sync` restores the documented `ctrlGroups`
+                        // invariant: an entry's handle stays open for the whole of any concurrent `Signal`
+                        // delivery. It is bounded native work — a handle close on Windows, a pgid liveness probe
+                        // on POSIX — exactly the release work it already did, now merely under the lock like
+                        // `KillChild`/`hardRelease`, so teardown is not lengthened beyond it. POSIX stops
+                        // tracking only once the child's group is empty, so a still-live child stays reapable by
+                        // the group.
+                        lock sync (fun () -> backend.Release spawned)
 
                     ValueTask.CompletedTask })
 

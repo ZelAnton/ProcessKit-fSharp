@@ -489,6 +489,62 @@ type PtyTests() =
         }
 
     [<Test>]
+    member _.``ResizeAsync racing teardown never throws and stays typed (T-203, R-01 concurrent window)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                // The sequential test above proves a resize AFTER teardown is refused. This one targets the
+                // CONCURRENT window R-01 flagged: `Teardown` both raises `runTornDown` and closes the pty master
+                // fd, and a resize that takes `sync` BETWEEN those two steps must NEVER `ioctl`/`SIGWINCH` a
+                // closed-and-recycled fd. The fix raises the flag BEFORE `closeStreams`, so a resize racing
+                // teardown must always resolve to a well-typed `Result` — `Ok` while the pty is live, or a typed
+                // `Unsupported`/`Io` once torn down — and must never throw. We hammer resize in a tight loop
+                // while a terminal verb reaps the run, across many iterations, so the race is actually hit.
+                let mutable spawned = 0
+
+                for _ in 1..30 do
+                    let cmd =
+                        (Command.create "/bin/sh" |> Command.args [ "-c"; "echo hi" ]).Pty(80, 24)
+                        |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                    match! runner.StartAsync(cmd, CancellationToken.None) with
+                    | Error(ProcessError.Unsupported _) -> ()
+                    | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                    | Ok running ->
+                        spawned <- spawned + 1
+                        use _running = running
+                        use stop = new CancellationTokenSource()
+
+                        // Spin resize concurrently with the teardown below (on the thread pool, so it truly
+                        // races `WaitAsync`'s reapGuard). Every result must be a typed `Result` — never a raised
+                        // exception, and never a garbled `Ok` produced by an `ioctl` on a torn-down fd.
+                        let resizeLoop =
+                            Task.Run(fun () ->
+                                let loop =
+                                    task {
+                                        while not stop.IsCancellationRequested do
+                                            match! running.ResizeAsync(100, 30) with
+                                            | Ok()
+                                            | Error(ProcessError.Unsupported _)
+                                            | Error(ProcessError.Io _) -> ()
+                                            | Error other ->
+                                                Assert.Fail
+                                                    $"resize racing teardown returned an unexpected error: {other}"
+                                    }
+
+                                loop :> Task)
+
+                        // Reap the run — its `reapGuard` runs `Teardown` (flag-then-`closeStreams`) — while the
+                        // resize loop hammers the same pty. Then stop the loop and observe any escaped failure.
+                        let! _ = running.WaitAsync()
+                        stop.Cancel()
+                        do! resizeLoop
+
+                Assert.That(spawned, Is.GreaterThan 0, "at least one pty run must have spawned to exercise the race")
+        }
+
+    [<Test>]
     member _.``Pty with Echo=false keeps a fed credential out of the captured output (secret-safety)``() : Task =
         task {
             if not isLinux then
