@@ -1228,6 +1228,28 @@ module internal Windows =
             val mutable CpuRate: uint32
         end
 
+    /// Capture the Job's current extended-limit block (the memory + active-process caps and their flags),
+    /// so a live limit update can roll those caps back to exactly this state should a LATER native write
+    /// (the CPU rate cap) fail after this block was already replaced. `None` if the query fails — a
+    /// guaranteed rollback is then impossible, which the caller surfaces honestly rather than silently.
+    /// Only the input fields (BasicLimitInformation + JobMemoryLimit) matter when the struct is written
+    /// back; the accounting/peak output fields the query also fills are ignored by `SetInformationJobObject`.
+    let private queryExtendedLimit (job: nativeint) : JOBOBJECT_EXTENDED_LIMIT_INFORMATION option =
+        let size = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()
+        let buffer = Marshal.AllocHGlobal size
+
+        try
+            let mutable returnLength = 0u
+
+            if
+                QueryInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, uint32 size, &returnLength)
+            then
+                Some(Marshal.PtrToStructure<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> buffer)
+            else
+                None
+        finally
+            Marshal.FreeHGlobal buffer
+
     /// Apply resource limits to a Job: a memory cap (`JobMemoryLimit`), an active-process cap, and a
     /// CPU hard cap (a fraction of *total* system CPU, so per-core quota is approximate). Preserves
     /// `KILL_ON_JOB_CLOSE`. Returns an error message on failure.
@@ -1240,6 +1262,14 @@ module internal Windows =
     /// previously-applied cap rather than silently leaving it in force — and disabling on a Job that had
     /// no CPU cap (a fresh Job, or a `None`→`None` update) reports `ERROR_INVALID_PARAMETER`, which is
     /// exactly the desired "no CPU cap" end state and so is treated as success.
+    ///
+    /// The caps land in two separate native writes — the extended-limit block (memory + active-process),
+    /// then the CPU rate block — so the second could fail after the first already applied. To keep the
+    /// honest `UpdateLimits` contract (a failed apply leaves the live Job on the PREVIOUS set), the prior
+    /// extended-limit block is captured up front and best-effort restored if the CPU-rate write fails,
+    /// so an `Error` return means the Job is back on the previous set, never a silent mix `Options.Limits`
+    /// would misreport (T-207). Only if that restore itself fails (or the prior couldn't be captured) is
+    /// the state indeterminate, and the error says so distinctly.
     let applyWindowsJobLimits (job: nativeint) (limits: ResourceLimits) : Result<unit, string> =
         // (Re)write the Job's CPU rate control block. `controlFlags = 0` disables CPU rate control (the
         // replace-semantics "no CPU cap" state); the enable+hard-cap flags with a rate arm the cap. The
@@ -1262,6 +1292,27 @@ module internal Windows =
             finally
                 Marshal.FreeHGlobal cpuBuffer
 
+        // Serialize an extended-limit block and hand it to `SetInformationJobObject`. Factored out so the
+        // SAME primitive both applies the NEW block and restores a captured PRIOR block on a rollback.
+        let writeExtendedLimit (info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION) : Result<unit, string> =
+            let size = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()
+            let buffer = Marshal.AllocHGlobal size
+
+            try
+                Marshal.StructureToPtr<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(info, buffer, false)
+
+                if SetInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, uint32 size) then
+                    Ok()
+                else
+                    Error(Win32Exception(Marshal.GetLastWin32Error()).Message)
+            finally
+                Marshal.FreeHGlobal buffer
+
+        // The Job's current caps, captured BEFORE the replacement so a CPU-rate failure that lands after
+        // the memory/active-process block was already overwritten can put those caps back exactly as they
+        // were.
+        let priorExt = queryExtendedLimit job
+
         let mutable info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         let mutable flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 
@@ -1278,15 +1329,14 @@ module internal Windows =
         | None -> ()
 
         info.BasicLimitInformation.LimitFlags <- flags
-        let size = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()
-        let buffer = Marshal.AllocHGlobal size
 
-        try
-            Marshal.StructureToPtr<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(info, buffer, false)
-
-            if not (SetInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, uint32 size)) then
-                Error(Win32Exception(Marshal.GetLastWin32Error()).Message)
-            else
+        match writeExtendedLimit info with
+        | Error message ->
+            // `SetInformationJobObject` applies the whole block or none, so a failure here changed nothing
+            // — the previous set is still in force and there is nothing to roll back.
+            Error message
+        | Ok() ->
+            let cpuResult =
                 match limits.CpuQuota with
                 | Some cores ->
                     let fraction = min 1.0 (cores / float Environment.ProcessorCount)
@@ -1302,8 +1352,24 @@ module internal Windows =
                     | Ok() -> Ok()
                     | Error errno when errno = ERROR_INVALID_PARAMETER -> Ok()
                     | Error errno -> Error(Win32Exception(errno).Message)
-        finally
-            Marshal.FreeHGlobal buffer
+
+            match cpuResult with
+            | Ok() -> Ok()
+            | Error cpuMessage ->
+                // The memory/active-process block already applied but the CPU-rate cap did not. Roll that
+                // block back to the captured prior so the live Job and the Options snapshot stay together on
+                // the previous set (T-207); if the prior couldn't be captured, or restoring it also fails,
+                // the state is indeterminate — say so distinctly so the caller never trusts Options here.
+                match priorExt with
+                | Some prior ->
+                    match writeExtendedLimit prior with
+                    | Ok() -> Error cpuMessage
+                    | Error restoreMessage ->
+                        Error
+                            $"failed to apply the Job CPU rate cap ({cpuMessage}) and could not roll the memory/active-process caps back to the previous set ({restoreMessage}); the Job's limits may be partially applied"
+                | None ->
+                    Error
+                        $"failed to apply the Job CPU rate cap ({cpuMessage}) and the Job's prior limits could not be captured to roll back; the Job's limits may be partially applied"
 
     let private buildWindowsEnvironment (command: Command) : nativeint =
         if not command.Config.ClearEnv && command.Config.EnvOverrides.IsEmpty then

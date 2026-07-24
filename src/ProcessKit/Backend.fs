@@ -146,6 +146,13 @@ type internal IContainmentBackend =
     /// whole-tree limit primitive (the POSIX process group) returns `ProcessError.ResourceLimit`, the
     /// same honest, typed refusal `Create` gives — never a silent no-op. The `ResourceLimits` is a full
     /// replacement: a dimension left `None` is reset to unbounded, not left at its previous cap.
+    ///
+    /// The caps are applied through several sequential native writes, so a later one can fail after an
+    /// earlier one landed. A limit-capable backend therefore captures the container's prior caps and
+    /// best-effort restores them if a write fails partway, so an `Error` return leaves the live container
+    /// on the PREVIOUS set (nothing net changed) — never a silent mix `Options.Limits` would misreport.
+    /// Only if that restore itself fails is the state indeterminate, which the `ProcessError.ResourceLimit`
+    /// message states explicitly.
     abstract UpdateLimits: ResourceLimits -> Result<unit, ProcessError>
 
     /// The hard teardown, run exactly once by the owning `ProcessGroup`: reap the tree and free the
@@ -346,8 +353,10 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             // back as unbounded rather than left at its previous cap. This runs synchronously under the
             // group's lifecycle lock (via `ProcessGroup.WhenLive`), so it works on the still-open
             // `jobHandle` exactly like `Suspend`/`Resume`/`Stats`/`Members` — no handle duplication is
-            // needed here, unlike the OFF-lock graceful poll (K-025/T-162); a genuine apply failure is an
-            // honest `ProcessError.ResourceLimit`.
+            // needed here, unlike the OFF-lock graceful poll (K-025/T-162). `applyWindowsJobLimits`
+            // best-effort restores the prior extended-limit block if the CPU-rate write fails after it, so
+            // a genuine apply failure is an honest `ProcessError.ResourceLimit` AND the live Job is back on
+            // the previous set (T-207).
             match Native.Windows.applyWindowsJobLimits jobHandle limits with
             | Ok() -> Ok()
             | Error message -> Error(ProcessError.ResourceLimit message)
@@ -548,8 +557,9 @@ type internal CgroupBackend(cgroupPath: string) =
             // `max` sentinel (only where that controller file already exists — a never-enabled
             // controller is already unbounded), never left at its previous cap. Runs under the group's
             // lifecycle lock (via `ProcessGroup.WhenLive`), so the cgroup directory can't be removed by a
-            // concurrent teardown mid-write; a genuine write/delegation failure is an honest
-            // `ProcessError.ResourceLimit`.
+            // concurrent teardown mid-write. `updateCgroupLimits` best-effort restores any controller file
+            // it already rewrote if a later write fails, so a genuine write/delegation failure is an honest
+            // `ProcessError.ResourceLimit` AND the live cgroup is back on the previous set (T-207).
             match Native.Cgroup.updateCgroupLimits cgroupPath limits with
             | Ok() -> Ok()
             | Error message -> Error(ProcessError.ResourceLimit message)

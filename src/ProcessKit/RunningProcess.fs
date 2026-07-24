@@ -974,7 +974,7 @@ type RunningProcess internal (host: RunningHost) =
                         Error(
                             tooLargeError
                                 (outBuf.TotalLines + errBuf.TotalLines)
-                                (outBuf.TotalBytes + errBuf.TotalBytes)
+                                (int (min (int64 outBuf.TotalBytes + int64 errBuf.TotalBytes) (int64 Int32.MaxValue)))
                         )
                 else
                     match stdinErrorOnSuccess outcome with
@@ -1040,7 +1040,16 @@ type RunningProcess internal (host: RunningHost) =
                 if stdoutCapture.TooLarge || errBuf.TooLarge then
                     // The raw stdout byte cap contributes no lines (a byte stream has none); stderr is
                     // line-pumped, so its totals carry the lines and both streams' bytes are summed.
-                    return Error(tooLargeError errBuf.TotalLines (stdoutCapture.TotalBytes + errBuf.TotalBytes))
+                    return
+                        Error(
+                            tooLargeError
+                                errBuf.TotalLines
+                                (int (
+                                    min
+                                        (int64 stdoutCapture.TotalBytes + int64 errBuf.TotalBytes)
+                                        (int64 Int32.MaxValue)
+                                ))
+                        )
                 else
                     match stdinErrorOnSuccess outcome with
                     | Some err -> return Error err
