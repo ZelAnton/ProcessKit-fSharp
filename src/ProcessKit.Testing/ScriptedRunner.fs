@@ -59,9 +59,9 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
                     .WithStderr(reply.StderrText)
                     .WithOutcome(reply.Outcome)
 
-            // A scripted command that asked for a pseudo-terminal (`Command.Pty`) is served as a
-            // merged-stream PTY fake (D3/D10): `OutputEventsAsync` yields only `OutputEvent.Stdout` and
-            // `ResizeAsync` is a recorded no-op success — the equivalent double path for a PTY scenario.
+            // `FakeProcess.Build` reads the command configuration, so `Command.MergeStderr()` replays as
+            // one stdout stream with no separate stderr channel. PTY additionally needs `WithPty()` for
+            // its recorded resize behavior.
             let fake = if command.Config.Pty.IsSome then fake.WithPty() else fake
             Ok(fake.Build())
 

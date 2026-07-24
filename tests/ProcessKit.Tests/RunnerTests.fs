@@ -117,6 +117,58 @@ type RunnerTests() =
         :> Task
 
     [<Test>]
+    member _.``CancelOn interrupts a retry backoff``() : Task =
+        task {
+            use cancelOn = new CancellationTokenSource()
+
+            let firstAttemptFinished =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let mutable calls = 0
+
+            let alwaysFailing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        firstAttemptFinished.TrySetResult() |> ignore
+                        Task.FromResult(Ok(ProcessResult.Failure "" "boom" 1))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Failure [||] "boom" 1))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.cancelOn cancelOn.Token
+                |> Command.retry 5 (TimeSpan.FromSeconds 60.0) (fun _ -> true)
+
+            let run = command |> Runner.run alwaysFailing CancellationToken.None
+            do! firstAttemptFinished.Task.WaitAsync(TimeSpan.FromSeconds 2.0)
+
+            // Give the retry loop time to enter its deliberately long delay, then cancel only the
+            // command-scoped token. The short completion bound proves the backoff did not sleep out.
+            do! Task.Delay(TimeSpan.FromMilliseconds 100.0)
+            cancelOn.Cancel()
+
+            let! finished = Task.WhenAny(run :> Task, Task.Delay(TimeSpan.FromSeconds 2.0))
+
+            Assert.That(
+                obj.ReferenceEquals(finished, run),
+                Is.True,
+                "CancelOn should interrupt the retry backoff instead of waiting for its full delay"
+            )
+
+            match! run with
+            | Error(ProcessError.Cancelled "svc") -> ()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+            Assert.That(calls, Is.EqualTo 1, "CancelOn must prevent a second attempt")
+        }
+        :> Task
+
+    [<Test>]
     member _.``retry does not re-run the command when only the parser fails``() : Task =
         task {
             let mutable calls = 0
