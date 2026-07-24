@@ -923,8 +923,21 @@ module internal PipelineRunner =
                         timeoutCts.Dispose()
                         linkedCts.Dispose()
 
+                        let externallyCancelled =
+                            cancellationToken.IsCancellationRequested
+                            || (cancelOn |> Option.exists (fun token -> token.IsCancellationRequested))
+
                         match spawnError with
                         | Some error -> return Error error
+                        | None when externallyCancelled ->
+                            return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
+                        | None when timeoutCts.IsCancellationRequested ->
+                            // The deadline won while staging: preserve its configured duration instead of
+                            // silently downgrading it to Cancelled merely because no session was created.
+                            match timeout with
+                            | Some deadline ->
+                                return Error(ProcessError.Timeout(stages[stages.Length - 1].Program, deadline, "", ""))
+                            | None -> return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
                         | None -> return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
                     else
                         // The whole chain is live. Build the `RunningHost` over the last stage; the session's

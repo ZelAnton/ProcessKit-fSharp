@@ -2,6 +2,7 @@ namespace ProcessKit.Tests
 
 open System.Threading
 open System.Threading.Tasks
+open System.Text
 open NUnit.Framework
 open NUnit.Framework.Legacy
 open ProcessKit
@@ -73,6 +74,36 @@ type TestabilityTests() =
 
             do! enumerator.DisposeAsync()
             CollectionAssert.AreEqual([| "a"; "b"; "c" |], collected.ToArray())
+        }
+
+    [<Test>]
+    member _.``FakeProcess exposes a recorded interactive stdin only for KeepStdinOpen``() : Task =
+        task {
+            let command = Command.create "svc" |> Command.keepStdinOpen
+            let fake = FakeProcess.OfCommand(command)
+            use proc = fake.Build()
+
+            match proc.TakeStdin() with
+            | Some stdin ->
+                do! stdin.WriteLineAsync "interactive payload"
+                do! stdin.FinishAsync()
+            | None -> Assert.Fail "a KeepStdinOpen fake must provide interactive stdin"
+
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes "interactive payload\n", fake.StdinBytes)
+
+            Assert.That(
+                proc.TakeStdin(),
+                Is.EqualTo(None: ProcessStdin option),
+                "TakeStdin must hand a KeepStdinOpen fake's sink out only once"
+            )
+
+            use noStdin = FakeProcess.OfCommand(Command.create "svc").Build()
+
+            Assert.That(
+                noStdin.TakeStdin(),
+                Is.EqualTo(None: ProcessStdin option),
+                "a fake without KeepStdinOpen must not expose stdin"
+            )
         }
 
     [<Test>]
