@@ -1200,11 +1200,16 @@ type SupervisorTests() =
             let! completed = session.Completion
 
             let stopSourceField =
-                typeof<SupervisionSession>.GetField("stopCts", BindingFlags.Instance ||| BindingFlags.NonPublic)
+                match
+                    typeof<SupervisionSession>.GetField("stopCts", BindingFlags.Instance ||| BindingFlags.NonPublic)
+                with
+                | null -> failwith "SupervisionSession.stopCts field was not found"
+                | field -> field
 
-            Assert.That(stopSourceField, Is.Not.Null, "the session retains its private stop source until completion")
-
-            let stopSource = stopSourceField.GetValue(session) :?> CancellationTokenSource
+            let stopSource =
+                match stopSourceField.GetValue(session) with
+                | :? CancellationTokenSource as cts -> cts
+                | other -> failwith $"expected a CancellationTokenSource, got {other}"
 
             Assert.Throws<ObjectDisposedException>(Action(fun () -> stopSource.Cancel()))
             |> ignore
