@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chain (e.g. `Encoding.GetBytes`, `List.ofSeq`).
 
 ### Fixed
+- `Pipeline.StartAsync` now preserves a pipeline deadline that fires while its stages are being spawned: the call returns `ProcessError.Timeout` with the configured duration instead of silently downgrading the failure to `ProcessError.Cancelled`.
 - `Exec.outputAll` and `Exec.outputAllBytes` now reject a null runner, command sequence, or command
   element immediately with a correctly named argument exception, before they start any command or
   report invalid input as an I/O failure.
