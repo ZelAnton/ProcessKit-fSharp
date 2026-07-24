@@ -560,6 +560,16 @@ type RunningProcess internal (host: RunningHost) =
         else
             None
 
+    // Observe any fault on an otherwise fire-and-forget outcome task, so it can never surface as an
+    // unobserved task exception at finalization when nothing awaits it (a streaming-only consumer that
+    // abandons `FinishAsync`, or a readiness probe that races — and never awaits — the memoized buffered
+    // exit wait, see `ensureBufferedWait` below). A consumer that *does* await (`FinishAsync`/
+    // `WaitAnyAsync`/`WaitAllAsync`/`awaitBufferedOutcome`) still re-throws it. Used by both streaming
+    // sessions and the buffered exit wait.
+    let observeFault (outcomeTask: Task<Outcome>) =
+        outcomeTask.ContinueWith(Action<Task<Outcome>>(fun t -> t.Exception |> ignore))
+        |> ignore
+
     // Wait for exit, applying the configured total and/or idle timeout: on whichever deadline fires,
     // kill the tree (gracefully if `TimeoutGrace` is set, else hard) — one shared kill for both, so no
     // double kill — and report `Outcome.TimedOut`. The idle watchdog is armed inside `raceTimeout` as
@@ -582,10 +592,21 @@ type RunningProcess internal (host: RunningHost) =
     // the verb that owns the pipes and a concurrent `ExitTask` on the same handle (the "verb, then
     // WaitAny/WaitAll" order) share that one wait — one `host.Wait()`, one set of readers — with
     // correct cross-thread visibility of `bufferedOutcome` in either arrival order.
+    //
+    // `observeFault` is attached here, exactly once, the moment the wait is created — not on every
+    // `ensureBufferedWait()` call. This covers `raceReadinessAgainstExit`, whose probe-vs-exit race
+    // (below) never awaits `childExitTask`: without this, a fault from this same memoized wait (e.g.
+    // `waitWithTimeout`'s timeout-race `onTimeout` hook, see its comment above) would surface as an
+    // unobserved task exception at finalization on a probe-only handle (probe → dispose, no consuming
+    // verb ever calls `awaitBufferedOutcome`/`ExitTask`). The attach is purely observational — it never
+    // reads/replaces `t.Result`/`t.Exception` beyond marking it observed — so every real awaiter of this
+    // exact `Task` (returned below, and by every subsequent `ensureBufferedWait()` call) still gets and
+    // re-throws the original fault unchanged.
     let ensureBufferedWait () : Task<Outcome> =
         lock stateLock (fun () ->
             if obj.ReferenceEquals(bufferedOutcome, null) then
                 bufferedOutcome <- waitWithTimeout ()
+                observeFault bufferedOutcome
 
             bufferedOutcome)
 
@@ -765,14 +786,6 @@ type RunningProcess internal (host: RunningHost) =
                 // `RunningProcess.DisposeAsync`'s own `markAbandoned()` call below, for the same reason.
                 markAbandoned ()
                 host.Teardown() }
-
-    // Observe any fault on an otherwise fire-and-forget outcome task, so it can never surface as an
-    // unobserved task exception at finalization when nothing awaits it (a streaming-only consumer that
-    // abandons `FinishAsync`). A consumer that *does* await (`FinishAsync`/`WaitAnyAsync`/`WaitAllAsync`)
-    // still re-throws it. Used by both streaming sessions.
-    let observeFault (outcomeTask: Task<Outcome>) =
-        outcomeTask.ContinueWith(Action<Task<Outcome>>(fun t -> t.Exception |> ignore))
-        |> ignore
 
     // Log the spawn once, at construction. Both this `Log.spawn` and the `RunTelemetryScope.Start`
     // (`Diag.runStarted`) above swallow any fault the consumer's logger / metric / trace sink raises, so

@@ -207,6 +207,18 @@ type ReadinessTests() =
 
         new RunningProcess(host)
 
+    // A `Wait` delegate for `syntheticProcess` that faults ~300ms after being invoked — asynchronously,
+    // through `task { }`, never synchronously from the call to `exitFaultsLate()` itself (KB K-058/
+    // K-016: a synchronous throw would never reach `ensureBufferedWait`'s memoized `Task<Outcome>` at
+    // all, so it would not reproduce what a real faulted exit wait looks like). Used by the T-212
+    // regression pair below: one readiness probe outruns this fault (never awaits it), one verb awaits
+    // it directly.
+    let exitFaultsLate () : Task<Outcome> =
+        task {
+            do! Task.Delay 300
+            return failwith "synthetic exit-wait fault"
+        }
+
     [<Test>]
     member _.``WaitForLine matches a stdout line, then dispose reaps the rest``() : Task =
         task {
@@ -1107,6 +1119,82 @@ type ReadinessTests() =
                 match outcome with
                 | Outcome.Exited code -> Assert.That(code, Is.EqualTo 7)
                 | other -> Assert.Fail $"expected Exited 7, got {other}"
+        }
+        :> Task
+
+    // Regression for T-212: `raceReadinessAgainstExit` (below `WaitForPortAsync`/`WaitForHttpAsync`/etc.)
+    // starts the shared, memoized `bufferedOutcome` (`ensureBufferedWait`) but never awaits it when the
+    // probe itself wins the race — so a fault surfacing later on that same memoized wait (e.g.
+    // `waitWithTimeout`'s timeout-race `onTimeout` hook calling native kill syscalls) previously had no
+    // observer at all on a probe-only handle: probe → dispose, with no consuming verb ever reaching
+    // `awaitBufferedOutcome`/`ExitTask`. `ensureBufferedWait` now attaches `observeFault` the moment it
+    // creates the wait, so the fault is marked observed for the CLR unconditionally — before this fix,
+    // it would surface here as `TaskScheduler.UnobservedTaskException` once the faulted task was
+    // finalized.
+    [<Test>]
+    member _.``A late fault on the memoized buffered exit wait does not surface as unobserved on a probe-only handle``
+        ()
+        : Task =
+        task {
+            let mutable unobserved = false
+
+            let handler =
+                EventHandler<UnobservedTaskExceptionEventArgs>(fun _ args ->
+                    unobserved <- true
+                    args.SetObserved())
+
+            TaskScheduler.UnobservedTaskException.AddHandler handler
+
+            try
+                // Nothing is listening on this port, so the probe itself resolves to `NotReady` well
+                // before `exitFaultsLate`'s ~300ms fault below — the probe, not the exit wait, wins
+                // `raceReadinessAgainstExit`'s race, so `childExitTask` is never awaited there.
+                let probeListener = new TcpListener(IPAddress.Loopback, 0)
+                probeListener.Start()
+                let port = (probeListener.LocalEndpoint :?> IPEndPoint).Port
+                probeListener.Stop()
+
+                let running = syntheticProcess (exitFaultsLate ())
+                let endpoint = IPEndPoint(IPAddress.Loopback, port)
+
+                match! running.WaitForPortAsync(endpoint, TimeSpan.FromMilliseconds 100.0) with
+                | Error(ProcessError.NotReady _) -> ()
+                | other -> Assert.Fail $"expected NotReady, got {other}"
+
+                // No consuming verb ever touches the memoized exit wait from here on — dispose the
+                // handle (which does not await it either, see `RunningProcess.DisposeAsync`) and let
+                // the still-pending fault land with nothing else watching it.
+                do! (running :> IAsyncDisposable).DisposeAsync()
+
+                // Let the exit wait's fault actually happen, then force a GC pass: an unobserved faulted
+                // task reports itself from the finalizer once collected.
+                do! Task.Delay 500
+                GC.Collect()
+                GC.WaitForPendingFinalizers()
+                GC.Collect()
+
+                Assert.That(unobserved, Is.False)
+            finally
+                TaskScheduler.UnobservedTaskException.RemoveHandler handler
+        }
+        :> Task
+
+    // Companion to the regression above: `observeFault`'s `ContinueWith` is purely observational — it
+    // must not swallow or replace the fault for a verb that genuinely awaits this same memoized wait.
+    // `WaitAsync` reuses `ensureBufferedWait()` (`awaitBufferedOutcome`), so it must still see and
+    // re-throw the original fault exactly as before this fix.
+    [<Test>]
+    member _.``A late fault on the memoized buffered exit wait still reaches a verb that awaits it``() : Task =
+        task {
+            let running = syntheticProcess (exitFaultsLate ())
+
+            try
+                let! _ = running.WaitAsync()
+                Assert.Fail "expected the exit wait's fault to propagate to WaitAsync"
+            with ex ->
+                Assert.That(ex.Message, Does.Contain "synthetic exit-wait fault")
+
+            do! (running :> IAsyncDisposable).DisposeAsync()
         }
         :> Task
 
