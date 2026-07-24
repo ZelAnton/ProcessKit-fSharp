@@ -257,12 +257,13 @@ module internal Pump =
     /// disposes it — only flushes it — and the flush itself is teardown-race-safe: it swallows the
     /// same two exceptions `disposeQuietly` does (a tee closed out from under us, or its underlying
     /// pipe/file breaking mid-flush), so a torn-down tee can never mask the pump's own outcome.
-    let private flushTeeQuietly (tee: Stream option) (cancellationToken: CancellationToken) : Task =
+    let private flushTeeQuietly (tee: Stream option) : Task =
         task {
             match tee with
             | Some sink ->
                 try
-                    do! sink.FlushAsync cancellationToken
+                    // Final flushing must outlive pump cancellation so it cannot replace a saved read fault.
+                    do! sink.FlushAsync CancellationToken.None
                 with
                 | :? ObjectDisposedException ->
                     // The tee was disposed out from under us during a teardown race; nothing to flush.
@@ -582,7 +583,7 @@ module internal Pump =
             with ex ->
                 fault <- Some ex
 
-            do! flushTeeQuietly tee cancellationToken
+            do! flushTeeQuietly tee
 
             match fault with
             | Some ex -> ExceptionDispatchInfo.Throw ex
@@ -802,7 +803,7 @@ module internal Pump =
             with ex ->
                 fault <- Some ex
 
-            do! flushTeeQuietly tee cancellationToken
+            do! flushTeeQuietly tee
 
             match fault with
             | Some ex -> ExceptionDispatchInfo.Throw ex
@@ -889,7 +890,7 @@ module internal Pump =
             with ex ->
                 fault <- Some ex
 
-            do! flushTeeQuietly tee cancellationToken
+            do! flushTeeQuietly tee
 
             match fault with
             | Some ex -> ExceptionDispatchInfo.Throw ex

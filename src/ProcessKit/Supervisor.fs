@@ -441,11 +441,21 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 stopping <- true
                 current)
 
-        try
-            stopCts.Cancel()
-        with :? ObjectDisposedException ->
-            // Already disposed under a concurrent teardown; nothing further to cancel.
-            ()
+        // `Cancel()` is serialized against `runLoop`'s teardown `Dispose()` under this same `gate` (see
+        // its `finally`), so the two can never interleave: whichever call takes `gate` first either runs
+        // `Cancel()` to completion while `stopCts` is still fully live (the linked `sleepCts` it notifies
+        // is guaranteed not to be disposing concurrently), or finds `stopCts` already disposed and hits
+        // the guard below cleanly. Without this lock, a `Cancel()` that starts just before a racing
+        // `Dispose()` could have its linked-token callback throw `ObjectDisposedException` against the
+        // already-torn-down `sleepCts`, which surfaces from `Cancel()` as an unhandled `AggregateException`
+        // that this handler — written only for a direct `ObjectDisposedException` — would not catch.
+        lock gate (fun () ->
+            try
+                stopCts.Cancel()
+            with :? ObjectDisposedException ->
+                // Already disposed by a concurrent `runLoop` teardown; the loop has already ended and
+                // there is nothing further to cancel.
+                ())
 
         child
 
@@ -934,6 +944,18 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 // that awaits `Completion` then reads `Status` never sees `IsActive = true` on a finished
                 // (or faulted) session.
                 markInactive ()
+
+                // The loop is the only consumer of this source's token. Once it has ended, release the
+                // cancellation registrations it owns; a late concurrent `StopAsync` is handled by
+                // `requestGracefulStop`'s ObjectDisposedException guard. Both disposals run under `gate`,
+                // serialized against `requestGracefulStop`'s `Cancel()` (see there) so the two can never
+                // interleave, and `sleepCts` — the linked source, registered to propagate `stopCts`'s
+                // cancellation — is disposed first so it can never be caught mid-teardown by a racing
+                // `Cancel()`'s callback invocation. `sleepCts`'s own `use` still disposes it again once
+                // this function returns, but `Dispose()` is idempotent, so that is a harmless no-op.
+                lock gate (fun () ->
+                    sleepCts.Dispose()
+                    stopCts.Dispose())
         }
 
     // Launch the loop in the background as the constructor's last step. `runLoop` yields before any real

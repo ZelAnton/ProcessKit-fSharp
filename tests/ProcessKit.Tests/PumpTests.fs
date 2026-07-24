@@ -93,6 +93,33 @@ type private ErroringReadStream(chunks: byte[] list, fault: exn) =
             ValueTask<int>(chunk.Length)
         | [] -> raise fault
 
+/// A writable tee whose flush follows its supplied token. This exposes whether a final pump flush
+/// incorrectly inherits an already-cancelled read-loop token.
+type private CancellationSensitiveFlushStream() =
+    inherit Stream()
+
+    override _.CanRead = false
+    override _.CanSeek = false
+    override _.CanWrite = true
+    override _.Length = 0L
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+
+    override _.FlushAsync(cancellationToken: CancellationToken) : Task =
+        if cancellationToken.IsCancellationRequested then
+            Task.FromCanceled cancellationToken
+        else
+            Task.CompletedTask
+
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = ()
+    override _.Read(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Write(_buffer, _offset, _count) = ()
+
 /// Direct tests of the internal output pump: decoding (BOM, multibyte boundaries, line endings)
 /// and the `OutputBufferPolicy` retention logic. These drive `Pump.readLines` / `Pump.LineBuffer`
 /// over in-memory streams, so they are deterministic and need no subprocess.
@@ -226,6 +253,31 @@ type PumpTests() =
                     CancellationToken.None)
 
         Assert.ThrowsAsync<DecoderFallbackException>(action) |> ignore
+
+    // --- T-221: a cancelled final-flush token must not mask the saved read-loop fault ---
+
+    [<Test>]
+    member _.``readLines preserves a read fault when the caller token is cancelled before final tee flush``() =
+        use cancellation = new CancellationTokenSource()
+        cancellation.Cancel()
+
+        use stream = new ErroringReadStream([], IOException "read-loop-boom")
+        use tee = new CancellationSensitiveFlushStream()
+
+        let action =
+            Func<Task>(fun () ->
+                Pump.readLines
+                    stream
+                    Encoding.UTF8
+                    LineTerminator.Lf
+                    (Some(tee :> Stream))
+                    (fun _ -> ValueTask.CompletedTask)
+                    None
+                    cancellation.Token)
+
+        match Assert.ThrowsAsync<IOException>(action) with
+        | null -> Assert.Fail("Expected an IOException.")
+        | fault -> Assert.That(fault.Message, Is.EqualTo "read-loop-boom")
 
     // --- T-087: readLinesUntilDone's genuine-read-fault vs teardown-race classification ---
 

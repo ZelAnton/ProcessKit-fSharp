@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- Fixed latent masking of the original read/write stream error when cancellation interrupted a tee-sink flush.
+- PTY streams now reject invalid buffer ranges before native I/O and fail safely when a write makes no progress.
+- Supervision stop lifecycle now completes cleanly after a session finishes.
 
 ## [2.7.0] - 2026-07-24
 

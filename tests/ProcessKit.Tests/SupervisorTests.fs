@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.Diagnostics
 open System.IO
+open System.Reflection
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -1189,6 +1190,55 @@ type SupervisorTests() =
             | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
 
             Assert.That(session.Status.IsActive, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a naturally completed session releases its stop source and accepts a late StopAsync``() : Task =
+        task {
+            let! session = supervise([ ok () ]).StartAsync()
+            let! completed = session.Completion
+
+            let stopSourceField =
+                match
+                    typeof<SupervisionSession>.GetField("stopCts", BindingFlags.Instance ||| BindingFlags.NonPublic)
+                with
+                | null -> failwith "SupervisionSession.stopCts field was not found"
+                | field -> field
+
+            let stopSource =
+                match stopSourceField.GetValue(session) with
+                | :? CancellationTokenSource as cts -> cts
+                | other -> failwith $"expected a CancellationTokenSource, got {other}"
+
+            Assert.Throws<ObjectDisposedException>(Action(fun () -> stopSource.Cancel()))
+            |> ignore
+
+            // A late caller can still await the already-final outcome: `requestGracefulStop` treats the
+            // disposed source as normal concurrent teardown rather than leaking ObjectDisposedException.
+            let! repeated = session.StopAsync(TimeSpan.Zero)
+
+            Assert.That(repeated, Is.EqualTo completed)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a StopAsync call racing the loop's own teardown never surfaces an unhandled exception``() : Task =
+        task {
+            // A capture-only, zero-backoff session completes almost immediately, so repeatedly racing a
+            // fresh `StopAsync()` call against the loop's own natural completion (which disposes the stop
+            // source, see `runLoop`'s `finally`) is the closest a deterministic test gets to landing inside
+            // the `Cancel()`-vs-`Dispose()` window both now serialize under `gate`. Before that lock, an
+            // unlucky interleaving could let `stopCts.Cancel()`'s linked-token callback throw against an
+            // already-disposing `sleepCts`, escaping `requestGracefulStop`'s direct-`ObjectDisposedException`
+            // guard as an unhandled `AggregateException`; awaiting `stopTask` below would surface that.
+            for _ in 1..200 do
+                let! session = supervise([ ok () ]).StartAsync()
+
+                let stopTask = Task.Run(fun () -> session.StopAsync(TimeSpan.Zero) :> Task)
+
+                do! session.Completion :> Task
+                do! stopTask
         }
         :> Task
 
