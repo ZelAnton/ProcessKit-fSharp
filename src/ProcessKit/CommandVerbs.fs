@@ -210,6 +210,29 @@ type CommandVerbs =
         ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine CommandVerbs.DefaultRunner cancellationToken predicate.Invoke command
 
+    /// Decode this command's captured stdout **and** stderr with the local console encoding instead of
+    /// UTF-8 — the one-line fix for a legacy Windows console program whose non-ASCII output otherwise
+    /// arrives as `U+FFFD` replacement characters. Equivalent to
+    /// `Encoding(ConsoleEncoding.current ())`, which documents exactly what is resolved: this process's
+    /// console output code page (or the system OEM code page when it has no console) on Windows, and
+    /// UTF-8 — the unchanged default, no P/Invoke, nothing to undo — everywhere else.
+    ///
+    /// **Opt-in, and the default is untouched.** Without this call captured text is still decoded UTF-8
+    /// on every platform, which is correct for every modern tool; reach for it for the pre-UTF-8
+    /// programs (`ping`, `netstat`, `chkdsk`, an old in-house CLI) whose output comes back mangled. It
+    /// is an ordinary builder knob, so `StdoutEncoding`/`StderrEncoding`/`Encoding` later in the same
+    /// chain override it (and it overrides them) — the last one wins, as everywhere else.
+    ///
+    /// The captured *bytes* are never affected: `OutputBytesAsync` and the raw tees stay byte-exact
+    /// regardless of which encoding decodes the text.
+    ///
+    /// (An extension member rather than a `Command` method only because of F# compile order: it reads
+    /// the console code page through the native layer, which compiles after `Command.fs`.)
+    [<Extension>]
+    static member ConsoleEncoding(command: Command) : Command =
+        ArgumentNullException.ThrowIfNull command
+        command.Encoding(ConsoleEncoding.current ())
+
     /// Resolve this command's program to a full path WITHOUT spawning it — a preflight/`doctor` check
     /// ("will this command find its program?"), synchronous and side-effect-free (a few `stat`s, no
     /// process), unlike probing availability by actually launching it (`ProbeAsync`). Resolution is

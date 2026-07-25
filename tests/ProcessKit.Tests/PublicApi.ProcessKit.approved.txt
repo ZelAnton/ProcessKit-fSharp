@@ -139,6 +139,7 @@ module ProcessKit.CommandModule
   static member windowsRestrictedToken(ProcessKit.Command) : ProcessKit.Command
 
 class ProcessKit.CommandVerbs
+  static member ConsoleEncoding(ProcessKit.Command) : ProcessKit.Command
   static member ExitCodeAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
   static member FirstLineAsync(ProcessKit.Command, System.Func<System.String, System.Boolean>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<System.String>, ProcessKit.ProcessError>>
   static member LaunchDetached(ProcessKit.Command) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.DetachedProcess, ProcessKit.ProcessError>
@@ -153,6 +154,9 @@ class ProcessKit.CommandVerbs
   static member RunUnitAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   static member StartAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
   static member TryParseAsync<T>(ProcessKit.Command, ProcessKit.TryParser<T>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>>
+
+module ProcessKit.ConsoleEncoding
+  static member current() : System.Text.Encoding
 
 class ProcessKit.DelegatingProcessRunner
   :> ProcessKit.IProcessRunner

@@ -844,7 +844,9 @@ type Command internal (config: CommandConfig) =
                 StderrEncoding = encoding }
         )
 
-    /// Decode both captured streams with `encoding`.
+    /// Decode both captured streams with `encoding`. For a legacy Windows console program — one whose
+    /// non-ASCII output arrives as `U+FFFD` because it writes a code page rather than UTF-8 — use
+    /// `ConsoleEncoding()`, which resolves the right code page for the current host and applies it here.
     member _.Encoding(encoding: Encoding) =
         ArgumentNullException.ThrowIfNull encoding
 

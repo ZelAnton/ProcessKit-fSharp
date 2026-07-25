@@ -21,52 +21,56 @@ The files currently compile in this exact order. The headings are architectural 
 7. `Diag.fs` — activities and metrics.
 8. `RunTelemetryScope.fs` — exactly-once run telemetry lifetime.
 9. `Mechanism.fs` — selected containment mechanism.
-10. `Signal.fs` — portable signal model.
-11. `Limits.fs` — resource and process-group options.
-12. `ProcessResult.fs` — captured result.
-13. `TryParser.fs` — .NET try-parse adapter.
-14. `OutputPolicy.fs` — buffered and streaming overflow policies.
-15. `OutputEvent.fs` — stdout/stderr event model.
-16. `Finished.fs` — finish result.
-17. `Stats.fs` — group/run statistics and samplers.
-18. `Stdin.fs` — stdin source model.
-19. `Timeouts.fs` — timeout normalization.
-20. `Priority.fs` — priority model and native mapping.
-21. `LineTerminator.fs` — line-ending rules.
-22. `Command.fs` — immutable command configuration and builder API.
-23. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
+10. `KillOnParentDeathScope.fs` — per-platform scope of parent-death cleanup.
+11. `Signal.fs` — portable signal model.
+12. `CgroupCpuMax.fs` — cgroup v2 `cpu.max` quota formatting and parsing.
+13. `Limits.fs` — resource and process-group options.
+14. `ProcessResult.fs` — captured result.
+15. `TryParser.fs` — .NET try-parse adapter.
+16. `OutputPolicy.fs` — buffered and streaming overflow policies.
+17. `OutputEvent.fs` — stdout/stderr event model.
+18. `Finished.fs` — finish result.
+19. `Stats.fs` — group/run statistics and samplers.
+20. `Stdin.fs` — stdin source model.
+21. `Timeouts.fs` — timeout normalization.
+22. `Priority.fs` — priority model and native mapping.
+23. `LineTerminator.fs` — line-ending rules.
+24. `Command.fs` — immutable command configuration and builder API.
+25. `MemberInfo.fs` — per-member identity snapshot of a contained tree.
+26. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
 
 ### Native and platform layer
 
-24. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
-25. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, limits, and accounting calls.
-26. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
-27. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
+27. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
+28. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, console code page, limits, and accounting calls.
+29. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
+30. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
+31. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
 
 ### Backend, pump, and channels
 
-28. `Backend.fs` — containment interface and its three implementations.
-29. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
-30. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
-31. `ProcessStdin.fs` — interactive stdin handle.
-32. `ReadinessProbe.fs` — readiness polling.
-33. `RunningProcess.fs` — live-process state, streams, completion, and disposal.
+32. `Backend.fs` — containment interface and its three implementations.
+33. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
+34. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
+35. `ProcessStdin.fs` — interactive stdin handle.
+36. `ReadinessProbe.fs` — readiness polling.
+37. `RunningProcess.fs` — live-process state, streams, completion, and disposal.
 
 ### Runner and verbs
 
-34. `PtySession.fs` — expect-style interaction over a live handle.
-35. `IProcessRunner.fs` — injectable runner seam.
-36. `Runner.fs` — capture primitives and reusable verbs.
-37. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
-38. `DelegatingProcessRunner.fs` — runner decorator base.
-39. `ProcessGroup.fs` — containment owner and shared-group runner.
-40. `JobRunner.fs` — default private-group runner.
-41. `CommandVerbs.fs` — default-runner `Command` extensions.
-42. `PipelineRunner.fs` — internal pipeline execution.
-43. `Pipeline.fs` — pipeline public API.
-44. `Supervisor.fs` — restart supervision.
-45. `CliClient.fs` — configured command client.
-46. `Exec.fs` — concise execution entry points.
+38. `PtySession.fs` — expect-style interaction over a live handle.
+39. `IProcessRunner.fs` — injectable runner seam.
+40. `Runner.fs` — capture primitives and reusable verbs.
+41. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
+42. `DelegatingProcessRunner.fs` — runner decorator base.
+43. `ProcessGroup.fs` — containment owner and shared-group runner.
+44. `JobRunner.fs` — default private-group runner.
+45. `CommandVerbs.fs` — default-runner `Command` extensions.
+46. `PipelineRunner.fs` — internal pipeline execution.
+47. `Pipeline.fs` — pipeline public API.
+48. `Supervisor.fs` — restart supervision.
+49. `CliClient.fs` — configured command client.
+50. `Exec.fs` — concise execution entry points.
 
 When adding a file, place it after everything it consumes and before everything that consumes it. Alphabetical sorting or SDK globbing would silently destroy this ordering model.
 
@@ -218,6 +222,10 @@ The modes are:
 Line and byte caps solve different problems. A line cap bounds object/count overhead but permits a few enormous strings. A byte cap bounds retained UTF-8 payload and also supplies `readLines` with an in-flight line-length cap: newline-free output is force-flushed into segments rather than growing one `StringBuilder` indefinitely. It now genuinely bounds retained memory for empty-line floods as well, because every retained line is charged for its separator byte. The line cap remains independent so callers can place a direct bound on object/count overhead. Raw byte capture has no line structure and uses only `MaxBytes` through `RawBuffer`.
 
 `readLines` reads 8192-byte chunks, tees raw bytes before decoding, strips a leading BOM from decoded text only, and applies the configured terminator rules across chunk boundaries. Its `onLine` callback returns `ValueTask`; awaiting it in the hot loop is what makes channel backpressure real. EOF resolves a pending carriage return and flushes a final unterminated line.
+
+Which encoding that decode uses is whatever `CommandConfig.StdoutEncoding`/`StderrEncoding` hold — `Encoding.UTF8` unless the builder overrode it. `ConsoleEncoding.fs` supplies the one override the library can resolve for itself. On Windows it reads the live console output code page (`GetConsoleOutputCP`, falling back to the system OEM code page through `GetOEMCP` when the process has no console — both P/Invokes belong to `Native.Windows.fs` like every other Win32 entry point), registers `CodePagesEncodingProvider` exactly once behind a `lazy` so `Encoding.GetEncoding` knows the single-byte OEM/ANSI pages at all, and returns the matching `Encoding`; a code page with no data falls back to UTF-8 rather than throwing out of a builder call. Off Windows it returns the very `Encoding.UTF8` instance the default already uses, with no platform call on that path. The provider needs no package reference: `System.Text.Encoding.CodePages` ships in the shared framework and the targeting pack for both TFMs, and net10.0's framework package-override list supersedes the standalone package.
+
+Nothing in the pump is aware of any of this — the resolved encoding arrives as an ordinary builder value. The verb that applies it, `Command.ConsoleEncoding()`, lives in `CommandVerbs.fs` rather than on `Command` itself for the compile-order reason above: it consumes a native-layer symbol, and `Command.fs` compiles before the native files.
 
 ## Stream channel machinery
 

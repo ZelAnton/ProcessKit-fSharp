@@ -495,6 +495,56 @@ Console.WriteLine(await cmd.OutputStringAsync() switch
 });
 ```
 
+#### Legacy Windows console output
+
+The default is right for every modern tool, but a Windows console program written
+before UTF-8 — `ping`, `netstat`, `chkdsk`, most of the built-in tooling, any
+application still built against the ANSI/OEM CRT — writes its non-ASCII text in a
+**code page**, so a UTF-8 decode turns every accented or Cyrillic character into
+`U+FFFD`. `ConsoleEncoding()` is the one-line fix: it resolves the code page this
+host's console actually uses and applies it to both captured streams.
+
+**F#**
+
+```fsharp
+task {
+    let cmd =
+        Command.create "legacy-tool"
+        |> Command.args [ "--report" ]
+
+    match! cmd.ConsoleEncoding().OutputStringAsync() with
+    | Ok result -> printfn $"{result.Stdout}"
+    | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+**C#**
+
+```csharp
+var cmd = new Command("legacy-tool").ConsoleEncoding();
+
+Console.WriteLine(await cmd.OutputStringAsync() switch
+{
+    { IsOk: true, ResultValue: var result } => result.Stdout,
+    { IsOk: false, ErrorValue: var err }   => err.Message,
+});
+```
+
+What it resolves, on Windows: the **output code page of this process's console** —
+what `chcp` reports, and what a child inherits — or the **system OEM code page**
+when the process has no console at all (a GUI application, a service). It is read
+live on every call, so a `chcp` during the run is honoured. Off Windows there is no
+second, legacy console encoding to discover, so the call is a genuine no-op: the same
+UTF-8 the default already uses, with no platform call at all. The same answer is
+available on its own as `ConsoleEncoding.current ()` — a plain `System.Text.Encoding`
+— for a [pipeline](pipelines.md), a `CliClient`, or a single stream via
+`StdoutEncoding`.
+
+It stays **opt-in**, and it is an ordinary builder knob: without the call nothing
+changes, and an `Encoding`/`StdoutEncoding`/`StderrEncoding` later in the chain
+overrides it (and it overrides them) — the last one wins. A console code page the
+runtime has no data for falls back to UTF-8 rather than failing the command.
+
 A single persistent decoder runs over the whole stream, so a multi-byte sequence
 that straddles two reads still decodes correctly and a `0x0A` byte inside a wider
 code unit isn't mistaken for a line break. The decoder is finalized at EOF, so an

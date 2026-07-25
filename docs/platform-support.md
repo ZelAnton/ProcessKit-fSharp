@@ -481,10 +481,12 @@ apply. See [Running in containers](containers.md) for the container-specific con
 
 **Output is decoded as UTF-8 by default.** Captured stdout/stderr text is decoded as UTF-8 unless
 you say otherwise. A Windows console program that emits a legacy OEM code page will decode incorrectly;
-set the encoding explicitly per stream with `Command.StdoutEncoding` / `Command.StderrEncoding`
-(or `Command.Encoding` for both). For legacy code pages, register the code-page provider first
-(`System.Text.Encoding.RegisterProvider(CodePagesEncodingProvider.Instance)`), then pass the
-`Encoding` you need.
+`Command.ConsoleEncoding()` fixes that in one call — it resolves this host's console output code page
+(or the system OEM code page when the process has no console), registers the code-page provider itself,
+and is a no-op off Windows. To name a different encoding, set it explicitly per stream with
+`Command.StdoutEncoding` / `Command.StderrEncoding` (or `Command.Encoding` for both), registering the
+code-page provider first (`System.Text.Encoding.RegisterProvider(CodePagesEncodingProvider.Instance)`)
+if it is a legacy code page.
 
 **POSIX pgid reuse.** Process-group signalling is inherently best-effort against pid/pgid reuse:
 between a child exiting and the group teardown running, the OS can recycle that pgid for an

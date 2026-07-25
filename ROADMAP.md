@@ -67,7 +67,12 @@ Deliberate, documented constraints — not correctness bugs — kept here for fu
   not-yet-terminated line still grows until EOF; bound it with `MaxBytes`, or pair an untrusted child
   with a `Timeout`.
 - **Default UTF-8 decoding.** Captured text is decoded UTF-8 by default; a Windows console program
-  emitting a legacy OEM code page needs an explicit `StdoutEncoding` / `StderrEncoding`.
+  emitting a legacy OEM code page still has to be decoded explicitly, because guessing a code page
+  for a child that does emit UTF-8 would corrupt output that reads correctly today. What the caller
+  no longer has to work out is *which* code page: `Command.ConsoleEncoding()` (or the
+  `ConsoleEncoding.current ()` it applies) resolves this host's console output / OEM code page and
+  decodes both streams with it, and is a no-op off Windows. `StdoutEncoding` / `StderrEncoding`
+  remain the way to name any other encoding.
 - **POSIX pgid-reuse window.** The process-group teardown has a small pid-reuse window on Unix; the
   cgroup v2 backend (engaged when resource limits are requested) does not.
 

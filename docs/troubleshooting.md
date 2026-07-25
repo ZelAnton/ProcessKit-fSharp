@@ -15,23 +15,34 @@ looks correct in a terminal but not in `ProcessResult.Stdout`.
 console programs still write the active OEM code page, and older tools may write
 Windows code page 1252. Decoding those bytes as UTF-8 produces mojibake.
 
-**Solution:** Configure the encoding the child actually writes. Set
-`StdoutEncoding` and `StderrEncoding` separately when they differ, or use
-`Encoding` for both. Legacy code pages may require registering
-`CodePagesEncodingProvider` once during application startup.
+**Solution:** For a Windows console program, `ConsoleEncoding()` is the whole fix:
+it resolves the code page this host's console actually uses — or the system OEM
+code page when the process has no console — and decodes both streams with it. It
+registers the code-page provider for you, and off Windows it is a no-op.
+
+```fsharp
+let command = (Command.create "legacy-tool").ConsoleEncoding()
+```
+
+When the child writes something other than the console encoding — a fixed code
+page such as Windows-1252, or a UTF-16 tool — name it explicitly instead, per
+stream with `StdoutEncoding` / `StderrEncoding` when they differ or `Encoding` for
+both:
 
 ```fsharp
 open System.Text
 
-Encoding.RegisterProvider(CodePagesEncodingProvider.Instance)
+Encoding.RegisterProvider CodePagesEncodingProvider.Instance
 
-let command =
+let fixedCodePage =
     Command.create "legacy-tool"
     |> Command.stdoutEncoding (Encoding.GetEncoding 1252)
 ```
 
-For an OEM console program, use its real OEM code page instead of assuming 1252.
-The complete decoding behavior and both F# and C# APIs are in
+The `RegisterProvider` call is needed only on this explicit path: single-byte code
+pages such as 1252 are not built into `System.Text.Encoding`, and unlike
+`ConsoleEncoding()` nothing has registered the provider on your behalf. The
+complete decoding behavior and both F# and C# APIs are in
 [Running commands: Encodings](commands.md#encodings).
 
 ## Process hangs during or after execution

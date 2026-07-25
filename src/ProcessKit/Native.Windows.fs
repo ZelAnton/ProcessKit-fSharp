@@ -701,6 +701,39 @@ module internal Windows =
         else
             Error(Win32Exception(Marshal.GetLastWin32Error()).Message)
 
+    // ----------------------------------------------------------------------------------
+    // Windows: console output code page
+    // ----------------------------------------------------------------------------------
+    //
+    // A Windows console program that predates UTF-8 does not write UTF-8: it writes a CODE PAGE, and
+    // which one depends on the console it was given. Both entry points are needed because they answer
+    // different questions and either can be the only meaningful answer. `GetConsoleOutputCP` reports
+    // the code page of the console attached to THIS process — the one a child inherits, and the one a
+    // `chcp` in that console changes at runtime — but it returns 0 when the process has no console at
+    // all (a GUI app, a Windows service, a test host started detached). `GetOEMCP` reports the system
+    // OEM code page, cannot fail, and is what a console child's C runtime falls back to when it has no
+    // console of its own.
+    //
+    // Neither declares `SetLastError`, unlike the rest of this file: `GetOEMCP` has no documented
+    // failure mode, and the only `GetConsoleOutputCP` outcome this layer distinguishes is its
+    // documented 0 sentinel, which is answered by the OEM fallback rather than surfaced as a Win32
+    // message. There is nothing here for a `GetLastError` read to add.
+
+    [<DllImport("kernel32.dll")>]
+    extern uint32 private GetConsoleOutputCP()
+
+    [<DllImport("kernel32.dll")>]
+    extern uint32 private GetOEMCP()
+
+    /// The code page a legacy console child of this process writes its output in: the output code page
+    /// of this process's console, or the system OEM code page when this process has no console. Read
+    /// live on every call rather than cached — a `chcp` in the console changes the answer while the
+    /// process runs.
+    let consoleOutputCodePage () : int =
+        match GetConsoleOutputCP() with
+        | 0u -> int (GetOEMCP())
+        | codePage -> int codePage
+
     // Tree introspection / suspend-resume for the `process-control` surface.
     [<Literal>]
     let private JobObjectBasicProcessIdList = 3
