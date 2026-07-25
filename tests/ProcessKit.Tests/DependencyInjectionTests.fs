@@ -184,7 +184,7 @@ type DependencyInjectionTests() =
             Assert.That(thrown.ParamName, Is.EqualTo "DefaultWorkingDirectory")
             Assert.That(thrown.Message, Does.Contain "DefaultWorkingDirectory")
 
-        options.DefaultWorkingDirectory <- null
+        options.DefaultWorkingDirectory <- Unchecked.defaultof<string>
         Assert.That(options.DefaultWorkingDirectory, Is.Null)
 
         options.DefaultWorkingDirectory <- "/app"
@@ -193,7 +193,7 @@ type DependencyInjectionTests() =
         Assert.That(options.DefaultWorkingDirectory, Is.EqualTo " /app")
         options.DefaultWorkingDirectory <- "/app "
         Assert.That(options.DefaultWorkingDirectory, Is.EqualTo "/app ")
-        options.DefaultWorkingDirectory <- null
+        options.DefaultWorkingDirectory <- Unchecked.defaultof<string>
         Assert.That(options.DefaultWorkingDirectory, Is.Null)
 
         task {

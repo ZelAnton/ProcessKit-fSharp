@@ -3,7 +3,6 @@ namespace ProcessKit
 open System
 open System.IO
 open System.Runtime.InteropServices
-open System.Text
 open System.Threading
 open System.Threading.Tasks
 
@@ -19,7 +18,7 @@ open System.Threading.Tasks
 /// child, so the safe recovery from a timed-out interactive write is to abandon the session — not to
 /// retry the write, which would duplicate the delivered prefix.
 [<Sealed>]
-type ProcessStdin internal (stream: Stream) =
+type ProcessStdin internal (stream: Stream, encoding: Text.Encoding) =
 
     /// Write raw bytes to the child's stdin. `bytes` must not be null (`ArgumentNullException` —
     /// a C# caller that forgets a null check would otherwise see a raw `NullReferenceException`).
@@ -27,10 +26,11 @@ type ProcessStdin internal (stream: Stream) =
         ArgumentNullException.ThrowIfNull bytes
         stream.WriteAsync(bytes, 0, bytes.Length, cancellationToken)
 
-    /// Write a line of UTF-8 text followed by `\n`. `text` must not be null (`ArgumentNullException`).
+    /// Write a line of text encoded with this command's `StdinEncoding` followed by `\n`. `text` must not
+    /// be null (`ArgumentNullException`).
     member _.WriteLineAsync(text: string, [<Optional>] cancellationToken: CancellationToken) : Task =
         ArgumentNullException.ThrowIfNull text
-        let bytes = Encoding.UTF8.GetBytes(text + "\n")
+        let bytes = Pump.lineWithLf encoding text
         stream.WriteAsync(bytes, 0, bytes.Length, cancellationToken)
 
     /// Flush buffered input to the child.

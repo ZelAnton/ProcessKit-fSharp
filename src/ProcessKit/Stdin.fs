@@ -3,11 +3,11 @@ namespace ProcessKit
 open System
 open System.Collections.Generic
 open System.IO
-open System.Text
 
 /// Where a child process's standard input comes from. Internal representation behind `Stdin`.
 type internal StdinSource =
     | Empty
+    | Text of string
     | Bytes of byte[]
     | File of path: string
     | Reader of Stream
@@ -35,12 +35,12 @@ type Stdin internal (source: StdinSource) =
     /// No input — the child sees end-of-file immediately.
     static member Empty = Stdin(StdinSource.Empty)
 
-    /// The UTF-8 bytes of `text`. `text` must not be null (`ArgumentNullException` — a C# caller that
-    /// forgets a null check would otherwise fail obscurely inside the background feeder rather than at
-    /// the API boundary).
+    /// Text encoded with the command's `StdinEncoding` (UTF-8 by default). `text` must not be null
+    /// (`ArgumentNullException` — a C# caller that forgets a null check would otherwise fail obscurely
+    /// inside the background feeder rather than at the API boundary).
     static member FromString(text: string) =
         ArgumentNullException.ThrowIfNull text
-        Stdin(StdinSource.Bytes(Encoding.UTF8.GetBytes text))
+        Stdin(StdinSource.Text text)
 
     /// Raw bytes. `bytes` must not be null (`ArgumentNullException`).
     static member FromBytes(bytes: byte[]) =
@@ -93,6 +93,7 @@ module internal StdinSource =
         | StdinSource.Lines _
         | StdinSource.AsyncLines _ -> true
         | StdinSource.Empty
+        | StdinSource.Text _
         | StdinSource.Bytes _
         | StdinSource.File _
         | StdinSource.Inherit -> false
@@ -103,6 +104,7 @@ module internal StdinSource =
         match source with
         | StdinSource.Inherit -> true
         | StdinSource.Empty
+        | StdinSource.Text _
         | StdinSource.Bytes _
         | StdinSource.File _
         | StdinSource.Reader _

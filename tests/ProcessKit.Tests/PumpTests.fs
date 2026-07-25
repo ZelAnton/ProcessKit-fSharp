@@ -918,6 +918,20 @@ type PumpTests() =
         | Some ex -> Assert.Fail $"a broken-pipe write must stay benign, got {ex.Message}"
 
     [<Test>]
+    member _.``feedStdinSource encodes line sources with the supplied command encoding``() =
+        use stdin = new MemoryStream()
+
+        let feeder =
+            Pump.feedStdinSourceWithEncoding
+                Encoding.Unicode
+                (Some(stdin :> Stream))
+                (Some(Stdin.FromLines [ "żółć" ]))
+                false
+
+        Assert.That(feeder.Task.Result, Is.EqualTo(None: exn option))
+        CollectionAssert.AreEqual(Encoding.Unicode.GetBytes "żółć\n", stdin.ToArray())
+
+    [<Test>]
     member _.``feedStdin does not let a broken-pipe write mask a source fault``() =
         // The source faults acquiring its enumerator AND the stdin stream is a broken pipe. The source
         // fault must still win — it is raised before any write is attempted.

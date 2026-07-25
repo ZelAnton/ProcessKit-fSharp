@@ -107,6 +107,26 @@ type TestabilityTests() =
         }
 
     [<Test>]
+    member _.``ProcessStdin honours the command text-stdin encoding``() : Task =
+        task {
+            let command =
+                Command.create "svc"
+                |> Command.encoding Encoding.Unicode
+                |> Command.keepStdinOpen
+
+            let fake = FakeProcess.OfCommand(command)
+            use proc = fake.Build()
+
+            match proc.TakeStdin() with
+            | Some stdin ->
+                do! stdin.WriteLineAsync "żółć"
+                do! stdin.FinishAsync()
+            | None -> Assert.Fail "expected an interactive stdin handle"
+
+            CollectionAssert.AreEqual(Encoding.Unicode.GetBytes "żółć\n", fake.StdinBytes)
+        }
+
+    [<Test>]
     member _.``ScriptedRunner.StartAsync serves a fake streaming process``() : Task =
         task {
             let runner: IProcessRunner = ScriptedRunner().On([ "svc" ], Reply.Ok "ready\ngo")

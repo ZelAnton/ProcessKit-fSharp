@@ -400,7 +400,14 @@ module internal PipelineRunner =
                                 // `command.Config.KeepStdinOpen`, which for stage 0 is always `false` in
                                 // practice — plumbed as a literal so the "no interactive writer" invariant
                                 // is explicit and cannot regress into a hang.
-                                stage0Feed <- Some(Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource false)
+                                stage0Feed <-
+                                    Some(
+                                        Pump.feedStdinSourceWithEncoding
+                                            stages[0].Config.StdinEncoding
+                                            sp.Stdin
+                                            stages[0].Config.StdinSource
+                                            false
+                                    )
                             else
                                 match prevStdout, sp.Stdin with
                                 | Some upstream, Some downstream ->
@@ -860,7 +867,14 @@ module internal PipelineRunner =
                             if index = 0 then
                                 // Only stage 0 may carry a stdin source; close its pipe after the source
                                 // (`keepStdinOpen = false`) — a pipeline exposes no interactive writer.
-                                stage0Feed <- Some(Pump.feedStdinSource sp.Stdin stages[0].Config.StdinSource false)
+                                stage0Feed <-
+                                    Some(
+                                        Pump.feedStdinSourceWithEncoding
+                                            stages[0].Config.StdinEncoding
+                                            sp.Stdin
+                                            stages[0].Config.StdinSource
+                                            false
+                                    )
                             else
                                 match prevStdout, sp.Stdin with
                                 | Some upstream, Some downstream ->

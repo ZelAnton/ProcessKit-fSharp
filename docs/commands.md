@@ -309,7 +309,7 @@ can never hang waiting for input. Everything else is opt-in via `Stdin`:
 | Source | Reusable on re-run? | Use for |
 |---|---|---|
 | `Stdin.Empty` | n/a (no input) | The default, made explicit |
-| `Stdin.FromString "…"` | yes | Text payloads (encoded as UTF-8) |
+| `Stdin.FromString "…"` | yes | Text payloads (encoded with `StdinEncoding`; UTF-8 by default) |
 | `Stdin.FromBytes bytes` | yes | Binary payloads |
 | `Stdin.FromFile path` | yes (re-opened per run) | Large inputs streamed from disk |
 | `Stdin.FromLines seq` | one-shot | A sequence of lines, each written `\n`-terminated |
@@ -460,10 +460,11 @@ only on the last stage.
 
 ### Encodings
 
-Captured output is decoded line by line, **UTF-8 by default**. Invalid bytes
-become the replacement character `U+FFFD` rather than raising an error. Override
-per stream with `StdoutEncoding` / `StderrEncoding`, or both at once with
-`Encoding` — each takes a `System.Text.Encoding`:
+Text stdin is encoded and captured output is decoded **UTF-8 by default**. Invalid
+output bytes become the replacement character `U+FFFD` rather than raising an error.
+Override stdin alone with `StdinEncoding`, either captured stream with
+`StdoutEncoding` / `StderrEncoding`, or all three at once with `Encoding` — each
+takes a `System.Text.Encoding`:
 
 **F#**
 
@@ -471,8 +472,8 @@ per stream with `StdoutEncoding` / `StderrEncoding`, or both at once with
 task {
     let cmd =
         Command.create "legacy-tool"
-        |> Command.encoding System.Text.Encoding.Latin1 // both streams…
-    // |> Command.stdoutEncoding enc / |> Command.stderrEncoding enc  // …or each its own
+        |> Command.encoding System.Text.Encoding.Latin1 // stdin and both streams…
+    // |> Command.stdinEncoding enc / |> Command.stdoutEncoding enc / |> Command.stderrEncoding enc
 
     match! cmd.OutputStringAsync() with
     | Ok result -> printfn $"{result.Stdout}"
@@ -485,8 +486,8 @@ task {
 ```csharp
 var cmd =
     new Command("legacy-tool")
-        .Encoding(System.Text.Encoding.Latin1); // both streams…
-// .StdoutEncoding(enc) / .StderrEncoding(enc)  // …or each its own
+        .Encoding(System.Text.Encoding.Latin1); // stdin and both streams…
+// .StdinEncoding(enc) / .StdoutEncoding(enc) / .StderrEncoding(enc)  // …or each its own
 
 Console.WriteLine(await cmd.OutputStringAsync() switch
 {
@@ -502,7 +503,7 @@ before UTF-8 — `ping`, `netstat`, `chkdsk`, most of the built-in tooling, any
 application still built against the ANSI/OEM CRT — writes its non-ASCII text in a
 **code page**, so a UTF-8 decode turns every accented or Cyrillic character into
 `U+FFFD`. `ConsoleEncoding()` is the one-line fix: it resolves the code page this
-host's console actually uses and applies it to both captured streams.
+host's console actually uses and applies it to text stdin and both captured streams.
 
 **F#**
 
@@ -551,7 +552,7 @@ later code-page change there, build the command again, or apply
 `Encoding(ConsoleEncoding.current ())` to it just before the launch.
 
 It stays **opt-in**, and it is an ordinary builder knob: without the call nothing
-changes, and an `Encoding`/`StdoutEncoding`/`StderrEncoding` later in the chain
+changes, and an `Encoding`/`StdinEncoding`/`StdoutEncoding`/`StderrEncoding` later in the chain
 overrides it (and it overrides them) — the last one wins. A console code page the
 runtime has no data for falls back to UTF-8 rather than failing the command.
 

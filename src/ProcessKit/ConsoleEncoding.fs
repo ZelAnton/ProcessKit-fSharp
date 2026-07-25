@@ -16,7 +16,7 @@ open System.Text
 /// This module resolves **which** code page that is, so the fix is one call rather than a research
 /// project (`GetOEMCP` vs `GetConsoleOutputCP`, `chcp`, `CodePagesEncodingProvider`).
 ///
-/// Use it through `Command.ConsoleEncoding()`, which applies the result to both captured streams, or
+/// Use it through `Command.ConsoleEncoding()`, which applies the result to text stdin and both captured streams, or
 /// take the `Encoding` directly from `current ()` for a `Pipeline`/`CliClient`/single-stream case.
 [<RequireQualifiedAccess>]
 module ConsoleEncoding =

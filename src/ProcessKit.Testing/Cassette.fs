@@ -563,7 +563,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             if obj.ReferenceEquals(scrubbed, null) then "" else scrubbed
 
     // The stdin-source digest used for matching, computed WITHOUT consuming the source: in-memory
-    // bytes hash their content, a file source hashes its path (or, opt-in, its contents). In the v5
+    // text/bytes hash their encoded content, a file source hashes its path (or, opt-in, its contents). In the v5
     // scheme, prefixes make the source domains structurally disjoint: `inherit|`, `path|<sha256>`, and
     // `bytes|<sha256>`. A one-shot streaming source can't be keyed without consuming it, so it is
     // rejected. Legacy is used only as a read fallback for v1-v4 cassette entries.
@@ -587,6 +587,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                     Ok(Some(hashBytes (Encoding.UTF8.GetBytes "inherit-stdin")))
                 else
                     Ok(Some "inherit|")
+            | StdinSource.Text text -> Ok(Some(bytesDigest (command.Config.StdinEncoding.GetBytes text)))
             | StdinSource.Bytes bytes -> Ok(Some(bytesDigest bytes))
             | StdinSource.File filePath ->
                 if options.HashFileStdinContents then

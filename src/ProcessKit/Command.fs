@@ -105,6 +105,9 @@ type internal CommandConfig =
       ClearEnv: bool
       StdinSource: Stdin option
       KeepStdinOpen: bool
+      // The encoding for text sent through `Stdin.FromString`/`FromLines`/`FromAsyncLines` and an
+      // interactive `ProcessStdin.WriteLineAsync`. Raw-byte stdin remains byte-exact.
+      StdinEncoding: Encoding
       StdoutMode: StdioMode
       StderrMode: StdioMode
       // Opt-in direct redirect of the child's stdout/stderr straight to a file at the OS level, handed to
@@ -260,6 +263,7 @@ module internal CommandConfig =
           ClearEnv = false
           StdinSource = None
           KeepStdinOpen = false
+          StdinEncoding = Encoding.UTF8
           StdoutMode = StdioMode.Piped
           StderrMode = StdioMode.Piped
           StdoutFile = None
@@ -826,6 +830,14 @@ type Command internal (config: CommandConfig) =
     /// existing one). Shorthand for `StderrToFile(path, append = false)` — see that overload.
     member this.StderrToFile(path: string) = this.StderrToFile(path, false)
 
+    /// Encode text sent to the child's stdin with `encoding` (default UTF-8). This affects
+    /// `Stdin.FromString`/`FromLines`/`FromAsyncLines` and `ProcessStdin.WriteLineAsync`; raw
+    /// `Stdin.FromBytes` and `ProcessStdin.WriteAsync` remain byte-exact.
+    member _.StdinEncoding(encoding: Encoding) =
+        ArgumentNullException.ThrowIfNull encoding
+
+        Command({ config with StdinEncoding = encoding })
+
     /// Decode captured stdout with `encoding` (default UTF-8).
     member _.StdoutEncoding(encoding: Encoding) =
         ArgumentNullException.ThrowIfNull encoding
@@ -844,14 +856,15 @@ type Command internal (config: CommandConfig) =
                 StderrEncoding = encoding }
         )
 
-    /// Decode both captured streams with `encoding`. For a legacy Windows console program — one whose
-    /// non-ASCII output arrives as `U+FFFD` because it writes a code page rather than UTF-8 — use
+    /// Encode text stdin and decode both captured streams with `encoding`. For a legacy Windows console
+    /// program — one whose non-ASCII input and output use a code page rather than UTF-8 — use
     /// `ConsoleEncoding()`, which resolves the right code page for the current host and applies it here.
     member _.Encoding(encoding: Encoding) =
         ArgumentNullException.ThrowIfNull encoding
 
         Command(
             { config with
+                StdinEncoding = encoding
                 StdoutEncoding = encoding
                 StderrEncoding = encoding }
         )
@@ -1398,10 +1411,13 @@ module Command =
     /// Decode captured stdout with `encoding`.
     let stdoutEncoding (enc: Encoding) (command: Command) = command.StdoutEncoding enc
 
+    /// Encode text sent to stdin with `encoding`.
+    let stdinEncoding (enc: Encoding) (command: Command) = command.StdinEncoding enc
+
     /// Decode captured stderr with `encoding`.
     let stderrEncoding (enc: Encoding) (command: Command) = command.StderrEncoding enc
 
-    /// Decode both captured streams with `encoding`.
+    /// Encode text stdin and decode both captured streams with `encoding`.
     let encoding (enc: Encoding) (command: Command) = command.Encoding enc
 
     /// Frame captured/streamed stdout lines with `terminator` (default `LineTerminator.Lf`).

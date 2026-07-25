@@ -11,6 +11,19 @@ open System.Threading.Tasks
 /// Internal: reading captured output into lines, raw bytes, and feeding stdin.
 module internal Pump =
 
+    /// Encode one nullable text line and append the protocol's LF without first allocating `text + "\n"`.
+    /// `Stdin.FromLines` historically treats a null element as an empty line, so retain that behaviour.
+    let lineWithLf (encoding: Encoding) (text: string) : byte[] =
+        let text = if isNull (box text) then String.Empty else text
+        let terminator = "\n"
+
+        let bytes =
+            Array.zeroCreate<byte> (encoding.GetByteCount text + encoding.GetByteCount terminator)
+
+        let written = encoding.GetBytes(text.AsSpan(), bytes.AsSpan())
+        encoding.GetBytes(terminator.AsSpan(), bytes.AsSpan(written)) |> ignore
+        bytes
+
     /// Accumulates retained output lines under an `OutputBufferPolicy`, tracking cumulative
     /// totals and whether the fail-loud ceiling tripped. Not thread-safe; one per stream.
     ///
@@ -1071,7 +1084,8 @@ module internal Pump =
     /// `TakeStdin`. `backgroundTask` keeps the whole feed on the pool, so that blocking wait is safe.
     /// (Off any such context — a pool or background thread, as in the tests and CI — `backgroundTask`
     /// is identical to `task`, so nothing else changes.)
-    let feedStdin
+    let private feedStdinWithEncoding
+        (encoding: Encoding)
         (source: StdinSource)
         (stdinStream: Stream)
         (closeWhenDone: bool)
@@ -1090,6 +1104,9 @@ module internal Pump =
                     // than via a wildcard so this stays exhaustive if a new source is added; writing
                     // nothing and reaching EOF is the only safe behaviour should it ever be reached.
                     ()
+                | StdinSource.Text text ->
+                    let bytes = encoding.GetBytes text
+                    do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                 | StdinSource.Bytes bytes -> do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                 | StdinSource.File _ ->
                     // Unreachable in practice: `feedStdinSource` below always intercepts
@@ -1116,7 +1133,7 @@ module internal Pump =
 
                         if hasNext then
                             let current = sourceStep (fun () -> enumerator.Current)
-                            let bytes = Encoding.UTF8.GetBytes(current + "\n")
+                            let bytes = lineWithLf encoding current
                             do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                         else
                             more <- false
@@ -1135,7 +1152,7 @@ module internal Pump =
 
                         if has then
                             let current = sourceStep (fun () -> enumerator.Current)
-                            let bytes = Encoding.UTF8.GetBytes(current + "\n")
+                            let bytes = lineWithLf encoding current
                             do! stdinStream.WriteAsync(bytes.AsMemory(), cancellationToken)
                         else
                             more <- false
@@ -1158,6 +1175,16 @@ module internal Pump =
 
             return fault
         }
+
+    /// Feed a source with the historical UTF-8 default. Production callers use
+    /// `feedStdinSourceWithEncoding` so a command's text-stdin encoding is honoured.
+    let feedStdin
+        (source: StdinSource)
+        (stdinStream: Stream)
+        (closeWhenDone: bool)
+        (cancellationToken: CancellationToken)
+        : Task<exn option> =
+        feedStdinWithEncoding Encoding.UTF8 source stdinStream closeWhenDone cancellationToken
 
     /// A started background stdin feed together with the lifecycle token that stops it. Created by
     /// `feedStdinSource`, one per started child.
@@ -1232,7 +1259,12 @@ module internal Pump =
     /// the source is fully drained so a kept-open pipe is handed to the caller with no second writer racing
     /// it. When there is nothing to feed the feeder is an inert no-op (no token, `Stop` does nothing,
     /// `Fault` is always `None`). (The no-source interactive case keeps the stream for `TakeStdin`.)
-    let feedStdinSource (stdin: Stream option) (source: Stdin option) (keepStdinOpen: bool) : StdinFeeder =
+    let feedStdinSourceWithEncoding
+        (encoding: Encoding)
+        (stdin: Stream option)
+        (source: Stdin option)
+        (keepStdinOpen: bool)
+        : StdinFeeder =
         match stdin, source with
         | Some stdinStream, Some src ->
             // Open a file source before returning the spawned handle. A fast child can otherwise exit
@@ -1245,7 +1277,12 @@ module internal Pump =
                     let cts = new CancellationTokenSource()
 
                     let feed =
-                        feedStdin (StdinSource.Reader file) stdinStream (not keepStdinOpen) cts.Token
+                        feedStdinWithEncoding
+                            encoding
+                            (StdinSource.Reader file)
+                            stdinStream
+                            (not keepStdinOpen)
+                            cts.Token
 
                     feed.ContinueWith(
                         (fun (_: Task<exn option>) -> file.Dispose()),
@@ -1269,6 +1306,13 @@ module internal Pump =
                 // writing: then the feed just drains + flushes the source and leaves the stream open, and its
                 // completion (`StdinFeeder.Task`) is the point after which `TakeStdin` may hand the stream to
                 // the caller — never while the feed is still writing (two writers on one pipe is forbidden).
-                let feed = feedStdin src.Source stdinStream (not keepStdinOpen) cts.Token
+                let feed =
+                    feedStdinWithEncoding encoding src.Source stdinStream (not keepStdinOpen) cts.Token
+
                 StdinFeeder(feed, Some cts)
         | _ -> StdinFeeder(Task.FromResult(None: exn option), None)
+
+    /// Feed a stdin source with the historical UTF-8 default; kept for internal callers and focused
+    /// pump tests that do not have a `Command` configuration to supply.
+    let feedStdinSource (stdin: Stream option) (source: Stdin option) (keepStdinOpen: bool) : StdinFeeder =
+        feedStdinSourceWithEncoding Encoding.UTF8 stdin source keepStdinOpen

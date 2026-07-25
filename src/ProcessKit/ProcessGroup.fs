@@ -212,7 +212,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // native kill through the lifecycle gate (see `killWhenLive`). The background stdin feed writes
             // to the child's own stdin pipe (not the container), so kicking it off here is race-free.
             let stdinFeeder =
-                Pump.feedStdinSource spawned.Stdin command.Config.StdinSource command.Config.KeepStdinOpen
+                Pump.feedStdinSourceWithEncoding
+                    command.Config.StdinEncoding
+                    spawned.Stdin
+                    command.Config.StdinSource
+                    command.Config.KeepStdinOpen
 
             let closeStreams () =
                 // Close the pipe streams (OS handles/fds) before releasing/detaching.

@@ -61,6 +61,7 @@ class ProcessKit.Command
   member StderrToFile(System.String) : ProcessKit.Command
   member StderrToFile(System.String, System.Boolean) : ProcessKit.Command
   member Stdin(ProcessKit.Stdin) : ProcessKit.Command
+  member StdinEncoding(System.Text.Encoding) : ProcessKit.Command
   member Stdout(ProcessKit.StdioMode) : ProcessKit.Command
   member StdoutEncoding(System.Text.Encoding) : ProcessKit.Command
   member StdoutLineTerminator(ProcessKit.LineTerminator) : ProcessKit.Command
@@ -122,6 +123,7 @@ module ProcessKit.CommandModule
   static member stderrTee(System.IO.Stream, ProcessKit.Command) : ProcessKit.Command
   static member stderrToFile(System.String, System.Boolean, ProcessKit.Command) : ProcessKit.Command
   static member stdin(ProcessKit.Stdin, ProcessKit.Command) : ProcessKit.Command
+  static member stdinEncoding(System.Text.Encoding, ProcessKit.Command) : ProcessKit.Command
   static member stdout(ProcessKit.StdioMode, ProcessKit.Command) : ProcessKit.Command
   static member stdoutEncoding(System.Text.Encoding, ProcessKit.Command) : ProcessKit.Command
   static member stdoutLineTerminator(ProcessKit.LineTerminator, ProcessKit.Command) : ProcessKit.Command

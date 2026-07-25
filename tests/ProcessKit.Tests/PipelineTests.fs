@@ -1001,7 +1001,7 @@ type PipelineTests() =
 
                 match! pipeline.OutputStringAsync() with
                 | Ok output ->
-                    Assert.That(lines output, Is.EqualTo(box [ "payload" ]))
+                    Assert.That(lines output.Stdout, Is.EqualTo(box [ "payload" ]))
                     Assert.That(File.ReadAllText path, Does.Contain "diagnostic")
                 | Error error -> Assert.Fail $"{error}"
             finally

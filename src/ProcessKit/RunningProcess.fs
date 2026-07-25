@@ -998,7 +998,7 @@ type RunningProcess internal (host: RunningHost) =
             // the interactive writer and the source feeder single-writer: the feeder drains the source
             // first, then the caller writes.
             host.StdinFeedComplete()
-            Some(ProcessStdin stream)
+            Some(ProcessStdin(stream, host.Config.StdinEncoding))
         | None -> None
 
     /// Signal the process tree to die without waiting (fire-and-forget, like `Process.Kill()`); the

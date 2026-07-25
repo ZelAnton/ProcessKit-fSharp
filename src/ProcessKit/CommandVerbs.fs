@@ -210,9 +210,9 @@ type CommandVerbs =
         ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine CommandVerbs.DefaultRunner cancellationToken predicate.Invoke command
 
-    /// Decode this command's captured stdout **and** stderr with the local console encoding instead of
-    /// UTF-8 — the one-line fix for a legacy Windows console program whose non-ASCII output otherwise
-    /// arrives as `U+FFFD` replacement characters. Equivalent to
+    /// Encode this command's text stdin and decode its captured stdout **and** stderr with the local console
+    /// encoding instead of UTF-8 — the one-line fix for a legacy Windows console program whose non-ASCII
+    /// input/output otherwise becomes mojibake. Equivalent to
     /// `Encoding(ConsoleEncoding.current ())`, which documents exactly what is resolved: this process's
     /// console output code page (or the system OEM code page when it has no console) on Windows, and
     /// UTF-8 — the unchanged default, no P/Invoke, nothing to undo — everywhere else.
