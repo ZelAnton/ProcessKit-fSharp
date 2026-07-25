@@ -808,7 +808,15 @@ type RunningProcess internal (host: RunningHost) =
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
-            ReadinessProbe.waitForHttp config.Program stdout stderr uri isSatisfactory timeout readinessToken)
+            ReadinessProbe.waitForHttp
+                config.TimeProvider
+                config.Program
+                stdout
+                stderr
+                uri
+                isSatisfactory
+                timeout
+                readinessToken)
 
     let waitForPort
         (endpoint: IPEndPoint)
@@ -816,7 +824,7 @@ type RunningProcess internal (host: RunningHost) =
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
-            ReadinessProbe.waitForPort config.Program stdout stderr endpoint timeout readinessToken)
+            ReadinessProbe.waitForPort config.TimeProvider config.Program stdout stderr endpoint timeout readinessToken)
 
     let waitForSocket
         (path: string)
@@ -824,7 +832,7 @@ type RunningProcess internal (host: RunningHost) =
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
-            ReadinessProbe.waitForSocket config.Program stdout stderr path timeout readinessToken)
+            ReadinessProbe.waitForSocket config.TimeProvider config.Program stdout stderr path timeout readinessToken)
 
     let waitForCustom
         (probe: Func<Task<bool>>)
@@ -832,7 +840,7 @@ type RunningProcess internal (host: RunningHost) =
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
-            ReadinessProbe.waitFor config.Program stdout stderr probe timeout readinessToken)
+            ReadinessProbe.waitFor config.TimeProvider config.Program stdout stderr probe timeout readinessToken)
 
     // Kill the tree the moment an output pump faults, so a still-producing child can't wedge the exit
     // wait — and the pump's siblings — by blocking on a full pipe that nobody drains once the pump
@@ -1766,7 +1774,7 @@ type RunningProcess internal (host: RunningHost) =
                 // silently capped at ~24.8 days, so reporting the raw, un-clamped value would claim a
                 // budget longer than what was actually enforced.
                 let armedTimeout = Timeouts.clampArmable timeout
-                use timeoutCts = new CancellationTokenSource(armedTimeout)
+                use timeoutCts = new CancellationTokenSource(armedTimeout, config.TimeProvider)
 
                 use linked =
                     CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken)

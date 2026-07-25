@@ -594,25 +594,16 @@ type CorrectnessBugTests() =
         }
 
     [<Test>]
-    member _.``a pipeline stage with a non-piped stdout does not deadlock``() : Task =
-        task {
-            // The producing stage's stdout is set to Inherit; the pipeline must still wire it to the
-            // next stage's stdin (forcing Piped) instead of leaving `cat` blocked on an unfed stdin.
-            // The timeout is a safety net — a regression would surface as TimedOut, not a hung suite.
-            // `sort` is a cross-platform passthrough for single-line input (exists on Windows and
-            // Unix); it emits once it sees EOF on stdin, so it doubles as a check that the pipeline
-            // closes the wired-up stdin.
-            let pipeline =
+    member _.``a pipeline stage with a non-piped stdout is rejected before it can deadlock``() =
+        // A pipeline owns every stage's stdout for wiring/capture. Refusing an incompatible explicit
+        // destination at the builder boundary is safer than silently overwriting it or risking an
+        // unfed downstream stdin.
+        Assert.Throws<ArgumentException>(
+            Action(fun () ->
                 ((shell "echo hello") |> Command.stdout StdioMode.Inherit).Pipe(shell "sort")
-                |> Pipeline.timeout (TimeSpan.FromSeconds 10.0)
-
-            match! pipeline.OutputStringAsync() with
-            | Error e -> Assert.Fail $"pipeline errored: {e.Message}"
-            | Ok result ->
-                match result.Outcome with
-                | Outcome.TimedOut -> Assert.Fail "pipeline deadlocked (timed out) — intermediate stdout was not wired"
-                | _ -> Assert.That(result.Stdout.Trim(), Is.EqualTo "hello")
-        }
+                |> ignore)
+        )
+        |> ignore
 
     [<Test>]
     member _.``a missing FromFile stdin source surfaces as ProcessError.Stdin on a successful run``() : Task =

@@ -266,7 +266,7 @@ module Runner =
                                 // (negative / `InfiniteTimeSpan` / over-long) can't throw synchronously out
                                 // of `Task.Delay` — which would break the honest-result contract — the same
                                 // guard `Timeouts` applies to `Command.Timeout`.
-                                do! Task.Delay(Timeouts.clampArmable delay, retryToken)
+                                do! Task.Delay(Timeouts.clampArmable delay, command.Config.TimeProvider, retryToken)
                             with :? System.OperationCanceledException ->
                                 // Cancelled mid-backoff: don't sleep out the rest of the delay. Report it
                                 // as `Cancelled` (not the prior attempt's error), consistent with every

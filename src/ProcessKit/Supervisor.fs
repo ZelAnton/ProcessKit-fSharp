@@ -260,13 +260,13 @@ type internal SupervisorConfig =
 
 module internal SupervisorConfig =
 
-    let realNow () =
-        float (Stopwatch.GetTimestamp()) / float Stopwatch.Frequency
+    let realNow (timeProvider: TimeProvider) () =
+        float (timeProvider.GetTimestamp()) / float timeProvider.TimestampFrequency
 
-    let realSleep (delay: TimeSpan) (cancellationToken: CancellationToken) : Task =
+    let realSleep (timeProvider: TimeProvider) (delay: TimeSpan) (cancellationToken: CancellationToken) : Task =
         task {
             try
-                do! Task.Delay(delay, cancellationToken)
+                do! Task.Delay(delay, timeProvider, cancellationToken)
             with :? OperationCanceledException ->
                 // Cancelled during a backoff / storm pause; the supervisor loop's top-of-iteration
                 // token check converts this into a terminal `Cancelled` result.
@@ -296,9 +296,10 @@ module internal SupervisorConfig =
           LivenessFailures = 3
           LivenessTimeout = TimeSpan.FromSeconds 2.0
           LivenessGrace = TimeSpan.FromSeconds 2.0
-          LivenessDelay = fun delay cancellationToken -> Task.Delay(delay, cancellationToken)
-          Now = realNow
-          Sleep = realSleep }
+          LivenessDelay =
+            fun delay cancellationToken -> Task.Delay(delay, command.Config.TimeProvider, cancellationToken)
+          Now = realNow command.Config.TimeProvider
+          Sleep = realSleep command.Config.TimeProvider }
 
 /// A consistent, point-in-time snapshot of a `SupervisionSession`'s live state — read atomically, so
 /// every field agrees with the others (no torn read across a concurrent update from the supervision
@@ -522,6 +523,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
 
                     let check (probeToken: CancellationToken) =
                         ReadinessProbe.waitForHttpUsing
+                            config.Command.Config.TimeProvider
                             (fun requestUri ct -> client.GetAsync(requestUri, ct))
                             (Func<HttpResponseMessage, bool> isSatisfactory)
                             program
@@ -532,7 +534,14 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                     check, (client :> IDisposable)
                 | LivenessProbe.Custom userProbe ->
                     let check (probeToken: CancellationToken) =
-                        ReadinessProbe.waitFor program None None (Func<Task<bool>> userProbe) probeTimeout probeToken
+                        ReadinessProbe.waitFor
+                            config.Command.Config.TimeProvider
+                            program
+                            None
+                            None
+                            (Func<Task<bool>> userProbe)
+                            probeTimeout
+                            probeToken
 
                     check,
                     { new IDisposable with

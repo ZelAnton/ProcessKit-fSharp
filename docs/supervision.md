@@ -551,6 +551,11 @@ The same injection point makes supervision logic testable with **no real process
 assert the restart and stop behavior deterministically — pair it with `.Jitter(false)` for
 reproducible timing:
 
+For tests that must also control elapsed time, build the command with a deterministic
+`TimeProvider` (`Command.TimeProvider(provider)` / `Command.timeProvider provider`). The provider
+drives the supervisor's restart backoff, storm-score decay, liveness interval, and liveness
+readiness deadline; production continues to use `TimeProvider.System` by default.
+
 **F#**
 
 ```fsharp

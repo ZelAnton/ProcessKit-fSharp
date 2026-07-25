@@ -110,6 +110,12 @@ spawns. The retry policy ([`Command.retry`](timeouts-and-cancellation.md)) is
 applied by the `Runner` verbs, so a double exercises your retry handling without
 a subprocess too.
 
+Time-dependent retry, readiness, and supervision tests can additionally set
+`Command.TimeProvider(provider)` (or `Command.timeProvider provider`). It defaults to
+`TimeProvider.System`; a deterministic provider lets the test advance delays and deadlines without
+waiting or changing process-wide time. The provider belongs on the command, so a `Supervisor` and
+its liveness probes inherit the same clock automatically.
+
 ## Scripting replies
 
 `ScriptedRunner` (in the `ProcessKit.Testing` namespace) is the work-horse

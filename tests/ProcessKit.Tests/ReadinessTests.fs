@@ -820,6 +820,7 @@ type ReadinessTests() =
 
             match!
                 ReadinessProbe.waitForPortUsing
+                    TimeProvider.System
                     neverConnects
                     "test"
                     endpoint
@@ -879,6 +880,7 @@ type ReadinessTests() =
 
             match!
                 ReadinessProbe.waitForPortUsing
+                    TimeProvider.System
                     lateConnect
                     "test"
                     endpoint
@@ -922,6 +924,7 @@ type ReadinessTests() =
 
             match!
                 ReadinessProbe.waitForPortUsing
+                    TimeProvider.System
                     faultsLate
                     "test"
                     endpoint

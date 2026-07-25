@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Added configurable text stdin encoding through `Command.StdinEncoding`.
+- `Command.TimeProvider` / `Command.timeProvider` selects the timer source for retry delays, readiness probes, and supervision; `TimeProvider.System` remains the default, while deterministic providers make those paths testable without global time changes.
 
 ### Changed
 - `Command.Encoding` and `Command.ConsoleEncoding()` now apply their encoding to text stdin as well as captured output.

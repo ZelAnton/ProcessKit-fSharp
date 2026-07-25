@@ -69,6 +69,7 @@ class ProcessKit.Command
   member StdoutToFile(System.String) : ProcessKit.Command
   member StdoutToFile(System.String, System.Boolean) : ProcessKit.Command
   member StreamBuffer(ProcessKit.StreamBufferPolicy) : ProcessKit.Command
+  member TimeProvider(System.TimeProvider) : ProcessKit.Command
   member Timeout(System.TimeSpan) : ProcessKit.Command
   member TimeoutGrace(System.TimeSpan) : ProcessKit.Command
   member Uid(System.Int32) : ProcessKit.Command
@@ -130,6 +131,7 @@ module ProcessKit.CommandModule
   static member stdoutTee(System.IO.Stream, ProcessKit.Command) : ProcessKit.Command
   static member stdoutToFile(System.String, System.Boolean, ProcessKit.Command) : ProcessKit.Command
   static member streamBuffer(ProcessKit.StreamBufferPolicy, ProcessKit.Command) : ProcessKit.Command
+  static member timeProvider(System.TimeProvider, ProcessKit.Command) : ProcessKit.Command
   static member timeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member timeoutGrace(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member uid(System.Int32, ProcessKit.Command) : ProcessKit.Command

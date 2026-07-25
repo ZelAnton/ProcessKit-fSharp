@@ -108,6 +108,10 @@ type internal CommandConfig =
       // The encoding for text sent through `Stdin.FromString`/`FromLines`/`FromAsyncLines` and an
       // interactive `ProcessStdin.WriteLineAsync`. Raw-byte stdin remains byte-exact.
       StdinEncoding: Encoding
+      // The clock and timer source for retry delays, readiness probes, and supervision. The system
+      // provider is the ordinary production default; callers can supply a deterministic provider for
+      // tests without changing global time.
+      TimeProvider: TimeProvider
       StdoutMode: StdioMode
       StderrMode: StdioMode
       // Opt-in direct redirect of the child's stdout/stderr straight to a file at the OS level, handed to
@@ -264,6 +268,7 @@ module internal CommandConfig =
           StdinSource = None
           KeepStdinOpen = false
           StdinEncoding = Encoding.UTF8
+          TimeProvider = TimeProvider.System
           StdoutMode = StdioMode.Piped
           StderrMode = StdioMode.Piped
           StdoutFile = None
@@ -837,6 +842,17 @@ type Command internal (config: CommandConfig) =
         ArgumentNullException.ThrowIfNull encoding
 
         Command({ config with StdinEncoding = encoding })
+
+    /// Use `timeProvider` for retry delays, readiness probes, and supervision. The default is
+    /// `TimeProvider.System`; supplying a deterministic provider makes those time-dependent paths
+    /// testable without changing process-wide time.
+    member _.TimeProvider(timeProvider: TimeProvider) =
+        ArgumentNullException.ThrowIfNull timeProvider
+
+        Command(
+            { config with
+                TimeProvider = timeProvider }
+        )
 
     /// Decode captured stdout with `encoding` (default UTF-8).
     member _.StdoutEncoding(encoding: Encoding) =
@@ -1413,6 +1429,9 @@ module Command =
 
     /// Encode text sent to stdin with `encoding`.
     let stdinEncoding (enc: Encoding) (command: Command) = command.StdinEncoding enc
+
+    /// Use `timeProvider` for retry delays, readiness probes, and supervision.
+    let timeProvider (provider: TimeProvider) (command: Command) = command.TimeProvider provider
 
     /// Decode captured stderr with `encoding`.
     let stderrEncoding (enc: Encoding) (command: Command) = command.StderrEncoding enc

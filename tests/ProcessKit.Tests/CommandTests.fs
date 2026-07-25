@@ -35,6 +35,24 @@ type CommandTests() =
         Assert.That(command.WorkingDirectory, Is.EqualTo(Some "/tmp"))
 
     [<Test>]
+    member _.``TimeProvider defaults to System and is an immutable builder setting``() =
+        let original = Command.create "tool"
+        let configured = original.TimeProvider(TimeProvider.System)
+
+        Assert.That(original.Config.TimeProvider, Is.SameAs TimeProvider.System)
+        Assert.That(configured.Config.TimeProvider, Is.SameAs TimeProvider.System)
+
+    [<Test>]
+    member _.``TimeProvider rejects null``() =
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () ->
+                Command.create "tool"
+                |> Command.timeProvider Unchecked.defaultof<TimeProvider>
+                |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
     member _.``preferLocal accumulates directories in the order added``() =
         let command =
             Command.create "eslint"

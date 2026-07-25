@@ -292,6 +292,11 @@ plain `ProcessError -> bool` through the module mirror).
 `maxAttempts - 1` retries), so `Retry 3` runs the command at most three times, and
 `0`/`1` both mean a single run — a command always runs at least once.
 
+Retry delays use `TimeProvider.System` by default. Tests that need to advance retry time without
+sleeping can attach a deterministic provider with `Command.TimeProvider(provider)` (or
+`Command.timeProvider provider`); the same provider also drives readiness deadlines and a
+`Supervisor` built for that command.
+
 **F#**
 
 ```fsharp

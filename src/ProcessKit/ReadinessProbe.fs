@@ -70,11 +70,11 @@ module internal ReadinessProbe =
     let private pollBackoff = TimeSpan.FromMilliseconds 50.0
 
     /// The backoff to use for the next poll: the smaller of the fixed `pollBackoff` and whatever time
-    /// remains before `armedTimeout` elapses on `clock` — `TimeSpan.Zero` once the budget is already
+    /// remains before `armedTimeout` elapses on `timeProvider` — `TimeSpan.Zero` once the budget is already
     /// spent. Caps the fixed backoff so it can never itself carry a very short overall `timeout` past
     /// its own budget.
-    let private remainingBackoff (clock: Stopwatch) (armedTimeout: TimeSpan) =
-        let remaining = armedTimeout - clock.Elapsed
+    let private remainingBackoff (timeProvider: TimeProvider) (startedTimestamp: int64) (armedTimeout: TimeSpan) =
+        let remaining = armedTimeout - timeProvider.GetElapsedTime(startedTimestamp)
 
         if remaining <= TimeSpan.Zero then
             TimeSpan.Zero
@@ -123,6 +123,7 @@ module internal ReadinessProbe =
     /// thread but is abandoned (and its eventual fault observed) exactly like a returned-but-never-
     /// completing task. The API does not claim it can force a caller-owned probe to stop.
     let private waitForCoreUsing
+        (timeProvider: TimeProvider)
         (program: string)
         (probe: CancellationToken -> Task<bool>)
         (timeout: TimeSpan)
@@ -139,12 +140,12 @@ module internal ReadinessProbe =
                 // silently capped at ~24.8 days, so reporting the raw, un-clamped value would claim a
                 // budget longer than what was actually enforced.
                 let armedTimeout = Timeouts.clampArmable timeout
-                use timeoutCts = new CancellationTokenSource(armedTimeout)
+                use timeoutCts = new CancellationTokenSource(armedTimeout, timeProvider)
 
                 use linked =
                     CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken)
 
-                let clock = Stopwatch.StartNew()
+                let startedTimestamp = timeProvider.GetTimestamp()
 
                 // A standalone deadline signal — a task that only ever completes (cancelled) once
                 // `linked` fires — reused across attempts so it can be raced against each `probe` call
@@ -155,7 +156,10 @@ module internal ReadinessProbe =
                 let mutable stopped = false
 
                 while not ready && not stopped do
-                    if linked.Token.IsCancellationRequested || clock.Elapsed >= armedTimeout then
+                    if
+                        linked.Token.IsCancellationRequested
+                        || timeProvider.GetElapsedTime(startedTimestamp) >= armedTimeout
+                    then
                         // The shared deadline (or the caller's token) already fired since the last
                         // backoff completed — there is no budget left to invoke `probe` again.
                         // Checked by elapsed time as well as by token, because a `CancellationTokenSource`
@@ -195,13 +199,13 @@ module internal ReadinessProbe =
                             else
                                 // Cap the backoff to whatever budget remains so a fixed 50ms poll can't
                                 // overrun a very short overall timeout on its own.
-                                let backoff = remainingBackoff clock armedTimeout
+                                let backoff = remainingBackoff timeProvider startedTimestamp armedTimeout
 
                                 if backoff <= TimeSpan.Zero then
                                     stopped <- true
                                 else
                                     try
-                                        do! Task.Delay(backoff, linked.Token)
+                                        do! Task.Delay(backoff, timeProvider, linked.Token)
                                     with :? OperationCanceledException ->
                                         // Deadline/cancellation fired mid-backoff; the loop exits below
                                         // and reports NotReady/Cancelled.
@@ -211,7 +215,11 @@ module internal ReadinessProbe =
                     // The probe happened to flip true, but the caller's own token fired concurrently —
                     // it still takes priority over a technically-successful result.
                     return Error(ProcessError.Cancelled program)
-                elif ready && (linked.Token.IsCancellationRequested || clock.Elapsed >= armedTimeout) then
+                elif
+                    ready
+                    && (linked.Token.IsCancellationRequested
+                        || timeProvider.GetElapsedTime(startedTimestamp) >= armedTimeout)
+                then
                     // `Task.WhenAny` can pick `probeTask` as the winner even though the deadline fired at
                     // essentially the same moment (both tasks completing concurrently is a genuine race,
                     // not just a check-then-act gap) — the unified-deadline contract requires reporting
@@ -240,6 +248,7 @@ module internal ReadinessProbe =
     /// sandboxed CI environments. `waitForPort` below is the production entry point, wired to a real
     /// `TcpClient` and to the background drain.
     let internal waitForPortUsing
+        (timeProvider: TimeProvider)
         (connect: IPEndPoint -> CancellationToken -> Task)
         (program: string)
         (endpoint: IPEndPoint)
@@ -262,7 +271,7 @@ module internal ReadinessProbe =
                     return false
             }
 
-        waitForCoreUsing program probe timeout cancellationToken
+        waitForCoreUsing timeProvider program probe timeout cancellationToken
 
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` once the shared
     /// `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). See
@@ -274,6 +283,7 @@ module internal ReadinessProbe =
     /// that has already exited reports `NotReady` promptly instead of polling out the whole `timeout` —
     /// the same early-exit contract `WaitForHttpAsync`/`WaitForAsync` honour.
     let waitForPort
+        (timeProvider: TimeProvider)
         (program: string)
         (stdout: Stream option)
         (stderr: Stream option)
@@ -288,7 +298,7 @@ module internal ReadinessProbe =
             }
 
         withBackgroundDrain stdout stderr (fun () ->
-            waitForPortUsing tcpConnect program endpoint timeout cancellationToken)
+            waitForPortUsing timeProvider tcpConnect program endpoint timeout cancellationToken)
 
     /// Whether this host can dial a Unix domain socket at all. Factored out as a predicate — rather than
     /// inlined as `Socket.OSSupportsUnixDomainSockets` — so a test can force both branches deterministically
@@ -311,6 +321,7 @@ module internal ReadinessProbe =
     /// deterministically slow stand-in — same rationale as `waitForPortUsing`. `waitForSocket` below is the
     /// production entry point, wired to a real `AddressFamily.Unix` socket and to the background drain.
     let internal waitForSocketUsing
+        (timeProvider: TimeProvider)
         (connect: string -> CancellationToken -> Task)
         (program: string)
         (path: string)
@@ -329,7 +340,7 @@ module internal ReadinessProbe =
                     return false
             }
 
-        waitForCoreUsing program probe timeout cancellationToken
+        waitForCoreUsing timeProvider program probe timeout cancellationToken
 
     /// Wait until a connection to the Unix domain socket at `path` succeeds, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). See
@@ -343,6 +354,7 @@ module internal ReadinessProbe =
     /// `unixDomainSocketsSupported` before ever calling this function, so an unsupported host never reaches
     /// the `AddressFamily.Unix` socket construction below.
     let waitForSocket
+        (timeProvider: TimeProvider)
         (program: string)
         (stdout: Stream option)
         (stderr: Stream option)
@@ -359,7 +371,7 @@ module internal ReadinessProbe =
             }
 
         withBackgroundDrain stdout stderr (fun () ->
-            waitForSocketUsing unixConnect program path timeout cancellationToken)
+            waitForSocketUsing timeProvider unixConnect program path timeout cancellationToken)
 
     /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).
@@ -367,6 +379,7 @@ module internal ReadinessProbe =
     /// particular HTTP transport. Network failures are deliberately false results: a refused connection,
     /// DNS failure, or a request cancelled by the shared deadline means the server is not ready yet.
     let internal waitForHttpUsing
+        (timeProvider: TimeProvider)
         (getResponse: Uri -> CancellationToken -> Task<HttpResponseMessage>)
         (isSatisfactory: Func<HttpResponseMessage, bool>)
         (program: string)
@@ -389,13 +402,14 @@ module internal ReadinessProbe =
                     return false
             }
 
-        waitForCoreUsing program probe timeout cancellationToken
+        waitForCoreUsing timeProvider program probe timeout cancellationToken
 
     /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).
     /// A single client is used for this readiness operation; its own timeout is disabled so every request
     /// is bounded only by the shared readiness deadline passed to `GetAsync`.
     let waitForHttp
+        (timeProvider: TimeProvider)
         (program: string)
         (stdout: Stream option)
         (stderr: Stream option)
@@ -410,6 +424,7 @@ module internal ReadinessProbe =
             return!
                 withBackgroundDrain stdout stderr (fun () ->
                     waitForHttpUsing
+                        timeProvider
                         (fun requestUri ct -> client.GetAsync(requestUri, ct))
                         isSatisfactory
                         program
@@ -429,6 +444,7 @@ module internal ReadinessProbe =
     /// instead of polling out the whole `timeout` — the same early-exit contract
     /// `WaitForHttpAsync`/`WaitForPortAsync` honour.
     let waitFor
+        (timeProvider: TimeProvider)
         (program: string)
         (stdout: Stream option)
         (stderr: Stream option)
@@ -437,4 +453,4 @@ module internal ReadinessProbe =
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         withBackgroundDrain stdout stderr (fun () ->
-            waitForCoreUsing program (fun _ -> probe.Invoke()) timeout cancellationToken)
+            waitForCoreUsing timeProvider program (fun _ -> probe.Invoke()) timeout cancellationToken)
