@@ -187,6 +187,31 @@ in an incompatible Job returns the typed `ProcessError.Adopt`. The adopted proce
 child: it is contained and killed through the OS primitive alone (`KILL_ON_JOB_CLOSE` / `cgroup.kill`) and
 never `waitpid`ed, so its exit is observed through the caller's own `Process`, not a `RunningProcess`.
 
+**Launching outside containment (`Command.LaunchDetached`)**
+
+The deliberate inverse of `Adopt`: instead of pulling a process *into* the container, it launches one
+that never enters any — the opt-out for spawn-and-forget work (a self-updater, a restart-myself
+relaunch, a daemon handed to the OS). See
+[Detached launch](commands.md#detached-launch-spawn-and-forget) for the full contract and the typed
+refusals; the platform divergences are:
+
+| Capability | Windows | Linux / macOS / BSD (POSIX) |
+|---|:---:|:---:|
+| Detachment mechanism | ✅ created running, assigned to **no** Job Object, no handle retained | ✅ `POSIX_SPAWN_SETSID` — its own session, no controlling terminal |
+| Survives a terminal/console close | 🟡 only with `CreateNoWindow()` (or `WindowsCtrlSignals()`) — it otherwise shares the caller's console | ✅ a new session cannot be reached by the terminal's hangup |
+| Leaves no entry behind when it exits first | ✅ nothing references the process | 🟡 it stays our direct child (`posix_spawn` cannot reparent), so its zombie lingers until this process exits |
+
+Both platforms return the same `DetachedProcess` (pid + start-time identity) and neither observes the
+child's exit — that is what "detached" means here. The POSIX zombie window is the honest cost of
+returning the *real* target pid rather than double-forking through a helper: the child genuinely
+outlives us (init adopts it then), and ProcessKit never reaps a process it does not contain.
+
+The opt-out covers the containment **ProcessKit** creates, not one your own process was placed in by
+someone else: a child of a job-bound Windows process joins that job by kernel rule (breakaway is not
+requested — most ambient jobs forbid it, so asking would turn a working launch into a spawn failure),
+and a Linux child inherits your cgroup, so a `systemctl stop` of your unit still reaps it. Work that
+must survive that belongs with the platform's own supervisor, not with a child process.
+
 **Reaping on sudden parent death (`Command.KillOnParentDeath`)**
 
 Kill-on-dispose covers the parent tearing the group down; it cannot cover the parent being killed

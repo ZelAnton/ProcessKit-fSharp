@@ -2257,3 +2257,228 @@ module internal Windows =
                 else
                     lock windowsSpawnLock (fun () -> spawnWindowsPtyCore job command pty)
             | None -> lock windowsSpawnLock (fun () -> spawnWindowsCore job command)
+
+    // ----------------------------------------------------------------------------------
+    // Windows: the detached launch (Command.LaunchDetached) — deliberately NOT contained
+    // ----------------------------------------------------------------------------------
+    //
+    // Every other spawn in this file exists to put the child INSIDE a Job Object before it can run a
+    // single instruction (CREATE_SUSPENDED -> AssignProcessToJobObject -> ResumeThread), because that Job
+    // is the whole kill-on-dispose guarantee. The detached launch is the one path that deliberately does
+    // the opposite: the child is created running, is assigned to NO Job at all, and no handle to it is
+    // retained — so nothing the parent does (Dispose, GC, `TerminateJobObject`, even the kernel's
+    // handle rundown when the parent dies) can reach it. That is the entire point of the verb; it is why
+    // the verb is a loud, separate opt-out rather than a flag on the ordinary path.
+    //
+    // Consequences, all deliberate:
+    //  * no CREATE_SUSPENDED / resume dance — nothing has to happen between creation and execution;
+    //  * no `waitWindows` registration and no retained process handle — nobody observes the exit;
+    //  * no pipes — a detached child has no parent-side reader (see `detachedChildHandle`).
+    // What is NOT skipped: the shared PATHEXT/prefer-local/cmd.exe-wrapper resolution
+    // (`buildWindowsCommandLine`, T-181/T-182 — no second copy of that logic), the writable
+    // command-line buffer (T-198), the environment block, and `windowsSpawnLock` — this path passes
+    // `bInheritHandles = true`, so it must not run concurrently with another spawn whose inheritable
+    // pipe ends would otherwise be snapshotted into this child (which would keep that run's reads from
+    // ever seeing EOF).
+
+    /// One std handle for a detached child: a `Command.StdoutToFile`/`StderrToFile` redirect, an
+    /// inherited copy of the parent's own std handle (`StdioMode.Inherit`), or the null device.
+    /// `StdioMode.Piped` — the builder default — resolves to the null device here rather than a pipe:
+    /// a detached child has no parent left to drain one, and a pipe whose read end is closed would give
+    /// the child `ERROR_BROKEN_PIPE` on its first write. That is the documented contract of the detached
+    /// verb (keep output with `StdoutToFile`, or share the caller's console with `StdioMode.Inherit`),
+    /// not a per-run downgrade; every knob that genuinely needs a parent-side reader (tees, line
+    /// handlers, the capture verbs) is refused up front by the verb layer instead.
+    /// Failure is raised, not returned, so the caller's single `with` turns it into `ProcessError.Spawn`
+    /// — the same shape `spawnWindowsCore`'s `setupOut` uses.
+    let private detachedChildHandle
+        (label: string)
+        (fileRedirect: (string * bool) option)
+        (mode: StdioMode)
+        (stdHandleId: int)
+        (nulAccess: uint32)
+        : nativeint =
+        let handle =
+            match fileRedirect with
+            | Some(path, append) -> inheritableFile path append
+            | None ->
+                match mode with
+                | StdioMode.Inherit -> inheritableStdHandle stdHandleId
+                | StdioMode.Null
+                | StdioMode.Piped -> inheritableNul nulAccess
+
+        if not (isValidHandle handle) then
+            let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+            failwith $"could not open the detached child's {label} handle: {message}"
+
+        handle
+
+    /// Launch `command` as a detached child — running, contained by nothing, unowned (see the section
+    /// comment above). Returns its pid and the OS-reported start time, read while our own process handle
+    /// is still open so the pid cannot have been recycled underneath the identity pair. The `Umask`/
+    /// `Uid`/`Gid`/`Groups`/`Setsid` Unix-only knobs are refused exactly as `spawnWindows` refuses them,
+    /// so the detached path diverges from the ordinary one only where detachment itself requires it.
+    let spawnDetachedWindows (command: Command) : Result<DetachedSpawn, ProcessError> =
+        let config = command.Config
+
+        match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups with
+        | Some _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
+        | _, Some _, _, _, _ -> Error(ProcessError.Unsupported "uid")
+        | _, _, Some _, _, _ -> Error(ProcessError.Unsupported "gid")
+        | _, _, _, true, _ -> Error(ProcessError.Unsupported "setsid")
+        | _, _, _, _, Some _ -> Error(ProcessError.Unsupported "groups")
+        | None, None, None, false, None ->
+            // Decide the launch (PATHEXT substitution / cmd.exe batch wrapper) BEFORE any handle is
+            // allocated, exactly as `spawnWindowsCore` does — an unsafe batch argument is refused here.
+            match buildWindowsCommandLine command with
+            | Error error -> Error error
+            | Ok commandLine ->
+                // Every inheritable handle opened for the child, dropped once the child has its own
+                // inherited copies (or immediately, if the launch failed or threw partway through).
+                let parentCopies = ResizeArray<nativeint>()
+
+                let releaseParentCopies () =
+                    for handle in parentCopies do
+                        closeHandleIfValid handle
+
+                    // Emptied as they are closed, so the unwind path below can never close one twice: a
+                    // Win32 handle VALUE is recycled the moment it is freed, so a second `CloseHandle` on
+                    // it could hit an unrelated object this process has since opened.
+                    parentCopies.Clear()
+
+                lock windowsSpawnLock (fun () ->
+                    try
+                        let stdinChild =
+                            let mode =
+                                if Stdin.isInherit config.StdinSource then
+                                    StdioMode.Inherit
+                                else
+                                    // The verb layer has already refused every feeder source (there is no
+                                    // parent to pump one), so the only remaining stdin is an immediate EOF.
+                                    StdioMode.Null
+
+                            let handle = detachedChildHandle "stdin" None mode STD_INPUT_HANDLE GENERIC_READ
+                            parentCopies.Add handle
+                            handle
+
+                        let outChild =
+                            let handle =
+                                detachedChildHandle
+                                    "stdout"
+                                    config.StdoutFile
+                                    config.StdoutMode
+                                    STD_OUTPUT_HANDLE
+                                    GENERIC_WRITE
+
+                            parentCopies.Add handle
+                            handle
+
+                        let errChild =
+                            if config.MergeStderr then
+                                // `2>&1` at the OS level: stderr shares the SAME handle as stdout, so both
+                                // land in the one destination and interleave honestly. Not added to
+                                // `parentCopies` a second time — that would be a double `CloseHandle`.
+                                outChild
+                            else
+                                let handle =
+                                    detachedChildHandle
+                                        "stderr"
+                                        config.StderrFile
+                                        config.StderrMode
+                                        STD_ERROR_HANDLE
+                                        GENERIC_WRITE
+
+                                parentCopies.Add handle
+                                handle
+
+                        let mutable startup = STARTUPINFO()
+                        startup.cb <- Marshal.SizeOf<STARTUPINFO>()
+                        startup.dwFlags <- STARTF_USESTDHANDLES
+                        startup.hStdInput <- stdinChild
+                        startup.hStdOutput <- outChild
+                        startup.hStdError <- errChild
+
+                        let mutable info = PROCESS_INFORMATION()
+
+                        let workingDirectory =
+                            config.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
+
+                        let environment = buildWindowsEnvironment command
+
+                        let flags =
+                            // Deliberately NO `CREATE_SUSPENDED`: there is no Job to assign the child to
+                            // before it runs, so there is nothing to suspend it for. Deliberately NO
+                            // `CREATE_BREAKAWAY_FROM_JOB` either: this verb opts out of the containment
+                            // ProcessKit creates, and cannot opt out of a Job the CALLER's own process was
+                            // placed in by someone else (the kernel puts a child of a job-bound process in
+                            // that same job). Requesting breakaway would fail outright with
+                            // ERROR_ACCESS_DENIED on every ambient job lacking `JOB_OBJECT_LIMIT_BREAKAWAY_OK`
+                            // — turning a working launch into a spawn failure — so the ambient case is
+                            // documented (docs/commands.md, docs/platform-support.md) rather than fought.
+                            (if environment = IntPtr.Zero then
+                                 0u
+                             else
+                                 CREATE_UNICODE_ENVIRONMENT)
+                            ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
+                            // Honoured for its OS-level effect — the child becomes the root of its own
+                            // console process group, so a CTRL+C/CTRL+BREAK in the caller's console is not
+                            // delivered to it. ProcessKit itself offers no way to signal a detached child
+                            // (that would need the containment this verb opted out of).
+                            ||| (if config.WindowsCtrlSignals then
+                                     CREATE_NEW_PROCESS_GROUP
+                                 else
+                                     0u)
+                            ||| (match config.Priority with
+                                 | Some priority -> PriorityMapping.windowsCreationFlag priority
+                                 | None -> 0u)
+
+                        // A PRIVATE, writable copy of the command line: `CreateProcessW` may patch this
+                        // buffer in place, so it must never be the memory of a managed string (T-198).
+                        let commandLineBuffer = Marshal.StringToHGlobalUni commandLine
+
+                        let created =
+                            CreateProcessW(
+                                IntPtr.Zero,
+                                commandLineBuffer,
+                                IntPtr.Zero,
+                                IntPtr.Zero,
+                                true,
+                                flags,
+                                environment,
+                                workingDirectory,
+                                &startup,
+                                &info
+                            )
+
+                        let lastError = Marshal.GetLastWin32Error()
+                        Marshal.FreeHGlobal commandLineBuffer
+
+                        if environment <> IntPtr.Zero then
+                            Marshal.FreeHGlobal environment
+
+                        if not created then
+                            releaseParentCopies ()
+
+                            if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
+                                Error(notFoundFromSpawnFailure command)
+                            else
+                                Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
+                        else
+                            let pid = int info.dwProcessId
+
+                            // Read the identity pair while `info.hProcess` is STILL OPEN: Windows does not
+                            // recycle a pid while any handle to that process remains, so the start time we
+                            // pair with the pid cannot already belong to a different process. After the
+                            // closes below nothing pins this pid any more — by design.
+                            let startTime = readProcessStartTime pid
+
+                            CloseHandle info.hThread |> ignore
+                            CloseHandle info.hProcess |> ignore
+                            // The child holds its own inherited copies now; drop ours so a redirect file or
+                            // the null device is not kept open by this process for the child's lifetime.
+                            releaseParentCopies ()
+
+                            Ok { Pid = pid; StartTime = startTime }
+                    with ex ->
+                        releaseParentCopies ()
+                        Error(ProcessError.Spawn(command.Program, ex.Message)))

@@ -44,6 +44,7 @@
 		<Compile Include="PtyTests.fs" />
 		<Compile Include="PtySessionTests.fs" />
 		<Compile Include="StdinInheritTests.fs" />
+		<Compile Include="DetachedLaunchTests.fs" />
 		<Compile Include="CorrectnessBugTests.fs" />
 		<Compile Include="ApiParityTests.fs" />
 		<Compile Include="TestabilityTests.fs" />

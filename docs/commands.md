@@ -960,6 +960,118 @@ The same vocabulary repeats on every layer. To run a verb through a specific
 exist on [`CliClient`](testing.md), [`Pipeline`](pipelines.md), and as the
 `Exec.*` one-liners.
 
+Exactly one verb deliberately breaks that shape — `LaunchDetached`, the opt-out from
+containment described next.
+
+## Detached launch (spawn-and-forget)
+
+Every verb above puts the child in a kill-on-dispose container, and that guarantee is
+the point of the library. But some launches only make sense *without* it: a
+**self-updater** that has to outlive the process it is replacing, a **restart-myself**
+relaunch, a **daemon or agent handed off to the OS**. `LaunchDetached` is the single,
+loudly named opt-out for those — a separate verb, never a flag on the ordinary path, so
+the containment guarantee stays unqualified everywhere else.
+
+**F#**
+
+```fsharp
+// Hand the updater off and exit — it must survive this process.
+match (Command.create "updater" |> Command.args [ "--apply"; "2.1.0" ]
+       |> Command.stdoutToFile "/var/log/updater.log" true).LaunchDetached() with
+| Ok child -> printfn $"updater running as pid {child.Pid}"
+| Error err -> eprintfn $"{err.Message}"
+
+// The one-liner form.
+let started = Exec.detach "updater" [ "--apply"; "2.1.0" ]
+```
+
+**C#**
+
+```csharp
+// Hand the updater off and exit — it must survive this process.
+Console.WriteLine(new Command("updater").Args(["--apply", "2.1.0"])
+        .StdoutToFile("/var/log/updater.log", append: true)
+        .LaunchDetached() switch
+{
+    { IsOk: true, ResultValue: var child } => $"updater running as pid {child.Pid}",
+    { IsOk: false, ErrorValue: var err }   => err.Message,
+});
+```
+
+It returns a **`DetachedProcess`** — `Pid`, `Program`, `StartTime` — and nothing else.
+It is a diagnostic snapshot, not a handle: no `Dispose`, no wait, no stream, no kill,
+because the child is no longer ProcessKit's to manage. `Pid` alone is not an identity (the
+OS reuses pids); the pair `Pid` + `StartTime` is, and it is captured while the pid is still
+pinned, so it can never describe an already-recycled process.
+
+**What you are giving up** — all of it, deliberately:
+
+- **No containment.** The child is in **no Job Object** (Windows) and in **its own new
+  session** (`setsid`, POSIX). Nothing this process does — `Dispose`, GC, or dying —
+  reaches it. `ProcessGroup`-level knobs (`ResourceLimits`, `ProcessGroupOptions`) are not
+  merely ignored: they live on the container this verb refuses to create.
+- **No exit.** Nobody waits on it, so there is no `Outcome`, no exit code, no duration,
+  and no `ProcessResult`. Its exit is invisible to this process by construction.
+- **No output.** There is no parent left to drain a pipe, so `StdioMode.Piped` — the
+  builder default — is wired to the **null device** here. Keep output with
+  `StdoutToFile`/`StderrToFile` (the child writes the file itself, with no pump), or share
+  the caller's own console with `Stdout(StdioMode.Inherit)`. `MergeStderr` still works: it
+  is an OS-level `2>&1` onto whichever destination stdout got.
+- **No test seam.** The launch bypasses `IProcessRunner`, so `ScriptedRunner` /
+  `RecordReplayRunner` do not intercept it — it is an opt-out from running under
+  ProcessKit, not a run. Put your own seam in front of it if a test must launch nothing.
+
+**Every incompatible knob is refused, never ignored.** Each returns a typed
+`ProcessError.Unsupported` naming the knob, *before* anything is spawned — so a `Timeout`
+can never look applied when nothing will ever enforce it:
+
+| Refused | Because |
+|---|---|
+| `Pty` | a pseudo-terminal is a live parent-side device that must be owned and pumped |
+| `KillOnParentDeath` | it asks the OS to kill the child with us — the opposite of detaching |
+| `Timeout` / `TimeoutGrace` / `IdleTimeout` | a deadline needs a parent watchdog that can still kill |
+| `CancelOn` | cancelling means killing, the very control this verb gives up |
+| `Stdin` (a feeder source) | feeding stdin needs a parent-side pump (`InheritStdin` *is* supported) |
+| `KeepStdinOpen` | it retains the parent's end of the stdin pipe for interactive writing |
+| `OnStdoutLine` / `OnStderrLine` / `StdoutTee` / `StderrTee` | all are fed by the parent's own copy of the output |
+| `StreamBuffer` | it bounds a streaming backlog, and nothing streams here |
+| `Retry` | retrying is a verb-layer policy over an observed failure; the spawn happens exactly once (`RetryNever` opts a command out of an inherited `CliClient` default) |
+
+Knobs only a capturing verb ever reads — `StdoutEncoding`/`StderrEncoding`, the line
+terminators, `OutputBuffer`, `OkCodes` — are no-ops here, exactly as they are on the verbs
+that ignore them today. Everything the OS can honour on its own **is** honoured:
+`CurrentDir`, `Env`/`EnvClear`/`PreferLocal`, the file redirects, `MergeStderr`,
+`InheritStdin`, `CreateNoWindow`, `WindowsCtrlSignals`, `Priority`, `Umask`, and the Unix
+`Uid`/`Gid`/`Groups` drop (through the same `setpriv` helper as a contained spawn).
+
+**Platform notes** — documented divergences, not silent ones:
+
+- **POSIX.** The child gets a new session with no controlling terminal (`Setsid()` asks for
+  exactly this, so setting it alongside is redundant, never a conflict), so a terminal
+  hangup cannot reach it. Because `posix_spawn` cannot reparent, it remains this process's
+  direct child in the kernel's table: it genuinely survives our exit (init adopts it then),
+  but if it exits *first*, while we are still running, its **zombie entry lingers until we
+  exit** — ProcessKit never reaps what it does not contain. A long-lived host that
+  launches many short-lived children should use the contained verbs; that is what
+  containment is for.
+- **Windows.** The child is created running and assigned to no Job, and no handle to it is
+  kept. It still shares the caller's **console** unless you add `CreateNoWindow()` (or
+  `WindowsCtrlSignals()`, which makes it the root of its own console process group), so in
+  the default wiring a console-close event still reaches it — the closest Windows analogue
+  of the POSIX session detach is `CreateNoWindow()`.
+
+The verb opts out of the containment **ProcessKit** creates; it cannot opt out of a container
+somebody put *your own process* in. On Windows, a child of a job-bound process joins that same
+job by kernel rule (ProcessKit does not request `CREATE_BREAKAWAY_FROM_JOB`: most ambient jobs
+forbid it, so asking would turn a working launch into a spawn failure). On Linux the child
+inherits your cgroup, so a `systemctl stop` of your unit still reaps it. If a launch must
+survive *that*, hand the work to the platform's own supervisor (a service manager, `systemd-run`,
+a scheduled task) rather than to a child process.
+
+`LaunchDetached` is **synchronous** (like `ProcessGroup.Create` and `ResolveProgram`): it
+does one bounded OS call and there is no run to await, so it returns the `Result` directly
+rather than a `Task` that never yields.
+
 ## Results
 
 The capturing verbs (`OutputStringAsync` / `OutputBytesAsync`) hand back a

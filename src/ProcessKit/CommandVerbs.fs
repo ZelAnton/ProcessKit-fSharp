@@ -8,6 +8,106 @@ open System.Text.Json
 open System.Text.Json.Serialization.Metadata
 open System.Threading
 
+/// The configuration guards for the detached launch (`Command.LaunchDetached`). A detached child has no
+/// parent-side machinery at all — no pump, no watchdog, no containment, no exit observation — so every
+/// builder knob that would need one is refused HERE, before anything is spawned, with a typed
+/// `ProcessError.Unsupported` naming the knob and why it cannot be honoured. That is the whole design
+/// stance of the verb: the incompatible knobs fail loudly rather than being quietly ignored, so a
+/// `Timeout` can never look applied when nothing will ever enforce it.
+///
+/// `Unsupported` (not `Spawn`) is the right case for all of them, matching how the library already
+/// reports a fixed capability gap "on this platform or in this configuration" (a Unix-only knob on
+/// Windows, `CurrentDir` on an old libc) as opposed to a per-invocation launch failure.
+module internal DetachedLaunch =
+
+    let private refuse (knob: string) (reason: string) =
+        ProcessError.Unsupported
+            $"{knob} on a detached launch: {reason}. Use StartAsync/RunAsync instead, or drop {knob}."
+
+    /// The first knob on `command` that a detached launch cannot honour, or `None` when the command is
+    /// launchable as-is. Checked in a fixed order so the same configuration always names the same knob.
+    ///
+    /// Deliberately NOT refused, because a detached child can honour them at the OS level with no parent
+    /// involvement: `CurrentDir`, `Env`/`EnvClear`/`PreferLocal`, `StdoutToFile`/`StderrToFile`,
+    /// `MergeStderr`, `Stdout`/`Stderr` `Null`/`Inherit`, `InheritStdin`, `CreateNoWindow`,
+    /// `WindowsCtrlSignals`, `Priority`, `Umask`, `Uid`/`Gid`/`Groups`, and `Setsid` (which a POSIX
+    /// detached launch performs anyway). `StdioMode.Piped` — the default — is wired to the null device
+    /// rather than refused: there is no parent left to drain a pipe, and refusing the default mode would
+    /// make the verb unusable without three extra builder calls. Knobs that only a capture/exit-observing
+    /// verb ever reads (`StdoutEncoding`/`StderrEncoding`, the line terminators, `OutputBuffer`,
+    /// `OkCodes`, `UncheckedInPipe`) are no-ops here exactly as they are on the verbs that ignore them
+    /// today; they are documented as such rather than refused, since a default-valued knob cannot be told
+    /// apart from an explicitly set one.
+    let incompatibleKnob (command: Command) : ProcessError option =
+        let config = command.Config
+
+        if config.Pty.IsSome then
+            Some(
+                refuse
+                    "Pty"
+                    "a pseudo-terminal is a live parent-side device (the ConPTY handle / pty master fd) that has to be owned, pumped and closed by this process, which a detached child by definition has no one to do"
+            )
+        elif config.KillOnParentDeath then
+            Some(
+                refuse
+                    "KillOnParentDeath"
+                    "it asks the OS to kill the child when this process dies, the exact opposite of detaching a child so it survives us"
+            )
+        elif config.Timeout.IsSome then
+            Some(refuse "Timeout" "enforcing a deadline needs a parent-side watchdog that can still kill the child")
+        elif config.TimeoutGrace.IsSome then
+            Some(refuse "TimeoutGrace" "it only softens a Timeout kill, and there is no timeout to enforce")
+        elif config.IdleTimeout.IsSome then
+            Some(
+                refuse
+                    "IdleTimeout"
+                    "watching for silence needs the parent to be reading the child's output, and to be able to kill it"
+            )
+        elif config.CancelOn.IsSome then
+            Some(
+                refuse
+                    "CancelOn"
+                    "cancelling a run means killing the child, which is precisely the control a detached launch gives up"
+            )
+        elif config.StdinSource.IsSome && not (Stdin.isInherit config.StdinSource) then
+            Some(
+                refuse
+                    "Stdin"
+                    "feeding stdin needs a parent-side pump writing into the child's pipe; InheritStdin (the parent's own standard input) is supported, and any other source is not"
+            )
+        elif config.KeepStdinOpen then
+            Some(
+                refuse
+                    "KeepStdinOpen"
+                    "it retains the parent's end of the stdin pipe for interactive writing, and the descriptor a detached launch returns has no stdin to write to"
+            )
+        elif config.OnStdoutLine.IsSome then
+            Some(refuse "OnStdoutLine" "per-line handlers need the parent to be pumping the child's stdout")
+        elif config.OnStderrLine.IsSome then
+            Some(refuse "OnStderrLine" "per-line handlers need the parent to be pumping the child's stderr")
+        elif config.StdoutTee.IsSome then
+            Some(
+                refuse
+                    "StdoutTee"
+                    "a tee is fed by the parent's own copy of the child's stdout; redirect the child's stdout straight to a file with StdoutToFile instead"
+            )
+        elif config.StderrTee.IsSome then
+            Some(
+                refuse
+                    "StderrTee"
+                    "a tee is fed by the parent's own copy of the child's stderr; redirect the child's stderr straight to a file with StderrToFile instead"
+            )
+        elif config.StreamBuffer.IsSome then
+            Some(refuse "StreamBuffer" "it bounds a streaming backlog, and nothing streams a detached child's output")
+        elif config.Retry.IsSome && not config.RetryDisabled then
+            Some(
+                refuse
+                    "Retry"
+                    "retrying is a verb-layer policy over an observed failure, and a detached launch performs the spawn exactly once (RetryNever opts a command inheriting a client default back out)"
+            )
+        else
+            None
+
 /// Default-runner convenience verbs on `Command`, callable from F# and C# as
 /// `command.StartAsync()` / `command.RunAsync()` etc. They use a shared `JobRunner`; for a custom or
 /// injected runner, go through `Runner.*` or call the runner directly. The `cancellationToken` is
@@ -129,3 +229,66 @@ type CommandVerbs =
     static member ResolveProgram(command: Command) : Result<string, ProcessError> =
         ArgumentNullException.ThrowIfNull command
         Native.Common.resolveCommandProgram command
+
+    /// Launch this command **outside all containment** and let it go — the library's single, deliberate
+    /// opt-out from the whole-tree kill-on-dispose guarantee, for the cases containment makes impossible:
+    /// a self-updater that must outlive the process it replaces, a restart-myself relaunch, a daemon or
+    /// agent handed off to the OS. On success it returns a `DetachedProcess` — a pid + start-time
+    /// identity snapshot, nothing more.
+    ///
+    /// **What you give up.** There is no `RunningProcess`, no `ProcessGroup`, no `Outcome`, and nothing
+    /// to dispose: the child is placed in **no Job Object** (Windows) and in **its own session**
+    /// (`setsid`, POSIX), no handle to it is retained, and no exit is ever observed. Nothing this process
+    /// does — `Dispose`, GC, even dying — will reach it. That is the entire point; if you want a
+    /// deadline, output, an exit code, or a kill, use `StartAsync`/`RunAsync` (or a `ProcessGroup`)
+    /// instead. `ProcessGroup`-level knobs (`ResourceLimits`, `ProcessGroupOptions`) are not merely
+    /// ignored here but unreachable: they live on the container this verb refuses to create.
+    ///
+    /// **Every incompatible builder knob is refused, not ignored** — `Pty`, `KillOnParentDeath`,
+    /// `Timeout`/`TimeoutGrace`/`IdleTimeout`, `CancelOn`, a feeder `Stdin` source, `KeepStdinOpen`, the
+    /// line handlers and tees, `StreamBuffer`, and an active `Retry` policy each come back as a typed
+    /// `ProcessError.Unsupported` naming the knob, before anything is spawned. `StdioMode.Piped` (the
+    /// default) is the one deliberate exception: with no parent left to drain a pipe it is wired to the
+    /// null device, so keep output with `StdoutToFile`/`StderrToFile`, or share the caller's own console
+    /// with `Stdout(StdioMode.Inherit)`.
+    ///
+    /// **Synchronous by design.** Like `ProcessGroup.Create`/`Adopt` and `ResolveProgram`, this does one
+    /// bounded OS call and has nothing to await — there is no run to wait for — so it returns the
+    /// `Result` directly rather than a `Task` that never yields.
+    ///
+    /// **Platform notes.** POSIX: the child gets a new session (no controlling terminal), so a terminal
+    /// hangup cannot reach it; because `posix_spawn` cannot reparent, it stays this process's direct
+    /// child in the kernel's table, so a child that exits *before* the parent leaves a zombie entry until
+    /// the parent exits (ProcessKit never reaps what it does not contain). Windows: the child shares the
+    /// caller's console unless you add `CreateNoWindow()` (or `WindowsCtrlSignals()`, which puts it in
+    /// its own console process group), so a console-close event still reaches it in the default wiring.
+    /// On both platforms this opts out of the containment ProcessKit creates, not one THIS process was
+    /// itself placed in: a child of a job-bound Windows process joins that job by kernel rule, and a
+    /// Linux child inherits this process's cgroup (so a `systemctl stop` of the unit still reaps it).
+    ///
+    /// The launch deliberately bypasses the `IProcessRunner` seam — it is an opt-out from running under
+    /// ProcessKit, not a run — so a test double (`ScriptedRunner`, `RecordReplayRunner`) does not
+    /// intercept it; put your own seam in front of it if a test must avoid launching anything.
+    [<Extension>]
+    static member LaunchDetached(command: Command) : Result<DetachedProcess, ProcessError> =
+        ArgumentNullException.ThrowIfNull command
+
+        match DetachedLaunch.incompatibleKnob command with
+        | Some error -> Error error
+        | None ->
+            let spawned =
+                if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                    Native.Windows.spawnDetachedWindows command
+                else
+                    Native.Posix.spawnDetachedPosix command
+
+            match spawned with
+            | Error error -> Error error
+            | Ok detached ->
+                // One lifecycle line for an operator: a detached launch is precisely the event worth
+                // seeing in a log, since nothing downstream will ever report this child's exit. Reuses
+                // the ordinary `ProcessSpawned` event id (no new taxonomy) with a fresh run id, since a
+                // detached launch has no run to correlate with. Argv and environment are never logged.
+                let runId = command.Config.RunId |> Option.defaultWith Diag.newRunId
+                Log.spawn command.Config.Logger command.Program (Some detached.Pid) runId
+                Ok(DetachedProcess(detached.Pid, command.Program, detached.StartTime))

@@ -64,6 +64,7 @@
 		<Compile Include="LineTerminator.fs" />
 		<Compile Include="Command.fs" />
 		<Compile Include="MemberInfo.fs" />
+		<Compile Include="DetachedProcess.fs" />
 		<Compile Include="Native.Common.fs" />
 		<Compile Include="Native.Windows.fs" />
 		<Compile Include="Native.Posix.fs" />

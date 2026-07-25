@@ -734,6 +734,52 @@ module internal Posix =
         let flags = if isMacOs then flags else flags ||| O_CLOEXEC
         openFile ("/dev/null", flags)
 
+    /// Open a `Command.StdoutToFile`/`StderrToFile` redirect target ON THE PARENT and hand back its raw
+    /// fd, for a spawn to dup2 onto the child's slot (then close in the child; the parent's copy closed
+    /// after the spawn), exactly like the `/dev/null` fd from `openDevNull`. Shared by the ordinary
+    /// contained spawn and the detached launch, so the O_APPEND rule below can never be re-derived
+    /// differently in a second copy.
+    ///
+    /// Both the create/truncate and the append opens go through .NET's own `open(2)`, which sets
+    /// O_CLOEXEC portably across Linux and macOS (no variadic `open(…, mode)` P/Invoke — the AArch64
+    /// variadic-ABI hazard this port avoids for `fcntl`), so the fd reaches the child with NO `dup(2)` of
+    /// a second logical copy that would drop O_CLOEXEC (K-029). Ownership is then released from the
+    /// SafeFileHandle (`SetHandleAsInvalid` — it does NOT close the fd) so the raw fd is managed by the
+    /// caller's single-close child-side machinery. `append = false` creates/truncates via
+    /// `File.OpenHandle(FileMode.Create)`; `append = true` opens a `FileStream(FileMode.Append)`, whose
+    /// Unix open sets the kernel O_APPEND flag AT OPEN TIME (the classic multi-writer shared-log idiom
+    /// .NET guarantees on Unix — unlike the lower-level `File.OpenHandle`) so every raw child write lands
+    /// atomically at EOF on Linux, Alpine, and macOS alike, with no custom `fcntl(F_SETFL)` and no
+    /// per-platform O_APPEND numeric value. A bad path / denied access is returned as an honest `Error`
+    /// message for the caller to report as a spawn failure — never a silent downgrade to the parent's own
+    /// stdout/stderr.
+    let private openRedirectFd (path: string) (append: bool) : Result<int, string> =
+        try
+            if append then
+                // Kernel O_APPEND is set at OPEN TIME by `FileMode.Append`'s Unix `open(2)`. The raw fd is
+                // detached from the FileStream (`SetHandleAsInvalid` marks the handle closed WITHOUT
+                // calling close(2)) BEFORE `fs` is disposed at the end of this branch's scope, so the
+                // FileStream's own Dispose — with an empty write buffer (nothing was written) — is a no-op
+                // on the real fd, which stays ours to hand to the child.
+                use fs =
+                    new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)
+
+                let handle = fs.SafeFileHandle
+                let raw = int (handle.DangerousGetHandle())
+                handle.SetHandleAsInvalid()
+                Ok raw
+            else
+                // Create/truncate: no append concern, so the lighter `File.OpenHandle` primitive is kept.
+                // Release .NET's ownership WITHOUT closing the fd, exactly as in the append branch.
+                let handle =
+                    File.OpenHandle(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite)
+
+                let raw = int (handle.DangerousGetHandle())
+                handle.SetHandleAsInvalid()
+                Ok raw
+        with ex ->
+            Error ex.Message
+
     // errno value for a syscall interrupted by a signal (same number on Linux and macOS).
     let private EINTR = 4
 
@@ -1910,56 +1956,21 @@ module internal Posix =
 
             fd
 
-        // `Command.StdoutToFile`/`StderrToFile`: open the redirect file ON THE PARENT and hand its fd to
-        // the child as a child-side fd (dup2'd onto the child's slot by a `posix_spawn` file action, then
-        // closed in the child; the parent's copy closed after spawn), exactly like the `/dev/null` fd from
-        // `openNul`. Both the create/truncate and the append opens go through .NET's own `open(2)`, which
-        // sets O_CLOEXEC portably across Linux and macOS (no variadic `open(…, mode)` P/Invoke — the
-        // AArch64 variadic-ABI hazard this port avoids for `fcntl`), so the fd reaches the child with NO
-        // `dup(2)` of a second logical copy that would drop O_CLOEXEC (K-029). Ownership is then released
-        // from the SafeFileHandle (`SetHandleAsInvalid` — it does NOT close the fd) so the raw fd is
-        // managed by the SAME single-close child-side machinery. `append = false` creates/truncates via
-        // `File.OpenHandle(FileMode.Create)`; `append = true` opens a `FileStream(FileMode.Append)`, whose
-        // Unix open sets the kernel O_APPEND flag AT OPEN TIME (the classic multi-writer shared-log idiom
-        // .NET guarantees on Unix — unlike the lower-level `File.OpenHandle`) so every raw child write lands
-        // atomically at EOF on Linux, Alpine, and macOS alike, with no custom `fcntl(F_SETFL)` and no
-        // per-platform O_APPEND numeric value — closing the whole variadic-ABI risk class the two earlier
-        // fcntl-based fixes were exposed to. A bad path/permission fails the spawn honestly.
+        // `Command.StdoutToFile`/`StderrToFile`: the redirect file is opened ON THE PARENT by the shared
+        // `openRedirectFd` (see it for the O_APPEND / O_CLOEXEC rules, K-029/K-051) and handed to the
+        // child as a child-side fd — dup2'd onto the child's slot by a `posix_spawn` file action, then
+        // closed in the child; the parent's copy closed after spawn — exactly like the `/dev/null` fd from
+        // `openNul`. Registered in `childSideFds` so the parent closes it exactly once. A bad
+        // path/permission fails the spawn honestly — symmetric to a failed `open(/dev/null)` (`openNul`)
+        // or `socketpair()` (`makeStdioChannel`) — never a silent downgrade to the parent's own
+        // stdout/stderr.
         let openRedirectFile (label: string) (path: string) (append: bool) : int =
-            try
-                let fd =
-                    if append then
-                        // Kernel O_APPEND is set at OPEN TIME by `FileMode.Append`'s Unix `open(2)`. The raw
-                        // fd is detached from the FileStream (`SetHandleAsInvalid` marks the handle closed
-                        // WITHOUT calling close(2)) BEFORE `fs` is disposed at end of this branch's scope, so
-                        // the FileStream's own Dispose — with an empty write buffer (nothing was written) —
-                        // is a no-op on the real fd, which stays ours to hand to the child.
-                        use fs =
-                            new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)
-
-                        let handle = fs.SafeFileHandle
-                        let raw = int (handle.DangerousGetHandle())
-                        handle.SetHandleAsInvalid()
-                        raw
-                    else
-                        // Create/truncate: no append concern, so the lighter `File.OpenHandle` primitive is
-                        // kept. Release .NET's ownership WITHOUT closing the fd, exactly as before.
-                        let handle =
-                            File.OpenHandle(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite)
-
-                        let raw = int (handle.DangerousGetHandle())
-                        handle.SetHandleAsInvalid()
-                        raw
-
-                // The raw fd is now ours to hand to the child and to close exactly once via `childSideFds`
-                // (parent) + a child-side addclose.
+            match openRedirectFd path append with
+            | Ok fd ->
                 childSideFds.Add fd
                 fd
-            with ex ->
-                // A bad redirect path / denied access is an honest per-invocation spawn failure — symmetric
-                // to a failed `open(/dev/null)` (`openNul`) or `socketpair()` (`makeStdioChannel`) — never a
-                // silent downgrade to the parent's own stdout/stderr.
-                failure <- Some $"could not open the redirect file '{path}' for {label}: {ex.Message}"
+            | Error message ->
+                failure <- Some $"could not open the redirect file '{path}' for {label}: {message}"
                 -1
 
         // Both socketpair ends are bidirectional and interchangeable; the tuple keeps the pipe-era
@@ -2661,8 +2672,10 @@ module internal Posix =
     /// Rewrite a `setpriv`-helper `NotFound` (the helper is off PATH) into a typed `ProcessError.Spawn`
     /// against the ORIGINAL program, so a caller who never mentioned `setpriv` gets a message naming what
     /// their request actually needs. The reason is tailored to whichever knob(s) routed through `setpriv` —
-    /// a `Uid`/`Gid` drop, `Command.KillOnParentDeath`, or both.
-    let private remapSetprivNotFound (command: Command) (result: Result<Spawned, ProcessError>) =
+    /// a `Uid`/`Gid` drop, `Command.KillOnParentDeath`, or both. Generic in the success payload: the same
+    /// remap serves the contained spawn (`Spawned`) and the detached launch (`DetachedSpawn`), which route
+    /// a drop through the very same helper.
+    let private remapSetprivNotFound (command: Command) (result: Result<'spawn, ProcessError>) =
         match result with
         | Error(ProcessError.NotFound _) ->
             let config = command.Config
@@ -2849,3 +2862,345 @@ module internal Posix =
                     | None -> launch ()
                 else
                     launch ()
+
+    // ----------------------------------------------------------------------------------
+    // POSIX: the detached launch (Command.LaunchDetached) — deliberately NOT contained
+    // ----------------------------------------------------------------------------------
+    //
+    // Every other spawn here puts the child in a process group (or cgroup) the owning `ProcessGroup`
+    // tears down with `killpg`, and registers its pid with the event-driven reap machinery. The detached
+    // launch deliberately does neither:
+    //
+    //  * `POSIX_SPAWN_SETSID` unconditionally — the child becomes a session leader (sid == pgid == pid)
+    //    with NO controlling terminal, so it is immune to the terminal hangup that would otherwise reach
+    //    a child sharing the caller's session, and it is in no group anyone else will `killpg`. This is
+    //    exactly what `Command.Setsid` asks for, so setting that knob alongside is redundant, never a
+    //    conflict; `POSIX_SPAWN_SETPGROUP` is not set (it and `SETSID` are mutually exclusive — see
+    //    `spawnPosixViaSpawn`'s note).
+    //  * The pid is added to NO reap ledger (`pendingWaits`), because nothing here ever waits on it —
+    //    the same deliberate stance `ProcessGroup.Adopt` takes for an external pid (K-016/K-072). Nor is
+    //    there any teardown path: no `killProcessGroup`, no kill-on-dispose, nothing for a `Dispose` or a
+    //    finalizer to reach.
+    //
+    // Honest divergence (documented, not silently swallowed): `posix_spawn` cannot reparent, so the
+    // detached child is still this process's DIRECT child in the kernel's table. It genuinely survives
+    // the parent's exit (nothing kills it, and init adopts it then), but if it exits FIRST, while the
+    // parent is still alive, its zombie entry lingers until the parent exits, because ProcessKit
+    // deliberately never reaps a process it does not contain. Long-lived hosts that launch many
+    // short-lived detached children should use the ordinary contained verbs instead — which is what
+    // containment is for.
+
+    /// Launch `command` detached from all containment (see the section comment above): its own session,
+    /// no reap ledger entry, no teardown. Returns the child's pid and OS-reported start time — read while
+    /// the pid is still pinned by the unreaped child, so the identity pair can never describe a recycled
+    /// pid. Structurally a much smaller `spawnPosixViaSpawn`: no socketpairs, no parent-kept ends, and
+    /// therefore no stream wrapping and no post-spawn teardown other than the priority fault path.
+    let private spawnDetachedPosixCore (command: Command) : Result<DetachedSpawn, ProcessError> =
+        let config = command.Config
+        // The verb layer has already refused every feeder stdin source (there is no parent left to pump
+        // one), so stdin is either the parent's own — `Command.InheritStdin` — or an immediate EOF.
+        let stdinInherit = Stdin.isInherit config.StdinSource
+        // Child-side fds the parent closes after the spawn (the child gets its own via dup2).
+        let childSideFds = System.Collections.Generic.List<int>()
+        let mutable failure: string option = None
+        // The fd the child should see at each slot; -1 = no dup2, i.e. inherit the parent's fd as-is.
+        let mutable stdinChildFd = -1
+        let mutable stdoutChildFd = -1
+        let mutable stderrChildFd = -1
+
+        // A failed open("/dev/null") (EMFILE/ENFILE) fails the spawn honestly rather than leaving the
+        // slot at -1, which would silently hand the child the parent's real stream — the same guard, for
+        // the same reason, as `spawnPosixViaSpawn`'s `openNul`.
+        let openNul (label: string) (flags: int) =
+            let fd = openDevNull flags
+
+            if fd >= 0 then
+                childSideFds.Add fd
+            else
+                let errno = Marshal.GetLastWin32Error()
+                failure <- Some $"open(/dev/null) failed for {label} (errno {errno})"
+
+            fd
+
+        let openRedirect (label: string) (path: string) (append: bool) =
+            match openRedirectFd path append with
+            | Ok fd ->
+                childSideFds.Add fd
+                fd
+            | Error message ->
+                failure <- Some $"could not open the redirect file '{path}' for {label}: {message}"
+                -1
+
+        // `StdioMode.Piped` — the builder default — is the null device on this path: a detached child has
+        // no parent left to drain a pipe, and one whose read end is closed would break the child's first
+        // write. Documented on the verb (keep output with `StdoutToFile`, or share the caller's terminal
+        // with `StdioMode.Inherit`); every knob that genuinely needs a parent-side reader is refused up
+        // front by the verb layer. On macOS `POSIX_SPAWN_CLOEXEC_DEFAULT` closes every fd not named by a
+        // file action at exec, so an inherited slot needs a self-dup2 to survive; on Linux it is
+        // inherited naturally with no file action, exactly as in `spawnPosixViaSpawn`.
+        if stdinInherit then
+            stdinChildFd <- (if isMacOs then 0 else -1)
+        else
+            stdinChildFd <- openNul "stdin" O_RDONLY
+
+        if failure.IsNone then
+            match config.StdoutFile with
+            | Some(path, append) -> stdoutChildFd <- openRedirect "stdout" path append
+            | None ->
+                match config.StdoutMode with
+                | StdioMode.Inherit -> stdoutChildFd <- (if isMacOs then 1 else -1)
+                | StdioMode.Null
+                | StdioMode.Piped -> stdoutChildFd <- openNul "stdout" O_WRONLY
+
+        if failure.IsNone then
+            if config.MergeStderr then
+                // `2>&1` at the OS level: fd 2 is dup2'd onto stdout's child-side fd, so both reference
+                // the one destination. The fd is NOT re-added to `childSideFds` (the stdout branch
+                // already registered it, and it must be closed exactly once); an inherited stdout on
+                // Linux has no child-side fd, so point fd 2 at fd 1 explicitly.
+                stderrChildFd <- (if stdoutChildFd >= 0 then stdoutChildFd else 1)
+            else
+                match config.StderrFile with
+                | Some(path, append) -> stderrChildFd <- openRedirect "stderr" path append
+                | None ->
+                    match config.StderrMode with
+                    | StdioMode.Inherit -> stderrChildFd <- (if isMacOs then 2 else -1)
+                    | StdioMode.Null
+                    | StdioMode.Piped -> stderrChildFd <- openNul "stderr" O_WRONLY
+
+        let closeFd fd = close fd |> ignore
+
+        match failure with
+        | Some message ->
+            for fd in childSideFds do
+                closeFd fd
+
+            Error(ProcessError.Spawn(command.Program, message))
+        | None ->
+            // Native scratch for the opaque posix_spawn_file_actions_t / posix_spawnattr_t plus the
+            // marshalled argv/envp, released by the `finally` below on every path — the same allocation
+            // and unwind discipline as `spawnPosixViaSpawn`.
+            let mutable fileActions = IntPtr.Zero
+            let mutable attributes = IntPtr.Zero
+            let mutable fileActionsReady = false
+            let mutable attributesReady = false
+            let mutable argvPointer = IntPtr.Zero
+            let mutable argvAllocations: nativeint list = []
+            let mutable envpPointer = IntPtr.Zero
+            let mutable envpAllocations: nativeint list = []
+            let mutable childFdsOpen = true
+
+            let closeChildSideFds () =
+                if childFdsOpen then
+                    for fd in childSideFds do
+                        closeFd fd
+
+                    childFdsOpen <- false
+
+            try
+                try
+                    fileActions <- Marshal.AllocHGlobal 1024
+                    attributes <- Marshal.AllocHGlobal 1024
+                    let argv = command.Program :: List.ofSeq config.Args
+
+                    let envp =
+                        effectiveEnvironment command
+                        |> Seq.map (fun entry -> $"{entry.Key}={entry.Value}")
+                        |> List.ofSeq
+
+                    let argvArray, argvStrings = marshalCStringArray argv
+                    argvPointer <- argvArray
+                    argvAllocations <- argvStrings
+                    let envpArray, envpStrings = marshalCStringArray envp
+                    envpPointer <- envpArray
+                    envpAllocations <- envpStrings
+
+                    // Every helper returns an errno-style rc; the FIRST non-zero one is an honest spawn
+                    // failure and stops the sequence — never operate a helper on a half-initialized struct.
+                    let mutable err: ProcessError option = None
+
+                    let register (helper: string) (call: unit -> int) =
+                        if err.IsNone then
+                            let rc = call ()
+
+                            if rc <> 0 then
+                                err <- Some(ProcessError.Spawn(command.Program, $"{helper} failed (rc {rc})"))
+
+                    register "posix_spawn_file_actions_init" (fun () -> posix_spawn_file_actions_init fileActions)
+
+                    if err.IsNone then
+                        fileActionsReady <- true
+
+                    register "posix_spawnattr_init" (fun () -> posix_spawnattr_init attributes)
+
+                    if err.IsNone then
+                        attributesReady <- true
+
+                    if stdinChildFd >= 0 then
+                        register "posix_spawn_file_actions_adddup2 (stdin)" (fun () ->
+                            posix_spawn_file_actions_adddup2 (fileActions, stdinChildFd, 0))
+
+                    if stdoutChildFd >= 0 then
+                        register "posix_spawn_file_actions_adddup2 (stdout)" (fun () ->
+                            posix_spawn_file_actions_adddup2 (fileActions, stdoutChildFd, 1))
+
+                    if stderrChildFd >= 0 then
+                        register "posix_spawn_file_actions_adddup2 (stderr)" (fun () ->
+                            posix_spawn_file_actions_adddup2 (fileActions, stderrChildFd, 2))
+
+                    // After dup2, close the originals so only 0/1/2 remain in the child. There are no
+                    // parent-kept ends to close here — the detached path creates none.
+                    for fd in childSideFds do
+                        register "posix_spawn_file_actions_addclose (child-side fd)" (fun () ->
+                            posix_spawn_file_actions_addclose (fileActions, fd))
+
+                    match config.WorkingDirectory with
+                    | Some directory when err.IsNone ->
+                        try
+                            let rc = posix_spawn_file_actions_addchdir_np (fileActions, directory)
+
+                            if rc <> 0 then
+                                err <-
+                                    Some(
+                                        ProcessError.Spawn(
+                                            command.Program,
+                                            $"posix_spawn_file_actions_addchdir_np failed for CurrentDir (rc {rc})"
+                                        )
+                                    )
+                        with :? EntryPointNotFoundException ->
+                            // libc predates the entry point; CurrentDir genuinely cannot be applied here.
+                            // Honest typed failure, never a silent run in the PARENT's working directory.
+                            err <-
+                                Some(
+                                    ProcessError.Unsupported
+                                        "CurrentDir on this platform (needs posix_spawn_file_actions_addchdir_np: glibc >= 2.29 or macOS >= 10.15)"
+                                )
+                    | _ -> ()
+
+                    // The detach itself: a new session (and therefore a new process group) for the child,
+                    // with no controlling terminal. Never combined with `POSIX_SPAWN_SETPGROUP`.
+                    let spawnFlags =
+                        if isMacOs then
+                            posixSpawnSetsid ||| POSIX_SPAWN_CLOEXEC_DEFAULT
+                        else
+                            posixSpawnSetsid
+
+                    register "posix_spawnattr_setflags" (fun () -> posix_spawnattr_setflags (attributes, spawnFlags))
+
+                    match err with
+                    | Some error ->
+                        closeChildSideFds ()
+                        Error error
+                    | None ->
+                        let spawnUnderLock () =
+                            let mutable localPid = 0
+
+                            let rc =
+                                posix_spawnp (
+                                    &localPid,
+                                    command.Program,
+                                    fileActions,
+                                    attributes,
+                                    argvPointer,
+                                    envpPointer
+                                )
+
+                            rc, localPid
+
+                        // `umask(2)` is a whole-process attribute with no posix_spawn attribute, so it is
+                        // set on the parent around the spawn under the SAME lock every other spawn takes —
+                        // a concurrent no-mask spawn must never observe this one's temporary umask.
+                        let rc, pid =
+                            lock umaskSpawnLock (fun () ->
+                                match config.Umask with
+                                | None -> spawnUnderLock ()
+                                | Some mask ->
+                                    let previous = umask mask
+
+                                    try
+                                        spawnUnderLock ()
+                                    finally
+                                        umask previous |> ignore)
+
+                        closeChildSideFds ()
+
+                        if rc <> 0 then
+                            if rc = ENOENT then
+                                Error(notFoundFromSpawnFailure command)
+                            else
+                                Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
+                        else
+                            // The child is running and detached. The ONLY thing that can still fail is the
+                            // post-spawn priority nudge; a refused one must not leave a detached child
+                            // running at an unintended priority (there would be no handle to fix it with
+                            // afterwards), so it is killed and reaped — the one teardown on this path, and
+                            // a fault path only, never part of the normal lifetime.
+                            let priorityRc =
+                                match config.Priority with
+                                | None -> 0
+                                | Some priority ->
+                                    match setpriorityForTests with
+                                    | Some hook -> hook PRIO_PROCESS pid (PriorityMapping.niceValue priority)
+                                    | None -> setpriority (PRIO_PROCESS, pid, PriorityMapping.niceValue priority)
+
+                            if priorityRc <> 0 then
+                                let errno = Marshal.GetLastWin32Error()
+                                killProcess pid
+                                reapLeader pid
+
+                                Error(
+                                    ProcessError.Spawn(
+                                        command.Program,
+                                        $"could not set process priority via setpriority (errno {errno}); raising priority may require privilege (CAP_SYS_NICE)"
+                                    )
+                                )
+                            else
+                                // Read the identity pair now: the child has not been reaped (and never will
+                                // be by us), so the kernel cannot recycle this pid underneath the read.
+                                Ok
+                                    { Pid = pid
+                                      StartTime = readProcessStartTime pid }
+                finally
+                    if fileActionsReady then
+                        posix_spawn_file_actions_destroy fileActions |> ignore
+
+                    if attributesReady then
+                        posix_spawnattr_destroy attributes |> ignore
+
+                    if fileActions <> IntPtr.Zero then
+                        Marshal.FreeHGlobal fileActions
+
+                    if attributes <> IntPtr.Zero then
+                        Marshal.FreeHGlobal attributes
+
+                    freeCStringArray argvPointer argvAllocations
+                    freeCStringArray envpPointer envpAllocations
+            with ex ->
+                // Reached only for a fault BEFORE `posix_spawnp` returns a live child (an OOM in the
+                // marshalling, a missing posix_spawn* entry point), so there is nothing to kill: close
+                // whatever fds are still open and report an honest Spawn error.
+                closeChildSideFds ()
+                Error(ProcessError.Spawn(command.Program, ex.Message))
+
+    /// Launch `command` as a detached POSIX child (see the section comment above). A requested `Uid`/`Gid`
+    /// drop rides the SAME `setpriv` helper as the contained path — it `exec`s the target in place, so the
+    /// pid, the new session, and the identity pair are unaffected — with the same up-front guards
+    /// (supplementary groups need a drop; a non-root caller cannot change ids) and the same remap of a
+    /// missing helper to an honest `ProcessError.Spawn`. `Command.KillOnParentDeath` never reaches here:
+    /// the verb layer refuses it up front, since arming a parent-death signal on a process whose whole
+    /// purpose is to outlive the parent is a contradiction, not a composition.
+    let spawnDetachedPosix (command: Command) : Result<DetachedSpawn, ProcessError> =
+        // Resolve any prefer-local program to its absolute path first, so a `setpriv` rewrite carries the
+        // substituted path — exactly as `spawnPosix` does (T-182).
+        let command = applyPreferLocal command
+        let config = command.Config
+
+        match groupsRequireDropError command with
+        | Some error -> Error error
+        | None ->
+            if config.Uid.IsSome || config.Gid.IsSome then
+                match privilegeDropPrecheck command with
+                | Some error -> Error error
+                | None -> spawnDetachedPosixCore (setprivCommand command) |> remapSetprivNotFound command
+            else
+                spawnDetachedPosixCore command
