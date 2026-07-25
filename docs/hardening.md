@@ -20,6 +20,7 @@ the source of truth.
 - [Capping the output flood](#capping-the-output-flood)
 - [Timeouts: total, idle, and graceful](#timeouts-total-idle-and-graceful)
 - [Dropping privileges and detaching the session](#dropping-privileges-and-detaching-the-session)
+- [Dropping privileges on Windows](#dropping-privileges-on-windows)
 - [PTY echo and captured secrets](#pty-echo-and-captured-secrets)
 - [Clearing the inherited environment](#clearing-the-inherited-environment)
 - [Secrets in logs, traces, metrics, and cassettes](#secrets-in-logs-traces-metrics-and-cassettes)
@@ -33,7 +34,9 @@ the source of truth.
 | Runaway memory / fork bomb / CPU hog | `ProcessGroupOptions` resource limits | [Process groups](process-groups.md#resource-limits) |
 | Log/output flood | `Command.OutputBuffer` / `Command.StreamBuffer` | [Running commands](commands.md), [Streaming](streaming.md#bounding-the-streaming-backlog) |
 | Hangs / stuck children | `Command.Timeout` / `IdleTimeout` / `TimeoutGrace` | [Timeouts, retries & cancellation](timeouts-and-cancellation.md) |
-| Excess privilege, escaping the containing session | `Command.Uid` / `Gid` / `Groups` / `Umask` / `Setsid` | [Running commands](commands.md) |
+| Excess privilege, escaping the containing session (Unix) | `Command.Uid` / `Gid` / `Groups` / `Umask` / `Setsid` | [Running commands](commands.md) |
+| Excess privilege, write access to the user's own data (Windows) | `Command.WindowsRestrictedToken` / `WindowsIntegrityLevel` | [Running commands](commands.md) |
+| A contained tree reaching into the desktop session (Windows) | `ProcessGroupOptions.WithUiRestrictions` | [Process groups](process-groups.md#windows-ui-restrictions) |
 | A credential echoed to a PTY | `PtyConfig.Echo = false` | [Pseudo-terminal (PTY)](pty.md) |
 | Leaked inherited secrets in `env` | `Command.EnvClear` | [Running commands](commands.md) |
 | Secrets leaking into logs/traces/fixtures | The observability + record/replay secret invariants | [Observability](observability.md), [Testing your code](testing.md#record-and-replay) |
@@ -130,9 +133,87 @@ worth having at hand specifically for a hardening review:
 This whole family is **Unix-only**: on Windows, any of `Uid`/`Gid`/`Groups`/
 `Setsid`/`Umask` fails the spawn with `ProcessError.Unsupported` — never a silent
 no-op — so a cross-platform hardening path must handle that error rather than
-assume the drop happened. Windows has no equivalent primitive to substitute; rely
-on the Job Object's resource limits and the caller's own least-privileged service
-account instead.
+assume the drop happened. Windows drops privilege a different way; see the next
+section.
+
+## Dropping privileges on Windows
+
+Windows has no `setuid`, so the Unix family above cannot be ported knob for knob.
+What it has instead is the **token**: every process carries one, and a child can be
+given a *weakened copy of the caller's own* rather than the caller's own. That is
+the same goal — a child that cannot do what the parent could — reached through a
+different primitive, and it is what closes what used to be a one-sided chapter here.
+
+Three Windows-only measures, each covering a different axis:
+
+- **`Command.WindowsRestrictedToken()` — take away what the child may *do*.** The
+  child runs under a token created with `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)`:
+  the caller's identity and ACLs, but no privilege beyond the always-present
+  `SeChangeNotifyPrivilege`. This matters most when the caller is (or may be)
+  elevated — an untrusted child inheriting an administrator token can debug other
+  processes, load drivers, take ownership, and shut the host down.
+- **`Command.WindowsIntegrityLevel(level)` — take away what the child may *write
+  to*.** Lowering the child's mandatory integrity level (`Medium` / `Low` /
+  `Untrusted`) makes Windows' no-write-up policy deny it write access to everything
+  labelled above that level — the user's profile, `HKCU`, other processes' windows —
+  whatever the DACL says. `Low` is the practical sandbox level; `Untrusted` is
+  stricter than most programs can survive, so treat it as a tested choice rather
+  than a stricter default.
+- **`ProcessGroupOptions.WithUiRestrictions(...)` — take away what the *tree* may do
+  to the desktop session.** A Job Object UI restriction set (clipboard read/write,
+  desktop creation/switching, display and system parameters, global atoms, and
+  `ExitWindows`) applied to the whole contained tree, not just the direct child. The
+  flags and their exact meanings are in
+  [Process groups → Windows UI restrictions](process-groups.md#windows-ui-restrictions).
+
+**F#**
+
+```fsharp
+task {
+    // Windows: no privileges, no write access above Low integrity, and no reach into the desktop session.
+    let options =
+        ProcessGroupOptions()
+            .WithMaxProcesses(32)
+            .WithUiRestrictions(WindowsUiRestrictions.All)
+
+    match ProcessGroup.Create options with
+    | Error err -> eprintfn $"cannot sandbox this host: {err.Message}" // Unsupported off Windows
+    | Ok group ->
+        use group = group
+
+        let untrusted =
+            Command.create "untrusted-tool"
+            |> Command.envClear
+            |> Command.windowsRestrictedToken
+            |> Command.windowsIntegrityLevel WindowsIntegrityLevel.Low
+            |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+        match! group.StartAsync untrusted with
+        | Ok proc ->
+            use proc = proc
+            let! outcome = proc.WaitAsync()
+            printfn $"{outcome}"
+        | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+The same honesty rules apply in the other direction: on **POSIX**,
+`WindowsRestrictedToken`/`WindowsIntegrityLevel` fail the spawn — and
+`WithUiRestrictions` fails `ProcessGroup.Create`/`UpdateLimits` — with
+`ProcessError.Unsupported`, never a silent no-op. Because each half of the pair is
+unsupported on the platform the other needs, combining a Windows token knob with a
+Unix `Uid`/`Gid`/`Groups`/`Umask`/`Setsid` knob on one command is rejected at the
+**builder boundary** (`ArgumentException`) rather than left to fail at runtime on
+every host: build the command your platform can actually run, branching on
+`RuntimeInformation.IsOSPlatform` (or `ProcessGroup.Mechanism`) where you need both.
+
+Two limits worth stating plainly, so this is not mistaken for more than it is. The
+child keeps the **caller's identity**: a restricted, low-integrity child can still
+*read* everything the caller can read, and can still open network connections — this
+is privilege reduction, not isolation, and a secret readable by the caller is
+readable by the child (which is why `EnvClear`, below, still matters). And the
+already-open stdio handles keep working at any integrity level, because their access
+check happened in the parent — by design, or the child could not report anything back.
 
 ## PTY echo and captured secrets
 

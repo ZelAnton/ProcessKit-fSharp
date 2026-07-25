@@ -859,6 +859,85 @@ Drive such tools non-interactively instead (key-based auth, `ssh -o BatchMode=ye
 `GIT_TERMINAL_PROMPT=0`), or feed a known answer over
 [interactive stdin](streaming.md).
 
+### Windows privilege drop (restricted token & integrity level)
+
+Two **Windows-only** builders are the counterpart of the Unix drop above. They do
+not change *who* the child runs as — there is no `setuid` on Windows — they hand it
+a weakened copy of the caller's own token:
+
+- **`WindowsRestrictedToken()`** starts the child under a **restricted token**
+  (`CreateRestrictedToken` with `DISABLE_MAX_PRIVILEGE`): same user, same SIDs, same
+  file ACLs — but no privilege beyond the always-present `SeChangeNotifyPrivilege`.
+  A child that inherits an administrator's token can otherwise debug other
+  processes, load drivers, take ownership, or shut the machine down; a restricted
+  one cannot.
+- **`WindowsIntegrityLevel(level)`** lowers the child's **mandatory integrity
+  level** to `WindowsIntegrityLevel.Medium`, `Low`, or `Untrusted`. Windows'
+  no-write-up policy then denies it write access to anything labelled above that
+  level — the user's own files, `HKCU`, the windows of medium-integrity processes —
+  regardless of the DACL that would otherwise allow it.
+
+The two are independent axes: privileges are what the child may **do**, integrity is
+what it may **write to**. Set both and they compose onto one token.
+
+**F#**
+
+```fsharp
+task {
+    // Windows: no privileges, and no write access above Low integrity.
+    let plugin =
+        Command.create "untrusted-plugin"
+        |> Command.windowsRestrictedToken
+        |> Command.windowsIntegrityLevel WindowsIntegrityLevel.Low
+
+    let! _ = plugin.RunAsync()
+    ()
+}
+```
+
+**C#**
+
+```csharp
+// Windows: no privileges, and no write access above Low integrity.
+await new Command("untrusted-plugin")
+    .WindowsRestrictedToken()
+    .WindowsIntegrityLevel(WindowsIntegrityLevel.Low)
+    .RunAsync();
+```
+
+Honest by construction, exactly like the Unix family — mirror image, same rules:
+
+- On **POSIX** either builder fails the spawn with `ProcessError.Unsupported`
+  (a restricted token and a mandatory integrity label have no POSIX equivalent; use
+  `Uid`/`Gid`/`Groups` there), never a silently unhardened child.
+- **Only lowering is offered.** Windows refuses to raise a token's integrity and a
+  restricted token can only lose rights, so neither builder is a privilege
+  *escalation* path — and there is deliberately no "High" variant that could only
+  ever fail.
+- The child's **stdio still works** at `Low` or `Untrusted`: the pipes were opened
+  by the parent and handed over as inherited handles, whose access check already
+  happened. What the child loses is write access to *new* objects — which at
+  `Untrusted` is nearly everything, so many programs cannot run there at all. That
+  surfaces as the child's own failure (a non-zero exit), not as a ProcessKit error.
+- If a host's policy refuses to let ProcessKit assign the derived token at all, the
+  spawn fails with a typed `ProcessError.Spawn` naming that refusal — it never falls
+  back to starting the child unhardened.
+
+Two combinations are rejected at the **builder boundary** with `ArgumentException`,
+in either chaining order:
+
+- **With `Pty`** — a PTY run goes through the ConPTY spawn call, which does not carry
+  the hardened token, so the child would quietly keep the parent's full one.
+- **With `Uid` / `Gid` / `User` / `Groups` / `Umask` / `Setsid`** — each half is
+  `Unsupported` on the platform the other half needs, so a command carrying both
+  could not run on *any* host. Build the platform's own command instead of one
+  command that is refused everywhere.
+
+For the group-level companion — Job Object UI restrictions that stop a contained tree
+touching the clipboard, desktops, or `ExitWindows` — see
+[Process groups → Windows UI restrictions](process-groups.md#windows-ui-restrictions),
+and [Hardening untrusted children](hardening.md) for the whole perimeter.
+
 ## Consuming verbs
 
 The builder describes the run; the verb you finish with decides what you get back.

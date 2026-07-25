@@ -4,6 +4,7 @@ open System
 open System.IO
 open System.Runtime.InteropServices
 open System.Text
+open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
@@ -484,5 +485,147 @@ type VerbTests() =
                 match! runner.RunAsync withGroups with
                 | Error(ProcessError.Unsupported _) -> Assert.Pass()
                 | other -> Assert.Fail $"expected Unsupported for groups on Windows, got {other}"
+        }
+        :> Task
+
+    // ---- WindowsRestrictedToken / WindowsIntegrityLevel (Windows token hardening, mirror-image) ---
+    //
+    // The Windows counterpart of the Unix drop above, and verified the same way: the CHILD reads its own
+    // token and reports it back, so the assertion is about what the OS actually gave the child rather
+    // than about the call ProcessKit made. `whoami` prints locale-independent identifiers — privilege
+    // constant names (`SeShutdownPrivilege`, …) and the raw integrity SID (`S-1-16-4096`) — so the
+    // assertions do not depend on the host's display language.
+
+    /// Every privilege constant named in a `whoami /priv` report, whatever its enabled/disabled state.
+    static member private PrivilegeNames(output: string) =
+        Regex.Matches(output, @"Se[A-Za-z]+Privilege")
+        |> Seq.map (fun regexMatch -> regexMatch.Value)
+        |> Set.ofSeq
+
+    [<Test>]
+    member _.``WindowsRestrictedToken leaves the child no privilege beyond SeChangeNotifyPrivilege``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Restricted tokens are Windows-only; the POSIX behaviour is the Unsupported gate below."
+            else
+                // `whoami /priv` makes the child enumerate its OWN token's privileges.
+                let probe = Command.create "whoami" |> Command.args [ "/priv" ]
+
+                match! runner.RunAsync probe with
+                | Error error ->
+                    // No `whoami` on this host (a trimmed image): the contract is unobservable here, so skip
+                    // explicitly rather than pass vacuously.
+                    Assert.Ignore $"whoami is unavailable on this host ({error.Message}); cannot read the child's token"
+                | Ok baseline ->
+                    let baselinePrivileges = VerbTests.PrivilegeNames baseline
+
+                    let baselineBeyondChangeNotify =
+                        Set.remove "SeChangeNotifyPrivilege" baselinePrivileges
+
+                    if Set.isEmpty baselineBeyondChangeNotify then
+                        // Nothing to take away — the account already holds only the privilege
+                        // DISABLE_MAX_PRIVILEGE keeps, so the drop cannot be observed.
+                        Assert.Ignore
+                            "this account holds no privilege beyond SeChangeNotifyPrivilege, so the restricted token has nothing observable to remove"
+                    else
+                        match! runner.RunAsync(probe |> Command.windowsRestrictedToken) with
+                        | Error error -> Assert.Fail $"a restricted-token spawn should succeed, got {error}"
+                        | Ok restricted ->
+                            let restrictedBeyondChangeNotify =
+                                VerbTests.PrivilegeNames restricted |> Set.remove "SeChangeNotifyPrivilege"
+
+                            let message =
+                                $"DISABLE_MAX_PRIVILEGE must leave the child no privilege beyond SeChangeNotifyPrivilege, but it reported {restrictedBeyondChangeNotify}"
+
+                            Assert.That(restrictedBeyondChangeNotify, Is.Empty, message)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WindowsIntegrityLevel runs the child at the requested (lower) integrity level``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Integrity levels are Windows-only; the POSIX behaviour is the Unsupported gate below."
+            else
+                // `whoami /groups` prints the token's mandatory label row, including its raw SID —
+                // `S-1-16-4096` is Low, `S-1-16-8192` Medium, `S-1-16-12288` High.
+                let probe = Command.create "whoami" |> Command.args [ "/groups" ]
+                let lowIntegritySid = "S-1-16-4096"
+
+                match! runner.RunAsync probe with
+                | Error error ->
+                    Assert.Ignore $"whoami is unavailable on this host ({error.Message}); cannot read the child's token"
+                | Ok baseline ->
+                    // Contrast first: an ordinary child does NOT run at low integrity, so the assertion
+                    // below cannot pass by accident on a host that was already low.
+                    let contrast =
+                        $"the baseline child should not already be at low integrity, but reported {lowIntegritySid}"
+
+                    Assert.That(baseline, Does.Not.Contain lowIntegritySid, contrast)
+
+                    let lowered = probe |> Command.windowsIntegrityLevel WindowsIntegrityLevel.Low
+
+                    match! runner.RunAsync lowered with
+                    | Error error -> Assert.Fail $"a low-integrity spawn should succeed, got {error}"
+                    | Ok output ->
+                        let message =
+                            $"the child's own token should carry the Low mandatory label ({lowIntegritySid})"
+
+                        Assert.That(output, Does.Contain lowIntegritySid, message)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the Windows token knobs compose - a restricted, low-integrity child reports both``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows token hardening is Windows-only; see the POSIX Unsupported gate below."
+            else
+                // Both knobs land on ONE token: the restricted copy is what gets relabelled, so the child
+                // must report the lowered integrity AND the stripped privileges together.
+                let probe =
+                    Command.create "whoami"
+                    |> Command.args [ "/all" ]
+                    |> Command.windowsRestrictedToken
+                    |> Command.windowsIntegrityLevel WindowsIntegrityLevel.Low
+
+                match! runner.RunAsync probe with
+                | Error error ->
+                    Assert.Ignore $"whoami is unavailable on this host ({error.Message}); cannot read the child's token"
+                | Ok output ->
+                    let beyondChangeNotify =
+                        VerbTests.PrivilegeNames output |> Set.remove "SeChangeNotifyPrivilege"
+
+                    let integrityMessage = "the composed token should carry the Low mandatory label"
+                    Assert.That(output, Does.Contain "S-1-16-4096", integrityMessage)
+
+                    let privilegeMessage =
+                        $"the composed token should also be privilege-stripped, but reported {beyondChangeNotify}"
+
+                    Assert.That(beyondChangeNotify, Is.Empty, privilegeMessage)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the Windows token knobs are honestly Unsupported on POSIX (no silent no-op)``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore
+                    "The POSIX Unsupported gate is POSIX-only; Windows applies the hardening (observed above)."
+            else
+                // The exact mirror image of the Uid/Gid/Groups/Setsid/Umask gates above: a hardening
+                // request the platform cannot honour fails the spawn instead of being dropped in silence.
+                let restricted = shell "echo hi" |> Command.windowsRestrictedToken
+
+                match! runner.RunAsync restricted with
+                | Error(ProcessError.Unsupported _) -> ()
+                | other -> Assert.Fail $"expected Unsupported for WindowsRestrictedToken on POSIX, got {other}"
+
+                let lowered =
+                    shell "echo hi" |> Command.windowsIntegrityLevel WindowsIntegrityLevel.Low
+
+                match! runner.RunAsync lowered with
+                | Error(ProcessError.Unsupported _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected Unsupported for WindowsIntegrityLevel on POSIX, got {other}"
         }
         :> Task

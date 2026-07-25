@@ -119,25 +119,34 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                         Error(ProcessError.ResourceLimit message)
                 else
                     withBackend (JobObjectBackend job)
-        elif RuntimeInformation.IsOSPlatform OSPlatform.Linux && limits.Any then
-            if Native.Cgroup.cgroupV2Available () then
-                match Native.Cgroup.createCgroup limits with
-                | Ok path -> withBackend (CgroupBackend path)
-                | Error message -> Error(ProcessError.ResourceLimit message)
-            else
-                Error(
-                    ProcessError.ResourceLimit
-                        "cgroup v2 is not mounted; whole-tree resource limits need a Windows Job Object or Linux cgroup v2"
-                )
-        elif limits.Any then
-            // macOS / BSD, or Linux without cgroup v2 — no whole-tree limit primitive.
-            Error(
-                ProcessError.ResourceLimit
-                    "this platform has no whole-tree resource-limit primitive (needs a Windows Job Object or Linux cgroup v2)"
-            )
         else
-            // No limits: the POSIX group forms when children are spawned (each becomes its own pgid).
-            withBackend (ProcessGroupBackend())
+            // Job Object UI restrictions are refused before any other off-Windows dispatch: unlike the
+            // memory/process/CPU caps — which a cgroup v2 hierarchy CAN enforce, and whose absence is
+            // therefore a `ResourceLimit` — a clipboard/desktop/exit-Windows restriction has no analogue
+            // in any POSIX primitive at all, so `Unsupported` is the honest classification. Never a group
+            // that silently runs its tree unrestricted.
+            match limits.UiRestrictionsUnsupported with
+            | Some error -> Error error
+            | None ->
+                if RuntimeInformation.IsOSPlatform OSPlatform.Linux && limits.Any then
+                    if Native.Cgroup.cgroupV2Available () then
+                        match Native.Cgroup.createCgroup limits with
+                        | Ok path -> withBackend (CgroupBackend path)
+                        | Error message -> Error(ProcessError.ResourceLimit message)
+                    else
+                        Error(
+                            ProcessError.ResourceLimit
+                                "cgroup v2 is not mounted; whole-tree resource limits need a Windows Job Object or Linux cgroup v2"
+                        )
+                elif limits.Any then
+                    // macOS / BSD, or Linux without cgroup v2 — no whole-tree limit primitive.
+                    Error(
+                        ProcessError.ResourceLimit
+                            "this platform has no whole-tree resource-limit primitive (needs a Windows Job Object or Linux cgroup v2)"
+                    )
+                else
+                    // No limits: the POSIX group forms when children are spawned (each becomes its own pgid).
+                    withBackend (ProcessGroupBackend())
 
     /// Test-only seam: wrap an arbitrary containment backend so the lifecycle guard (spawn / control /
     /// stat versus release) can be exercised against a synthetic backend, with no real OS handles.

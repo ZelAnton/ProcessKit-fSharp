@@ -560,9 +560,17 @@ type internal CgroupBackend(cgroupPath: string) =
             // concurrent teardown mid-write. `updateCgroupLimits` best-effort restores any controller file
             // it already rewrote if a later write fails, so a genuine write/delegation failure is an honest
             // `ProcessError.ResourceLimit` AND the live cgroup is back on the previous set (T-207).
-            match Native.Cgroup.updateCgroupLimits cgroupPath limits with
-            | Ok() -> Ok()
-            | Error message -> Error(ProcessError.ResourceLimit message)
+            //
+            // Job Object UI restrictions have no cgroup counterpart to rewrite, so an update carrying any
+            // is refused up front with the same `Unsupported` `ProcessGroup.Create` gives here — the caps
+            // in force are left exactly as they were, rather than a partial apply that silently dropped
+            // the restriction half of the requested set.
+            match limits.UiRestrictionsUnsupported with
+            | Some error -> Error error
+            | None ->
+                match Native.Cgroup.updateCgroupLimits cgroupPath limits with
+                | Ok() -> Ok()
+                | Error message -> Error(ProcessError.ResourceLimit message)
 
         member _.HardRelease() =
             Native.Cgroup.killCgroup cgroupPath
@@ -763,15 +771,21 @@ type internal ProcessGroupBackend() =
             let active = children.Snapshot() |> List.filter stillOurs |> List.length
             Ok(ProcessGroupStats(active, None, None))
 
-        member _.UpdateLimits(_limits) =
+        member _.UpdateLimits(limits) =
             // The POSIX process-group mechanism has no whole-tree limit primitive to update — the exact
             // reason `ProcessGroup.Create` already refuses to build a limited group over it. Refuse the
             // update the same honest, typed way rather than pretending to have applied caps that no
-            // kernel container is enforcing (a silent no-op would be a false success).
-            Error(
-                ProcessError.ResourceLimit
-                    "the POSIX process-group mechanism has no whole-tree resource-limit primitive to update (needs a Windows Job Object or Linux cgroup v2)"
-            )
+            // kernel container is enforcing (a silent no-op would be a false success). A requested Job
+            // Object UI restriction is refused with `Unsupported` rather than `ResourceLimit`, matching
+            // `Create`: a resource cap exists as a concept here and merely cannot be enforced, while a
+            // clipboard/desktop restriction has no POSIX counterpart at all.
+            match limits.UiRestrictionsUnsupported with
+            | Some error -> Error error
+            | None ->
+                Error(
+                    ProcessError.ResourceLimit
+                        "the POSIX process-group mechanism has no whole-tree resource-limit primitive to update (needs a Windows Job Object or Linux cgroup v2)"
+                )
 
         member _.HardRelease() =
             // Each pgid's leader is a child we posix_spawned, so we must waitpid it ourselves — `killpg`

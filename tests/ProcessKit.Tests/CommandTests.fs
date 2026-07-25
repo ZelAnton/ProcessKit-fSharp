@@ -397,6 +397,154 @@ type CommandTests() =
         Assert.That(dropped.Config.Gid, Is.EqualTo(Some 1000))
         Assert.That(dropped.Config.Groups, Is.EqualTo(Some [ 27; 44 ]))
 
+    // ---- WindowsRestrictedToken / WindowsIntegrityLevel (Windows token hardening) ---------------
+
+    [<Test>]
+    member _.``the Windows token-hardening knobs are unset by default``() =
+        let config = Command.create("git").Config
+        Assert.That(config.WindowsRestrictedToken, Is.False)
+        Assert.That(config.WindowsIntegrityLevel, Is.EqualTo(None: WindowsIntegrityLevel option))
+
+    [<Test>]
+    member _.``WindowsRestrictedToken records the flag and the instance method matches the module function``() =
+        let viaModule = Command.create "git" |> Command.windowsRestrictedToken
+        let viaInstance = Command("git").WindowsRestrictedToken()
+        Assert.That(viaModule.Config.WindowsRestrictedToken, Is.True)
+        Assert.That(viaInstance.Config.WindowsRestrictedToken, Is.True)
+
+    [<Test>]
+    member _.``WindowsIntegrityLevel records the level and the instance method matches the module function``() =
+        let viaModule =
+            Command.create "git" |> Command.windowsIntegrityLevel WindowsIntegrityLevel.Low
+
+        let viaInstance = Command("git").WindowsIntegrityLevel WindowsIntegrityLevel.Low
+        Assert.That(viaModule.Config.WindowsIntegrityLevel, Is.EqualTo(Some WindowsIntegrityLevel.Low))
+        Assert.That(viaInstance.Config.WindowsIntegrityLevel, Is.EqualTo(Some WindowsIntegrityLevel.Low))
+
+    [<Test>]
+    member _.``the Windows token-hardening knobs are immutable - setting them returns a new command``() =
+        let baseCommand = Command.create "git"
+
+        let hardened =
+            baseCommand
+            |> Command.windowsRestrictedToken
+            |> Command.windowsIntegrityLevel WindowsIntegrityLevel.Untrusted
+
+        Assert.That(baseCommand.Config.WindowsRestrictedToken, Is.False)
+        Assert.That(baseCommand.Config.WindowsIntegrityLevel, Is.EqualTo(None: WindowsIntegrityLevel option))
+        Assert.That(hardened.Config.WindowsRestrictedToken, Is.True)
+        Assert.That(hardened.Config.WindowsIntegrityLevel, Is.EqualTo(Some WindowsIntegrityLevel.Untrusted))
+
+    [<Test>]
+    member _.``the two Windows token knobs compose - privileges and integrity are independent axes``() =
+        // Both land on ONE token at spawn: the restricted copy is what gets the lowered label. Setting
+        // either must not clear the other.
+        let hardened =
+            Command.create "worker"
+            |> Command.windowsIntegrityLevel WindowsIntegrityLevel.Low
+            |> Command.windowsRestrictedToken
+
+        Assert.That(hardened.Config.WindowsRestrictedToken, Is.True)
+        Assert.That(hardened.Config.WindowsIntegrityLevel, Is.EqualTo(Some WindowsIntegrityLevel.Low))
+
+    // A Windows-only token knob combined with a Unix-only privilege/session knob is a command NO platform
+    // could run (each half is `ProcessError.Unsupported` on the platform the other half needs), so it is
+    // refused at the builder boundary — in both chaining orders, like every other conflict pair here.
+
+    [<Test>]
+    member _.``a Unix privilege drop then WindowsRestrictedToken is rejected``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () ->
+                Command.create "git"
+                |> Command.user 1000 1000
+                |> Command.windowsRestrictedToken
+                |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``WindowsRestrictedToken then a Unix privilege drop is rejected, reverse order``() =
+        let ex =
+            Assert.Throws<ArgumentException>(
+                Action(fun () ->
+                    Command.create "git"
+                    |> Command.windowsRestrictedToken
+                    |> Command.uid 1000
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail "expected an ArgumentException"
+        | e -> Assert.That(e.ParamName, Is.EqualTo "Uid")
+
+    [<Test>]
+    member _.``Setsid then WindowsIntegrityLevel is rejected``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () ->
+                Command.create "git"
+                |> Command.setsid
+                |> Command.windowsIntegrityLevel WindowsIntegrityLevel.Low
+                |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``WindowsIntegrityLevel then Umask is rejected, reverse order``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () ->
+                Command.create "git"
+                |> Command.windowsIntegrityLevel WindowsIntegrityLevel.Low
+                |> Command.umask 0o022
+                |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``Groups after WindowsRestrictedToken is rejected``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () ->
+                Command.create "git"
+                |> Command.windowsRestrictedToken
+                |> Command.groups [ 27 ]
+                |> ignore)
+        )
+        |> ignore
+
+    // A PTY spawns through the ConPTY call, which does not carry the hardened token — so the pair is
+    // refused rather than silently giving the child the parent's full token. Both orders, as with Setsid.
+
+    [<Test>]
+    member _.``Pty then WindowsRestrictedToken is rejected``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> (Command.create "cmd" |> Command.pty).WindowsRestrictedToken() |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``WindowsRestrictedToken then Pty is rejected, reverse order``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> ((Command.create "cmd").WindowsRestrictedToken()).Pty() |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``Pty then WindowsIntegrityLevel is rejected``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () ->
+                (Command.create "cmd" |> Command.pty).WindowsIntegrityLevel WindowsIntegrityLevel.Low
+                |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``WindowsIntegrityLevel then Pty is rejected, reverse order``() =
+        Assert.Throws<ArgumentException>(
+            Action(fun () ->
+                ((Command.create "cmd").WindowsIntegrityLevel WindowsIntegrityLevel.Low).Pty()
+                |> ignore)
+        )
+        |> ignore
+
     // ---- KillOnParentDeath (reap on sudden parent death) + platform scope report ---------------
 
     [<Test>]

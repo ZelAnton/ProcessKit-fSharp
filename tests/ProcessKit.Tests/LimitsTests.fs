@@ -275,6 +275,182 @@ type LimitsTests() =
         }
         :> Task
 
+    // ---- Job Object UI restrictions (Windows-only whole-tree desktop restrictions) ---------------
+
+    [<Test>]
+    member _.``WithUiRestrictions records the flag set and counts as a limit``() =
+        let restrictions =
+            WindowsUiRestrictions.ReadClipboard
+            ||| WindowsUiRestrictions.WriteClipboard
+            ||| WindowsUiRestrictions.ExitWindows
+
+        let options = ProcessGroupOptions().WithUiRestrictions restrictions
+        Assert.That(options.Limits.UiRestrictions, Is.EqualTo restrictions)
+        // Restrictions alone still need the limit-capable mechanism, so they must make `Any` true —
+        // otherwise `ProcessGroup.Create` would skip the apply and hand back an unrestricted Job.
+        Assert.That(options.Limits.Any, Is.True)
+        Assert.That(ResourceLimits.None.UiRestrictions, Is.EqualTo WindowsUiRestrictions.None)
+        Assert.That(ResourceLimits.None.Any, Is.False)
+
+    [<Test>]
+    member _.``WithUiRestrictions composes with the resource caps and can be cleared again``() =
+        let both =
+            ProcessGroupOptions().WithMemoryMax(128L * 1024L * 1024L).WithUiRestrictions(WindowsUiRestrictions.Desktop)
+
+        Assert.That(both.Limits.MemoryMax, Is.EqualTo(Some(128L * 1024L * 1024L)))
+        Assert.That(both.Limits.UiRestrictions, Is.EqualTo WindowsUiRestrictions.Desktop)
+
+        // Replace semantics, like every other dimension: `None` clears the set rather than merging.
+        let cleared = both.WithUiRestrictions WindowsUiRestrictions.None
+        Assert.That(cleared.Limits.UiRestrictions, Is.EqualTo WindowsUiRestrictions.None)
+        Assert.That(cleared.Limits.MemoryMax, Is.EqualTo(Some(128L * 1024L * 1024L)))
+
+    [<Test>]
+    member _.``WithUiRestrictions rejects bits outside the defined set``() =
+        // An undefined bit has no meaning to SetInformationJobObject; refusing it at the builder keeps an
+        // out-of-range cast from being written to the Job as an unknown restriction class.
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () ->
+                ResourceLimits.None.WithUiRestrictions(enum<WindowsUiRestrictions> 0x1000)
+                |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () ->
+                ProcessGroupOptions().WithUiRestrictions(enum<WindowsUiRestrictions> -1)
+                |> ignore)
+        )
+        |> ignore
+
+        // The whole defined set is of course accepted.
+        let all = ResourceLimits.None.WithUiRestrictions WindowsUiRestrictions.All
+        Assert.That(all.UiRestrictions, Is.EqualTo WindowsUiRestrictions.All)
+
+    [<Test>]
+    member _.``UI restrictions round-trip through the Job Object (Windows)``() =
+        if not isWindows then
+            Assert.Ignore "Job Object UI restrictions are Windows-only; the POSIX refusal is asserted below."
+        else
+            // The real apply path `ProcessGroup.Create`/`UpdateLimits` uses, asserted against the Job's own
+            // read-back: the UI behaviour itself (a blocked clipboard read) is not observable from a test,
+            // but the configuration the kernel now holds is.
+            match Native.Windows.createWindowsJob () with
+            | Error error -> Assert.Fail $"could not create a Job Object: {error}"
+            | Ok job ->
+                try
+                    let requested =
+                        WindowsUiRestrictions.ReadClipboard
+                        ||| WindowsUiRestrictions.Desktop
+                        ||| WindowsUiRestrictions.ExitWindows
+
+                    let limits = ResourceLimits.None.WithUiRestrictions requested
+
+                    match Native.Windows.applyWindowsJobLimits job limits with
+                    | Error message -> Assert.Fail $"applying UI restrictions failed: {message}"
+                    | Ok() ->
+                        match Native.Windows.queryWindowsUiRestrictions job with
+                        | None -> Assert.Fail "the Job's UI restrictions could not be read back"
+                        | Some inForce ->
+                            Assert.That(inForce, Is.EqualTo(uint32 (int requested)))
+
+                            // Replace semantics on a LIVE Job: dropping the set lifts the restrictions
+                            // rather than leaving the previous ones in force.
+                            match Native.Windows.applyWindowsJobLimits job ResourceLimits.None with
+                            | Error message -> Assert.Fail $"clearing UI restrictions failed: {message}"
+                            | Ok() ->
+                                match Native.Windows.queryWindowsUiRestrictions job with
+                                | None -> Assert.Fail "the Job's UI restrictions could not be read back after clearing"
+                                | Some cleared -> Assert.That(cleared, Is.EqualTo 0u)
+                finally
+                    Native.Windows.closeWindowsHandle job
+
+    [<Test>]
+    member _.``a group created with UI restrictions still runs children, and can update or clear them (Windows)``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Job Object UI restrictions are Windows-only; the refusal is asserted below."
+            else
+                // The public path end to end: Create applies them alongside a resource cap, the group
+                // still works, and a live UpdateLimits replaces (then clears) the set with `Options`
+                // following what is actually enforced.
+                let options =
+                    ProcessGroupOptions()
+                        .WithMaxProcesses(64)
+                        .WithUiRestrictions(WindowsUiRestrictions.ReadClipboard ||| WindowsUiRestrictions.ExitWindows)
+
+                match ProcessGroup.Create options with
+                | Error error -> Assert.Fail $"a Job Object should accept UI restrictions, got {error}"
+                | Ok group ->
+                    use group = group
+                    Assert.That(group.Mechanism, Is.EqualTo Mechanism.JobObject)
+
+                    Assert.That(
+                        group.Options.Limits.UiRestrictions,
+                        Is.EqualTo(WindowsUiRestrictions.ReadClipboard ||| WindowsUiRestrictions.ExitWindows)
+                    )
+
+                    // A restricted tree is still a working tree: an ordinary console child is unaffected.
+                    match! runInGroup group with
+                    | Ok result -> Assert.That(result.Stdout, Does.Contain "limited")
+                    | Error error -> Assert.Fail $"a child in a UI-restricted group should still run, got {error}"
+
+                    let widened =
+                        ResourceLimits.None.WithMaxProcesses(64).WithUiRestrictions WindowsUiRestrictions.All
+
+                    match group.UpdateLimits widened with
+                    | Ok() -> Assert.That(group.Options.Limits.UiRestrictions, Is.EqualTo WindowsUiRestrictions.All)
+                    | Error error -> Assert.Fail $"updating UI restrictions on a live Job should succeed, got {error}"
+
+                    // Replace semantics through the public verb too: a set without restrictions lifts them.
+                    match group.UpdateLimits(ResourceLimits.None.WithMaxProcesses 64) with
+                    | Ok() -> Assert.That(group.Options.Limits.UiRestrictions, Is.EqualTo WindowsUiRestrictions.None)
+                    | Error error -> Assert.Fail $"clearing UI restrictions on a live Job should succeed, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a group asking for UI restrictions is honestly Unsupported off Windows``() =
+        if isWindows then
+            Assert.Ignore "The Unsupported gate is the off-Windows behaviour; Windows applies the restrictions."
+        else
+            // No POSIX primitive has this concept at all — so it is `Unsupported`, distinct from the
+            // `ResourceLimit` used when a cap that exists in principle merely cannot be enforced here.
+            // Never a group that quietly runs its tree with no restrictions.
+            let options =
+                ProcessGroupOptions().WithUiRestrictions WindowsUiRestrictions.ReadClipboard
+
+            match ProcessGroup.Create options with
+            | Error(ProcessError.Unsupported _) -> Assert.Pass()
+            | Ok group ->
+                (group :> IDisposable).Dispose()
+                Assert.Fail "a group with UI restrictions must not be created off Windows"
+            | Error other -> Assert.Fail $"expected Unsupported for UI restrictions off Windows, got {other}"
+
+    [<Test>]
+    member _.``UpdateLimits carrying UI restrictions is honestly Unsupported on the POSIX backends``() =
+        // Backend-level (runs on every platform): both non-Job backends must refuse the update rather
+        // than apply the resource half and silently drop the restriction half.
+        let limits =
+            ResourceLimits.None.WithMemoryMax(64L * 1024L * 1024L).WithUiRestrictions(WindowsUiRestrictions.All)
+
+        let processGroup: IContainmentBackend = ProcessGroupBackend()
+
+        match processGroup.UpdateLimits limits with
+        | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Is.Not.Empty)
+        | other -> Assert.Fail $"expected Unsupported from the process-group backend, got {other}"
+
+        // The cgroup backend refuses before it touches a single controller file, so a non-existent path
+        // is enough to prove the gate runs first.
+        let cgroup: IContainmentBackend =
+            CgroupBackend(Path.Combine(Path.GetTempPath(), $"processkit-ui-{Guid.NewGuid():N}"))
+
+        match cgroup.UpdateLimits limits with
+        | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Is.Not.Empty)
+        | other -> Assert.Fail $"expected Unsupported from the cgroup backend, got {other}"
+
     [<Test>]
     member _.``UpdateLimits on the POSIX process-group backend is an honest typed ResourceLimit``() =
         // The process-group mechanism has no whole-tree limit primitive, so a LIVE limit update must be

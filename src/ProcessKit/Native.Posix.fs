@@ -2696,6 +2696,29 @@ module internal Posix =
             )
         | other -> other
 
+    /// The honest typed refusal for the Windows-only token-hardening knobs
+    /// (`Command.WindowsRestrictedToken`/`WindowsIntegrityLevel`), or `None` when neither is requested.
+    /// Both are Win32 token concepts — a `CreateRestrictedToken` privilege strip and a mandatory
+    /// integrity label — with no POSIX equivalent: a POSIX privilege drop is `Uid`/`Gid`/`Groups`, an
+    /// entirely different mechanism this cannot silently stand in for. Refused BEFORE any spawn work on
+    /// every POSIX entry point, exactly as `Native.Windows.spawnWindows` refuses `Uid`/`Gid`/`Groups`/
+    /// `Setsid`/`Umask` — the two Unsupported gates are deliberate mirror images, so neither platform
+    /// silently ignores the other's hardening request. Reported one at a time; the first requested knob
+    /// names the failure.
+    let private windowsHardeningUnsupported (config: CommandConfig) : ProcessError option =
+        if config.WindowsRestrictedToken then
+            Some(
+                ProcessError.Unsupported
+                    "WindowsRestrictedToken is a Win32 restricted-token (CreateRestrictedToken) primitive; POSIX has no equivalent (use Uid/Gid/Groups for a POSIX privilege drop)"
+            )
+        elif config.WindowsIntegrityLevel.IsSome then
+            Some(
+                ProcessError.Unsupported
+                    "WindowsIntegrityLevel is a Windows mandatory-integrity-label primitive; POSIX has no equivalent (use Uid/Gid/Groups for a POSIX privilege drop)"
+            )
+        else
+            None
+
     /// Spawn `command` as a contained POSIX child. A command requesting a privilege drop (`Uid`/`Gid`) or
     /// `Command.KillOnParentDeath` (Linux) is rewritten to run through the `setpriv` helper and spawned on
     /// the ordinary `posix_spawn` path — the drop / `--pdeathsig` arming runs in `setpriv` before it
@@ -2710,40 +2733,46 @@ module internal Posix =
         let command = applyPreferLocal command
         let config = command.Config
 
-        if
-            config.KillOnParentDeath
-            && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux)
-        then
-            // macOS/BSD have no `PR_SET_PDEATHSIG` analog to reap a child on sudden parent death. Refuse the
-            // request honestly rather than silently ignoring it (matching `KillOnParentDeathScope.Nothing`).
-            Error(
-                ProcessError.Unsupported
-                    "KillOnParentDeath needs Linux's PR_SET_PDEATHSIG (armed via setpriv); macOS/BSD have no parent-death-signal analog"
-            )
-        elif config.Pty.IsSome then
-            // A PTY gives the child a real controlling pseudo-terminal via the `setsid --ctty` helper (see
-            // `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe (D9). A
-            // `KillOnParentDeath` request is armed inside the ctty shim (`cttyShimCommand`, via `setpriv`).
-            spawnPosixPty command
-        else
+        // The Windows-only token knobs are refused first, before any other dispatch: a POSIX host has no
+        // restricted token and no integrity label to honour them with.
+        match windowsHardeningUnsupported config with
+        | Some error -> Error error
+        | None ->
+            if
+                config.KillOnParentDeath
+                && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux)
+            then
+                // macOS/BSD have no `PR_SET_PDEATHSIG` analog to reap a child on sudden parent death. Refuse
+                // the request honestly rather than silently ignoring it (matching
+                // `KillOnParentDeathScope.Nothing`).
+                Error(
+                    ProcessError.Unsupported
+                        "KillOnParentDeath needs Linux's PR_SET_PDEATHSIG (armed via setpriv); macOS/BSD have no parent-death-signal analog"
+                )
+            elif config.Pty.IsSome then
+                // A PTY gives the child a real controlling pseudo-terminal via the `setsid --ctty` helper (see
+                // `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe (D9). A
+                // `KillOnParentDeath` request is armed inside the ctty shim (`cttyShimCommand`, via `setpriv`).
+                spawnPosixPty command
+            else
 
-            match groupsRequireDropError command with
-            | Some error -> Error error
-            | None ->
-                if needsSetpriv config then
-                    // A uid/gid drop needs the non-root precheck; a lone `KillOnParentDeath` (no credential
-                    // change) does not, so the precheck runs only when a drop is actually requested.
-                    let precheck =
-                        if config.Uid.IsSome || config.Gid.IsSome then
-                            privilegeDropPrecheck command
-                        else
-                            None
+                match groupsRequireDropError command with
+                | Some error -> Error error
+                | None ->
+                    if needsSetpriv config then
+                        // A uid/gid drop needs the non-root precheck; a lone `KillOnParentDeath` (no credential
+                        // change) does not, so the precheck runs only when a drop is actually requested.
+                        let precheck =
+                            if config.Uid.IsSome || config.Gid.IsSome then
+                                privilegeDropPrecheck command
+                            else
+                                None
 
-                    match precheck with
-                    | Some error -> Error error
-                    | None -> spawnPosixViaSpawn (setprivCommand command) |> remapSetprivNotFound command
-                else
-                    spawnPosixViaSpawn command
+                        match precheck with
+                        | Some error -> Error error
+                        | None -> spawnPosixViaSpawn (setprivCommand command) |> remapSetprivNotFound command
+                    else
+                        spawnPosixViaSpawn command
 
     // ----------------------------------------------------------------------------------
     // Linux cgroup v2: place the child INSIDE its cgroup atomically with its own execution
@@ -2846,11 +2875,16 @@ module internal Posix =
                 )
             | other -> other
 
-        // A PTY gates the same unsupported-host check as `spawnPosixPty` before the cgroup launch; the rest
-        // of the dispatch (Groups-need-a-drop, non-root drop precheck) is shared with the non-pty path.
-        let ptyGate = if config.Pty.IsSome then ptyHostUnsupported () else None
+        // The Windows-only token knobs have no POSIX equivalent and are refused first (the same gate
+        // `spawnPosix` applies); a PTY then gates the same unsupported-host check as `spawnPosixPty` before
+        // the cgroup launch. The rest of the dispatch (Groups-need-a-drop, non-root drop precheck) is
+        // shared with the non-pty path.
+        let unsupportedGate =
+            match windowsHardeningUnsupported config with
+            | Some error -> Some error
+            | None -> if config.Pty.IsSome then ptyHostUnsupported () else None
 
-        match ptyGate with
+        match unsupportedGate with
         | Some error -> Error error
         | None ->
             match groupsRequireDropError command with
@@ -3195,12 +3229,17 @@ module internal Posix =
         let command = applyPreferLocal command
         let config = command.Config
 
-        match groupsRequireDropError command with
+        // The Windows-only token knobs are refused here too, before any launch work: a detached child gets
+        // no weaker honesty guarantee than a contained one just because nothing tracks it afterwards.
+        match windowsHardeningUnsupported config with
         | Some error -> Error error
         | None ->
-            if config.Uid.IsSome || config.Gid.IsSome then
-                match privilegeDropPrecheck command with
-                | Some error -> Error error
-                | None -> spawnDetachedPosixCore (setprivCommand command) |> remapSetprivNotFound command
-            else
-                spawnDetachedPosixCore command
+            match groupsRequireDropError command with
+            | Some error -> Error error
+            | None ->
+                if config.Uid.IsSome || config.Gid.IsSome then
+                    match privilegeDropPrecheck command with
+                    | Some error -> Error error
+                    | None -> spawnDetachedPosixCore (setprivCommand command) |> remapSetprivNotFound command
+                else
+                    spawnDetachedPosixCore command

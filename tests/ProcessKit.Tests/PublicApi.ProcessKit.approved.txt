@@ -75,6 +75,8 @@ class ProcessKit.Command
   member UncheckedInPipe() : ProcessKit.Command
   member User(System.Int32, System.Int32) : ProcessKit.Command
   member WindowsCtrlSignals() : ProcessKit.Command
+  member WindowsIntegrityLevel(ProcessKit.WindowsIntegrityLevel) : ProcessKit.Command
+  member WindowsRestrictedToken() : ProcessKit.Command
   new(System.String)
   property Arguments : System.Collections.Generic.IReadOnlyList<System.String> { get }
   property ConfiguredTimeout : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
@@ -133,6 +135,8 @@ module ProcessKit.CommandModule
   static member uncheckedInPipe(ProcessKit.Command) : ProcessKit.Command
   static member user(System.Int32, System.Int32, ProcessKit.Command) : ProcessKit.Command
   static member windowsCtrlSignals(ProcessKit.Command) : ProcessKit.Command
+  static member windowsIntegrityLevel(ProcessKit.WindowsIntegrityLevel, ProcessKit.Command) : ProcessKit.Command
+  static member windowsRestrictedToken(ProcessKit.Command) : ProcessKit.Command
 
 class ProcessKit.CommandVerbs
   static member ExitCodeAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.Int32, ProcessKit.ProcessError>>
@@ -761,6 +765,7 @@ class ProcessKit.ProcessGroupOptions
   member WithMaxProcesses(System.Int32) : ProcessKit.ProcessGroupOptions
   member WithMemoryMax(System.Int64) : ProcessKit.ProcessGroupOptions
   member WithShutdownTimeout(System.TimeSpan) : ProcessKit.ProcessGroupOptions
+  member WithUiRestrictions(ProcessKit.WindowsUiRestrictions) : ProcessKit.ProcessGroupOptions
   new()
   property Limits : ProcessKit.ResourceLimits { get }
   property ShutdownTimeout : System.TimeSpan { get }
@@ -911,10 +916,12 @@ class ProcessKit.ResourceLimits
   member WithCpuQuota(System.Double) : ProcessKit.ResourceLimits
   member WithMaxProcesses(System.Int32) : ProcessKit.ResourceLimits
   member WithMemoryMax(System.Int64) : ProcessKit.ResourceLimits
+  member WithUiRestrictions(ProcessKit.WindowsUiRestrictions) : ProcessKit.ResourceLimits
   property CpuQuota : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
   property MaxProcesses : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property MemoryMax : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property None : ProcessKit.ResourceLimits { get }
+  property UiRestrictions : ProcessKit.WindowsUiRestrictions { get }
 
 class ProcessKit.RestartCause
   :> System.Collections.IStructuralEquatable
@@ -1287,4 +1294,51 @@ delegate ProcessKit.TryParser`1 : System.MulticastDelegate
 class ProcessKit.WaitAnyResult
   property Index : System.Int32 { get }
   property Outcome : ProcessKit.Outcome { get }
+
+class ProcessKit.WindowsIntegrityLevel
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.WindowsIntegrityLevel>
+  member Equals(ProcessKit.WindowsIntegrityLevel) : System.Boolean
+  member Equals(ProcessKit.WindowsIntegrityLevel, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsLow() : System.Boolean
+  member get_IsMedium() : System.Boolean
+  member get_IsUntrusted() : System.Boolean
+  member get_Tag() : System.Int32
+  property IsLow : System.Boolean { get }
+  property IsMedium : System.Boolean { get }
+  property IsUntrusted : System.Boolean { get }
+  property Low : ProcessKit.WindowsIntegrityLevel { get }
+  property Medium : ProcessKit.WindowsIntegrityLevel { get }
+  property Tag : System.Int32 { get }
+  property Untrusted : ProcessKit.WindowsIntegrityLevel { get }
+  static member get_Low() : ProcessKit.WindowsIntegrityLevel
+  static member get_Medium() : ProcessKit.WindowsIntegrityLevel
+  static member get_Untrusted() : ProcessKit.WindowsIntegrityLevel
+
+module ProcessKit.WindowsIntegrityLevel+Tags
+  field literal Low : System.Int32
+  field literal Medium : System.Int32
+  field literal Untrusted : System.Int32
+
+enum ProcessKit.WindowsUiRestrictions
+  :> System.IComparable
+  :> System.IConvertible
+  :> System.IFormattable
+  :> System.ISpanFormattable
+  field literal All : ProcessKit.WindowsUiRestrictions
+  field literal Desktop : ProcessKit.WindowsUiRestrictions
+  field literal DisplaySettings : ProcessKit.WindowsUiRestrictions
+  field literal ExitWindows : ProcessKit.WindowsUiRestrictions
+  field literal GlobalAtoms : ProcessKit.WindowsUiRestrictions
+  field literal Handles : ProcessKit.WindowsUiRestrictions
+  field literal None : ProcessKit.WindowsUiRestrictions
+  field literal ReadClipboard : ProcessKit.WindowsUiRestrictions
+  field literal SystemParameters : ProcessKit.WindowsUiRestrictions
+  field literal WriteClipboard : ProcessKit.WindowsUiRestrictions
+  field value__ : System.Int32
 

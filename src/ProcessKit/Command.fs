@@ -45,6 +45,43 @@ type PtyConfig =
     /// The ratified default PTY geometry and flags: 80 columns × 24 rows, cooked-mode echo on.
     static member Default = { Cols = 80; Rows = 24; Echo = true }
 
+/// The Windows *mandatory integrity level* a child's token is lowered to — see
+/// `Command.WindowsIntegrityLevel`.
+///
+/// Windows labels every token (and every securable object) with an integrity level and enforces a
+/// no-write-up policy: a process may not modify an object labelled above its own level, whatever the
+/// DACL says. Lowering the level a child runs at therefore takes away write access to the user's own
+/// files, registry, and windows *without* changing who the child runs as — the closest Windows
+/// analogue to the Unix `Uid`/`Gid` drop, and the mechanism behind browser renderer sandboxes.
+///
+/// Only levels at or below an ordinary process's own are offered: a token's integrity can be lowered
+/// but never raised (`SetTokenInformation` refuses), so an "elevate me" variant could only ever fail
+/// the spawn. Pair with `Command.WindowsRestrictedToken` for the full drop — the two are independent
+/// (integrity governs what may be *written to*, privileges govern what may be *done*).
+[<RequireQualifiedAccess; NoComparison>]
+type WindowsIntegrityLevel =
+
+    /// `S-1-16-8192` — the level an ordinary, non-elevated user process already runs at. Meaningful
+    /// mainly from an **elevated** parent, where it drops the child back to the level the logged-on
+    /// user's own programs run at instead of inheriting the parent's High integrity.
+    | Medium
+
+    /// `S-1-16-4096` — the sandbox level: no write access to the user's profile, `HKCU`, or the
+    /// desktop's medium-integrity windows. A child at this level can still read most of the file
+    /// system and open network connections; it writes only where a low-integrity label allows (its
+    /// own `%TEMP%\Low`, for instance). The usual choice for untrusted work that must still produce
+    /// output through the pipes ProcessKit already opened for it (inherited handles are unaffected —
+    /// the access check happened when the parent opened them).
+    | Low
+
+    /// `S-1-16-0` — the most restrictive label Windows has: below even anonymous access, with no
+    /// write access anywhere by default. Many programs cannot start at all here (a runtime that must
+    /// write a temp file, load a user-profile DLL, or open a named object will fail), so treat it as
+    /// a deliberate, tested choice for a self-contained binary rather than a stricter default. It is
+    /// never a silent downgrade: whatever the child can no longer do surfaces as that child's own
+    /// failure, not as a ProcessKit error.
+    | Untrusted
+
 /// The immutable configuration behind a `Command`. Internal — consumers build it through the
 /// `Command` builder; the runner/native layer reads it to spawn.
 ///
@@ -160,6 +197,23 @@ type internal CommandConfig =
       // without `Uid`/`Gid` is refused up front with `ProcessError.Spawn` (never a silent no-op), and on
       // Windows any set value fails the spawn with `ProcessError.Unsupported`, exactly like `Uid`/`Gid`.
       Groups: int list option
+      // Windows privilege reduction: spawn the child with a RESTRICTED copy of this process's own primary
+      // token (`CreateRestrictedToken` with `DISABLE_MAX_PRIVILEGE`, then `CreateProcessAsUser`), so the
+      // child holds no privilege beyond the always-present `SeChangeNotifyPrivilege`. `false` (the
+      // default) spawns through the ordinary `CreateProcessW` with the inherited token, byte-identical to
+      // before this option existed. Windows-only: a set value fails a POSIX spawn with
+      // `ProcessError.Unsupported`, never a silent no-op — the mirror image of how `Uid`/`Gid`/`Setsid`
+      // fail on Windows. Rejected at the builder boundary alongside `Pty` (the ConPTY path has its own
+      // spawn call, which is not on this token path) and alongside the Unix drop family (a command
+      // carrying both could not run on ANY platform).
+      WindowsRestrictedToken: bool
+      // Windows integrity drop: lower the child's token to this mandatory integrity level
+      // (`SetTokenInformation(TokenIntegrityLevel, ...)` on a duplicated primary token, spawned with
+      // `CreateProcessAsUser`). `None` (the default) inherits the parent's level. Independent of
+      // `WindowsRestrictedToken` — integrity governs what the child may WRITE to, privileges what it may
+      // DO — and the two compose on one token when both are set. Windows-only and rejected in the same
+      // combinations, with the same honest `ProcessError.Unsupported` on POSIX.
+      WindowsIntegrityLevel: WindowsIntegrityLevel option
       // Unix `setsid()`: detach the child into a brand-new session with no controlling terminal. `false`
       // (the default) leaves the child in the caller's session. Unix-only: `true` fails a Windows spawn
       // with `ProcessError.Unsupported`. `setsid()` also makes the child a new process-group leader
@@ -236,6 +290,8 @@ module internal CommandConfig =
           Uid = None
           Gid = None
           Groups = None
+          WindowsRestrictedToken = false
+          WindowsIntegrityLevel = None
           Setsid = false
           KillOnParentDeath = false
           Pty = None
@@ -312,6 +368,10 @@ module internal CommandConfig =
     let private ptyInheritStdinReason =
         "a PTY replaces the child's stdin with the pty slave/ConPTY input pipe, so there is no way to also hand it the parent's own standard input — InheritStdin would be silently ignored"
 
+    [<Literal>]
+    let private ptyWindowsTokenReason =
+        "a PTY run is created through the separate ConPTY spawn path (a pseudoconsole attribute on CreateProcessExtended), which does not take the hardened token — the child would keep the parent's full token while the call looked like it had been honoured"
+
     /// The `ArgumentException` for combining `Pty` with a knob a pseudo-terminal cannot honour. Named after
     /// the offending knob so the message points at whichever of the pair was set second, per the project's
     /// "reject conflicts at the builder boundary, never a silent downgrade" rule.
@@ -319,10 +379,11 @@ module internal CommandConfig =
         ArgumentException($"{knob} cannot be combined with Pty: {reason}. Drop one of the two.", knob)
 
     /// Guard `Pty(...)`: reject it when a separate-stderr observation hook (`StderrTee`/`OnStderrLine`, D4),
-    /// `Setsid` (D8), or `InheritStdin` is already set. A PTY implies OS-level merge semantics (one terminal
-    /// stream, no separate stderr), a controlling pseudo-terminal (contradicting `Setsid`'s
-    /// controlling-tty-less new session), and its own stdin device (contradicting `InheritStdin`'s promise
-    /// of the parent's own standard input).
+    /// `Setsid` (D8), `InheritStdin`, or a Windows token-hardening knob is already set. A PTY implies
+    /// OS-level merge semantics (one terminal stream, no separate stderr), a controlling pseudo-terminal
+    /// (contradicting `Setsid`'s controlling-tty-less new session), its own stdin device (contradicting
+    /// `InheritStdin`'s promise of the parent's own standard input), and its own ConPTY spawn call
+    /// (which does not carry the hardened token).
     let ensurePtyCompatible (config: CommandConfig) =
         if config.StderrTee.IsSome then
             raise (ptyConflict "StderrTee" ptyMergedStreamReason)
@@ -336,6 +397,12 @@ module internal CommandConfig =
         if Stdin.isInherit config.StdinSource then
             raise (ptyConflict "InheritStdin" ptyInheritStdinReason)
 
+        if config.WindowsRestrictedToken then
+            raise (ptyConflict "WindowsRestrictedToken" ptyWindowsTokenReason)
+
+        if config.WindowsIntegrityLevel.IsSome then
+            raise (ptyConflict "WindowsIntegrityLevel" ptyWindowsTokenReason)
+
     /// Guard `StderrTee`/`OnStderrLine`: reject them when `Pty` is already set — the mirror of
     /// `ensurePtyCompatible`'s observer checks, so the conflict is caught in either chaining order.
     let ensureNoPty (config: CommandConfig) (knob: string) =
@@ -347,6 +414,50 @@ module internal CommandConfig =
     let ensureNoPtyForSetsid (config: CommandConfig) =
         if config.Pty.IsSome then
             raise (ptyConflict "Setsid" ptySetsidReason)
+
+    /// The Unix-only privilege/session knob currently set on `config`, if any. Feeds the bidirectional
+    /// guard below; the order is only which one gets named first when several are set.
+    let private unixPrivilegeKnob (config: CommandConfig) : string option =
+        if config.Uid.IsSome then Some "Uid"
+        elif config.Gid.IsSome then Some "Gid"
+        elif config.Groups.IsSome then Some "Groups"
+        elif config.Umask.IsSome then Some "Umask"
+        elif config.Setsid then Some "Setsid"
+        else None
+
+    /// The `ArgumentException` for combining a Windows-only token-hardening knob
+    /// (`WindowsRestrictedToken`/`WindowsIntegrityLevel`) with a Unix-only privilege/session knob
+    /// (`Uid`/`Gid`/`Groups`/`Umask`/`Setsid`). Unlike the other conflicts here this is not a
+    /// contradiction *within* one platform: it is a command no platform can run, because each half fails
+    /// the spawn with `ProcessError.Unsupported` on exactly the platform the other half needs. Caught at
+    /// the builder boundary — where the mistake is — instead of being left to surface as a runtime
+    /// refusal on whichever host the caller happens to be on. `named` is whichever knob was set second,
+    /// so the exception points at the call that introduced the conflict.
+    let private crossPlatformHardeningConflict (named: string) (windowsKnob: string) (unixKnob: string) =
+        ArgumentException(
+            $"{windowsKnob} (Windows-only) cannot be combined with {unixKnob} (Unix-only): each fails the spawn with ProcessError.Unsupported on the platform the other one needs, so the command could not run on any host. Drop one of the two.",
+            named
+        )
+
+    /// Guard `WindowsRestrictedToken()`/`WindowsIntegrityLevel(...)`: reject them when `Pty` (which spawns
+    /// through the ConPTY path, not the token path) or a Unix-only privilege/session knob is already set.
+    let ensureWindowsTokenHardeningCompatible (config: CommandConfig) (knob: string) =
+        if config.Pty.IsSome then
+            raise (ptyConflict knob ptyWindowsTokenReason)
+
+        match unixPrivilegeKnob config with
+        | Some unixKnob -> raise (crossPlatformHardeningConflict knob knob unixKnob)
+        | None -> ()
+
+    /// Guard the Unix-only privilege/session knobs (`Uid`/`Gid`/`User`/`Groups`/`Umask`/`Setsid`): reject
+    /// them when a Windows-only token-hardening knob is already set — the mirror of
+    /// `ensureWindowsTokenHardeningCompatible`, so the conflict is caught in either chaining order.
+    let ensureNoWindowsTokenHardening (config: CommandConfig) (knob: string) =
+        if config.WindowsRestrictedToken then
+            raise (crossPlatformHardeningConflict knob "WindowsRestrictedToken" knob)
+
+        if config.WindowsIntegrityLevel.IsSome then
+            raise (crossPlatformHardeningConflict knob "WindowsIntegrityLevel" knob)
 
     // The `ArgumentException` for combining a stdout/stderr file redirect (`StdoutToFile`/`StderrToFile`)
     // with a knob that needs a parent-side view of that same stream, or with `MergeStderr`/`Pty`. Named
@@ -1009,6 +1120,7 @@ type Command internal (config: CommandConfig) =
     member _.Umask(mask: int) =
         ArgumentOutOfRangeException.ThrowIfNegative mask
         ArgumentOutOfRangeException.ThrowIfGreaterThan(mask, 0o7777)
+        CommandConfig.ensureNoWindowsTokenHardening config "Umask"
         Command({ config with Umask = Some mask })
 
     /// Run the child under this Unix user id (`setuid`). **Unix-only:** on Windows (which has no
@@ -1024,6 +1136,7 @@ type Command internal (config: CommandConfig) =
     /// `ArgumentOutOfRangeException` at the builder boundary). Pair with `Gid` (or `User`) for a full drop.
     member _.Uid(uid: int) =
         ArgumentOutOfRangeException.ThrowIfNegative uid
+        CommandConfig.ensureNoWindowsTokenHardening config "Uid"
         Command({ config with Uid = Some uid })
 
     /// Run the child under this Unix group id (`setgid`) — see `Uid` for the mechanism, platform notes,
@@ -1031,6 +1144,7 @@ type Command internal (config: CommandConfig) =
     /// correct privilege drop. `gid` must be non-negative.
     member _.Gid(gid: int) =
         ArgumentOutOfRangeException.ThrowIfNegative gid
+        CommandConfig.ensureNoWindowsTokenHardening config "Gid"
         Command({ config with Gid = Some gid })
 
     /// Run the child under this Unix user **and** group id — the common privilege-drop pair, equivalent
@@ -1040,6 +1154,7 @@ type Command internal (config: CommandConfig) =
     member _.User(uid: int, gid: int) =
         ArgumentOutOfRangeException.ThrowIfNegative uid
         ArgumentOutOfRangeException.ThrowIfNegative gid
+        CommandConfig.ensureNoWindowsTokenHardening config "User"
 
         Command(
             { config with
@@ -1061,6 +1176,7 @@ type Command internal (config: CommandConfig) =
     /// offending element by index (`Groups[2]`).
     member _.Groups(gids: seq<int>) =
         ArgumentNullException.ThrowIfNull gids
+        CommandConfig.ensureNoWindowsTokenHardening config "Groups"
         let materialized = gids |> Seq.toArray
 
         materialized
@@ -1087,7 +1203,58 @@ type Command internal (config: CommandConfig) =
     /// command. A `setsid()` the OS refuses fails the spawn with `ProcessError.Spawn`.
     member _.Setsid() =
         CommandConfig.ensureNoPtyForSetsid config
+        CommandConfig.ensureNoWindowsTokenHardening config "Setsid"
         Command({ config with Setsid = true })
+
+    /// Run the child with a **restricted token**: a copy of this process's own primary token created
+    /// with `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)`, which strips every privilege the caller
+    /// holds except the always-present `SeChangeNotifyPrivilege`. The child is then started with
+    /// `CreateProcessAsUser` under that token. It keeps the caller's *identity* (same user, same SIDs,
+    /// same file ACLs apply) but loses the ability to do the privileged things that identity could —
+    /// debug another process, load a driver, take ownership, shut the machine down, impersonate.
+    ///
+    /// This is the Windows half of the hardening story whose Unix half is `Uid`/`Gid`/`Groups`; combine
+    /// it with `WindowsIntegrityLevel` (which restricts what the child may *write to*, orthogonally to
+    /// what it may *do*) and with the containing group's `ProcessGroupOptions` resource limits and
+    /// `WindowsUiRestrictions` for the full perimeter — see the hardening guide.
+    ///
+    /// **Windows-only:** on POSIX a set value fails the spawn with `ProcessError.Unsupported`, never a
+    /// silent no-op — the mirror image of `Uid`/`Setsid` failing on Windows. Rejected at the builder
+    /// boundary in combination with `Pty` (a ConPTY run spawns through a different call that does not
+    /// carry the token) and with the Unix-only `Uid`/`Gid`/`Groups`/`Umask`/`Setsid` family (a command
+    /// carrying both halves could not run on *any* host). Elevation is unaffected: a restricted token
+    /// cannot gain rights, only lose them, so this never turns into a privilege *escalation* path.
+    member _.WindowsRestrictedToken() =
+        CommandConfig.ensureWindowsTokenHardeningCompatible config "WindowsRestrictedToken"
+
+        Command(
+            { config with
+                WindowsRestrictedToken = true }
+        )
+
+    /// Lower the child's **mandatory integrity level** to `level` (Windows), by labelling the token it
+    /// is started with (`SetTokenInformation(TokenIntegrityLevel, ...)` on a duplicated primary token,
+    /// spawned via `CreateProcessAsUser`). Windows' no-write-up policy then denies the child write
+    /// access to anything labelled above that level — the user's own files, `HKCU`, and the windows of
+    /// medium-integrity processes — regardless of the DACL that would otherwise allow it.
+    ///
+    /// Integrity is a *separate axis* from privileges: use `WindowsRestrictedToken` to take away what
+    /// the child may **do**, and this to take away what it may **write to**. Both compose onto one
+    /// token when set together. Only lowering is offered (`WindowsIntegrityLevel.Medium`/`Low`/
+    /// `Untrusted`) — Windows refuses to raise a token's integrity, so a "higher" variant could only
+    /// ever fail the spawn.
+    ///
+    /// The child's already-open handles are unaffected: the stdio pipes ProcessKit hands it were opened
+    /// by the parent and their access check has already happened, so a `Low`-integrity child still
+    /// writes its output back normally. **Windows-only**, with the same honest `ProcessError.Unsupported`
+    /// on POSIX and the same builder-boundary conflicts as `WindowsRestrictedToken`.
+    member _.WindowsIntegrityLevel(level: WindowsIntegrityLevel) =
+        CommandConfig.ensureWindowsTokenHardeningCompatible config "WindowsIntegrityLevel"
+
+        Command(
+            { config with
+                WindowsIntegrityLevel = Some level }
+        )
 
     /// Opt in to reaping this child when the **parent process dies suddenly** — a SIGKILL, a crash, or a
     /// Windows `TerminateProcess` — the one case the deterministic kill-on-drop tree guarantee cannot
@@ -1341,6 +1508,16 @@ module Command =
     /// Detach the child into a new session (`setsid()`). Unix-only: a set request fails a Windows spawn
     /// with `ProcessError.Unsupported`. Containment is preserved. See `Command.Setsid`.
     let setsid (command: Command) = command.Setsid()
+
+    /// Run the child with a restricted token (`CreateRestrictedToken` + `DISABLE_MAX_PRIVILEGE`), keeping
+    /// the caller's identity but none of its privileges. Windows-only: a set request fails a POSIX spawn
+    /// with `ProcessError.Unsupported`. See `Command.WindowsRestrictedToken`.
+    let windowsRestrictedToken (command: Command) = command.WindowsRestrictedToken()
+
+    /// Lower the child's Windows mandatory integrity level, denying it write access to anything labelled
+    /// above that level. Windows-only: a set request fails a POSIX spawn with `ProcessError.Unsupported`.
+    /// See `Command.WindowsIntegrityLevel`.
+    let windowsIntegrityLevel (level: WindowsIntegrityLevel) (command: Command) = command.WindowsIntegrityLevel level
 
     /// Opt in to reaping this child when the parent process dies suddenly (SIGKILL/crash/`TerminateProcess`).
     /// Windows reaps the whole Job tree with no extra action; Linux the direct child only via

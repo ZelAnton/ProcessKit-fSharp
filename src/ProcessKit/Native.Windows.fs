@@ -1242,6 +1242,18 @@ module internal Windows =
             val mutable CpuRate: uint32
         end
 
+    // Job Object UI restrictions (`ProcessGroupOptions.WithUiRestrictions`): one flags word denying the
+    // contained tree clipboard/desktop/display/exit-Windows access. The `WindowsUiRestrictions` values are
+    // the Win32 `JOB_OBJECT_UILIMIT_*` bits verbatim, so the mapping is a plain widening conversion.
+    [<Literal>]
+    let private JobObjectBasicUIRestrictions = 4
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private JOBOBJECT_BASIC_UI_RESTRICTIONS =
+        struct
+            val mutable UIRestrictionsClass: uint32
+        end
+
     /// Capture the Job's current extended-limit block (the memory + active-process caps and their flags),
     /// so a live limit update can roll those caps back to exactly this state should a LATER native write
     /// (the CPU rate cap) fail after this block was already replaced. `None` if the query fails — a
@@ -1264,9 +1276,28 @@ module internal Windows =
         finally
             Marshal.FreeHGlobal buffer
 
-    /// Apply resource limits to a Job: a memory cap (`JobMemoryLimit`), an active-process cap, and a
-    /// CPU hard cap (a fraction of *total* system CPU, so per-core quota is approximate). Preserves
-    /// `KILL_ON_JOB_CLOSE`. Returns an error message on failure.
+    /// The Job's current UI-restriction flags (`JOBOBJECT_BASIC_UI_RESTRICTIONS`), or `None` if the query
+    /// fails. Serves two purposes: the limit-apply path uses it to skip a no-op rewrite and to roll the
+    /// restrictions back when a later write fails (the same contract `queryExtendedLimit` gives the
+    /// memory/active-process block), and it is the read-back a test asserts the applied set against.
+    let queryWindowsUiRestrictions (job: nativeint) : uint32 option =
+        let size = Marshal.SizeOf<JOBOBJECT_BASIC_UI_RESTRICTIONS>()
+        let buffer = Marshal.AllocHGlobal size
+
+        try
+            let mutable returnLength = 0u
+
+            if QueryInformationJobObject(job, JobObjectBasicUIRestrictions, buffer, uint32 size, &returnLength) then
+                Some (Marshal.PtrToStructure<JOBOBJECT_BASIC_UI_RESTRICTIONS> buffer).UIRestrictionsClass
+            else
+                None
+        finally
+            Marshal.FreeHGlobal buffer
+
+    /// Apply resource limits to a Job: a memory cap (`JobMemoryLimit`), an active-process cap, a
+    /// CPU hard cap (a fraction of *total* system CPU, so per-core quota is approximate), and the
+    /// UI restrictions (clipboard/desktop/display/exit-Windows). Preserves `KILL_ON_JOB_CLOSE`.
+    /// Returns an error message on failure.
     ///
     /// This cleanly REPLACES the caps in force, so it serves both `ProcessGroup.Create` (a fresh Job)
     /// and `ProcessGroup.UpdateLimits` (a live Job): `SetInformationJobObject` overwrites the whole
@@ -1277,13 +1308,18 @@ module internal Windows =
     /// no CPU cap (a fresh Job, or a `None`→`None` update) reports `ERROR_INVALID_PARAMETER`, which is
     /// exactly the desired "no CPU cap" end state and so is treated as success.
     ///
-    /// The caps land in two separate native writes — the extended-limit block (memory + active-process),
-    /// then the CPU rate block — so the second could fail after the first already applied. To keep the
-    /// honest `UpdateLimits` contract (a failed apply leaves the live Job on the PREVIOUS set), the prior
-    /// extended-limit block is captured up front and best-effort restored if the CPU-rate write fails,
-    /// so an `Error` return means the Job is back on the previous set, never a silent mix `Options.Limits`
-    /// would misreport (T-207). Only if that restore itself fails (or the prior couldn't be captured) is
-    /// the state indeterminate, and the error says so distinctly.
+    /// The caps land in separate native writes — the UI restrictions, the extended-limit block (memory +
+    /// active-process), then the CPU rate block — so a later one could fail after an earlier one already
+    /// applied. To keep the honest `UpdateLimits` contract (a failed apply leaves the live Job on the
+    /// PREVIOUS set), each prior block is captured up front and best-effort restored if a later write
+    /// fails, so an `Error` return means the Job is back on the previous set, never a silent mix
+    /// `Options.Limits` would misreport (T-207). Only if a restore itself fails (or a prior couldn't be
+    /// captured) is the state indeterminate, and the error says so distinctly.
+    ///
+    /// The UI restrictions are written FIRST, and only when they actually differ from what the Job
+    /// already carries: a failure there has then changed nothing at all (the same "nothing to roll back"
+    /// position as a failed first block), and the overwhelmingly common case — a limit set with no UI
+    /// restrictions on a Job that has none — issues no extra native call.
     let applyWindowsJobLimits (job: nativeint) (limits: ResourceLimits) : Result<unit, string> =
         // (Re)write the Job's CPU rate control block. `controlFlags = 0` disables CPU rate control (the
         // replace-semantics "no CPU cap" state); the enable+hard-cap flags with a rate arm the cap. The
@@ -1322,10 +1358,53 @@ module internal Windows =
             finally
                 Marshal.FreeHGlobal buffer
 
-        // The Job's current caps, captured BEFORE the replacement so a CPU-rate failure that lands after
-        // the memory/active-process block was already overwritten can put those caps back exactly as they
-        // were.
+        // (Re)write the Job's UI-restriction flags — a single flags word with the same replace semantics
+        // as the blocks above: `0` means "no UI restrictions", so a set dropped from an update is
+        // genuinely lifted rather than left in force.
+        let writeUiRestrictions (restrictions: uint32) : Result<unit, string> =
+            let mutable uiInfo = JOBOBJECT_BASIC_UI_RESTRICTIONS()
+            uiInfo.UIRestrictionsClass <- restrictions
+            let uiSize = Marshal.SizeOf<JOBOBJECT_BASIC_UI_RESTRICTIONS>()
+            let uiBuffer = Marshal.AllocHGlobal uiSize
+
+            try
+                Marshal.StructureToPtr<JOBOBJECT_BASIC_UI_RESTRICTIONS>(uiInfo, uiBuffer, false)
+
+                if SetInformationJobObject(job, JobObjectBasicUIRestrictions, uiBuffer, uint32 uiSize) then
+                    Ok()
+                else
+                    // Captured inline, before the `finally` runs a P/Invoke that could reset it.
+                    Error(Win32Exception(Marshal.GetLastWin32Error()).Message)
+            finally
+                Marshal.FreeHGlobal uiBuffer
+
+        // The Job's current caps, captured BEFORE the replacement so a later failure that lands after an
+        // earlier block was already overwritten can put those caps back exactly as they were.
         let priorExt = queryExtendedLimit job
+        let priorUi = queryWindowsUiRestrictions job
+        let requestedUi = uint32 (int limits.UiRestrictions)
+
+        // Best-effort restore of the Job's prior UI restrictions after a LATER write failed. `None` when
+        // there is nothing to undo or the undo succeeded; `Some reason` when the Job may still carry the
+        // half-applied set, which the caller's error must then say out loud.
+        let restoreUiRestrictions (uiChanged: bool) : string option =
+            if not uiChanged then
+                None
+            else
+                match priorUi with
+                | Some prior ->
+                    match writeUiRestrictions prior with
+                    | Ok() -> None
+                    | Error message -> Some message
+                | None -> Some "the Job's prior UI restrictions could not be captured"
+
+        // Append a failed UI rollback to an error message, so a caller is never told the Job was cleanly
+        // put back on its previous set when one half of it was not.
+        let withUiNote (message: string) (uiNote: string option) =
+            match uiNote with
+            | None -> message
+            | Some note ->
+                $"{message}; the Job's previous UI restrictions could not be restored either ({note}), so they may still be in force"
 
         let mutable info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         let mutable flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -1344,46 +1423,71 @@ module internal Windows =
 
         info.BasicLimitInformation.LimitFlags <- flags
 
-        match writeExtendedLimit info with
+        // Skipped entirely when the Job already carries exactly the requested set (including the common
+        // "none requested, none in force"); written unconditionally when the prior could not be read,
+        // since nothing then proves the Job is already right.
+        let uiWrite =
+            if priorUi = Some requestedUi then
+                Ok false
+            else
+                writeUiRestrictions requestedUi |> Result.map (fun () -> true)
+
+        match uiWrite with
         | Error message ->
-            // `SetInformationJobObject` applies the whole block or none, so a failure here changed nothing
-            // — the previous set is still in force and there is nothing to roll back.
-            Error message
-        | Ok() ->
-            let cpuResult =
-                match limits.CpuQuota with
-                | Some cores ->
-                    let fraction = min 1.0 (cores / float Environment.ProcessorCount)
-                    let rate = uint32 (max 1.0 (Math.Round(fraction * 10000.0)))
+            // Nothing else has been touched yet, so the previous set is still wholly in force.
+            Error $"failed to apply the Job UI restrictions: {message}"
+        | Ok uiChanged ->
 
-                    writeCpuRate (JOB_OBJECT_CPU_RATE_CONTROL_ENABLE ||| JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP) rate
-                    |> Result.mapError (fun errno -> Win32Exception(errno).Message)
-                | None ->
-                    // Replace semantics: no CPU quota now, so disable any rate cap a prior apply set.
-                    // Disabling on a Job that has none enabled is rejected with ERROR_INVALID_PARAMETER —
-                    // the "no CPU cap" state already holds, so treat that as success; surface anything else.
-                    match writeCpuRate 0u 0u with
-                    | Ok() -> Ok()
-                    | Error errno when errno = ERROR_INVALID_PARAMETER -> Ok()
-                    | Error errno -> Error(Win32Exception(errno).Message)
+            match writeExtendedLimit info with
+            | Error message ->
+                // `SetInformationJobObject` applies the whole block or none, so a failure here changed
+                // nothing in the memory/active-process caps — but the UI restrictions written just above
+                // did change, so put those back before reporting.
+                Error(withUiNote message (restoreUiRestrictions uiChanged))
+            | Ok() ->
+                let cpuResult =
+                    match limits.CpuQuota with
+                    | Some cores ->
+                        let fraction = min 1.0 (cores / float Environment.ProcessorCount)
+                        let rate = uint32 (max 1.0 (Math.Round(fraction * 10000.0)))
 
-            match cpuResult with
-            | Ok() -> Ok()
-            | Error cpuMessage ->
-                // The memory/active-process block already applied but the CPU-rate cap did not. Roll that
-                // block back to the captured prior so the live Job and the Options snapshot stay together on
-                // the previous set (T-207); if the prior couldn't be captured, or restoring it also fails,
-                // the state is indeterminate — say so distinctly so the caller never trusts Options here.
-                match priorExt with
-                | Some prior ->
-                    match writeExtendedLimit prior with
-                    | Ok() -> Error cpuMessage
-                    | Error restoreMessage ->
-                        Error
-                            $"failed to apply the Job CPU rate cap ({cpuMessage}) and could not roll the memory/active-process caps back to the previous set ({restoreMessage}); the Job's limits may be partially applied"
-                | None ->
-                    Error
-                        $"failed to apply the Job CPU rate cap ({cpuMessage}) and the Job's prior limits could not be captured to roll back; the Job's limits may be partially applied"
+                        writeCpuRate (JOB_OBJECT_CPU_RATE_CONTROL_ENABLE ||| JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP) rate
+                        |> Result.mapError (fun errno -> Win32Exception(errno).Message)
+                    | None ->
+                        // Replace semantics: no CPU quota now, so disable any rate cap a prior apply set.
+                        // Disabling on a Job that has none enabled is rejected with ERROR_INVALID_PARAMETER —
+                        // the "no CPU cap" state already holds, so treat that as success; surface anything else.
+                        match writeCpuRate 0u 0u with
+                        | Ok() -> Ok()
+                        | Error errno when errno = ERROR_INVALID_PARAMETER -> Ok()
+                        | Error errno -> Error(Win32Exception(errno).Message)
+
+                match cpuResult with
+                | Ok() -> Ok()
+                | Error cpuMessage ->
+                    // The memory/active-process block already applied but the CPU-rate cap did not. Roll
+                    // that block (and the UI restrictions) back to the captured prior so the live Job and
+                    // the Options snapshot stay together on the previous set (T-207); if a prior couldn't
+                    // be captured, or restoring it also fails, the state is indeterminate — say so
+                    // distinctly so the caller never trusts Options here.
+                    let uiNote = restoreUiRestrictions uiChanged
+
+                    match priorExt with
+                    | Some prior ->
+                        match writeExtendedLimit prior with
+                        | Ok() -> Error(withUiNote cpuMessage uiNote)
+                        | Error restoreMessage ->
+                            Error(
+                                withUiNote
+                                    $"failed to apply the Job CPU rate cap ({cpuMessage}) and could not roll the memory/active-process caps back to the previous set ({restoreMessage}); the Job's limits may be partially applied"
+                                    uiNote
+                            )
+                    | None ->
+                        Error(
+                            withUiNote
+                                $"failed to apply the Job CPU rate cap ({cpuMessage}) and the Job's prior limits could not be captured to roll back; the Job's limits may be partially applied"
+                                uiNote
+                        )
 
     let private buildWindowsEnvironment (command: Command) : nativeint =
         if not command.Config.ClearEnv && command.Config.EnvOverrides.IsEmpty then
@@ -1932,6 +2036,347 @@ module internal Windows =
                 disposeCreatedPipes ()
                 Error(ProcessError.Spawn(command.Program, ex.Message))
 
+    // ----------------------------------------------------------------------------------
+    // Token hardening: a restricted / lowered-integrity primary token for the child
+    // ----------------------------------------------------------------------------------
+    //
+    // `Command.WindowsRestrictedToken` and `Command.WindowsIntegrityLevel` are the Windows counterpart of
+    // the POSIX `Uid`/`Gid`/`Groups` drop: instead of changing WHO the child runs as, they hand it a
+    // weakened copy of this process's own primary token, so it keeps the caller's identity but loses
+    // privileges (`CreateRestrictedToken` with `DISABLE_MAX_PRIVILEGE`) and/or the right to write to
+    // anything labelled above its mandatory integrity level (`SetTokenInformation(TokenIntegrityLevel)`).
+    // A child started under such a token goes through `CreateProcessAsUserW` rather than `CreateProcessW`;
+    // everything else about the spawn — the suspended→assign-to-Job→resume containment dance, the stdio
+    // handles, the environment block, the command-line buffer — is byte-for-byte the ordinary path.
+    //
+    // Both tokens are derived from the caller's OWN token, which is what keeps this an unprivileged
+    // operation: Windows lets a process assign a token derived from its own without
+    // `SE_ASSIGNPRIMARYTOKEN_NAME`. A host that nevertheless refuses (a locked-down policy) surfaces as a
+    // typed `ProcessError.Spawn` naming the missing privilege — never a silent fallback to an unhardened
+    // child, which would be exactly the "you asked for a sandbox and did not get one" failure this whole
+    // feature exists to prevent.
+
+    // Token access rights (winnt.h). Deliberately the exact set needed, not `TOKEN_ALL_ACCESS`:
+    // duplicate/query the source, adjust the copy's default label, and assign it as a primary token.
+    [<Literal>]
+    let private TOKEN_ASSIGN_PRIMARY = 0x0001u
+
+    [<Literal>]
+    let private TOKEN_DUPLICATE = 0x0002u
+
+    [<Literal>]
+    let private TOKEN_QUERY = 0x0008u
+
+    [<Literal>]
+    let private TOKEN_ADJUST_DEFAULT = 0x0080u
+
+    // `CreateRestrictedToken` flag: disable every privilege in the new token except
+    // `SeChangeNotifyPrivilege` (which Windows requires for ordinary path traversal).
+    [<Literal>]
+    let private DISABLE_MAX_PRIVILEGE = 0x1u
+
+    // `SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation` and `TOKEN_TYPE.TokenPrimary`. The level is
+    // ignored for a primary token but must still be a valid enumeration value.
+    [<Literal>]
+    let private SecurityImpersonation = 2
+
+    [<Literal>]
+    let private TokenPrimary = 1
+
+    // `TOKEN_INFORMATION_CLASS.TokenIntegrityLevel` and the `SE_GROUP_INTEGRITY` attribute a mandatory
+    // label carries.
+    [<Literal>]
+    let private TokenIntegrityLevel = 25
+
+    [<Literal>]
+    let private SE_GROUP_INTEGRITY = 0x00000020u
+
+    // Returned by `CreateProcessAsUser` on a host whose policy denies assigning this primary token.
+    [<Literal>]
+    let private ERROR_PRIVILEGE_NOT_HELD = 1314
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private SID_AND_ATTRIBUTES =
+        struct
+            val mutable Sid: nativeint
+            val mutable Attributes: uint32
+        end
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private TOKEN_MANDATORY_LABEL =
+        struct
+            val mutable Label: SID_AND_ATTRIBUTES
+        end
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool private OpenProcessToken(nativeint ProcessHandle, uint32 DesiredAccess, nativeint& TokenHandle)
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool private CreateRestrictedToken(
+        nativeint ExistingTokenHandle,
+        uint32 Flags,
+        uint32 DisableSidCount,
+        nativeint SidsToDisable,
+        uint32 DeletePrivilegeCount,
+        nativeint PrivilegesToDelete,
+        uint32 RestrictedSidCount,
+        nativeint SidsToRestrict,
+        nativeint& NewTokenHandle
+    )
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool private DuplicateTokenEx(
+        nativeint hExistingToken,
+        uint32 dwDesiredAccess,
+        nativeint lpTokenAttributes,
+        int ImpersonationLevel,
+        int TokenType,
+        nativeint& phNewToken
+    )
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool private SetTokenInformation(
+        nativeint TokenHandle,
+        int TokenInformationClass,
+        nativeint TokenInformation,
+        uint32 TokenInformationLength
+    )
+
+    // `StringSid` is a read-only `LPCWSTR` input — unlike `CreateProcess*`'s `lpCommandLine` (T-198) this
+    // API never writes through it, so an ordinary marshalled managed string is correct here.
+    [<DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern bool private ConvertStringSidToSidW(string StringSid, nativeint& Sid)
+
+    [<DllImport("advapi32.dll")>]
+    extern uint32 private GetLengthSid(nativeint pSid)
+
+    [<DllImport("kernel32.dll")>]
+    extern nativeint private LocalFree(nativeint hMem)
+
+    // Same shape as `CreateProcessW` with the token in front. `lpCommandLine` is `LPWSTR` here too — the
+    // OS may patch it in place — so it is a `nativeint` into a private unmanaged buffer, never a managed
+    // string (T-198); the call sites share the very same buffer they build for `CreateProcessW`.
+    [<DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "CreateProcessAsUserW")>]
+    extern bool private CreateProcessAsUserW(
+        nativeint hToken,
+        nativeint lpApplicationName,
+        nativeint lpCommandLine,
+        nativeint lpProcessAttributes,
+        nativeint lpThreadAttributes,
+        bool bInheritHandles,
+        uint32 dwCreationFlags,
+        nativeint lpEnvironment,
+        string lpCurrentDirectory,
+        STARTUPINFO& lpStartupInfo,
+        PROCESS_INFORMATION& lpProcessInformation
+    )
+
+    /// The well-known SID of each mandatory integrity level (`S-1-16-<rid>`). Locale-independent and
+    /// stable across Windows versions, which is why the label is built from the SID string rather than
+    /// looked up by name.
+    let private integrityLevelSid (level: WindowsIntegrityLevel) : string =
+        match level with
+        | WindowsIntegrityLevel.Untrusted -> "S-1-16-0"
+        | WindowsIntegrityLevel.Low -> "S-1-16-4096"
+        | WindowsIntegrityLevel.Medium -> "S-1-16-8192"
+
+    /// Lower `token`'s mandatory integrity level to `level`. The SID comes from `ConvertStringSidToSidW`
+    /// (allocated by the OS with `LocalAlloc`, so freed with `LocalFree`) and is written through a
+    /// `TOKEN_MANDATORY_LABEL` whose length must include the variable-size SID that follows it. Every
+    /// allocation is released on both the success and the failure path.
+    let private applyIntegrityLevel (token: nativeint) (level: WindowsIntegrityLevel) : Result<unit, string> =
+        let mutable sid = IntPtr.Zero
+
+        if not (ConvertStringSidToSidW(integrityLevelSid level, &sid)) then
+            Error(
+                $"could not build the {level} integrity-level SID: {Win32Exception(Marshal.GetLastWin32Error()).Message}"
+            )
+        else
+            let labelSize = Marshal.SizeOf<TOKEN_MANDATORY_LABEL>()
+            let buffer = Marshal.AllocHGlobal labelSize
+
+            try
+                let mutable label = TOKEN_MANDATORY_LABEL()
+                label.Label.Sid <- sid
+                label.Label.Attributes <- SE_GROUP_INTEGRITY
+                Marshal.StructureToPtr<TOKEN_MANDATORY_LABEL>(label, buffer, false)
+
+                // The information length covers the fixed struct plus the SID it points at — the
+                // documented contract for `TokenIntegrityLevel`.
+                let informationLength = uint32 labelSize + GetLengthSid sid
+
+                if SetTokenInformation(token, TokenIntegrityLevel, buffer, informationLength) then
+                    Ok()
+                else
+                    // Captured inline, before the `finally` runs a P/Invoke that could reset it.
+                    Error(
+                        $"could not lower the child token to {level} integrity: {Win32Exception(Marshal.GetLastWin32Error()).Message}"
+                    )
+            finally
+                Marshal.FreeHGlobal buffer
+                LocalFree sid |> ignore
+
+    /// The hardened PRIMARY token a child asking for `WindowsRestrictedToken` and/or
+    /// `WindowsIntegrityLevel` must be started under, or `IntPtr.Zero` when it asked for neither (the
+    /// ordinary `CreateProcessW` path). The caller owns the returned handle and must close it after the
+    /// spawn; every intermediate handle and allocation is released here, on success and failure alike.
+    ///
+    /// A restricted token is `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` over this process's own
+    /// token — every privilege but `SeChangeNotifyPrivilege` disabled, identity untouched. Without that
+    /// flag the token is a plain primary duplicate, so an integrity-only request never mutates the
+    /// caller's OWN token (which relabelling in place would, permanently, for the whole process).
+    let private buildHardenedToken (config: CommandConfig) : Result<nativeint, string> =
+        if not config.WindowsRestrictedToken && config.WindowsIntegrityLevel.IsNone then
+            Ok IntPtr.Zero
+        else
+            let mutable selfToken = IntPtr.Zero
+
+            let access =
+                TOKEN_DUPLICATE
+                ||| TOKEN_QUERY
+                ||| TOKEN_ASSIGN_PRIMARY
+                ||| TOKEN_ADJUST_DEFAULT
+
+            if not (OpenProcessToken(GetCurrentProcess(), access, &selfToken)) then
+                Error(
+                    $"could not open this process's own token to derive a hardened one: {Win32Exception(Marshal.GetLastWin32Error()).Message}"
+                )
+            else
+                try
+                    let mutable childToken = IntPtr.Zero
+
+                    let derived =
+                        if config.WindowsRestrictedToken then
+                            if
+                                CreateRestrictedToken(
+                                    selfToken,
+                                    DISABLE_MAX_PRIVILEGE,
+                                    0u,
+                                    IntPtr.Zero,
+                                    0u,
+                                    IntPtr.Zero,
+                                    0u,
+                                    IntPtr.Zero,
+                                    &childToken
+                                )
+                            then
+                                Ok childToken
+                            else
+                                Error(
+                                    $"could not create a restricted token for the child: {Win32Exception(Marshal.GetLastWin32Error()).Message}"
+                                )
+                        elif
+                            DuplicateTokenEx(
+                                selfToken,
+                                access,
+                                IntPtr.Zero,
+                                SecurityImpersonation,
+                                TokenPrimary,
+                                &childToken
+                            )
+                        then
+                            Ok childToken
+                        else
+                            Error(
+                                $"could not duplicate this process's token for the child: {Win32Exception(Marshal.GetLastWin32Error()).Message}"
+                            )
+
+                    match derived with
+                    | Error message -> Error message
+                    | Ok token ->
+                        match config.WindowsIntegrityLevel with
+                        | None -> Ok token
+                        | Some level ->
+                            match applyIntegrityLevel token level with
+                            | Ok() -> Ok token
+                            | Error message ->
+                                // The token is unusable as requested; close it rather than hand back a
+                                // half-hardened one the caller might spawn under.
+                                closeHandleIfValid token
+                                Error message
+                finally
+                    closeHandleIfValid selfToken
+
+    /// The result of the token-aware child creation: the hardened token could not be built (nothing was
+    /// spawned), or `CreateProcess*` ran and reported this success flag plus the Win32 error captured
+    /// immediately after it.
+    type private ChildCreation =
+        | TokenFailed of Reason: string
+        | Created of Succeeded: bool * LastError: int
+
+    /// Create the child through `CreateProcessAsUserW` with a hardened token when the command asked for
+    /// one, and through the ordinary `CreateProcessW` otherwise — the single seam both Windows spawn
+    /// paths (contained and detached) share, so the hardening cannot be honoured on one and silently
+    /// dropped on the other. The token's whole lifetime lives inside this function: built immediately
+    /// before the call and closed immediately after it (the child holds its own reference by then), with
+    /// no throwing code in between, so it can neither leak nor outlive the spawn that consumes it.
+    let private createChildProcess
+        (config: CommandConfig)
+        (commandLineBuffer: nativeint)
+        (creationFlags: uint32)
+        (environment: nativeint)
+        (workingDirectory: string)
+        (startup: byref<STARTUPINFO>)
+        (info: byref<PROCESS_INFORMATION>)
+        : ChildCreation =
+        match buildHardenedToken config with
+        | Error reason -> TokenFailed reason
+        | Ok token ->
+            let created =
+                if token = IntPtr.Zero then
+                    CreateProcessW(
+                        IntPtr.Zero,
+                        commandLineBuffer,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        true,
+                        creationFlags,
+                        environment,
+                        workingDirectory,
+                        &startup,
+                        &info
+                    )
+                else
+                    CreateProcessAsUserW(
+                        token,
+                        IntPtr.Zero,
+                        commandLineBuffer,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        true,
+                        creationFlags,
+                        environment,
+                        workingDirectory,
+                        &startup,
+                        &info
+                    )
+
+            // Read the error BEFORE closing the token: `CloseHandle` is itself a P/Invoke and would reset
+            // the thread's last-error value the caller needs to classify this spawn.
+            let lastError = Marshal.GetLastWin32Error()
+            closeHandleIfValid token
+            Created(created, lastError)
+
+    /// Turn a failed hardened-token spawn into an honest, typed `ProcessError`. `ERROR_PRIVILEGE_NOT_HELD`
+    /// is the one failure worth naming specifically: it means this host's policy refuses to let the
+    /// process assign the token it derived, so the requested hardening cannot be applied here at all —
+    /// reported as such rather than as an opaque Win32 message, and never downgraded to an unhardened
+    /// child.
+    let private hardenedSpawnError (command: Command) (lastError: int) : ProcessError =
+        if lastError = ERROR_PRIVILEGE_NOT_HELD then
+            ProcessError.Spawn(
+                command.Program,
+                "this host refuses to start a process under the hardened token (CreateProcessAsUser reported ERROR_PRIVILEGE_NOT_HELD); the requested WindowsRestrictedToken/WindowsIntegrityLevel could not be applied"
+            )
+        else
+            ProcessError.Spawn(command.Program, Win32Exception(lastError).Message)
+
+    /// Whether `command` asked for any Windows token hardening — the switch between the plain
+    /// `CreateProcessW` spawn and the `CreateProcessAsUser` one, and the reason a failed spawn is
+    /// classified by `hardenedSpawnError`.
+    let private wantsHardenedToken (config: CommandConfig) : bool =
+        config.WindowsRestrictedToken || config.WindowsIntegrityLevel.IsSome
+
     /// Spawn `command` suspended, assign it to `job` while still suspended (so no
     /// grandchild can escape the container), then resume it. Returns the process handle and
     /// managed read streams for stdout/stderr.
@@ -2127,21 +2572,18 @@ module internal Windows =
                 // `string` (a possibly interned literal) — see the binding above (T-198).
                 let commandLineBuffer = Marshal.StringToHGlobalUni commandLine
 
-                let created =
-                    CreateProcessW(
-                        IntPtr.Zero,
-                        commandLineBuffer,
-                        IntPtr.Zero,
-                        IntPtr.Zero,
-                        true,
-                        flags,
-                        environment,
-                        workingDirectory,
-                        &startup,
-                        &info
-                    )
+                // `CreateProcessW`, or `CreateProcessAsUserW` under a restricted / lowered-integrity token
+                // when the command asked for one (the token is built and closed inside this call).
+                let creation =
+                    createChildProcess config commandLineBuffer flags environment workingDirectory &startup &info
 
-                let lastError = Marshal.GetLastWin32Error()
+                let struct (created, lastError) =
+                    match creation with
+                    | Created(succeeded, error) -> struct (succeeded, error)
+                    // The hardened token could not be built, so nothing was spawned: report the reason as
+                    // the spawn failure instead of quietly starting an unhardened child. `lastError = 0`
+                    // routes past the NotFound/hardened classification below to this message.
+                    | TokenFailed _ -> struct (false, 0)
 
                 // Free the writable command-line copy now: `CreateProcess` has finished reading (and
                 // restoring) it by the time it returns, and no throwing code runs between its allocation and
@@ -2168,10 +2610,15 @@ module internal Windows =
                 if not created then
                     releaseStdio ()
 
-                    if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
-                        Error(notFoundFromSpawnFailure command)
-                    else
-                        Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
+                    match creation with
+                    | TokenFailed reason -> Error(ProcessError.Spawn(command.Program, reason))
+                    | Created _ ->
+                        if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
+                            Error(notFoundFromSpawnFailure command)
+                        elif wantsHardenedToken config then
+                            Error(hardenedSpawnError command lastError)
+                        else
+                            Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
                 elif not (AssignProcessToJobObject(job, info.hProcess)) then
                     // Suspended but uncontained — kill it rather than let it run free.
                     let message = Win32Exception(Marshal.GetLastWin32Error()).Message
@@ -2252,7 +2699,16 @@ module internal Windows =
                 // takes `windowsSpawnLock` for the same reason the pipe path does: a concurrent pipe spawn
                 // with `bInheritHandles = true` must not snapshot this path's inheritable pipe-client ends
                 // in its own child (this path itself passes `bInheritHandles = false`).
-                if not (conptyAvailable ()) then
+                if wantsHardenedToken config then
+                    // Defense in depth: the builder already refuses this pair, so a `CommandConfig` reaching
+                    // here with both set could only come from inside the library. The ConPTY spawn is a
+                    // different call (`CreateProcessExtended`) that does not carry the hardened token, so
+                    // running it would silently give the child the parent's full token — refused instead.
+                    Error(
+                        ProcessError.Unsupported
+                            "Pty with WindowsRestrictedToken/WindowsIntegrityLevel (the ConPTY spawn path cannot carry a hardened token)"
+                    )
+                elif not (conptyAvailable ()) then
                     Error(ProcessError.Unsupported "Pty (needs Windows 10 1809+ / ConPTY)")
                 else
                     lock windowsSpawnLock (fun () -> spawnWindowsPtyCore job command pty)
@@ -2436,21 +2892,23 @@ module internal Windows =
                         // buffer in place, so it must never be the memory of a managed string (T-198).
                         let commandLineBuffer = Marshal.StringToHGlobalUni commandLine
 
-                        let created =
-                            CreateProcessW(
-                                IntPtr.Zero,
-                                commandLineBuffer,
-                                IntPtr.Zero,
-                                IntPtr.Zero,
-                                true,
-                                flags,
-                                environment,
-                                workingDirectory,
-                                &startup,
+                        // The same token-aware seam the contained path uses: a detached launch opts out of
+                        // containment, not of the hardening the caller asked for.
+                        let creation =
+                            createChildProcess
+                                config
+                                commandLineBuffer
+                                flags
+                                environment
+                                workingDirectory
+                                &startup
                                 &info
-                            )
 
-                        let lastError = Marshal.GetLastWin32Error()
+                        let struct (created, lastError) =
+                            match creation with
+                            | Created(succeeded, error) -> struct (succeeded, error)
+                            | TokenFailed _ -> struct (false, 0)
+
                         Marshal.FreeHGlobal commandLineBuffer
 
                         if environment <> IntPtr.Zero then
@@ -2459,10 +2917,15 @@ module internal Windows =
                         if not created then
                             releaseParentCopies ()
 
-                            if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
-                                Error(notFoundFromSpawnFailure command)
-                            else
-                                Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
+                            match creation with
+                            | TokenFailed reason -> Error(ProcessError.Spawn(command.Program, reason))
+                            | Created _ ->
+                                if lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
+                                    Error(notFoundFromSpawnFailure command)
+                                elif wantsHardenedToken config then
+                                    Error(hardenedSpawnError command lastError)
+                                else
+                                    Error(ProcessError.Spawn(command.Program, Win32Exception(lastError).Message))
                         else
                             let pid = int info.dwProcessId
 

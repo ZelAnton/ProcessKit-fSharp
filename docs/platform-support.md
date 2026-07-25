@@ -291,6 +291,7 @@ mechanism reads `cpu.stat` / `memory.peak`.
 | `WithMemoryMax` (whole tree) | ✅ | ✅ | ❌ `ProcessError.ResourceLimit` |
 | `WithMaxProcesses` | ✅ | ✅ | ❌ `ProcessError.ResourceLimit` |
 | `WithCpuQuota` | 🟡 approximate | ✅ | ❌ `ProcessError.ResourceLimit` |
+| `WithUiRestrictions` (clipboard/desktop/exit-Windows) | ✅ `JOBOBJECT_BASIC_UI_RESTRICTIONS` | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` |
 
 `WithCpuQuota` is a fraction of a single core (`0.5` = half a core, `2.0` = two cores). On Windows
 it is converted against the host's CPU count and is approximate. Because limits need a real
@@ -298,13 +299,44 @@ limit-capable container, the POSIX process-group mechanism cannot enforce any of
 limits where none can apply fails at creation with `ProcessError.ResourceLimit` rather than
 returning a silently-unbounded group.
 
+`WithUiRestrictions` is the one dimension that is **Windows-only rather than
+limit-capable-container-only**: it restricts what the contained tree may do to the interactive desktop
+session (clipboard, desktops, display/system parameters, global atoms, `ExitWindows`), which no POSIX
+primitive — cgroup v2 included — has any analogue for. That is why it refuses with
+`ProcessError.Unsupported` rather than the `ResourceLimit` the caps above use: a memory cap is a
+concept everywhere and merely unenforceable on some mechanisms, while a clipboard restriction does not
+exist off Windows at all. Either way the request is never silently dropped.
+
 These caps are also updatable on a **live** group via `ProcessGroup.UpdateLimits(ResourceLimits)` —
 an optional runtime operation that re-applies a full replacement cap set without recreating the
 group or restarting its children. It follows the same platform matrix as creation: the Windows Job
-Object re-applies via `SetInformationJobObject`, the Linux cgroup v2 mechanism rewrites
-`memory.max` / `pids.max` / `cpu.max`, and the POSIX process-group mechanism (macOS/BSD, or Linux
-without cgroup v2) returns `ProcessError.ResourceLimit` — never a silent no-op. See
+Object re-applies via `SetInformationJobObject` (the caps **and** the UI restrictions), the Linux
+cgroup v2 mechanism rewrites `memory.max` / `pids.max` / `cpu.max` (and refuses a set carrying UI
+restrictions with `ProcessError.Unsupported`, leaving the previous caps untouched), and the POSIX
+process-group mechanism (macOS/BSD, or Linux without cgroup v2) returns
+`ProcessError.ResourceLimit` — never a silent no-op. See
 [process-groups.md](process-groups.md) for the API and semantics.
+
+**Windows privilege drop (`Command.WindowsRestrictedToken` / `WindowsIntegrityLevel`)**
+
+The mirror image of the Unix privilege drop below: Windows has no `setuid`, so a child is hardened by
+handing it a weakened copy of the caller's own token instead of a different identity.
+
+| Capability | Windows | Linux / macOS / BSD (POSIX) |
+|---|:---:|:---:|
+| `WindowsRestrictedToken()` (no privilege but `SeChangeNotifyPrivilege`) | ✅ `CreateRestrictedToken` + `CreateProcessAsUser` | ❌ `ProcessError.Unsupported` |
+| `WindowsIntegrityLevel(Medium/Low/Untrusted)` | ✅ `SetTokenInformation(TokenIntegrityLevel)` | ❌ `ProcessError.Unsupported` |
+| Either, combined with `Command.Pty` | ❌ `ArgumentException` at the builder (ConPTY spawns through a call that cannot carry the token) | ❌ same builder refusal |
+| Either, combined with `Uid`/`Gid`/`Groups`/`Umask`/`Setsid` | ❌ `ArgumentException` at the builder | ❌ same builder refusal |
+
+Both apply to the **direct child** (and, through token inheritance, the descendants it starts); they
+are honoured on the contained spawn and on `Command.LaunchDetached` alike. Neither can raise
+privilege — a restricted token only loses rights and Windows refuses to raise a token's integrity, so
+there is deliberately no elevating variant. A host policy that refuses to let ProcessKit assign the
+derived token fails the spawn with a typed `ProcessError.Spawn` naming that refusal, never a silent
+fallback to an unhardened child. The cross-platform pair is rejected at the *builder* rather than at
+the spawn because each half is `Unsupported` on the platform the other half needs, so such a command
+could not run anywhere. See [commands.md](commands.md) and [hardening.md](hardening.md).
 
 ### Pseudo-terminal (PTY) capabilities
 
@@ -381,6 +413,16 @@ silently ignored. The whole family is **Unix-only**: on Windows `Uid`/`Gid`/`Gro
 each fail the spawn with `ProcessError.Unsupported`, never a silent no-op. `setpriv` ships on mainstream
 Linux; where it is absent (macOS/BSD) a `Uid`/`Gid`/`Groups` drop fails with a typed `ProcessError.Spawn`
 naming the missing helper.
+
+**A Windows-hardened child keeps the caller's identity.** `WindowsRestrictedToken` and
+`WindowsIntegrityLevel` reduce *privilege* and *write* access; they do not change **who** the child is.
+It still runs as the caller, so it can read whatever the caller can read and open network connections
+freely — privilege reduction, not isolation. In particular a secret the caller can read is a secret the
+child can read, which is why `Command.EnvClear` and the rest of the perimeter in
+[hardening.md](hardening.md) still matter. Two further honest edges: the child's already-open stdio
+handles keep working at any integrity level (their access check happened in the parent — by design, or
+it could not report anything back), and at `Untrusted` many programs cannot start at all, which surfaces
+as that child's own non-zero exit rather than as a ProcessKit error.
 
 **`KillOnParentDeath` reaps only the direct child on Linux, and only up to a set-uid `exec`.** The
 opt-in `Command.KillOnParentDeath()` reaps a child when its parent dies *suddenly*, but the guarantee is

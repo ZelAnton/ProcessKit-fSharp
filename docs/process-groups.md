@@ -628,6 +628,7 @@ Limits need a **real container** — a Windows Job Object or a Linux cgroup v2.
 | Memory cap | ✅ whole-tree | ✅ whole-tree (`memory.max`) | ❌ |
 | Process-count cap | ✅ | ✅ (`pids.max`) | ❌ |
 | CPU quota | 🟡 approximate | ✅ (`cpu.max`) | ❌ |
+| [UI restrictions](#windows-ui-restrictions) | ✅ clipboard/desktop/exit-Windows | ❌ `Unsupported` | ❌ `Unsupported` |
 
 Where a requested cap can't be enforced, `Create` **fails fast** with
 `ProcessError.ResourceLimit` rather than handing back a silently-unbounded group —
@@ -667,6 +668,88 @@ if (created is { IsOk: false, ErrorValue: var err })
 using var group = created.GetValueOrThrow(); // ...
 ```
 
+### Windows UI restrictions
+
+A Job Object can also restrict what its tree may do to the **interactive desktop
+session** it shares with you — a different axis from the resource caps above, and
+one with no POSIX counterpart. `WithUiRestrictions(...)` takes a `[<Flags>]`
+`WindowsUiRestrictions` set (combine with `|||` in F#, `|` in C#, or take the lot
+with `All`):
+
+| Flag | Denies the tree |
+|---|---|
+| `Handles` | using USER handles owned by processes outside the job |
+| `ReadClipboard` / `WriteClipboard` | reading / writing the clipboard |
+| `SystemParameters` | `SystemParametersInfo` (system-wide settings) |
+| `DisplaySettings` | `ChangeDisplaySettings` |
+| `GlobalAtoms` | the session's global atom table (the job gets its own) |
+| `Desktop` | creating or switching desktops |
+| `ExitWindows` | logging off, shutting down, or restarting the machine |
+
+**F#**
+
+```fsharp
+task {
+    // A tool that has no business touching the desktop session it runs in.
+    let options =
+        ProcessGroupOptions()
+            .WithMaxProcesses(32)
+            .WithUiRestrictions(
+                WindowsUiRestrictions.ReadClipboard
+                ||| WindowsUiRestrictions.WriteClipboard
+                ||| WindowsUiRestrictions.ExitWindows
+            )
+
+    match ProcessGroup.Create options with
+    | Ok group ->
+        use group = group
+        let! _restricted = group.StartAsync(Command.create "untrusted-tool")
+        ()
+    | Error err -> eprintfn $"{err.Message}" // ProcessError.Unsupported off Windows
+}
+```
+
+**C#**
+
+```csharp
+var uiOptions = new ProcessGroupOptions()
+    .WithMaxProcesses(32)
+    .WithUiRestrictions(
+        WindowsUiRestrictions.ReadClipboard
+        | WindowsUiRestrictions.WriteClipboard
+        | WindowsUiRestrictions.ExitWindows);
+
+var uiCreated = ProcessGroup.Create(uiOptions);
+if (uiCreated is { IsOk: false, ErrorValue: var uiErr })
+{
+    Console.Error.WriteLine(uiErr.Message); // ProcessError.Unsupported off Windows
+    return;
+}
+
+using var uiGroup = uiCreated.GetValueOrThrow();
+await uiGroup.StartAsync(new Command("untrusted-tool"));
+```
+
+The rules match the resource caps, with one deliberate difference in the error:
+
+- **Windows-only.** Off Windows `ProcessGroup.Create` (and `UpdateLimits`) fails with
+  `ProcessError.Unsupported`, not `ProcessError.ResourceLimit`. A memory cap is a
+  concept every platform has and only some can enforce; a clipboard or desktop
+  restriction has no POSIX analogue at all, so it is reported as an unsupported
+  operation rather than an unenforceable limit. Either way it is never dropped
+  silently.
+- **Replace semantics**, like every other dimension:
+  `WithUiRestrictions(WindowsUiRestrictions.None)` lifts the restrictions on the next
+  apply rather than leaving the previous set in force, and `group.Options.Limits.UiRestrictions`
+  reads back what is actually applied.
+- A set carrying **undefined bits** (an out-of-range cast) is rejected at the builder
+  boundary with `ArgumentOutOfRangeException` rather than written to the Job as an
+  unknown restriction class.
+- These restrictions bound what the tree may do to the *desktop session*. They are
+  **not** a filesystem, network, or registry sandbox — pair them with the resource
+  caps and with `Command.WindowsRestrictedToken` / `WindowsIntegrityLevel` (see
+  [Running commands](commands.md)) for a real perimeter.
+
 ### Updating limits on a live group
 
 Limits are not frozen at creation. `UpdateLimits(ResourceLimits)` re-applies a new
@@ -698,8 +781,8 @@ Behaviour follows the mechanism, honestly and without a silent downgrade:
 
 | Mechanism | `UpdateLimits` |
 |---|---|
-| Windows Job Object | ✅ re-applies via `SetInformationJobObject` on the live job |
-| Linux cgroup v2 | ✅ rewrites `memory.max` / `pids.max` / `cpu.max` in place |
+| Windows Job Object | ✅ re-applies via `SetInformationJobObject` on the live job (caps **and** UI restrictions) |
+| Linux cgroup v2 | ✅ rewrites `memory.max` / `pids.max` / `cpu.max` in place (UI restrictions → `ProcessError.Unsupported`) |
 | POSIX process group / macOS / BSD | ❌ `ProcessError.ResourceLimit` (no whole-tree limit primitive to update) |
 
 On the POSIX process-group mechanism there is no container to re-tune, so
