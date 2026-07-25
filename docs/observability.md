@@ -62,6 +62,7 @@ run inside an HTTP request appears under that request's trace.
 
 Wire it into OpenTelemetry:
 
+<!-- docsnippet:ignore reason: OpenTelemetry's own registration API; this repository does not reference the OpenTelemetry packages -->
 ```csharp
 services.AddOpenTelemetry().WithTracing(t => t.AddSource(ProcessKitDiagnostics.ActivitySourceName));
 ```
@@ -89,6 +90,7 @@ duration histogram is in **seconds** (the OTel norm for `*.duration`).
 | `processkit.supervisor.storm_pauses` | Counter | `{pause}` | program |
 | `processkit.supervisor.liveness_restarts` | Counter | `{restart}` | program |
 
+<!-- docsnippet:ignore reason: OpenTelemetry's own registration API; this repository does not reference the OpenTelemetry packages -->
 ```csharp
 services.AddOpenTelemetry().WithMetrics(m => m.AddMeter(ProcessKitDiagnostics.MeterName));
 ```

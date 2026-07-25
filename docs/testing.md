@@ -168,6 +168,7 @@ NUnit):
 
 **F#**
 
+<!-- docsnippet:ignore reason: continues the `head` example defined in the block above; each block is compiled on its own -->
 ```fsharp
 [<TestFixture>]
 type GitTests() =
@@ -187,6 +188,7 @@ type GitTests() =
 
 **C#**
 
+<!-- docsnippet:ignore reason: continues the `Head` example defined in the block above; each block is compiled on its own -->
 ```csharp
 [TestFixture]
 public class GitTests
@@ -214,6 +216,7 @@ in `result.Code`:
 
 **F#**
 
+<!-- docsnippet:imports NUnit.Framework -->
 ```fsharp
 task {
     let runner = (ScriptedRunner()).Fallback(Reply.Fail(2, "boom"))
@@ -233,6 +236,7 @@ task {
 
 **C#**
 
+<!-- docsnippet:imports NUnit.Framework -->
 ```csharp
 var runner = new ScriptedRunner().Fallback(Reply.Fail(2, "boom"));
 var grep = new Command("grep").Args(["needle", "file"]);
@@ -258,6 +262,7 @@ ran `git commit` exactly once" needs no bespoke counting decorator:
 
 **F#**
 
+<!-- docsnippet:imports NUnit.Framework -->
 ```fsharp
 task {
     let runner = (ScriptedRunner()).Fallback(Reply.Ok "")
@@ -276,6 +281,7 @@ task {
 
 **C#**
 
+<!-- docsnippet:imports NUnit.Framework -->
 ```csharp
 var runner = new ScriptedRunner().Fallback(Reply.Ok(""));
 
@@ -442,6 +448,7 @@ device). The doubles model that observable shape:
   handle; the [`WithRedaction`](#record-and-replay) hook scrubs the whole merged stream, so an
   echoed credential never lands in a committed fixture.
 
+<!-- docsnippet:imports NUnit.Framework -->
 ```fsharp
 task {
     // A PTY fake: one merged stream, resize is a recorded no-op.
@@ -463,6 +470,7 @@ bytes into `FakeProcess.StdinBytes`. Add **`WithStdinOpen()`** to give the fake 
 stdin the send verbs need (a fake built from your own `Command.KeepStdinOpen` command through
 `ScriptedRunner` already has it).
 
+<!-- docsnippet:imports NUnit.Framework, System.Text -->
 ```fsharp
 task {
     let fake =
@@ -696,12 +704,14 @@ Production wires the real runner and the per-client defaults:
 
 **F#**
 
+<!-- docsnippet:ignore reason: continues the `Git` wrapper defined in the block above; each block is compiled on its own -->
 ```fsharp
 let git = Git((CliClient.create "git").WithDefaults(fun c -> c.Timeout(TimeSpan.FromSeconds 30.0)))
 ```
 
 **C#**
 
+<!-- docsnippet:ignore reason: continues the `Git` wrapper defined in the block above; each block is compiled on its own -->
 ```csharp
 var git = new Git(new CliClient("git").WithDefaults(c => c.Timeout(TimeSpan.FromSeconds(30))));
 ```
@@ -710,6 +720,7 @@ var git = new Git(new CliClient("git").WithDefaults(c => c.Timeout(TimeSpan.From
 
 **F#**
 
+<!-- docsnippet:ignore reason: continues the `Git` wrapper defined in the block above; each block is compiled on its own -->
 ```fsharp
 [<TestFixture>]
 type GitWrapperTests() =
@@ -731,6 +742,7 @@ type GitWrapperTests() =
 
 **C#**
 
+<!-- docsnippet:ignore reason: continues the `Git` wrapper defined in the block above; each block is compiled on its own -->
 ```csharp
 [TestFixture]
 public class GitWrapperTests

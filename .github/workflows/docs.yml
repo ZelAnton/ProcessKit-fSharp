@@ -52,6 +52,7 @@ on:
       - 'theme/**'
       - 'book.toml'
       - '.github/workflows/docs.yml'
+      - 'scripts/verify-doc-snippets.ps1'
   workflow_dispatch:
 
 # Only one Pages deployment may be in flight at a time; never cancel one that is
@@ -100,12 +101,14 @@ jobs:
         run: python3 scripts/check-sidebar-nav.py book/index.html
 
       # docs/internals/** and docs/planning/** are internal, non-public project
-      # notes. They are absent from docs/SUMMARY.md so they never appear in the
-      # book's navigation, but mdBook copies any non-chapter source file to the
-      # output verbatim — so drop them from the built site to guarantee they are
-      # not reachable at a guessed URL either.
+      # notes, and docs/snippets/** is the compile harness for the guides' code
+      # samples (see the `snippets` job below), not prose. They are absent from
+      # docs/SUMMARY.md so they never appear in the book's navigation, but mdBook
+      # copies any non-chapter source file to the output verbatim — so drop them
+      # from the built site to guarantee they are not reachable at a guessed URL
+      # either.
       - name: Prune internal docs from the built book
-        run: rm -rf book/internals book/planning
+        run: rm -rf book/internals book/planning book/snippets
 
       # ── API reference (fsdocs) → /api/ subpath, built from the latest release ─
       # Resolve which release the reference should reflect: the just-published tag
@@ -210,6 +213,47 @@ jobs:
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: _site
+
+  # ── Do the guides' code samples still compile against the library? ──────────
+  # The API snapshot test and ApiCompat protect the binary surface; nothing
+  # protected the prose, so every ```fsharp / ```csharp block in docs/*.md used to
+  # be free to rot as the API moved. This job extracts them all and compiles them
+  # against the library built from THIS ref (docs/snippets, see its README for the
+  # wrapping rules and the `docsnippet:ignore` marker).
+  #
+  # It runs beside `build` rather than gating `deploy`: a stale sample is a red
+  # check to fix, not a reason to block publishing an otherwise-correct docs edit —
+  # the same way ci.yml's format/analyze/typos jobs are independent signals.
+  #
+  # Coverage note: this workflow triggers on docs/theme/book edits and on every
+  # release, not on a src/** push. A pure API change therefore surfaces here at the
+  # next docs edit or at the next release, whichever comes first; run
+  # `pwsh scripts/verify-doc-snippets.ps1` locally when changing public API.
+  snippets:
+    name: Verify documentation snippets compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          # The harness pins net10.0; the libraries it references build for the
+          # whole TargetFrameworks set, which this SDK band covers.
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Directory.Packages.props', 'nuget.config', 'global.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      # pwsh is preinstalled on this runner image. The script builds
+      # docs/snippets/DocSnippets.slnx (a mini-solution outside ProcessKit.slnx,
+      # whose BuildDependency entries build the referenced libraries first) and
+      # reports every compiler error at the markdown line it came from.
+      - name: Compile every F#/C# sample in docs/*.md
+        run: pwsh scripts/verify-doc-snippets.ps1
 
   deploy:
     needs: build

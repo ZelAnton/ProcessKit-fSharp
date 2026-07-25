@@ -183,6 +183,7 @@ the docs. See [Running commands](commands.md), [Streaming & interactive I/O](str
 
 **Before (F#, raw `System.Diagnostics.Process`)**
 
+<!-- docsnippet:imports System.Diagnostics -->
 ```fsharp
 task {
     let psi =
@@ -211,6 +212,7 @@ task {
 
 **Before (C#, raw `System.Diagnostics.Process`)**
 
+<!-- docsnippet:imports System.Diagnostics -->
 ```csharp
 var psi = new ProcessStartInfo("git", "rev-parse HEAD")
 {
@@ -245,6 +247,7 @@ contained and reaped even if the task is abandoned mid-run.
 
 **Before (C#, CliWrap)**
 
+<!-- docsnippet:ignore reason: CliWrap's own API, shown for contrast; ProcessKit does not reference CliWrap outside benchmarks -->
 ```csharp
 var result = await (
     Cli.Wrap("git").WithArguments(["log", "--format=%an"])
@@ -272,6 +275,7 @@ Console.WriteLine(await pipeline.OutputStringAsync() switch
 **Before (F#, CliWrap)** — CliWrap's `|` is a plain operator overload on `.NET` types, so it works
 unchanged from F#:
 
+<!-- docsnippet:ignore reason: CliWrap's own API, shown for contrast; ProcessKit does not reference CliWrap outside benchmarks -->
 ```fsharp
 task {
     let cmd =
@@ -308,6 +312,7 @@ case) and chain timeouts.
 
 **Before (C#, CliWrap's event stream)**
 
+<!-- docsnippet:ignore reason: CliWrap's own API, shown for contrast; ProcessKit does not reference CliWrap outside benchmarks -->
 ```csharp
 await foreach (var cmdEvent in Cli.Wrap("dotnet").WithArguments(["build", "-c", "Release"]).ListenAsync())
 {
@@ -340,6 +345,7 @@ Console.WriteLine($"exited {finished.Outcome}");
 
 **Before (F#, `Process.OutputDataReceived`)**
 
+<!-- docsnippet:imports System.Diagnostics -->
 ```fsharp
 let psi = ProcessStartInfo("dotnet", "build -c Release", RedirectStandardOutput = true, UseShellExecute = false)
 use proc = new Process(StartInfo = psi)

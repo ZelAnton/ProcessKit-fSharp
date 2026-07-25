@@ -271,7 +271,7 @@ if (started is { IsOk: false, ErrorValue: var startErr })
     return;
 }
 
-using var proc = started.GetValueOrThrow();
+await using var proc = started.GetValueOrThrow();
 var outcome = await proc.WaitAsync();
 Console.WriteLine(outcome);
 ```

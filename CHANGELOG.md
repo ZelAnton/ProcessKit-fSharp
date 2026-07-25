@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
+- Fixed the hardening guide's C# sample disposing a `RunningProcess` with `using`, which does not compile — the handle is `IAsyncDisposable`, so the sample now reads `await using`.
 - Fixed latent masking of the original read/write stream error when cancellation interrupted a tee-sink flush.
 - PTY streams now reject invalid buffer ranges before native I/O and fail safely when a write makes no progress.
 - Supervision stop lifecycle now completes cleanly after a session finishes.
