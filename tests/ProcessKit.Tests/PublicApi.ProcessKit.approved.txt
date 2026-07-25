@@ -382,8 +382,10 @@ class ProcessKit.OutputEvent
   member get_Tag() : System.Int32
   property IsStderr : System.Boolean { get }
   property IsStdout : System.Boolean { get }
+  property Sequence : System.Int64 { get }
   property Tag : System.Int32 { get }
   property Text : System.String { get }
+  property TimestampUtc : System.DateTimeOffset { get }
   static member NewStderr(ProcessKit.OutputLine) : ProcessKit.OutputEvent
   static member NewStdout(ProcessKit.OutputLine) : ProcessKit.OutputEvent
 
@@ -405,7 +407,9 @@ module ProcessKit.OutputEvent+Tags
 
 class ProcessKit.OutputLine
   member ToString() : System.String
+  property Sequence : System.Int64 { get }
   property Text : System.String { get }
+  property TimestampUtc : System.DateTimeOffset { get }
 
 class ProcessKit.OverflowMode
   :> System.Collections.IStructuralEquatable

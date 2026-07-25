@@ -212,8 +212,11 @@ after `StdoutLinesAsync()`.
 
 When the *order* of stdout relative to stderr matters — a build tool that prints
 progress to one and diagnostics to the other — `OutputEventsAsync()` returns an
-`IAsyncEnumerable<OutputEvent>` that merges both channels in arrival order. Each
-`OutputEvent` carries `IsStdout` / `IsStderr` and the line `Text`:
+`IAsyncEnumerable<OutputEvent>` that merges both channels in arrival order. Each event's
+`OutputLine` carries its `Text`, `TimestampUtc` (captured from the command's `TimeProvider`), and a
+one-based `Sequence` shared by stdout and stderr for that run. The sequence records the order in
+which the independently-drained streams reached ProcessKit's line-framing boundary, so a collected
+transcript can be sorted unambiguously even if later processing is concurrent:
 
 **F#**
 
@@ -232,8 +235,8 @@ task {
                 match! e.MoveNextAsync() with
                 | true ->
                     let ev = e.Current
-                    if ev.IsStdout then printfn $"out| {ev.Text}"
-                    else eprintfn $"err| {ev.Text}"
+                    if ev.IsStdout then printfn $"{ev.Sequence} out| {ev.Text}"
+                    else eprintfn $"{ev.Sequence} err| {ev.Text}"
                 | false -> go <- false
         finally
             e.DisposeAsync().AsTask().Wait()
@@ -248,11 +251,17 @@ await using var proc = (await new Command("dotnet").Args(["build", "-c", "Releas
 await foreach (var ev in proc.OutputEventsAsync())
 {
     if (ev.IsStdout)
-        Console.WriteLine($"out| {ev.Text}");
+        Console.WriteLine($"{ev.Sequence} out| {ev.Text}");
     else
-        Console.Error.WriteLine($"err| {ev.Text}");
+        Console.Error.WriteLine($"{ev.Sequence} err| {ev.Text}");
 }
 ```
+
+`FakeProcess`, `ScriptedRunner`, and cassette replay all run through the same framing path. Their
+sequence numbers are therefore deterministic for a given emitted order. Timestamps are synthesized
+when the fake/replay stream is consumed; attach a deterministic `Command.TimeProvider` when a test
+needs stable timestamp values. Cassettes continue to store output text rather than capture-time
+metadata, so existing cassette versions remain compatible.
 
 From C#, `await foreach (var ev in proc.OutputEventsAsync()) { ... }`. Choose `OutputEventsAsync()`
 *or* `StdoutLinesAsync()` for a given run — both consume stdout, so they are alternatives,

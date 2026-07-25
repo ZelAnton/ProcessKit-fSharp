@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added configurable text stdin encoding through `Command.StdinEncoding`.
 - `Command.TimeProvider` / `Command.timeProvider` selects the timer source for retry delays, readiness probes, and supervision; `TimeProvider.System` remains the default, while deterministic providers make those paths testable without global time changes.
+- `OutputLine.TimestampUtc` and `OutputLine.Sequence` expose each streamed event line's capture time and one-based cross-stream order; fake and replay streams synthesize the same metadata through the command's `TimeProvider` without changing cassette files.
 
 ### Changed
 - `Command.Encoding` and `Command.ConsoleEncoding()` now apply their encoding to text stdin as well as captured output.

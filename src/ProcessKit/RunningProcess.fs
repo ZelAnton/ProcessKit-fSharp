@@ -334,6 +334,10 @@ type RunningProcess internal (host: RunningHost) =
     let readStdoutLineCount () = Volatile.Read(&stdoutLineCount)
     let readStderrLineCount () = Volatile.Read(&stderrLineCount)
 
+    // One sequence domain for both event pumps. The atomic increment records the order in which the
+    // two independently-drained streams reach ProcessKit's line-framing boundary.
+    let mutable outputEventSequence = 0L
+
     // Idle-timeout (`Command.IdleTimeout`, opt-in): a resettable "no output" watchdog, plus thin
     // activity-tracking wrappers around the stdout/stderr pipes that reset it on every non-empty read.
     // Byte granularity — honest and uniform across every verb (line pumps, byte drains, raw captures
@@ -1563,7 +1567,13 @@ type RunningProcess internal (host: RunningHost) =
                                             eventChannel.Reader
                                             countSoFar
                                             bumpDroppedStreamLine
-                                            (wrap (OutputLine line)))
+                                            (wrap (
+                                                OutputLine(
+                                                    line,
+                                                    config.TimeProvider.GetUtcNow(),
+                                                    Interlocked.Increment(&outputEventSequence)
+                                                )
+                                            )))
                                     None
                                     (fun () -> disposalCts.Token.IsCancellationRequested)
                         with ex ->

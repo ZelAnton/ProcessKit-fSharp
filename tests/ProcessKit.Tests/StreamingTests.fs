@@ -21,6 +21,11 @@ open ProcessKit
 /// Must be public: STJ's constructor-based deserialization needs an accessible constructor.
 type JsonLine = { Id: int; Label: string }
 
+type private FixedTimeProvider(timestampUtc: DateTimeOffset) =
+    inherit TimeProvider()
+
+    override _.GetUtcNow() = timestampUtc
+
 /// Raw `getrlimit`/`setrlimit` access to `RLIMIT_NOFILE`, used ONLY by the T-028 regression test
 /// below (``spawnPosix fails instead of silently inheriting when open(/dev/null) fails``) to pin
 /// the test process's file-descriptor ceiling at an exact, deterministic point so a specific
@@ -472,6 +477,9 @@ type StreamingTests() =
 
     [<Test>]
     member _.``OutputEvents merges stdout and stderr``() : Task =
+        let capturedAt = DateTimeOffset(2026, 7, 26, 12, 34, 56, TimeSpan.Zero)
+        let timeProvider = FixedTimeProvider capturedAt
+
         let script =
             if isWindows then
                 "echo out&echo err 1>&2"
@@ -479,7 +487,9 @@ type StreamingTests() =
                 "echo out; echo err 1>&2"
 
         task {
-            match! runner.StartAsync(shell script, CancellationToken.None) with
+            let command = shell script |> Command.timeProvider timeProvider
+
+            match! runner.StartAsync(command, CancellationToken.None) with
             | Error error -> Assert.Fail $"{error}"
             | Ok running ->
                 let! events = collect (running.OutputEventsAsync())
@@ -500,6 +510,20 @@ type StreamingTests() =
 
                 Assert.That(hasStdout, Is.True, "missing stdout event")
                 Assert.That(hasStderr, Is.True, "missing stderr event")
+                Assert.That(events |> Seq.map (fun e -> e.TimestampUtc), Is.All.EqualTo capturedAt)
+
+                CollectionAssert.AreEqual(
+                    [| 1L; 2L |],
+                    events |> Seq.map (fun e -> e.Sequence) |> Seq.sort |> Seq.toArray
+                )
+
+                events
+                |> Seq.iter (fun event ->
+                    match event with
+                    | OutputEvent.Stdout line
+                    | OutputEvent.Stderr line ->
+                        Assert.That(line.TimestampUtc, Is.EqualTo event.TimestampUtc)
+                        Assert.That(line.Sequence, Is.EqualTo event.Sequence))
         }
         :> Task
 
