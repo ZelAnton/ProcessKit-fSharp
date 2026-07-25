@@ -347,16 +347,16 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             | None -> Error(ProcessError.Io "failed to query Job Object accounting")
 
         member _.UpdateLimits(limits) =
-            // Re-apply the whole limit set to the live Job via `SetInformationJobObject` (memory /
-            // active-process caps in one extended-limit write, then the CPU rate cap) — the same call
-            // `Create` uses, which cleanly REPLACES the caps in force: a dimension now `None` is written
-            // back as unbounded rather than left at its previous cap. This runs synchronously under the
-            // group's lifecycle lock (via `ProcessGroup.WhenLive`), so it works on the still-open
-            // `jobHandle` exactly like `Suspend`/`Resume`/`Stats`/`Members` — no handle duplication is
-            // needed here, unlike the OFF-lock graceful poll (K-025/T-162). `applyWindowsJobLimits`
-            // best-effort restores the prior extended-limit block if the CPU-rate write fails after it, so
-            // a genuine apply failure is an honest `ProcessError.ResourceLimit` AND the live Job is back on
-            // the previous set (T-207).
+            // Re-apply the whole limit set to the live Job via `SetInformationJobObject` (the UI
+            // restrictions first, then the memory / active-process caps AND the CPU-affinity mask together
+            // in one extended-limit write, then the CPU rate cap) — the same call `Create` uses, which
+            // cleanly REPLACES the caps in force: a dimension now `None` is written back as unbounded
+            // rather than left at its previous cap. This runs synchronously under the group's lifecycle
+            // lock (via `ProcessGroup.WhenLive`), so it works on the still-open `jobHandle` exactly like
+            // `Suspend`/`Resume`/`Stats`/`Members` — no handle duplication is needed here, unlike the
+            // OFF-lock graceful poll (K-025/T-162). `applyWindowsJobLimits` best-effort restores the prior
+            // extended-limit block if the CPU-rate write fails after it, so a genuine apply failure is an
+            // honest `ProcessError.ResourceLimit` AND the live Job is back on the previous set (T-207).
             match Native.Windows.applyWindowsJobLimits jobHandle limits with
             | Ok() -> Ok()
             | Error message -> Error(ProcessError.ResourceLimit message)
@@ -551,15 +551,21 @@ type internal CgroupBackend(cgroupPath: string) =
                 Ok(ProcessGroupStats(active, cpu, peak))
 
         member _.UpdateLimits(limits) =
-            // Rewrite the cgroup's controller files in place (`memory.max`/`pids.max`/`cpu.max`),
-            // enabling any controller the new caps newly need in the parent's `cgroup.subtree_control`
-            // first. REPLACE semantics: a dimension now `None` is reset to the controller's unbounded
-            // `max` sentinel (only where that controller file already exists — a never-enabled
-            // controller is already unbounded), never left at its previous cap. Runs under the group's
-            // lifecycle lock (via `ProcessGroup.WhenLive`), so the cgroup directory can't be removed by a
-            // concurrent teardown mid-write. `updateCgroupLimits` best-effort restores any controller file
-            // it already rewrote if a later write fails, so a genuine write/delegation failure is an honest
-            // `ProcessError.ResourceLimit` AND the live cgroup is back on the previous set (T-207).
+            // Rewrite the cgroup's controller files in place (`memory.max`/`pids.max`/`cpu.max`/
+            // `cpuset.cpus`), enabling any controller the new caps newly need in the parent's
+            // `cgroup.subtree_control` first (`cpuset` is the one a hierarchy most often lacks entirely,
+            // and its absence fails the update before any file is written). REPLACE semantics: a dimension
+            // now `None` is reset to that controller file's OWN "unbounded" sentinel — `max` for
+            // `memory.max`/`pids.max`/`cpu.max`, but a blank line (written as `"\n"`) for `cpuset.cpus`,
+            // which does not accept `max` at all and whose value would silently survive a zero-length
+            // write. The sentinel is per-file and never inherited: a dimension added to this plan must
+            // bring its own. Either way the reset only happens where that controller file already exists
+            // (a never-enabled controller is already unbounded), never left at its previous cap. Runs under
+            // the group's lifecycle lock (via `ProcessGroup.WhenLive`), so the cgroup directory can't be
+            // removed by a concurrent teardown mid-write. `updateCgroupLimits` best-effort restores any
+            // controller file it already rewrote if a later write fails, so a genuine write/delegation
+            // failure is an honest `ProcessError.ResourceLimit` AND the live cgroup is back on the previous
+            // set (T-207).
             //
             // Job Object UI restrictions have no cgroup counterpart to rewrite, so an update carrying any
             // is refused up front with the same `Unsupported` `ProcessGroup.Create` gives here — the caps

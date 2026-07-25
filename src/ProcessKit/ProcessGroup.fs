@@ -121,10 +121,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     withBackend (JobObjectBackend job)
         else
             // Job Object UI restrictions are refused before any other off-Windows dispatch: unlike the
-            // memory/process/CPU caps — which a cgroup v2 hierarchy CAN enforce, and whose absence is
-            // therefore a `ResourceLimit` — a clipboard/desktop/exit-Windows restriction has no analogue
-            // in any POSIX primitive at all, so `Unsupported` is the honest classification. Never a group
-            // that silently runs its tree unrestricted.
+            // resource caps — which a cgroup v2 hierarchy CAN enforce, and whose absence is therefore a
+            // `ResourceLimit` — a clipboard/desktop/exit-Windows restriction has no analogue in any POSIX
+            // primitive at all, so `Unsupported` is the honest classification. Never a group that silently
+            // runs its tree unrestricted.
             match limits.UiRestrictionsUnsupported with
             | Some error -> Error error
             | None ->
@@ -646,10 +646,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// in force: a dimension left `None` becomes unbounded again, not left at its previous cap.
     ///
     /// A limit-capable mechanism re-applies the caps to its live container — **Windows** re-issues
-    /// `SetInformationJobObject` on the Job, **Linux cgroup v2** rewrites `memory.max`/`pids.max`/
-    /// `cpu.max` — while the **POSIX process-group** mechanism (macOS/BSD, or Linux without cgroup v2)
-    /// has no whole-tree limit primitive and returns `ProcessError.ResourceLimit`, the same honest,
-    /// typed refusal `Create` gives for a limited group there — never a silent no-op.
+    /// `SetInformationJobObject` on the Job (the caps, the CPU-affinity mask, and the UI restrictions),
+    /// **Linux cgroup v2** rewrites `memory.max`/`pids.max`/`cpu.max`/`cpuset.cpus` in place — while the
+    /// **POSIX process-group** mechanism (macOS/BSD, or Linux without cgroup v2) has no whole-tree limit
+    /// primitive and returns `ProcessError.ResourceLimit`, the same honest, typed refusal `Create` gives
+    /// for a limited group there — never a silent no-op. On Linux the CPU-affinity pin additionally needs
+    /// the `cpuset` controller: a hierarchy that does not carry it at all cannot enforce a pin, so an
+    /// update requesting one is refused with that same typed `ProcessError.ResourceLimit` — and refused
+    /// before any controller file is written, so the previous caps stay in force — never a dropped pin.
     ///
     /// Routed through the same lifecycle gate as the other control verbs: the released-flag check AND
     /// the native re-apply run in one critical section, so a call racing (or following) teardown either

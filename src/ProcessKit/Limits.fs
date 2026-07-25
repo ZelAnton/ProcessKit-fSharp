@@ -9,11 +9,11 @@ module internal Limits =
 /// The Windows Job Object **UI restrictions** a process group can impose on its whole tree
 /// (`JOBOBJECT_BASIC_UI_RESTRICTIONS`) — see `ProcessGroupOptions.WithUiRestrictions`.
 ///
-/// These are the desktop-side counterpart of the resource caps: where `ResourceLimits`'
-/// memory/process/CPU caps bound what a contained tree may *consume*, these bound what it may *do to
-/// the interactive session it happens to share with you* — read or overwrite the clipboard, change
-/// display or system-wide parameters, create or switch desktops, or log the user off / shut the
-/// machine down. A build plugin or a downloaded tool has no business doing any of that, and unlike a
+/// These are the desktop-side counterpart of the resource caps: where the rest of `ResourceLimits`
+/// bounds what a contained tree may *consume* (and which cores it may consume it on), these bound what
+/// it may *do to the interactive session it happens to share with you* — read or overwrite the
+/// clipboard, change display or system-wide parameters, create or switch desktops, or log the user
+/// off / shut the machine down. A build plugin or a downloaded tool has no business doing any of that, and unlike a
 /// resource cap there is no way to notice after the fact that it did.
 ///
 /// A `[<Flags>]` set: combine the members with `|||` (F#) or `|` (C#), or take the whole set with
