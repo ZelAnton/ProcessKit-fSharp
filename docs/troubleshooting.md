@@ -223,5 +223,3 @@ Confirm that the test project also references its normal NUnit adapter and
 shown in the [testing guide](testing.md#scripting-replies).
 
 ---
-
-Next: [Comparison and migration guide](comparison.md)
