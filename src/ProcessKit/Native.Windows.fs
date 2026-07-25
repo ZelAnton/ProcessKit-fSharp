@@ -1225,6 +1225,13 @@ module internal Windows =
     [<Literal>]
     let private JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200u
 
+    // `JOBOBJECT_BASIC_LIMIT_INFORMATION.Affinity` is honoured only when this flag is set; without it the
+    // field is ignored and the tree keeps the ambient affinity (which is why clearing the pin is just a
+    // matter of NOT setting the flag — there is no separate "disable" call to make, and so no analogue of
+    // the CPU-rate-control ERROR_INVALID_PARAMETER-on-already-disabled case below).
+    [<Literal>]
+    let private JOB_OBJECT_LIMIT_AFFINITY = 0x00000010u
+
     [<Literal>]
     let private JobObjectCpuRateControlInformation = 15
 
@@ -1294,9 +1301,80 @@ module internal Windows =
         finally
             Marshal.FreeHGlobal buffer
 
+    /// The Job's current CPU-affinity mask, or `None` when it carries no affinity limit at all (or the
+    /// query failed). The read-back a test asserts an applied pin against, mirroring
+    /// `queryWindowsUiRestrictions` — the mask field is only meaningful while `JOB_OBJECT_LIMIT_AFFINITY`
+    /// is set, so an unpinned Job reports `None` rather than whatever stale bits the field happens to
+    /// hold.
+    let queryWindowsJobAffinity (job: nativeint) : unativeint option =
+        match queryExtendedLimit job with
+        | Some info when info.BasicLimitInformation.LimitFlags &&& JOB_OBJECT_LIMIT_AFFINITY <> 0u ->
+            Some info.BasicLimitInformation.Affinity
+        | _ -> None
+
+    /// The Job Object affinity mask for a requested core set, or an honest message naming the cores that
+    /// have no representation in it. `JOBOBJECT_BASIC_LIMIT_INFORMATION.Affinity` is a single
+    /// pointer-sized bitmask scoped to ONE processor group — 64 bits on x64, 32 on x86 — so a core index
+    /// at or beyond that width cannot be expressed at all. Refusing it here (before any native write)
+    /// keeps the shift from wrapping the index around onto a different, wrong core, which is exactly the
+    /// silent downgrade this library refuses to make: the caller gets a typed `ResourceLimit` naming the
+    /// cores instead.
+    let windowsAffinityMask (cores: int list) : Result<unativeint, string> =
+        let bits = IntPtr.Size * 8
+
+        match cores |> List.filter (fun core -> core >= bits) with
+        | [] -> cores |> List.fold (fun mask core -> mask ||| (1un <<< core)) 0un |> Ok
+        | unrepresentable ->
+            let listed = unrepresentable |> List.map string |> String.concat ", "
+
+            Error
+                $"CPU core(s) {listed} cannot be pinned through a Windows Job Object: its affinity mask is one {bits}-bit word covering a single processor group, so only cores 0-{bits - 1} can be named"
+
+    /// The extended-limit block a limit set asks for — the memory and active-process caps, the CPU
+    /// affinity pin, and the preserved `KILL_ON_JOB_CLOSE` — or an honest message when the requested pin
+    /// has no representation in a Job affinity mask. Resolved as a pure value, with no native call, so
+    /// `applyWindowsJobLimits` can refuse an impossible set while the Job is still wholly untouched.
+    ///
+    /// A dimension left `None` simply does not set its flag, which IS the replace semantics: the block is
+    /// written whole, so an unset flag means that cap is lifted. Affinity is no exception — dropping the
+    /// pin needs no separate "disable" call (contrast the CPU rate control, which does).
+    let private extendedLimitBlockFor (limits: ResourceLimits) : Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION, string> =
+        let affinity =
+            match limits.CpuAffinityCores with
+            | Some cores -> windowsAffinityMask cores |> Result.map Some
+            | None -> Ok Option.None
+
+        match affinity with
+        | Error message -> Error message
+        | Ok affinityMask ->
+            let mutable info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            let mutable flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+            match limits.MaxProcesses with
+            | Some n ->
+                flags <- flags ||| JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                info.BasicLimitInformation.ActiveProcessLimit <- uint32 (max 0 n)
+            | None -> ()
+
+            match limits.MemoryMax with
+            | Some bytes ->
+                flags <- flags ||| JOB_OBJECT_LIMIT_JOB_MEMORY
+                info.JobMemoryLimit <- unativeint (uint64 bytes)
+            | None -> ()
+
+            match affinityMask with
+            | Some mask ->
+                flags <- flags ||| JOB_OBJECT_LIMIT_AFFINITY
+                info.BasicLimitInformation.Affinity <- mask
+            | None -> ()
+
+            info.BasicLimitInformation.LimitFlags <- flags
+            Ok info
+
     /// Apply resource limits to a Job: a memory cap (`JobMemoryLimit`), an active-process cap, a
-    /// CPU hard cap (a fraction of *total* system CPU, so per-core quota is approximate), and the
-    /// UI restrictions (clipboard/desktop/display/exit-Windows). Preserves `KILL_ON_JOB_CLOSE`.
+    /// CPU hard cap (a fraction of *total* system CPU, so per-core quota is approximate), the CPU-affinity
+    /// pin (`Affinity` + `JOB_OBJECT_LIMIT_AFFINITY`), and the UI restrictions
+    /// (clipboard/desktop/display/exit-Windows). Preserves `KILL_ON_JOB_CLOSE`.
     /// Returns an error message on failure.
     ///
     /// This cleanly REPLACES the caps in force, so it serves both `ProcessGroup.Create` (a fresh Job)
@@ -1309,17 +1387,21 @@ module internal Windows =
     /// exactly the desired "no CPU cap" end state and so is treated as success.
     ///
     /// The caps land in separate native writes — the UI restrictions, the extended-limit block (memory +
-    /// active-process), then the CPU rate block — so a later one could fail after an earlier one already
-    /// applied. To keep the honest `UpdateLimits` contract (a failed apply leaves the live Job on the
-    /// PREVIOUS set), each prior block is captured up front and best-effort restored if a later write
+    /// active-process + affinity), then the CPU rate block — so a later one could fail after an earlier one
+    /// already applied. To keep the honest `UpdateLimits` contract (a failed apply leaves the live Job on
+    /// the PREVIOUS set), each prior block is captured up front and best-effort restored if a later write
     /// fails, so an `Error` return means the Job is back on the previous set, never a silent mix
     /// `Options.Limits` would misreport (T-207). Only if a restore itself fails (or a prior couldn't be
-    /// captured) is the state indeterminate, and the error says so distinctly.
+    /// captured) is the state indeterminate, and the error says so distinctly. The affinity pin needs no
+    /// rollback machinery of its own: it rides in the extended-limit block, which the kernel applies whole
+    /// or not at all, so it is already covered by that block's captured prior.
     ///
     /// The UI restrictions are written FIRST, and only when they actually differ from what the Job
     /// already carries: a failure there has then changed nothing at all (the same "nothing to roll back"
     /// position as a failed first block), and the overwhelmingly common case — a limit set with no UI
-    /// restrictions on a Job that has none — issues no extra native call.
+    /// restrictions on a Job that has none — issues no extra native call. Ahead of even that, the whole
+    /// extended-limit block is resolved as a pure value (`extendedLimitBlockFor`), so a pin no affinity
+    /// mask can express is refused with the Job untouched rather than half-updated.
     let applyWindowsJobLimits (job: nativeint) (limits: ResourceLimits) : Result<unit, string> =
         // (Re)write the Job's CPU rate control block. `controlFlags = 0` disables CPU rate control (the
         // replace-semantics "no CPU cap" state); the enable+hard-cap flags with a rate arm the cap. The
@@ -1406,88 +1488,92 @@ module internal Windows =
             | Some note ->
                 $"{message}; the Job's previous UI restrictions could not be restored either ({note}), so they may still be in force"
 
-        let mutable info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        let mutable flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        // Win32 rejects an affinity mask that is not a subset of this process's own affinity with a bare
+        // ERROR_INVALID_PARAMETER — "the parameter is incorrect", which names no core and no reason. When
+        // the block being written carries a pin, say what was asked for, so a request for a core this host
+        // does not have (or will not give this process) is actionable rather than a riddle.
+        let withAffinityNote (message: string) =
+            match limits.CpuAffinityCores with
+            | Some cores ->
+                let listed = cores |> List.map string |> String.concat ", "
 
-        match limits.MaxProcesses with
-        | Some n ->
-            flags <- flags ||| JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-            info.BasicLimitInformation.ActiveProcessLimit <- uint32 (max 0 n)
-        | None -> ()
+                $"{message} (the requested CPU affinity pins the tree to core(s) {listed}; a Job's affinity mask must be a subset of this process's own, so every core named must exist on this host and be available to it)"
+            | None -> message
 
-        match limits.MemoryMax with
-        | Some bytes ->
-            flags <- flags ||| JOB_OBJECT_LIMIT_JOB_MEMORY
-            info.JobMemoryLimit <- unativeint (uint64 bytes)
-        | None -> ()
-
-        info.BasicLimitInformation.LimitFlags <- flags
-
-        // Skipped entirely when the Job already carries exactly the requested set (including the common
-        // "none requested, none in force"); written unconditionally when the prior could not be read,
-        // since nothing then proves the Job is already right.
-        let uiWrite =
-            if priorUi = Some requestedUi then
-                Ok false
-            else
-                writeUiRestrictions requestedUi |> Result.map (fun () -> true)
-
-        match uiWrite with
+        match extendedLimitBlockFor limits with
         | Error message ->
-            // Nothing else has been touched yet, so the previous set is still wholly in force.
-            Error $"failed to apply the Job UI restrictions: {message}"
-        | Ok uiChanged ->
+            // A pin no Job affinity mask can express. Refused before a single native write, so the Job
+            // still carries exactly the caps it had.
+            Error message
+        | Ok info ->
 
-            match writeExtendedLimit info with
+            // Skipped entirely when the Job already carries exactly the requested set (including the common
+            // "none requested, none in force"); written unconditionally when the prior could not be read,
+            // since nothing then proves the Job is already right.
+            let uiWrite =
+                if priorUi = Some requestedUi then
+                    Ok false
+                else
+                    writeUiRestrictions requestedUi |> Result.map (fun () -> true)
+
+            match uiWrite with
             | Error message ->
-                // `SetInformationJobObject` applies the whole block or none, so a failure here changed
-                // nothing in the memory/active-process caps — but the UI restrictions written just above
-                // did change, so put those back before reporting.
-                Error(withUiNote message (restoreUiRestrictions uiChanged))
-            | Ok() ->
-                let cpuResult =
-                    match limits.CpuQuota with
-                    | Some cores ->
-                        let fraction = min 1.0 (cores / float Environment.ProcessorCount)
-                        let rate = uint32 (max 1.0 (Math.Round(fraction * 10000.0)))
+                // Nothing else has been touched yet, so the previous set is still wholly in force.
+                Error $"failed to apply the Job UI restrictions: {message}"
+            | Ok uiChanged ->
 
-                        writeCpuRate (JOB_OBJECT_CPU_RATE_CONTROL_ENABLE ||| JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP) rate
-                        |> Result.mapError (fun errno -> Win32Exception(errno).Message)
-                    | None ->
-                        // Replace semantics: no CPU quota now, so disable any rate cap a prior apply set.
-                        // Disabling on a Job that has none enabled is rejected with ERROR_INVALID_PARAMETER —
-                        // the "no CPU cap" state already holds, so treat that as success; surface anything else.
-                        match writeCpuRate 0u 0u with
-                        | Ok() -> Ok()
-                        | Error errno when errno = ERROR_INVALID_PARAMETER -> Ok()
-                        | Error errno -> Error(Win32Exception(errno).Message)
+                match writeExtendedLimit info with
+                | Error message ->
+                    // `SetInformationJobObject` applies the whole block or none, so a failure here changed
+                    // nothing in the memory/active-process/affinity caps — but the UI restrictions written
+                    // just above did change, so put those back before reporting.
+                    Error(withUiNote (withAffinityNote message) (restoreUiRestrictions uiChanged))
+                | Ok() ->
+                    let cpuResult =
+                        match limits.CpuQuota with
+                        | Some cores ->
+                            let fraction = min 1.0 (cores / float Environment.ProcessorCount)
+                            let rate = uint32 (max 1.0 (Math.Round(fraction * 10000.0)))
 
-                match cpuResult with
-                | Ok() -> Ok()
-                | Error cpuMessage ->
-                    // The memory/active-process block already applied but the CPU-rate cap did not. Roll
-                    // that block (and the UI restrictions) back to the captured prior so the live Job and
-                    // the Options snapshot stay together on the previous set (T-207); if a prior couldn't
-                    // be captured, or restoring it also fails, the state is indeterminate — say so
-                    // distinctly so the caller never trusts Options here.
-                    let uiNote = restoreUiRestrictions uiChanged
+                            writeCpuRate
+                                (JOB_OBJECT_CPU_RATE_CONTROL_ENABLE ||| JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP)
+                                rate
+                            |> Result.mapError (fun errno -> Win32Exception(errno).Message)
+                        | None ->
+                            // Replace semantics: no CPU quota now, so disable any rate cap a prior apply set.
+                            // Disabling on a Job that has none enabled is rejected with ERROR_INVALID_PARAMETER —
+                            // the "no CPU cap" state already holds, so treat that as success; surface anything else.
+                            match writeCpuRate 0u 0u with
+                            | Ok() -> Ok()
+                            | Error errno when errno = ERROR_INVALID_PARAMETER -> Ok()
+                            | Error errno -> Error(Win32Exception(errno).Message)
 
-                    match priorExt with
-                    | Some prior ->
-                        match writeExtendedLimit prior with
-                        | Ok() -> Error(withUiNote cpuMessage uiNote)
-                        | Error restoreMessage ->
+                    match cpuResult with
+                    | Ok() -> Ok()
+                    | Error cpuMessage ->
+                        // The memory/active-process/affinity block already applied but the CPU-rate cap did
+                        // not. Roll that block (and the UI restrictions) back to the captured prior so the
+                        // live Job and the Options snapshot stay together on the previous set (T-207); if a
+                        // prior couldn't be captured, or restoring it also fails, the state is indeterminate
+                        // — say so distinctly so the caller never trusts Options here.
+                        let uiNote = restoreUiRestrictions uiChanged
+
+                        match priorExt with
+                        | Some prior ->
+                            match writeExtendedLimit prior with
+                            | Ok() -> Error(withUiNote cpuMessage uiNote)
+                            | Error restoreMessage ->
+                                Error(
+                                    withUiNote
+                                        $"failed to apply the Job CPU rate cap ({cpuMessage}) and could not roll the memory/active-process/affinity caps back to the previous set ({restoreMessage}); the Job's limits may be partially applied"
+                                        uiNote
+                                )
+                        | None ->
                             Error(
                                 withUiNote
-                                    $"failed to apply the Job CPU rate cap ({cpuMessage}) and could not roll the memory/active-process caps back to the previous set ({restoreMessage}); the Job's limits may be partially applied"
+                                    $"failed to apply the Job CPU rate cap ({cpuMessage}) and the Job's prior limits could not be captured to roll back; the Job's limits may be partially applied"
                                     uiNote
                             )
-                    | None ->
-                        Error(
-                            withUiNote
-                                $"failed to apply the Job CPU rate cap ({cpuMessage}) and the Job's prior limits could not be captured to roll back; the Job's limits may be partially applied"
-                                uiNote
-                        )
 
     let private buildWindowsEnvironment (command: Command) : nativeint =
         if not command.Config.ClearEnv && command.Config.EnvOverrides.IsEmpty then

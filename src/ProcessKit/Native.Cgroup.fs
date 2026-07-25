@@ -60,10 +60,33 @@ module internal Cgroup =
         let quota = CgroupCpuMax.calculateQuota cores
         CgroupCpuMax.formatCpuMax quota
 
+    /// Render a set of core indices as a cgroup v2 cpuset list — the grammar `cpuset.cpus` accepts and
+    /// prints back: each run of consecutive indices collapses into `lo-hi`, a lone index stays bare, and
+    /// the runs are joined with commas (`[0; 2; 3]` → `"0,2-3"`). Sorted and de-duplicated defensively, so
+    /// the rendering does not depend on the caller having normalized first.
+    let formatCpuList (cores: int list) : string =
+        let runs =
+            cores
+            |> List.distinct
+            |> List.sort
+            |> List.fold
+                (fun runs core ->
+                    match runs with
+                    | (lo, hi) :: rest when core = hi + 1 -> (lo, core) :: rest
+                    | _ -> (core, core) :: runs)
+                []
+            |> List.rev
+
+        runs
+        |> List.map (fun (lo, hi) -> if lo = hi then string lo else $"{lo}-{hi}")
+        |> String.concat ","
+
     // Enable the controllers the given limits need (only the missing ones) in the parent's
     // `cgroup.subtree_control`. Shared by creation and the live update, so both enable exactly the
     // controllers their cap set requires. Raises on failure (notably EBUSY writing subtree_control when
-    // this process is not at the real cgroup root).
+    // this process is not at the real cgroup root, or ENOENT for a controller this hierarchy does not
+    // carry at all — `cpuset` is the one most often absent, so a CPU-affinity pin fails fast there rather
+    // than being quietly skipped).
     let private enableNeededControllers (parent: string) (limits: ResourceLimits) =
         let needed =
             [ if limits.MemoryMax.IsSome then
@@ -71,7 +94,9 @@ module internal Cgroup =
               if limits.MaxProcesses.IsSome then
                   "pids"
               if limits.CpuQuota.IsSome then
-                  "cpu" ]
+                  "cpu"
+              if limits.CpuAffinityCores.IsSome then
+                  "cpuset" ]
 
         let subtreeFile = Path.Combine(parent, "cgroup.subtree_control")
 
@@ -104,6 +129,10 @@ module internal Cgroup =
 
         match limits.CpuQuota with
         | Some cores -> File.WriteAllText(Path.Combine(cgroupPath, "cpu.max"), cpuMaxValue cores)
+        | None -> ()
+
+        match limits.CpuAffinityCores with
+        | Some cores -> File.WriteAllText(Path.Combine(cgroupPath, "cpuset.cpus"), formatCpuList cores)
         | None -> ()
 
     // A process-wide counter making each cgroup name unique without relying on `CreateDirectory`
@@ -140,14 +169,24 @@ module internal Cgroup =
             with ex ->
                 Error ex.Message
 
+    // A cgroup interface file is cleared by writing a BLANK line, never by writing zero bytes: a
+    // zero-length write does not reach the kernel's parser at all, so the value would silently stay put.
+    // Only `cpuset.cpus` can read back blank (an unpinned cpuset prints just a newline); `memory.max`/
+    // `pids.max`/`cpu.max` always carry a value, so this only ever substitutes for the cpuset case.
+    let private restorePayload (prior: string) =
+        if String.IsNullOrWhiteSpace prior then "\n" else prior
+
     /// Apply a new limit set to an EXISTING cgroup in place (the live `ProcessGroup.UpdateLimits` path),
     /// without recreating the cgroup or restarting its members. Enables any controller the new caps
     /// newly need in the parent's `cgroup.subtree_control`, then rewrites `memory.max`/`pids.max`/
-    /// `cpu.max`. REPLACE semantics, mirroring the Windows Job path: a dimension now `None` is reset to
-    /// the controller's unbounded `max` sentinel — but only where that controller's interface file
-    /// already exists (a controller never enabled at creation is already unbounded, and its `*.max` file
-    /// would not exist to write). Returns an error message on any write/delegation failure (e.g. EBUSY
-    /// when not at the real cgroup root), which the backend turns into `ProcessError.ResourceLimit`.
+    /// `cpu.max`/`cpuset.cpus`. REPLACE semantics, mirroring the Windows Job path: a dimension now `None`
+    /// is reset to the controller's own "unbounded" sentinel — `max` for the three caps, a blank line for
+    /// `cpuset.cpus` (an empty cpuset means "inherit the parent's cores", i.e. unpinned; `max` is not a
+    /// value it accepts) — but only where that controller's interface file already exists (a controller
+    /// never enabled at creation is already unbounded, and its file would not exist to write). Returns an
+    /// error message on any write/delegation failure (e.g. EBUSY when not at the real cgroup root, or
+    /// ENOENT enabling a `cpuset` controller this hierarchy lacks), which the backend turns into
+    /// `ProcessError.ResourceLimit`.
     ///
     /// The caps are written one controller file at a time, so a later write could fail after an earlier
     /// one already landed. To keep the honest `UpdateLimits` contract — a failed apply leaves the live
@@ -167,25 +206,28 @@ module internal Cgroup =
                 enableNeededControllers parent limits
 
                 // The controller files to (re)write, in apply order, each paired with the content the new
-                // set wants: `Some v` writes the cap; `None` resets to the unbounded `max` sentinel — but
-                // only where the controller file already exists (a never-enabled controller is already
-                // unbounded, with no file to reset).
+                // set wants and with that file's own "unbounded" sentinel: `Some v` writes the cap; `None`
+                // resets to the sentinel — but only where the controller file already exists (a
+                // never-enabled controller is already unbounded, with no file to reset). The sentinel is
+                // per-file because `cpuset.cpus` does not speak `max`: an empty cpuset is what means "every
+                // core the parent allows", and it is written as a blank line.
                 let plan =
-                    [ "memory.max", (limits.MemoryMax |> Option.map string)
-                      "pids.max", (limits.MaxProcesses |> Option.map string)
-                      "cpu.max", (limits.CpuQuota |> Option.map cpuMaxValue) ]
+                    [ "memory.max", (limits.MemoryMax |> Option.map string), "max"
+                      "pids.max", (limits.MaxProcesses |> Option.map string), "max"
+                      "cpu.max", (limits.CpuQuota |> Option.map cpuMaxValue), "max"
+                      "cpuset.cpus", (limits.CpuAffinityCores |> Option.map formatCpuList), "\n" ]
 
                 // Files already overwritten, with their PRIOR content, so a later failure can undo them.
                 let applied = System.Collections.Generic.List<string * string>()
 
                 try
-                    for (fileName, value) in plan do
+                    for (fileName, value, unsetSentinel) in plan do
                         let file = Path.Combine(cgroupPath, fileName)
 
                         let content =
                             match value with
                             | Some v -> Some v
-                            | None -> if File.Exists file then Some "max" else None
+                            | None -> if File.Exists file then Some unsetSentinel else None
 
                         match content with
                         | None -> ()
@@ -205,7 +247,7 @@ module internal Cgroup =
                     // that distinctly so the caller never treats `Options.Limits` as authoritative.
                     try
                         for (file, prior) in Seq.rev applied do
-                            File.WriteAllText(file, prior)
+                            File.WriteAllText(file, restorePayload prior)
 
                         Error writeEx.Message
                     with restoreEx ->

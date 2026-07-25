@@ -605,7 +605,7 @@ using var group = created.GetValueOrThrow();
 await group.StartAsync(new Command("untrusted-tool")); // ... runs within the limited group ...
 ```
 
-The three caps are:
+The four caps are:
 
 - `WithMemoryMax(bytes)` — a whole-tree memory ceiling, in bytes (`int64`).
 - `WithMaxProcesses(count)` — the maximum number of processes the tree may hold.
@@ -613,13 +613,21 @@ The three caps are:
   core, `2.0` = two cores). On Windows this is converted against the host's CPU
   count and is approximate (a rate cap, not an exact share); on Linux cgroup v2 it
   maps to `cpu.max`.
+- `WithCpuAffinity(cores)` — the CPU cores (zero-based logical processor indices)
+  the tree may be scheduled on: `[0; 1]` pins it to the first two. The complement
+  of the quota — where `WithCpuQuota` bounds *how much* CPU the tree gets,
+  this bounds *which* cores it gets it from, so a noisy child can be kept off the
+  ones a latency-critical workload runs on. Windows writes a Job Object affinity
+  mask (`JOB_OBJECT_LIMIT_AFFINITY`); Linux cgroup v2 writes `cpuset.cpus`. See
+  [CPU affinity](#cpu-affinity) for the two platform ceilings.
 
 The configured caps are also readable back: `group.Options.Limits` is a
 `ResourceLimits` whose `MemoryMax` (`int64 option`), `MaxProcesses` (`int option`),
-and `CpuQuota` (`float option`) are `Some` only for the limits you set
-(`ResourceLimits.None` is the empty set). You can build a `ResourceLimits` value
-directly with the same `WithMemoryMax` / `WithMaxProcesses` / `WithCpuQuota`
-methods if you want to inspect or compose limits before applying them.
+`CpuQuota` (`float option`), and `CpuAffinity` (`IReadOnlyList<int> option`, in
+ascending order) are `Some` only for the limits you set (`ResourceLimits.None` is
+the empty set). You can build a `ResourceLimits` value directly with the same
+`WithMemoryMax` / `WithMaxProcesses` / `WithCpuQuota` / `WithCpuAffinity` methods
+if you want to inspect or compose limits before applying them.
 
 Limits need a **real container** — a Windows Job Object or a Linux cgroup v2.
 
@@ -628,6 +636,7 @@ Limits need a **real container** — a Windows Job Object or a Linux cgroup v2.
 | Memory cap | ✅ whole-tree | ✅ whole-tree (`memory.max`) | ❌ |
 | Process-count cap | ✅ | ✅ (`pids.max`) | ❌ |
 | CPU quota | 🟡 approximate | ✅ (`cpu.max`) | ❌ |
+| [CPU affinity](#cpu-affinity) | ✅ mask, cores 0–63 | ✅ (`cpuset.cpus`) | ❌ |
 | [UI restrictions](#windows-ui-restrictions) | ✅ clipboard/desktop/exit-Windows | ❌ `Unsupported` | ❌ `Unsupported` |
 
 Where a requested cap can't be enforced, `Create` **fails fast** with
@@ -667,6 +676,66 @@ if (created is { IsOk: false, ErrorValue: var err })
 
 using var group = created.GetValueOrThrow(); // ...
 ```
+
+### CPU affinity
+
+`WithCpuAffinity(cores)` pins the whole tree to a set of CPU cores — zero-based
+logical processor indices, treated as a set rather than an ordered sequence, so
+`[3; 0; 2]` and `[0; 2; 3]` are the same pin and both read back ascending. It
+composes with the quota: cap how much CPU the tree may burn *and* which cores it
+may burn it on.
+
+**F#**
+
+```fsharp
+let pinned =
+    ProcessGroupOptions()
+        .WithCpuQuota(2.0)              // at most two cores' worth of CPU ...
+        .WithCpuAffinity([ 2; 3 ])      // ... and only ever on cores 2 and 3
+```
+
+**C#**
+
+```csharp
+var pinned = new ProcessGroupOptions()
+    .WithCpuQuota(2.0)                  // at most two cores' worth of CPU ...
+    .WithCpuAffinity(new[] { 2, 3 });   // ... and only ever on cores 2 and 3
+```
+
+Invalid sets are rejected at the builder, not deep inside a native call: `null`
+throws `ArgumentNullException`, an empty set or a repeated index throws
+`ArgumentException` (a set with no core could never run anything, and a repeat is a
+typo rather than an intent), and a negative index throws
+`ArgumentOutOfRangeException`.
+
+Two further constraints are the platform's, not the builder's, so they are reported
+as a typed `ProcessError.ResourceLimit` when the group is created or updated — never
+as a pin quietly dropped, and never as an index wrapped onto some other core:
+
+- **Windows** holds the pin in a single pointer-sized affinity mask covering one
+  [processor group](https://learn.microsoft.com/en-us/windows/win32/procthread/processor-groups),
+  so only cores `0`–`63` can be named on x64 (`0`–`31` on x86). A machine with more
+  logical processors than that splits them across groups the mask cannot reach.
+- **Every requested core must exist on the host and be available to this process.**
+  A Job's affinity mask has to be a subset of the creating process's own, so pinning
+  to core 12 on an 8-core host — or to a core the process has itself been excluded
+  from — fails rather than silently landing somewhere else. Linux cgroup v2 applies
+  the same rule against the parent cgroup's effective cores.
+
+On Linux, `cpuset` is a **separate cgroup v2 controller**, so the pin needs it
+enabled in the parent's `cgroup.subtree_control` — which ProcessKit does for you, on
+the same terms as `memory`/`pids`/`cpu` (see [Resource limits](#resource-limits)
+for the real-cgroup-root prerequisite). A hierarchy whose `cgroup.controllers` does
+not carry `cpuset` at all cannot host a pin, and says so with
+`ProcessError.ResourceLimit`. macOS, BSD, and the Linux process-group fallback have
+no whole-tree affinity primitive at all, so a pin fails fast there for the same
+reason every other cap does.
+
+The pin is live-updatable through [`UpdateLimits`](#updating-limits-on-a-live-group)
+with the same replace semantics as every other dimension: passing a limit set
+*without* a pin lifts it (the tree may use every core again) rather than leaving the
+previous mask in force, and `group.Options.Limits.CpuAffinity` follows only what
+actually got applied.
 
 ### Windows UI restrictions
 
@@ -781,8 +850,8 @@ Behaviour follows the mechanism, honestly and without a silent downgrade:
 
 | Mechanism | `UpdateLimits` |
 |---|---|
-| Windows Job Object | ✅ re-applies via `SetInformationJobObject` on the live job (caps **and** UI restrictions) |
-| Linux cgroup v2 | ✅ rewrites `memory.max` / `pids.max` / `cpu.max` in place (UI restrictions → `ProcessError.Unsupported`) |
+| Windows Job Object | ✅ re-applies via `SetInformationJobObject` on the live job (caps, affinity mask, **and** UI restrictions) |
+| Linux cgroup v2 | ✅ rewrites `memory.max` / `pids.max` / `cpu.max` / `cpuset.cpus` in place (UI restrictions → `ProcessError.Unsupported`) |
 | POSIX process group / macOS / BSD | ❌ `ProcessError.ResourceLimit` (no whole-tree limit primitive to update) |
 
 On the POSIX process-group mechanism there is no container to re-tune, so

@@ -761,6 +761,7 @@ class ProcessKit.ProcessGroup
   static member Create(ProcessKit.ProcessGroupOptions) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroup, ProcessKit.ProcessError>
 
 class ProcessKit.ProcessGroupOptions
+  member WithCpuAffinity(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.ProcessGroupOptions
   member WithCpuQuota(System.Double) : ProcessKit.ProcessGroupOptions
   member WithMaxProcesses(System.Int32) : ProcessKit.ProcessGroupOptions
   member WithMemoryMax(System.Int64) : ProcessKit.ProcessGroupOptions
@@ -913,10 +914,12 @@ class ProcessKit.PtySessionOptions
   property WindowChars : System.Int32 { get }
 
 class ProcessKit.ResourceLimits
+  member WithCpuAffinity(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.ResourceLimits
   member WithCpuQuota(System.Double) : ProcessKit.ResourceLimits
   member WithMaxProcesses(System.Int32) : ProcessKit.ResourceLimits
   member WithMemoryMax(System.Int64) : ProcessKit.ResourceLimits
   member WithUiRestrictions(ProcessKit.WindowsUiRestrictions) : ProcessKit.ResourceLimits
+  property CpuAffinity : Microsoft.FSharp.Core.FSharpOption<System.Collections.Generic.IReadOnlyList<System.Int32>> { get }
   property CpuQuota : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
   property MaxProcesses : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property MemoryMax : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }

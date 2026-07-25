@@ -70,6 +70,33 @@ type LimitsTests() =
     let isMacOs = RuntimeInformation.IsOSPlatform OSPlatform.OSX
     let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
 
+    // The pinned cores as an option-of-list, so an assertion can compare against exactly the set it asked
+    // for. Deliberately NOT a bare `int list`: NUnit's `Is.EqualTo` cannot disambiguate its `'T` and
+    // `'T seq` overloads for an F# list (FS0041), whereas an option is not a sequence, so
+    // `Is.EqualTo(Some [ ... ])` resolves cleanly AND stays order-sensitive — which matters here, because
+    // the ascending normalization is part of the contract.
+    let pinnedCores (limits: ResourceLimits) : int list option =
+        limits.CpuAffinity |> Option.map List.ofSeq
+
+    // The lowest `count` CPU cores THIS process is actually allowed to run on, ascending. A Job Object's
+    // affinity mask must be a subset of the creating process's own, so the Windows affinity tests derive
+    // their request from the live mask instead of assuming cores 0..n exist and are available to it — a
+    // constrained CI runner (a container with a cpu-set, an ARM64 host) may have neither. Windows-only, and
+    // its callers are already gated on that.
+    let lowestAvailableCores (count: int) : int list =
+        try
+            use current = System.Diagnostics.Process.GetCurrentProcess()
+            let mask = uint64 (unativeint current.ProcessorAffinity)
+
+            [ 0..63 ]
+            |> List.filter (fun bit -> mask &&& (1UL <<< bit) <> 0UL)
+            |> List.truncate count
+        with _ ->
+            // The affinity mask could not be read (an unsupported platform, a denied query, an already-exited
+            // handle). There is then no core this test can honestly claim is pinnable, and the callers treat
+            // an empty result as "skip" rather than asserting against a guessed core index.
+            []
+
     // POSIX errno numbers the identity-safe delivery seam tests inject through the syscall closures.
     let ESRCH = 3
     let ENOSYS = 38
@@ -450,6 +477,289 @@ type LimitsTests() =
         match cgroup.UpdateLimits limits with
         | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Is.Not.Empty)
         | other -> Assert.Fail $"expected Unsupported from the cgroup backend, got {other}"
+
+    // ---- CPU affinity (Job Object affinity mask / cgroup v2 cpuset.cpus) -------------------------
+
+    [<Test>]
+    member _.``WithCpuAffinity records the pinned cores in ascending order and counts as a limit``() =
+        // The set is normalized, so the same pin written in any order is the same limit — and a pin alone
+        // must make `Any` true, or `ProcessGroup.Create` would hand back an unpinned container.
+        let options = ProcessGroupOptions().WithCpuAffinity [ 3; 0; 2 ]
+        Assert.That(pinnedCores options.Limits, Is.EqualTo(Some [ 0; 2; 3 ]))
+        Assert.That(options.Limits.Any, Is.True)
+
+        // The default pins nothing at all.
+        Assert.That(ResourceLimits.None.CpuAffinity |> Option.isNone, Is.True)
+        Assert.That(ResourceLimits.None.Any, Is.False)
+
+    [<Test>]
+    member _.``the CpuAffinity read-back is a fresh copy, so the limit set cannot be mutated through it``() =
+        // A caller holding the returned list must not be able to reach into the (immutable) limit set.
+        let limits = ResourceLimits.None.WithCpuAffinity [ 0; 1 ]
+
+        match limits.CpuAffinity, limits.CpuAffinity with
+        | Some first, Some second -> Assert.That(first, Is.Not.SameAs second)
+        | _ -> Assert.Fail "the pinned cores should have been recorded"
+
+        // Two independent reads still report exactly the same pin — a copy, not a different answer.
+        Assert.That(pinnedCores limits, Is.EqualTo(Some [ 0; 1 ]))
+
+    [<Test>]
+    member _.``WithCpuAffinity composes with the resource caps and replaces a previous pin``() =
+        let both =
+            ProcessGroupOptions().WithMemoryMax(128L * 1024L * 1024L).WithCpuAffinity [ 1 ]
+
+        Assert.That(both.Limits.MemoryMax, Is.EqualTo(Some(128L * 1024L * 1024L)))
+        Assert.That(pinnedCores both.Limits, Is.EqualTo(Some [ 1 ]))
+
+        // Replace semantics, like every other dimension: the new set replaces rather than merges, and the
+        // other caps ride along untouched.
+        let repinned = both.WithCpuAffinity [ 0; 1 ]
+        Assert.That(pinnedCores repinned.Limits, Is.EqualTo(Some [ 0; 1 ]))
+        Assert.That(repinned.Limits.MemoryMax, Is.EqualTo(Some(128L * 1024L * 1024L)))
+
+        // And a set built without a pin genuinely carries none — this is how a live update lifts one.
+        let unpinned = ResourceLimits.None.WithMemoryMax(128L * 1024L * 1024L)
+        Assert.That(unpinned.CpuAffinity |> Option.isNone, Is.True)
+
+    [<Test>]
+    member _.``WithCpuAffinity rejects a null, empty, negative, or repeated core set``() =
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> ResourceLimits.None.WithCpuAffinity(Unchecked.defaultof<seq<int>>) |> ignore)
+        )
+        |> ignore
+
+        // No core to run on could never let anything run — a misconfiguration, not a limit.
+        Assert.Throws<ArgumentException>(Action(fun () -> ResourceLimits.None.WithCpuAffinity [] |> ignore))
+        |> ignore
+
+        // Cores are numbered from 0; a negative index has no meaning in either platform encoding (and on
+        // Windows would shift a mask bit out of range).
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithCpuAffinity [ 0; -1 ] |> ignore)
+        )
+        |> ignore
+
+        // An affinity set is a set: a repeat is a typo in a generated list, not an intent.
+        Assert.Throws<ArgumentException>(Action(fun () -> ResourceLimits.None.WithCpuAffinity [ 1; 0; 1 ] |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``ProcessGroupOptions.WithCpuAffinity rejects the same invalid sets as ResourceLimits``() =
+        Assert.Throws<ArgumentException>(Action(fun () -> ProcessGroupOptions().WithCpuAffinity [] |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ProcessGroupOptions().WithCpuAffinity [ -3 ] |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentException>(Action(fun () -> ProcessGroupOptions().WithCpuAffinity [ 2; 2 ] |> ignore))
+        |> ignore
+
+        let accepted = ProcessGroupOptions().WithCpuAffinity [ 0 ]
+        Assert.That(pinnedCores accepted.Limits, Is.EqualTo(Some [ 0 ]))
+
+    [<Test>]
+    member _.``the cgroup cpuset rendering collapses consecutive cores into ranges``() =
+        // `cpuset.cpus` speaks a comma-separated list of single cores and `lo-hi` runs, and prints back in
+        // exactly that shape — pure string logic, so it is asserted on every platform, not just Linux.
+        Assert.That(Native.Cgroup.formatCpuList [ 0 ], Is.EqualTo "0")
+        Assert.That(Native.Cgroup.formatCpuList [ 0; 1 ], Is.EqualTo "0-1")
+        Assert.That(Native.Cgroup.formatCpuList [ 0; 2; 3 ], Is.EqualTo "0,2-3")
+        Assert.That(Native.Cgroup.formatCpuList [ 1; 3; 5 ], Is.EqualTo "1,3,5")
+        Assert.That(Native.Cgroup.formatCpuList [ 0; 1; 2; 3; 8; 9 ], Is.EqualTo "0-3,8-9")
+        // Unsorted / repeated input still renders canonically (the builder already normalizes, so this is
+        // the defensive half of the contract rather than a path production takes).
+        Assert.That(Native.Cgroup.formatCpuList [ 3; 0; 2; 3 ], Is.EqualTo "0,2-3")
+
+    [<Test>]
+    member _.``a Job affinity mask is a bitmask, and refuses a core it cannot express``() =
+        // Pure bit math, so it runs everywhere. The mask is one pointer-sized word covering a SINGLE
+        // Windows processor group, so an index at or beyond its width has no representation — and must be
+        // refused rather than silently wrapped onto some other, wrong core.
+        let width = IntPtr.Size * 8
+
+        match Native.Windows.windowsAffinityMask [ 0 ] with
+        | Ok mask -> Assert.That(mask, Is.EqualTo 1un)
+        | Error message -> Assert.Fail $"core 0 must be expressible, got {message}"
+
+        match Native.Windows.windowsAffinityMask [ 0; 2 ] with
+        | Ok mask -> Assert.That(mask, Is.EqualTo 5un)
+        | Error message -> Assert.Fail $"cores 0 and 2 must be expressible, got {message}"
+
+        match Native.Windows.windowsAffinityMask [ width - 1 ] with
+        | Ok mask -> Assert.That(mask, Is.EqualTo(1un <<< (width - 1)))
+        | Error message -> Assert.Fail $"the top mask bit must be expressible, got {message}"
+
+        match Native.Windows.windowsAffinityMask [ 0; width ] with
+        | Error message -> Assert.That(message, Does.Contain(string width))
+        | Ok mask -> Assert.Fail $"core {width} has no bit in a {width}-bit mask, got {mask}"
+
+    [<Test>]
+    member _.``CPU affinity round-trips through the Job Object (Windows)``() =
+        if not isWindows then
+            Assert.Ignore "The Job Object affinity mask is the Windows encoding; the other platforms are covered below."
+        else
+            // Pin to cores this process is actually allowed to run on: a Job's affinity mask must be a
+            // subset of its own, so deriving the request from the live mask keeps the test honest on a
+            // constrained CI runner instead of assuming cores 0..n exist and are available.
+            match lowestAvailableCores 2 with
+            | [] -> Assert.Ignore "could not read this process's own affinity mask to derive a pinnable core"
+            | cores ->
+                match Native.Windows.createWindowsJob () with
+                | Error error -> Assert.Fail $"could not create a Job Object: {error}"
+                | Ok job ->
+                    try
+                        let limits = ResourceLimits.None.WithCpuAffinity cores
+
+                        match Native.Windows.applyWindowsJobLimits job limits with
+                        | Error message -> Assert.Fail $"applying a CPU-affinity pin failed: {message}"
+                        | Ok() ->
+                            let expected = cores |> List.fold (fun mask core -> mask ||| (1un <<< core)) 0un
+
+                            match Native.Windows.queryWindowsJobAffinity job with
+                            | None -> Assert.Fail "the Job's affinity mask could not be read back"
+                            | Some inForce ->
+                                Assert.That(inForce, Is.EqualTo expected)
+
+                                // Replace semantics on a LIVE Job: dropping the pin clears
+                                // JOB_OBJECT_LIMIT_AFFINITY, so the tree may use every core again rather
+                                // than staying stuck on the previous mask.
+                                match Native.Windows.applyWindowsJobLimits job ResourceLimits.None with
+                                | Error message -> Assert.Fail $"clearing the CPU-affinity pin failed: {message}"
+                                | Ok() ->
+                                    Assert.That(Native.Windows.queryWindowsJobAffinity job |> Option.isNone, Is.True)
+                    finally
+                        Native.Windows.closeWindowsHandle job
+
+    [<Test>]
+    member _.``a group created with a CPU-affinity pin still runs children, and can update or clear it (Windows)``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The Job Object holds the pin on Windows; the other platforms are covered below."
+            else
+                match lowestAvailableCores 2 with
+                | [] -> Assert.Ignore "could not read this process's own affinity mask to derive a pinnable core"
+                | cores ->
+                    // The public path end to end: Create pins alongside a resource cap, the pinned tree
+                    // still works, and a live UpdateLimits narrows then lifts the pin with `Options`
+                    // following what is actually enforced.
+                    let options = ProcessGroupOptions().WithMaxProcesses(64).WithCpuAffinity cores
+
+                    match ProcessGroup.Create options with
+                    | Error error -> Assert.Fail $"a Job Object should accept a CPU-affinity pin, got {error}"
+                    | Ok group ->
+                        use group = group
+                        Assert.That(group.Mechanism, Is.EqualTo Mechanism.JobObject)
+
+                        Assert.That(pinnedCores group.Options.Limits, Is.EqualTo(Some cores))
+
+                        // A pinned tree is still a working tree.
+                        match! runInGroup group with
+                        | Ok result -> Assert.That(result.Stdout, Does.Contain "limited")
+                        | Error error -> Assert.Fail $"a child in a pinned group should still run, got {error}"
+
+                        // Narrow the pin to a single core on the live Job.
+                        let narrowed =
+                            ResourceLimits.None.WithMaxProcesses(64).WithCpuAffinity [ List.head cores ]
+
+                        match group.UpdateLimits narrowed with
+                        | Ok() -> Assert.That(pinnedCores group.Options.Limits, Is.EqualTo(Some [ List.head cores ]))
+                        | Error error -> Assert.Fail $"narrowing the pin on a live Job should succeed, got {error}"
+
+                        // Replace semantics through the public verb too: a set without a pin lifts it.
+                        match group.UpdateLimits(ResourceLimits.None.WithMaxProcesses 64) with
+                        | Ok() -> Assert.That(group.Options.Limits.CpuAffinity |> Option.isNone, Is.True)
+                        | Error error -> Assert.Fail $"clearing the pin on a live Job should succeed, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a CPU-affinity pin no Job mask can express is refused before anything is applied (Windows)``() =
+        if not isWindows then
+            Assert.Ignore "The mask-width ceiling is a Job Object property; see the pure mask test above."
+        else
+            // A core index beyond the mask's width is a typed refusal at `Create`, not a pin quietly
+            // dropped (nor an index wrapped onto a different core). Asserted through the public verb so the
+            // whole chain — builder accepts, backend refuses — is covered.
+            let options = ProcessGroupOptions().WithCpuAffinity [ IntPtr.Size * 8 ]
+
+            match ProcessGroup.Create options with
+            | Error(ProcessError.ResourceLimit detail) -> Assert.That(detail, Is.Not.Empty)
+            | Ok group ->
+                (group :> IDisposable).Dispose()
+                Assert.Fail "a core index outside the Job affinity mask must not produce a group"
+            | Error other -> Assert.Fail $"expected ResourceLimit for an inexpressible core, got {other}"
+
+    [<Test>]
+    member _.``a group asking for a CPU-affinity pin uses a limit-capable mechanism or fails fast``() : Task =
+        task {
+            // Same contract as the other caps: a pin needs a Job Object or a cgroup v2 `cpuset`, and where
+            // there is none the group must fail fast rather than run its tree across every core.
+            //
+            // On Windows the mask must be a subset of this process's own affinity, so derive the core
+            // rather than assuming core 0 is available to it. Off Windows the affinity mask cannot be read
+            // (`lowestAvailableCores` reports none), and the expectation there is a refusal — or, on Linux,
+            // either outcome — so any valid index will do.
+            let requested =
+                match lowestAvailableCores 1 with
+                | [] -> [ 0 ]
+                | cores -> cores
+
+            let options = ProcessGroupOptions().WithCpuAffinity requested
+            let result = ProcessGroup.Create options
+
+            if isWindows then
+                match result with
+                | Ok group ->
+                    use group = group
+                    Assert.That(group.Mechanism, Is.EqualTo Mechanism.JobObject)
+
+                    match! runInGroup group with
+                    | Ok r -> Assert.That(r.Stdout, Does.Contain "limited")
+                    | Error error -> Assert.Fail $"{error}"
+                | Error error -> Assert.Fail $"a Job Object should be able to pin {requested}, got {error}"
+            elif isMacOs then
+                // No whole-tree primitive at all — and macOS has no CPU-affinity API to fall back on
+                // either, so this can only ever be an honest refusal.
+                match result with
+                | Error(ProcessError.ResourceLimit _) -> Assert.Pass()
+                | Ok group ->
+                    (group :> IDisposable).Dispose()
+                    Assert.Fail "macOS cannot pin a tree to cores; the group must not be created"
+                | other -> Assert.Fail $"expected ResourceLimit on macOS, got {other}"
+            else
+                // Linux: a cgroup v2 at the real root enforces the pin through `cpuset.cpus`. Unlike
+                // memory/pids/cpu, `cpuset` is a controller a hierarchy may simply not delegate, so even
+                // the privileged CI leg cannot be required to reach the enforcing path — both outcomes are
+                // acceptable, and neither is a silently-unpinned group.
+                match result with
+                | Ok group ->
+                    use group = group
+                    Assert.That(group.Mechanism, Is.EqualTo Mechanism.CgroupV2)
+
+                    match! runInGroup group with
+                    | Ok r -> Assert.That(r.Stdout, Does.Contain "limited")
+                    | Error error -> Assert.Fail $"{error}"
+                | Error(ProcessError.ResourceLimit _) -> Assert.Pass()
+                | Error other -> Assert.Fail $"expected CgroupV2 or a typed ResourceLimit, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``UpdateLimits carrying a CPU-affinity pin is an honest typed ResourceLimit on the POSIX backend``() =
+        // Backend-level, so it runs on every platform: the process-group mechanism has no whole-tree
+        // primitive to pin with, so a live update asking for one must be refused the same typed way
+        // `Create` refuses — a `ResourceLimit` (the cap exists as a concept, this mechanism just cannot
+        // enforce it), never a silent no-op that leaves the tree on every core while `Options` claims a pin.
+        let backend: IContainmentBackend = ProcessGroupBackend()
+
+        match backend.UpdateLimits(ResourceLimits.None.WithCpuAffinity [ 0; 1 ]) with
+        | Error(ProcessError.ResourceLimit detail) -> Assert.That(detail, Is.Not.Empty)
+        | other -> Assert.Fail $"expected ProcessError.ResourceLimit, got {other}"
 
     [<Test>]
     member _.``UpdateLimits on the POSIX process-group backend is an honest typed ResourceLimit``() =

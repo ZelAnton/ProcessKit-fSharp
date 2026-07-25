@@ -1,6 +1,7 @@
 namespace ProcessKit
 
 open System
+open System.Collections.Generic
 
 module internal Limits =
     let DefaultStopGrace = TimeSpan.FromSeconds 2.0
@@ -81,10 +82,16 @@ type WindowsUiRestrictions =
 [<Sealed>]
 type ResourceLimits
     internal
-    (memoryMax: int64 option, maxProcesses: int option, cpuQuota: float option, uiRestrictions: WindowsUiRestrictions) =
+    (
+        memoryMax: int64 option,
+        maxProcesses: int option,
+        cpuQuota: float option,
+        uiRestrictions: WindowsUiRestrictions,
+        cpuAffinity: int list option
+    ) =
 
     /// No limits — the default.
-    static member None = ResourceLimits(None, None, None, WindowsUiRestrictions.None)
+    static member None = ResourceLimits(None, None, None, WindowsUiRestrictions.None, None)
 
     /// Maximum total memory for the tree, in bytes. `None` leaves memory unbounded.
     member _.MemoryMax = memoryMax
@@ -101,20 +108,31 @@ type ResourceLimits
     /// `UpdateLimits` with `ProcessError.Unsupported` off Windows, never a silent drop.
     member _.UiRestrictions = uiRestrictions
 
+    /// The CPU cores the tree is pinned to, in ascending order, or `None` when it may run on every core
+    /// (the default). A fresh list each read, so a caller can never mutate the limit set through it.
+    member _.CpuAffinity: IReadOnlyList<int> option =
+        cpuAffinity
+        |> Option.map (fun cores -> List.toArray cores :> IReadOnlyList<int>)
+
+    /// The pinned cores as the plain list the backends encode from (a Job Object affinity bitmask, a
+    /// cgroup v2 `cpuset.cpus` range string). Internal so the shipped surface keeps the `IReadOnlyList`
+    /// shape used by every other public collection here, while the native layer avoids re-copying.
+    member internal _.CpuAffinityCores = cpuAffinity
+
     /// A copy with the memory cap set. `bytes` must be positive — zero or negative is rejected
     /// (`ArgumentOutOfRangeException`): a non-positive cap could never let anything run, so it is a
     /// misconfiguration rather than a meaningful limit, and previously degraded silently (e.g. a
     /// negative value converting to a huge `unativeint` on Windows — effectively "unlimited").
     member _.WithMemoryMax(bytes: int64) =
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(bytes, 0L)
-        ResourceLimits(Some bytes, maxProcesses, cpuQuota, uiRestrictions)
+        ResourceLimits(Some bytes, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity)
 
     /// A copy with the live-process cap set. `count` must be positive — zero or negative is rejected
     /// (`ArgumentOutOfRangeException`): the tree always has at least its own leader process, so a
     /// non-positive cap could never be satisfied.
     member _.WithMaxProcesses(count: int) =
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(count, 0)
-        ResourceLimits(memoryMax, Some count, cpuQuota, uiRestrictions)
+        ResourceLimits(memoryMax, Some count, cpuQuota, uiRestrictions, cpuAffinity)
 
     /// A copy with the CPU quota (in cores) set. `cores` must be a finite, strictly positive number —
     /// zero, negative, `NaN`, or `PositiveInfinity`/`NegativeInfinity` is rejected
@@ -140,7 +158,7 @@ type ResourceLimits
                 )
             )
 
-        ResourceLimits(memoryMax, maxProcesses, Some cores, uiRestrictions)
+        ResourceLimits(memoryMax, maxProcesses, Some cores, uiRestrictions, cpuAffinity)
 
     /// A copy imposing the given Windows Job Object UI restrictions on the whole tree (see
     /// `WindowsUiRestrictions`). `WindowsUiRestrictions.None` clears them again — the set REPLACES the
@@ -163,16 +181,78 @@ type ResourceLimits
                 )
             )
 
-        ResourceLimits(memoryMax, maxProcesses, cpuQuota, restrictions)
+        ResourceLimits(memoryMax, maxProcesses, cpuQuota, restrictions, cpuAffinity)
+
+    /// A copy pinning the whole tree to `cores` — the CPU cores (zero-based logical processor indices)
+    /// its processes may be scheduled on. The complement of `WithCpuQuota`: the quota bounds *how much*
+    /// CPU the tree gets, this bounds *which* cores it gets it from, so a noisy child can be kept off the
+    /// cores a latency-critical workload runs on. The set REPLACES any previous one, like every other
+    /// dimension here; leave it unset for "every core".
+    ///
+    /// Rejected at the builder rather than deep in a native call: a `null` set
+    /// (`ArgumentNullException`), an empty one (`ArgumentException` — no core to run on could never let
+    /// anything run, so it is a misconfiguration rather than a limit), a negative index
+    /// (`ArgumentOutOfRangeException`), and a repeated index (`ArgumentException` — an affinity set is a
+    /// set, and a repeat is far more likely a typo in a generated list than an intent). The accepted set
+    /// is stored in ascending order, so `[2; 0]` and `[0; 2]` are the same limit.
+    ///
+    /// **Needs a limit-capable mechanism**, like every other cap here: the Windows Job Object's affinity
+    /// mask (`JOB_OBJECT_LIMIT_AFFINITY`) or the Linux cgroup v2 `cpuset` controller (`cpuset.cpus`). On
+    /// macOS and the Linux process-group fallback there is no whole-tree primitive to pin with, so the
+    /// group fails with `ProcessError.ResourceLimit` rather than running everywhere unpinned. Two
+    /// platform limits are reported the same honest way at apply time rather than guessed at here (the
+    /// machine that builds the limit set need not be the one it runs on): the Windows mask is a single
+    /// pointer-sized word covering one processor group, so an index at or beyond its width (64 on x64)
+    /// has no representation; and every requested core must actually exist on the host and be available
+    /// to this process.
+    member _.WithCpuAffinity(cores: seq<int>) =
+        ArgumentNullException.ThrowIfNull(cores, nameof cores)
+        let requested = List.ofSeq cores
+
+        if List.isEmpty requested then
+            raise (
+                ArgumentException(
+                    "the CPU-affinity set must not be empty — name at least one core to pin the tree to, or leave the affinity unset to allow every core",
+                    nameof cores
+                )
+            )
+
+        match requested |> List.tryFind (fun core -> core < 0) with
+        | Some negative ->
+            raise (
+                ArgumentOutOfRangeException(
+                    nameof cores,
+                    negative,
+                    "a CPU core index must not be negative (cores are numbered from 0)"
+                )
+            )
+        | None -> ()
+
+        match requested |> List.countBy id |> List.filter (fun (_, count) -> count > 1) with
+        | [] -> ()
+        | repeated ->
+            let listed = repeated |> List.map (fst >> string) |> String.concat ", "
+
+            raise (
+                ArgumentException(
+                    $"the CPU-affinity set lists core(s) {listed} more than once; it is a set of cores, so each may appear at most once",
+                    nameof cores
+                )
+            )
+
+        ResourceLimits(memoryMax, maxProcesses, cpuQuota, uiRestrictions, Some(List.sort requested))
 
     /// Whether any limit is set (so the group needs a limit-capable mechanism). UI restrictions count:
     /// they too are applied through `SetInformationJobObject` and need the Job Object mechanism, so a
-    /// group asking only for them must still take the limit-capable path rather than skip the apply.
+    /// group asking only for them must still take the limit-capable path rather than skip the apply. So
+    /// does a CPU-affinity pin, for the same reason: only a Job Object or a cgroup v2 `cpuset` can hold
+    /// it, so a group asking only for it must not be handed the unpinned process-group fallback.
     member internal _.Any =
         memoryMax.IsSome
         || maxProcesses.IsSome
         || cpuQuota.IsSome
         || uiRestrictions <> WindowsUiRestrictions.None
+        || cpuAffinity.IsSome
 
     /// The honest typed refusal for a mechanism that cannot impose UI restrictions, or `None` when
     /// none were requested. One definition shared by `ProcessGroup.Create` and both non-Job backends'
@@ -226,6 +306,13 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, limits: ResourceLi
     /// tree unrestricted. See `ResourceLimits.WithUiRestrictions`.
     member _.WithUiRestrictions(restrictions: WindowsUiRestrictions) =
         ProcessGroupOptions(shutdownTimeout, limits.WithUiRestrictions restrictions)
+
+    /// A copy pinning the tree to `cores` — the CPU cores its processes may be scheduled on (the Windows
+    /// Job Object affinity mask, the Linux cgroup v2 `cpuset.cpus`). Needs a limit-capable mechanism:
+    /// elsewhere `ProcessGroup.Create` fails with `ProcessError.ResourceLimit` rather than silently
+    /// running the tree on every core. See `ResourceLimits.WithCpuAffinity`.
+    member _.WithCpuAffinity(cores: seq<int>) =
+        ProcessGroupOptions(shutdownTimeout, limits.WithCpuAffinity cores)
 
     /// A copy carrying a wholesale-replaced `ResourceLimits` set, keeping the shutdown window.
     /// Internal — used by `ProcessGroup.UpdateLimits` to refresh the `Options` snapshot a consumer
