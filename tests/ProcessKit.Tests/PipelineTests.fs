@@ -965,6 +965,52 @@ type PipelineTests() =
         |> ignore
 
     [<Test>]
+    member _.``a pipeline rejects per-stage stdout destinations it would otherwise replace``() =
+        let withFile command =
+            command |> Command.stdoutToFile "pipeline-output.txt" false
+
+        let withNull command =
+            command |> Command.stdout StdioMode.Null
+
+        let withInherited command =
+            command |> Command.stdout StdioMode.Inherit
+
+        // Validate both the first and an appended stage, so the public two-command builder and
+        // Pipeline.Pipe cannot silently reset a destination to Piped.
+        for configure in [ withFile; withNull; withInherited ] do
+            Assert.Throws<ArgumentException>(Action(fun () -> (configure (emit [ "x" ])).Pipe sortStage |> ignore))
+            |> ignore
+
+            Assert.Throws<ArgumentException>(Action(fun () -> (emit [ "x" ]).Pipe(configure sortStage) |> ignore))
+            |> ignore
+
+    [<Test>]
+    member _.``a pipeline honours per-stage StderrToFile while preserving stdout wiring``() : Task =
+        task {
+            let path =
+                Path.Combine(Path.GetTempPath(), $"processkit-pipeline-stderr-{Guid.NewGuid():N}.txt")
+
+            let first =
+                if isWindows then
+                    shell "echo payload & echo diagnostic 1>&2"
+                else
+                    shell "printf 'payload\\n'; printf 'diagnostic\\n' >&2"
+
+            try
+                let pipeline = (first |> Command.stderrToFile path false).Pipe sortStage
+
+                match! pipeline.OutputStringAsync() with
+                | Ok output ->
+                    Assert.That(lines output, Is.EqualTo(box [ "payload" ]))
+                    Assert.That(File.ReadAllText path, Does.Contain "diagnostic")
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                if File.Exists path then
+                    File.Delete path
+        }
+        :> Task
+
+    [<Test>]
     member _.``chain-level Pipeline.CancelOn cancels the whole pipeline``() : Task =
         // The chain-level builder is a distinct, un-guarded method (unlike a per-stage Command.CancelOn),
         // so it must keep cancelling the whole chain exactly as before.

@@ -35,8 +35,28 @@ module internal PipelineStageGuard =
     ///   pipeline;
     /// - a `Stdin` source on a stage **after the first** — every stage past stage 0 reads from the
     ///   previous stage's stdout, so only stage 0 may feed a source.
+    /// - `StdoutToFile` on **any** stage — every stage's stdout is owned by the pipeline: intermediate
+    ///   output feeds the following stage and final output is captured by the pipeline itself.
+    /// - `Stdout(StdioMode.Null|Inherit)` on **any** stage — the pipeline must use a pipe for that same
+    ///   wiring and capture, so accepting another destination would silently replace it with `Piped`.
     let validate (paramName: string) (stageIndex: int) (command: Command) =
         let config = command.Config
+
+        if config.StdoutFile.IsSome then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets StdoutToFile, but a pipeline owns every stage's stdout: intermediate output feeds the next stage and final output is captured by the pipeline. Run the command on its own to redirect stdout to a file.",
+                    paramName
+                )
+            )
+
+        if config.StdoutMode <> StdioMode.Piped then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets Stdout to {config.StdoutMode}, but a pipeline owns every stage's stdout and requires a pipe for stage wiring and final output capture. Leave stdout at the default Piped mode, or run the command on its own.",
+                    paramName
+                )
+            )
 
         if config.Timeout.IsSome then
             raise (
@@ -268,8 +288,12 @@ type PipelineSession
 /// per-stage `Retry` on any stage (retry is a verb-layer mechanism, and stages spawn directly,
 /// bypassing it), and a per-stage `CancelOn` on any stage (a stage's own `Command.CancelOn` token is
 /// likewise a verb-layer mechanism the direct stage spawn bypasses; only the chain-level
-/// `Pipeline.CancelOn` cancels a pipeline). Set the deadline on the pipeline, cancel the whole chain
-/// with `Pipeline.CancelOn`, feed stage 0, or run the command on its own.
+/// `Pipeline.CancelOn` cancels a pipeline), `StdoutToFile` on any stage (stdout is instead pipeline
+/// wiring or final captured output), and `Stdout(StdioMode.Null|Inherit)` on any stage (the pipeline
+/// must use a pipe rather than silently override that destination). `StderrToFile` remains supported:
+/// it directs that stage's diagnostics to the requested file while the chain continues to carry stdout.
+/// Set the deadline on the pipeline, cancel the whole chain with `Pipeline.CancelOn`, feed stage 0, or
+/// run the command on its own.
 ///
 /// `MergeStderr` (a shell `2>&1`) is allowed only on the **last** stage — its stdout is the pipeline's
 /// captured output, so merging captures the final stage's combined stdout+stderr. On any earlier stage
@@ -294,9 +318,9 @@ type PipelineSession
 type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancelOn: CancellationToken option) =
 
     /// Append another stage; its stdin is fed from the current last stage's stdout. Rejects
-    /// (`ArgumentException`) a stage that sets a per-stage `Timeout`/`IdleTimeout`/`Retry`/`CancelOn` or
-    /// a `Stdin` source — a pipeline cannot honour those (see the type doc); the appended stage is
-    /// always after the first.
+    /// (`ArgumentException`) a stage that sets a per-stage `Timeout`/`IdleTimeout`/`Retry`/`CancelOn`,
+    /// `StdoutToFile`, non-piped `Stdout`, or a `Stdin` source — a pipeline cannot honour those (see the
+    /// type doc); the appended stage is always after the first.
     member _.Pipe(command: Command) =
         ArgumentNullException.ThrowIfNull command
         PipelineStageGuard.validate (nameof command) commands.Length command
