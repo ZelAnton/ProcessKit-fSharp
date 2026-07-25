@@ -2,6 +2,9 @@ namespace ProcessKit
 
 open System
 
+module internal Limits =
+    let DefaultStopGrace = TimeSpan.FromSeconds 2.0
+
 /// Resource limits enforced on a process group **as a whole** (not per process), applied to the
 /// kernel container at creation time.
 ///
@@ -77,7 +80,7 @@ type ResourceLimits internal (memoryMax: int64 option, maxProcesses: int option,
 type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, limits: ResourceLimits) =
 
     /// The defaults: a 2-second shutdown grace, no limits.
-    new() = ProcessGroupOptions(TimeSpan.FromSeconds 2.0, ResourceLimits.None)
+    new() = ProcessGroupOptions(Limits.DefaultStopGrace, ResourceLimits.None)
 
     /// How long `ShutdownAsync` waits after SIGTERM before escalating to SIGKILL (Unix; default 2s).
     member _.ShutdownTimeout = shutdownTimeout
