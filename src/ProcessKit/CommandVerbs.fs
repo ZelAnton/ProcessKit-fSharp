@@ -30,8 +30,11 @@ module internal DetachedLaunch =
     /// Deliberately NOT refused, because a detached child can honour them at the OS level with no parent
     /// involvement: `CurrentDir`, `Env`/`EnvClear`/`PreferLocal`, `StdoutToFile`/`StderrToFile`,
     /// `MergeStderr`, `Stdout`/`Stderr` `Null`/`Inherit`, `InheritStdin`, `CreateNoWindow`,
-    /// `WindowsCtrlSignals`, `Priority`, `Umask`, `Uid`/`Gid`/`Groups`, and `Setsid` (which a POSIX
-    /// detached launch performs anyway). `StdioMode.Piped` — the default — is wired to the null device
+    /// `WindowsCtrlSignals`, `WindowsRestrictedToken`, `WindowsIntegrityLevel`, `Priority`, `Umask`,
+    /// `Uid`/`Gid`/`Groups`, and `Setsid` (which a POSIX detached launch performs anyway). The Windows
+    /// hardening knobs are honoured by the Windows detached spawn and fail with the same typed
+    /// `ProcessError.Unsupported` as every Windows-only hardening request on POSIX. `StdioMode.Piped` —
+    /// the default — is wired to the null device
     /// rather than refused: there is no parent left to drain a pipe, and refusing the default mode would
     /// make the verb unusable without three extra builder calls. Knobs that only a capture/exit-observing
     /// verb ever reads (`StdoutEncoding`/`StderrEncoding`, the line terminators, `OutputBuffer`,
@@ -303,6 +306,9 @@ type CommandVerbs =
     /// the parent exits (ProcessKit never reaps what it does not contain). Windows: the child shares the
     /// caller's console unless you add `CreateNoWindow()` (or `WindowsCtrlSignals()`, which puts it in
     /// its own console process group), so a console-close event still reaches it in the default wiring.
+    /// `WindowsRestrictedToken()` and `WindowsIntegrityLevel(...)` remain effective on Windows: detaching
+    /// opts out of containment, not the requested token hardening. On POSIX both remain honestly
+    /// unsupported, returning the usual typed `ProcessError.Unsupported` before launch.
     /// On both platforms this opts out of the containment ProcessKit creates, not one THIS process was
     /// itself placed in: a child of a job-bound Windows process joins that job by kernel rule, and a
     /// Linux child inherits this process's cgroup (so a `systemctl stop` of the unit still reaps it).
