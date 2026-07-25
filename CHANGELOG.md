@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [2.8.0] - 2026-07-25
+
+### Added
 - `Command.ConsoleEncoding()` decodes a child's captured stdout and stderr with the local console encoding instead of UTF-8 — the one-line fix for a legacy Windows console program (`ping`, `netstat`, an old in-house CLI) whose non-ASCII output otherwise arrives as `U+FFFD`; it resolves this process's console output code page, or the system OEM code page when there is no console, and is a no-op off Windows. The same answer is available on its own as `ConsoleEncoding.current ()` for a pipeline, a `CliClient`, or a single stream. The UTF-8 default is unchanged, and this adds no new package dependency.
 - `Command.LaunchDetached()` / `Exec.detach` launch a child **outside all containment** — no Job Object on Windows, its own `setsid` session on POSIX — for spawn-and-forget work that must outlive the caller (a self-updater, a restart-myself relaunch, a daemon handed to the OS); it returns a lightweight `DetachedProcess` (pid + start-time identity, no wait/stream/kill member), and every builder knob a detached child cannot honour (`Pty`, `KillOnParentDeath`, the timeouts, `CancelOn`, a feeder `Stdin`, `KeepStdinOpen`, the line handlers and tees, `StreamBuffer`, `Retry`) is refused with a typed `ProcessError.Unsupported` instead of being ignored.
 - `PtySession` drives an interactive program the way an expect script does: wait for a pattern (text or `Regex`) in the child's raw terminal output — including a prompt such as `Password: ` that no line-based wait can see — with a per-pattern timeout, answer it through `SendAsync`/`SendLineAsync`, and read the whole exchange back from `Transcript`.
@@ -460,7 +471,8 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - POSIX: the SIGCHLD dispatch callback no longer blocks on a `Thread.Sleep` spin while resolving a reap race against a concurrent `reapLeader` (group teardown) — the same bounded grace period now runs on the thread pool instead of the shared signal-dispatch thread, so it can no longer delay reaping every other pending child. A race that genuinely can't be resolved within the grace period now reports `Outcome.Unobserved` rather than a fabricated clean exit; the far more common case — the concurrent reap actually landing the real status — is unaffected.
 - Linux cgroup v2: a child that cannot be migrated into the cgroup (the write to `cgroup.procs` fails) is now killed and reaped, and the spawn fails with `ProcessError.ResourceLimit`, instead of being silently left to run in the parent cgroup entirely outside the requested resource limits. The `Mechanism.CgroupV2` / `ProcessGroup.Create` docs now also state the spawn→migrate window honestly: the limits apply to the child and every descendant it forks *after* migration, while a grandchild forked in the brief window before the migration write completes stays in the parent cgroup — still reaped by kill-on-drop teardown, but outside the resource limits.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.7.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.8.0...HEAD
+[2.8.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.7.0...v2.8.0
 [2.7.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.6.0...v2.7.0
 [2.6.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.5.0...v2.6.0
 [2.5.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.4.2...v2.5.0
