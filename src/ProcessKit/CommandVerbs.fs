@@ -120,36 +120,43 @@ type CommandVerbs =
     /// Start the command and return a live `RunningProcess`.
     [<Extension>]
     static member StartAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
+        ArgumentNullException.ThrowIfNull command
         Runner.start CommandVerbs.DefaultRunner cancellationToken command
 
     /// Require a zero/accepted exit and return stdout, trailing whitespace trimmed.
     [<Extension>]
     static member RunAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
+        ArgumentNullException.ThrowIfNull command
         Runner.run CommandVerbs.DefaultRunner cancellationToken command
 
     /// Require a zero/accepted exit, discarding the captured output.
     [<Extension>]
     static member RunUnitAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
+        ArgumentNullException.ThrowIfNull command
         Runner.runUnit CommandVerbs.DefaultRunner cancellationToken command
 
     /// Run to completion, capturing stdout as decoded text (a non-zero exit is data).
     [<Extension>]
     static member OutputStringAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
+        ArgumentNullException.ThrowIfNull command
         Runner.outputString CommandVerbs.DefaultRunner cancellationToken command
 
     /// Run to completion, capturing stdout as raw bytes.
     [<Extension>]
     static member OutputBytesAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
+        ArgumentNullException.ThrowIfNull command
         Runner.outputBytes CommandVerbs.DefaultRunner cancellationToken command
 
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel code.
     [<Extension>]
     static member ExitCodeAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
+        ArgumentNullException.ThrowIfNull command
         Runner.exitCode CommandVerbs.DefaultRunner cancellationToken command
 
     /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
     [<Extension>]
     static member ProbeAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
+        ArgumentNullException.ThrowIfNull command
         Runner.probe CommandVerbs.DefaultRunner cancellationToken command
 
     /// Require a zero/accepted exit and parse the trimmed stdout into a `'T`; a thrown parser error
@@ -158,6 +165,7 @@ type CommandVerbs =
     static member ParseAsync
         (command: Command, parser: Func<string, 'T>, [<Optional>] cancellationToken: CancellationToken)
         =
+        ArgumentNullException.ThrowIfNull command
         ArgumentNullException.ThrowIfNull parser
         Runner.parse CommandVerbs.DefaultRunner cancellationToken parser.Invoke command
 
@@ -169,6 +177,7 @@ type CommandVerbs =
     static member TryParseAsync
         (command: Command, parser: TryParser<'T>, [<Optional>] cancellationToken: CancellationToken)
         =
+        ArgumentNullException.ThrowIfNull command
         ArgumentNullException.ThrowIfNull parser
         Runner.tryParse CommandVerbs.DefaultRunner cancellationToken (TryParser.toResult parser) command
 
@@ -190,6 +199,7 @@ type CommandVerbs =
             [<Optional>] options: JsonSerializerOptions | null,
             [<Optional>] cancellationToken: CancellationToken
         ) =
+        ArgumentNullException.ThrowIfNull command
         Runner.outputJson<'T> CommandVerbs.DefaultRunner cancellationToken (Option.ofObj options) command
 
     /// Require a zero/accepted exit and deserialize the trimmed stdout using source-generated
@@ -199,6 +209,7 @@ type CommandVerbs =
     static member OutputJsonAsync<'T>
         (command: Command, typeInfo: JsonTypeInfo<'T>, [<Optional>] cancellationToken: CancellationToken)
         =
+        ArgumentNullException.ThrowIfNull command
         ArgumentNullException.ThrowIfNull typeInfo
         Runner.outputJsonTyped<'T> CommandVerbs.DefaultRunner cancellationToken typeInfo command
 
@@ -207,6 +218,7 @@ type CommandVerbs =
     static member FirstLineAsync
         (command: Command, predicate: Func<string, bool>, [<Optional>] cancellationToken: CancellationToken)
         =
+        ArgumentNullException.ThrowIfNull command
         ArgumentNullException.ThrowIfNull predicate
         Runner.firstLine CommandVerbs.DefaultRunner cancellationToken predicate.Invoke command
 

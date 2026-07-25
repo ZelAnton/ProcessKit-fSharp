@@ -35,6 +35,24 @@ type VerbTests() =
             shell "echo line1; echo line2; echo line3"
 
     [<Test>]
+    member _.``public verb extensions reject null command and runner arguments eagerly``() =
+        let nullCommand = Unchecked.defaultof<Command>
+        let nullRunner = Unchecked.defaultof<IProcessRunner>
+
+        Assert.Throws<ArgumentNullException>(Action(fun () -> CommandVerbs.RunAsync(nullCommand) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> ProcessRunnerExtensions.RunAsync(runner, nullCommand) |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> ProcessRunnerExtensions.RunAsync(nullRunner, Command.create "svc") |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
     member _.``StdoutTee copies raw output to the sink as well as capturing it``() : Task =
         task {
             use sink = new MemoryStream()
