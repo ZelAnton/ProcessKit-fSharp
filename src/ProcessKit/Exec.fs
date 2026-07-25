@@ -44,6 +44,16 @@ module Exec =
     let outputBytes (program: string) (args: seq<string>) =
         (Command.create program |> Command.args args).OutputBytesAsync()
 
+    /// Launch `program` with `args` **outside all containment** and let it go — the one-liner form of
+    /// `Command.LaunchDetached`, which documents the full contract. Unlike every other verb here the
+    /// child runs in no kill-on-dispose group (Windows: no Job Object; POSIX: its own `setsid` session),
+    /// is never waited on, and outlives this process; all you get back is its pid + start-time identity.
+    /// Reach for it only for genuine spawn-and-forget work (a self-updater, a restart-myself relaunch, a
+    /// daemon handed off to the OS) — for anything you want to observe, use `run`/`outputString` instead.
+    /// Synchronous, like `which`: there is no run to await.
+    let detach (program: string) (args: seq<string>) : Result<DetachedProcess, ProcessError> =
+        (Command.create program |> Command.args args).LaunchDetached()
+
     // Validate and materialize a batch before starting any capture. This keeps programmer errors out
     // of the per-command exception boundary, where they would otherwise be misreported as `Io`.
     let private prepareBatch (runner: IProcessRunner) (commands: seq<Command>) : Command[] =

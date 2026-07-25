@@ -220,8 +220,7 @@ type PipelineSession
         }
 
     /// `StopAsync` using the default grace window (2 seconds, matching `ProcessGroupOptions.ShutdownTimeout`).
-    member this.StopAsync() : Task<Outcome> =
-        this.StopAsync(TimeSpan.FromSeconds 2.0)
+    member this.StopAsync() : Task<Outcome> = this.StopAsync Limits.DefaultStopGrace
 
     /// Signal the whole chain to die without waiting (fire-and-forget, like `RunningProcess.Kill`); the
     /// tree is fully reaped when the session is disposed. For a blocking stop, use `StopAsync` or dispose.

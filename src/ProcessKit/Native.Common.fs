@@ -41,6 +41,21 @@ module internal Common =
             PtyControl: nativeint option
         }
 
+    /// A freshly spawned **detached** child (`Command.LaunchDetached`) — the deliberate opt-out from
+    /// containment. Deliberately unlike `Spawned`: there is no handle to hold, no stream to pump and no
+    /// PTY control, because nothing in the library waits on, signals, or kills this process. Only the two
+    /// identity facts the platform layer can capture while the pid is still pinned (Windows: our own open
+    /// process handle; POSIX: the unreaped child) survive the launch, and the verb layer turns them into
+    /// the public `DetachedProcess`.
+    type DetachedSpawn =
+        {
+            /// The OS process id of the detached child.
+            Pid: int
+            /// Its OS-reported start time (see `readProcessStartTime`), the pid-reuse disambiguator, or
+            /// `None` when the platform could not report one — never fabricated.
+            StartTime: DateTime option
+        }
+
     /// The OS-reported start time of `pid` (`System.Diagnostics.Process.StartTime`, local kind), or
     /// `None` when the process has exited between enumeration and this read, or its start time is
     /// inaccessible on this platform/timing. The single cross-platform start-time read shared by the

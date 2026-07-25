@@ -347,10 +347,6 @@ type SupervisionStatus
 [<Sealed>]
 type SupervisionSession internal (config: SupervisorConfig, cancellationToken: CancellationToken) =
 
-    // The grace window the parameterless `StopAsync()` uses — 2 s, matching `RunningProcess.StopAsync`'s
-    // own default so a session and a live handle agree on how long a soft stop waits before escalating.
-    static let defaultStopGrace = TimeSpan.FromSeconds 2.0
-
     // Serializes the observable snapshot and the stop/current-child state, so an external `Status`/
     // `StopAsync` reader never races the supervision loop's publications. Kept deliberately simple (one
     // lock, immutable snapshot) rather than a lattice of volatiles — the loop publishes rarely (once per
@@ -1001,7 +997,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
         }
 
     /// `StopAsync` using the default 2-second grace window (matching `RunningProcess.StopAsync`).
-    member this.StopAsync() : Task<Result<SupervisionOutcome, ProcessError>> = this.StopAsync defaultStopGrace
+    member this.StopAsync() : Task<Result<SupervisionOutcome, ProcessError>> = this.StopAsync Limits.DefaultStopGrace
 
     /// Internal seam for hosting-style wrappers (`ProcessKit.Extensions.Hosting`): request the same
     /// graceful stop as `StopAsync` — set the `stopping` flag and interrupt the backoff / storm sleep so

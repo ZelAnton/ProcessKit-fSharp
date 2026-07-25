@@ -1035,12 +1035,6 @@ type RunningProcess internal (host: RunningHost) =
         | Some resize -> Task.FromResult(resize (cols, rows))
         | None -> Task.FromResult(Error(ProcessError.Unsupported "Resize (not a PTY run)"))
 
-    // The grace window the parameterless `StopAsync()` uses — 2 seconds, matching
-    // `ProcessGroupOptions.ShutdownTimeout`'s default so a live handle and its owning group agree on
-    // how long a soft stop waits before escalating. Private: it is a documented default, not new
-    // public surface.
-    static member private DefaultStopGrace = TimeSpan.FromSeconds 2.0
-
     /// Gracefully stop the process tree, then reap it: send the child a soft signal (SIGTERM), wait
     /// up to `gracePeriod` for it to exit on its own, then hard-kill whatever is still alive — the
     /// same graceful-kill machinery `Command.TimeoutGrace` and `ProcessGroup.ShutdownAsync` drive.
@@ -1097,8 +1091,7 @@ type RunningProcess internal (host: RunningHost) =
         }
 
     /// `StopAsync` using the default 2-second grace window (matching `ProcessGroupOptions.ShutdownTimeout`).
-    member this.StopAsync() : Task<Outcome> =
-        this.StopAsync RunningProcess.DefaultStopGrace
+    member this.StopAsync() : Task<Outcome> = this.StopAsync Limits.DefaultStopGrace
 
     /// Run to completion, capturing stdout as decoded text. A non-zero exit is data; the tree is
     /// reaped when the call returns.
