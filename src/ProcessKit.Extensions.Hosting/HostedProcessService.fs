@@ -11,7 +11,7 @@ open ProcessKit
 /// Options for a ProcessKit hosted process registered with `AddProcessKitHostedProcess`.
 [<Sealed>]
 type HostedProcessOptions() =
-    let mutable shutdownGracePeriod = TimeSpan.FromSeconds 2.0
+    let mutable shutdownGracePeriod = Limits.DefaultStopGrace
 
     /// The grace period passed to `RunningProcess.StopAsync` during host shutdown.
     member _.ShutdownGracePeriod

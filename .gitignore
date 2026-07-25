@@ -30,6 +30,10 @@ apidocs/output/
 # mdBook build output (docs.yml renders this from docs/ + theme/ + book.toml).
 /book/
 
+# Compilation units extracted from the guides' code samples — scripts/verify-doc-snippets.ps1
+# rewrites them from scratch on every run; only the harness projects and their fixtures are tracked.
+docs/snippets/*/Generated/
+
 # Build results
 [Dd]ebug/
 [Rr]elease/

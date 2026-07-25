@@ -139,6 +139,7 @@ transitively via the ASP.NET Core shared framework in a web host; add
 `Microsoft.Extensions.Diagnostics.HealthChecks` explicitly in a Worker Service) with
 `HealthCheckRegistration`'s factory overload:
 
+<!-- docsnippet:imports Microsoft.Extensions.Diagnostics.HealthChecks -->
 ```csharp
 services.AddProcessKitHostedProcess("worker", new Command("worker").Arg("--serve"));
 services.AddProcessKitHostedProcessHealthCheck("worker");

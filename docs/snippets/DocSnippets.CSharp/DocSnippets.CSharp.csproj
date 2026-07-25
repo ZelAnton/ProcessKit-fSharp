@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<!-- Single-TFM on purpose: this harness only has to answer "does the sample still
+		     typecheck against the current API", and the public surface is TFM-uniform.
+		     net10.0 matches the SDK band pinned in global.json. -->
+		<TargetFrameworks>net10.0</TargetFrameworks>
+		<IsPackable>false</IsPackable>
+		<GenerateDocumentationFile>false</GenerateDocumentationFile>
+		<!-- See DocSnippets.FSharp.fsproj for why warnings are not errors here. -->
+		<TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+		<!-- CS0612/CS0618/CS0619: a sample using an API we deprecated is exactly the drift
+		     this check exists to catch, so it stays fatal. -->
+		<WarningsAsErrors>$(WarningsAsErrors);CS0612;CS0618;CS0619</WarningsAsErrors>
+		<!-- Expected noise from prose-shaped code: 1998 = async method without await,
+		     0219/0168/8321 = declared but never used, 4014 = call not awaited,
+		     0162 = unreachable code, 860x/86xx = nullable-flow warnings a sample cannot
+		     satisfy without noise the reader does not need. -->
+		<NoWarn>$(NoWarn);CS0105;CS0162;CS0168;CS0219;CS1998;CS4014;CS8321;CS8600;CS8601;CS8602;CS8603;CS8604;CS8618;CS8619;CS8625</NoWarn>
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Testing\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.DependencyInjection\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.Hosting\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<!-- The library assemblies are F#, so their public surface (FSharpResult/FSharpOption,
+		     and ProcessKit's own DUs) needs FSharp.Core even from C#. Under Central Package
+		     Management the F# SDK's implicit reference does not apply to a C# project. -->
+		<PackageReference Include="FSharp.Core" />
+		<PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+		<!-- docs/dependency-injection.md shows the reader wiring the keyed health check into
+		     AddHealthChecks(), which lives in the full package, not the Abstractions. -->
+		<PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" />
+		<PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions" />
+		<PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+		<PackageReference Include="NUnit" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Reference Include="ProcessKit" />
+		<Reference Include="ProcessKit.Testing" />
+		<Reference Include="ProcessKit.Extensions.DependencyInjection" />
+		<Reference Include="ProcessKit.Extensions.Hosting" />
+	</ItemGroup>
+
+</Project>

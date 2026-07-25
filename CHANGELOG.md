@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `Command.LaunchDetached()` / `Exec.detach` launch a child **outside all containment** — no Job Object on Windows, its own `setsid` session on POSIX — for spawn-and-forget work that must outlive the caller (a self-updater, a restart-myself relaunch, a daemon handed to the OS); it returns a lightweight `DetachedProcess` (pid + start-time identity, no wait/stream/kill member), and every builder knob a detached child cannot honour (`Pty`, `KillOnParentDeath`, the timeouts, `CancelOn`, a feeder `Stdin`, `KeepStdinOpen`, the line handlers and tees, `StreamBuffer`, `Retry`) is refused with a typed `ProcessError.Unsupported` instead of being ignored.
 - `PtySession` drives an interactive program the way an expect script does: wait for a pattern (text or `Regex`) in the child's raw terminal output — including a prompt such as `Password: ` that no line-based wait can see — with a per-pattern timeout, answer it through `SendAsync`/`SendLineAsync`, and read the whole exchange back from `Transcript`.
 - `ProcessKit.Testing.FakeProcess.WithStdinOpen()` keeps a fake's stdin open (like `Command.KeepStdinOpen()`), so a `PtySession` can be driven against the PTY double with no real process.
 
@@ -15,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
+- Fixed the hardening guide's C# sample disposing a `RunningProcess` with `using`, which does not compile — the handle is `IAsyncDisposable`, so the sample now reads `await using`.
 - Fixed latent masking of the original read/write stream error when cancellation interrupted a tee-sink flush.
 - PTY streams now reject invalid buffer ranges before native I/O and fail safely when a write makes no progress.
 - Supervision stop lifecycle now completes cleanly after a session finishes.

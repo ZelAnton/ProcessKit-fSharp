@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<!-- Single-TFM on purpose: this harness only has to answer "does the sample still
+		     typecheck against the current API", and the public surface is TFM-uniform.
+		     net10.0 matches the SDK band pinned in global.json. -->
+		<TargetFrameworks>net10.0</TargetFrameworks>
+		<IsPackable>false</IsPackable>
+		<GenerateDocumentationFile>false</GenerateDocumentationFile>
+		<!-- Warnings-as-errors is right for shipping code and wrong here: guide samples are
+		     written for a reader, so they legitimately ignore results, bind values they never
+		     use, and match only the interesting cases. Those would be a wall of false failures.
+		     Errors still fail the build - that is the whole check - and the few warnings that
+		     really do mean "the docs are stale" are promoted back to errors below. -->
+		<TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+		<!-- FS0044: a sample using an API we deprecated is exactly the drift this check exists
+		     to catch, so it stays fatal. -->
+		<WarningsAsErrors>$(WarningsAsErrors);FS0044</WarningsAsErrors>
+		<!-- Expected noise from prose-shaped code: 20 = result implicitly ignored,
+		     25 = incomplete pattern match, 1182 = unused binding (this repo opts into it via
+		     Directory.Build.props), 64/3370 = inference details, 49 = uppercase identifier in
+		     a pattern. -->
+		<NoWarn>$(NoWarn);FS0020;FS0025;FS0049;FS0064;FS1182;FS3370</NoWarn>
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Testing\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.DependencyInjection\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.Hosting\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<!-- F# compile order is significant, so Fixtures.fs is listed before the generated
+		     units that consume it. The wildcard is the one deliberate exception to the repo's
+		     "no globbing" rule: the generated files are written by
+		     scripts/verify-doc-snippets.ps1, one per fenced block, and never reference each
+		     other - so their relative order carries no meaning. -->
+		<Compile Include="Fixtures.fs" />
+		<Compile Include="Generated/*.fs" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- See the library .fsproj: explicit FSharp.Core is required under CPM. -->
+		<PackageReference Include="FSharp.Core" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+		<PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+		<PackageReference Include="NUnit" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Reference Include="ProcessKit" />
+		<Reference Include="ProcessKit.Testing" />
+		<Reference Include="ProcessKit.Extensions.DependencyInjection" />
+		<Reference Include="ProcessKit.Extensions.Hosting" />
+	</ItemGroup>
+
+</Project>

@@ -658,6 +658,7 @@ returning a `Result`:
 
 **F#**
 
+<!-- docsnippet:imports System.Net -->
 ```fsharp
 task {
     match! (Command.create "my-server").StartAsync() with
@@ -700,6 +701,7 @@ task {
 
 **C#**
 
+<!-- docsnippet:imports System.Net -->
 ```csharp
 await using var proc = (await new Command("my-server").StartAsync()).GetValueOrThrow();
 
