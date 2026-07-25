@@ -33,3 +33,4 @@
 - [Platform support](platform-support.md)
 - [Hardening untrusted children](hardening.md)
 - [Running in containers](containers.md)
+- [Troubleshooting](troubleshooting.md)

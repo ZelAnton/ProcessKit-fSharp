@@ -34,38 +34,39 @@ The files currently compile in this exact order. The headings are architectural 
 20. `Priority.fs` — priority model and native mapping.
 21. `LineTerminator.fs` — line-ending rules.
 22. `Command.fs` — immutable command configuration and builder API.
+23. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
 
 ### Native and platform layer
 
-23. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
-24. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, limits, and accounting calls.
-25. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
-26. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
+24. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
+25. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, limits, and accounting calls.
+26. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
+27. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
 
 ### Backend, pump, and channels
 
-27. `Backend.fs` — containment interface and its three implementations.
-28. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
-29. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
-30. `ProcessStdin.fs` — interactive stdin handle.
-31. `ReadinessProbe.fs` — readiness polling.
-32. `RunningProcess.fs` — live-process state, streams, completion, and disposal.
+28. `Backend.fs` — containment interface and its three implementations.
+29. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
+30. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
+31. `ProcessStdin.fs` — interactive stdin handle.
+32. `ReadinessProbe.fs` — readiness polling.
+33. `RunningProcess.fs` — live-process state, streams, completion, and disposal.
 
 ### Runner and verbs
 
-33. `PtySession.fs` — expect-style interaction over a live handle.
-34. `IProcessRunner.fs` — injectable runner seam.
-35. `Runner.fs` — capture primitives and reusable verbs.
-36. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
-37. `DelegatingProcessRunner.fs` — runner decorator base.
-38. `ProcessGroup.fs` — containment owner and shared-group runner.
-39. `JobRunner.fs` — default private-group runner.
-40. `CommandVerbs.fs` — default-runner `Command` extensions.
-41. `PipelineRunner.fs` — internal pipeline execution.
-42. `Pipeline.fs` — pipeline public API.
-43. `Supervisor.fs` — restart supervision.
-44. `CliClient.fs` — configured command client.
-45. `Exec.fs` — concise execution entry points.
+34. `PtySession.fs` — expect-style interaction over a live handle.
+35. `IProcessRunner.fs` — injectable runner seam.
+36. `Runner.fs` — capture primitives and reusable verbs.
+37. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
+38. `DelegatingProcessRunner.fs` — runner decorator base.
+39. `ProcessGroup.fs` — containment owner and shared-group runner.
+40. `JobRunner.fs` — default private-group runner.
+41. `CommandVerbs.fs` — default-runner `Command` extensions.
+42. `PipelineRunner.fs` — internal pipeline execution.
+43. `Pipeline.fs` — pipeline public API.
+44. `Supervisor.fs` — restart supervision.
+45. `CliClient.fs` — configured command client.
+46. `Exec.fs` — concise execution entry points.
 
 When adding a file, place it after everything it consumes and before everything that consumes it. Alphabetical sorting or SDK globbing would silently destroy this ordering model.
 
@@ -229,6 +230,8 @@ Spawn -> Track -> expose RunningProcess -> pump + Wait -> Release -> dispose str
                `---- teardown owns ----'
 ```
 
+`Command.LaunchDetached` is the one deliberate exception to that sequence, and it is structured so it can never dilute it. It has its own spawn path in each platform layer (`Native.Windows.spawnDetachedWindows`, `Native.Posix.spawnDetachedPosix`) which skips the whole transaction: no Job assignment (so no `CREATE_SUSPENDED`/resume dance), `POSIX_SPAWN_SETSID` instead of the tracked process group, no `Track`, no reap-ledger entry, no retained handle, no `Release`. It returns only a `DetachedProcess` (pid + start time), never a `RunningProcess`, so there is no handle through which the missing guarantees could be mistaken for present ones, and every builder knob that would require the parent-side machinery it does not create is refused up front with a typed `ProcessError.Unsupported` (`DetachedLaunch.incompatibleKnob` in `CommandVerbs.fs`). It shares the resolution, command-line, environment, stdio-opening, and privilege-drop helpers with the contained paths rather than re-deriving them, so the divergence is exactly the containment, nothing else. Keep it that way: a detached mode reachable as a *flag* on the ordinary path would make the kill-on-drop guarantee conditional everywhere, which is precisely what the separate verb avoids.
+
 For a private per-run group, disposing `RunningProcess` disposes its `ProcessGroup`, so the whole tree dies. For a shared group, disposing a child handle detaches that run's I/O; the group remains the lifetime owner until `ShutdownAsync` or group disposal. `ProcessGroup` implements deterministic `IDisposable`/`IAsyncDisposable` teardown, and its finalizer is the last-resort safety net when callers fail to dispose.
 
 `ProcessGroup` guards its whole lifecycle with one lock (`sync`). A spawn+track (and the start of a run) and every control/accounting verb run their released-flag check *and* their native backend call inside that lock, so each either completes fully on the live container or observes the flag and returns `Unsupported` before touching native. The live→released transition also flips the flag under `sync`: acquiring the lock waits out any in-flight operation (each holds the lock for its whole native call), and once the flag is set every later operation bails. Whichever of `Dispose`/`DisposeAsync`/`ShutdownAsync`/finalizer wins that flip owns the one-shot `HardRelease`; the losers are no-ops, so teardown runs exactly once. `HardRelease` is bounded (SIGKILL + `waitpid` + close) and also runs under `sync`, but `ShutdownAsync` deliberately keeps its *unbounded* graceful-stop wait off the lock — the flag is already set, so no new operation can start during that wait.
@@ -261,6 +264,7 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 | Selection | Windows, with or without limits | macOS/BSD; Linux without requested limits | Linux when limits are requested |
 | Containment timing | Child suspended, assigned to Job, then resumed | Group created atomically by `posix_spawn` attributes | POSIX group at spawn; `/bin/sh` launcher joins the cgroup before `exec`ing the target (already contained on its first instruction) |
 | Adopt external process (`Adopt`) | `AssignProcessToJobObject` (opens a least-privilege handle, assigns, closes it — Job membership persists) | `ProcessError.Unsupported` — `setpgid` cannot relocate a foreign, already-`exec`ed process | Write the pid to `cgroup.procs` (limited groups only; the plain POSIX fallback is the middle column) |
+| Detached launch (`LaunchDetached`) | Created running, assigned to no Job, both handles closed at once | `POSIX_SPAWN_SETSID`: own session, no pgid tracking, no reap-ledger entry | Same as the middle column — a detached child joins no cgroup |
 | Whole-tree hard kill | Terminate Job or close kill-on-close Job handle | `killpg(SIGKILL)` for each tracked pgid | `cgroup.kill`; freeze-and-SIGKILL sweep fallback |
 | Graceful tree stop | Best-effort `WM_CLOSE` to members' windows, poll to grace, then hard Job kill | `SIGTERM`, poll, then `SIGKILL` | signal members with `SIGTERM`, poll, then cgroup hard kill |
 | General signals | Kill; Int/Term as best-effort CTRL+BREAK (`WindowsCtrlSignals()` child) and/or `WM_CLOSE` (windowed member) | `killpg` with mapped/raw signal | per-current-member signal sweep; Kill is atomic cgroup kill |
@@ -290,6 +294,7 @@ Run it locally with `dotnet run -c Release --project benchmarks/ProcessKit.Bench
 - Never expose a spawned child before successful tracking.
 - Never stop draining a captured pipe merely because retention overflowed; only explicit streaming backpressure may pace it.
 - Never convert a requested resource limit or signal into a silent weaker fallback.
+- Keep the opt-out from containment a separate, loudly named verb with typed refusals — never a flag on a contained path.
 - Keep teardown exactly once, but child cleanup owned by exactly one racer.
 - Pair POSIX group killing with direct-child reaping.
 - Treat handles/PIDs as identities only while tracking proves they have not been released and reused.

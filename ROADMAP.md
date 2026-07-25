@@ -20,6 +20,12 @@ Shipped changes are in [`CHANGELOG.md`](CHANGELOG.md).
   the PTY geometry. **`PtySession`** turns that into the expect-style automation loop — wait for a
   prompt (text or `Regex`) in the raw terminal stream with a per-pattern timeout, answer it through the
   interactive stdin, and keep an optional transcript.
+- One explicit **opt-out from containment** — `Command.LaunchDetached` / `Exec.detach` — for
+  spawn-and-forget work that must outlive this process (a self-updater, a restart-myself relaunch, a
+  daemon handed to the OS): the child is placed in no Job Object and in its own POSIX session, and the
+  verb returns a `DetachedProcess` (pid + start-time identity) with no wait/stream/kill member. It is a
+  separate, loudly named verb — never a flag on the ordinary path — and every builder knob it cannot
+  honour is a typed `ProcessError.Unsupported`, so the kill-on-dispose guarantee above stays unqualified.
 - Shell-free **`Pipeline`s** with pipefail semantics.
 - **`Supervisor`** — restart policies, exponential backoff + jitter, and a failure-storm guard.
 - Tree control on **`ProcessGroup`** (`Signal` / `Suspend` / `Resume` / `Members` / `KillAll` /
