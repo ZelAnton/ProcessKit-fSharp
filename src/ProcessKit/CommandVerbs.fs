@@ -223,6 +223,12 @@ type CommandVerbs =
     /// is an ordinary builder knob, so `StdoutEncoding`/`StderrEncoding`/`Encoding` later in the same
     /// chain override it (and it overrides them) — the last one wins, as everywhere else.
     ///
+    /// **Resolved here, once.** The code page is read as THIS call runs and the resulting `Encoding` is
+    /// stored in the returned command; a `Command` is immutable, so nothing re-reads it at spawn time or
+    /// while the child runs. A `chcp` issued after the command was built is picked up only by a command
+    /// built again — or given `Encoding(ConsoleEncoding.current ())` before the launch — which is worth
+    /// knowing for a command built once and reused (a long-lived `CliClient`, a template in a field).
+    ///
     /// The captured *bytes* are never affected: `OutputBytesAsync` and the raw tees stay byte-exact
     /// regardless of which encoding decodes the text.
     ///

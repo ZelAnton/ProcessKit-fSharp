@@ -532,13 +532,23 @@ Console.WriteLine(await cmd.OutputStringAsync() switch
 
 What it resolves, on Windows: the **output code page of this process's console** —
 what `chcp` reports, and what a child inherits — or the **system OEM code page**
-when the process has no console at all (a GUI application, a service). It is read
-live on every call, so a `chcp` during the run is honoured. Off Windows there is no
-second, legacy console encoding to discover, so the call is a genuine no-op: the same
-UTF-8 the default already uses, with no platform call at all. The same answer is
-available on its own as `ConsoleEncoding.current ()` — a plain `System.Text.Encoding`
-— for a [pipeline](pipelines.md), a `CliClient`, or a single stream via
-`StdoutEncoding`.
+when the process has no console at all (a GUI application, a service). Off Windows
+there is no second, legacy console encoding to discover, so the call is a genuine
+no-op: the same UTF-8 the default already uses, with no platform call at all. The
+same answer is available on its own as `ConsoleEncoding.current ()` — a plain
+`System.Text.Encoding` — for a [pipeline](pipelines.md), a `CliClient`, or a single
+stream via `StdoutEncoding`.
+
+**When the code page is read.** `ConsoleEncoding.current ()` reads it live, on every
+call. The builder knob calls it **once**, as that link in the chain is built, and
+stores the resulting `Encoding` in the command: a `Command` is immutable, so nothing
+re-reads the code page at spawn time or while the child runs. A `chcp` issued after
+the command was built is therefore *not* picked up — the command keeps decoding with
+the code page that was active when `ConsoleEncoding()` ran. That is invisible for a
+command built and launched in one breath, and it is worth knowing for one built once
+and reused: a long-lived `CliClient`, a template command kept in a field. To honour a
+later code-page change there, build the command again, or apply
+`Encoding(ConsoleEncoding.current ())` to it just before the launch.
 
 It stays **opt-in**, and it is an ordinary builder knob: without the call nothing
 changes, and an `Encoding`/`StdoutEncoding`/`StderrEncoding` later in the chain
