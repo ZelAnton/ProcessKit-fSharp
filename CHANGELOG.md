@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Added configurable text stdin encoding through `Command.StdinEncoding` and `Command.Encoding`.
+- Added configurable text stdin encoding through `Command.StdinEncoding`.
 
 ### Changed
--
+- `Command.Encoding` and `Command.ConsoleEncoding()` now apply their encoding to text stdin as well as captured output.
 
 ### Fixed
 -

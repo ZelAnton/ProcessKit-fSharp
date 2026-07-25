@@ -312,9 +312,9 @@ can never hang waiting for input. Everything else is opt-in via `Stdin`:
 | `Stdin.FromString "…"` | yes | Text payloads (encoded with `StdinEncoding`; UTF-8 by default) |
 | `Stdin.FromBytes bytes` | yes | Binary payloads |
 | `Stdin.FromFile path` | yes (re-opened per run) | Large inputs streamed from disk |
-| `Stdin.FromLines seq` | one-shot | A sequence of lines, each written `\n`-terminated |
+| `Stdin.FromLines seq` | one-shot | A sequence of lines, each `\n`-terminated and encoded with `StdinEncoding` |
 | `Stdin.FromStream stream` | one-shot | Any readable `Stream` — a socket, a decompressor, … |
-| `Stdin.FromAsyncLines asyncSeq` | one-shot | An `IAsyncEnumerable<string>` — a channel, a tail, … |
+| `Stdin.FromAsyncLines asyncSeq` | one-shot | An `IAsyncEnumerable<string>` encoded line by line with `StdinEncoding` |
 
 **F#**
 

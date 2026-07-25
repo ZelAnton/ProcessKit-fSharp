@@ -127,6 +127,30 @@ type TestabilityTests() =
         }
 
     [<Test>]
+    member _.``FakeProcess omits streams that a real command redirects or does not pipe``() : Task =
+        task {
+            let command =
+                Command.create "svc"
+                |> Command.stdoutToFile "out.txt" false
+                |> Command.stderr StdioMode.Null
+
+            use proc =
+                FakeProcess.OfCommand(command).WithStdout("output").WithStderr("diagnostic").Build()
+
+            match! proc.OutputStringAsync() with
+            | Ok result ->
+                Assert.That(result.Stdout, Is.Empty)
+                Assert.That(result.Stderr, Is.Empty)
+            | Error error -> Assert.Fail $"FakeProcess OutputString failed: {error.Message}"
+
+            use eventProc =
+                FakeProcess.OfCommand(command).WithStdout("output").WithStderr("diagnostic").Build()
+
+            let! events = collectEvents eventProc
+            Assert.That(events, Is.Empty)
+        }
+
+    [<Test>]
     member _.``ScriptedRunner.StartAsync serves a fake streaming process``() : Task =
         task {
             let runner: IProcessRunner = ScriptedRunner().On([ "svc" ], Reply.Ok "ready\ngo")

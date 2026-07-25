@@ -40,8 +40,9 @@ type internal FakeStdinRecorder() =
 /// Builds an in-memory `RunningProcess` for unit-testing code that consumes a live handle —
 /// `StdoutLinesAsync` / `OutputEventsAsync` / `FinishAsync` / the readiness probes / the buffered verbs — without
 /// spawning a real process. Immutable and fluent; `Build()` returns a real `RunningProcess` whose
-/// stdout/stderr are `MemoryStream`s of the scripted text, whose wait resolves to the scripted
-/// outcome, and whose kill/teardown are no-ops.
+/// observable stdout/stderr are `MemoryStream`s of scripted text when the command pipes that stream;
+/// file redirects and `Null`/`Inherit` destinations expose no parent-side stream, just like a real
+/// spawn. Its wait resolves to the scripted outcome, and kill/teardown are no-ops.
 ///
 /// Call `WithPty()` to model a pseudo-terminal (`Command.Pty`) run: the built handle then exposes a
 /// **single merged stream** (`OutputEvent.Stderr` is never produced) and `ResizeAsync` is a recorded
@@ -163,6 +164,12 @@ type FakeProcess
         let config = template.Config
         let isPty = pty.IsSome
         let hasMergedStderr = isPty || config.MergeStderr
+        let hasStdout = config.StdoutFile.IsNone && config.StdoutMode = StdioMode.Piped
+
+        let hasStderr =
+            not hasMergedStderr
+            && config.StderrFile.IsNone
+            && config.StderrMode = StdioMode.Piped
 
         // A PTY or MergeStderr has one observable stdout stream: the child's stdout and stderr share a
         // terminal device or the OS folds stderr into stdout. The fake joins scripted stderr on a newline
@@ -178,15 +185,18 @@ type FakeProcess
                 stdout
 
         let stdoutStream =
-            new MemoryStream(config.StdoutEncoding.GetBytes stdoutText) :> Stream
+            if hasStdout then
+                Some(new MemoryStream(config.StdoutEncoding.GetBytes stdoutText) :> Stream)
+            else
+                None
 
         // PTY and MergeStderr runs have no separate stderr channel, exactly like a real spawn whose
         // `Spawned.Stderr` is `None`; a normal fake keeps its own stderr stream.
         let stderrStream =
-            if hasMergedStderr then
-                None
-            else
+            if hasStderr then
                 Some(new MemoryStream(config.StderrEncoding.GetBytes stderr) :> Stream)
+            else
+                None
 
         // Match the real spawn's capability boundary: `TakeStdin` has a writable pipe exactly for a
         // KeepStdinOpen run. A fake does not feed `Command.Stdin` sources, so this in-memory sink is ready
@@ -196,7 +206,7 @@ type FakeProcess
         let host: RunningHost =
             { Config = config
               Pid = pid
-              Stdout = Some stdoutStream
+              Stdout = stdoutStream
               Stderr = stderrStream
               Stdin = stdinStream
               StartTime = DateTime.UtcNow
@@ -226,7 +236,7 @@ type FakeProcess
                 | None -> None
               Teardown =
                 fun () ->
-                    stdoutStream.Dispose()
+                    stdoutStream |> Option.iter (fun s -> s.Dispose())
                     stderrStream |> Option.iter (fun s -> s.Dispose())
                     stdinStream |> Option.iter (fun s -> s.Dispose())
                     ValueTask.CompletedTask }
