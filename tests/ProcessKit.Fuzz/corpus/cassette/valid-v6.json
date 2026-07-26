@@ -1,0 +1,15 @@
+{
+  "Version": 6,
+  "Entries": [
+    {
+      "Program": "tool",
+      "Args": [],
+      "HasStdin": false,
+      "EnvNames": [],
+      "Stdout": "seed output",
+      "Stderr": "",
+      "Code": 0,
+      "DurationMs": 1.0
+    }
+  ]
+}

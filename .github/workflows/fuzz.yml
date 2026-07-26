@@ -1,0 +1,58 @@
+name: Fuzz smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * 2'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Directory.Packages.props', '.config/dotnet-tools.json', 'nuget.config', 'global.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Download pinned libFuzzer driver
+        shell: bash
+        run: |
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/libfuzzer-dotnet" \
+            https://github.com/Metalnem/libfuzzer-dotnet/releases/download/v2025.05.02.0904/libfuzzer-dotnet-ubuntu
+          echo 'c2c2a90d94c409a4af339a0d4f244e0442c5a5d249be0f1252ba07871f285958  '"$RUNNER_TEMP/libfuzzer-dotnet" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/libfuzzer-dotnet"
+
+      - name: Fuzz output framing
+        shell: pwsh
+        run: >-
+          ./scripts/fuzz.ps1 -Target Pump
+          -LibFuzzer "$env:RUNNER_TEMP/libfuzzer-dotnet"
+          -DurationSeconds 45
+
+      - name: Fuzz cassette replay
+        shell: pwsh
+        run: >-
+          ./scripts/fuzz.ps1 -Target Cassette
+          -LibFuzzer "$env:RUNNER_TEMP/libfuzzer-dotnet"
+          -DurationSeconds 45 -SkipBuild
+
+      - name: Upload fuzz findings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-findings
+          path: artifacts/fuzz
+          if-no-files-found: ignore

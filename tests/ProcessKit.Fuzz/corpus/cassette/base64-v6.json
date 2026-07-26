@@ -1,0 +1,17 @@
+{
+  "Version": 6,
+  "Entries": [
+    {
+      "Program": "tool",
+      "Args": [],
+      "HasStdin": false,
+      "EnvNames": [],
+      "Stdout": "",
+      "Stderr": "seed error",
+      "StdoutBase64": "AAEC/38=",
+      "Signalled": true,
+      "Signal": 15,
+      "DurationMs": 2.0
+    }
+  ]
+}
