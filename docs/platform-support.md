@@ -279,10 +279,12 @@ are reported.
 |---|:---:|:---:|:---:|
 | `ActiveProcessCount` | ✅ | ✅ | ✅ |
 | `TotalCpuTime` + `PeakMemoryBytes` | ✅ | ✅ | ❌ active count only |
+| `IoReadBytes` / `IoWriteBytes` + operation counts | ✅ Job aggregate | 🟡 `io.stat` when I/O is delegated | ❌ `None` |
 
-On the POSIX process-group mechanism, `ProcessGroupStats.TotalCpuTime` and `PeakMemoryBytes` are
-`None` — only the live process count is available. Windows reads Job Object accounting; the cgroup
-mechanism reads `cpu.stat` / `memory.peak`.
+On the POSIX process-group mechanism, all optional `ProcessGroupStats` metrics are `None` — only the
+live process count is available. Windows reads Job Object accounting; the cgroup mechanism reads
+`cpu.stat`, `memory.peak`, and, when that controller is delegated, block-device counters from
+`io.stat`.
 
 **Resource limits (`ProcessGroupOptions`)**
 

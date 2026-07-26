@@ -641,7 +641,7 @@ using var group = created.GetValueOrThrow();   // ... run within the limited gro
 ```fsharp
 match group.Stats() with
 | Ok stats ->
-    printfn $"active={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}"
+    printfn $"active={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} read={stats.IoReadBytes} write={stats.IoWriteBytes}"
 | Error _ -> ()
 
 // A periodic series (IAsyncEnumerable) for live dashboards:
@@ -652,13 +652,13 @@ let series = group.SampleStatsAsync(TimeSpan.FromSeconds 1.0)
 
 ```csharp
 if (group.Stats() is { IsOk: true, ResultValue: var stats })
-    Console.WriteLine($"active={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}");
+    Console.WriteLine($"active={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} read={stats.IoReadBytes} write={stats.IoWriteBytes}");
 
 // A periodic series (IAsyncEnumerable) for live dashboards:
 var series = group.SampleStatsAsync(TimeSpan.FromSeconds(1));
 ```
 
-Per-run profiling captures exit code, duration, CPU, and peak memory:
+Per-run profiling captures exit code, duration, CPU, peak memory, and private-tree I/O where available:
 
 **F#**
 
@@ -667,7 +667,7 @@ match! (Command.create "heavy-job").StartAsync() with
 | Ok proc ->
     use _ = proc
     let! profile = proc.ProfileAsync()
-    printfn $"exit={profile.ExitCode} cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} samples={profile.Samples}"
+    printfn $"exit={profile.ExitCode} cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} read={profile.IoReadBytes} write={profile.IoWriteBytes} samples={profile.Samples}"
 | Error _ -> ()
 ```
 
@@ -676,7 +676,7 @@ match! (Command.create "heavy-job").StartAsync() with
 ```csharp
 await using var proc = (await new Command("heavy-job").StartAsync()).GetValueOrThrow();
 var profile = await proc.ProfileAsync();
-Console.WriteLine($"exit={profile.ExitCode} cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} samples={profile.Samples}");
+Console.WriteLine($"exit={profile.ExitCode} cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} read={profile.IoReadBytes} write={profile.IoWriteBytes} samples={profile.Samples}");
 ```
 
 ## Supervision

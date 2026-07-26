@@ -5,15 +5,28 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 
+[<Struct; NoComparison>]
+type internal ProcessIoCounters =
+    { ReadBytes: int64
+      WriteBytes: int64
+      ReadOperations: int64
+      WriteOperations: int64 }
+
 /// A snapshot of a process group's resource usage.
 ///
-/// `TotalCpuTime` and `PeakMemoryBytes` are `None` when the platform can't report them — the POSIX
+/// Optional CPU, memory, and I/O fields are `None` when the platform can't report them — the POSIX
 /// process-group mechanism (macOS and the Linux fallback) has no kernel accumulator; the Linux
-/// cgroup v2 backend (the `limits` feature) supplies them. Sealed with an internal constructor so
-/// it can gain metrics without breaking the frozen API.
+/// cgroup v2 backend (the `limits` feature) supplies the controller metrics available to it. Sealed
+/// with an internal constructor so it can gain metrics without breaking the frozen API.
 [<Sealed>]
-type ProcessGroupStats internal (activeProcessCount: int, totalCpuTime: TimeSpan option, peakMemoryBytes: int64 option)
-    =
+type ProcessGroupStats
+    internal
+    (
+        activeProcessCount: int,
+        totalCpuTime: TimeSpan option,
+        peakMemoryBytes: int64 option,
+        ioCounters: ProcessIoCounters option
+    ) =
 
     /// Number of live processes currently in the group. Under the POSIX process-group mechanism
     /// this counts live process *groups* (one per contained child) rather than individual
@@ -28,15 +41,38 @@ type ProcessGroupStats internal (activeProcessCount: int, totalCpuTime: TimeSpan
     /// (Windows: the Job's peak *committed* memory). Not directly comparable across platforms.
     member _.PeakMemoryBytes = peakMemoryBytes
 
+    /// Bytes read by the contained tree, if the containment mechanism exposes an aggregate I/O
+    /// counter. Windows reports the Job Object's OS I/O total; Linux cgroup v2 reports block-device
+    /// bytes from `io.stat`; the POSIX process-group fallback returns `None`.
+    member _.IoReadBytes = ioCounters |> Option.map _.ReadBytes
+
+    /// Bytes written by the contained tree, with the same platform availability as `IoReadBytes`.
+    member _.IoWriteBytes = ioCounters |> Option.map _.WriteBytes
+
+    /// Read operations performed by the contained tree, when the platform exposes the count.
+    member _.IoReadOperations = ioCounters |> Option.map _.ReadOperations
+
+    /// Write operations performed by the contained tree, when the platform exposes the count.
+    member _.IoWriteOperations = ioCounters |> Option.map _.WriteOperations
+
+    member internal _.IoCounters = ioCounters
+
 /// Resource summary of one finished run — produced by `RunningProcess.ProfileAsync`.
 ///
 /// CPU and memory come from the started child process (the same source as `RunningProcess.CpuTime`
-/// / `PeakMemoryBytes`), so they are `None` where per-process metrics are unavailable or when the
-/// run exited before the first sample landed. Sealed with an internal constructor.
+/// / `PeakMemoryBytes`). I/O comes from the run's private containment tree and stays `None` for a
+/// shared group, where an aggregate would include sibling runs. Sealed with an internal constructor.
 [<Sealed>]
 type RunProfile
     internal
-    (outcome: Outcome, duration: TimeSpan, cpuTime: TimeSpan option, peakMemoryBytes: int64 option, samples: int) =
+    (
+        outcome: Outcome,
+        duration: TimeSpan,
+        cpuTime: TimeSpan option,
+        peakMemoryBytes: int64 option,
+        ioCounters: ProcessIoCounters option,
+        samples: int
+    ) =
 
     /// How the profiled run concluded — a clean exit, a signal kill, or a timeout. `ExitCode` /
     /// `Signal` / `TimedOut` are the convenience reads over it, so a profile is a superset of `Wait`:
@@ -62,6 +98,20 @@ type RunProfile
 
     /// Peak resident memory observed across the samples, in bytes.
     member _.PeakMemoryBytes = peakMemoryBytes
+
+    /// Bytes read by the run's whole private containment tree. `None` when the platform cannot expose
+    /// a tree aggregate or the run belongs to a shared group whose counter would include siblings.
+    member _.IoReadBytes = ioCounters |> Option.map _.ReadBytes
+
+    /// Bytes written by the run's whole private containment tree, with the same availability contract
+    /// as `IoReadBytes`.
+    member _.IoWriteBytes = ioCounters |> Option.map _.WriteBytes
+
+    /// Read operations performed by the run's private tree, when available.
+    member _.IoReadOperations = ioCounters |> Option.map _.ReadOperations
+
+    /// Write operations performed by the run's private tree, when available.
+    member _.IoWriteOperations = ioCounters |> Option.map _.WriteOperations
 
     /// How many sampling ticks ran (including ones that found no data).
     member _.Samples = samples

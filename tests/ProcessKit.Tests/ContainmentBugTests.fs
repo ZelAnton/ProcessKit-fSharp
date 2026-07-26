@@ -148,7 +148,7 @@ type internal SyntheticBackend() =
 
         member _.Stats() =
             requireLive "Stats"
-            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None))
+            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None))
 
         member _.UpdateLimits(_limits) =
             // A live limit re-apply must never reach the backend after teardown; count the ones that do
@@ -263,7 +263,7 @@ type internal CtrlSignalRaceBackend() =
         member _.Resume() = Ok()
 
         member _.Stats() =
-            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None))
+            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None))
 
         member _.UpdateLimits(_limits) = Ok()
         member _.HardRelease() = lock gate (fun () -> tracked.Clear())

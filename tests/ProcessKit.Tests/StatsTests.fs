@@ -2,6 +2,7 @@ namespace ProcessKit.Tests
 
 open System
 open System.Diagnostics
+open System.IO
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
@@ -50,6 +51,7 @@ type StatsTests() =
           StartKill = ignore
           GracefulKill = fun _ -> Task.CompletedTask
           ResizePty = None
+          TreeStats = None
           Teardown = fun () -> ValueTask() }
 
     [<Test>]
@@ -68,6 +70,17 @@ type StatsTests() =
                 Assert.That(profile.ExitCode, Is.EqualTo(Some 0))
                 Assert.That(profile.Duration, Is.GreaterThan TimeSpan.Zero)
                 Assert.That(profile.Samples, Is.GreaterThanOrEqualTo 1)
+
+                if isWindows then
+                    Assert.That(profile.IoReadBytes.IsSome, Is.True)
+                    Assert.That(profile.IoWriteBytes.IsSome, Is.True)
+                    Assert.That(profile.IoReadOperations.IsSome, Is.True)
+                    Assert.That(profile.IoWriteOperations.IsSome, Is.True)
+                else
+                    Assert.That(profile.IoReadBytes.IsNone, Is.True)
+                    Assert.That(profile.IoWriteBytes.IsNone, Is.True)
+                    Assert.That(profile.IoReadOperations.IsNone, Is.True)
+                    Assert.That(profile.IoWriteOperations.IsNone, Is.True)
         }
         :> Task
 
@@ -105,10 +118,18 @@ type StatsTests() =
                         // The Job Object reports cumulative CPU and peak committed memory.
                         Assert.That(stats.TotalCpuTime.IsSome, Is.True)
                         Assert.That(stats.PeakMemoryBytes.IsSome, Is.True)
+                        Assert.That(stats.IoReadBytes.IsSome, Is.True)
+                        Assert.That(stats.IoWriteBytes.IsSome, Is.True)
+                        Assert.That(stats.IoReadOperations.IsSome, Is.True)
+                        Assert.That(stats.IoWriteOperations.IsSome, Is.True)
                     else
                         // The POSIX process-group mechanism has no kernel accumulator.
                         Assert.That(stats.TotalCpuTime.IsNone, Is.True)
                         Assert.That(stats.PeakMemoryBytes.IsNone, Is.True)
+                        Assert.That(stats.IoReadBytes.IsNone, Is.True)
+                        Assert.That(stats.IoWriteBytes.IsNone, Is.True)
+                        Assert.That(stats.IoReadOperations.IsNone, Is.True)
+                        Assert.That(stats.IoWriteOperations.IsNone, Is.True)
                 | Error error -> Assert.Fail $"{error}"
 
                 running.Kill()
@@ -240,16 +261,84 @@ type StatsTests() =
         :> Task
 
     [<Test>]
+    member _.``cgroup io.stat sums counters across block devices``() =
+        let directory =
+            Path.Combine(Path.GetTempPath(), $"processkit-io-stats-{Guid.NewGuid():N}")
+
+        Directory.CreateDirectory directory |> ignore
+
+        try
+            File.WriteAllText(Path.Combine(directory, "cpu.stat"), "usage_usec 5\n")
+            File.WriteAllText(Path.Combine(directory, "memory.peak"), "42\n")
+
+            File.WriteAllText(
+                Path.Combine(directory, "io.stat"),
+                "8:0 rbytes=4 wbytes=9 rios=1 wios=2 dbytes=3 dios=1\n"
+                + "8:16 rbytes=7 wbytes=13 rios=3 wios=4\n"
+            )
+
+            let cpu, memory, io = ProcessKit.Native.Cgroup.cgroupStats directory
+            Assert.That(cpu, Is.EqualTo(Some(TimeSpan.FromTicks 50L)))
+            Assert.That(memory, Is.EqualTo(Some 42L))
+            Assert.That(io.IsSome, Is.True)
+            Assert.That(io.Value.ReadBytes, Is.EqualTo 11L)
+            Assert.That(io.Value.WriteBytes, Is.EqualTo 22L)
+            Assert.That(io.Value.ReadOperations, Is.EqualTo 4L)
+            Assert.That(io.Value.WriteOperations, Is.EqualTo 6L)
+        finally
+            Directory.Delete(directory, true)
+
+    [<Test>]
+    member _.``ProfileAsync projects private tree I/O counters from its final snapshot``() : Task =
+        task {
+            let counters =
+                { ReadBytes = 101L
+                  WriteBytes = 202L
+                  ReadOperations = 3L
+                  WriteOperations = 4L }
+
+            let stats = ProcessGroupStats(0, None, None, Some counters)
+
+            let host =
+                { hostOverCurrentProcess None with
+                    TreeStats = Some(fun () -> Some stats) }
+
+            use running = new RunningProcess(host)
+            let! profile = running.ProfileAsync(TimeSpan.FromMilliseconds 10.0)
+            Assert.That(profile.IoReadBytes, Is.EqualTo(Some 101L))
+            Assert.That(profile.IoWriteBytes, Is.EqualTo(Some 202L))
+            Assert.That(profile.IoReadOperations, Is.EqualTo(Some 3L))
+            Assert.That(profile.IoWriteOperations, Is.EqualTo(Some 4L))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ProfileAsync does not attribute a shared group's aggregate I/O to one run``() : Task =
+        task {
+            use group = create ()
+
+            match! group.StartAsync(shell "exit 0") with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let! profile = running.ProfileAsync(TimeSpan.FromMilliseconds 10.0)
+                Assert.That(profile.IoReadBytes.IsNone, Is.True)
+                Assert.That(profile.IoWriteBytes.IsNone, Is.True)
+                Assert.That(profile.IoReadOperations.IsNone, Is.True)
+                Assert.That(profile.IoWriteOperations.IsNone, Is.True)
+        }
+        :> Task
+
+    [<Test>]
     member _.``AvgCpuCores divides CPU time by duration``() =
         let profile =
-            RunProfile(Outcome.Exited 0, TimeSpan.FromSeconds 2.0, Some(TimeSpan.FromSeconds 1.0), None, 5)
+            RunProfile(Outcome.Exited 0, TimeSpan.FromSeconds 2.0, Some(TimeSpan.FromSeconds 1.0), None, None, 5)
 
         match profile.AvgCpuCores with
         | Some avg -> Assert.That(avg, Is.EqualTo(0.5).Within 1e-9)
         | None -> Assert.Fail "expected an average"
 
         let noDuration =
-            RunProfile(Outcome.Exited 0, TimeSpan.Zero, Some(TimeSpan.FromSeconds 1.0), None, 1)
+            RunProfile(Outcome.Exited 0, TimeSpan.Zero, Some(TimeSpan.FromSeconds 1.0), None, None, 1)
 
         Assert.That(noDuration.AvgCpuCores.IsNone, Is.True)
 
@@ -257,18 +346,22 @@ type StatsTests() =
     member _.``RunProfile.Outcome distinguishes a timeout and a signal kill (both leave ExitCode None)``() =
         // The point of carrying the full Outcome: ExitCode is None for both a timeout and a signal kill,
         // so a profiled run can only tell them apart via Outcome / TimedOut / Signal.
-        let timedOut = RunProfile(Outcome.TimedOut, TimeSpan.FromSeconds 1.0, None, None, 1)
+        let timedOut =
+            RunProfile(Outcome.TimedOut, TimeSpan.FromSeconds 1.0, None, None, None, 1)
+
         Assert.That(timedOut.ExitCode.IsNone, Is.True)
         Assert.That(timedOut.TimedOut, Is.True)
         Assert.That(timedOut.Signal.IsNone, Is.True)
 
         let signalled =
-            RunProfile(Outcome.Signalled(Some 9), TimeSpan.FromSeconds 1.0, None, None, 1)
+            RunProfile(Outcome.Signalled(Some 9), TimeSpan.FromSeconds 1.0, None, None, None, 1)
 
         Assert.That(signalled.ExitCode.IsNone, Is.True)
         Assert.That(signalled.TimedOut, Is.False)
         Assert.That(signalled.Signal, Is.EqualTo(Some 9))
 
-        let exited = RunProfile(Outcome.Exited 3, TimeSpan.FromSeconds 1.0, None, None, 1)
+        let exited =
+            RunProfile(Outcome.Exited 3, TimeSpan.FromSeconds 1.0, None, None, None, 1)
+
         Assert.That(exited.ExitCode, Is.EqualTo(Some 3))
         Assert.That(exited.Outcome, Is.EqualTo(Outcome.Exited 3))

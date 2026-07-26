@@ -343,7 +343,7 @@ type internal JobObjectBackend(jobHandle: nativeint) =
 
         member _.Stats() =
             match Native.Windows.jobStatsWindows jobHandle with
-            | Some(active, cpu, peak) -> Ok(ProcessGroupStats(active, Some cpu, Some peak))
+            | Some(active, cpu, peak, io) -> Ok(ProcessGroupStats(active, Some cpu, Some peak, Some io))
             | None -> Error(ProcessError.Io "failed to query Job Object accounting")
 
         member _.UpdateLimits(limits) =
@@ -547,8 +547,8 @@ type internal CgroupBackend(cgroupPath: string) =
                 )
             | Ok members ->
                 let active = List.length members
-                let cpu, peak = Native.Cgroup.cgroupStats cgroupPath
-                Ok(ProcessGroupStats(active, cpu, peak))
+                let cpu, peak, io = Native.Cgroup.cgroupStats cgroupPath
+                Ok(ProcessGroupStats(active, cpu, peak, io))
 
         member _.UpdateLimits(limits) =
             // Rewrite the cgroup's controller files in place (`memory.max`/`pids.max`/`cpu.max`/
@@ -775,7 +775,7 @@ type internal ProcessGroupBackend() =
 
         member _.Stats() =
             let active = children.Snapshot() |> List.filter stillOurs |> List.length
-            Ok(ProcessGroupStats(active, None, None))
+            Ok(ProcessGroupStats(active, None, None, None))
 
         member _.UpdateLimits(limits) =
             // The POSIX process-group mechanism has no whole-tree limit primitive to update — the exact

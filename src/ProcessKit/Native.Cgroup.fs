@@ -634,9 +634,76 @@ module internal Cgroup =
         with ex ->
             Error ex.Message
 
-    /// cgroup accounting for `stats`: cumulative CPU (cpu.stat `usage_usec`) and peak memory
-    /// (`memory.peak`), each `None` when the file is absent.
-    let cgroupStats (cgroupPath: string) : TimeSpan option * int64 option =
+    let private cgroupIoCounters (cgroupPath: string) : ProcessIoCounters option =
+        try
+            let mutable readBytes = 0L
+            let mutable writeBytes = 0L
+            let mutable readOperations = 0L
+            let mutable writeOperations = 0L
+            let mutable malformed = false
+
+            let addSaturated current value =
+                if value > Int64.MaxValue - current then
+                    Int64.MaxValue
+                else
+                    current + value
+
+            let content = File.ReadAllText(Path.Combine(cgroupPath, "io.stat"))
+            let mutable cursor = 0
+
+            while cursor < content.Length do
+                while cursor < content.Length && Char.IsWhiteSpace content[cursor] do
+                    cursor <- cursor + 1
+
+                let tokenStart = cursor
+
+                while cursor < content.Length && not (Char.IsWhiteSpace content[cursor]) do
+                    cursor <- cursor + 1
+
+                let mutable separator = tokenStart
+
+                while separator < cursor && content[separator] <> '=' do
+                    separator <- separator + 1
+
+                if separator > tokenStart && separator < cursor then
+                    let name = content.AsSpan(tokenStart, separator - tokenStart)
+                    let valueText = content.AsSpan(separator + 1, cursor - separator - 1)
+
+                    match Int64.TryParse valueText with
+                    | true, value when value >= 0L ->
+                        if name.SequenceEqual "rbytes" then
+                            readBytes <- addSaturated readBytes value
+                        elif name.SequenceEqual "wbytes" then
+                            writeBytes <- addSaturated writeBytes value
+                        elif name.SequenceEqual "rios" then
+                            readOperations <- addSaturated readOperations value
+                        elif name.SequenceEqual "wios" then
+                            writeOperations <- addSaturated writeOperations value
+                    | _ when
+                        name.SequenceEqual "rbytes"
+                        || name.SequenceEqual "wbytes"
+                        || name.SequenceEqual "rios"
+                        || name.SequenceEqual "wios"
+                        ->
+                        malformed <- true
+                    | _ -> ()
+
+            if malformed then
+                None
+            else
+                Some
+                    { ReadBytes = readBytes
+                      WriteBytes = writeBytes
+                      ReadOperations = readOperations
+                      WriteOperations = writeOperations }
+        with _ ->
+            // io.stat is an optional controller file and can also disappear with a concurrently removed
+            // cgroup; either case means the I/O metric is unavailable, while the other stats stay valid.
+            None
+
+    /// cgroup accounting for `stats`: cumulative CPU (`cpu.stat` `usage_usec`), peak memory
+    /// (`memory.peak`), and aggregate block I/O (`io.stat`), each `None` when its file is unavailable.
+    let cgroupStats (cgroupPath: string) : TimeSpan option * int64 option * ProcessIoCounters option =
         let cpu =
             try
                 File.ReadAllLines(Path.Combine(cgroupPath, "cpu.stat"))
@@ -658,7 +725,7 @@ module internal Cgroup =
             with _ ->
                 None
 
-        cpu, memory
+        cpu, memory, cgroupIoCounters cgroupPath
 
     /// Remove a (drained) cgroup directory. Best-effort cleanup.
     let removeCgroup (cgroupPath: string) =

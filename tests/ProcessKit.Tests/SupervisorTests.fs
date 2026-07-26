@@ -95,6 +95,7 @@ module private SessionTestHelpers =
               StartKill = startKill
               GracefulKill = graceful
               ResizePty = None
+              TreeStats = None
               Teardown =
                 fun () ->
                     stdout.Dispose()

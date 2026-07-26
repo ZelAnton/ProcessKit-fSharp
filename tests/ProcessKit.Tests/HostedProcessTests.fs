@@ -69,6 +69,7 @@ type private BlockingRunner() =
                             finished.TrySetResult(Outcome.Signalled None) |> ignore
                             Task.CompletedTask
                       ResizePty = None
+                      TreeStats = None
                       Teardown =
                         fun () ->
                             stdout.Dispose()
@@ -132,6 +133,7 @@ type private LateFaultingStopRunner() =
                             }
                             :> Task
                       ResizePty = None
+                      TreeStats = None
                       Teardown =
                         fun () ->
                             stdout.Dispose()
@@ -222,6 +224,7 @@ type private SlowSpawnRunner() =
                             finished.TrySetResult(Outcome.Signalled None) |> ignore
                             Task.CompletedTask
                       ResizePty = None
+                      TreeStats = None
                       Teardown =
                         fun () ->
                             stdout.Dispose()
@@ -283,6 +286,7 @@ type private CrashThenBackoffRunner() =
                             finished.TrySetResult(Outcome.Signalled None) |> ignore
                             Task.CompletedTask
                       ResizePty = None
+                      TreeStats = None
                       Teardown =
                         fun () ->
                             stdout.Dispose()

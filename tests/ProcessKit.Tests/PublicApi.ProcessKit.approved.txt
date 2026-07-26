@@ -785,6 +785,10 @@ class ProcessKit.ProcessGroupOptions
 
 class ProcessKit.ProcessGroupStats
   property ActiveProcessCount : System.Int32 { get }
+  property IoReadBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property IoReadOperations : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property IoWriteBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property IoWriteOperations : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property TotalCpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
 
@@ -1006,6 +1010,10 @@ class ProcessKit.RunProfile
   property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
   property Duration : System.TimeSpan { get }
   property ExitCode : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property IoReadBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property IoReadOperations : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property IoWriteBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property IoWriteOperations : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property Outcome : ProcessKit.Outcome { get }
   property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property Samples : System.Int32 { get }

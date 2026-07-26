@@ -374,6 +374,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                          killWhenLive (fun () -> backend.KillChild spawned)
                          Task.CompletedTask))
               ResizePty = resizePty
+              TreeStats =
+                if ownsGroup then
+                    Some(fun () ->
+                        match this.Stats() with
+                        | Ok stats -> Some stats
+                        | Error _ -> None)
+                else
+                    None
               Teardown =
                 fun () ->
                     // Stop the stdin feeder first: cancelling its lifecycle token unblocks a feed parked
@@ -690,8 +698,8 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                 Error error)
 
     /// A snapshot of the group's resource usage. On Windows this reads the Job Object's accounting
-    /// (CPU + peak committed memory + active count); on cgroup v2 the cgroup accounting; on the POSIX
-    /// fallback only the live group count (CPU/memory are `None`). Errors once the group is released.
+    /// (CPU + peak committed memory + I/O + active count); on cgroup v2 it reads the cgroup accounting;
+    /// on the POSIX fallback only the live group count is available. Errors once the group is released.
     member this.Stats() : Result<ProcessGroupStats, ProcessError> =
         this.WhenLive(fun () -> backend.Stats())
 

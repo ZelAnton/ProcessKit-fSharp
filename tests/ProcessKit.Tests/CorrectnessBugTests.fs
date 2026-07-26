@@ -199,6 +199,7 @@ type CorrectnessBugTests() =
           StartKill = ignore
           GracefulKill = fun _ -> Task.CompletedTask
           ResizePty = None
+          TreeStats = None
           Teardown = fun () -> ValueTask() }
 
     let shell (script: string) =
@@ -392,6 +393,7 @@ type CorrectnessBugTests() =
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
                   ResizePty = None
+                  TreeStats = None
                   Teardown = fun () -> ValueTask() }
 
             use running = new RunningProcess(host)
@@ -452,6 +454,7 @@ type CorrectnessBugTests() =
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
                   ResizePty = None
+                  TreeStats = None
                   Teardown = fun () -> ValueTask() }
 
             use running = new RunningProcess(host)

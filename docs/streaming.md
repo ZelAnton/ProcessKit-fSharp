@@ -874,6 +874,7 @@ task {
 
         printfn $"exit={profile.ExitCode} wall={profile.Duration} samples={profile.Samples}"
         printfn $"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpuCores}"
+        printfn $"read={profile.IoReadBytes} write={profile.IoWriteBytes}"
 }
 ```
 
@@ -890,19 +891,23 @@ var profile = await proc.ProfileAsync(TimeSpan.FromMilliseconds(100));
 
 Console.WriteLine($"exit={profile.ExitCode} wall={profile.Duration} samples={profile.Samples}");
 Console.WriteLine($"cpu={profile.CpuTime} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpuCores}");
+Console.WriteLine($"read={profile.IoReadBytes} write={profile.IoWriteBytes}");
 ```
 
 `ProfileAsync()` with no argument uses a default sampling interval; `ProfileAsync(interval)`
 samples at the cadence you pick. The resulting `RunProfile` exposes `ExitCode`,
 `Duration` (wall clock), `CpuTime` (user + kernel), `PeakMemoryBytes`, the number of
 `Samples` taken, and `AvgCpuCores` — CPU time over wall time, so a value near `1.7` means
-roughly 1.7 cores were busy on average.
+roughly 1.7 cores were busy on average. `IoReadBytes`, `IoWriteBytes`,
+`IoReadOperations`, and `IoWriteOperations` report the whole private containment tree
+when one is attributable to this run (currently the per-run Windows Job Object).
 
-These figures describe the started child, not a whole tree — for the tree's
-aggregate use `ProcessGroup.Stats` / `SampleStatsAsync` ([Process groups](process-groups.md)).
-Availability follows the platform: full CPU and memory on Windows and the Linux
-cgroup backend, and `None` where the kernel doesn't account per-process cheaply — see
-[Platform support](platform-support.md).
+CPU and memory describe the started child; the I/O counters describe its private tree.
+A run started inside a shared `ProcessGroup` leaves profile I/O as `None`, because the
+group aggregate also includes siblings. That includes Linux cgroup v2: sample its
+`io.stat` aggregate explicitly through `ProcessGroup.Stats` / `SampleStatsAsync`
+([Process groups](process-groups.md)). See the [platform matrix](platform-support.md#process-groups)
+for availability.
 
 ---
 

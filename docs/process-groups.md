@@ -873,7 +873,7 @@ resource usage, wrapped in a `Result`:
 ```fsharp
 match group.Stats() with
 | Ok stats ->
-    printfn $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}"
+    printfn $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} read={stats.IoReadBytes} write={stats.IoWriteBytes}"
 | Error err -> eprintfn $"{err.Message}"
 ```
 
@@ -882,17 +882,18 @@ match group.Stats() with
 ```csharp
 Console.WriteLine((group.Stats()) switch
 {
-    { IsOk: true, ResultValue: var stats } => $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} peak={stats.PeakMemoryBytes}",
+    { IsOk: true, ResultValue: var stats } => $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} read={stats.IoReadBytes} write={stats.IoWriteBytes}",
     { IsOk: false, ErrorValue: var err }  => err.Message,
 });
 ```
 
 `ProcessGroupStats` carries `ActiveProcessCount` (an `int`, always populated),
-`TotalCpuTime` (`TimeSpan option`), and `PeakMemoryBytes` (`int64 option`). CPU
-time and peak memory are available where the kernel accounts for the whole tree —
-**Windows** (Job Object accounting) and the **Linux cgroup v2** backend; on the
-**POSIX process-group** backend only the live count is reported and the two
-`option` fields stay `None`.
+`TotalCpuTime` (`TimeSpan option`), `PeakMemoryBytes` (`int64 option`), and four
+`int64 option` I/O counters: `IoReadBytes`, `IoWriteBytes`, `IoReadOperations`, and
+`IoWriteOperations`. Windows Job Object accounting and Linux cgroup v2 provide the
+tree aggregates (cgroup bytes/operations come from block-device `io.stat` when the
+I/O controller is delegated to that hierarchy). On the POSIX process-group backend
+only the live count is reported and all optional metrics stay `None`.
 
 `SampleStatsAsync(interval)` turns the snapshot into a periodic series as an
 `IAsyncEnumerable<ProcessGroupStats>` — the first sample immediately, then one per
@@ -930,8 +931,9 @@ background task, so it neither keeps the group alive nor leaks if you abandon it
 The series ends on the first snapshot the group can no longer report (notably once
 the group has been torn down) or when the enumerator's token fires.
 
-For a *single run's* end-to-end summary (exit code, duration, CPU, peak memory)
-rather than a live group series, use `RunningProcess.Profile` — see
+For a *single run's* end-to-end summary (exit code, duration, CPU, peak memory, and
+private-tree I/O where available) rather than a live group series, use
+`RunningProcess.ProfileAsync` — see
 [streaming.md](streaming.md).
 
 ---

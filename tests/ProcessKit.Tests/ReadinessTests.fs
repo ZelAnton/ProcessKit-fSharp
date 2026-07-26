@@ -68,6 +68,7 @@ type ReadinessTests() =
               StartKill = ignore
               GracefulKill = fun _ -> Task.CompletedTask
               ResizePty = None
+              TreeStats = None
               Teardown = fun () -> ValueTask() }
 
         new RunningProcess(host), stdoutPipe.Writer.AsStream(), stderrPipe.Writer.AsStream()
@@ -203,6 +204,7 @@ type ReadinessTests() =
               StartKill = ignore
               GracefulKill = fun _ -> Task.CompletedTask
               ResizePty = None
+              TreeStats = None
               Teardown = fun () -> ValueTask() }
 
         new RunningProcess(host)

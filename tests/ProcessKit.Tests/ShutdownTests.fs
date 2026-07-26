@@ -50,7 +50,10 @@ type private GracefulFaultBackend() =
         member _.Signal(_signal) = Ok()
         member _.Suspend() = Ok()
         member _.Resume() = Ok()
-        member _.Stats() = Ok(ProcessGroupStats(0, None, None))
+
+        member _.Stats() =
+            Ok(ProcessGroupStats(0, None, None, None))
+
         member _.UpdateLimits(_limits) = Ok()
 
         member _.HardRelease() =

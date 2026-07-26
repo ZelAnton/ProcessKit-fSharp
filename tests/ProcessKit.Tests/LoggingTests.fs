@@ -142,6 +142,7 @@ type LoggingTests() =
           StartKill = ignore
           GracefulKill = fun _ -> Task.CompletedTask
           ResizePty = None
+          TreeStats = None
           Teardown = fun () -> ValueTask() }
 
     let memoryStream (text: string) : Stream =

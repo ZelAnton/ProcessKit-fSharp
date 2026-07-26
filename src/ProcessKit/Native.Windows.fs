@@ -1076,7 +1076,7 @@ module internal Windows =
     // Job-Object accounting for `stats`: cumulative CPU + active count (basic accounting) and peak
     // committed memory (extended limit info).
     [<Literal>]
-    let private JobObjectBasicAccountingInformation = 1
+    let private JobObjectBasicAndIoAccountingInformation = 8
 
     [<StructLayout(LayoutKind.Sequential)>]
     type private JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
@@ -1091,11 +1091,18 @@ module internal Windows =
             val mutable TotalTerminatedProcesses: uint32
         end
 
-    /// Snapshot a Job's accounting: `(activeProcesses, totalCpuTime, peakCommittedBytes)`. `None` if
-    /// either query fails (e.g. the job handle was closed). CPU is user + kernel (100ns units, the
-    /// same as a `TimeSpan` tick).
-    let jobStatsWindows (job: nativeint) : (int * TimeSpan * int64) option =
-        let accSize = Marshal.SizeOf<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>()
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION =
+        struct
+            val mutable BasicInfo: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+            val mutable IoInfo: IO_COUNTERS
+        end
+
+    /// Snapshot a Job's accounting: active processes, total CPU, peak committed memory, and cumulative
+    /// read/write I/O counters. `None` if either query fails (e.g. the job handle was closed). CPU is
+    /// user + kernel (100ns units, the same as a `TimeSpan` tick).
+    let jobStatsWindows (job: nativeint) : (int * TimeSpan * int64 * ProcessIoCounters) option =
+        let accSize = Marshal.SizeOf<JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION>()
         let extSize = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()
         let accBuffer = Marshal.AllocHGlobal accSize
         let extBuffer = Marshal.AllocHGlobal extSize
@@ -1106,7 +1113,7 @@ module internal Windows =
             let okAcc =
                 QueryInformationJobObject(
                     job,
-                    JobObjectBasicAccountingInformation,
+                    JobObjectBasicAndIoAccountingInformation,
                     accBuffer,
                     uint32 accSize,
                     &returnLength
@@ -1126,12 +1133,27 @@ module internal Windows =
                 // which is `[<RequiresDynamicCode>]` — its marshalling stub for an arbitrary runtime Type
                 // can't be generated ahead of time, so it warns under NativeAOT). The generic form has the
                 // concrete struct baked in at compile time and is trim/AOT-clean.
-                let acc = Marshal.PtrToStructure<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION> accBuffer
+                let acc =
+                    Marshal.PtrToStructure<JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION> accBuffer
 
                 let ext = Marshal.PtrToStructure<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> extBuffer
 
-                let cpu = TimeSpan.FromTicks(acc.TotalUserTime + acc.TotalKernelTime)
-                Some(int acc.ActiveProcesses, cpu, int64 ext.PeakJobMemoryUsed)
+                let cpu =
+                    TimeSpan.FromTicks(acc.BasicInfo.TotalUserTime + acc.BasicInfo.TotalKernelTime)
+
+                let count (value: uint64) =
+                    if value > uint64 Int64.MaxValue then
+                        Int64.MaxValue
+                    else
+                        int64 value
+
+                let io =
+                    { ReadBytes = count acc.IoInfo.ReadTransferCount
+                      WriteBytes = count acc.IoInfo.WriteTransferCount
+                      ReadOperations = count acc.IoInfo.ReadOperationCount
+                      WriteOperations = count acc.IoInfo.WriteOperationCount }
+
+                Some(int acc.BasicInfo.ActiveProcesses, cpu, int64 ext.PeakJobMemoryUsed, io)
             else
                 None
         finally
@@ -1145,7 +1167,7 @@ module internal Windows =
     /// tree running.
     let jobTreeAliveWindows (job: nativeint) : bool =
         match jobStatsWindows job with
-        | Some(active, _, _) -> active > 0
+        | Some(active, _, _, _) -> active > 0
         | None -> true
 
     // ----------------------------------------------------------------------------------

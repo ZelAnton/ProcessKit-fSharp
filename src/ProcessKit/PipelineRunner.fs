@@ -1136,6 +1136,7 @@ module internal PipelineRunner =
                               StartKill = killTreeGated
                               GracefulKill = gracefulKillGated
                               ResizePty = None
+                              TreeStats = None
                               Teardown =
                                 fun () ->
                                     let shouldRun =

@@ -59,6 +59,9 @@ type internal RunningHost =
         /// `RunningProcess.ResizeAsync`, which returns a typed `ProcessError.Unsupported` when it is
         /// `None` (a non-PTY run — D6). A pure resize: it never touches the exit-wait/consumption state.
         ResizePty: (int * int -> Result<unit, ProcessError>) option
+        /// Whole-tree stats for a run that owns a private containment group. Shared runs leave this
+        /// `None`: the group's counters include siblings and must not be attributed to one profile.
+        TreeStats: (unit -> ProcessGroupStats option) option
         /// Reap the tree and release the container.
         Teardown: unit -> ValueTask
     }
@@ -1357,8 +1360,10 @@ type RunningProcess internal (host: RunningHost) =
             return outcome
         }
 
-    /// Run to completion while periodically sampling the child's CPU/memory every `interval`, and
-    /// return a `RunProfile`. Drains and discards output (like `WaitAsync`) and reaps the tree.
+    /// Run to completion while periodically sampling the child's CPU/memory and, where available, its
+    /// private containment tree's I/O every `interval`, then return a `RunProfile`. Drains and discards
+    /// output (like `WaitAsync`) and reaps the tree. A run in a shared group reports no I/O counters,
+    /// because the group's aggregate would include sibling runs.
     /// A non-positive `interval` (`<= TimeSpan.Zero`) is rejected with `ArgumentOutOfRangeException`
     /// — a sampling cadence must be a positive duration. Validated up front, before the pipes are
     /// claimed, so an invalid call neither consumes this one-shot handle nor starts a tight loop.
@@ -1376,7 +1381,16 @@ type RunningProcess internal (host: RunningHost) =
             let mutable samples = 0
             let mutable lastCpu = None
             let mutable peakMemory = None
+            let mutable lastIo = None
             use sampleCts = new CancellationTokenSource()
+
+            let sampleTreeIo () =
+                match host.TreeStats with
+                | Some stats ->
+                    match stats () with
+                    | Some snapshot -> snapshot.IoCounters |> Option.iter (fun counters -> lastIo <- Some counters)
+                    | None -> ()
+                | None -> ()
 
             let sampler =
                 task {
@@ -1397,6 +1411,8 @@ type RunningProcess internal (host: RunningHost) =
                                         )
                                 | None -> ()
                             | None -> ()
+
+                            sampleTreeIo ()
 
                             samples <- samples + 1
                             // Clamp so an over-long sampling period can't throw out of `Task.Delay`.
@@ -1437,8 +1453,12 @@ type RunningProcess internal (host: RunningHost) =
             match error with
             | Some ex -> return! Task.FromException<RunProfile> ex
             | None ->
+                // Job/cgroup accounting remains queryable after the child exits and is cumulative, so
+                // take one final snapshot before this private group is released. It closes the common
+                // short-run race where the child finishes between periodic ticks.
+                sampleTreeIo ()
                 conclude outcome
-                return RunProfile(outcome, elapsed (), lastCpu, peakMemory, samples)
+                return RunProfile(outcome, elapsed (), lastCpu, peakMemory, lastIo, samples)
         }
 
     /// `ProfileAsync` sampling every 100 ms.
@@ -1672,6 +1692,17 @@ type RunningProcess internal (host: RunningHost) =
                                     terminator
                                     tee
                                     (fun line ->
+                                        // Capture metadata at the framing boundary, before a user handler can
+                                        // block or mutate a deterministic TimeProvider. The two pumps share the
+                                        // atomic counter, so the number records which framed line reached this
+                                        // boundary first rather than which handler happened to return first.
+                                        let outputLine =
+                                            OutputLine(
+                                                line,
+                                                config.TimeProvider.GetUtcNow(),
+                                                Interlocked.Increment(&outputEventSequence)
+                                            )
+
                                         invokeLine onLine line
                                         bump ()
 
@@ -1680,13 +1711,7 @@ type RunningProcess internal (host: RunningHost) =
                                             eventChannel.Reader
                                             countSoFar
                                             bumpDroppedStreamLine
-                                            (wrap (
-                                                OutputLine(
-                                                    line,
-                                                    config.TimeProvider.GetUtcNow(),
-                                                    Interlocked.Increment(&outputEventSequence)
-                                                )
-                                            )))
+                                            (wrap outputLine))
                                     None
                                     (fun () -> disposalCts.Token.IsCancellationRequested)
                         with ex ->

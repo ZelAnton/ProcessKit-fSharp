@@ -26,6 +26,15 @@ type private FixedTimeProvider(timestampUtc: DateTimeOffset) =
 
     override _.GetUtcNow() = timestampUtc
 
+type private AdjustableTimeProvider(timestampUtc: DateTimeOffset) =
+    inherit TimeProvider()
+
+    let mutable current = timestampUtc
+
+    override _.GetUtcNow() = current
+
+    member _.SetUtcNow(value: DateTimeOffset) = current <- value
+
 /// Raw `getrlimit`/`setrlimit` access to `RLIMIT_NOFILE`, used ONLY by the T-028 regression test
 /// below (``spawnPosix fails instead of silently inheriting when open(/dev/null) fails``) to pin
 /// the test process's file-descriptor ceiling at an exact, deterministic point so a specific
@@ -221,6 +230,7 @@ type StreamingTests() =
               StartKill = ignore
               GracefulKill = fun _ -> Task.CompletedTask
               ResizePty = None
+              TreeStats = None
               Teardown = fun () -> ValueTask() }
 
         new RunningProcess(host)
@@ -248,6 +258,7 @@ type StreamingTests() =
               StartKill = ignore
               GracefulKill = fun _ -> Task.CompletedTask
               ResizePty = None
+              TreeStats = None
               Teardown = fun () -> ValueTask() }
 
         new RunningProcess(host)
@@ -524,6 +535,29 @@ type StreamingTests() =
                     | OutputEvent.Stderr line ->
                         Assert.That(line.TimestampUtc, Is.EqualTo event.TimestampUtc)
                         Assert.That(line.Sequence, Is.EqualTo event.Sequence))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputEvents captures metadata before invoking the line handler``() : Task =
+        let capturedAt = DateTimeOffset(2026, 7, 26, 12, 0, 0, TimeSpan.Zero)
+        let changedByHandler = capturedAt.AddHours 1.0
+        let timeProvider = AdjustableTimeProvider capturedAt
+
+        task {
+            let command =
+                shell "echo out"
+                |> Command.timeProvider timeProvider
+                |> Command.onStdoutLine (fun _ -> timeProvider.SetUtcNow changedByHandler)
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let! events = collect (running.OutputEventsAsync())
+                Assert.That(events, Has.Count.EqualTo 1)
+                Assert.That(events[0].TimestampUtc, Is.EqualTo capturedAt)
+                Assert.That(events[0].Sequence, Is.EqualTo 1L)
+                Assert.That(timeProvider.GetUtcNow(), Is.EqualTo changedByHandler)
         }
         :> Task
 
@@ -872,6 +906,7 @@ type StreamingTests() =
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
                   ResizePty = None
+                  TreeStats = None
                   Teardown =
                     fun () ->
                         teardowns <- teardowns + 1
@@ -957,6 +992,7 @@ type StreamingTests() =
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
                   ResizePty = None
+                  TreeStats = None
                   Teardown = fun () -> ValueTask() }
 
             let profile =
@@ -1617,6 +1653,7 @@ type StreamingTests() =
                   StartKill = ignore
                   GracefulKill = fun _ -> Task.CompletedTask
                   ResizePty = None
+                  TreeStats = None
                   Teardown = fun () -> ValueTask() }
 
             use running = new RunningProcess(host)

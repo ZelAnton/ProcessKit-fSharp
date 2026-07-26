@@ -234,6 +234,7 @@ type FakeProcess
                         recorder.Record(cols, rows)
                         Ok())
                 | None -> None
+              TreeStats = None
               Teardown =
                 fun () ->
                     stdoutStream |> Option.iter (fun s -> s.Dispose())
