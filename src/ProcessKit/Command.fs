@@ -108,9 +108,9 @@ type internal CommandConfig =
       // The encoding for text sent through `Stdin.FromString`/`FromLines`/`FromAsyncLines` and an
       // interactive `ProcessStdin.WriteLineAsync`. Raw-byte stdin remains byte-exact.
       StdinEncoding: Encoding
-      // The clock and timer source for retry delays, readiness probes, and supervision. The system
-      // provider is the ordinary production default; callers can supply a deterministic provider for
-      // tests without changing global time.
+      // The clock and timer source for retry delays, readiness probes, PtySession pattern deadlines,
+      // and supervision. The system provider is the ordinary production default; callers can supply a
+      // deterministic provider for tests without changing global time.
       TimeProvider: TimeProvider
       StdoutMode: StdioMode
       StderrMode: StdioMode
@@ -874,9 +874,9 @@ type Command internal (config: CommandConfig) =
 
         Command({ config with StdinEncoding = encoding })
 
-    /// Use `timeProvider` for retry delays, readiness probes, and supervision. The default is
-    /// `TimeProvider.System`; supplying a deterministic provider makes those time-dependent paths
-    /// testable without changing process-wide time.
+    /// Use `timeProvider` for retry delays, readiness probes, `PtySession` pattern deadlines, and
+    /// supervision. The default is `TimeProvider.System`; supplying a deterministic provider makes
+    /// those time-dependent paths testable without changing process-wide time.
     member _.TimeProvider(timeProvider: TimeProvider) =
         ArgumentNullException.ThrowIfNull timeProvider
 
@@ -1470,7 +1470,7 @@ module Command =
     /// Encode text sent to stdin with `encoding`.
     let stdinEncoding (enc: Encoding) (command: Command) = command.StdinEncoding enc
 
-    /// Use `timeProvider` for retry delays, readiness probes, and supervision.
+    /// Use `timeProvider` for retry delays, readiness probes, `PtySession` pattern deadlines, and supervision.
     let timeProvider (provider: TimeProvider) (command: Command) = command.TimeProvider provider
 
     /// Decode captured stderr with `encoding`.

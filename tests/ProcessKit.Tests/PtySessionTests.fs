@@ -15,6 +15,44 @@ open NUnit.Framework
 open ProcessKit
 open ProcessKit.Testing
 
+type private ManualTimer(callback: TimerCallback, state: obj | null) =
+    let mutable disposed = 0
+
+    member _.Fire() =
+        if Volatile.Read(&disposed) = 0 then
+            callback.Invoke state
+
+    interface ITimer with
+        member _.Change(_dueTime, _period) = Volatile.Read(&disposed) = 0
+
+        member _.Dispose() =
+            Interlocked.Exchange(&disposed, 1) |> ignore
+
+        member _.DisposeAsync() =
+            Interlocked.Exchange(&disposed, 1) |> ignore
+            ValueTask()
+
+type private ManualTimerProvider() =
+    inherit TimeProvider()
+
+    let gate = obj ()
+    let timers = ResizeArray<ManualTimer>()
+
+    let timerCreated =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    override _.CreateTimer(callback, state, _dueTime, _period) =
+        let timer = new ManualTimer(callback, state)
+        lock gate (fun () -> timers.Add timer)
+        timerCreated.TrySetResult() |> ignore
+        timer :> ITimer
+
+    member _.TimerCreated = timerCreated.Task
+
+    member _.FireAll() =
+        let snapshot = lock gate (fun () -> timers.ToArray())
+        snapshot |> Array.iter (fun timer -> timer.Fire())
+
 /// Tests for the expect-style interaction layer (`PtySession`, T-226): waiting for a pattern in the
 /// child's RAW merged terminal output — a prompt such as `Password: ` carries no line terminator, so it
 /// is exactly what the line-framed `WaitForLineAsync` cannot see — sending input back through the
@@ -254,6 +292,32 @@ type PtySessionTests() =
                     Assert.That(reported, Is.EqualTo(TimeSpan.FromMilliseconds 200.0))
                 | Error other -> Assert.Fail $"expected a second independent NotReady, got {other}"
                 | Ok _ -> Assert.Fail "nothing should have matched the second pattern either"
+        }
+
+    [<Test>]
+    member _.``an expect deadline uses the command TimeProvider``() : Task =
+        task {
+            let provider = ManualTimerProvider()
+
+            let command = silentSleeper () |> Command.timeProvider provider
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"spawn failed: {error}"
+            | Ok running ->
+                use running = running
+                Assert.That(running.Config.TimeProvider, Is.SameAs provider)
+                let session = PtySession running
+                let budget = TimeSpan.FromHours 1.0
+                let pending = session.ExpectAsync("this-never-arrives", budget)
+
+                Assert.That(pending.IsCompleted, Is.False)
+                do! provider.TimerCreated.WaitAsync(TimeSpan.FromSeconds 2.0)
+                provider.FireAll()
+
+                match! pending.WaitAsync(TimeSpan.FromSeconds 2.0) with
+                | Error(ProcessError.NotReady(_, reported)) -> Assert.That(reported, Is.EqualTo budget)
+                | Error other -> Assert.Fail $"expected ProcessError.NotReady, got {other}"
+                | Ok matched -> Assert.Fail $"nothing should have matched, got {matched.Text}"
         }
 
     [<Test>]

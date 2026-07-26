@@ -182,7 +182,7 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
             // CLAMPED value in `NotReady` — the same rule `WaitForLineAsync`/`ReadinessProbe` follow, so
             // a reported budget is always the one actually enforced.
             let armed = Timeouts.clampArmable timeout
-            use deadline = new CancellationTokenSource(armed)
+            use deadline = new CancellationTokenSource(armed, config.TimeProvider)
 
             use linked =
                 CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, cancellationToken)

@@ -222,6 +222,10 @@ Console.WriteLine(await session.WaitForExitAsync());
 the same contract. Matching runs over the unframed session view rather than one line, so `^`/`$`
 anchor to the window unless you pass `RegexOptions.Multiline`.
 
+Each pattern deadline uses the command's `TimeProvider` (`TimeProvider.System` by default), just like
+`WaitForLineAsync`. Attach a deterministic provider with `Command.TimeProvider(provider)` /
+`Command.timeProvider provider` when a test should advance an expect timeout without sleeping.
+
 ### What the session owns
 
 - **The output pipes.** Creating a session claims the handle exactly like `OutputEventsAsync` does, so
