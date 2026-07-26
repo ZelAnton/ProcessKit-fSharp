@@ -64,7 +64,7 @@ restated so this document is self-contained:
 | D2 | Config shape | A `Pty: PtyConfig option` on `CommandConfig` (`None` = off), carrying initial size + flags — not a bare bool, unlike `MergeStderr`/`Setsid`, because a PTY needs parameters. |
 | D3 | Output model | A PTY gives the child **one** terminal, so stdout+stderr are physically **one merged stream** at the OS level. PTY therefore *implies* merge semantics; `OutputEvent.Stderr` is never produced under PTY. |
 | D4 | Separate-stderr observers | Rejected up front (`ArgumentException`) when combined with `Pty`, reusing the existing `ensureNoMergeStderr` guard family — there is no separate stderr stream to observe. |
-| D5 | VT/ANSI sequences | **Preserved verbatim.** ProcessKit never strips or interprets escape sequences; captured output is the raw pty byte stream decoded per the configured encoding. |
+| D5 | VT/ANSI sequences | **Preserved by default.** Captured output and byte tees stay raw; `PtySession.WithAnsiFiltering(...)` can remove controls from its matching window and transcript. |
 | D6 | Resize | New `RunningProcess.ResizeAsync(cols, rows)` → `Task<Result<unit, ProcessError>>`; `ResizePseudoConsole` (Windows) / `TIOCSWINSZ`+`SIGWINCH` (POSIX). On a non-PTY run: typed `ProcessError.Unsupported`. |
 | D7 | Containment | **Unchanged guarantee.** PTY changes stdio wiring only. Windows: the Job is attached in the *same* `STARTUPINFOEX` attribute list as the pseudoconsole. POSIX: the pty controlling-tty setup rides the existing helper-launcher pattern; the pgid/cgroup model is untouched. |
 | D8 | `Setsid` interaction (POSIX) | **Mutually exclusive.** `Setsid` = new session with *no* controlling tty; `Pty` = new session *with* a controlling pty. Combining them is contradictory → `ArgumentException`. |
@@ -226,10 +226,9 @@ member RunningProcess.ResizeAsync :
     OS genuinely did not distinguish them.
   - `StdoutLinesAsync` (`:934`) streams the merged lines. This is the natural, already-correct
     behaviour of the existing merge path — PTY reuses it rather than inventing a parallel one.
-- **VT/ANSI preserved verbatim (D5).** ProcessKit does not strip, interpret, or "cook" escape
-  sequences — captured bytes are exactly what the child wrote, decoded per encoding. A consumer that
-  wants clean text strips VT itself; a consumer driving a TUI wants the raw sequences. Documented so
-  a `WaitForLineAsync` predicate author knows a prompt line may carry cursor/color escapes.
+- **VT/ANSI preserved by default (D5).** Capture and byte tees do not strip, interpret, or "cook"
+  escape sequences. The expect-style layer offers an explicit `PtySession.WithAnsiFiltering(...)`
+  view for stable prompt matching and readable transcripts; it does not alter the underlying stream.
 - **Newline translation.** A pty applies `ONLCR` (`\n` → `\r\n`) on output by default. The existing
   line-terminator normalization (`src/ProcessKit/LineTerminator.fs`, consumed by `Pump`) already
   strips `\r\n`, so `StdoutLinesAsync` lines come through terminator-clean without special-casing —

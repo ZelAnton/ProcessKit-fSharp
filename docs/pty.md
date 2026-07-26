@@ -219,8 +219,8 @@ Console.WriteLine(await session.WaitForExitAsync());
 ```
 
 `ExpectAsync` also takes a `Regex` for a prompt that varies (`new Regex(@"psql \(\d+\.\d+\)")`), with
-the same contract. Matching runs over raw terminal text rather than one line, so `^`/`$` anchor to the
-window unless you pass `RegexOptions.Multiline`.
+the same contract. Matching runs over the unframed session view rather than one line, so `^`/`$`
+anchor to the window unless you pass `RegexOptions.Multiline`.
 
 ### What the session owns
 
@@ -244,6 +244,27 @@ with `PtySessionOptions.LineEnding` for a child that wants something else. Becau
 Interaction works against a plain (non-PTY) run too, but the child decides whether a prompt is ever
 visible: without a terminal most programs switch stdout to block buffering and the prompt stays in the
 child's own buffer — which is exactly what `Command.Pty` is for.
+
+### ANSI/VT-decorated prompts
+
+Terminal programs often decorate prompts with colour (CSI sequences) or emit OSC title/hyperlink
+controls. The ordinary `PtySession` constructors preserve that raw terminal text. Opt into a cleaned
+session when patterns and diagnostics should see only visible text:
+
+```fsharp
+let session = PtySession.WithAnsiFiltering proc
+let! prompt = session.ExpectAsync("Password: ", TimeSpan.FromSeconds 30.0)
+```
+
+```csharp
+var session = PtySession.WithAnsiFiltering(proc);
+var prompt = await session.ExpectAsync("Password: ", TimeSpan.FromSeconds(30));
+```
+
+Filtering applies consistently to matching, `Pending`, and `Transcript`. It is incremental, so CSI,
+OSC (BEL or ST terminated), and single-ESC controls are removed even when a read boundary lands inside
+the sequence. The byte-exact `Command.StdoutTee`/`StderrTee` sinks remain raw. The same factory works
+with `FakeProcess.WithPty()`, which lets tests exercise the cleaned conversation without a real PTY.
 
 ### Secrets in a transcript
 

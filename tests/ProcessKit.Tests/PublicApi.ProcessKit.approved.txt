@@ -907,6 +907,8 @@ class ProcessKit.PtySession
   property Transcript : System.String { get }
   property TranscriptTruncated : System.Boolean { get }
   property WindowTruncated : System.Boolean { get }
+  static member WithAnsiFiltering(ProcessKit.RunningProcess) : ProcessKit.PtySession
+  static member WithAnsiFiltering(ProcessKit.RunningProcess, ProcessKit.PtySessionOptions) : ProcessKit.PtySession
 
 class ProcessKit.PtySessionOptions
   :> System.Collections.IStructuralEquatable

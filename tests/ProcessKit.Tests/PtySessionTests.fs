@@ -9,6 +9,8 @@ open System.Text
 open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
+open FsCheck
+open FsCheck.FSharp
 open NUnit.Framework
 open ProcessKit
 open ProcessKit.Testing
@@ -60,6 +62,21 @@ type PtySessionTests() =
         match text.IndexOf(pattern, StringComparison.Ordinal) with
         | -1 -> None
         | index -> Some(index, pattern.Length)
+
+    let filterAnsi (text: string) (chunkSizes: int list) =
+        let filter = AnsiEscapeFilter()
+        let output = StringBuilder()
+        let sizes = List.toArray chunkSizes
+        let mutable offset = 0
+        let mutable chunk = 0
+
+        while offset < text.Length do
+            let count = min sizes[chunk % sizes.Length] (text.Length - offset)
+            filter.Append(text.AsSpan(offset, count), output)
+            offset <- offset + count
+            chunk <- chunk + 1
+
+        output.ToString()
 
     // ----------------------------------------------------------------------------------
     // Pattern waiting + sending, against the PTY double
@@ -124,6 +141,54 @@ type PtySessionTests() =
             | Ok matched -> Assert.That(matched.Text, Is.EqualTo "answer=42")
             | Error error -> Assert.Fail $"the text after the regex match should still be pending: {error}"
         }
+
+    [<Test>]
+    member _.``ANSI filtering makes styled prompts matchable and cleans the transcript``() : Task =
+        task {
+            let fake =
+                FakeProcess
+                    .Create("fake-colour-tool")
+                    .WithPty()
+                    .WithStdout("\u001b]0;installer\u0007\u001b[33mPassword:\u001b[0m ready\u001b7!\u001b8")
+
+            use running = fake.Build()
+            let session = PtySession.WithAnsiFiltering running
+
+            match! session.ExpectAsync("Password: ready!", TimeSpan.FromSeconds 10.0) with
+            | Ok matched -> Assert.That(matched.Text, Is.EqualTo "Password: ready!")
+            | Error error -> Assert.Fail $"the styled prompt should match without its controls: {error}"
+
+            let! _ = session.WaitForExitAsync()
+            Assert.That(session.Transcript, Is.EqualTo "Password: ready!")
+            Assert.That(session.Transcript.IndexOf('\u001b'), Is.EqualTo -1)
+        }
+
+    [<Test>]
+    member _.``the ordinary session keeps ANSI controls raw by default``() : Task =
+        task {
+            let raw = "\u001b[32mready> \u001b[0m"
+            let fake = FakeProcess.Create("fake-colour-tool").WithPty().WithStdout(raw)
+            use running = fake.Build()
+            let session = PtySession running
+            let! _ = session.WaitForExitAsync()
+            Assert.That(session.Transcript, Is.EqualTo raw)
+        }
+
+    [<Test>]
+    member _.``ANSI filtering is invariant under arbitrary chunk boundaries``() =
+        let input =
+            "head \u001b[1;31mred\u001b[0m "
+            + "\u001b]0;BEL title\u0007after "
+            + "\u001b]8;;https://example.test\u001b\\link\u001b]8;;\u001b\\ "
+            + "\u001b7saved\u001b8 done"
+
+        let expected = "head red after link saved done"
+        let chunks = Gen.nonEmptyListOf (Gen.choose (1, 12))
+
+        let property =
+            Prop.forAll (Arb.fromGen chunks) (fun chunkSizes -> filterAnsi input chunkSizes = expected)
+
+        Check.QuickThrowOnFailure property
 
     [<Test>]
     member _.``a send on a run with no interactive stdin is a typed Unsupported``() : Task =

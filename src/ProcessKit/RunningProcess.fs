@@ -104,10 +104,98 @@ type internal ExpectStep =
     /// fault that ended it (`Some ex`).
     | Ended of fault: exn option
 
+[<RequireQualifiedAccess>]
+type private AnsiFilterState =
+    | Text = 0
+    | Escape = 1
+    | EscapeIntermediate = 2
+    | Csi = 3
+    | Osc = 4
+    | OscEscape = 5
+    | ControlString = 6
+    | ControlStringEscape = 7
+
+/// Incrementally removes ANSI/VT control sequences from decoded terminal text. The mutable state is
+/// deliberately retained between calls because an escape sequence may straddle any read boundary.
+/// Visible characters are appended straight from the input span to the caller's builder, avoiding a
+/// temporary filtered string on every pump chunk.
+type internal AnsiEscapeFilter() =
+
+    let mutable state = AnsiFilterState.Text
+
+    member _.Append(input: ReadOnlySpan<char>, output: StringBuilder) =
+        for index = 0 to input.Length - 1 do
+            let ch = input[index]
+
+            match state with
+            | AnsiFilterState.Text ->
+                match ch with
+                | '\u001b' -> state <- AnsiFilterState.Escape
+                | '\u009b' -> state <- AnsiFilterState.Csi
+                | '\u009d' -> state <- AnsiFilterState.Osc
+                | '\u0090'
+                | '\u0098'
+                | '\u009e'
+                | '\u009f' -> state <- AnsiFilterState.ControlString
+                | '\u009c' -> ()
+                | _ -> output.Append ch |> ignore
+            | AnsiFilterState.Escape ->
+                match ch with
+                | '[' -> state <- AnsiFilterState.Csi
+                | ']' -> state <- AnsiFilterState.Osc
+                | 'P'
+                | 'X'
+                | '^'
+                | '_' -> state <- AnsiFilterState.ControlString
+                | '\u001b' -> state <- AnsiFilterState.Escape
+                | c when c >= '\u0020' && c <= '\u002f' -> state <- AnsiFilterState.EscapeIntermediate
+                | c when c >= '\u0030' && c <= '\u007e' -> state <- AnsiFilterState.Text
+                | _ ->
+                    state <- AnsiFilterState.Text
+                    output.Append ch |> ignore
+            | AnsiFilterState.EscapeIntermediate ->
+                match ch with
+                | '\u001b' -> state <- AnsiFilterState.Escape
+                | c when c >= '\u0020' && c <= '\u002f' -> ()
+                | c when c >= '\u0030' && c <= '\u007e' -> state <- AnsiFilterState.Text
+                | _ ->
+                    state <- AnsiFilterState.Text
+                    output.Append ch |> ignore
+            | AnsiFilterState.Csi ->
+                match ch with
+                | '\u001b' -> state <- AnsiFilterState.Escape
+                | c when c >= '\u0040' && c <= '\u007e' -> state <- AnsiFilterState.Text
+                | _ -> ()
+            | AnsiFilterState.Osc ->
+                match ch with
+                | '\u0007'
+                | '\u009c' -> state <- AnsiFilterState.Text
+                | '\u001b' -> state <- AnsiFilterState.OscEscape
+                | _ -> ()
+            | AnsiFilterState.OscEscape ->
+                match ch with
+                | '\\' -> state <- AnsiFilterState.Text
+                | '\u001b' -> ()
+                | '\u009c' -> state <- AnsiFilterState.Text
+                | _ -> state <- AnsiFilterState.Osc
+            | AnsiFilterState.ControlString ->
+                match ch with
+                | '\u009c' -> state <- AnsiFilterState.Text
+                | '\u001b' -> state <- AnsiFilterState.ControlStringEscape
+                | _ -> ()
+            | AnsiFilterState.ControlStringEscape ->
+                match ch with
+                | '\\'
+                | '\u009c' -> state <- AnsiFilterState.Text
+                | '\u001b' -> ()
+                | _ -> state <- AnsiFilterState.ControlString
+            | _ -> invalidOp "Unknown ANSI filter state"
+
 /// The shared state behind an interactive expect-style session (`PtySession`): a bounded sliding
-/// window of the child's raw merged output that pattern waits are matched against, plus the optional
-/// session transcript. Deliberately unframed — a terminal prompt (`Password: `, `> `) carries no line
-/// terminator, so the line pumps' framing is exactly what a pattern waiter must NOT go through.
+/// window of the child's merged output that pattern waits are matched against, plus the optional
+/// session transcript. The view is raw by default and ANSI-filtered for the explicit filtered-session
+/// factory. It is always unframed — a terminal prompt (`Password: `, `> `) carries no line terminator,
+/// so the line pumps' framing is exactly what a pattern waiter must NOT go through.
 ///
 /// Filled by the session's raw pumps (`Pump.readTextUntilDone`, one per piped stream) and drained by
 /// `TryConsume` on the caller's thread, so every operation runs under one `gate` — including a
@@ -168,6 +256,31 @@ type internal ExpectWindow(maxWindowChars: int, maxTranscriptChars: int option) 
                 | None -> ()
 
                 publish ())
+
+    /// Filter a freshly decoded chunk straight into both bounded buffers. Copying the newly appended
+    /// range between builders avoids allocating a second, cleaned string for each raw pump read.
+    member _.AppendFiltered(filter: AnsiEscapeFilter, text: string) =
+        if text.Length > 0 then
+            lock gate (fun () ->
+                let start = window.Length
+                filter.Append(text.AsSpan(), window)
+                let appended = window.Length - start
+
+                if appended > 0 then
+                    match maxTranscriptChars with
+                    | Some cap ->
+                        transcript.Append(window, start, appended) |> ignore
+
+                        if transcript.Length > cap then
+                            transcript.Remove(0, transcript.Length - cap) |> ignore
+                            transcriptTruncated <- true
+                    | None -> ()
+
+                    if window.Length > maxWindowChars then
+                        window.Remove(0, window.Length - maxWindowChars) |> ignore
+                        windowTruncated <- true
+
+                    publish ())
 
     /// Mark the child's output as ended — cleanly (`None`) or with a genuine read fault (`Some ex`) —
     /// and wake every waiter. Idempotent: the first completion wins, so a second reader finishing (or a
@@ -1670,7 +1783,7 @@ type RunningProcess internal (host: RunningHost) =
     // nothing to observe on this path — the byte-exact tees (`StdoutTee`/`StderrTee`) still do, and are
     // fed exactly as the line pumps feed them.
     member internal _.StartInteractiveSession
-        (windowChars: int, transcriptChars: int option)
+        (windowChars: int, transcriptChars: int option, filterAnsi: bool)
         : Result<ExpectWindow, ProcessError> =
         lock stateLock (fun () ->
             if consumption <> Consumption.Fresh then
@@ -1683,16 +1796,16 @@ type RunningProcess internal (host: RunningHost) =
                     match stream with
                     | None -> Task.CompletedTask
                     | Some s ->
+                        let append =
+                            if filterAnsi then
+                                let filter = AnsiEscapeFilter()
+                                fun text -> window.AppendFiltered(filter, text)
+                            else
+                                fun text -> window.Append text
+
                         task {
                             try
-                                do!
-                                    Pump.readTextUntilDone
-                                        s
-                                        encoding
-                                        tee
-                                        (fun text -> window.Append text)
-                                        isTearingDown
-                                        CancellationToken.None
+                                do! Pump.readTextUntilDone s encoding tee append isTearingDown CancellationToken.None
                             with ex ->
                                 // A genuine OS read fault is reclassified into `ProcessError.Io` (T-087)
                                 // before it reaches `Complete`/`interactiveOutcome` below.

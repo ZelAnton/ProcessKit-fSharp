@@ -119,7 +119,7 @@ type ExpectMatch internal (before: string, text: string) =
 /// arrives in the child's output stream and therefore in the transcript. For a credential exchange use
 /// `Echo = false` (POSIX), or turn `CaptureTranscript` off, or both.
 [<Sealed>]
-type PtySession(running: RunningProcess, options: PtySessionOptions) =
+type PtySession private (running: RunningProcess, options: PtySessionOptions, filterAnsi: bool) =
 
     do
         ArgumentNullException.ThrowIfNull(running, nameof running)
@@ -153,7 +153,7 @@ type PtySession(running: RunningProcess, options: PtySessionOptions) =
             else
                 None
 
-        match running.StartInteractiveSession(options.WindowChars, transcriptChars) with
+        match running.StartInteractiveSession(options.WindowChars, transcriptChars, filterAnsi) with
         | Ok w -> w
         | Error error -> raise (InvalidOperationException error.Message)
 
@@ -252,21 +252,35 @@ type PtySession(running: RunningProcess, options: PtySessionOptions) =
                 | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
             }
 
-    /// A session over `running` with the default tuning (`PtySessionOptions.Default`).
-    new(running: RunningProcess) = PtySession(running, PtySessionOptions.Default)
+    /// A raw-output session over `running` with explicit tuning. ANSI/VT escape sequences remain in
+    /// pattern matching, `Pending`, and `Transcript`; use `WithAnsiFiltering` to remove them.
+    new(running: RunningProcess, options: PtySessionOptions) = PtySession(running, options, false)
+
+    /// A raw-output session over `running` with the default tuning (`PtySessionOptions.Default`).
+    new(running: RunningProcess) = PtySession(running, PtySessionOptions.Default, false)
+
+    /// Create a session that removes ANSI/VT escape sequences before matching or retaining terminal
+    /// output. Filtering is incremental across read boundaries and covers CSI sequences, OSC strings
+    /// terminated by BEL or ST, and single ESC forms. Byte-exact output tees remain unfiltered.
+    static member WithAnsiFiltering(running: RunningProcess, options: PtySessionOptions) =
+        PtySession(running, options, true)
+
+    /// Create an ANSI-filtered session with the default tuning (`PtySessionOptions.Default`).
+    static member WithAnsiFiltering(running: RunningProcess) =
+        PtySession(running, PtySessionOptions.Default, true)
 
     /// Wait until `pattern` appears in the child's terminal output, or fail with `NotReady` after
     /// `timeout` — a budget for THIS pattern alone, entirely separate from the run-wide
     /// `Command.Timeout`/`IdleTimeout` (which kill the child; this one does not). `Cancelled` if
     /// `cancellationToken` fires first.
     ///
-    /// The match is an ordinal substring search over the raw, unframed window, so a prompt that never
-    /// ends its line (`Password: `) is found the moment it arrives. Note that a terminal ends its own
-    /// lines with `\r\n`: match on the prompt text itself rather than on a trailing `\n`. Everything up
-    /// to and including the match is consumed, so the next call starts after it; a pattern that has not
-    /// arrived by the deadline leaves the window untouched, so a longer retry still sees what did
-    /// arrive. `pattern` must be non-null and non-empty (an empty pattern matches everywhere and would
-    /// make a script silently pass).
+    /// The match is an ordinal substring search over the unframed session view (raw by default,
+    /// control-free from `WithAnsiFiltering`), so a prompt that never ends its line (`Password: `) is
+    /// found the moment it arrives. Note that a terminal ends its own lines with `\r\n`: match on the
+    /// prompt text itself rather than on a trailing `\n`. Everything up to and including the match is
+    /// consumed, so the next call starts after it; a pattern that has not arrived by the deadline leaves
+    /// the window untouched, so a longer retry still sees what did arrive. `pattern` must be non-null
+    /// and non-empty (an empty pattern matches everywhere and would make a script silently pass).
     ///
     /// Ends promptly with `NotReady` if the child's output ends first (it exited, or closed the
     /// terminal) rather than waiting out the whole `timeout`, and with `ProcessError.Io` if reading it
@@ -291,8 +305,8 @@ type PtySession(running: RunningProcess, options: PtySessionOptions) =
     /// form of the overload above, with the identical timeout, consumption, early-end, and error
     /// contract. The `Regex` is used exactly as given, including its own options and `MatchTimeout`.
     ///
-    /// Matching runs over a sliding window of raw terminal text, not over one line, so `^`/`$` anchor
-    /// against the window's bounds rather than the child's line structure unless you pass
+    /// Matching runs over the same sliding, unframed session view as the string overload, so `^`/`$`
+    /// anchor against the window's bounds rather than the child's line structure unless you pass
     /// `RegexOptions.Multiline`.
     member _.ExpectAsync
         (pattern: Regex, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
