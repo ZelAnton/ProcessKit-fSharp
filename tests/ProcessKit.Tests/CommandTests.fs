@@ -53,6 +53,49 @@ type CommandTests() =
         |> ignore
 
     [<Test>]
+    member _.``IdleTimeout rejects every destination combination with no parent-side output``() =
+        let idle = TimeSpan.FromSeconds 5.0
+
+        let assertRejected (configure: Command -> Command) =
+            Assert.Throws<ArgumentException>(
+                Action(fun () -> configure (Command.create "tool") |> Command.idleTimeout idle |> ignore)
+            )
+            |> ignore
+
+        assertRejected (fun command -> command.Stdout(StdioMode.Null).Stderr(StdioMode.Null))
+        assertRejected (fun command -> command.Stdout(StdioMode.Inherit).Stderr(StdioMode.Inherit))
+        assertRejected (fun command -> command.StdoutToFile("stdout.log").StderrToFile("stderr.log"))
+
+        assertRejected (fun command -> command.StdoutToFile("stdout.log").Stderr(StdioMode.Null))
+
+        assertRejected (fun command -> command.Stdout(StdioMode.Null).MergeStderr())
+
+    [<Test>]
+    member _.``IdleTimeout conflict is rejected when the last destination removes parent-side output``() =
+        let withIdle = Command.create("tool").IdleTimeout(TimeSpan.FromSeconds 5.0)
+
+        let assertRejected (configure: Command -> Command) =
+            Assert.Throws<ArgumentException>(Action(fun () -> configure withIdle |> ignore))
+            |> ignore
+
+        assertRejected (fun command -> command.Stdout(StdioMode.Null).Stderr(StdioMode.Null))
+        assertRejected (fun command -> command.Stdout(StdioMode.Inherit).Stderr(StdioMode.Inherit))
+        assertRejected (fun command -> command.StdoutToFile("stdout.log").StderrToFile("stderr.log"))
+        assertRejected (fun command -> command.Stdout(StdioMode.Null).MergeStderr())
+
+    [<Test>]
+    member _.``IdleTimeout accepts one observable pipe and a PTY master``() =
+        let idle = TimeSpan.FromSeconds 5.0
+
+        let commands =
+            [ Command.create("tool").Stdout(StdioMode.Null).IdleTimeout(idle)
+              Command.create("tool").StderrToFile("stderr.log").IdleTimeout(idle)
+              Command.create("tool").Stderr(StdioMode.Null).MergeStderr().IdleTimeout(idle)
+              Command.create("tool").Stdout(StdioMode.Null).Stderr(StdioMode.Null).Pty().IdleTimeout(idle) ]
+
+        Assert.That(List.length commands, Is.EqualTo 4)
+
+    [<Test>]
     member _.``preferLocal accumulates directories in the order added``() =
         let command =
             Command.create "eslint"

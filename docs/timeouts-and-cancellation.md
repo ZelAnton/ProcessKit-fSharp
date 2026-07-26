@@ -198,7 +198,12 @@ Key facts:
   bytes — so a single long line without a newline still counts as active, and it works
   uniformly for the buffered capture verbs, the streaming verbs, the raw `OutputBytesAsync`,
   and even the output-discarding `WaitAsync`/`ProfileAsync`. It is independent of
-  `StdoutLineCount`/`StderrLineCount`, which stay pure line counters.
+  `StdoutLineCount`/`StderrLineCount`, which stay pure line counters. This requires at least
+  one output stream the parent can read: a piped stdout/stderr or a PTY's merged master.
+  A command whose effective destinations are only `StdioMode.Null`, `StdioMode.Inherit`, or
+  direct file redirects is rejected with `ArgumentException` at the builder boundary (in
+  either chaining order), because those OS-level destinations cannot report activity back to
+  the idle watchdog.
 - **The idle clock starts when consumption begins** (the verb's exit wait), not at some
   earlier construction, so a handle you drive later is not killed for a gap before you
   started reading.

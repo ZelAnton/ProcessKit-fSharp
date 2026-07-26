@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- `Command.IdleTimeout` now rejects configurations with no parent-observable output stream instead of falsely timing out an active child whose output goes only to inherited, null, or file destinations.
 
 ## [2.9.0] - 2026-07-26
 

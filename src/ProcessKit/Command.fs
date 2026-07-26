@@ -541,6 +541,29 @@ module internal CommandConfig =
         if config.StderrFile.IsSome then
             raise (stderrFileConflict knob)
 
+    // Idle activity is observed by the parent-side output pumps. A PTY always exposes its single
+    // merged master stream; otherwise only an effective Piped destination is observable (stderr follows
+    // stdout under MergeStderr, and a direct file redirect takes precedence over the matching mode).
+    let private hasParentSideOutput (config: CommandConfig) =
+        config.Pty.IsSome
+        || (config.StdoutFile.IsNone && config.StdoutMode = StdioMode.Piped)
+        || (not config.MergeStderr
+            && config.StderrFile.IsNone
+            && config.StderrMode = StdioMode.Piped)
+
+    let private idleTimeoutConflict () =
+        ArgumentException(
+            "IdleTimeout requires at least one parent-side output stream whose reads can reset the idle deadline. Keep stdout or stderr Piped, or use Pty; Null, Inherit, and direct file redirects cannot report output activity to the parent.",
+            "IdleTimeout"
+        )
+
+    /// Reject an armed `IdleTimeout` once a prospective builder state has no output stream the parent
+    /// can observe. Every relevant destination setter calls this on the state it is about to return, so
+    /// the conflict is caught whichever setting appears last in a fluent chain.
+    let ensureIdleTimeoutCompatible (config: CommandConfig) =
+        if config.IdleTimeout.IsSome && not (hasParentSideOutput config) then
+            raise (idleTimeoutConflict ())
+
     /// Validate a `PtyConfig`'s geometry at the `Command.Pty` builder boundary: both dimensions must be at
     /// least 1 (a terminal has no zero/negative size) and fit a Win32 `COORD`'s `SHORT`
     /// (`Int16.MaxValue`, also a sane ceiling on POSIX `winsize`), rejected with
@@ -764,20 +787,24 @@ type Command internal (config: CommandConfig) =
     /// Set how the child's standard output is connected (default `Piped`). This is a stdout *destination*
     /// setter, so it also clears any prior `StdoutToFile` redirect — the last destination in a chain wins.
     member _.Stdout(mode: StdioMode) =
-        Command(
+        let updated =
             { config with
                 StdoutMode = mode
                 StdoutFile = None }
-        )
+
+        CommandConfig.ensureIdleTimeoutCompatible updated
+        Command(updated)
 
     /// Set how the child's standard error is connected (default `Piped`). Also clears any prior
     /// `StderrToFile` redirect — the last destination in a chain wins (see `Stdout`).
     member _.Stderr(mode: StdioMode) =
-        Command(
+        let updated =
             { config with
                 StderrMode = mode
                 StderrFile = None }
-        )
+
+        CommandConfig.ensureIdleTimeoutCompatible updated
+        Command(updated)
 
     /// Redirect the child's standard **output** straight to the file at `path`, at the OS level — the
     /// child is handed the open file as its stdout handle/fd ON THE SPAWN (Windows: an inheritable file
@@ -804,10 +831,12 @@ type Command internal (config: CommandConfig) =
         CommandConfig.rejectEmbeddedNul (nameof path) path
         CommandConfig.ensureStdoutFileCompatible config
 
-        Command(
+        let updated =
             { config with
                 StdoutFile = Some(path, append) }
-        )
+
+        CommandConfig.ensureIdleTimeoutCompatible updated
+        Command(updated)
 
     /// Redirect the child's standard output straight to the file at `path`, creating it (truncating an
     /// existing one). Shorthand for `StdoutToFile(path, append = false)` — see that overload.
@@ -826,10 +855,12 @@ type Command internal (config: CommandConfig) =
         CommandConfig.rejectEmbeddedNul (nameof path) path
         CommandConfig.ensureStderrFileCompatible config
 
-        Command(
+        let updated =
             { config with
                 StderrFile = Some(path, append) }
-        )
+
+        CommandConfig.ensureIdleTimeoutCompatible updated
+        Command(updated)
 
     /// Redirect the child's standard error straight to the file at `path`, creating it (truncating an
     /// existing one). Shorthand for `StderrToFile(path, append = false)` — see that overload.
@@ -986,7 +1017,10 @@ type Command internal (config: CommandConfig) =
     member _.MergeStderr() =
         CommandConfig.ensureNoMergeStderrObservers config
         CommandConfig.ensureNoFileRedirect config "MergeStderr"
-        Command({ config with MergeStderr = true })
+
+        let updated = { config with MergeStderr = true }
+        CommandConfig.ensureIdleTimeoutCompatible updated
+        Command(updated)
 
     /// Bound the in-memory backlog of captured lines.
     member _.OutputBuffer(policy: OutputBufferPolicy) =
@@ -1032,17 +1066,22 @@ type Command internal (config: CommandConfig) =
     /// from `Timeout`, which bounds the *total* run length regardless of output: the two are
     /// independent and may both be set, each firing on its own condition. Idle activity is measured at
     /// byte granularity across every verb (buffered capture, streaming, raw bytes, and the drained
-    /// `WaitAsync`/`ProfileAsync`), so even a run whose output is discarded — or a single long
-    /// newline-free blob — counts as active. A negative `duration` is rejected
+    /// `WaitAsync`/`ProfileAsync`), so output discarded by a parent-side verb — or a single long
+    /// newline-free blob — still counts as active. At least one effective parent-side output stream is
+    /// required: combining this with only `Null`, `Inherit`, or direct file destinations is rejected with
+    /// `ArgumentException` in either chaining order; a PTY's merged master stream is observable. A
+    /// negative `duration` is rejected
     /// (`ArgumentOutOfRangeException`, matching `Timeout`); one larger than ~24.8 days is treated as no
     /// idle deadline. Honours `TimeoutGrace` (a graceful stop, then a hard kill) exactly as `Timeout`.
     member _.IdleTimeout(duration: TimeSpan) =
         ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero)
 
-        Command(
+        let updated =
             { config with
                 IdleTimeout = Some duration }
-        )
+
+        CommandConfig.ensureIdleTimeoutCompatible updated
+        Command(updated)
 
     /// Also cancel the run when `cancellationToken` fires (in addition to any verb token). This binds the
     /// token to the **completion** verbs — `RunAsync`/`Output*`/`ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/`FirstLineAsync`:
