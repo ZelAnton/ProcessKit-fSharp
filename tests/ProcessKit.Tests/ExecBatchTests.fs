@@ -44,7 +44,7 @@ type private QueueBlockingRunner() =
             failwith "this test runner only supports text capture"
 
         member _.SpawnAsync(_command, _cancellationToken) =
-            failwith "this test runner only supports text capture"
+            raise (NotSupportedException "this test runner only supports text capture")
 
 /// A runner whose text-capture seam is cancelled independently of the verb token.
 type private CaptureCancellingRunner() =
@@ -56,7 +56,7 @@ type private CaptureCancellingRunner() =
             failwith "this test runner only supports text capture"
 
         member _.SpawnAsync(_command, _cancellationToken) =
-            failwith "this test runner only supports text capture"
+            raise (NotSupportedException "this test runner only supports text capture")
 
 /// Records capture attempts so batch argument validation can prove it ran before any command started.
 type private BoundaryValidationRunner() =
@@ -74,7 +74,7 @@ type private BoundaryValidationRunner() =
             failwith "invalid batch input must fail before bytes capture starts"
 
         member _.SpawnAsync(_command, _cancellationToken) =
-            failwith "this test runner only supports capture"
+            raise (NotSupportedException "this test runner only supports capture")
 
 [<TestFixture>]
 type ExecBatchTests() =

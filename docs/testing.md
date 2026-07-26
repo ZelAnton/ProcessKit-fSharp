@@ -87,6 +87,12 @@ below. The last two — `firstLine` and `start` — need a live handle and go th
 reconstructs a live handle from the recording), so streaming and readiness code replays too —
 see [what the doubles don't cover](#what-the-doubles-dont-cover).
 
+A custom runner that deliberately supports capture but cannot expose a live handle may throw
+`NotSupportedException` synchronously from `SpawnAsync`. `Supervisor` treats that specific exception
+as the capture-only capability marker and falls back to `CaptureStringAsync`; any other exception is
+allowed to surface as a runner defect instead of silently disabling live status, graceful stop, and
+liveness monitoring.
+
 Production code, generic over the runner:
 
 **F#**

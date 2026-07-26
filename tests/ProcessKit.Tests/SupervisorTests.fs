@@ -29,7 +29,7 @@ type private SequenceRunner(replies: Result<ProcessResult<string>, ProcessError>
             failwith "SequenceRunner only scripts CaptureString"
 
         member _.SpawnAsync(_command, _cancellationToken) =
-            failwith "SequenceRunner only scripts CaptureString"
+            raise (NotSupportedException "SequenceRunner only scripts CaptureString")
 
 /// Records the output-buffer policy of the command it is asked to run, so a test can assert the
 /// supervisor applied its capture policy to each incarnation.
@@ -48,7 +48,7 @@ type private CapturingRunner() =
             failwith "CapturingRunner only scripts CaptureString"
 
         member _.SpawnAsync(_command, _cancellationToken) =
-            failwith "CapturingRunner only scripts CaptureString"
+            raise (NotSupportedException "CapturingRunner only scripts CaptureString")
 
 /// A virtual clock: `Sleep` records the requested delay and advances `Now` instead of waiting, so
 /// backoff and storm-decay timing is deterministic and instant (a virtual/paused clock).
@@ -205,9 +205,9 @@ type private CrashLoopRunner() =
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "CrashLoopRunner drives incarnations via SpawnAsync"))
 
-/// A capture-only runner (its `SpawnAsync` throws, like the scripted doubles) that blocks its single
-/// incarnation until the test releases it — for exercising the graceful-stop loop control on a runner
-/// that exposes no live handle.
+/// A capture-only runner (its `SpawnAsync` uses the explicit `NotSupportedException` capability marker)
+/// that blocks its single incarnation until the test releases it — for exercising the graceful-stop
+/// loop control on a runner that exposes no live handle.
 type private GatedCaptureRunner() =
     let started =
         new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -228,10 +228,31 @@ type private GatedCaptureRunner() =
             }
 
         member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
-            failwith "GatedCaptureRunner only scripts CaptureString"
+            raise (NotSupportedException "GatedCaptureRunner only scripts CaptureString")
 
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             failwith "GatedCaptureRunner only scripts CaptureString"
+
+/// A runner whose live-spawn primitive has a genuine synchronous bug. Its capture primitive is valid
+/// only so the regression can prove the supervisor does not silently fall back to it.
+type private FaultingSpawnRunner() =
+    let mutable captures = 0
+
+    member _.Captures = Volatile.Read(&captures)
+
+    interface IProcessRunner with
+        member _.SpawnAsync(_command, _cancellationToken) =
+            raise (InvalidOperationException "synchronous spawn defect")
+
+        member _.CaptureStringAsync(command, _cancellationToken) =
+            Interlocked.Increment(&captures) |> ignore
+
+            Task.FromResult(
+                Ok(ProcessResult<string>(command.Program, "masked", "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ]))
+            )
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "not used by this regression"))
 
 /// A spawn-capable runner whose every incarnation stays alive (a never-completing wait) until it is
 /// gracefully stopped — so a liveness probe has a live-but-running child to fail against (KB K-044:
@@ -1191,6 +1212,25 @@ type SupervisorTests() =
             | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
 
             Assert.That(session.Status.IsActive, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a synchronous SpawnAsync defect is not masked by the capture-only fallback``() : Task =
+        task {
+            let runner = FaultingSpawnRunner()
+            let supervisor = Supervisor(Command.create "worker").WithRunner runner
+            let! session = supervisor.StartAsync()
+
+            try
+                let! _ = session.Completion
+                Assert.Fail "the unexpected SpawnAsync exception should fault supervision"
+            with
+            // The exact runner defect must pass through the background supervision task unchanged.
+            | :? InvalidOperationException as ex ->
+                Assert.That(ex.Message, Is.EqualTo "synchronous spawn defect")
+
+            Assert.That(runner.Captures, Is.Zero, "an unexpected exception must not enter capture-only mode")
         }
         :> Task
 

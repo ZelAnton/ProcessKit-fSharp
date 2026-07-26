@@ -370,9 +370,10 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     let mutable stopping = false
     let mutable stopGrace = TimeSpan.Zero
 
-    // Latches false the first time the configured runner proves capture-only (its `SpawnAsync` throws
-    // because it scripts only the capture primitive): the session then drives incarnations through
-    // `CaptureStringAsync` — no live pid / graceful child-stop, but supervision itself is unaffected.
+    // Latches false when the configured runner explicitly proves capture-only by throwing
+    // `NotSupportedException` synchronously from `SpawnAsync`: the session then drives incarnations
+    // through `CaptureStringAsync` — no live pid / graceful child-stop, but supervision itself is
+    // unaffected. Any other exception remains a runner defect and escapes instead of being masked.
     let mutable spawnCapable = true
 
     // Set by a per-incarnation liveness monitor the moment it decides the live child is unresponsive
@@ -625,12 +626,11 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                     let spawned =
                         try
                             Some(config.Runner.SpawnAsync(command, effectiveToken))
-                        with _ ->
-                            // A capture-only runner throws from `SpawnAsync` (it has no live handle to
-                            // return). Latch onto its capture primitive for the rest of the session and
-                            // drive this incarnation through it below — supervision is unaffected; only
-                            // the live pid / graceful child-stop degrade. A real runner never throws here
-                            // (it returns `Ok`/`Error`), so it stays on the tracked path.
+                        with
+                        // This is the documented capability marker for a capture-only runner: it has no
+                        // live handle to return, so falling back is intended. Other exceptions are not
+                        // caught; masking a runner bug would silently remove status, stop, and liveness.
+                        | :? NotSupportedException ->
                             spawnCapable <- false
                             None
 

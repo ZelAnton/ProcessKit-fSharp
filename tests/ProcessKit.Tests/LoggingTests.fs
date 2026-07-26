@@ -74,7 +74,8 @@ type private AlwaysCrash() =
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             failwith "AlwaysCrash has no CaptureBytes"
 
-        member _.SpawnAsync(_command, _cancellationToken) = failwith "AlwaysCrash has no Spawn"
+        member _.SpawnAsync(_command, _cancellationToken) =
+            raise (NotSupportedException "AlwaysCrash has no Spawn")
 
 [<TestFixture>]
 type LoggingTests() =

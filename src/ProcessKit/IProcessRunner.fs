@@ -35,5 +35,10 @@ type IProcessRunner =
     /// handle, or call its `Kill`). This differs from the completion primitives
     /// (`CaptureStringAsync`/`CaptureBytesAsync`), which drive the child to completion and so honour the
     /// token — and the command's `CancelOn` — for the whole run.
+    ///
+    /// A deliberately capture-only implementation may throw `NotSupportedException` synchronously to
+    /// signal that it cannot produce a live handle; `Supervisor` recognizes that specific capability
+    /// marker and falls back to `CaptureStringAsync`. Any other exception is treated as an implementation
+    /// failure and is not hidden by the fallback.
     abstract member SpawnAsync:
         command: Command * cancellationToken: CancellationToken -> Task<Result<RunningProcess, ProcessError>>
