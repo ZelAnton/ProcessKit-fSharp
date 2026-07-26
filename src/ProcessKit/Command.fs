@@ -995,8 +995,9 @@ type Command internal (config: CommandConfig) =
 
     /// Opt in to a bounded/backpressure channel for the streaming verbs (`StdoutLinesAsync`/
     /// `OutputEventsAsync`/`WaitForLineAsync`). Unset (the default) keeps the unbounded streaming
-    /// channel ProcessKit has always used. See [Streaming](../../docs/streaming.md) for the
-    /// backpressure deadlock footgun before opting in to `StreamFullMode.Backpressure`.
+    /// channel ProcessKit has always used. See
+    /// <a href="https://zelanton.github.io/ProcessKit-fSharp/streaming.html">Streaming</a> for the backpressure
+    /// deadlock footgun before opting in to `StreamFullMode.Backpressure`.
     member _.StreamBuffer(policy: StreamBufferPolicy) =
         ArgumentNullException.ThrowIfNull policy
 

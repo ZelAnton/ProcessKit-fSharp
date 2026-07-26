@@ -124,9 +124,9 @@ type StreamFullMode =
     /// the consumer catches up, so the child itself observably blocks writing to a full stdout/stderr
     /// pipe. Bounds memory losslessly, at the cost of the child's timing — opt in only when you intend
     /// to pace a trusted producer against your consumer (see the deadlock note in
-    /// [Streaming](../../docs/streaming.md) before using it: a `Command.Timeout` kills the *child* but
-    /// does not by itself free a writer parked here if you abandon reading — dispose the
-    /// `RunningProcess` to release it).
+    /// <a href="https://zelanton.github.io/ProcessKit-fSharp/streaming.html">Streaming</a> before using it: a
+    /// `Command.Timeout` kills the *child* but does not by itself free a writer parked here if you abandon
+    /// reading — dispose the `RunningProcess` to release it).
     | Backpressure
 
     /// Ring-buffer / "tail" semantics: drop the oldest queued item to make room for the newest.
