@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `OutputLine.TimestampUtc` and `OutputLine.Sequence` expose each streamed event line's capture time and one-based cross-stream order; fake and replay streams synthesize the same metadata through the command's `TimeProvider` without changing cassette files.
 - `PtySession.WithAnsiFiltering(...)` removes CSI, OSC, and single-ESC terminal controls from pattern matching, pending output, and transcripts while preserving raw byte tees and the existing raw-session default.
 - `ProcessGroupStats` exposes optional tree I/O byte and operation counters from Windows Job Objects and Linux cgroup v2; `RunProfile` exposes an attributable private-tree aggregate on Windows, with explicit `None` on unsupported or shared-profile paths.
+- Added a scripting guide for using ProcessKit safely from `.fsx` files with `dotnet fsi`, including Ctrl+C cleanup and cross-platform tool resolution.
 
 ### Changed
 - `Command.Encoding` and `Command.ConsoleEncoding()` now apply their encoding to text stdin as well as captured output.

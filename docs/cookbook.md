@@ -967,4 +967,4 @@ see [testing.md → Record and replay](testing.md#record-and-replay).
 
 ---
 
-Next: [Running commands](commands.md)
+Next: [Scripting with F# Interactive](scripting.md)

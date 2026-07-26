@@ -1,6 +1,6 @@
 # Running commands
 
-[Previous: Overview](./)
+[Previous: Scripting with F# Interactive](scripting.md)
 
 `Command` is the entry point of the runner layer: an immutable builder that
 describes *what* to run and *how*, plus a family of consuming verbs that decide

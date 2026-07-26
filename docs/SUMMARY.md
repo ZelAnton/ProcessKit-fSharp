@@ -20,6 +20,7 @@
 
 - [Comparison and migration guide](comparison.md)
 - [Cookbook](cookbook.md)
+- [Scripting with F# Interactive](scripting.md)
 - [Running commands](commands.md)
 - [Process groups](process-groups.md)
 - [Streaming & interactive I/O](streaming.md)

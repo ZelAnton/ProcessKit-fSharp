@@ -211,6 +211,7 @@ projects covering capture, streaming readiness, pipelines, supervision, DI, and 
 | Guide | Covers |
 |---|---|
 | [Cookbook](docs/cookbook.md) | Task → snippet recipes for everything below; the fastest way in |
+| [Scripting with F# Interactive](docs/scripting.md) | `.fsx` setup, one-off helpers, reusable CLI clients, Ctrl+C cleanup, and portable tool resolution |
 | [Running commands](docs/commands.md) | The full `Command` builder and every consuming verb, with error semantics |
 | [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
 | [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, readiness probes, `WaitAnyAsync`, profiling |
