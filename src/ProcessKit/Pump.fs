@@ -341,71 +341,46 @@ module internal Pump =
                 // as ProcessKit has always pumped lines — a bare '\r' is content (accumulated whole).
                 while reading do
                     let! read = stream.ReadAsync(byteBuffer.AsMemory(0, byteBuffer.Length), cancellationToken)
+                    let mutable chars = 0
 
                     if read = 0 then
                         reading <- false
+                        chars <- decoder.GetChars(byteBuffer, 0, 0, charBuffer, 0, true)
                     else
                         match tee with
                         | Some sink -> do! sink.WriteAsync(byteBuffer.AsMemory(0, read), cancellationToken)
                         | None -> ()
 
-                        let chars = decoder.GetChars(byteBuffer, 0, read, charBuffer, 0)
-                        let mutable pos = consumeBom chars
+                        chars <- decoder.GetChars(byteBuffer, 0, read, charBuffer, 0)
 
-                        // Scan the decoded chunk for '\n' via `IndexOf` instead of a per-character loop —
-                        // each run of non-newline characters between two `\n` (or to the end of the chunk)
-                        // is appended to `line` in one batched `StringBuilder.Append(char[], int, int)` call.
-                        while pos < chars do
-                            let newlineIndex = Array.IndexOf(charBuffer, '\n', pos, chars - pos)
-                            let runEnd = if newlineIndex >= 0 then newlineIndex else chars
+                    let mutable pos = consumeBom chars
 
-                            match maxLineLength with
-                            | None ->
-                                if runEnd > pos then
-                                    line.Append(charBuffer, pos, runEnd - pos) |> ignore
+                    // Scan both ordinary decoded chunks and the decoder's EOF flush through this one
+                    // block. Keeping it inline in the read state machine avoids allocating a Task/closure
+                    // per chunk on this hot path.
+                    while pos < chars do
+                        let newlineIndex = Array.IndexOf(charBuffer, '\n', pos, chars - pos)
+                        let runEnd = if newlineIndex >= 0 then newlineIndex else chars
 
-                                pos <- runEnd
-                            | Some cap ->
-                                // `appendCapped` batches the per-character force-flush at the cap (see its
-                                // doc comment); it always advances through the whole run, so `pos` lands on
-                                // `runEnd` exactly as the inline version's `p` used to.
-                                do! appendCapped line charBuffer pos runEnd cap onLine
-                                pos <- runEnd
+                        match maxLineLength with
+                        | None ->
+                            if runEnd > pos then
+                                line.Append(charBuffer, pos, runEnd - pos) |> ignore
 
-                            if newlineIndex >= 0 then
-                                if line.Length > 0 && line[line.Length - 1] = '\r' then
-                                    line.Length <- line.Length - 1
+                            pos <- runEnd
+                        | Some cap ->
+                            // `appendCapped` batches the per-character force-flush at the cap (see its
+                            // doc comment); it always advances through the whole run.
+                            do! appendCapped line charBuffer pos runEnd cap onLine
+                            pos <- runEnd
 
-                                do! onLine (line.ToString())
-                                line.Clear() |> ignore
-                                pos <- newlineIndex + 1
+                        if newlineIndex >= 0 then
+                            if line.Length > 0 && line[line.Length - 1] = '\r' then
+                                line.Length <- line.Length - 1
 
-                let flushedChars = decoder.GetChars(byteBuffer, 0, 0, charBuffer, 0, true)
-                let mutable flushedPos = consumeBom flushedChars
-
-                while flushedPos < flushedChars do
-                    let newlineIndex =
-                        Array.IndexOf(charBuffer, '\n', flushedPos, flushedChars - flushedPos)
-
-                    let runEnd = if newlineIndex >= 0 then newlineIndex else flushedChars
-
-                    match maxLineLength with
-                    | None ->
-                        if runEnd > flushedPos then
-                            line.Append(charBuffer, flushedPos, runEnd - flushedPos) |> ignore
-
-                        flushedPos <- runEnd
-                    | Some cap ->
-                        do! appendCapped line charBuffer flushedPos runEnd cap onLine
-                        flushedPos <- runEnd
-
-                    if newlineIndex >= 0 then
-                        if line.Length > 0 && line[line.Length - 1] = '\r' then
-                            line.Length <- line.Length - 1
-
-                        do! onLine (line.ToString())
-                        line.Clear() |> ignore
-                        flushedPos <- newlineIndex + 1
+                            do! onLine (line.ToString())
+                            line.Clear() |> ignore
+                            pos <- newlineIndex + 1
 
                 if line.Length > 0 then
                     if line[line.Length - 1] = '\r' then
@@ -459,111 +434,77 @@ module internal Pump =
 
                 while reading do
                     let! read = stream.ReadAsync(byteBuffer.AsMemory(0, byteBuffer.Length), cancellationToken)
+                    let mutable chars = 0
 
                     if read = 0 then
                         reading <- false
+
+                        // Preserve the existing EOF order: a deferred CR from real input is resolved
+                        // before decoder fallback characters are flushed (see the truncated-sequence
+                        // regression). The flushed characters then enter the shared scan below.
+                        if pendingCr then
+                            if crSplits then do! emitLine () else do! appendChar '\r'
+
+                            pendingCr <- false
+
+                        chars <- decoder.GetChars(byteBuffer, 0, 0, charBuffer, 0, true)
                     else
                         match tee with
                         | Some sink -> do! sink.WriteAsync(byteBuffer.AsMemory(0, read), cancellationToken)
                         | None -> ()
 
-                        let chars = decoder.GetChars(byteBuffer, 0, read, charBuffer, 0)
-                        let mutable pos = consumeBom chars
+                        chars <- decoder.GetChars(byteBuffer, 0, read, charBuffer, 0)
 
-                        while pos < chars do
-                            if pendingCr then
-                                // Resolve the deferred '\r' against the next character.
-                                if charBuffer[pos] = '\n' then
-                                    // '\r\n' — a single terminator; emit the content before the '\r' and
-                                    // consume the '\n'.
-                                    do! emitLine ()
-                                    pos <- pos + 1
-                                elif crSplits then
-                                    // Lone '\r' that ends a line — emit; the current char starts the next
-                                    // line, so it is left for the scan below (pos not advanced).
-                                    do! emitLine ()
-                                else
-                                    // Lone '\r' that is content under `CrLf` — keep it, then re-scan the
-                                    // current char (pos not advanced).
-                                    do! appendChar '\r'
+                    let mutable pos = consumeBom chars
 
-                                pendingCr <- false
+                    // Ordinary decoded chunks and the decoder's EOF flush share the same scanner,
+                    // without an extra async helper allocation per read.
+                    while pos < chars do
+                        if pendingCr then
+                            // Resolve the deferred '\r' against the next character.
+                            if charBuffer[pos] = '\n' then
+                                // '\r\n' — a single terminator; emit the content before the '\r' and
+                                // consume the '\n'.
+                                do! emitLine ()
+                                pos <- pos + 1
+                            elif crSplits then
+                                // Lone '\r' that ends a line — emit; the current char starts the next
+                                // line, so it is left for the scan below (pos not advanced).
+                                do! emitLine ()
                             else
-                                // Batch the run of content up to the next '\r' or '\n'.
-                                let crIndex = Array.IndexOf(charBuffer, '\r', pos, chars - pos)
-                                let lfIndex = Array.IndexOf(charBuffer, '\n', pos, chars - pos)
+                                // Lone '\r' that is content under `CrLf` — keep it, then re-scan the
+                                // current char (pos not advanced).
+                                do! appendChar '\r'
 
-                                let sigIndex =
-                                    match crIndex, lfIndex with
-                                    | -1, -1 -> -1
-                                    | -1, n -> n
-                                    | r, -1 -> r
-                                    | r, n -> min r n
-
-                                let runEnd = if sigIndex >= 0 then sigIndex else chars
-                                do! appendRun pos runEnd
-
-                                if sigIndex < 0 then
-                                    pos <- chars
-                                elif charBuffer[sigIndex] = '\n' then
-                                    // A lone '\n' (no pending '\r'): a terminator under `Lf`/`Any`,
-                                    // content under `Cr`/`CrLf`.
-                                    if lfSplits then do! emitLine () else do! appendChar '\n'
-                                    pos <- sigIndex + 1
-                                else
-                                    // A '\r' — defer the decision until the next character (or EOF).
-                                    pendingCr <- true
-                                    pos <- sigIndex + 1
-
-                // EOF: resolve any deferred trailing '\r', then flush a final unterminated line.
-                if pendingCr then
-                    if crSplits then
-                        // Trailing bare '\r' ended the last frame — emit its content (even if empty,
-                        // mirroring how a trailing '\n' emits under `Lf`).
-                        do! emitLine ()
-                    else
-                        // Content under `CrLf` — keep the trailing '\r' on the final line.
-                        do! appendChar '\r'
-
-                    pendingCr <- false
-
-                let flushedChars = decoder.GetChars(byteBuffer, 0, 0, charBuffer, 0, true)
-                let mutable flushedPos = consumeBom flushedChars
-
-                while flushedPos < flushedChars do
-                    if pendingCr then
-                        if charBuffer[flushedPos] = '\n' then
-                            do! emitLine ()
-                            flushedPos <- flushedPos + 1
-                        elif crSplits then
-                            do! emitLine ()
+                            pendingCr <- false
                         else
-                            do! appendChar '\r'
+                            // Batch the run of content up to the next '\r' or '\n'.
+                            let crIndex = Array.IndexOf(charBuffer, '\r', pos, chars - pos)
+                            let lfIndex = Array.IndexOf(charBuffer, '\n', pos, chars - pos)
 
-                        pendingCr <- false
-                    else
-                        let crIndex = Array.IndexOf(charBuffer, '\r', flushedPos, flushedChars - flushedPos)
-                        let lfIndex = Array.IndexOf(charBuffer, '\n', flushedPos, flushedChars - flushedPos)
+                            let sigIndex =
+                                match crIndex, lfIndex with
+                                | -1, -1 -> -1
+                                | -1, n -> n
+                                | r, -1 -> r
+                                | r, n -> min r n
 
-                        let sigIndex =
-                            match crIndex, lfIndex with
-                            | -1, -1 -> -1
-                            | -1, n -> n
-                            | r, -1 -> r
-                            | r, n -> min r n
+                            let runEnd = if sigIndex >= 0 then sigIndex else chars
+                            do! appendRun pos runEnd
 
-                        let runEnd = if sigIndex >= 0 then sigIndex else flushedChars
-                        do! appendRun flushedPos runEnd
+                            if sigIndex < 0 then
+                                pos <- chars
+                            elif charBuffer[sigIndex] = '\n' then
+                                // A lone '\n' (no pending '\r'): a terminator under `Lf`/`Any`,
+                                // content under `Cr`/`CrLf`.
+                                if lfSplits then do! emitLine () else do! appendChar '\n'
+                                pos <- sigIndex + 1
+                            else
+                                // A '\r' — defer the decision until the next character (or EOF).
+                                pendingCr <- true
+                                pos <- sigIndex + 1
 
-                        if sigIndex < 0 then
-                            flushedPos <- flushedChars
-                        elif charBuffer[sigIndex] = '\n' then
-                            if lfSplits then do! emitLine () else do! appendChar '\n'
-                            flushedPos <- sigIndex + 1
-                        else
-                            pendingCr <- true
-                            flushedPos <- sigIndex + 1
-
+                // A trailing CR produced by the decoder flush is resolved after its shared scan.
                 if pendingCr then
                     if crSplits then do! emitLine () else do! appendChar '\r'
 
