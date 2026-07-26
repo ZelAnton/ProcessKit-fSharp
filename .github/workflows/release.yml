@@ -27,6 +27,7 @@ jobs:
       #   build-provenance attestation below.
       # attestations: write the provenance attestation to the repo's attestation store.
       contents: write
+      actions: write
       id-token: write
       attestations: write
     steps:
@@ -535,4 +536,24 @@ jobs:
             sleep $((attempt * 10))
           done
           echo "::error::Failed to create/update the GitHub Release after 3 attempts. The package is ALREADY on nuget.org and the tag is ALREADY on main. Do NOT re-run this workflow (a re-run computes the NEXT version and orphans this release). Finish by hand: if the Release does not exist yet, 'gh release create $TAG --title $TAG --notes-file release-notes.md ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS'; if it already exists (likely, since a partial attempt may have created it), 'gh release edit $TAG --notes-file release-notes.md && gh release upload $TAG ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS --clobber'."
+          exit 1
+
+      # A Release created with GITHUB_TOKEN does not emit another workflow-triggering
+      # `release: published` event. Dispatch Docs explicitly so its fsdocs half is always
+      # rebuilt from the version that was just published, even without a configured App token.
+      - name: Refresh Pages from the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if gh workflow run docs.yml --ref main; then
+              echo "Dispatched the combined Pages workflow (attempt $attempt)."
+              exit 0
+            fi
+            echo "::warning::Pages dispatch attempt $attempt failed; retrying after backoff..."
+            sleep $((attempt * 10))
+          done
+          echo "::error::The release is complete, but the Pages refresh could not be dispatched. " \
+            "Run 'gh workflow run docs.yml --ref main' by hand."
           exit 1
