@@ -318,6 +318,14 @@ type ReadinessTests() =
         }
         :> Task
 
+    [<TestCase(199, false)>]
+    [<TestCase(200, true)>]
+    [<TestCase(299, true)>]
+    [<TestCase(300, false)>]
+    member _.``the shared default HTTP predicate accepts exactly 2xx``(statusCode: int, expected: bool) =
+        use response = new HttpResponseMessage(enum<HttpStatusCode> statusCode)
+        Assert.That(ReadinessProbe.defaultHttpSuccess.Invoke response, Is.EqualTo expected)
+
     [<Test>]
     member _.WaitForHttpReturnsNotReadyWhenItsEndpointNeverReturnsASatisfactoryResponse() : Task =
         task {

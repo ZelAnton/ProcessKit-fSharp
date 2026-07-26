@@ -2014,14 +2014,7 @@ type RunningProcess internal (host: RunningHost) =
         : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull uri
 
-        this.WaitForHttpAsync(
-            uri,
-            Func<HttpResponseMessage, bool>(fun response ->
-                let statusCode = int response.StatusCode
-                statusCode >= 200 && statusCode < 300),
-            timeout,
-            cancellationToken
-        )
+        this.WaitForHttpAsync(uri, ReadinessProbe.defaultHttpSuccess, timeout, cancellationToken)
 
     /// Like `WaitForHttpAsync(uri, timeout, cancellationToken)`, but treats only status codes from
     /// `acceptableStatusCodes` as ready. The sequence is materialized once before polling, so every retry

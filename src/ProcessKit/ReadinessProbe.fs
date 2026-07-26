@@ -18,6 +18,12 @@ open System.Threading.Tasks
 /// them) for the background drain below.
 module internal ReadinessProbe =
 
+    /// The one default HTTP health contract shared by readiness and supervisor liveness: every 2xx
+    /// response is satisfactory. Kept as a single delegate so the two callers cannot drift and do not
+    /// allocate an equivalent closure for every builder call.
+    let defaultHttpSuccess =
+        Func<HttpResponseMessage, bool>(fun response -> response.IsSuccessStatusCode)
+
     /// Background-drain `stdout`/`stderr` (discarding every byte) for the duration of `work`, so a
     /// child that writes more than one OS pipe buffer of startup output (~64 KiB on Linux) before
     /// becoming ready can't block in `write()` while a readiness probe polls — the same reason

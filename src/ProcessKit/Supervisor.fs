@@ -218,7 +218,7 @@ module internal Liveness =
 type internal LivenessProbe =
 
     /// Poll `uri` with HTTP GET each attempt; the child is healthy when a response satisfies the check.
-    | Http of uri: Uri * isSatisfactory: (HttpResponseMessage -> bool)
+    | Http of uri: Uri * isSatisfactory: Func<HttpResponseMessage, bool>
 
     /// Evaluate an arbitrary async predicate each attempt; the child is healthy when it returns `true`.
     | Custom of probe: (unit -> Task<bool>)
@@ -526,7 +526,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                         ReadinessProbe.waitForHttpUsing
                             config.Command.Config.TimeProvider
                             (fun requestUri ct -> client.GetAsync(requestUri, ct))
-                            (Func<HttpResponseMessage, bool> isSatisfactory)
+                            isSatisfactory
                             program
                             uri
                             probeTimeout
@@ -1246,13 +1246,7 @@ type Supervisor internal (config: SupervisorConfig) =
     member this.LivenessHttp(uri: Uri, interval: TimeSpan) =
         ArgumentNullException.ThrowIfNull uri
 
-        this.LivenessHttp(
-            uri,
-            Func<HttpResponseMessage, bool>(fun response ->
-                let statusCode = int response.StatusCode
-                statusCode >= 200 && statusCode < 300),
-            interval
-        )
+        this.LivenessHttp(uri, ReadinessProbe.defaultHttpSuccess, interval)
 
     /// Like `LivenessHttp(uri, interval)`, but uses `isSatisfactory` to decide whether a response means
     /// the child is healthy (e.g. accept only a specific health-endpoint status/body). A zero or
@@ -1263,7 +1257,7 @@ type Supervisor internal (config: SupervisorConfig) =
 
         Supervisor(
             { config with
-                Liveness = Some(LivenessProbe.Http(uri, (fun response -> isSatisfactory.Invoke response)))
+                Liveness = Some(LivenessProbe.Http(uri, isSatisfactory))
                 LivenessInterval = Liveness.clampInterval interval }
         )
 
