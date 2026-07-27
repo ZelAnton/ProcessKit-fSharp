@@ -88,7 +88,8 @@
    `chapter-item` class (see the K-005 pitfall / docs/SUMMARY.md's comment), so a
    `:not(.chapter-item)` selector never matches anything and is dead. There is
    also no class that marks "Overview" alone: the implementation-switcher entries
-   (Rust version / Python wrapper) become `li.chapter-item.affix > a` too, once
+   (Rust version / CLI Runner / Python wrapper) become
+   `li.chapter-item.affix > a` too, once
    theme/nav-links.js upgrades them into live links.
    What IS unique to "Overview" is its position: docs/SUMMARY.md pins it as the
    sole entry of its own un-numbered block, sandwiched between the implementation

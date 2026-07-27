@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- The Pages navigation now links to the ProcessKit CLI Runner immediately after the Rust implementation.
 
 ### Changed
 -

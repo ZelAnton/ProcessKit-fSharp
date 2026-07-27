@@ -49,7 +49,7 @@ _EXPECTED_PINNED_TITLE = "Overview"
 # The implementation-switcher's draft entries (docs/SUMMARY.md) -- these must
 # never pick up the pinned-title style, with or without theme/nav-links.js
 # having run (this script checks the pre-JS, server-rendered markup only).
-_DRAFT_TITLES = {"Rust version", "Python wrapper", ".NET version"}
+_DRAFT_TITLES = ["Rust version", "CLI Runner", "Python wrapper", ".NET version"]
 
 
 class Node:
@@ -261,9 +261,9 @@ def main(argv: list[str]) -> int:
     buckets = classify_entries(ol)
     errors: list[str] = []
 
-    if set(buckets["draft"]) != _DRAFT_TITLES:
+    if buckets["draft"] != _DRAFT_TITLES:
         errors.append(
-            f"expected draft entries {sorted(_DRAFT_TITLES)!r}, found {sorted(buckets['draft'])!r} "
+            f"expected draft entries {_DRAFT_TITLES!r}, found {buckets['draft']!r} "
             "-- docs/SUMMARY.md's implementation switcher changed; update _DRAFT_TITLES."
         )
     if not buckets["regular"]:
@@ -296,7 +296,7 @@ def main(argv: list[str]) -> int:
 
     print(
         "check-sidebar-nav: OK -- pinned-title selector matches exactly "
-        f"{matched_titles!r}; draft={sorted(buckets['draft'])!r}; "
+        f"{matched_titles!r}; draft={buckets['draft']!r}; "
         f"regular={len(buckets['regular'])} numbered chapters; "
         f"prefix-affix={sorted(buckets['prefix-affix'])!r}"
     )

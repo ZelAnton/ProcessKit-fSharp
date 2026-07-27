@@ -1,14 +1,15 @@
 # Summary
 
-<!-- The three entries below form the implementation switcher, pinned above
+<!-- The four entries below form the implementation switcher, pinned above
      Overview at the very top of the sidebar. mdBook cannot point a SUMMARY.md
      entry at an external URL (a raw URL fails the build), so they are carried
      as DRAFT prefix chapters — bare `[Title]()` links (no leading `-`, unlike a
      bullet list) with no chapter files, in the same un-numbered prefix block as
-     Overview itself. theme/nav-links.js upgrades "Rust version" and "Python
-     wrapper" into live external links; ".NET version" remains a labelled,
-     non-clickable indicator for this current implementation. -->
+     Overview itself. theme/nav-links.js upgrades "Rust version", "CLI Runner",
+     and "Python wrapper" into live external links; ".NET version" remains a
+     labelled, non-clickable indicator for this current implementation. -->
 [Rust version]()
+[CLI Runner]()
 [Python wrapper]()
 [.NET version]()
 
