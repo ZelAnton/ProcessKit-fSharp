@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - The Pages navigation now links to the ProcessKit CLI Runner immediately after the Rust implementation.
+- HTTP readiness and liveness probes now accept caller-owned `HttpClient` instances for custom headers, TLS validation, proxies, and transports without transferring ownership.
 
 ### Changed
 -
 
 ### Fixed
--
+- HTTP readiness and liveness probes now reject relative URIs immediately instead of surfacing raw transport errors or restarting healthy children.
+- HTTP readiness probes now reject empty acceptable-status sets and unrepresentable Unix-socket paths instead of silently consuming the full readiness timeout.
 
 ## [2.9.1] - 2026-07-26
 

@@ -286,6 +286,37 @@ var byPredicate = new Supervisor(new Command("worker"))
     .LivenessCheck(() => PingWorkerAsync(), TimeSpan.FromSeconds(5)); // returns Task<bool>
 ```
 
+Every `LivenessHttp` form also accepts a caller-owned `HttpClient` immediately after the URI. Use it
+for authentication headers, custom certificate validation, proxies, or a custom transport such as HTTP
+over a Unix domain socket:
+
+**F#**
+
+<!-- docsnippet:imports System.Net.Http -->
+```fsharp
+use healthClient = new HttpClient()
+healthClient.DefaultRequestHeaders.Add("Authorization", "Bearer local-health-token")
+
+let supervised =
+    (Supervisor.create (Command.create "worker"))
+        .LivenessHttp(Uri "https://localhost:9000/health", healthClient, TimeSpan.FromSeconds 5.0)
+```
+
+**C#**
+
+<!-- docsnippet:imports System.Net.Http -->
+```csharp
+using var healthClient = new HttpClient();
+healthClient.DefaultRequestHeaders.Add("Authorization", "Bearer local-health-token");
+
+var supervised = new Supervisor(new Command("worker"))
+    .LivenessHttp(new Uri("https://localhost:9000/health"), healthClient, TimeSpan.FromSeconds(5));
+```
+
+The supervisor reuses the supplied client across every incarnation and probe attempt but never mutates
+or disposes it; the caller remains responsible for its lifetime. HTTP liveness URIs must be absolute,
+so configuration errors fail when the supervisor is built rather than restarting a healthy child.
+
 How it behaves:
 
 - **When it restarts.** After `LivenessFailures` **consecutive** failed attempts, the supervisor
@@ -308,7 +339,8 @@ How it behaves:
   metric — see [Observability](observability.md).
 
 `LivenessFailures`, `LivenessTimeout`, and `LivenessGrace` have **no effect** unless a probe
-(`LivenessHttp` / `LivenessCheck`) is set. `LivenessInterval` and `LivenessTimeout` must be positive;
+(`LivenessHttp` / `LivenessCheck`) is set. A non-positive liveness interval is clamped to 1 ms;
+`LivenessTimeout` accepts `TimeSpan.Zero` as a fail-fast attempt but rejects negative values;
 `LivenessFailures` must be at least `1`; `LivenessGrace` accepts `TimeSpan.Zero` (kill immediately)
 but rejects a negative value.
 

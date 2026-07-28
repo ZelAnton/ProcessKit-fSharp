@@ -4,6 +4,8 @@ open System
 open System.Collections.Generic
 open System.Diagnostics
 open System.IO
+open System.Net
+open System.Net.Http
 open System.Reflection
 open System.Text
 open System.Threading
@@ -11,6 +13,25 @@ open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
 open ProcessKit.Testing
+
+type private LivenessHttpHandler() =
+    inherit HttpMessageHandler()
+
+    let mutable requests = 0
+    let mutable disposed = 0
+
+    member _.Requests = Volatile.Read(&requests)
+    member _.Disposed = Volatile.Read(&disposed) <> 0
+
+    override _.SendAsync(_request: HttpRequestMessage, _cancellationToken: CancellationToken) =
+        Interlocked.Increment(&requests) |> ignore
+        Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK))
+
+    override this.Dispose(disposing: bool) =
+        if disposing then
+            Interlocked.Exchange(&disposed, 1) |> ignore
+
+        base.Dispose disposing
 
 /// A subprocess-free `IProcessRunner` that returns a fixed *sequence* of replies, one per call.
 /// Running out of replies fails the test loudly, so an unexpected restart is caught rather than
@@ -1366,10 +1387,16 @@ type SupervisorTests() =
     member _.``liveness knobs validate their arguments``() =
         let s = Supervisor(Command.create "x")
         let uri = Uri "http://localhost:9/health"
+        let relativeUri = Uri("health", UriKind.Relative)
         let positive = TimeSpan.FromSeconds 1.0
+        use client = new HttpClient(new LivenessHttpHandler())
 
         // Every valid configuration builds without throwing.
         s.LivenessHttp(uri, positive) |> ignore
+        s.LivenessHttp(uri, client, positive) |> ignore
+
+        s.LivenessHttp(uri, client, Func<HttpResponseMessage, bool>(fun _ -> true), positive)
+        |> ignore
 
         s.LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult true), positive)
         |> ignore
@@ -1407,6 +1434,50 @@ type SupervisorTests() =
             Action(fun () -> s.LivenessHttp(Unchecked.defaultof<Uri>, positive) |> ignore)
         )
         |> ignore
+
+        Assert.Throws<ArgumentException>(Action(fun () -> s.LivenessHttp(relativeUri, positive) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentException>(Action(fun () -> s.LivenessHttp(relativeUri, client, positive) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> s.LivenessHttp(uri, Unchecked.defaultof<HttpClient>, positive) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``HTTP liveness uses but never disposes a caller-owned client``() : Task =
+        task {
+            let runner = LivenessChildRunner()
+            let delay = LivenessDelayGate()
+            let handler = new LivenessHttpHandler()
+            use client = new HttpClient(handler)
+            let uri = Uri "https://self-signed.test/health"
+
+            let supervisor =
+                Supervisor(Command.create "healthy-http")
+                    .WithRunner(runner)
+                    .LivenessHttp(uri, client, TimeSpan.FromMilliseconds 10.0)
+                    .LivenessTimeout(TimeSpan.FromMilliseconds 100.0)
+                    .WithLivenessDelay(fun span cancellationToken -> delay.Delay(span, cancellationToken))
+
+            let! session = supervisor.StartAsync()
+            do! delay.FirstRequested
+            delay.ReleaseFirst()
+            do! waitUntil "caller-owned HTTP liveness probe" (fun () -> handler.Requests = 1)
+
+            let! outcome = session.StopAsync(TimeSpan.FromMilliseconds 100.0)
+
+            match outcome with
+            | Ok result -> Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+            | Error error -> Assert.Fail $"{error}"
+
+            Assert.That(handler.Disposed, Is.False, "ProcessKit must not dispose a caller-owned HttpClient")
+            use! response = client.GetAsync uri
+            Assert.That(response.StatusCode, Is.EqualTo HttpStatusCode.OK)
+        }
+        :> Task
 
     [<Test>]
     member _.``non-positive liveness intervals use a deterministic 1 ms startup delay``() : Task =

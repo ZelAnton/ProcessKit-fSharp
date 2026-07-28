@@ -938,6 +938,36 @@ type RunningProcess internal (host: RunningHost) =
                 timeout
                 readinessToken)
 
+    let waitForHttpWithClient
+        (client: HttpClient)
+        (uri: Uri)
+        (isSatisfactory: Func<HttpResponseMessage, bool>)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
+            ReadinessProbe.waitForHttpWithClient
+                config.TimeProvider
+                config.Program
+                stdout
+                stderr
+                client
+                uri
+                isSatisfactory
+                timeout
+                readinessToken)
+
+    let httpStatusPredicate (acceptableStatusCodes: seq<int>) =
+        ArgumentNullException.ThrowIfNull acceptableStatusCodes
+        let accepted = HashSet<int>(acceptableStatusCodes)
+
+        if accepted.Count = 0 then
+            raise (
+                ArgumentException("At least one acceptable HTTP status code is required.", nameof acceptableStatusCodes)
+            )
+
+        Func<HttpResponseMessage, bool>(fun response -> accepted.Contains(int response.StatusCode))
+
     let waitForPort
         (endpoint: IPEndPoint)
         (timeout: TimeSpan)
@@ -947,12 +977,19 @@ type RunningProcess internal (host: RunningHost) =
             ReadinessProbe.waitForPort config.TimeProvider config.Program stdout stderr endpoint timeout readinessToken)
 
     let waitForSocket
-        (path: string)
+        (endpoint: EndPoint)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
-            ReadinessProbe.waitForSocket config.TimeProvider config.Program stdout stderr path timeout readinessToken)
+            ReadinessProbe.waitForSocket
+                config.TimeProvider
+                config.Program
+                stdout
+                stderr
+                endpoint
+                timeout
+                readinessToken)
 
     let waitForCustom
         (probe: Func<Task<bool>>)
@@ -1993,7 +2030,9 @@ type RunningProcess internal (host: RunningHost) =
     /// `ReadinessProbe.waitForSocket`/`waitForCoreUsing` for the full contract. Requires the host to
     /// support `AF_UNIX` sockets (Windows 10 1809+, any current Linux/macOS via .NET's own requirement);
     /// on a host without that support this returns `Error(ProcessError.Unsupported ...)` immediately,
-    /// before ever attempting to dial — never a silent downgrade or an inevitable hang.
+    /// before ever attempting to dial — never a silent downgrade or an inevitable hang. A path that
+    /// cannot fit the platform's Unix-socket address fails immediately with `ArgumentOutOfRangeException`
+    /// rather than being retried as if no listener were present.
     member _.WaitForSocketAsync
         (path: string, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -2001,24 +2040,34 @@ type RunningProcess internal (host: RunningHost) =
 
         match ReadinessProbe.unixDomainSocketsSupported (fun () -> Socket.OSSupportsUnixDomainSockets) with
         | Error err -> Task.FromResult(Error err)
-        | Ok() -> waitForSocket path timeout cancellationToken
+        | Ok() ->
+            let endpoint = UnixDomainSocketEndPoint path
+            waitForSocket endpoint timeout cancellationToken
 
     /// Poll `uri` with HTTP GET until a response passes the default 2xx check, or fail with `NotReady`
     /// once `timeout` expires (or `Cancelled` if `cancellationToken` fires first). Connection failures,
     /// DNS failures, and request cancellations caused by the shared deadline are retried every 50ms.
     /// If the child exits before a satisfactory response arrives, this returns `NotReady` immediately.
     /// While polling, the child's piped stdout/stderr are background-drained and discarded exactly like
-    /// `WaitForPortAsync`, so startup output cannot block a chatty child before it becomes ready.
+    /// `WaitForPortAsync`, so startup output cannot block a chatty child before it becomes ready. `uri`
+    /// must be absolute; a relative URI throws `ArgumentException` before polling begins.
     member this.WaitForHttpAsync
         (uri: Uri, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        ArgumentNullException.ThrowIfNull uri
+        ReadinessProbe.validateAbsoluteUri uri
 
         this.WaitForHttpAsync(uri, ReadinessProbe.defaultHttpSuccess, timeout, cancellationToken)
 
+    /// Like `WaitForHttpAsync(uri, timeout, cancellationToken)`, but sends requests through the
+    /// caller-owned `client`. ProcessKit neither mutates nor disposes the client.
+    member this.WaitForHttpAsync
+        (uri: Uri, client: HttpClient, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        this.WaitForHttpAsync(uri, client, ReadinessProbe.defaultHttpSuccess, timeout, cancellationToken)
+
     /// Like `WaitForHttpAsync(uri, timeout, cancellationToken)`, but treats only status codes from
     /// `acceptableStatusCodes` as ready. The sequence is materialized once before polling, so every retry
-    /// applies the same criteria.
+    /// applies the same criteria. The sequence must contain at least one status code.
     member this.WaitForHttpAsync
         (uri: Uri, acceptableStatusCodes: seq<int>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken) : Task<
                                                                                                                                 Result<
@@ -2027,19 +2076,29 @@ type RunningProcess internal (host: RunningHost) =
                                                                                                                                  >
                                                                                                                              >
         =
-        ArgumentNullException.ThrowIfNull uri
-        ArgumentNullException.ThrowIfNull acceptableStatusCodes
-        let accepted = HashSet<int>(acceptableStatusCodes)
+        ReadinessProbe.validateAbsoluteUri uri
+        let isSatisfactory = httpStatusPredicate acceptableStatusCodes
 
-        this.WaitForHttpAsync(
-            uri,
-            Func<HttpResponseMessage, bool>(fun response -> accepted.Contains(int response.StatusCode)),
-            timeout,
-            cancellationToken
-        )
+        this.WaitForHttpAsync(uri, isSatisfactory, timeout, cancellationToken)
+
+    /// Like the status-code overload, but sends requests through the caller-owned `client`. ProcessKit
+    /// neither mutates nor disposes the client.
+    member this.WaitForHttpAsync
+        (
+            uri: Uri,
+            client: HttpClient,
+            acceptableStatusCodes: seq<int>,
+            timeout: TimeSpan,
+            [<Optional>] cancellationToken: CancellationToken
+        ) : Task<Result<unit, ProcessError>> =
+        ReadinessProbe.validateAbsoluteUri uri
+        ArgumentNullException.ThrowIfNull client
+        let isSatisfactory = httpStatusPredicate acceptableStatusCodes
+        this.WaitForHttpAsync(uri, client, isSatisfactory, timeout, cancellationToken)
 
     /// Like `WaitForHttpAsync(uri, timeout, cancellationToken)`, but uses `isSatisfactory` to inspect
     /// each response. A false result is retried; an exception from caller-supplied validation propagates.
+    /// `uri` must be absolute.
     member _.WaitForHttpAsync
         (
             uri: Uri,
@@ -2047,9 +2106,24 @@ type RunningProcess internal (host: RunningHost) =
             timeout: TimeSpan,
             [<Optional>] cancellationToken: CancellationToken
         ) : Task<Result<unit, ProcessError>> =
-        ArgumentNullException.ThrowIfNull uri
+        ReadinessProbe.validateAbsoluteUri uri
         ArgumentNullException.ThrowIfNull isSatisfactory
         waitForHttp uri isSatisfactory timeout cancellationToken
+
+    /// Like the predicate overload, but sends requests through the caller-owned `client`. ProcessKit
+    /// neither mutates nor disposes the client.
+    member _.WaitForHttpAsync
+        (
+            uri: Uri,
+            client: HttpClient,
+            isSatisfactory: Func<HttpResponseMessage, bool>,
+            timeout: TimeSpan,
+            [<Optional>] cancellationToken: CancellationToken
+        ) : Task<Result<unit, ProcessError>> =
+        ReadinessProbe.validateAbsoluteUri uri
+        ArgumentNullException.ThrowIfNull client
+        ArgumentNullException.ThrowIfNull isSatisfactory
+        waitForHttpWithClient client uri isSatisfactory timeout cancellationToken
 
     /// Poll `probe` until it returns true, or fail with `NotReady` once the shared `timeout` deadline
     /// elapses (or `Cancelled` if `cancellationToken` fires first). The deadline is honored even if

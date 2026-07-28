@@ -667,7 +667,7 @@ returning a `Result`:
 
 **F#**
 
-<!-- docsnippet:imports System.Net -->
+<!-- docsnippet:imports System.Net, System.Net.Http -->
 ```fsharp
 task {
     match! (Command.create "my-server").StartAsync() with
@@ -701,6 +701,14 @@ task {
         | Ok() -> printfn "HTTP health check passed"
         | Error err -> eprintfn $"{err.Message}"
 
+        // Supply a configured, caller-owned client for auth headers, custom TLS, proxies, or UDS HTTP.
+        use healthClient = new HttpClient()
+        healthClient.DefaultRequestHeaders.Add("Authorization", "Bearer local-health-token")
+
+        match! proc.WaitForHttpAsync(health, healthClient, TimeSpan.FromSeconds 10.0) with
+        | Ok() -> printfn "configured HTTP health check passed"
+        | Error err -> eprintfn $"{err.Message}"
+
         // 5. Any async predicate (a file appearing, a custom dependency check, …):
         match! proc.WaitForAsync((fun () -> healthCheck ()), TimeSpan.FromSeconds 10.0) with
         | Ok() -> printfn "healthy"
@@ -710,7 +718,7 @@ task {
 
 **C#**
 
-<!-- docsnippet:imports System.Net -->
+<!-- docsnippet:imports System.Net, System.Net.Http -->
 ```csharp
 await using var proc = (await new Command("my-server").StartAsync()).GetValueOrThrow();
 
@@ -744,6 +752,16 @@ var health = new Uri("http://127.0.0.1:8080/health");
 Console.WriteLine(await proc.WaitForHttpAsync(health, TimeSpan.FromSeconds(10)) switch
 {
     { IsOk: true }        => "HTTP health check passed",
+    { IsOk: false, ErrorValue: var err } => err.Message,
+});
+
+// Supply a configured, caller-owned client for auth headers, custom TLS, proxies, or UDS HTTP.
+using var healthClient = new HttpClient();
+healthClient.DefaultRequestHeaders.Add("Authorization", "Bearer local-health-token");
+
+Console.WriteLine(await proc.WaitForHttpAsync(health, healthClient, TimeSpan.FromSeconds(10)) switch
+{
+    { IsOk: true }        => "configured HTTP health check passed",
     { IsOk: false, ErrorValue: var err } => err.Message,
 });
 
@@ -782,7 +800,12 @@ async health check fits — re-evaluated until it returns `true` or the deadline
 
 `WaitForHttpAsync` sends GET requests every 50ms until it receives a 2xx response. Pass a
 `seq&lt;int&gt;` of acceptable status codes or a `Func<HttpResponseMessage, bool>` overload when a
-non-2xx response or response-specific validation defines readiness.
+non-2xx response or response-specific validation defines readiness. Every HTTP overload also accepts
+a caller-owned `HttpClient`, enabling authentication headers, custom certificate validation, proxies,
+and transports such as HTTP over a Unix domain socket; ProcessKit reuses but never mutates or disposes
+that client. HTTP probe URIs must be absolute, and an explicit acceptable-status sequence must contain
+at least one value. `WaitForSocketAsync` likewise rejects a socket path that the platform cannot encode
+before polling begins instead of spending the full timeout on a permanently invalid endpoint.
 ## Racing several children
 
 `RunningProcess.WaitAny` races several started handles and reports whichever exits

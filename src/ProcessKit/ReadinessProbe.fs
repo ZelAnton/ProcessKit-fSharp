@@ -18,6 +18,12 @@ open System.Threading.Tasks
 /// them) for the background drain below.
 module internal ReadinessProbe =
 
+    let validateAbsoluteUri (uri: Uri) =
+        ArgumentNullException.ThrowIfNull uri
+
+        if not uri.IsAbsoluteUri then
+            raise (ArgumentException("The HTTP probe URI must be absolute.", nameof uri))
+
     /// The one default HTTP health contract shared by readiness and supervisor liveness: every 2xx
     /// response is satisfactory. Kept as a single delegate so the two callers cannot drift and do not
     /// allocate an equivalent closure for every builder call.
@@ -328,16 +334,16 @@ module internal ReadinessProbe =
     /// production entry point, wired to a real `AddressFamily.Unix` socket and to the background drain.
     let internal waitForSocketUsing
         (timeProvider: TimeProvider)
-        (connect: string -> CancellationToken -> Task)
+        (connect: EndPoint -> CancellationToken -> Task)
         (program: string)
-        (path: string)
+        (endpoint: EndPoint)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         let probe (ct: CancellationToken) : Task<bool> =
             task {
                 try
-                    do! connect path ct
+                    do! connect endpoint ct
                     return true
                 with _ ->
                     // ANY connect failure means the socket is not accepting yet — no listener bound at
@@ -364,20 +370,20 @@ module internal ReadinessProbe =
         (program: string)
         (stdout: Stream option)
         (stderr: Stream option)
-        (path: string)
+        (endpoint: EndPoint)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        let unixConnect (path: string) (ct: CancellationToken) : Task =
+        let unixConnect (socketEndpoint: EndPoint) (ct: CancellationToken) : Task =
             task {
                 use client =
                     new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
 
-                do! client.ConnectAsync(UnixDomainSocketEndPoint path, ct)
+                do! client.ConnectAsync(socketEndpoint, ct)
             }
 
         withBackgroundDrain stdout stderr (fun () ->
-            waitForSocketUsing timeProvider unixConnect program path timeout cancellationToken)
+            waitForSocketUsing timeProvider unixConnect program endpoint timeout cancellationToken)
 
     /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).
@@ -410,6 +416,29 @@ module internal ReadinessProbe =
 
         waitForCoreUsing timeProvider program probe timeout cancellationToken
 
+    /// Poll an HTTP endpoint through caller-owned `client`. The client is reused for every attempt and is
+    /// never disposed or mutated by ProcessKit; each request still receives the shared readiness token.
+    let waitForHttpWithClient
+        (timeProvider: TimeProvider)
+        (program: string)
+        (stdout: Stream option)
+        (stderr: Stream option)
+        (client: HttpClient)
+        (uri: Uri)
+        (isSatisfactory: Func<HttpResponseMessage, bool>)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        withBackgroundDrain stdout stderr (fun () ->
+            waitForHttpUsing
+                timeProvider
+                (fun requestUri ct -> client.GetAsync(requestUri, ct))
+                isSatisfactory
+                program
+                uri
+                timeout
+                cancellationToken)
+
     /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).
     /// A single client is used for this readiness operation; its own timeout is disabled so every request
@@ -428,15 +457,16 @@ module internal ReadinessProbe =
             use client = new HttpClient(Timeout = Timeout.InfiniteTimeSpan)
 
             return!
-                withBackgroundDrain stdout stderr (fun () ->
-                    waitForHttpUsing
-                        timeProvider
-                        (fun requestUri ct -> client.GetAsync(requestUri, ct))
-                        isSatisfactory
-                        program
-                        uri
-                        timeout
-                        cancellationToken)
+                waitForHttpWithClient
+                    timeProvider
+                    program
+                    stdout
+                    stderr
+                    client
+                    uri
+                    isSatisfactory
+                    timeout
+                    cancellationToken
         }
 
     /// Poll `probe` until it returns true, or fail with `NotReady` once the shared `timeout` deadline

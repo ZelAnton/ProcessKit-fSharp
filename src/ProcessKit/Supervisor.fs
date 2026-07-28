@@ -218,7 +218,7 @@ module internal Liveness =
 type internal LivenessProbe =
 
     /// Poll `uri` with HTTP GET each attempt; the child is healthy when a response satisfies the check.
-    | Http of uri: Uri * isSatisfactory: Func<HttpResponseMessage, bool>
+    | Http of uri: Uri * isSatisfactory: Func<HttpResponseMessage, bool> * client: HttpClient option
 
     /// Evaluate an arbitrary async predicate each attempt; the child is healthy when it returns `true`.
     | Custom of probe: (unit -> Task<bool>)
@@ -519,8 +519,13 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
             // deadline logic.
             let attempt, resources =
                 match probe with
-                | LivenessProbe.Http(uri, isSatisfactory) ->
-                    let client = new HttpClient(Timeout = Timeout.InfiniteTimeSpan)
+                | LivenessProbe.Http(uri, isSatisfactory, callerClient) ->
+                    let client, resources =
+                        match callerClient with
+                        | Some client -> client, None
+                        | None ->
+                            let client = new HttpClient(Timeout = Timeout.InfiniteTimeSpan)
+                            client, Some(client :> IDisposable)
 
                     let check (probeToken: CancellationToken) =
                         ReadinessProbe.waitForHttpUsing
@@ -532,7 +537,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             probeTimeout
                             probeToken
 
-                    check, (client :> IDisposable)
+                    check, resources
                 | LivenessProbe.Custom userProbe ->
                     let check (probeToken: CancellationToken) =
                         ReadinessProbe.waitFor
@@ -544,9 +549,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             probeTimeout
                             probeToken
 
-                    check,
-                    { new IDisposable with
-                        member _.Dispose() = () }
+                    check, None
 
             backgroundTask {
                 try
@@ -598,7 +601,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                     // return, and the ordinary restart path takes over.
                                     observeFault (running.StopAsync grace)
                 finally
-                    resources.Dispose()
+                    resources |> Option.iter (fun resource -> resource.Dispose())
             }
             :> Task
 
@@ -1242,22 +1245,43 @@ type Supervisor internal (config: SupervisorConfig) =
     /// Liveness needs a live child handle, so it applies only to a spawn-capable runner (the default),
     /// not a capture-only test double. A single attempt reuses the same poll/deadline core as
     /// `RunningProcess.WaitForHttpAsync`. A zero or negative `interval` is clamped to a safe 1 ms
-    /// minimum so a configuration typo does not reject supervisor startup or create a hot loop.
+    /// minimum so a configuration typo does not reject supervisor startup or create a hot loop. `uri`
+    /// must be absolute; a relative URI throws `ArgumentException` while building the supervisor.
     member this.LivenessHttp(uri: Uri, interval: TimeSpan) =
-        ArgumentNullException.ThrowIfNull uri
+        ReadinessProbe.validateAbsoluteUri uri
 
         this.LivenessHttp(uri, ReadinessProbe.defaultHttpSuccess, interval)
+
+    /// Like `LivenessHttp(uri, interval)`, but sends requests through the caller-owned `client`.
+    /// ProcessKit reuses the client across attempts and never mutates or disposes it.
+    member this.LivenessHttp(uri: Uri, client: HttpClient, interval: TimeSpan) =
+        this.LivenessHttp(uri, client, ReadinessProbe.defaultHttpSuccess, interval)
 
     /// Like `LivenessHttp(uri, interval)`, but uses `isSatisfactory` to decide whether a response means
     /// the child is healthy (e.g. accept only a specific health-endpoint status/body). A zero or
     /// negative `interval` is clamped to a safe 1 ms minimum.
     member _.LivenessHttp(uri: Uri, isSatisfactory: Func<HttpResponseMessage, bool>, interval: TimeSpan) =
-        ArgumentNullException.ThrowIfNull uri
+        ReadinessProbe.validateAbsoluteUri uri
         ArgumentNullException.ThrowIfNull isSatisfactory
 
         Supervisor(
             { config with
-                Liveness = Some(LivenessProbe.Http(uri, isSatisfactory))
+                Liveness = Some(LivenessProbe.Http(uri, isSatisfactory, None))
+                LivenessInterval = Liveness.clampInterval interval }
+        )
+
+    /// Like the predicate overload, but sends requests through the caller-owned `client`. ProcessKit
+    /// reuses the client across attempts and never mutates or disposes it.
+    member _.LivenessHttp
+        (uri: Uri, client: HttpClient, isSatisfactory: Func<HttpResponseMessage, bool>, interval: TimeSpan)
+        =
+        ReadinessProbe.validateAbsoluteUri uri
+        ArgumentNullException.ThrowIfNull client
+        ArgumentNullException.ThrowIfNull isSatisfactory
+
+        Supervisor(
+            { config with
+                Liveness = Some(LivenessProbe.Http(uri, isSatisfactory, Some client))
                 LivenessInterval = Liveness.clampInterval interval }
         )
 

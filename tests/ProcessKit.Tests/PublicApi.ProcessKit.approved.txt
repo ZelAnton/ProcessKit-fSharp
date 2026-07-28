@@ -1054,6 +1054,9 @@ class ProcessKit.RunningProcess
   member WaitForAsync(System.Func<System.Threading.Tasks.Task<System.Boolean>>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForHttpAsync(System.Uri, System.Collections.Generic.IEnumerable<System.Int32>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForHttpAsync(System.Uri, System.Func<System.Net.Http.HttpResponseMessage, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member WaitForHttpAsync(System.Uri, System.Net.Http.HttpClient, System.Collections.Generic.IEnumerable<System.Int32>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member WaitForHttpAsync(System.Uri, System.Net.Http.HttpClient, System.Func<System.Net.Http.HttpResponseMessage, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member WaitForHttpAsync(System.Uri, System.Net.Http.HttpClient, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForHttpAsync(System.Uri, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForLineAsync(System.Func<System.String, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
   member WaitForPortAsync(System.Net.IPEndPoint, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
@@ -1280,6 +1283,8 @@ class ProcessKit.Supervisor
   member LivenessFailures(System.Int32) : ProcessKit.Supervisor
   member LivenessGrace(System.TimeSpan) : ProcessKit.Supervisor
   member LivenessHttp(System.Uri, System.Func<System.Net.Http.HttpResponseMessage, System.Boolean>, System.TimeSpan) : ProcessKit.Supervisor
+  member LivenessHttp(System.Uri, System.Net.Http.HttpClient, System.Func<System.Net.Http.HttpResponseMessage, System.Boolean>, System.TimeSpan) : ProcessKit.Supervisor
+  member LivenessHttp(System.Uri, System.Net.Http.HttpClient, System.TimeSpan) : ProcessKit.Supervisor
   member LivenessHttp(System.Uri, System.TimeSpan) : ProcessKit.Supervisor
   member LivenessTimeout(System.TimeSpan) : ProcessKit.Supervisor
   member MaxBackoff(System.TimeSpan) : ProcessKit.Supervisor

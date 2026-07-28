@@ -3,7 +3,6 @@
 extend-exclude = [
 	"**/bin/**",
 	"**/obj/**",
-	"BenchmarkDotNet.Artifacts/**",
 	"apidocs/_*/**",
 	"apidocs/output/**",
 	"**/fixtures/**",

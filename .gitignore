@@ -54,6 +54,9 @@ TestResults/
 *.coverage
 *.coveragexml
 
+# BenchmarkDotNet build output (published by CI when needed, never source-controlled).
+/BenchmarkDotNet.Artifacts/
+
 ## -------
 ## F# / FSI
 ## -------

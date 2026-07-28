@@ -509,7 +509,7 @@ of hammering restarts at backoff speed. Supervision runs through the `IProcessRu
 
 ## Waiting for a child to be ready
 
-"Start a server, then use it" needs the server to be *ready*, not merely started. Three probes
+"Start a server, then use it" needs the server to be *ready*, not merely started. Five probes
 replace the arbitrary sleep:
 
 **F#**
@@ -553,6 +553,11 @@ Console.WriteLine(await proc.WaitForLineAsync(l => l.Contains("listening on"), T
 A probe that doesn't pass within its deadline — or that can no longer pass (the child exits; for
 `WaitForLineAsync`, its stdout closes) — fails with `ProcessError.NotReady` (distinct from a timeout)
 and **does not kill the child**: the caller decides what happens next.
+
+HTTP readiness and supervisor liveness accept a caller-owned `HttpClient` for authentication headers,
+custom TLS validation, proxies, or alternate transports. ProcessKit reuses but never mutates or
+disposes that client; the caller retains its lifetime. HTTP probe URIs must be absolute, explicit
+acceptable-status sets must be non-empty, and invalid Unix-socket paths fail before polling begins.
 
 *Deeper: [Streaming → readiness probes](docs/streaming.md#readiness-probes).*
 

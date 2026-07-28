@@ -15,6 +15,34 @@ open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
 
+type private ReadinessHttpHandler() =
+    inherit HttpMessageHandler()
+
+    let mutable requests = 0
+    let mutable disposed = 0
+    let mutable probeHeader: string option = None
+
+    member _.Requests = Volatile.Read(&requests)
+    member _.Disposed = Volatile.Read(&disposed) <> 0
+    member _.ProbeHeader = probeHeader
+
+    override _.SendAsync(request: HttpRequestMessage, _cancellationToken: CancellationToken) =
+        Interlocked.Increment(&requests) |> ignore
+
+        probeHeader <-
+            if request.Headers.Contains "X-ProcessKit-Probe" then
+                request.Headers.GetValues "X-ProcessKit-Probe" |> Seq.tryHead
+            else
+                None
+
+        Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent))
+
+    override this.Dispose(disposing: bool) =
+        if disposing then
+            Interlocked.Exchange(&disposed, 1) |> ignore
+
+        base.Dispose disposing
+
 [<TestFixture>]
 type ReadinessTests() =
 
@@ -315,6 +343,105 @@ type ReadinessTests() =
                 | Error error -> Assert.Fail $"{error}"
             finally
                 listener.Stop()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``HTTP readiness arguments fail fast at the API boundary``() : Task =
+        task {
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            let relative = Uri("health", UriKind.Relative)
+            let timeout = TimeSpan.FromSeconds 1.0
+            use client = new HttpClient(new ReadinessHttpHandler())
+
+            Assert.Throws<ArgumentException>(Action(fun () -> running.WaitForHttpAsync(relative, timeout) |> ignore))
+            |> ignore
+
+            Assert.Throws<ArgumentException>(
+                Action(fun () -> running.WaitForHttpAsync(relative, Seq.singleton 200, timeout) |> ignore)
+            )
+            |> ignore
+
+            Assert.Throws<ArgumentException>(
+                Action(fun () ->
+                    running.WaitForHttpAsync(relative, Func<HttpResponseMessage, bool>(fun _ -> true), timeout)
+                    |> ignore)
+            )
+            |> ignore
+
+            Assert.Throws<ArgumentException>(
+                Action(fun () ->
+                    running.WaitForHttpAsync(Uri "http://localhost/", Seq.empty<int>, timeout)
+                    |> ignore)
+            )
+            |> ignore
+
+            Assert.Throws<ArgumentException>(
+                Action(fun () -> running.WaitForHttpAsync(relative, client, timeout) |> ignore)
+            )
+            |> ignore
+
+            Assert.Throws<ArgumentException>(
+                Action(fun () -> running.WaitForHttpAsync(relative, client, Seq.singleton 200, timeout) |> ignore)
+            )
+            |> ignore
+
+            Assert.Throws<ArgumentException>(
+                Action(fun () ->
+                    running.WaitForHttpAsync(relative, client, Func<HttpResponseMessage, bool>(fun _ -> true), timeout)
+                    |> ignore)
+            )
+            |> ignore
+
+            Assert.Throws<ArgumentException>(
+                Action(fun () ->
+                    running.WaitForHttpAsync(Uri "http://localhost/", client, Seq.empty<int>, timeout)
+                    |> ignore)
+            )
+            |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``HTTP readiness uses but never disposes a caller-owned client``() : Task =
+        task {
+            let handler = new ReadinessHttpHandler()
+            use client = new HttpClient(handler)
+            client.DefaultRequestHeaders.Add("X-ProcessKit-Probe", "configured")
+            let uri = Uri "https://self-signed.test/health"
+            let timeout = TimeSpan.FromSeconds 1.0
+
+            use defaultProbe = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+
+            match! defaultProbe.WaitForHttpAsync(uri, client, timeout) with
+            | Error error -> Assert.Fail $"default client overload failed: {error}"
+            | Ok() -> ()
+
+            use statusProbe = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+
+            match! statusProbe.WaitForHttpAsync(uri, client, Seq.singleton 204, timeout) with
+            | Error error -> Assert.Fail $"status client overload failed: {error}"
+            | Ok() -> ()
+
+            use predicateProbe = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+
+            match!
+                predicateProbe.WaitForHttpAsync(
+                    uri,
+                    client,
+                    Func<HttpResponseMessage, bool>(fun response -> response.StatusCode = HttpStatusCode.NoContent),
+                    timeout
+                )
+            with
+            | Error error -> Assert.Fail $"predicate client overload failed: {error}"
+            | Ok() -> ()
+
+            Assert.That(handler.Requests, Is.EqualTo 3)
+            Assert.That(handler.ProbeHeader, Is.EqualTo(Some "configured"))
+            Assert.That(handler.Disposed, Is.False, "ProcessKit must not dispose a caller-owned HttpClient")
+
+            use! response = client.GetAsync uri
+            Assert.That(response.StatusCode, Is.EqualTo HttpStatusCode.NoContent)
         }
         :> Task
 
@@ -1291,6 +1418,22 @@ type ReadinessTests() =
             match! running.WaitForSocketAsync(path, TimeSpan.FromMilliseconds 250.0) with
             | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
             | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForSocket rejects an endpoint path that cannot fit in sun_path``() : Task =
+        task {
+            if not Socket.OSSupportsUnixDomainSockets then
+                Assert.Ignore "this host has no AF_UNIX support"
+
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            let path = String('x', 512)
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () -> running.WaitForSocketAsync(path, TimeSpan.FromSeconds 1.0) |> ignore)
+            )
+            |> ignore
         }
         :> Task
 
