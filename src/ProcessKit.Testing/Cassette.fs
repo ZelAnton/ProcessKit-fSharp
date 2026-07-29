@@ -950,9 +950,16 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             resultOf: Command -> CassetteEntry -> Result<ProcessResult<'a>, ProcessError>
         ) : Task<Result<ProcessResult<'a>, ProcessError>> =
         task {
-            if cancellationToken.IsCancellationRequested then
-                // Honour the cancelled-is-always-an-error contract on every mode: replay ignored the
-                // token entirely, and record should not capture a run the caller cancelled up front.
+            use linkedCts =
+                match command.Config.CancelOn with
+                | Some extra -> CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, extra)
+                | None -> CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+
+            let effectiveToken = linkedCts.Token
+
+            if effectiveToken.IsCancellationRequested then
+                // Completion verbs honour both their own token and `Command.CancelOn`, including in
+                // replay mode where no inner runner exists to observe the command configuration.
                 return Error(ProcessError.Cancelled command.Program)
             elif command.Config.ExtraFds.Count > 0 then
                 return
@@ -966,37 +973,51 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 | Ok digest ->
                     match mode with
                     | RecordMode(inner, recorded, dirty) ->
-                        match! captureInner inner command cancellationToken with
+                        match! captureInner inner command effectiveToken with
                         | Error error -> return Error error
                         | Ok result ->
-                            lock gate (fun () ->
-                                recorded.Add(entryOf command result digest)
-                                dirty.Value <- true)
+                            if effectiveToken.IsCancellationRequested then
+                                return Error(ProcessError.Cancelled command.Program)
+                            else
+                                lock gate (fun () ->
+                                    recorded.Add(entryOf command result digest)
+                                    dirty.Value <- true)
 
-                            return Ok result
+                                return Ok result
                     | ReplayMode slots ->
                         match replayEntry slots command digest with
                         | Error error -> return Error error
-                        | Ok(Some entry) -> return resultOf command entry
+                        | Ok(Some entry) ->
+                            if effectiveToken.IsCancellationRequested then
+                                return Error(ProcessError.Cancelled command.Program)
+                            else
+                                return resultOf command entry
                         | Ok None -> return Error(ProcessError.CassetteMiss command.Program)
                     | AutoMode(inner, slots, recorded, dirty) ->
                         let key = keyOf command digest
 
                         match replayEntry slots command digest with
                         | Error error -> return Error error
-                        | Ok(Some entry) -> return resultOf command entry
+                        | Ok(Some entry) ->
+                            if effectiveToken.IsCancellationRequested then
+                                return Error(ProcessError.Cancelled command.Program)
+                            else
+                                return resultOf command entry
                         | Ok None ->
-                            match! captureInner inner command cancellationToken with
+                            match! captureInner inner command effectiveToken with
                             | Error error -> return Error error
                             | Ok result ->
-                                let entry = entryOf command result digest
+                                if effectiveToken.IsCancellationRequested then
+                                    return Error(ProcessError.Cancelled command.Program)
+                                else
+                                    let entry = entryOf command result digest
 
-                                lock gate (fun () ->
-                                    recorded.Add entry
-                                    remember slots key entry
-                                    dirty.Value <- true)
+                                    lock gate (fun () ->
+                                        recorded.Add entry
+                                        remember slots key entry
+                                        dirty.Value <- true)
 
-                                return Ok result
+                                    return Ok result
         }
 
     member private this.Capture(command: Command, cancellationToken: CancellationToken) =

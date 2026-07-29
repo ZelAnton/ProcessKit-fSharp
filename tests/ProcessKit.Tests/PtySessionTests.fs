@@ -593,6 +593,23 @@ type PtySessionTests() =
         |> ignore
 
     [<Test>]
+    member _.``session options reject null at public entry points``() : Task =
+        task {
+            let fake = FakeProcess.Create("fake-tool").WithPty()
+
+            use running = fake.Build()
+            let options = Unchecked.defaultof<PtySessionOptions>
+
+            Assert.Throws<ArgumentNullException>(Action(fun () -> PtySession(running, options) |> ignore))
+            |> ignore
+
+            Assert.Throws<ArgumentNullException>(
+                Action(fun () -> PtySession.WithAnsiFiltering(running, options) |> ignore)
+            )
+            |> ignore
+        }
+
+    [<Test>]
     member _.``a session started after a readiness probe still reports the real exit (K-016)``() : Task =
         task {
             // The probe starts the handle's ONE shared exit wait while deliberately leaving the pipes

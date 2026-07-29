@@ -669,6 +669,11 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             clearCurrent running
 
                             match fault with
+                            | Some(:? ProcessException as ex) ->
+                                // Buffered pump failures are typed ProcessExceptions at the live-handle
+                                // boundary; supervision consumes the structured error so transient I/O can
+                                // follow the configured restart policy and retain liveness attribution.
+                                return Error ex.Error
                             | Some ex -> return! Task.FromException<Result<ProcessResult<string>, ProcessError>> ex
                             | None -> return captured
             }
@@ -902,6 +907,10 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                         escalation <- escalation + 1
                                         bumpRestarts ()
                         | Error error ->
+                            // Consume the per-incarnation verdict even when capture itself failed: a
+                            // live child can fault its pump after the monitor has stopped it.
+                            let livenessCausedError = takeLivenessTripped ()
+
                             match error with
                             | ProcessError.Cancelled _ -> final <- Some(Error error)
                             | _ ->
@@ -919,9 +928,14 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                     final <- Some(Error error)
                                 else
                                     do! stormGate ()
-                                    // A run that never produced a result had no live child to probe, so a
-                                    // spawn/IO-error restart is always an ordinary `Exit`-cause restart.
-                                    do! sleepBackoff escalation (restarts + 1) RestartCause.Exit
+
+                                    let cause =
+                                        if livenessCausedError then
+                                            RestartCause.Liveness
+                                        else
+                                            RestartCause.Exit
+
+                                    do! sleepBackoff escalation (restarts + 1) cause
                                     escalation <- escalation + 1
                                     bumpRestarts ()
 

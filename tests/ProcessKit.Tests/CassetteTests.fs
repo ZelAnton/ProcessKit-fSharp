@@ -137,6 +137,65 @@ type CassetteTests() =
         }
 
     [<Test>]
+    member _.``replay completion honours an already-cancelled Command.CancelOn``() : Task =
+        withCassette (fun path ->
+            task {
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("recorded", 0))
+                        let! _ = (runner recorder).OutputStringAsync(Command.create "tool", CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                use cancelled = new CancellationTokenSource()
+                cancelled.Cancel()
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    let command = (Command.create "tool").CancelOn(cancelled.Token)
+
+                    match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                    | Error(ProcessError.Cancelled "tool") -> ()
+                    | other -> Assert.Fail $"expected Command.CancelOn cancellation, got {other}"
+            })
+
+    [<Test>]
+    member _.``replay Start ignores Command.CancelOn after the spawn boundary``() : Task =
+        withCassette (fun path ->
+            task {
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("recorded", 0))
+                        let! _ = (runner recorder).OutputStringAsync(Command.create "tool", CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                use cancelled = new CancellationTokenSource()
+                cancelled.Cancel()
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    let command = (Command.create "tool").CancelOn(cancelled.Token)
+
+                    match! (runner replayer).StartAsync(command, CancellationToken.None) with
+                    | Error error -> Assert.Fail $"CancelOn must not cancel a caller-owned live handle: {error}"
+                    | Ok running ->
+                        use running = running
+
+                        match! running.OutputStringAsync() with
+                        | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded")
+                        | Error error -> Assert.Fail $"replayed fake failed: {error}"
+            })
+
+    [<Test>]
     member _.``a cassette entry with omitted fields replays without a NullReferenceException``() : Task =
         withCassette (fun path ->
             task {

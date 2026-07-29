@@ -13,8 +13,8 @@ open ProcessKit
 /// matching `JobRunner`/`ProcessGroup`) and the verb projection itself.
 module internal Seam =
 
-    /// Guard cancellation, then hand off to `resolve` for an already-validated command. A cancelled
-    /// run is always an error and never reaches `resolve`.
+    /// Guard the one-shot spawn token, then hand off to `resolve` for an already-validated command.
+    /// `CancelOn` deliberately does not apply here: a live handle is caller-driven after spawning.
     let serve
         (resolve: Command -> Result<RunningProcess, ProcessError>)
         (command: Command)
@@ -25,20 +25,47 @@ module internal Seam =
         else
             resolve command
 
+    /// Run a completion verb with the same linked-token contract as a real runner. Unlike `SpawnAsync`,
+    /// completion owns the running fake and therefore kills it when either cancellation source fires.
+    let complete
+        (resolve: Command -> Result<RunningProcess, ProcessError>)
+        (consume: RunningProcess -> Task<Result<'a, ProcessError>>)
+        (command: Command)
+        (cancellationToken: CancellationToken)
+        : Task<Result<'a, ProcessError>> =
+        task {
+            use linkedCts =
+                match command.Config.CancelOn with
+                | Some extra -> CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, extra)
+                | None -> CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+
+            let effectiveToken = linkedCts.Token
+
+            if effectiveToken.IsCancellationRequested then
+                return Error(ProcessError.Cancelled command.Program)
+            else
+                match resolve command with
+                | Error error -> return Error error
+                | Ok running ->
+                    use _registration = effectiveToken.Register(fun () -> running.Kill())
+                    let! result = consume running
+
+                    if effectiveToken.IsCancellationRequested then
+                        return Error(ProcessError.Cancelled command.Program)
+                    else
+                        return result
+        }
+
     /// Build the full `IProcessRunner` seam over `resolve`, so a double's own `interface
     /// IProcessRunner` block is a one-line forward per verb instead of a byte-for-byte copy of the
     /// cancellation check and the string/bytes/handle projection.
     let runner (resolve: Command -> Result<RunningProcess, ProcessError>) : IProcessRunner =
         { new IProcessRunner with
             member _.CaptureStringAsync(command, cancellationToken) =
-                match serve resolve command cancellationToken with
-                | Ok running -> running.OutputStringAsync()
-                | Error error -> Task.FromResult(Error error)
+                complete resolve (fun running -> running.OutputStringAsync()) command cancellationToken
 
             member _.SpawnAsync(command, cancellationToken) =
                 Task.FromResult(serve resolve command cancellationToken)
 
             member _.CaptureBytesAsync(command, cancellationToken) =
-                match serve resolve command cancellationToken with
-                | Ok running -> running.OutputBytesAsync()
-                | Error error -> Task.FromResult(Error error) }
+                complete resolve (fun running -> running.OutputBytesAsync()) command cancellationToken }

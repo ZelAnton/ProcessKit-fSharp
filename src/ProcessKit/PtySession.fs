@@ -123,6 +123,7 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
 
     do
         ArgumentNullException.ThrowIfNull(running, nameof running)
+        ArgumentNullException.ThrowIfNull(options, nameof options)
         ArgumentOutOfRangeException.ThrowIfLessThan(options.WindowChars, 1, "options.WindowChars")
 
         if options.CaptureTranscript then

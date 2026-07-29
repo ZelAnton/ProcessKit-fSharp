@@ -91,20 +91,20 @@ type private FakeClock() =
 [<AutoOpen>]
 module private SessionTestHelpers =
 
-    let buildRunningProcess
+    let buildRunningProcessWithStdout
         (command: Command)
         (pid: int option)
+        (stdout: Stream)
         (wait: unit -> Task<Outcome>)
         (graceful: TimeSpan -> Task)
         (startKill: unit -> unit)
         : RunningProcess =
-        let stdout = new MemoryStream()
         let stderr = new MemoryStream()
 
         let host: RunningHost =
             { Config = command.Config
               Pid = pid
-              Stdout = Some(stdout :> Stream)
+              Stdout = Some stdout
               Stderr = Some(stderr :> Stream)
               Stdin = None
               StartTime = DateTime.UtcNow
@@ -125,6 +125,15 @@ module private SessionTestHelpers =
                     ValueTask.CompletedTask }
 
         new RunningProcess(host)
+
+    let buildRunningProcess
+        (command: Command)
+        (pid: int option)
+        (wait: unit -> Task<Outcome>)
+        (graceful: TimeSpan -> Task)
+        (startKill: unit -> unit)
+        : RunningProcess =
+        buildRunningProcessWithStdout command pid (new MemoryStream()) wait graceful startKill
 
     /// Poll `predicate` until it holds or a generous deadline elapses, failing the test loudly on a
     /// timeout so a wedged supervision loop surfaces as a clear assertion rather than a hung test.
@@ -317,6 +326,99 @@ type private LivenessChildRunner() =
 
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "LivenessChildRunner drives incarnations via SpawnAsync"))
+
+/// A readable stream that stays pending until the test releases a genuine I/O fault.
+type private GatedIoFaultStream() =
+    inherit Stream()
+
+    let release =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    member _.Fault() = release.TrySetResult() |> ignore
+
+    member private _.ReadFault(cancellationToken: CancellationToken) : Task<int> =
+        task {
+            do! release.Task.WaitAsync cancellationToken
+            return raise (IOException "scripted live-pump fault")
+        }
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = raise (NotSupportedException())
+        and set _ = raise (NotSupportedException())
+
+    override _.Flush() = ()
+
+    override _.Read(_buffer, _offset, _count) =
+        release.Task.GetAwaiter().GetResult()
+        raise (IOException "scripted live-pump fault")
+
+    override this.ReadAsync(_buffer, _offset, _count, cancellationToken) = this.ReadFault cancellationToken
+
+    override this.ReadAsync(_buffer: Memory<byte>, cancellationToken) =
+        ValueTask<int>(this.ReadFault cancellationToken)
+
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = raise (NotSupportedException())
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+
+/// The first incarnation is live until liveness stops it, then its stdout pump faults with genuine I/O;
+/// the second exits normally so a leaked liveness verdict would be observable as a wrong cause.
+type private LivenessIoErrorRunner() =
+    let mutable spawns = 0
+
+    member _.Spawns = Volatile.Read(&spawns)
+
+    interface IProcessRunner with
+        member _.SpawnAsync(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                let incarnation = Interlocked.Increment(&spawns)
+
+                if incarnation = 1 then
+                    let wait =
+                        TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                    let stdout = new GatedIoFaultStream()
+
+                    let hardKill () =
+                        wait.TrySetResult(Outcome.Exited 0) |> ignore
+
+                    Task.FromResult(
+                        Ok(
+                            buildRunningProcessWithStdout
+                                command
+                                (Some 8080)
+                                stdout
+                                (fun () -> wait.Task)
+                                (fun _ ->
+                                    stdout.Fault()
+                                    Task.CompletedTask)
+                                hardKill
+                        )
+                    )
+                else
+                    Task.FromResult(
+                        Ok(
+                            buildRunningProcess
+                                command
+                                (Some 8081)
+                                (fun () -> Task.FromResult(Outcome.Exited 1))
+                                (fun _ -> Task.CompletedTask)
+                                (fun () -> ())
+                        )
+                    )
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "LivenessIoErrorRunner uses SpawnAsync"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "LivenessIoErrorRunner uses SpawnAsync"))
 
 /// A deterministic liveness-delay seam: the first requested delay is held until the test releases it,
 /// while later delays remain cancellable. This makes startup-delay and no-hot-loop assertions independent
@@ -1565,6 +1667,35 @@ type SupervisorTests() =
 
                 Assert.That(events[0].Program, Is.EqualTo "hung")
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a liveness-stopped incarnation that returns Io keeps its liveness restart cause``() : Task =
+        task {
+            let runner = LivenessIoErrorRunner()
+            let events = ResizeArray<SupervisorRestartEvent>()
+
+            let supervisor =
+                Supervisor(Command.create "hung-io")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .MaxRestarts(2)
+                    .LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult false), TimeSpan.FromMilliseconds 10.0)
+                    .LivenessFailures(1)
+                    .LivenessTimeout(TimeSpan.FromMilliseconds 40.0)
+                    .LivenessGrace(TimeSpan.FromMilliseconds 100.0)
+                    .OnRestart(fun e -> events.Add e)
+
+            match! supervisor.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 2)
+                Assert.That(runner.Spawns, Is.EqualTo 3)
+                Assert.That(events.Count, Is.EqualTo 2)
+                Assert.That(events[0].Cause, Is.EqualTo RestartCause.Liveness)
+                Assert.That(events[1].Cause, Is.EqualTo RestartCause.Exit, "the liveness flag must not leak")
+            | Error error -> Assert.Fail $"expected the transient I/O error to follow the restart policy, got {error}"
         }
         :> Task
 

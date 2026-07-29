@@ -178,6 +178,39 @@ type TestabilityTests() =
         }
 
     [<Test>]
+    member _.``ScriptedRunner completion honours an already-cancelled Command.CancelOn``() : Task =
+        task {
+            use cancelled = new CancellationTokenSource()
+            cancelled.Cancel()
+
+            let runner: IProcessRunner = ScriptedRunner().On([ "x" ], Reply.Ok "must not run")
+            let command = (Command.create "x").CancelOn(cancelled.Token)
+
+            match! runner.OutputStringAsync(command, CancellationToken.None) with
+            | Error(ProcessError.Cancelled "x") -> ()
+            | other -> Assert.Fail $"expected Command.CancelOn cancellation, got {other}"
+        }
+
+    [<Test>]
+    member _.``ScriptedRunner Start ignores Command.CancelOn after the spawn boundary``() : Task =
+        task {
+            use cancelled = new CancellationTokenSource()
+            cancelled.Cancel()
+
+            let runner: IProcessRunner = ScriptedRunner().On([ "x" ], Reply.Ok "started")
+            let command = (Command.create "x").CancelOn(cancelled.Token)
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"CancelOn must not cancel a caller-owned live handle: {error}"
+            | Ok running ->
+                use running = running
+
+                match! running.OutputStringAsync() with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "started")
+                | Error error -> Assert.Fail $"started fake failed: {error}"
+        }
+
+    [<Test>]
     member _.``ScriptedRunner can script a timeout``() : Task =
         task {
             let runner: IProcessRunner = ScriptedRunner().On([ "x" ], Reply.TimedOut)
