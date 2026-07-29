@@ -150,41 +150,50 @@ expand files in F# before creating the command.
 
 ## Handle Ctrl+C without orphaning the run
 
-By default the runtime may terminate a console application immediately after Ctrl+C. Set
-`ConsoleCancelEventArgs.Cancel`, cancel a token, and let the ProcessKit verb unwind. A completion verb
-observes the token for the whole run, kills the contained tree, waits for cleanup, and returns
-`ProcessError.Cancelled`.
+For a live handle, `ForwardParentSignals` installs and owns the signal handlers, suppresses the
+parent's immediate termination, and forwards the first request into the run's graceful
+`StopSignal` → grace → hard-kill path. It automatically unregisters when the child exits; disposing
+the returned scope unregisters earlier.
 
 ```fsharp
 let runWithCtrlC () =
-    use shutdown = new CancellationTokenSource()
+    task {
+        match! (Command.create "long-running-tool").StartAsync() with
+        | Error error -> return Error error
+        | Ok running ->
+            use running = running
+            use _signals = running.ForwardParentSignals(TimeSpan.FromSeconds 5.0)
+            return! running.OutputStringAsync()
+    }
 
-    let handler =
-        ConsoleCancelEventHandler(fun _ eventArgs ->
-            eventArgs.Cancel <- true
-            shutdown.Cancel())
-
-    Console.CancelKeyPress.AddHandler handler
-
-    try
-        (Command.create "long-running-tool").ExitCodeAsync(shutdown.Token)
-        |> fun pending -> pending.GetAwaiter().GetResult()
-    finally
-        Console.CancelKeyPress.RemoveHandler handler
-
-let childExit = runWithCtrlC ()
+let childExit = runWithCtrlC().GetAwaiter().GetResult()
 ```
 
-Do not call `Environment.Exit` in the handler: it bypasses the unwind you installed the handler to
-preserve. This pattern covers an ordinary Ctrl+C. A crash, `SIGKILL`, or `TerminateProcess` cannot run
+```csharp
+var started = await new Command("long-running-tool").StartAsync();
+if (started is { IsOk: true, ResultValue: var running })
+{
+    await using (running)
+    using (running.ForwardParentSignals(TimeSpan.FromSeconds(5)))
+        await running.OutputStringAsync();
+}
+```
+
+On POSIX the scope handles `SIGINT` and `SIGTERM`. On Windows it handles Ctrl+C and Ctrl+Break,
+but forwarding means the existing Windows `StopAsync` contract — best-effort `WM_CLOSE`, then atomic
+Job termination after the grace window — not a guarantee that a windowless console child receives
+the original Ctrl event. Repeated signals while the scope is active do not start duplicate teardown.
+
+Do not call `Environment.Exit`: it bypasses the unwind the forwarding scope protects. A crash,
+`SIGKILL`, or `TerminateProcess` cannot run
 managed disposal; if sudden parent death is in scope, read
 [`KillOnParentDeath`](containers.md#when-the-parent-is-killed-outright-commandkillonparentdeath)
 before opting in. Its honest scope is platform-specific: whole tree on Windows, direct child only on
 Linux, and unavailable on macOS/BSD.
 
-If you use `StartAsync` and keep a live `RunningProcess`, cancellation is caller-driven after the spawn:
-dispose the handle (or call `StopAsync`) from your token callback. Completion verbs such as the one
-above track cancellation themselves.
+Completion verbs can instead receive a cancellation token for the whole run and return
+`ProcessError.Cancelled`; `ForwardParentSignals` is specifically for a caller-owned live handle where
+you want an honest graceful `Outcome`.
 
 ## Return an honest exit code
 

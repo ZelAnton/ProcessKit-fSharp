@@ -476,10 +476,14 @@ await cmd.RunAsync(); // also cancels if shutdownToken fires
 
 The contract, path by path:
 
+For a live `RunningProcess` in a CLI wrapper, `ForwardParentSignals(gracePeriod)` is the first-class
+scope for Ctrl+C/Ctrl+Break on Windows and SIGINT/SIGTERM on POSIX. It calls `StopAsync` once,
+auto-unsubscribes when the child exits, and leaves output consumption to the caller.
+
 | Situation | Behavior |
 |---|---|
 | Cancel during `RunAsync` / `OutputStringAsync` / `OutputBytesAsync` / `ExitCodeAsync` / `ProbeAsync` / `ParseAsync` | tree killed → `Error (ProcessError.Cancelled program)` |
-| Cancel on a live handle (`StdoutLinesAsync`/`FinishAsync` after `StartAsync`) | **not tracked** — the token is checked only before the spawn, and a live handle is caller-driven. Stop the handle yourself (or register the token to do it): `Kill`/dispose for an immediate hard kill, or `StopAsync(gracePeriod)` for the command's configured soft signal → grace → hard-kill stop; ProcessKit does not kill the child or surface `Cancelled` for you here |
+| Cancel on a live handle (`StdoutLinesAsync`/`FinishAsync` after `StartAsync`) | **not tracked** — the token is checked only before the spawn, and a live handle is caller-driven. Stop the handle yourself: `Kill`/dispose for an immediate hard kill, `StopAsync(gracePeriod)` for a graceful stop, or `ForwardParentSignals(gracePeriod)` for parent console/termination signals; ProcessKit does not surface `Cancelled` for you here |
 | Token already cancelled **before** the run | short-circuits before spawning — no process is ever created |
 | `FirstLineAsync` mid-run | surfaces `ProcessError.Cancelled` once the token fires (not `Ok None`) |
 | Under `Retry` | terminal — the built-in classifiers reject `Cancelled` and the loop stops re-trying |

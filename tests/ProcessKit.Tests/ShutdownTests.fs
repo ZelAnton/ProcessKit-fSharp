@@ -61,6 +61,51 @@ type private GracefulFaultBackend() =
         member _.HardRelease() =
             hardReleaseCount <- hardReleaseCount + 1
 
+type private ForwardingHost() =
+    let completion =
+        TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable gracefulStops = 0
+
+    member _.GracefulStops = Volatile.Read(&gracefulStops)
+
+    member _.Complete(outcome: Outcome) =
+        completion.TrySetResult outcome |> ignore
+
+    member this.Build() =
+        let command = Command.create "forwarded-child"
+        let stdout = new MemoryStream()
+        let stderr = new MemoryStream()
+
+        let host: RunningHost =
+            { Config = command.Config
+              Pid = Some 4321
+              Stdout = Some(stdout :> Stream)
+              Stderr = Some(stderr :> Stream)
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = None
+              Wait = fun () -> completion.Task
+              StdinError = fun () -> None
+              StdinFeedComplete = ignore
+              StartKill = fun () -> this.Complete(Outcome.Signalled None)
+              Signal = fun _ -> Ok()
+              GracefulKill =
+                fun _ ->
+                    Interlocked.Increment(&gracefulStops) |> ignore
+                    this.Complete(Outcome.Signalled(Some 15))
+                    Task.CompletedTask
+              ResizePty = None
+              TreeStats = None
+              Teardown =
+                fun () ->
+                    stdout.Dispose()
+                    stderr.Dispose()
+                    ValueTask.CompletedTask }
+
+        new RunningProcess(host)
+
 [<TestFixture>]
 type ShutdownTests() =
 
@@ -81,6 +126,17 @@ type ShutdownTests() =
     let tempMarker (prefix: string) =
         let id = Guid.NewGuid().ToString("N")
         Path.Combine(Path.GetTempPath(), $"pk-{prefix}-{id}.marker")
+
+    let waitUntil (predicate: unit -> bool) : Task =
+        task {
+            let deadline = DateTime.UtcNow.AddSeconds 5.0
+
+            while not (predicate ()) && DateTime.UtcNow < deadline do
+                do! Task.Delay 10
+
+            Assert.That(predicate (), Is.True, "timed out waiting for forwarding scope teardown")
+        }
+        :> Task
 
     // Start a live handle over the DEFAULT runner's private, handle-owned group (`Command.StartAsync()`),
     // which — unlike the shared-group `group.StartAsync` above — gets the full graceful stop on Unix.
@@ -309,6 +365,64 @@ type ShutdownTests() =
             finally
                 if File.Exists marker then
                     File.Delete marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``parent signal forwarding starts one graceful stop and removes its subscription``() : Task =
+        task {
+            let host = ForwardingHost()
+            use running = host.Build()
+            let mutable callback = fun () -> false
+            let mutable disposed = 0
+
+            use scope =
+                running.ForwardParentSignalsUsing(
+                    TimeSpan.Zero,
+                    fun forward ->
+                        callback <- forward
+
+                        { new IDisposable with
+                            member _.Dispose() =
+                                Interlocked.Increment(&disposed) |> ignore }
+                )
+
+            Assert.That(callback (), Is.True)
+            Assert.That(callback (), Is.True, "a repeat signal is suppressed but remains handled by the scope")
+            do! waitUntil (fun () -> Volatile.Read(&disposed) = 1)
+            Assert.That(host.GracefulStops, Is.EqualTo 1, "two signals must not start duplicate StopAsync calls")
+
+            scope.Dispose()
+            Assert.That(Volatile.Read(&disposed), Is.EqualTo 1, "scope disposal is idempotent after auto-unsubscribe")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``parent signal forwarding auto-unsubscribes on natural exit without consuming output``() : Task =
+        task {
+            let host = ForwardingHost()
+            use running = host.Build()
+            let mutable callback = fun () -> false
+            let mutable disposed = 0
+
+            use _scope =
+                running.ForwardParentSignalsUsing(
+                    TimeSpan.FromSeconds 1.0,
+                    fun forward ->
+                        callback <- forward
+
+                        { new IDisposable with
+                            member _.Dispose() =
+                                Interlocked.Increment(&disposed) |> ignore }
+                )
+
+            host.Complete(Outcome.Exited 0)
+            do! waitUntil (fun () -> Volatile.Read(&disposed) = 1)
+            Assert.That(callback (), Is.False, "a callback racing after auto-unsubscribe cannot stop the run")
+
+            match! running.OutputStringAsync() with
+            | Ok result -> Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 0))
+            | Error error -> Assert.Fail $"forwarding must not consume the output pipes: {error}"
         }
         :> Task
 

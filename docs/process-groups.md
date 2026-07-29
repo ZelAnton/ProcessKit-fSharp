@@ -628,9 +628,16 @@ The five caps are:
   `PerJobUserTimeLimit`; POSIX installs `RLIMIT_CPU` before each child `exec` (soft limit rounded up
   to seconds, hard limit one second later so `SIGXCPU` can be observed).
 
+Linux cgroup v2 also offers the `WithOomGroupKill()` policy. It writes
+`memory.oom.group=1`, so an OOM event kills every process in the contained tree as one unit instead
+of leaving survivors after the kernel selects a single victim. This semantic has no Job Object or
+POSIX process-group equivalent: `ProcessGroup.Create` returns `ProcessError.Unsupported` outside
+Linux cgroup v2. It composes naturally with `WithMemoryMax`, but can also protect against an OOM
+triggered by an ancestor cgroup.
+
 The configured caps are also readable back: `group.Options.Limits` is a
 `ResourceLimits` whose `MemoryMax` (`int64 option`), `MaxProcesses` (`int option`),
-`CpuQuota` (`float option`), `CpuTimeMax` (`TimeSpan option`), and `CpuAffinity` (`IReadOnlyList<int> option`, in
+`CpuQuota` (`float option`), `CpuTimeMax` (`TimeSpan option`), `OomGroupKill` (`bool`), and `CpuAffinity` (`IReadOnlyList<int> option`, in
 ascending order) are `Some` only for the limits you set (`ResourceLimits.None` is
 the empty set). You can build a `ResourceLimits` value directly with the same
 `WithMemoryMax` / `WithMaxProcesses` / `WithCpuQuota` / `WithCpuAffinity` methods
@@ -641,6 +648,7 @@ Limits need a **real container** — a Windows Job Object or a Linux cgroup v2.
 | Capability | Windows Job Object | Linux cgroup v2 | POSIX process group / macOS / BSD |
 |---|:---:|:---:|:---:|
 | Memory cap | ✅ whole-tree | ✅ whole-tree (`memory.max`) | ❌ |
+| Atomic whole-tree OOM kill | ❌ `Unsupported` | ✅ (`memory.oom.group`) | ❌ `Unsupported` |
 | Process-count cap | ✅ | ✅ (`pids.max`) | ❌ |
 | CPU quota | 🟡 approximate | ✅ (`cpu.max`) | ❌ |
 | CPU-time maximum | ✅ whole Job | ✅ per spawned process (`RLIMIT_CPU`) | ✅ per spawned process (`RLIMIT_CPU`) |
@@ -859,7 +867,7 @@ Behaviour follows the mechanism, honestly and without a silent downgrade:
 | Mechanism | `UpdateLimits` |
 |---|---|
 | Windows Job Object | ✅ re-applies via `SetInformationJobObject` on the live job (caps, affinity mask, **and** UI restrictions) |
-| Linux cgroup v2 | ✅ rewrites `memory.max` / `pids.max` / `cpu.max` / `cpuset.cpus` in place (UI restrictions → `ProcessError.Unsupported`) |
+| Linux cgroup v2 | ✅ rewrites `memory.max` / `memory.oom.group` / `pids.max` / `cpu.max` / `cpuset.cpus` in place (UI restrictions → `ProcessError.Unsupported`) |
 | POSIX process group / macOS / BSD | ❌ `ProcessError.ResourceLimit` (no whole-tree limit primitive to update) |
 
 `CpuTimeMax` is spawn-time on POSIX, including the cgroup backend. A live update that changes it is

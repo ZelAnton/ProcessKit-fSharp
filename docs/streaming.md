@@ -349,6 +349,31 @@ the same stream, so the **last one in the chain wins** — a later `Stdout(Stdio
 prior `StdoutToFile`, and vice versa. A bad path (missing directory, denied permission) fails the
 spawn with `ProcessError.Spawn`, never a silent drop of the child's output.
 
+### Rotating a long-lived log
+
+When the log must stay bounded, use a caller-owned `RotatingFileSink` as a tee. The active file is
+the requested path; `.1` is the newest archive and `.N` the oldest. Writes are split at the byte
+limit, and archives beyond `maxFiles` are deleted:
+
+```fsharp
+use log = new RotatingFileSink("/var/log/my-service.log", 64L * 1024L * 1024L, 5)
+
+let command =
+    Command.create "my-service"
+    |> Command.stdoutTee log
+```
+
+```csharp
+using var log = new RotatingFileSink("/var/log/my-service.log", 64L * 1024L * 1024L, 5);
+var command = new Command("my-service").StdoutTee(log);
+```
+
+This deliberately has the opposite lifetime trade-off from `StdoutToFile`: rotation requires the
+parent-side pump, so it stops when the parent exits. The stream remains captured as usual, and the
+caller owns the sink. A write, flush, delete, or rename failure propagates through the existing tee
+error contract and fails the run; ProcessKit never silently drops log bytes. Use separate sink
+instances for stdout and stderr.
+
 ## Bounding the streaming backlog
 
 By default, the channel that feeds `StdoutLinesAsync()` / `OutputEventsAsync()` / `WaitForLineAsync()`

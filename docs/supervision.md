@@ -399,6 +399,12 @@ The captured output is what you read back from `SupervisionOutcome.FinalResult` 
 supervision ends. For the full set of buffer policies and overflow modes, see
 [commands.md](commands.md).
 
+For a bounded on-disk log across incarnations, keep one caller-owned
+[`RotatingFileSink`](streaming.md#rotating-a-long-lived-log) and attach it with `StdoutTee` or
+`StderrTee` before building the supervisor. The supervisor's bounded in-memory tail remains
+available in `FinalResult`, while the sink rotates the byte-exact stream. Because rotation is
+parent-side, dispose the sink only after the supervision session has ended.
+
 ## Stopping
 
 After every completed run three gates are checked, in this order:

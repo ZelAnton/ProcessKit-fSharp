@@ -89,7 +89,7 @@ module internal Cgroup =
     // than being quietly skipped).
     let private enableNeededControllers (parent: string) (limits: ResourceLimits) =
         let needed =
-            [ if limits.MemoryMax.IsSome then
+            [ if limits.MemoryMax.IsSome || limits.OomGroupKill then
                   "memory"
               if limits.MaxProcesses.IsSome then
                   "pids"
@@ -122,6 +122,9 @@ module internal Cgroup =
         match limits.MemoryMax with
         | Some bytes -> File.WriteAllText(Path.Combine(cgroupPath, "memory.max"), string bytes)
         | None -> ()
+
+        if limits.OomGroupKill then
+            File.WriteAllText(Path.Combine(cgroupPath, "memory.oom.group"), "1")
 
         match limits.MaxProcesses with
         | Some n -> File.WriteAllText(Path.Combine(cgroupPath, "pids.max"), string n)
@@ -213,6 +216,7 @@ module internal Cgroup =
                 // core the parent allows", and it is written as a blank line.
                 let plan =
                     [ "memory.max", (limits.MemoryMax |> Option.map string), "max"
+                      "memory.oom.group", (if limits.OomGroupKill then Some "1" else None), "0"
                       "pids.max", (limits.MaxProcesses |> Option.map string), "max"
                       "cpu.max", (limits.CpuQuota |> Option.map cpuMaxValue), "max"
                       "cpuset.cpus", (limits.CpuAffinityCores |> Option.map formatCpuList), "\n" ]

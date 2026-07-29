@@ -108,7 +108,12 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         let withBackend (backend: IContainmentBackend) = Ok(new ProcessGroup(backend, options))
 
         if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
-            if options.StopSignal <> Signal.Term then
+            if limits.OomGroupKill then
+                Error(
+                    ProcessError.Unsupported
+                        "whole-tree OOM kill is a Linux cgroup v2 memory.oom.group policy; Windows Job Objects have no equivalent"
+                )
+            elif options.StopSignal <> Signal.Term then
                 Error(
                     ProcessError.Unsupported
                         $"ProcessGroupOptions.StopSignal({options.StopSignal}) on Windows; only the default Signal.Term contract maps to the existing WM_CLOSE/CTRL+BREAK graceful path"
@@ -133,12 +138,22 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // runs its tree unrestricted.
             match limits.UiRestrictionsUnsupported with
             | Some error -> Error error
+            | None when limits.OomGroupKill && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux) ->
+                Error(
+                    ProcessError.Unsupported
+                        "whole-tree OOM kill is a Linux cgroup v2 memory.oom.group policy; this platform has no equivalent"
+                )
             | None ->
                 if RuntimeInformation.IsOSPlatform OSPlatform.Linux && limits.WholeTreeAny then
                     if Native.Cgroup.cgroupV2Available () then
                         match Native.Cgroup.createCgroup limits with
                         | Ok path -> withBackend (CgroupBackend(path, limits))
                         | Error message -> Error(ProcessError.ResourceLimit message)
+                    elif limits.OomGroupKill then
+                        Error(
+                            ProcessError.Unsupported
+                                "whole-tree OOM kill requires an available Linux cgroup v2 memory.oom.group mechanism"
+                        )
                     else
                         Error(
                             ProcessError.ResourceLimit
@@ -683,7 +698,8 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     ///
     /// A limit-capable mechanism re-applies the caps to its live container — **Windows** re-issues
     /// `SetInformationJobObject` on the Job (the caps, the CPU-affinity mask, and the UI restrictions),
-    /// **Linux cgroup v2** rewrites `memory.max`/`pids.max`/`cpu.max`/`cpuset.cpus` in place — while the
+    /// **Linux cgroup v2** rewrites `memory.max`/`memory.oom.group`/`pids.max`/`cpu.max`/`cpuset.cpus`
+    /// in place — while the
     /// **POSIX process-group** mechanism (macOS/BSD, or Linux without cgroup v2) has no whole-tree limit
     /// primitive and returns `ProcessError.ResourceLimit`, the same honest, typed refusal `Create` gives
     /// for a limited group there — never a silent no-op. On Linux the CPU-affinity pin additionally needs

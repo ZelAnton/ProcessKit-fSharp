@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `Supervisor.LivenessMemory` restarts a live child whose attributable process-tree peak memory remains above a configured byte threshold.
-
-### Changed
--
+- `ResourceLimits.WithOomGroupKill` makes Linux cgroup v2 kill a contained process tree as one unit on OOM.
+- `RotatingFileSink` provides bounded parent-side log rotation for stdout and stderr tees.
+- `RunningProcess.ForwardParentSignals` forwards parent interrupts into one graceful tree stop with automatic unsubscription.
 
 ### Fixed
 - Supervisor restarts now apply the restart policy to typed live-output pump failures and retain liveness-failure attribution without leaking it to later children.

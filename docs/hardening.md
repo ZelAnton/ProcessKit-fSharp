@@ -60,6 +60,11 @@ matrix, and the fail-fast behaviour when a cap can't be enforced are in
 [Process groups → Resource limits](process-groups.md#resource-limits); the
 underlying `ResourceLimits` type lives in `src/ProcessKit/Limits.fs`.
 
+On Linux cgroup v2, add `WithOomGroupKill()` when partial survival after an OOM would leave the
+tool in an unsafe or corrupted state. The kernel then treats the cgroup as one OOM unit and kills
+the whole tree. The option is deliberately `ProcessError.Unsupported` on Windows and other POSIX
+platforms rather than pretending that their different memory-limit semantics are equivalent.
+
 The load-bearing fact for a hardening perimeter: caps need a **real container** — a
 Windows Job Object or a Linux cgroup v2. On macOS/BSD and the Linux
 process-group fallback there is no whole-tree limit primitive at all, so

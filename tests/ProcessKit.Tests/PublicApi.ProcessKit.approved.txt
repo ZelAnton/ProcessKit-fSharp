@@ -786,6 +786,7 @@ class ProcessKit.ProcessGroupOptions
   member WithCpuTimeMax(System.TimeSpan) : ProcessKit.ProcessGroupOptions
   member WithMaxProcesses(System.Int32) : ProcessKit.ProcessGroupOptions
   member WithMemoryMax(System.Int64) : ProcessKit.ProcessGroupOptions
+  member WithOomGroupKill() : ProcessKit.ProcessGroupOptions
   member WithShutdownTimeout(System.TimeSpan) : ProcessKit.ProcessGroupOptions
   member WithStopSignal(ProcessKit.Signal) : ProcessKit.ProcessGroupOptions
   member WithUiRestrictions(ProcessKit.WindowsUiRestrictions) : ProcessKit.ProcessGroupOptions
@@ -948,6 +949,7 @@ class ProcessKit.ResourceLimits
   member WithCpuTimeMax(System.TimeSpan) : ProcessKit.ResourceLimits
   member WithMaxProcesses(System.Int32) : ProcessKit.ResourceLimits
   member WithMemoryMax(System.Int64) : ProcessKit.ResourceLimits
+  member WithOomGroupKill() : ProcessKit.ResourceLimits
   member WithUiRestrictions(ProcessKit.WindowsUiRestrictions) : ProcessKit.ResourceLimits
   property CpuAffinity : Microsoft.FSharp.Core.FSharpOption<System.Collections.Generic.IReadOnlyList<System.Int32>> { get }
   property CpuQuota : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
@@ -955,6 +957,7 @@ class ProcessKit.ResourceLimits
   property MaxProcesses : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property MemoryMax : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property None : ProcessKit.ResourceLimits { get }
+  property OomGroupKill : System.Boolean { get }
   property UiRestrictions : ProcessKit.WindowsUiRestrictions { get }
 
 class ProcessKit.RestartCause
@@ -1018,6 +1021,28 @@ class ProcessKit.ResultExtensions
   static member Switch<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, System.Action<T>, System.Action<ProcessKit.ProcessError>) : System.Void
   static member TryGetValue<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, T&, ProcessKit.ProcessError&) : System.Boolean
 
+class ProcessKit.RotatingFileSink : System.IO.Stream
+  :> System.IAsyncDisposable
+  :> System.IDisposable
+  member Dispose(System.Boolean) : System.Void
+  member Flush() : System.Void
+  member FlushAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task
+  member Read(System.Byte[], System.Int32, System.Int32) : System.Int32
+  member Seek(System.Int64, System.IO.SeekOrigin) : System.Int64
+  member SetLength(System.Int64) : System.Void
+  member Write(System.Byte[], System.Int32, System.Int32) : System.Void
+  member WriteAsync(System.Byte[], System.Int32, System.Int32, System.Threading.CancellationToken) : System.Threading.Tasks.Task
+  member WriteAsync(System.ReadOnlyMemory<System.Byte>, System.Threading.CancellationToken) : System.Threading.Tasks.ValueTask
+  new(System.String, System.Int64, System.Int32)
+  property CanRead : System.Boolean { get }
+  property CanSeek : System.Boolean { get }
+  property CanWrite : System.Boolean { get }
+  property Length : System.Int64 { get }
+  property MaxBytes : System.Int64 { get }
+  property MaxFiles : System.Int32 { get }
+  property Path : System.String { get }
+  property Position : System.Int64 { get; set }
+
 class ProcessKit.RunProfile
   property AvgCpuCores : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
   property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
@@ -1050,6 +1075,8 @@ module ProcessKit.Runner
 class ProcessKit.RunningProcess
   :> System.IAsyncDisposable
   member FinishAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.Finished, ProcessKit.ProcessError>>
+  member ForwardParentSignals() : System.IDisposable
+  member ForwardParentSignals(System.TimeSpan) : System.IDisposable
   member Kill() : System.Void
   member OutputBytesAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
   member OutputEventsAsync() : System.Collections.Generic.IAsyncEnumerable<ProcessKit.OutputEvent>

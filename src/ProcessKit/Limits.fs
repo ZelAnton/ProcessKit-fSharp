@@ -85,6 +85,7 @@ type ResourceLimits
     internal
     (
         memoryMax: int64 option,
+        oomGroupKill: bool,
         maxProcesses: int option,
         cpuQuota: float option,
         uiRestrictions: WindowsUiRestrictions,
@@ -93,10 +94,15 @@ type ResourceLimits
     ) =
 
     /// No limits — the default.
-    static member None = ResourceLimits(None, None, None, WindowsUiRestrictions.None, None, None)
+    static member None =
+        ResourceLimits(None, false, None, None, WindowsUiRestrictions.None, None, None)
 
     /// Maximum total memory for the tree, in bytes. `None` leaves memory unbounded.
     member _.MemoryMax = memoryMax
+
+    /// Whether a Linux cgroup v2 OOM event kills the whole contained tree atomically. This is a
+    /// cgroup-only policy; requesting it on another mechanism is refused with `ProcessError.Unsupported`.
+    member _.OomGroupKill = oomGroupKill
 
     /// Maximum number of live processes in the tree. `None` leaves the count unbounded.
     member _.MaxProcesses = maxProcesses
@@ -131,14 +137,19 @@ type ResourceLimits
     /// negative value converting to a huge `unativeint` on Windows — effectively "unlimited").
     member _.WithMemoryMax(bytes: int64) =
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(bytes, 0L)
-        ResourceLimits(Some bytes, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax)
+        ResourceLimits(Some bytes, oomGroupKill, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax)
+
+    /// A copy that asks Linux cgroup v2 to treat the cgroup as one OOM unit (`memory.oom.group=1`),
+    /// so the kernel kills the whole tree instead of selecting one victim. Unsupported outside cgroup v2.
+    member _.WithOomGroupKill() =
+        ResourceLimits(memoryMax, true, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax)
 
     /// A copy with the live-process cap set. `count` must be positive — zero or negative is rejected
     /// (`ArgumentOutOfRangeException`): the tree always has at least its own leader process, so a
     /// non-positive cap could never be satisfied.
     member _.WithMaxProcesses(count: int) =
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(count, 0)
-        ResourceLimits(memoryMax, Some count, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax)
+        ResourceLimits(memoryMax, oomGroupKill, Some count, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax)
 
     /// A copy with the CPU quota (in cores) set. `cores` must be a finite, strictly positive number —
     /// zero, negative, `NaN`, or `PositiveInfinity`/`NegativeInfinity` is rejected
@@ -164,7 +175,7 @@ type ResourceLimits
                 )
             )
 
-        ResourceLimits(memoryMax, maxProcesses, Some cores, uiRestrictions, cpuAffinity, cpuTimeMax)
+        ResourceLimits(memoryMax, oomGroupKill, maxProcesses, Some cores, uiRestrictions, cpuAffinity, cpuTimeMax)
 
     /// A copy imposing the given Windows Job Object UI restrictions on the whole tree (see
     /// `WindowsUiRestrictions`). `WindowsUiRestrictions.None` clears them again — the set REPLACES the
@@ -187,7 +198,7 @@ type ResourceLimits
                 )
             )
 
-        ResourceLimits(memoryMax, maxProcesses, cpuQuota, restrictions, cpuAffinity, cpuTimeMax)
+        ResourceLimits(memoryMax, oomGroupKill, maxProcesses, cpuQuota, restrictions, cpuAffinity, cpuTimeMax)
 
     /// A copy pinning the whole tree to `cores` — the CPU cores (zero-based logical processor indices)
     /// its processes may be scheduled on. The complement of `WithCpuQuota`: the quota bounds *how much*
@@ -246,7 +257,15 @@ type ResourceLimits
                 )
             )
 
-        ResourceLimits(memoryMax, maxProcesses, cpuQuota, uiRestrictions, Some(List.sort requested), cpuTimeMax)
+        ResourceLimits(
+            memoryMax,
+            oomGroupKill,
+            maxProcesses,
+            cpuQuota,
+            uiRestrictions,
+            Some(List.sort requested),
+            cpuTimeMax
+        )
 
     /// A copy limiting CPU time. `duration` must be finite and strictly positive. POSIX rounds the
     /// soft `RLIMIT_CPU` up to whole seconds and gives the hard limit one additional second so the
@@ -255,12 +274,13 @@ type ResourceLimits
         if duration <= TimeSpan.Zero then
             raise (ArgumentOutOfRangeException(nameof duration, duration, "CPU time must be positive and finite"))
 
-        ResourceLimits(memoryMax, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, Some duration)
+        ResourceLimits(memoryMax, oomGroupKill, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, Some duration)
 
     /// Whether any limit is set. Windows uses this to decide whether the fresh Job needs a limit block.
     /// POSIX dispatch uses `WholeTreeAny` below because CPU-time alone is enforceable without a container.
     member internal _.Any =
         memoryMax.IsSome
+        || oomGroupKill
         || maxProcesses.IsSome
         || cpuQuota.IsSome
         || uiRestrictions <> WindowsUiRestrictions.None
@@ -271,6 +291,7 @@ type ResourceLimits
     /// can enforce it per child with `RLIMIT_CPU`, including on macOS and the Linux process-group fallback.
     member internal _.WholeTreeAny =
         memoryMax.IsSome
+        || oomGroupKill
         || maxProcesses.IsSome
         || cpuQuota.IsSome
         || uiRestrictions <> WindowsUiRestrictions.None
@@ -321,6 +342,11 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, stopSignal: Signal
     /// A copy capping the tree's total memory at `bytes`.
     member _.WithMemoryMax(bytes: int64) =
         ProcessGroupOptions(shutdownTimeout, stopSignal, limits.WithMemoryMax bytes)
+
+    /// A copy enabling cgroup v2 whole-tree OOM kills. Linux cgroup v2-only; creation is refused
+    /// with `ProcessError.Unsupported` on mechanisms that cannot provide this semantic.
+    member _.WithOomGroupKill() =
+        ProcessGroupOptions(shutdownTimeout, stopSignal, limits.WithOomGroupKill())
 
     /// A copy capping the number of live processes in the tree at `count`.
     member _.WithMaxProcesses(count: int) =

@@ -1993,6 +1993,62 @@ type StreamingTests() =
         }
         :> Task
 
+    [<Test>]
+    member _.``RotatingFileSink splits writes at the byte limit and retains newest archives``() : Task =
+        task {
+            let directory = Directory.CreateTempSubdirectory("pk-rotate-").FullName
+            let path = Path.Combine(directory, "worker.log")
+            let sink = new RotatingFileSink(path, 4L, 2)
+
+            try
+                do! sink.WriteAsync(Encoding.UTF8.GetBytes("abcdefghij").AsMemory(), CancellationToken.None).AsTask()
+                do! sink.FlushAsync()
+                let activeLength = sink.Length
+                sink.Dispose()
+
+                Assert.That(File.ReadAllText path, Is.EqualTo "ij")
+                Assert.That(File.ReadAllText(path + ".1"), Is.EqualTo "efgh")
+                Assert.That(File.ReadAllText(path + ".2"), Is.EqualTo "abcd")
+                Assert.That(activeLength, Is.EqualTo 2L)
+            finally
+                sink.Dispose()
+                Directory.Delete(directory, true)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``RotatingFileSink composes with StdoutTee without changing captured bytes``() : Task =
+        task {
+            let directory = Directory.CreateTempSubdirectory("pk-rotate-tee-").FullName
+            let path = Path.Combine(directory, "worker.log")
+            let sink = new RotatingFileSink(path, 4L, 8)
+
+            try
+                let command = shell "echo abcdefghij" |> Command.stdoutTee sink
+
+                match! runBytes command with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok result ->
+                    do! sink.FlushAsync()
+                    sink.Dispose()
+
+                    let replayed =
+                        [ for index in 8..-1..1 do
+                              let archive = path + $".{index}"
+
+                              if File.Exists archive then
+                                  yield! File.ReadAllBytes archive
+
+                          yield! File.ReadAllBytes path ]
+                        |> Array.ofList
+
+                    CollectionAssert.AreEqual(result.Stdout, replayed)
+            finally
+                sink.Dispose()
+                Directory.Delete(directory, true)
+        }
+        :> Task
+
     // --- Idle timeout (`Command.IdleTimeout`): kill a run that stops producing output (T-052). The
     //     deadline is reset by each chunk of stdout/stderr (byte granularity, across every verb), and
     //     surfaces — like the total `Timeout` — as `Outcome.TimedOut`. ---

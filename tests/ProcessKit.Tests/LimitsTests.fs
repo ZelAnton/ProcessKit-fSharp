@@ -171,17 +171,31 @@ type LimitsTests() =
         let options =
             ProcessGroupOptions()
                 .WithMemoryMax(256L * 1024L * 1024L)
+                .WithOomGroupKill()
                 .WithMaxProcesses(50)
                 .WithCpuQuota(1.5)
                 .WithCpuTimeMax(TimeSpan.FromSeconds 3.0)
                 .WithStopSignal(Signal.Int)
 
         Assert.That(options.Limits.MemoryMax, Is.EqualTo(Some(256L * 1024L * 1024L)))
+        Assert.That(options.Limits.OomGroupKill, Is.True)
         Assert.That(options.Limits.MaxProcesses, Is.EqualTo(Some 50))
         Assert.That(options.Limits.CpuQuota, Is.EqualTo(Some 1.5))
         Assert.That(options.Limits.CpuTimeMax, Is.EqualTo(Some(TimeSpan.FromSeconds 3.0)))
         Assert.That(options.StopSignal, Is.EqualTo Signal.Int)
         Assert.That(ResourceLimits.None.Any, Is.False)
+
+    [<Test>]
+    member _.``whole-tree OOM kill is honestly unsupported outside Linux cgroup v2``() =
+        if RuntimeInformation.IsOSPlatform OSPlatform.Linux then
+            Assert.Ignore "non-cgroup refusal is exercised on Windows and macOS"
+
+        match ProcessGroup.Create(ProcessGroupOptions().WithOomGroupKill()) with
+        | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Does.Contain "memory.oom.group")
+        | Error other -> Assert.Fail $"expected Unsupported, got {other}"
+        | Ok group ->
+            (group :> IDisposable).Dispose()
+            Assert.Fail "a non-cgroup mechanism must not claim whole-tree OOM-kill support"
 
     [<Test>]
     member _.``ResourceLimits builders reject non-positive values``() =
@@ -1236,6 +1250,27 @@ type LimitsTests() =
                 // memory.max was rewritten to the new cap, then rolled back to exactly its prior content:
                 // the cgroup is left on the previous set, not the partially-applied new one.
                 Assert.That(File.ReadAllText memoryMax, Is.EqualTo priorMemory)
+        finally
+            Directory.Delete(root, true)
+
+    [<Test>]
+    member _.``updateCgroupLimits toggles memory oom group with replacement semantics``() =
+        let root = Directory.CreateTempSubdirectory("pk-oom-group-").FullName
+
+        try
+            let cgroupPath = Path.Combine(root, "child")
+            Directory.CreateDirectory cgroupPath |> ignore
+            File.WriteAllText(Path.Combine(root, "cgroup.subtree_control"), "")
+            let oomGroup = Path.Combine(cgroupPath, "memory.oom.group")
+            File.WriteAllText(oomGroup, "0")
+
+            match Native.Cgroup.updateCgroupLimits cgroupPath (ResourceLimits.None.WithOomGroupKill()) with
+            | Error detail -> Assert.Fail $"enabling memory.oom.group failed: {detail}"
+            | Ok() -> Assert.That(File.ReadAllText oomGroup, Is.EqualTo "1")
+
+            match Native.Cgroup.updateCgroupLimits cgroupPath ResourceLimits.None with
+            | Error detail -> Assert.Fail $"clearing memory.oom.group failed: {detail}"
+            | Ok() -> Assert.That(File.ReadAllText oomGroup, Is.EqualTo "0")
         finally
             Directory.Delete(root, true)
 

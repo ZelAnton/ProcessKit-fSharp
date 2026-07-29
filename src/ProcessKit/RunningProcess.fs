@@ -1210,6 +1210,115 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// tree is fully reaped when the handle is disposed. For a blocking kill, dispose the handle.
     member _.Kill() = host.StartKill()
 
+    /// Forward parent termination requests into this run's graceful tree-stop path. POSIX registers
+    /// `SIGINT` and `SIGTERM`; Windows handles Ctrl+C and Ctrl+Break through `Console.CancelKeyPress`.
+    /// The first signal starts one `StopAsync(gracePeriod)` and suppresses the parent's default immediate
+    /// termination while the tree stops; repeated signals never start duplicate teardown.
+    ///
+    /// The returned caller-owned scope removes the handlers when disposed. It is also removed
+    /// automatically when the child exits. Registering the scope starts only the handle's shared exit
+    /// observation and does not claim stdout/stderr, so capture and streaming verbs remain available.
+    /// On Windows the forwarded request uses the ordinary `StopAsync` contract (best-effort `WM_CLOSE`,
+    /// then Job termination after the grace window), not a promise that a console child receives the
+    /// original Ctrl event.
+    member this.ForwardParentSignals(gracePeriod: TimeSpan) : IDisposable =
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero, nameof gracePeriod)
+
+        let subscribe (forward: unit -> bool) =
+            if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                let handler =
+                    ConsoleCancelEventHandler(fun _ eventArgs ->
+                        if forward () then
+                            eventArgs.Cancel <- true)
+
+                Console.CancelKeyPress.AddHandler handler
+
+                { new IDisposable with
+                    member _.Dispose() =
+                        Console.CancelKeyPress.RemoveHandler handler }
+            else
+                let callback (context: PosixSignalContext) =
+                    if forward () then
+                        context.Cancel <- true
+
+                let interrupt = PosixSignalRegistration.Create(PosixSignal.SIGINT, callback)
+
+                try
+                    let terminate = PosixSignalRegistration.Create(PosixSignal.SIGTERM, callback)
+
+                    { new IDisposable with
+                        member _.Dispose() =
+                            terminate.Dispose()
+                            interrupt.Dispose() }
+                with _ ->
+                    interrupt.Dispose()
+                    reraise ()
+
+        this.ForwardParentSignalsUsing(gracePeriod, subscribe)
+
+    /// `ForwardParentSignals` using the default 2-second graceful-stop window.
+    member this.ForwardParentSignals() : IDisposable =
+        this.ForwardParentSignals Limits.DefaultStopGrace
+
+    /// Test seam for the forwarding lifecycle: production supplies platform signal registrations;
+    /// tests inject a callback holder without sending a real signal to the test runner process.
+    member internal this.ForwardParentSignalsUsing
+        (gracePeriod: TimeSpan, subscribe: ((unit -> bool) -> IDisposable))
+        : IDisposable =
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero, nameof gracePeriod)
+        ArgumentNullException.ThrowIfNull subscribe
+
+        let registrationGate = obj ()
+        let mutable registration: IDisposable option = None
+        let mutable disposed = 0
+        let mutable forwarded = 0
+
+        let dispose () =
+            if Interlocked.Exchange(&disposed, 1) = 0 then
+                lock registrationGate (fun () ->
+                    registration |> Option.iter (fun value -> value.Dispose())
+                    registration <- None)
+
+        let forward () =
+            if Volatile.Read(&disposed) <> 0 then
+                false
+            else
+                if Interlocked.CompareExchange(&forwarded, 1, 0) = 0 then
+                    let stopTask = this.StopAsync gracePeriod
+
+                    stopTask.ContinueWith(
+                        Action<Task<Outcome>>(fun completed ->
+                            if completed.IsFaulted then
+                                completed.Exception |> ignore),
+                        CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default
+                    )
+                    |> ignore
+
+                true
+
+        let created = subscribe forward
+
+        lock registrationGate (fun () ->
+            if Volatile.Read(&disposed) <> 0 then
+                created.Dispose()
+            else
+                registration <- Some created)
+
+        let exitTask = ensureBufferedWait ()
+
+        exitTask.ContinueWith(
+            Action<Task<Outcome>>(fun _ -> dispose ()),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        )
+        |> ignore
+
+        { new IDisposable with
+            member _.Dispose() = dispose () }
+
     /// Resize the child's controlling pseudo-terminal to `cols` columns x `rows` rows (a `Command.Pty`
     /// run only). Windows applies it with `ResizePseudoConsole`; POSIX applies `ioctl(TIOCSWINSZ)` on the
     /// pty master and then delivers `SIGWINCH` to the child so a running TUI re-queries its geometry (D6).

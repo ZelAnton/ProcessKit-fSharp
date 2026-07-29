@@ -63,6 +63,7 @@
 		<Compile Include="Backoff.fs" />
 		<Compile Include="Priority.fs" />
 		<Compile Include="LineTerminator.fs" />
+		<Compile Include="RotatingFileSink.fs" />
 		<Compile Include="Command.fs" />
 		<Compile Include="MemberInfo.fs" />
 		<Compile Include="DetachedProcess.fs" />

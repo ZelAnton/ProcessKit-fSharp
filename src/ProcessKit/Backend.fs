@@ -388,17 +388,23 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
             // OFF-lock graceful poll (K-025/T-162). `applyWindowsJobLimits` best-effort restores the prior
             // extended-limit block if the CPU-rate write fails after it, so a genuine apply failure is an
             // honest `ProcessError.ResourceLimit` AND the live Job is back on the previous set (T-207).
-            let result =
-                if currentLimits.CpuTimeMax.IsSome && limits.CpuTimeMax = currentLimits.CpuTimeMax then
-                    Native.Windows.applyWindowsJobLimitsPreservingCpuTime jobHandle limits
-                else
-                    Native.Windows.applyWindowsJobLimits jobHandle limits
+            if limits.OomGroupKill then
+                Error(
+                    ProcessError.Unsupported
+                        "whole-tree OOM kill is a Linux cgroup v2 memory.oom.group policy; Windows Job Objects have no equivalent"
+                )
+            else
+                let result =
+                    if currentLimits.CpuTimeMax.IsSome && limits.CpuTimeMax = currentLimits.CpuTimeMax then
+                        Native.Windows.applyWindowsJobLimitsPreservingCpuTime jobHandle limits
+                    else
+                        Native.Windows.applyWindowsJobLimits jobHandle limits
 
-            match result with
-            | Ok() ->
-                currentLimits <- limits
-                Ok()
-            | Error message -> Error(ProcessError.ResourceLimit message)
+                match result with
+                | Ok() ->
+                    currentLimits <- limits
+                    Ok()
+                | Error message -> Error(ProcessError.ResourceLimit message)
 
         member _.HardRelease() =
             ctrlGroups.Clear()
@@ -618,7 +624,7 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                 Ok(ProcessGroupStats(active, cpu, peak, io))
 
         member _.UpdateLimits(limits) =
-            // Rewrite the cgroup's controller files in place (`memory.max`/`pids.max`/`cpu.max`/
+            // Rewrite the cgroup's controller files in place (`memory.max`/`memory.oom.group`/`pids.max`/`cpu.max`/
             // `cpuset.cpus`), enabling any controller the new caps newly need in the parent's
             // `cgroup.subtree_control` first (`cpuset` is the one a hierarchy most often lacks entirely,
             // and its absence fails the update before any file is written). REPLACE semantics: a dimension
@@ -889,6 +895,10 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                 Error(
                     ProcessError.ResourceLimit
                         "CPU-time is applied with RLIMIT_CPU before each child exec and cannot be changed for processes already running; create a new group for a different CpuTimeMax"
+                )
+            elif limits.OomGroupKill then
+                Error(
+                    ProcessError.Unsupported "whole-tree OOM kill requires a Linux cgroup v2 memory.oom.group mechanism"
                 )
             elif not limits.WholeTreeAny then
                 Ok()
