@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - The Pages navigation now links to the ProcessKit CLI Runner immediately after the Rust implementation.
+- `Command.RetryBackoff` / `Command.retryBackoff` retries one operation with bounded exponential delays and optional jitter, using the command's `TimeProvider`.
 - HTTP readiness and liveness probes now accept caller-owned `HttpClient` instances for custom headers, TLS validation, proxies, and transports without transferring ownership.
 - `RunningProcess.Signal` delivers a signal to one run's own contained tree, with matching signal recording in `FakeProcess`.
 - `Command.StopSignal` and `ProcessGroupOptions.WithStopSignal` select the soft signal used before graceful-stop escalation.

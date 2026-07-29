@@ -218,7 +218,7 @@ module Runner =
                         $"'{command.Program}' has a one-shot stdin source and cannot be retried ({maxAttempts} attempts requested): a second attempt would find the source already exhausted"
                 )
             )
-        | false, Some(maxAttempts, delay, shouldRetry) ->
+        | false, Some(maxAttempts, delayPolicy, shouldRetry) ->
             task {
                 // A command-scoped `CancelOn` covers the whole retrying run, including a pending
                 // backoff where no individual attempt is active.
@@ -257,6 +257,10 @@ module Runner =
                             && not isCancelled
                         then
                             attempt <- attempt + 1
+
+                            let delay =
+                                RetryDelayPolicy.delay attempt command.Config.RetryJitterSource delayPolicy
+
                             let runId = command.Config.RunId |> Option.defaultValue ""
                             Log.retry command.Config.Logger command.Program attempt delay runId
                             Diag.retried command.Program

@@ -87,7 +87,11 @@ try {
     }
 
     Invoke-Stage 'Fantomas formatting' {
-        Invoke-External 'dotnet' @('fantomas', '--check', 'src', 'tests', 'samples')
+        Invoke-External 'dotnet' @(
+            'fantomas', '--check',
+            'src', 'tests', 'samples', 'benchmarks',
+            'docs/snippets/DocSnippets.FSharp/Fixtures.fs'
+        )
     }
 
     if (Get-Command typos -ErrorAction SilentlyContinue) {
@@ -124,20 +128,29 @@ try {
         }
     }
 
-    $pinnedMdBook = Join-Path $repoRoot '.work/tools/mdbook-0.4.40/mdbook.exe'
     $mdBook = $null
 
     if ($env:PROCESSKIT_MDBOOK) {
-        $mdBook = $env:PROCESSKIT_MDBOOK
-    }
-    elseif (Test-Path -LiteralPath $pinnedMdBook) {
-        $mdBook = $pinnedMdBook
-    }
-    elseif (Get-Command mdbook -ErrorAction SilentlyContinue) {
-        $version = (& mdbook --version 2>$null) -join ' '
+        $candidate = Get-Command $env:PROCESSKIT_MDBOOK -ErrorAction SilentlyContinue
 
-        if ($version -match '\b0\.4\.40\b') {
-            $mdBook = 'mdbook'
+        if ($candidate) {
+            $version = ((& $candidate.Source --version 2>$null) -join ' ').Trim()
+
+            if ($version -eq 'mdbook v0.4.40') {
+                $mdBook = $candidate.Source
+            }
+        }
+    }
+
+    if (-not $mdBook) {
+        $candidate = Get-Command mdbook -ErrorAction SilentlyContinue
+
+        if ($candidate) {
+            $version = ((& $candidate.Source --version 2>$null) -join ' ').Trim()
+
+            if ($version -eq 'mdbook v0.4.40') {
+                $mdBook = $candidate.Source
+            }
         }
     }
 

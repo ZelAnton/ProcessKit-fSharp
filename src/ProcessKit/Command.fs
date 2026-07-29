@@ -167,12 +167,15 @@ type internal CommandConfig =
       // idle deadline. A pipeline stage cannot honour it (rejected by `PipelineStageGuard`).
       IdleTimeout: TimeSpan option
       CancelOn: CancellationToken option
-      Retry: (int * TimeSpan * Func<ProcessError, bool>) option
+      Retry: (int * RetryDelayPolicy * Func<ProcessError, bool>) option
+      // Production jitter uses Random.Shared. Tests replace this immutable seam so exponential retry
+      // delays can be asserted exactly while still exercising the command's TimeProvider timers.
+      RetryJitterSource: unit -> float
       // Explicit one-shot opt-out of retrying, distinct from `Retry = None` ("no policy set"). Set by
       // `RetryNever` and read by the verb layer's `withRetry`, which runs the command exactly once
       // whenever this is `true` — even if `Retry` itself carries a policy inherited from a
-      // `CliClient.WithDefaults` template. `Retry` (the builder method) resets this back to `false`,
-      // so the last of `.Retry(...)`/`.RetryNever()` in a chain wins, like every other builder knob.
+      // `CliClient.WithDefaults` template. `Retry`/`RetryBackoff` reset this back to `false`, so the
+      // last retry-policy/`RetryNever()` call in a chain wins, like every other builder knob.
       RetryDisabled: bool
       UncheckedInPipe: bool
       OkCodes: int list
@@ -297,6 +300,7 @@ module internal CommandConfig =
           IdleTimeout = None
           CancelOn = None
           Retry = None
+          RetryJitterSource = fun () -> Random.Shared.NextDouble()
           RetryDisabled = false
           UncheckedInPipe = false
           OkCodes = [ 0 ]
@@ -1145,17 +1149,43 @@ type Command internal (config: CommandConfig) =
 
         Command(
             { config with
-                Retry = Some(maxAttempts, delay, shouldRetry)
-                // A fresh `Retry` call re-opts-in, undoing an earlier `RetryNever` in the same chain —
-                // the last of the two builder calls wins, as with every other knob.
+                Retry = Some(maxAttempts, RetryDelayPolicy.Fixed delay, shouldRetry)
+                // A fresh retry policy re-opts-in, undoing an earlier `RetryNever` in the same chain.
+                RetryDisabled = false }
+        )
+
+    /// Run the command up to `maxAttempts` times in total, using exponential backoff before each
+    /// retry: `baseDelay × factor^n` (starting at `n = 0`), capped at `maxDelay` before optional
+    /// jitter multiplies it by a random factor in `[0.5, 1.5)`. All delays must be non-negative;
+    /// `factor` must be finite and at least `1.0`. Retry timers use the command's `TimeProvider`.
+    member _.RetryBackoff
+        (
+            maxAttempts: int,
+            baseDelay: TimeSpan,
+            factor: float,
+            maxDelay: TimeSpan,
+            jitter: bool,
+            shouldRetry: Func<ProcessError, bool>
+        ) =
+        ArgumentNullException.ThrowIfNull shouldRetry
+        ArgumentOutOfRangeException.ThrowIfLessThan(baseDelay, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxDelay, TimeSpan.Zero)
+
+        if not (Double.IsFinite factor) || factor < 1.0 then
+            raise (ArgumentOutOfRangeException(nameof factor, factor, "factor must be finite and at least 1.0"))
+
+        Command(
+            { config with
+                Retry =
+                    Some(maxAttempts, RetryDelayPolicy.Exponential(baseDelay, factor, maxDelay, jitter), shouldRetry)
                 RetryDisabled = false }
         )
 
     /// Explicitly disable retrying for this command, overriding any `Retry` policy already on it —
     /// including one inherited from a `CliClient.WithDefaults` template. Distinct from never having
-    /// called `Retry` at all: an unset `Retry` still accepts a client's default, `RetryNever` refuses
-    /// it. The command always runs exactly once. A later `Retry(...)` call in the same chain re-opts
-    /// back in (the last call wins).
+    /// called `Retry`/`RetryBackoff` at all: an unset policy still accepts a client's default,
+    /// `RetryNever` refuses it. The command always runs exactly once. A later retry-policy call in the
+    /// same chain re-opts back in (the last call wins).
     member _.RetryNever() =
         Command({ config with RetryDisabled = true })
 
@@ -1452,6 +1482,14 @@ type Command internal (config: CommandConfig) =
     member internal _.WithRunId(runId: string) =
         Command({ config with RunId = Some runId })
 
+    member internal _.WithRetryJitterSource(source: unit -> float) =
+        ArgumentNullException.ThrowIfNull source
+
+        Command(
+            { config with
+                RetryJitterSource = source }
+        )
+
 /// Pipe-friendly functions over `Command`, mirroring the instance **builder** methods. The run
 /// verbs (`RunAsync`/`OutputStringAsync`/`ParseAsync`/…) are instance methods only — end a pipeline with method
 /// syntax (`(cmd |> Command.arg "x").RunAsync()`), or go through `Runner.*` with an explicit runner.
@@ -1585,6 +1623,19 @@ module Command =
     /// beyond the maximum armable timer interval are clamped when the retry runs.
     let retry (maxAttempts: int) (delay: TimeSpan) (shouldRetry: ProcessError -> bool) (command: Command) =
         command.Retry(maxAttempts, delay, Func<ProcessError, bool> shouldRetry)
+
+    /// Run the command with exponential retry backoff: `baseDelay × factor^n`, capped at `maxDelay`
+    /// before optional jitter. Retry timers use the command's `TimeProvider`.
+    let retryBackoff
+        (maxAttempts: int)
+        (baseDelay: TimeSpan)
+        (factor: float)
+        (maxDelay: TimeSpan)
+        (jitter: bool)
+        (shouldRetry: ProcessError -> bool)
+        (command: Command)
+        =
+        command.RetryBackoff(maxAttempts, baseDelay, factor, maxDelay, jitter, Func<ProcessError, bool> shouldRetry)
 
     /// Explicitly disable retrying for this command, overriding any inherited `Retry` policy (e.g.
     /// from a `CliClient.WithDefaults` template). The command always runs exactly once.

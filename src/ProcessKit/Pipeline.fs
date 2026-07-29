@@ -77,7 +77,7 @@ module internal PipelineStageGuard =
         if config.Retry.IsSome then
             raise (
                 ArgumentException(
-                    $"pipeline stage {stageIndex} ('{command.Program}') sets a per-stage Retry, which a pipeline cannot honour: retry is a verb-layer mechanism and pipeline stages are spawned directly, bypassing it. Retry the pipeline as a whole instead.",
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets a per-stage Retry/RetryBackoff policy, which a pipeline cannot honour: retry is a verb-layer mechanism and pipeline stages are spawned directly, bypassing it. Retry the pipeline as a whole instead.",
                     paramName
                 )
             )

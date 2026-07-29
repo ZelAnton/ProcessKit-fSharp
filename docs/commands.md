@@ -842,13 +842,17 @@ Console.WriteLine(await cmd.RunAsync() switch
   cancelled token stops the loop. The delay must be zero or positive; negative
   values are rejected when the command is built, while values beyond the runtime
   timer maximum (about 24.8 days) are clamped when armed.
+- **`RetryBackoff`** uses the same attempt/classifier contract with a growing
+  `baseDelay × factor^n` pause, capped by `maxDelay` before optional `[0.5, 1.5)`
+  jitter. Base/cap delays must be non-negative and `factor` must be finite and at
+  least `1.0`; the pipe-friendly mirror is `Command.retryBackoff`.
 - **`RetryNever`** explicitly disables retrying for this command — it always runs
   exactly once. This differs from simply never calling `Retry`: a `CliClient` built
   with `WithDefaults(fun c -> c.Retry(...))` applies that default `Retry` to every
-  command built from its template, and `RetryNever` is the one way to opt a specific
-  command out of an inherited default. Calling `Retry` again after `RetryNever` in
-  the same chain re-enables retrying — the last of the two wins, like any other
-  builder call.
+  command built from its template (the same is true of `RetryBackoff`), and
+  `RetryNever` is the one way to opt a specific command out of an inherited default.
+  Calling either retry builder again after `RetryNever` re-enables retrying — the
+  last policy call wins, like any other builder setting.
 
 To tie a run to a `CancellationToken`, use `CancelOn` (or pass a token to any verb's
 optional token parameter, `cmd.RunAsync(ct)`). A cancelled run is **always** an error

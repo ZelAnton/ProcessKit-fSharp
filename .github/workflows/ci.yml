@@ -68,7 +68,7 @@ jobs:
         run: dotnet tool restore
 
       - name: Check formatting
-        run: dotnet fantomas --check src tests samples
+        run: dotnet fantomas --check src tests samples benchmarks docs/snippets/DocSnippets.FSharp/Fixtures.fs
 
   analyze:
     if: github.event_name != 'schedule'

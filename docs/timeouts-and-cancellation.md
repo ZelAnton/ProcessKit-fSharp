@@ -296,6 +296,13 @@ failed run, sleeping `delay` between tries, retrying only while `predicate`
 accepts the error. The predicate is a `Func<ProcessError, bool>` (from F#, a
 plain `ProcessError -> bool` through the module mirror).
 
+For a growing delay, use
+`Command.RetryBackoff(maxAttempts, baseDelay, factor, maxDelay, jitter, predicate)`
+(mirror: `Command.retryBackoff`). The unjittered first retry uses `baseDelay`;
+later waits grow as `baseDelay × factor^n`; those values are capped at `maxDelay`
+before optional uniform jitter multiplies them by a value in `[0.5, 1.5)`. This is the same
+backoff vocabulary as `Supervisor`, applied to a finite one-operation retry loop.
+
 `maxAttempts` is the **total** number of runs (the first run plus up to
 `maxAttempts - 1` retries), so `Retry 3` runs the command at most three times, and
 `0`/`1` both mean a single run — a command always runs at least once.
@@ -303,7 +310,8 @@ plain `ProcessError -> bool` through the module mirror).
 `delay` must be zero or positive; negative values, including
 `Timeout.InfiniteTimeSpan`, are rejected when the command is built. Delays beyond
 the maximum interval supported by the runtime timer (about 24.8 days) are clamped
-to that interval when armed.
+to that interval when armed. `RetryBackoff` likewise rejects negative base/cap
+delays, and its factor must be finite and at least `1.0`.
 
 Retry delays use `TimeProvider.System` by default. Tests that need to advance retry time without
 sleeping can attach a deterministic provider with `Command.TimeProvider(provider)` (or
@@ -369,14 +377,26 @@ The two built-in classifiers are ready to drop in as predicates:
 ```fsharp
 let cmd =
     Command.create "flaky-tool"
-    |> Command.retry 5 (TimeSpan.FromMilliseconds 200.0) ProcessError.isTransient
+    |> Command.retryBackoff
+        5
+        (TimeSpan.FromMilliseconds 200.0)
+        2.0
+        (TimeSpan.FromSeconds 10.0)
+        true
+        ProcessError.isTransient
 ```
 
 **C#**
 
 ```csharp
 var cmd = new Command("flaky-tool")
-    .Retry(5, TimeSpan.FromMilliseconds(200), err => err.IsTransient);
+    .RetryBackoff(
+        5,
+        TimeSpan.FromMilliseconds(200),
+        2.0,
+        TimeSpan.FromSeconds(10),
+        true,
+        err => err.IsTransient);
 ```
 
 **Where retry earns its keep.** Retry replays the run whenever a verb yields an
@@ -398,7 +418,7 @@ Two ground rules:
 
 For "keep a *service* alive whenever it exits" rather than "replay this one
 operation", reach for a [supervision.md](supervision.md) `Supervisor` — the same
-backoff shape, a different loop condition.
+backoff vocabulary, a different loop condition.
 
 ## Cancellation
 

@@ -52,6 +52,7 @@ class ProcessKit.Command
   member Pty(ProcessKit.PtyConfig) : ProcessKit.Command
   member Pty(System.Int32, System.Int32) : ProcessKit.Command
   member Retry(System.Int32, System.TimeSpan, System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Command
+  member RetryBackoff(System.Int32, System.TimeSpan, System.Double, System.TimeSpan, System.Boolean, System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Command
   member RetryNever() : ProcessKit.Command
   member Setsid() : ProcessKit.Command
   member Stderr(ProcessKit.StdioMode) : ProcessKit.Command
@@ -118,6 +119,7 @@ module ProcessKit.CommandModule
   static member ptyConfig(ProcessKit.PtyConfig, ProcessKit.Command) : ProcessKit.Command
   static member ptySize(System.Int32, System.Int32, ProcessKit.Command) : ProcessKit.Command
   static member retry(System.Int32, System.TimeSpan, Microsoft.FSharp.Core.FSharpFunc<ProcessKit.ProcessError, System.Boolean>, ProcessKit.Command) : ProcessKit.Command
+  static member retryBackoff(System.Int32, System.TimeSpan, System.Double, System.TimeSpan, System.Boolean, Microsoft.FSharp.Core.FSharpFunc<ProcessKit.ProcessError, System.Boolean>, ProcessKit.Command) : ProcessKit.Command
   static member retryNever(ProcessKit.Command) : ProcessKit.Command
   static member setsid(ProcessKit.Command) : ProcessKit.Command
   static member stderr(ProcessKit.StdioMode, ProcessKit.Command) : ProcessKit.Command

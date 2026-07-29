@@ -149,40 +149,21 @@ module internal Supervision =
         | None -> OutputBufferPolicy(Some DefaultSupervisionTail, policy.MaxBytes, policy.Overflow)
 
     /// A safe ceiling for any computed delay, so jitter never overflows `Task.Delay`.
-    let maxDelay = TimeSpan.FromMilliseconds(float Int32.MaxValue)
+    let maxDelay = Backoff.maxDelay
 
     /// `base × factor^n`, capped at `cap`.
     let backoffDelay (baseDelay: TimeSpan) (factor: float) (n: int) (cap: TimeSpan) : TimeSpan =
-        if baseDelay <= TimeSpan.Zero then
-            TimeSpan.Zero
-        else
-            let scaled = baseDelay.TotalSeconds * (factor ** float n)
-
-            if not (Double.IsFinite scaled) || scaled >= cap.TotalSeconds then
-                cap
-            else
-                min (TimeSpan.FromSeconds scaled) cap
+        Backoff.exponentialDelay baseDelay factor n cap
 
     /// A pseudo-random factor in `[0.5, 1.5)`.
-    let jitterFactor () = 0.5 + Random.Shared.NextDouble()
+    let jitterFactor () =
+        Backoff.jitterFactor (fun () -> Random.Shared.NextDouble())
 
     /// Multiply `delay` by a uniform random factor in `[0.5, 1.5)` when `enabled`, always clamped to
     /// `[0, maxDelay]` so the result is safe to hand to `Task.Delay` — even with jitter off and a
     /// large `MaxBackoff` / `StormPause`, the delay can never overflow the BCL timer.
     let applyJitter (delay: TimeSpan) (enabled: bool) : TimeSpan =
-        if delay <= TimeSpan.Zero then
-            TimeSpan.Zero
-        else
-            let scaled =
-                if enabled then
-                    delay.TotalSeconds * jitterFactor ()
-                else
-                    delay.TotalSeconds
-
-            if not (Double.IsFinite scaled) || scaled >= maxDelay.TotalSeconds then
-                maxDelay
-            else
-                TimeSpan.FromSeconds scaled
+        Backoff.applyJitter delay enabled (fun () -> Random.Shared.NextDouble())
 
     /// Fold one failure into the decaying score: the previous score halves every `halfLife` of
     /// elapsed time, then the new failure adds `1`. A zero half-life keeps no history (every

@@ -473,7 +473,9 @@ counts only on the POSIX process-group fallback; `ProfileAsync` samples the star
 
 ## Supervising a long-lived child
 
-Where `Command.Retry` replays one run until it succeeds, a `Supervisor` keeps a child **alive**:
+Where `Command.Retry` replays one run with a fixed pause,
+`Command.RetryBackoff` provides bounded exponential backoff with optional jitter for that same
+finite operation. A `Supervisor` instead keeps a child **alive**:
 it restarts the command per policy whenever it exits, with bounded restarts and exponential
 backoff (jittered by default so a restarted fleet doesn't stampede):
 

@@ -9,6 +9,58 @@ open NUnit.Framework
 open ProcessKit
 open ProcessKit.Testing
 
+type private RetryTimer(callback: TimerCallback, state: obj | null) =
+    let mutable disposed = 0
+
+    member _.Fire() =
+        if Volatile.Read(&disposed) = 0 then
+            callback.Invoke state
+
+    interface ITimer with
+        member _.Change(_dueTime, _period) = Volatile.Read(&disposed) = 0
+
+        member _.Dispose() =
+            Interlocked.Exchange(&disposed, 1) |> ignore
+
+        member _.DisposeAsync() =
+            Interlocked.Exchange(&disposed, 1) |> ignore
+            ValueTask()
+
+type private RetryTimeProvider() =
+    inherit TimeProvider()
+
+    let gate = obj ()
+    let timers = ResizeArray<RetryTimer * TimeSpan>()
+    let created = new SemaphoreSlim(0)
+
+    override _.CreateTimer(callback, state, dueTime, _period) =
+        let timer = new RetryTimer(callback, state)
+        lock gate (fun () -> timers.Add(timer, dueTime))
+        created.Release() |> ignore
+        timer :> ITimer
+
+    member _.WaitForTimer(index: int) : Task<TimeSpan> =
+        task {
+            let mutable found = None
+
+            while found.IsNone do
+                found <-
+                    lock gate (fun () ->
+                        if timers.Count > index then
+                            Some(snd timers[index])
+                        else
+                            None)
+
+                if found.IsNone then
+                    do! created.WaitAsync()
+
+            return found.Value
+        }
+
+    member _.Fire(index: int) =
+        let timer = lock gate (fun () -> fst timers[index])
+        timer.Fire()
+
 [<TestFixture>]
 type RunnerTests() =
 
@@ -140,6 +192,92 @@ type RunnerTests() =
 
         Command("svc").Retry(0, TimeSpan.Zero, shouldRetry) |> ignore
         Command("svc").Retry(1, TimeSpan.Zero, shouldRetry) |> ignore
+
+    [<Test>]
+    member _.``RetryBackoff validates every delay and factor at the builder boundary``() =
+        let shouldRetry = Func<ProcessError, bool>(fun _ -> true)
+        let zero = TimeSpan.Zero
+
+        for delay in [ TimeSpan.FromTicks -1L; Timeout.InfiniteTimeSpan ] do
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () -> Command("svc").RetryBackoff(3, delay, 2.0, zero, true, shouldRetry) |> ignore)
+            )
+            |> ignore
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () ->
+                    Command.create "svc"
+                    |> Command.retryBackoff 3 zero 2.0 delay true (fun _ -> true)
+                    |> ignore)
+            )
+            |> ignore
+
+        for factor in [ 0.99; Double.NaN; Double.PositiveInfinity; Double.NegativeInfinity ] do
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () ->
+                    CliClient("svc")
+                        .WithDefaults(fun command -> command.RetryBackoff(3, zero, factor, zero, true, shouldRetry))
+                    |> ignore)
+            )
+            |> ignore
+
+        Command("svc").RetryBackoff(1, zero, 1.0, zero, false, shouldRetry) |> ignore
+
+    [<Test>]
+    member _.``RetryBackoff inherits through CliClient and uses TimeProvider with deterministic jitter``() : Task =
+        task {
+            let provider = RetryTimeProvider()
+            let samples = System.Collections.Generic.Queue<float>([ 0.0; 0.5; 0.9 ])
+            let mutable calls = 0
+
+            let flaky =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+
+                        if calls < 4 then
+                            Task.FromResult(Ok(ProcessResult.Failure "" "transient" 1))
+                        else
+                            Task.FromResult(Ok(ProcessResult.Success "ready"))
+
+                    member _.CaptureBytesAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let client =
+                CliClient("svc")
+                    .WithRunner(flaky)
+                    .WithDefaults(fun command ->
+                        command.RetryBackoff(
+                            4,
+                            TimeSpan.FromMilliseconds 100.0,
+                            2.0,
+                            TimeSpan.FromMilliseconds 250.0,
+                            true,
+                            Func<ProcessError, bool>(fun _ -> true)
+                        ))
+
+            let command =
+                client.Command([]).TimeProvider(provider).WithRetryJitterSource(fun () -> samples.Dequeue())
+
+            let run = command |> Runner.run flaky CancellationToken.None
+            let expected = [| 50.0; 200.0; 350.0 |]
+
+            for index in 0 .. expected.Length - 1 do
+                let! delay = provider.WaitForTimer index
+                Assert.That(delay.TotalMilliseconds, Is.EqualTo(expected[index]).Within 0.001)
+                provider.Fire index
+
+            match! run with
+            | Ok "ready" -> ()
+            | other -> Assert.Fail $"expected the fourth attempt to succeed, got {other}"
+
+            Assert.That(calls, Is.EqualTo 4)
+            Assert.That(samples.Count, Is.EqualTo 0, "each retry must draw exactly one jitter sample")
+        }
+        :> Task
 
     [<Test>]
     member _.``CancelOn interrupts a retry backoff``() : Task =

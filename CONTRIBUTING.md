@@ -44,7 +44,7 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
   tabs** — the compiler rejects tabs. The aggregate script checks it before building;
   to run that stage alone:
   ```sh
-  dotnet fantomas --check src tests
+  dotnet fantomas --check src tests samples benchmarks docs/snippets/DocSnippets.FSharp/Fixtures.fs
   ```
   CI fails on unformatted F#. Do not reformat code you are not changing.
 - **Static analysis** uses `fsharp-analyzers` with the Ionide.Analyzers rule
