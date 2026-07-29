@@ -52,8 +52,9 @@ signal to one pid:
   grandchildren included. Where a mechanism has a genuine weakness (a `setsid` child escapes a
   POSIX process group), the active `Mechanism` is reported instead of pretending — never a silent
   downgrade.
-- **Async-first.** Run-and-capture, line streaming, interactive stdin, readiness probes,
-  shell-free pipelines, supervision — all return `Task<…>` and stream as `IAsyncEnumerable<…>`.
+- **Async-first.** Run-and-capture, line/Content-Length streaming, interactive stdin, readiness
+  probes, shell-free pipelines, supervision — all return `Task<…>` and stream as
+  `IAsyncEnumerable<…>`.
 - **Honest results.** A non-zero exit is data (`ProcessResult`) until you ask for success; a
   timeout is *captured* in the result; a cancellation is always an error; every platform
   divergence is typed or documented. A `ProcessError.Timeout` from ProcessKit carries the exact
@@ -61,8 +62,8 @@ signal to one pid:
   actual wall-clock time including teardown. If a custom `IProcessRunner` returns `Outcome.TimedOut`
   without that internal cause, the configured duration is unknown and the error honestly falls back
   to the result's actual elapsed duration.
-- **Testable.** One interface seam (`IProcessRunner`) swaps the real spawner for scripted doubles
-  or record/replay cassettes — no subprocess in your tests.
+- **Testable.** One interface seam (`IProcessRunner`) swaps the real spawner for scripted doubles,
+  deterministic fault injection, or record/replay cassettes — no subprocess in your tests.
 
 ### How it compares
 
@@ -216,11 +217,12 @@ health reporting, and test doubles.
 | [Scripting with F# Interactive](docs/scripting.md) | `.fsx` setup, one-off helpers, reusable CLI clients, Ctrl+C cleanup, and portable tool resolution |
 | [Running commands](docs/commands.md) | The full `Command` builder and every consuming verb, with error semantics |
 | [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
-| [Streaming & interactive I/O](docs/streaming.md) | Line streaming, conversational stdin, readiness probes, `WaitAnyAsync`, profiling |
+| [Streaming & interactive I/O](docs/streaming.md) | Line/Content-Length streaming, conversational stdin, readiness probes, `WaitAnyAsync`, profiling |
+| [Performance & scalability](docs/performance.md) | Event-driven waits, buffer/backpressure tuning, fleet sizing, benchmark interpretation |
 | [Pipelines](docs/pipelines.md) | Shell-free `a → b → c`, pipefail attribution, chain timeouts |
 | [Timeouts, retries & cancellation](docs/timeouts-and-cancellation.md) | Captured vs raised deadlines, retry classifiers, `CancellationToken` |
 | [Supervision](docs/supervision.md) | Restart policies, backoff & jitter, stop conditions, outcomes |
-| [Testing your code](docs/testing.md) | The `IProcessRunner` seam, scripted / record-replay doubles, cassettes, `CliClient` |
+| [Testing your code](docs/testing.md) | The `IProcessRunner` seam, scripted/fault-injecting/record-replay doubles, cassettes, `CliClient` |
 | [Platform support](docs/platform-support.md) | Mechanisms, every capability matrix, and each caveat |
 
 Where the project is headed: the **[roadmap](ROADMAP.md)**.

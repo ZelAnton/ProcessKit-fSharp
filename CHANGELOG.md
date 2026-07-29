@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ResourceLimits.WithOomGroupKill` makes Linux cgroup v2 kill a contained process tree as one unit on OOM.
 - `RotatingFileSink` provides bounded parent-side log rotation for stdout and stderr tees.
 - `RunningProcess.ForwardParentSignals` forwards parent interrupts into one graceful tree stop with automatic unsubscription.
+- `ContentLengthSession` provides byte-exact full-duplex framing for LSP, DAP, BSP, and similar live protocols.
+- `ProcessKit.Testing.FaultInjectingRunner` adds scripted, first-N, and seeded deterministic failure scenarios with virtual-time latency.
+- A performance and scalability guide documents event-driven waits, buffer tuning, fleet sizing, and benchmark interpretation.
 
 ### Fixed
 - Supervisor restarts now apply the restart policy to typed live-output pump failures and retain liveness-failure attribution without leaking it to later children.

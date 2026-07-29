@@ -53,6 +53,7 @@ class ProcessKit.Testing.DryRunRunner
 
 class ProcessKit.Testing.FakeProcess
   member Build() : ProcessKit.RunningProcess
+  member WithContentLengthFrames(System.Collections.Generic.IEnumerable<System.Byte[]>) : ProcessKit.Testing.FakeProcess
   member WithExit(System.Int32) : ProcessKit.Testing.FakeProcess
   member WithOutcome(ProcessKit.Outcome) : ProcessKit.Testing.FakeProcess
   member WithPid(System.Int32) : ProcessKit.Testing.FakeProcess
@@ -66,6 +67,23 @@ class ProcessKit.Testing.FakeProcess
   property StdinBytes : System.Byte[] { get }
   static member Create() : ProcessKit.Testing.FakeProcess
   static member Create(System.String) : ProcessKit.Testing.FakeProcess
+
+class ProcessKit.Testing.FaultInjectingRunner : ProcessKit.DelegatingProcessRunner
+  :> ProcessKit.IProcessRunner
+  member CaptureBytesAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  member CaptureStringAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
+  member SpawnAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
+  new(ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Testing.FaultInjection>)
+  new(ProcessKit.IProcessRunner, System.Int32, ProcessKit.Testing.FaultInjection)
+  property InvocationCount : System.Int32 { get }
+  static member Seeded(ProcessKit.IProcessRunner, System.Int32, System.Double, ProcessKit.Testing.FaultInjection) : ProcessKit.Testing.FaultInjectingRunner
+
+class ProcessKit.Testing.FaultInjection
+  member WithLatency(System.TimeSpan) : ProcessKit.Testing.FaultInjection
+  property Latency : System.TimeSpan { get }
+  static member Delegate() : ProcessKit.Testing.FaultInjection
+  static member Error(ProcessKit.ProcessError) : ProcessKit.Testing.FaultInjection
+  static member Outcome(ProcessKit.Outcome) : ProcessKit.Testing.FaultInjection
 
 class ProcessKit.Testing.RecordReplayOptions
   member WithArgNormalizer(System.Func<System.String[], System.String[]>) : ProcessKit.Testing.RecordReplayOptions

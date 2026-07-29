@@ -532,9 +532,9 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // racing set of drains on the same streams.
     let mutable eventOutcome = Unchecked.defaultof<Task<Outcome>>
 
-    // The interactive (expect-style) session's single combined outcome — the exit wait plus both raw
-    // readers draining, the unframed analogue of `eventOutcome` above. `ExitTask` reuses it for an
-    // `Interactive` handle so it does not start a second, racing set of readers on the same streams.
+    // An interactive raw session's single combined outcome — the exit wait plus both readers draining.
+    // `PtySession` owns unframed text; `ContentLengthSession` owns framed stdout plus a stderr drain.
+    // `ExitTask` reuses it for either `Interactive` handle so it never starts racing readers.
     let mutable interactiveOutcome = Unchecked.defaultof<Task<Outcome>>
 
     // A buffered verb's single exit wait (`OutputStringAsync`/`OutputBytesAsync`/`WaitAsync`/
@@ -2084,6 +2084,65 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
 
                 Ok window)
 
+    /// Claim stdout for a Content-Length parser supplied by `ContentLengthSession`, while draining
+    /// stderr independently so a chatty protocol server cannot block. The parser receives the raw
+    /// stdout stream and byte-exact tee; its task becomes this handle's shared interactive outcome.
+    member internal _.StartContentLengthSession
+        (startStdoutPump: Stream -> Stream option -> (unit -> bool) -> Task)
+        : Result<unit, ProcessError> =
+        ArgumentNullException.ThrowIfNull startStdoutPump
+
+        lock stateLock (fun () ->
+            if consumption <> Consumption.Fresh then
+                Error(alreadyConsumedError ())
+            else
+                match stdoutStream with
+                | None -> Error(ProcessError.Unsupported "Content-Length sessions require piped stdout")
+                | Some stdout ->
+                    consumption <- Consumption.Interactive
+
+                    let stdoutPump =
+                        task {
+                            try
+                                do! startStdoutPump stdout config.StdoutTee isTearingDown
+                            with
+                            | :? ObjectDisposedException when isTearingDown () ->
+                                // This handle's teardown closed stdout while the framed reader was active.
+                                ()
+                            | :? IOException when isTearingDown () ->
+                                // This handle's teardown broke the pipe; the run outcome remains authoritative.
+                                ()
+                            | ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
+                        }
+                        :> Task
+
+                    let stderrPump =
+                        match stderrStream with
+                        | None -> Task.CompletedTask
+                        | Some stderr ->
+                            Pump.readTextUntilDone
+                                stderr
+                                config.StderrEncoding
+                                config.StderrTee
+                                ignore
+                                isTearingDown
+                                CancellationToken.None
+
+                    let pumps = [| stdoutPump; stderrPump |]
+                    killTreeOnPumpFault stdoutPump
+                    killTreeOnPumpFault stderrPump
+
+                    interactiveOutcome <-
+                        task {
+                            let! outcome = ensureBufferedWait ()
+                            do! Task.WhenAll pumps
+                            conclude outcome
+                            return outcome
+                        }
+
+                    observeFault interactiveOutcome
+                    Ok())
+
     /// The `CommandConfig` this handle was started from. Internal: `PtySession` reads the program name
     /// and the terminal encoding from it.
     member internal _.Config: CommandConfig = config
@@ -2330,8 +2389,8 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                         // starting our own drains here, which would race a second reader on the same streams.
                         eventOutcome
                     elif consumption = Consumption.Interactive then
-                        // An expect-style session's raw readers already drain the pipes; reuse their shared
-                        // outcome for the same reason as the event session above.
+                        // An interactive raw session already drains the pipes; reuse its shared outcome for
+                        // the same reason as the event session above.
                         interactiveOutcome
                     elif consumption = Consumption.Buffered then
                         // A buffered verb already claimed the pipes; share its single wait (memoized under

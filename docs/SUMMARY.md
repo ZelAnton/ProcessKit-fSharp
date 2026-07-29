@@ -26,6 +26,7 @@
 - [Running commands](commands.md)
 - [Process groups](process-groups.md)
 - [Streaming & interactive I/O](streaming.md)
+- [Performance & scalability](performance.md)
 - [Pseudo-terminal (PTY)](pty.md)
 - [Pipelines](pipelines.md)
 - [Timeouts, retries & cancellation](timeouts-and-cancellation.md)

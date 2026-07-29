@@ -425,6 +425,55 @@ fires — because retry lives in the verb layer over the `CaptureStringAsync` pr
 want spawning to be a hard error, return
 `Error(ProcessError.Unsupported "no streaming in this double")` from `SpawnAsync`.
 
+## Deterministic fault injection
+
+`FaultInjectingRunner` packages that decorator pattern for resilience tests. It wraps any
+`IProcessRunner` and intercepts the three primitive invocations before delegating. The common
+"fail N times, then succeed" retry test is direct:
+
+**F#**
+
+```fsharp
+let inner: IProcessRunner = (ScriptedRunner()).Fallback(Reply.Ok "recovered")
+
+let runner: IProcessRunner =
+    FaultInjectingRunner(
+        inner,
+        2,
+        FaultInjection.Error(ProcessError.Io "transient network failure")
+    )
+
+let command =
+    (Command.create "tool").Retry(2, TimeSpan.Zero, Func<ProcessError, bool>(fun error -> error.IsTransient))
+let recovered = runner.OutputStringAsync(command)
+```
+
+**C#**
+
+```csharp
+IProcessRunner inner = new ScriptedRunner().Fallback(Reply.Ok("recovered"));
+IProcessRunner runner = new FaultInjectingRunner(
+    inner,
+    2,
+    FaultInjection.Error(ProcessError.NewIo("transient network failure")));
+
+var recovered = runner.OutputStringAsync(
+    new Command("tool").Retry(2, TimeSpan.Zero, error => error.IsTransient));
+```
+
+The sequence constructor consumes different `FaultInjection` values in order and then delegates.
+`FaultInjection.Outcome(...)` synthesizes non-zero, signalled, timed-out, or unobserved live/bulk
+results; `FaultInjection.Delegate()` is an explicit pass-through step. `Seeded(inner, seed,
+probability, injection)` chooses the same invocation indices for the same seed and call order, making
+probabilistic scenarios reproducible rather than flaky.
+
+`WithLatency(duration)` delays that one injection through the intercepted command's
+`TimeProvider`. Supply a virtual provider, advance its timer, and test timeout/storm-guard behavior
+without sleeping. Completion calls link both the verb token and `Command.CancelOn`; `SpawnAsync`
+keeps its ordinary one-shot token boundary. A cancelled delayed action returns
+`ProcessError.Cancelled` and never reaches the inner runner. `InvocationCount` is safe to inspect
+after concurrent calls, although reproducibility still uses invocation order as its sequence axis.
+
 ## What the doubles don't cover
 
 The subprocess-free doubles center on the **bulk** primitives. `ScriptedRunner` and
@@ -439,6 +488,12 @@ streaming call through a capture verb, then replay it as a stream. The full live
 and a [`Pipeline`](pipelines.md) are best tested against a real (possibly trivial) child
 process; keep the scripted/cassette doubles for everything that flows through the capture
 primitives.
+
+`FakeProcess.WithContentLengthFrames(payloads)` is the framed-protocol exception: it builds
+canonical CRLF `Content-Length` messages around byte-exact scripted payloads, so a
+[`ContentLengthSession`](streaming.md#content-length-framed-sessions-lsp--dap) can be tested without
+a server process. Pair it with `WithStdinOpen()` and assert `FakeProcess.StdinBytes` to verify frames
+the client sent.
 
 ## Pseudo-terminal (PTY) doubles
 

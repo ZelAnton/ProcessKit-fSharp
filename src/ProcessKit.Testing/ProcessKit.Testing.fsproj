@@ -42,6 +42,7 @@
 		<Compile Include="RecordedInvocation.fs" />
 		<Compile Include="ScriptedRunner.fs" />
 		<Compile Include="DryRunRunner.fs" />
+		<Compile Include="FaultInjectingRunner.fs" />
 		<Compile Include="Cassette.fs" />
 	</ItemGroup>
 

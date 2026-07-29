@@ -691,6 +691,72 @@ interactivity at all — give the command `Stdin.FromLines seq`,
 background writer feed it; those sources run concurrently with the output pumps and
 never deadlock. See the stdin source table in [Running commands](commands.md).
 
+## Content-Length framed sessions (LSP / DAP)
+
+Language servers, debug adapters, and BSP servers usually do not speak newline-delimited JSON.
+They frame each byte payload as `Content-Length: N`, CRLF, a blank CRLF line, then exactly `N`
+payload bytes. `ContentLengthSession` owns a live handle's stdout and exposes those payloads as a
+single `IAsyncEnumerable<byte[]>`; build the command with `KeepStdinOpen` to send frames back.
+
+**F#**
+
+<!-- docsnippet:imports System.Text -->
+```fsharp
+task {
+    let command = (Command.create "language-server").KeepStdinOpen()
+
+    match! command.StartAsync() with
+    | Error err -> eprintfn $"{err.Message}"
+    | Ok proc ->
+        use proc = proc
+        let session = ContentLengthSession(proc)
+        let initialize = Encoding.UTF8.GetBytes "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}"
+
+        match! session.SendAsync initialize with
+        | Error err -> eprintfn $"{err.Message}"
+        | Ok() ->
+            let frames = session.FramesAsync().GetAsyncEnumerator()
+
+            try
+                let! received = frames.MoveNextAsync()
+
+                if received then
+                    printfn "received %d bytes" frames.Current.Length
+            finally
+                frames.DisposeAsync().AsTask().Wait()
+}
+```
+
+**C#**
+
+<!-- docsnippet:imports System.Text -->
+```csharp
+await using var process =
+    (await new Command("language-server").KeepStdinOpen().StartAsync()).GetValueOrThrow();
+var session = new ContentLengthSession(process);
+
+var initialize = Encoding.UTF8.GetBytes("{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}");
+(await session.SendAsync(initialize)).GetValueOrThrow();
+
+await foreach (var frame in session.FramesAsync())
+    Console.WriteLine($"received {frame.Length} bytes");
+```
+
+The default maximum payload in either direction is 16 MiB; pass a smaller positive `maxFrameBytes`
+to the constructor for an untrusted peer. Oversized, duplicate/missing `Content-Length`, non-ASCII
+headers, bare-LF headers, and truncated payloads fail the enumerator with `ProcessException`
+carrying `ProcessError.Parse` before a misleading partial frame is yielded. Extra headers such as
+`Content-Type` are accepted. `SendAsync` serializes concurrent callers so header/payload pairs never
+interleave; after cancelling a send, abandon the session because the child may have received a
+prefix. `FinishInputAsync` closes framed stdin and lets the child observe EOF.
+
+Payloads remain raw for byte accuracy and NativeAOT-friendly caller control. For typed JSON, pass
+each frame to `JsonSerializer.Deserialize(frame, MyJsonContext.Default.Message)` (or the matching
+source-generated `JsonTypeInfo`) and serialize outgoing values to UTF-8 bytes before `SendAsync`.
+The session is the sole stdout consumer: do not combine it with `OutputStringAsync`, line/NDJSON
+streaming, `PtySession`, or another framed session on the same handle. Stderr is drained separately
+and still reaches `StderrTee`.
+
 ## Readiness probes
 
 "Start a server, then use it" needs the server to be *ready*, not merely started.

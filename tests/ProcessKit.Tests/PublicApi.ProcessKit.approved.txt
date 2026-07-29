@@ -170,6 +170,15 @@ class ProcessKit.CommandVerbs
 module ProcessKit.ConsoleEncoding
   static member current() : System.Text.Encoding
 
+class ProcessKit.ContentLengthSession
+  member FinishInputAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member FramesAsync() : System.Collections.Generic.IAsyncEnumerable<System.Byte[]>
+  member SendAsync(System.Byte[]) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member SendAsync(System.Byte[], System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  new(ProcessKit.RunningProcess)
+  new(ProcessKit.RunningProcess, System.Int32)
+  property MaxFrameBytes : System.Int32 { get }
+
 class ProcessKit.DelegatingProcessRunner
   :> ProcessKit.IProcessRunner
   member CaptureBytesAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
