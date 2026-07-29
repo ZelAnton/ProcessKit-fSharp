@@ -33,6 +33,19 @@ Dependencies are audited against the NuGet advisory database on every restore
 [Dependabot](.github/dependabot.yml) keeps GitHub Actions and NuGet packages
 current.
 
+## Release integrity and SBOM
+
+Every GitHub Release includes one CycloneDX 1.7 JSON software bill of materials
+for each published NuGet package. The SBOM records the exact release version and
+its resolved dependency graph, including each companion package's matching
+`ProcessKit` dependency.
+
+The `.nupkg`, `.snupkg`, `*.cdx.json`, and `SHA256SUMS` files are covered by the
+release workflow's build-provenance attestations. `SHA256SUMS` also lists every
+package and SBOM, so downloaded assets can be checked with `sha256sum -c
+SHA256SUMS`; provenance can be checked with `gh attestation verify <file> --repo
+ZelAnton/ProcessKit-fSharp`.
+
 > **No CodeQL.** GitHub CodeQL has no F# support, so this repository ships no
 > CodeQL workflow. Static hygiene relies instead on `TreatWarningsAsErrors` and
 > Fantomas formatting checks in CI. F# analyzers are integrated through the

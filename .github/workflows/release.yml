@@ -329,12 +329,116 @@ jobs:
               -p:PackWithCoreDependency=true /p:Version=${{ steps.version.outputs.version }}
           done
 
+      # Generate one machine-readable dependency inventory for each package exactly as it is
+      # shipped. CycloneDX is a CI tool, not a project dependency; pinning its version here keeps
+      # the release surface reproducible without adding anything to a consumer's NuGet graph.
+      #
+      # The three companion projects have a release-only PackageReference to the exact co-released
+      # ProcessKit version. Their preceding pack restored that conditional graph into project.assets.json;
+      # carry the same MSBuild properties in the environment and disable another restore so CycloneDX
+      # reads that shipped graph instead of silently reverting to the everyday assembly Reference.
+      - name: Generate CycloneDX SBOMs
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/cyclonedx-dotnet"
+          dotnet tool install --tool-path "$tool_dir" CycloneDX --version 6.2.0
+          cyclonedx="$tool_dir/dotnet-CycloneDX"
+
+          projects=(
+            src/ProcessKit/ProcessKit.fsproj
+            src/ProcessKit.Testing/ProcessKit.Testing.fsproj
+            src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj
+            src/ProcessKit.Extensions.Hosting/ProcessKit.Extensions.Hosting.fsproj
+          )
+          packages=(
+            ProcessKit
+            ProcessKit.Testing
+            ProcessKit.Extensions.DependencyInjection
+            ProcessKit.Extensions.Hosting
+          )
+
+          for i in "${!projects[@]}"; do
+            args=(
+              "${projects[$i]}"
+              --output ./artifacts
+              --filename "${packages[$i]}.cdx.json"
+              --output-format Json
+              --spec-version 1.7
+              --set-name "${packages[$i]}"
+              --set-version "$RELEASE_VERSION"
+              --set-type Library
+              --set-nuget-purl
+              --disable-package-restore
+            )
+
+            if [[ "$i" -eq 0 ]]; then
+              "$cyclonedx" "${args[@]}"
+            else
+              PackWithCoreDependency=true CoreDepVersion="$RELEASE_VERSION" \
+                "$cyclonedx" "${args[@]}"
+            fi
+          done
+
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          version = os.environ["RELEASE_VERSION"]
+          root = pathlib.Path("artifacts")
+          names = [
+              "ProcessKit",
+              "ProcessKit.Testing",
+              "ProcessKit.Extensions.DependencyInjection",
+              "ProcessKit.Extensions.Hosting",
+          ]
+
+          for name in names:
+              path = root / f"{name}.cdx.json"
+              try:
+                  bom = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError) as error:
+                  print(f"::error::{path}: invalid or missing CycloneDX JSON: {error}", file=sys.stderr)
+                  sys.exit(1)
+
+              component = bom.get("metadata", {}).get("component", {})
+              expected = {"name": name, "version": version, "type": "library"}
+              actual = {key: component.get(key) for key in expected}
+              if bom.get("bomFormat") != "CycloneDX" or bom.get("specVersion") != "1.7" or actual != expected:
+                  print(
+                      f"::error::{path}: unexpected BOM identity/spec: "
+                      f"bomFormat={bom.get('bomFormat')!r}, specVersion={bom.get('specVersion')!r}, "
+                      f"component={actual!r}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              if name != "ProcessKit":
+                  core_components = [
+                      item
+                      for item in bom.get("components", [])
+                      if item.get("name") == "ProcessKit" and item.get("version") == version
+                  ]
+                  if len(core_components) != 1:
+                      print(
+                          f"::error::{path}: expected exactly one ProcessKit@{version} dependency, "
+                          f"found {len(core_components)}",
+                          file=sys.stderr,
+                      )
+                      sys.exit(1)
+
+              print(f"validated {path} ({len(bom.get('components', []))} components)")
+          PY
+
       - name: Generate SHA256SUMS
         run: |
           set -euo pipefail
           shopt -s nullglob
           cd ./artifacts
-          files=(*.nupkg *.snupkg)
+          files=(*.nupkg *.snupkg *.cdx.json)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "::error::No package files to hash in ./artifacts."
             exit 1
@@ -343,7 +447,7 @@ jobs:
           cat SHA256SUMS
 
       # Generate provenance attestations for the exact artifacts about to ship (the
-      # four .nupkg + their .snupkg symbol packages and the SHA256SUMS manifest),
+      # four .nupkg + their .snupkg symbol packages, four CycloneDX SBOMs, and the SHA256SUMS manifest),
       # cryptographically binding them to this workflow run so consumers can verify
       # origin with `gh attestation verify <file> --repo <owner>/<repo>`. A logical
       # continuation of the repo's existing supply-chain hardening (SHA-pinned actions,
@@ -364,6 +468,7 @@ jobs:
           subject-path: |
             artifacts/*.nupkg
             artifacts/*.snupkg
+            artifacts/*.cdx.json
             artifacts/SHA256SUMS
 
       # Bump the declared <Version> of all four packages in lockstep (they are packed above with
@@ -518,7 +623,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          assets=(./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS)
+          assets=(./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/*.cdx.json ./artifacts/SHA256SUMS)
           for attempt in 1 2 3; do
             if gh release view "$TAG" >/dev/null 2>&1; then
               if gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md \
@@ -535,7 +640,7 @@ jobs:
             echo "::warning::GitHub Release step attempt $attempt failed; retrying after backoff..."
             sleep $((attempt * 10))
           done
-          echo "::error::Failed to create/update the GitHub Release after 3 attempts. The package is ALREADY on nuget.org and the tag is ALREADY on main. Do NOT re-run this workflow (a re-run computes the NEXT version and orphans this release). Finish by hand: if the Release does not exist yet, 'gh release create $TAG --title $TAG --notes-file release-notes.md ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS'; if it already exists (likely, since a partial attempt may have created it), 'gh release edit $TAG --notes-file release-notes.md && gh release upload $TAG ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS --clobber'."
+          echo "::error::Failed to create/update the GitHub Release after 3 attempts. The package is ALREADY on nuget.org and the tag is ALREADY on main. Do NOT re-run this workflow (a re-run computes the NEXT version and orphans this release). Finish by hand: if the Release does not exist yet, 'gh release create $TAG --title $TAG --notes-file release-notes.md ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/*.cdx.json ./artifacts/SHA256SUMS'; if it already exists (likely, since a partial attempt may have created it), 'gh release edit $TAG --notes-file release-notes.md && gh release upload $TAG ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/*.cdx.json ./artifacts/SHA256SUMS --clobber'."
           exit 1
 
       # A Release created with GITHUB_TOKEN does not emit another workflow-triggering
