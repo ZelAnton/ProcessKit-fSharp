@@ -62,8 +62,8 @@ type RestartCause =
     /// when no liveness probe is configured.
     | Exit
 
-    /// A configured liveness probe (`Supervisor.LivenessHttp`/`LivenessCheck`) found the *live* child
-    /// unresponsive for the configured number of consecutive attempts, so the supervisor gracefully
+    /// A configured liveness probe (`Supervisor.LivenessHttp`/`LivenessCheck`/`LivenessMemory`) found the *live* child
+    /// unhealthy for the configured number of consecutive attempts, so the supervisor gracefully
     /// stopped it and restarted it through the ordinary policy/backoff path.
     | Liveness
 
@@ -190,11 +190,10 @@ module internal Liveness =
         else
             interval
 
-/// How the supervisor checks whether a *live* incarnation is still healthy: an HTTP endpoint (poll
-/// until a response satisfies the check) or an arbitrary async predicate. Internal — built through the
-/// `Supervisor.LivenessHttp`/`LivenessCheck` builder methods. Both funnel through the shared readiness
-/// poll/deadline core (`ReadinessProbe.waitForCoreUsing`), so a single liveness attempt is one bounded
-/// health-check window, never a duplicated polling loop.
+/// How the supervisor checks whether a *live* incarnation is still healthy: an HTTP endpoint, an
+/// arbitrary async predicate, or an attributable whole-tree memory sample. Internal — built through
+/// the `Supervisor.LivenessHttp`/`LivenessCheck`/`LivenessMemory` builder methods. Endpoint probes funnel
+/// through the shared readiness poll/deadline core (`ReadinessProbe.waitForCoreUsing`).
 [<RequireQualifiedAccess; NoComparison>]
 type internal LivenessProbe =
 
@@ -203,6 +202,9 @@ type internal LivenessProbe =
 
     /// Evaluate an arbitrary async predicate each attempt; the child is healthy when it returns `true`.
     | Custom of probe: (unit -> Task<bool>)
+
+    /// Sample attributable whole-tree peak memory; healthy while it is at or below `maxBytes`.
+    | Memory of maxBytes: int64
 
 /// The immutable configuration behind a `Supervisor`. Internal — built through the `Supervisor`
 /// builder.
@@ -364,6 +366,10 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     // incarnation, always ordered before the graceful stop that makes the loop observe the exit.
     let mutable livenessTripped = false
 
+    // A resource probe can fail because the active containment backend cannot provide attributable
+    // whole-tree accounting. Preserve that typed failure across the graceful stop it triggers.
+    let mutable livenessFatalError: ProcessError option = None
+
     // The atomically-published snapshot. Seeded active-with-no-child; refreshed on every state change.
     let mutable status = SupervisionStatus(true, 0, false, None, None)
 
@@ -460,6 +466,15 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
             livenessTripped <- false
             tripped)
 
+    let markLivenessFatalError error =
+        lock gate (fun () -> livenessFatalError <- Some error)
+
+    let takeLivenessFatalError () =
+        lock gate (fun () ->
+            let error = livenessFatalError
+            livenessFatalError <- None
+            error)
+
     // A per-incarnation liveness monitor: while the live child runs, periodically ask a configured probe
     // whether it is still healthy, and after `LivenessFailures` consecutive failed attempts, gracefully
     // stop it so `captureIncarnation`'s output verb returns and the ORDINARY restart path (policy +
@@ -531,6 +546,14 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             probeToken
 
                     check, None
+                | LivenessProbe.Memory maxBytes ->
+                    let check (_probeToken: CancellationToken) =
+                        match running.TreePeakMemoryBytes() with
+                        | Ok bytes when bytes <= maxBytes -> Task.FromResult(Ok())
+                        | Ok _ -> Task.FromResult(Error(ProcessError.NotReady(program, probeTimeout)))
+                        | Error error -> Task.FromResult(Error error)
+
+                    check, None
 
             backgroundTask {
                 try
@@ -567,10 +590,21 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             | Error(ProcessError.Cancelled _) ->
                                 // Torn down mid-attempt; not a health failure. The loop guard ends the monitor.
                                 ()
-                            | Error _ ->
-                                consecutiveFailures <- consecutiveFailures + 1
+                            | Error error ->
+                                let fatalResourceError =
+                                    match probe, error with
+                                    | LivenessProbe.Memory _, ProcessError.NotReady _ -> false
+                                    | LivenessProbe.Memory _, _ -> true
+                                    | _ -> false
 
-                                if consecutiveFailures >= threshold then
+                                if fatalResourceError then
+                                    tripped <- true
+                                    markLivenessFatalError error
+                                    observeFault (running.StopAsync grace)
+                                else
+                                    consecutiveFailures <- consecutiveFailures + 1
+
+                                if not fatalResourceError && consecutiveFailures >= threshold then
                                     tripped <- true
                                     // Record the liveness verdict BEFORE stopping the child, so the loop
                                     // observes the flag once the graceful stop makes `OutputStringAsync`
@@ -668,14 +702,18 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             do! monitorTask
                             clearCurrent running
 
-                            match fault with
-                            | Some(:? ProcessException as ex) ->
+                            let fatalLivenessError = takeLivenessFatalError ()
+
+                            match fatalLivenessError, fault with
+                            | Some error, _ -> return Error error
+                            | None, Some(:? ProcessException as ex) ->
                                 // Buffered pump failures are typed ProcessExceptions at the live-handle
                                 // boundary; supervision consumes the structured error so transient I/O can
                                 // follow the configured restart policy and retain liveness attribution.
                                 return Error ex.Error
-                            | Some ex -> return! Task.FromException<Result<ProcessResult<string>, ProcessError>> ex
-                            | None -> return captured
+                            | None, Some ex ->
+                                return! Task.FromException<Result<ProcessResult<string>, ProcessError>> ex
+                            | None, None -> return captured
             }
 
     // The supervision loop itself — one faithful copy of `Supervisor.RunAsync`'s former body, extended
@@ -788,7 +826,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                     Diag.supervisorRestarted program
 
                     // A liveness-forced restart is additionally surfaced under its own event/metric, so an
-                    // operator can tell a "live-but-hung service" restart apart from an ordinary crash
+                    // operator can tell a live-child health restart apart from an ordinary crash
                     // restart without inventing a parallel event system — same `ProcessKitDiagnostics`
                     // taxonomy, one extra id. The generic restart telemetry above still fires (it IS a
                     // restart and counts in `SupervisionOutcome.Restarts`).
@@ -1297,9 +1335,37 @@ type Supervisor internal (config: SupervisorConfig) =
                 LivenessInterval = Liveness.clampInterval interval }
         )
 
+    /// Enable a whole-process-tree **memory liveness probe**. The supervisor samples attributable
+    /// peak resident memory every configured liveness interval and treats a value above `maxBytes`
+    /// as a failed attempt. After `LivenessFailures` consecutive failures it gracefully stops and
+    /// restarts the child through the ordinary liveness path. `maxBytes` must be positive.
+    ///
+    /// Whole-tree accounting requires a private Job Object or cgroup. If the active backend cannot
+    /// provide an attributable metric, supervision ends with a typed `ProcessError.Unsupported`
+    /// instead of silently falling back to leader-only or shared-group memory.
+    member _.LivenessMemory(maxBytes: int64) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxBytes, 1L, nameof maxBytes)
+
+        Supervisor(
+            { config with
+                Liveness = Some(LivenessProbe.Memory maxBytes) }
+        )
+
+    /// Like `LivenessMemory(maxBytes)`, but also sets the sampling interval. A zero or negative
+    /// interval is clamped to the same safe 1 ms minimum as the other liveness probes.
+    member _.LivenessMemory(maxBytes: int64, interval: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxBytes, 1L, nameof maxBytes)
+
+        Supervisor(
+            { config with
+                Liveness = Some(LivenessProbe.Memory maxBytes)
+                LivenessInterval = Liveness.clampInterval interval }
+        )
+
     /// How many **consecutive** failed liveness attempts trip a restart (default `3`). A single healthy
     /// attempt resets the run, so a flaky endpoint that recovers does not restart the child. `count`
-    /// must be at least `1`. No effect unless a liveness probe (`LivenessHttp`/`LivenessCheck`) is set.
+    /// must be at least `1`. No effect unless a liveness probe (`LivenessHttp`/`LivenessCheck`/
+    /// `LivenessMemory`) is set.
     member _.LivenessFailures(count: int) =
         ArgumentOutOfRangeException.ThrowIfLessThan(count, 1, nameof count)
         Supervisor({ config with LivenessFailures = count })

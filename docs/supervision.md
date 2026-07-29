@@ -232,8 +232,8 @@ stdout. The opt-in **liveness probe** closes that gap the way a systemd watchdog
 liveness probe does: it periodically asks whether the live child is still healthy and, after enough
 consecutive failures, restarts it. It is **off by default**.
 
-Point it at the child's own health surface — an HTTP endpoint it serves, or any async check of your
-own:
+Point it at the child's own health surface — an HTTP endpoint it serves, any async check of your own,
+or the attributable peak memory of its contained process tree:
 
 **F#**
 
@@ -274,6 +274,10 @@ let byStatus =
 let byPredicate =
     (Supervisor.create (Command.create "worker"))
         .LivenessCheck((fun () -> pingWorkerAsync ()), TimeSpan.FromSeconds 5.0) // returns Task<bool>
+
+let byMemory =
+    (Supervisor.create (Command.create "worker"))
+        .LivenessMemory(512L * 1024L * 1024L, TimeSpan.FromSeconds 10.0) // restart above 512 MiB
 ```
 
 **C#**
@@ -284,7 +288,17 @@ var byStatus = new Supervisor(new Command("worker"))
 
 var byPredicate = new Supervisor(new Command("worker"))
     .LivenessCheck(() => PingWorkerAsync(), TimeSpan.FromSeconds(5)); // returns Task<bool>
+
+var byMemory = new Supervisor(new Command("worker"))
+    .LivenessMemory(512L * 1024L * 1024L, TimeSpan.FromSeconds(10)); // restart above 512 MiB
 ```
+
+`LivenessMemory(maxBytes)` uses the current liveness interval; the two-argument overload sets it in
+the same call. It samples whole-tree peak resident memory from the run's private Job Object or cgroup,
+so descendants count and a value that crosses the threshold remains over it for that incarnation.
+ProcessKit never substitutes leader-only or shared-group memory: when the active backend cannot
+provide an attributable tree metric, supervision stops the live child and returns a typed
+`ProcessError.Unsupported`.
 
 Every `LivenessHttp` form also accepts a caller-owned `HttpClient` immediately after the URI. Use it
 for authentication headers, custom certificate validation, proxies, or a custom transport such as HTTP
@@ -329,7 +343,7 @@ How it behaves:
 The soft phase is the supervised command's `Command.StopSignal` (default `Signal.Term`). The same
 setting is therefore honored by an explicit supervision-session `StopAsync`, a liveness restart, and
 the hosting extension's `StopAsync`; Windows refuses an unrepresentable custom signal at spawn.
-- **Each attempt is bounded.** One attempt gives the endpoint/predicate up to `LivenessTimeout` to
+- **Each endpoint attempt is bounded.** One HTTP/predicate attempt gives the endpoint/predicate up to `LivenessTimeout` to
   prove healthy (reusing the same poll/deadline core as `RunningProcess.WaitForHttpAsync`); a
   `false` result, a network failure, a raised exception, or a hung probe all count as one failed
   attempt.
@@ -343,7 +357,7 @@ the hosting extension's `StopAsync`; Windows refuses an unrepresentable custom s
   metric — see [Observability](observability.md).
 
 `LivenessFailures`, `LivenessTimeout`, and `LivenessGrace` have **no effect** unless a probe
-(`LivenessHttp` / `LivenessCheck`) is set. A non-positive liveness interval is clamped to 1 ms;
+(`LivenessHttp` / `LivenessCheck` / `LivenessMemory`) is set. A non-positive liveness interval is clamped to 1 ms;
 `LivenessTimeout` accepts `TimeSpan.Zero` as a fail-fast attempt but rejects negative values;
 `LivenessFailures` must be at least `1`; `LivenessGrace` accepts `TimeSpan.Zero` (kill immediately)
 but rejects a negative value.

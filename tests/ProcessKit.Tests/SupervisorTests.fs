@@ -126,6 +126,42 @@ module private SessionTestHelpers =
 
         new RunningProcess(host)
 
+    let buildRunningProcessWithTreeStats
+        (command: Command)
+        (pid: int option)
+        (treeStats: (unit -> ProcessGroupStats option) option)
+        (wait: unit -> Task<Outcome>)
+        (graceful: TimeSpan -> Task)
+        (startKill: unit -> unit)
+        : RunningProcess =
+        let stdout = new MemoryStream()
+        let stderr = new MemoryStream()
+
+        let host: RunningHost =
+            { Config = command.Config
+              Pid = pid
+              Stdout = Some(stdout :> Stream)
+              Stderr = Some(stderr :> Stream)
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = None
+              Wait = wait
+              StdinError = fun () -> None
+              StdinFeedComplete = ignore
+              StartKill = startKill
+              Signal = fun _ -> Ok()
+              GracefulKill = graceful
+              ResizePty = None
+              TreeStats = treeStats
+              Teardown =
+                fun () ->
+                    stdout.Dispose()
+                    stderr.Dispose()
+                    ValueTask.CompletedTask }
+
+        new RunningProcess(host)
+
     let buildRunningProcess
         (command: Command)
         (pid: int option)
@@ -326,6 +362,44 @@ type private LivenessChildRunner() =
 
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "LivenessChildRunner drives incarnations via SpawnAsync"))
+
+/// A spawn-capable child whose attributable whole-tree memory sample is controlled by the test.
+type private MemoryLivenessRunner(treeStats: (unit -> ProcessGroupStats option) option) =
+    let mutable spawns = 0
+    let mutable gracefulStops = 0
+
+    member _.Spawns = Volatile.Read(&spawns)
+    member _.GracefulStops = Volatile.Read(&gracefulStops)
+
+    interface IProcessRunner with
+        member _.SpawnAsync(command, cancellationToken) =
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                let incarnation = Interlocked.Increment(&spawns)
+
+                let wait =
+                    TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                let running =
+                    buildRunningProcessWithTreeStats
+                        command
+                        (Some(9000 + incarnation))
+                        treeStats
+                        (fun () -> wait.Task)
+                        (fun _ ->
+                            Interlocked.Increment(&gracefulStops) |> ignore
+                            wait.TrySetResult(Outcome.Signalled(Some 15)) |> ignore
+                            Task.CompletedTask)
+                        (fun () -> wait.TrySetResult(Outcome.Signalled None) |> ignore)
+
+                Task.FromResult(Ok running)
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "MemoryLivenessRunner uses SpawnAsync"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "MemoryLivenessRunner uses SpawnAsync"))
 
 /// A readable stream that stays pending until the test releases a genuine I/O fault.
 type private GatedIoFaultStream() =
@@ -1504,6 +1578,9 @@ type SupervisorTests() =
         s.LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult true), positive)
         |> ignore
 
+        s.LivenessMemory 1L |> ignore
+        s.LivenessMemory(1L, positive) |> ignore
+
         s.LivenessFailures 1 |> ignore
         s.LivenessGrace TimeSpan.Zero |> ignore // zero grace = immediate escalation, a valid config
 
@@ -1515,6 +1592,12 @@ type SupervisorTests() =
         |> ignore
 
         s.LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult true), TimeSpan.FromMilliseconds -1.0)
+        |> ignore
+
+        s.LivenessMemory(1L, TimeSpan.Zero) |> ignore
+        s.LivenessMemory(1L, TimeSpan.FromMilliseconds -1.0) |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.LivenessMemory 0L |> ignore))
         |> ignore
 
         Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> s.LivenessFailures 0 |> ignore))
@@ -1667,6 +1750,74 @@ type SupervisorTests() =
 
                 Assert.That(events[0].Program, Is.EqualTo "hung")
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``whole-tree memory above the threshold uses the ordinary liveness restart path``() : Task =
+        task {
+            let mutable samples = 0
+
+            let treeStats () =
+                Interlocked.Increment(&samples) |> ignore
+                Some(ProcessGroupStats(1, None, Some 4096L, None))
+
+            let runner = MemoryLivenessRunner(Some treeStats)
+            let events = ResizeArray<SupervisorRestartEvent>()
+
+            let supervisor =
+                Supervisor(Command.create "memory-hog")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .MaxRestarts(1)
+                    .LivenessMemory(1024L, TimeSpan.FromMilliseconds 1.0)
+                    .LivenessFailures(2)
+                    .LivenessGrace(TimeSpan.Zero)
+                    .OnRestart(fun event -> events.Add event)
+
+            match! supervisor.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 1)
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.RestartsExhausted)
+                Assert.That(runner.Spawns, Is.EqualTo 2)
+                Assert.That(runner.GracefulStops, Is.EqualTo 2)
+                Assert.That(Volatile.Read(&samples), Is.GreaterThanOrEqualTo 4)
+                Assert.That(events.Count, Is.EqualTo 1)
+                Assert.That(events[0].Cause, Is.EqualTo RestartCause.Liveness)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``memory liveness fails honestly when whole-tree accounting is unavailable``() : Task =
+        task {
+            let cases: (string * (unit -> ProcessGroupStats option) option) list =
+                [ "missing", None
+                  "faulting", Some(fun () -> raise (InvalidOperationException "counter disappeared")) ]
+
+            for caseName, treeStats in cases do
+                let runner = MemoryLivenessRunner(treeStats)
+
+                let supervisor =
+                    Supervisor(Command.create $"unaccounted-{caseName}")
+                        .WithRunner(runner)
+                        .LivenessMemory(1024L, TimeSpan.FromMilliseconds 1.0)
+                        .LivenessFailures(1)
+                        .LivenessGrace(TimeSpan.Zero)
+
+                match! supervisor.RunAsync() with
+                | Error(ProcessError.Unsupported message) ->
+                    Assert.That(message, Does.Contain "whole-tree memory accounting")
+                    Assert.That(runner.Spawns, Is.EqualTo 1, "an unavailable metric is not retried as a child crash")
+
+                    Assert.That(
+                        runner.GracefulStops,
+                        Is.EqualTo 1,
+                        "the live child is torn down before the error returns"
+                    )
+                | Error error -> Assert.Fail $"expected Unsupported for {caseName}, got {error}"
+                | Ok outcome -> Assert.Fail $"expected Unsupported for {caseName}, got {outcome}"
         }
         :> Task
 

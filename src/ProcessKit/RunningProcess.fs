@@ -1132,6 +1132,24 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         | Some pid -> snd (processMetrics pid)
         | None -> None
 
+    /// Whole-tree peak memory for internal resource monitors. A private group may expose accounting
+    /// even when the leader has exited; shared/fallback groups fail honestly instead of attributing a
+    /// sibling aggregate or silently substituting leader-only memory.
+    member internal _.TreePeakMemoryBytes() : Result<int64, ProcessError> =
+        try
+            match host.TreeStats with
+            | None -> Error(ProcessError.Unsupported "whole-tree memory accounting is unavailable for this run")
+            | Some snapshot ->
+                match snapshot () with
+                | None -> Error(ProcessError.Unsupported "whole-tree memory accounting could not be read for this run")
+                | Some stats ->
+                    match stats.PeakMemoryBytes with
+                    | Some bytes -> Ok bytes
+                    | None ->
+                        Error(ProcessError.Unsupported "whole-tree memory accounting is unavailable on this platform")
+        with ex ->
+            Error(ProcessError.Unsupported $"whole-tree memory accounting failed for this run: {ex.Message}")
+
     /// Total stdout lines pumped so far (counts dropped lines too).
     member _.StdoutLineCount = readStdoutLineCount ()
 

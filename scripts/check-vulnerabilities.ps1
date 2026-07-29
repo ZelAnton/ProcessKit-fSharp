@@ -9,15 +9,36 @@ $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 
 Push-Location $repoRoot
 try {
-    $output =
-        & dotnet list ProcessKit.slnx package --vulnerable --include-transitive --format json 2>&1
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'dotnet'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
 
-    if ($LASTEXITCODE -ne 0) {
-        $output | Write-Host
-        throw "dotnet list package failed with exit code $LASTEXITCODE"
+    foreach ($argument in @('list', 'ProcessKit.slnx', 'package', '--vulnerable', '--include-transitive', '--format', 'json')) {
+        $startInfo.ArgumentList.Add($argument)
     }
 
-    $report = ($output -join [Environment]::NewLine) | ConvertFrom-Json
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+
+    try {
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+
+        if ($process.ExitCode -ne 0) {
+            if (-not [string]::IsNullOrWhiteSpace($stdout)) { Write-Host $stdout }
+            if (-not [string]::IsNullOrWhiteSpace($stderr)) { Write-Host $stderr }
+            throw "dotnet list package failed with exit code $($process.ExitCode)"
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+
+    $report = $stdout | ConvertFrom-Json
     $findings = [System.Collections.Generic.List[object]]::new()
 
     foreach ($project in @($report.projects)) {

@@ -836,6 +836,45 @@ type WhichResolutionTests() =
         Path.GetFullPath(path).StartsWith(Path.GetFullPath dir, comparison)
 
     [<Test>]
+    member _.``relative path-form ResolveProgram and spawn both anchor to CurrentDir``() : Task =
+        task {
+            let dir = freshDir "current-dir-path"
+            let baseName = "processkit-relative-tool"
+
+            try
+                let relativeProgram, expectedPath, args =
+                    if isWindows then
+                        let toolPath = Path.Combine(dir, baseName + ".exe")
+
+                        let comSpec =
+                            match Environment.GetEnvironmentVariable "ComSpec" with
+                            | null -> failwith "ComSpec is required for the Windows relative-path test"
+                            | value -> value
+
+                        File.Copy(comSpec, toolPath)
+                        ".\\" + baseName + ".exe", toolPath, [ "/d"; "/c"; "echo CURRENT-DIR-HIT" ]
+                    else
+                        let toolPath = Path.Combine(dir, baseName)
+                        File.WriteAllText(toolPath, "#!/bin/sh\necho CURRENT-DIR-HIT\n")
+                        File.SetUnixFileMode(toolPath, UnixFileMode.UserRead ||| UnixFileMode.UserExecute)
+                        "./" + baseName, toolPath, []
+
+                let command =
+                    Command.create relativeProgram |> Command.args args |> Command.currentDir dir
+
+                match command.ResolveProgram() with
+                | Error error -> Assert.Fail $"CurrentDir-relative preflight failed: {error}"
+                | Ok resolved -> Assert.That(resolved, Is.EqualTo(Path.GetFullPath expectedPath))
+
+                match! command.OutputStringAsync() with
+                | Error error -> Assert.Fail $"CurrentDir-relative spawn failed: {error}"
+                | Ok result -> Assert.That(result.Stdout, Does.Contain "CURRENT-DIR-HIT")
+            finally
+                Directory.Delete(dir, true)
+        }
+        :> Task
+
+    [<Test>]
     member this.``ResolveProgram resolves against the command's Env PATH override, where Exec.which does not (T-183)``
         ()
         =

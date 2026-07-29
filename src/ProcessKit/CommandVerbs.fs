@@ -268,7 +268,8 @@ type CommandVerbs =
     /// — exactly the `PATH`/PATHEXT/executable-bit resolution the real spawn goes through (one shared
     /// resolver, no second copy). On success it returns the resolved absolute path; on a miss it returns
     /// the SAME typed `ProcessError.NotFound` — with the SAME `Searched` diagnostic — a real spawn of this
-    /// command would fail with.
+    /// command would fail with. A relative path-form program (`./tool`, `bin/tool`) is resolved against
+    /// `CurrentDir` when configured, matching the child's launch directory on every platform.
     ///
     /// **Differs from `Exec.which`.** `Exec.which` (and `CliClient.EnsureAvailableAsync`) resolves against
     /// the CURRENT PROCESS's `PATH`, with no prefer-local — "is this tool installed on the host". This

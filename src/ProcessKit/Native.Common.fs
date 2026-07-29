@@ -248,7 +248,8 @@ module internal Common =
     type ResolveContext =
         { Path: string
           PathExt: string
-          PreferLocal: string list }
+          PreferLocal: string list
+          WorkingDirectory: string option }
 
     /// The resolution context of the CURRENT PROCESS: its own `PATH`/`PATHEXT`, and NO prefer-local
     /// directories. This is the historical `Exec.which`/`resolveProgram` behaviour — resolve a program
@@ -262,7 +263,8 @@ module internal Common =
 
         { Path = read "PATH"
           PathExt = read "PATHEXT"
-          PreferLocal = [] }
+          PreferLocal = []
+          WorkingDirectory = None }
 
     /// The resolution context of `command`'s EFFECTIVE CHILD environment: the `PATH`/`PATHEXT` the child
     /// will actually see (its `Env`/`EnvRemove`/`EnvClear` applied to the inherited set — reusing the very
@@ -294,7 +296,8 @@ module internal Common =
 
         { Path = lookup "PATH"
           PathExt = lookup "PATHEXT"
-          PreferLocal = preferLocal }
+          PreferLocal = preferLocal
+          WorkingDirectory = baseDir }
 
     /// Walk `ctx.Path` for `program` (a bare name — see `isBareName`), reusing `probeDir` (with the
     /// context's `PathExt`) for each directory in order. Returns `(found, searched)`: `found` is the first
@@ -339,8 +342,8 @@ module internal Common =
     /// child environment + prefer-local). A bare name is looked up prefer-local first (T-182), then
     /// `ctx.Path` (typed `ProcessError.NotFound` with `Searched` naming the probed `PATH` value on a miss);
     /// a path-form program is checked directly against its own directory component with the SAME `probeDir`
-    /// (so a missing extension is still resolved on Windows), never against `PATH` or prefer-local, and its
-    /// `NotFound` carries no `Searched` (nothing was searched — a single candidate location was checked).
+    /// (so a missing extension is still resolved on Windows), anchored to the command working directory
+    /// when present, never against `PATH` or prefer-local, and its `NotFound` carries no `Searched`.
     ///
     /// Never throws: `probeDir` already absorbs per-candidate IO/access races (see its own doc comment),
     /// so a raw exception surfacing here would be something unexpected at the level of the whole resolution
@@ -359,11 +362,19 @@ module internal Common =
                     | None, searched ->
                         Error(ProcessError.NotFound(program, (if searched = "" then None else Some searched)))
             else
-                let directory =
+                let programDirectory =
                     match Path.GetDirectoryName program with
                     | null
                     | "" -> "."
                     | d -> d
+
+                let directory =
+                    if Path.IsPathRooted program then
+                        programDirectory
+                    else
+                        match ctx.WorkingDirectory with
+                        | Some cwd -> Path.Combine(cwd, programDirectory)
+                        | None -> programDirectory
 
                 let fileName =
                     match Path.GetFileName program with
@@ -371,7 +382,7 @@ module internal Common =
                     | name -> name
 
                 match probeDir ctx.PathExt directory fileName with
-                | Some found -> Ok found
+                | Some found -> Ok(Path.GetFullPath found)
                 | None -> Error(ProcessError.NotFound(program, None))
         with ex ->
             Error(ProcessError.Io $"failed to resolve '{program}': {ex.Message}")
@@ -453,8 +464,9 @@ module internal Common =
     /// never disagree with what a preflight of the same config reports. The `PATH` walked is the command's
     /// EFFECTIVE child `PATH` (its `Env` override applied), the same block `CreateProcessW` hands the child,
     /// so a bare name reachable only via an overridden `PATH` resolves here exactly as the child would see
-    /// it. `AsIs` on every non-Windows platform (there is no `PATHEXT`) and for a path-form program or a
-    /// name that resolves to nothing; a `PATH` `.exe` match is deliberately left `AsIs` so the OS's own
+    /// it. `AsIs` on every non-Windows platform (there is no `PATHEXT`) and for a name that resolves to
+    /// nothing; a relative path-form match is substituted by its working-directory-anchored absolute path,
+    /// while a `PATH` `.exe` match is deliberately left `AsIs` so the OS's own
     /// bare-name search still applies. A **prefer-local** match (`Command.PreferLocal`, T-182) is consulted
     /// first and is ALWAYS substituted as its resolved absolute path — even a `.exe`, unlike a `PATH`
     /// `.exe`, because the OS would never find it in a prefer-local directory on its own — with a
@@ -462,12 +474,8 @@ module internal Common =
     let resolveWindowsLaunch (command: Command) : WindowsLaunch =
         let program = command.Program
 
-        if
-            not (RuntimeInformation.IsOSPlatform OSPlatform.Windows)
-            || not (isBareName program)
-        then
-            // POSIX has no PATHEXT (the OS resolves a bare name exactly as `probeDir` models it), and a
-            // path-form program is handed to the OS verbatim — never rewritten. Both stay byte-for-byte.
+        if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
+            // POSIX has no PATHEXT and resolves a relative path-form after the child-side chdir.
             WindowsLaunch.AsIs
         else
             let ctx = commandContext command
@@ -492,12 +500,17 @@ module internal Common =
                 else
                     WindowsLaunch.DirectPath resolved
 
-            match findPreferLocal ctx program with
-            | Some resolved -> classify resolved true
-            | None ->
-                match findInContextPath ctx program |> fst with
+            if isBareName program then
+                match findPreferLocal ctx program with
+                | Some resolved -> classify resolved true
                 | None ->
-                    // Not found by our resolver either: leave it to the OS, whose failure still flows
-                    // through `notFoundFromSpawnFailure` for an honest, `which`-consistent `NotFound`.
-                    WindowsLaunch.AsIs
-                | Some resolved -> classify resolved false
+                    match findInContextPath ctx program |> fst with
+                    | None ->
+                        // Not found by our resolver either: leave it to the OS, whose failure still flows
+                        // through `notFoundFromSpawnFailure` for an honest, `which`-consistent `NotFound`.
+                        WindowsLaunch.AsIs
+                    | Some resolved -> classify resolved false
+            else
+                match resolveWith ctx program with
+                | Ok resolved -> classify resolved true
+                | Error _ -> WindowsLaunch.AsIs

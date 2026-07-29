@@ -192,10 +192,10 @@ module internal Windows =
     /// the `which`-vs-spawn divergence this closes. A prefer-local match (`Command.PreferLocal`) is
     /// searched first and is likewise substituted by absolute path (even a `.exe`, since the OS never
     /// searches those directories). A `.cmd`/`.bat` match — on `PATH` or prefer-local — additionally
-    /// routes through `cmd.exe /d /c` with BatBadBut-safe quoting. A `PATH` `.exe` match, a path-form
-    /// program, and a name that resolves to nothing are all left verbatim (the OS resolves them exactly as
-    /// before). Fails only when a batch-wrapper argument (or script path) cannot be safely quoted for
-    /// cmd.exe.
+    /// routes through `cmd.exe /d /c` with BatBadBut-safe quoting. A relative path-form program is first
+    /// anchored to `CurrentDir` and substituted as an absolute path, keeping Windows aligned with POSIX
+    /// child-side chdir resolution. A `PATH` `.exe` match and a name that resolves to nothing stay verbatim.
+    /// Fails only when a batch-wrapper argument (or script path) cannot be safely quoted for cmd.exe.
     let private buildWindowsCommandLine (command: Command) : Result<string, ProcessError> =
         let appendRaw (quoted: string) =
             if command.Config.WindowsRawArgs.IsEmpty then

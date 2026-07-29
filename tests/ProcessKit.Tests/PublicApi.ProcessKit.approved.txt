@@ -1301,6 +1301,8 @@ class ProcessKit.Supervisor
   member LivenessHttp(System.Uri, System.Net.Http.HttpClient, System.Func<System.Net.Http.HttpResponseMessage, System.Boolean>, System.TimeSpan) : ProcessKit.Supervisor
   member LivenessHttp(System.Uri, System.Net.Http.HttpClient, System.TimeSpan) : ProcessKit.Supervisor
   member LivenessHttp(System.Uri, System.TimeSpan) : ProcessKit.Supervisor
+  member LivenessMemory(System.Int64) : ProcessKit.Supervisor
+  member LivenessMemory(System.Int64, System.TimeSpan) : ProcessKit.Supervisor
   member LivenessTimeout(System.TimeSpan) : ProcessKit.Supervisor
   member MaxBackoff(System.TimeSpan) : ProcessKit.Supervisor
   member MaxRestarts(System.Int32) : ProcessKit.Supervisor
