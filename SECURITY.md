@@ -31,7 +31,11 @@ Dependencies are audited against the NuGet advisory database on every restore
 (`NuGetAudit`/`NuGetAuditMode=all`, configured in
 [`Directory.Build.props`](Directory.Build.props)), and
 [Dependabot](.github/dependabot.yml) keeps GitHub Actions and NuGet packages
-current.
+current. A scheduled and manually dispatchable
+[`Dependency vulnerabilities`](.github/workflows/vulnerability-scan.yml) workflow
+also checks direct and transitive packages weekly; run the same fail-loud check
+locally with `pwsh scripts/check-vulnerabilities.ps1` or as part of
+`scripts/verify-all.ps1`.
 
 ## Release integrity and SBOM
 

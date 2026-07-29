@@ -12,7 +12,7 @@ open System.Threading.Tasks
 open ProcessKit.Native.Common
 
 /// POSIX process-group containment: `posix_spawn` into a fresh process group, event-driven
-/// `waitpid` reaping via a shared SIGCHLD registration, and `killpg`/`kill` signal delivery.
+/// event-driven child reaping via pidfd/epoll, kqueue, or shared SIGCHLD, and `killpg`/`kill` signals.
 /// All libc `DllImport`s for this layer live here (including the single-pid `kill`, which the
 /// cgroup layer also uses); call sites are guarded by `RuntimeInformation.IsOSPlatform` so a libc
 /// entry point is only invoked on a POSIX host. Depends only on `Native.Common`.
@@ -1403,8 +1403,8 @@ module internal Posix =
 
     let private pidfdSupported = detectPidfdSupport ()
 
-    /// Internal diagnostic (not public API): the POSIX exit-wait mechanism this process selected — `true`
-    /// = the Linux pidfd fast path, `false` = the shared SIGCHLD fallback. For tests / observability.
+    /// Internal diagnostic (not public API): whether this process selected the Linux pidfd fast path.
+    /// `false` means macOS kqueue or the shared SIGCHLD fallback. For tests / observability.
     let pidfdActive = pidfdSupported
 
     /// Pin the exact task currently running as `pid` via `pidfd_open(2)` (Linux >= 5.3), for the cgroup
@@ -1621,10 +1621,163 @@ module internal Posix =
                     close pidfd |> ignore
                     blockingReapFallback pending pid
 
+    // ----------------------------------------------------------------------------------
+    // macOS: EVFILT_PROC / NOTE_EXIT on one shared kqueue reaper
+    // ----------------------------------------------------------------------------------
+
+    [<Literal>]
+    let private EVFILT_PROC = -5s
+
+    [<Literal>]
+    let private EV_ADD = 0x0001us
+
+    [<Literal>]
+    let private EV_ONESHOT = 0x0010us
+
+    [<Literal>]
+    let private EV_DELETE = 0x0002us
+
+    [<Literal>]
+    let private NOTE_EXIT = 0x80000000u
+
+    [<Literal>]
+    let private keventSize = 32
+
+    [<Literal>]
+    let private maxKqueueEvents = 64
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private kqueue()
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int private kevent(
+        int kq,
+        nativeint changelist,
+        int nchanges,
+        nativeint eventlist,
+        int nevents,
+        nativeint timeout
+    )
+
+    let private kqueueRegs = ConcurrentDictionary<int64, PidfdReg>()
+    let mutable private kqueueFd = -1
+    let mutable private kqueueToken = 0L
+    let private kqueueInitLock = obj ()
+
+    let private reapKqueueReg (reg: PidfdReg) =
+        let mutable status = 0
+        let mutable result = waitpid (reg.Pid, &status, WNOHANG)
+
+        while result < 0 && Marshal.GetLastWin32Error() = EINTR do
+            result <- waitpid (reg.Pid, &status, WNOHANG)
+
+        if result = reg.Pid then
+            resolveGroup reg.Pid reg.Pending (decodeWaitStatus status)
+            true
+        elif result = 0 then
+            false
+        else
+            graceThenResolve reg |> ignore
+            true
+
+    let private kqueueReaperLoop () =
+        let events = Marshal.AllocHGlobal(maxKqueueEvents * keventSize)
+
+        while true do
+            let count = kevent (kqueueFd, IntPtr.Zero, 0, events, maxKqueueEvents, IntPtr.Zero)
+
+            if count < 0 then
+                if Marshal.GetLastWin32Error() <> EINTR then
+                    Thread.Sleep 1
+            else
+                for index in 0 .. count - 1 do
+                    let event = IntPtr.Add(events, index * keventSize)
+                    let token = Marshal.ReadInt64(event, 24)
+
+                    match kqueueRegs.TryRemove token with
+                    | true, reg ->
+                        if not (reapKqueueReg reg) then
+                            // A defensive spurious notification must not strand the group after the
+                            // one-shot filter is consumed. Hand it to the portable shared fallback and
+                            // probe once immediately; the normal NOTE_EXIT path is already waitable here.
+                            ensureSigchldRegistration ()
+                            tryReapPending reg.Pid |> ignore
+                    | false, _ -> ()
+
+    let private ensureKqueue () =
+        if kqueueFd < 0 then
+            lock kqueueInitLock (fun () ->
+                if kqueueFd < 0 then
+                    let fd = kqueue ()
+
+                    if fd >= 0 then
+                        kqueueFd <- fd
+                        let thread = Thread(ThreadStart(kqueueReaperLoop))
+                        thread.IsBackground <- true
+                        thread.Name <- "ProcessKit-kqueue-reaper"
+                        thread.Start())
+
+    let private deleteKqueueRegistration (pid: int) =
+        let change = Marshal.AllocHGlobal keventSize
+
+        try
+            for offset in 0..7 do
+                Marshal.WriteInt32(change, offset * 4, 0)
+
+            Marshal.WriteInt64(change, 0, int64 pid)
+            Marshal.WriteInt16(change, 8, EVFILT_PROC)
+            Marshal.WriteInt16(change, 10, int16 EV_DELETE)
+            kevent (kqueueFd, change, 1, IntPtr.Zero, 0, IntPtr.Zero) |> ignore
+        finally
+            Marshal.FreeHGlobal change
+
+    let private beginKqueueWait (pid: int) (pending: PendingWait) : bool =
+        ensureKqueue ()
+
+        if kqueueFd < 0 then
+            false
+        else
+            let token = Interlocked.Increment(&kqueueToken)
+            let reg = { Pid = pid; Pending = pending }
+            let change = Marshal.AllocHGlobal keventSize
+
+            try
+                for offset in 0..7 do
+                    Marshal.WriteInt32(change, offset * 4, 0)
+
+                Marshal.WriteInt64(change, 0, int64 pid)
+                Marshal.WriteInt16(change, 8, EVFILT_PROC)
+                Marshal.WriteInt16(change, 10, int16 (EV_ADD ||| EV_ONESHOT))
+                Marshal.WriteInt32(change, 12, int NOTE_EXIT)
+                Marshal.WriteInt64(change, 24, token)
+                kqueueRegs[token] <- reg
+
+                if kevent (kqueueFd, change, 1, IntPtr.Zero, 0, IntPtr.Zero) <> 0 then
+                    kqueueRegs.TryRemove token |> ignore
+                    false
+                else
+                    // Register first, then probe: an exit racing registration is either delivered by
+                    // kqueue or reaped here. Both paths carry the exact PendingWait generation and the
+                    // first resolution wins, so no status is lost or applied to a reused pid.
+                    if reapKqueueReg reg then
+                        kqueueRegs.TryRemove token |> ignore
+                        // The immediate probe may have won before the NOTE_EXIT event was dequeued, or
+                        // registration may have landed on a pid number already reused after an ECHILD
+                        // race. Remove the kernel filter as well as the managed token so no stale one-shot
+                        // registration lingers until that unrelated process exits.
+                        deleteKqueueRegistration pid
+
+                    true
+            finally
+                Marshal.FreeHGlobal change
+
+    /// Internal diagnostic for tests: true once macOS initialized the shared kqueue exit reaper.
+    let kqueueActive () = isMacOs && kqueueFd >= 0
+
     /// Reap a POSIX child and report how it concluded, without parking a thread per child. On Linux
     /// >= 5.4 each child is awaited through its own `pidfd` on one shared epoll reaper (O(1) dispatch,
-    /// pid-reuse-safe `waitid(P_PIDFD)` reap); elsewhere — macOS, an old kernel — through the shared
-    /// process-wide SIGCHLD registration. Which one is chosen is fixed for the process at first use; the
+    /// pid-reuse-safe `waitid(P_PIDFD)` reap); macOS uses per-child EVFILT_PROC/NOTE_EXIT registrations
+    /// on one shared kqueue; older Linux and other POSIX hosts use the process-wide SIGCHLD fallback. The
     /// public contract (the decoded `Outcome`, zombie-free teardown, the `nativeint` pid handle) is
     /// identical either way.
     ///
@@ -1634,7 +1787,7 @@ module internal Posix =
     /// or triggers a second reap. A wait that registers just AFTER the child was reaped (the double-
     /// registration race the flaky idempotency test exercises) still gets the real status from the group's
     /// briefly-cached outcome, instead of losing an ECHILD race and inventing an `Unobserved`.
-    let rec private waitPosixCore (usePidfd: bool) (pid: nativeint) : Task<Outcome> =
+    let rec private waitPosixCore (useFastPath: bool) (pid: nativeint) : Task<Outcome> =
         let intPid = int pid
 
         let tcs =
@@ -1661,8 +1814,10 @@ module internal Posix =
                   Outcome = ValueNone }
 
             if pendingWaits.TryAdd(intPid, pending) then
-                if usePidfd && pidfdSupported then
+                if useFastPath && pidfdSupported then
                     beginPidfdWait intPid pending
+                elif useFastPath && isMacOs && beginKqueueWait intPid pending then
+                    ()
                 else
                     ensureSigchldRegistration ()
                     // The child may already have exited — even before this call started — so probe once
@@ -1673,10 +1828,10 @@ module internal Posix =
             else
                 // Lost the race to register first — a concurrent call for the same pid won in between our
                 // `TryGetValue` miss and this `TryAdd`. Retry so we join the winner's group instead.
-                waitPosixCore usePidfd pid
+                waitPosixCore useFastPath pid
 
-    /// Reap a POSIX child on the mechanism selected once for this process (pidfd fast path where
-    /// available, else the shared SIGCHLD reaper). See `waitPosixCore`.
+    /// Reap a POSIX child on the platform fast path (Linux pidfd or macOS kqueue), with the shared
+    /// SIGCHLD reaper as the remaining POSIX fallback. See `waitPosixCore`.
     let waitPosix (pid: nativeint) : Task<Outcome> = waitPosixCore true pid
 
     /// Test seam (internal, not public API): force the shared-SIGCHLD fallback path regardless of pidfd
@@ -1931,6 +2086,13 @@ module internal Posix =
         let mutable stdoutParentRead: int option = None
         let mutable stderrChildFd = -1
         let mutable stderrParentRead: int option = None
+        let extraParentEnds = System.Collections.Generic.Dictionary<int, int>()
+        let extraChildEnds = System.Collections.Generic.List<int * int>()
+        // Socketpair fds that collided with a requested target fd are kept open until after spawn so
+        // later allocations cannot reuse that number. They retain CLOEXEC (Linux) or are closed by
+        // POSIX_SPAWN_CLOEXEC_DEFAULT (macOS), and are never explicitly closed in the child because a
+        // target-number collision would otherwise close the final dup2'd channel.
+        let extraTargetReservations = System.Collections.Generic.List<int>()
         let mutable failure: string option = None
         // Under a PTY with an interactive/fed stdin, the write side is the SAME single master fd the
         // parent keeps for the merged output (a pty master is bidirectional; read and write on it are
@@ -1985,6 +2147,30 @@ module internal Posix =
                 None
             else
                 Some(fds[0], fds[1])
+
+        // Allocate every extra channel before stdio. A socketpair end that lands directly on any target
+        // is retained as a CLOEXEC reservation and retried; later stdio/file allocations may still use a
+        // higher target number, so the child-side close actions below explicitly preserve every target
+        // after the extra dup2 actions have overwritten that slot.
+        let extraTargets = System.Collections.Generic.HashSet<int>(config.ExtraFds)
+
+        let makeExtraChannel (targetFd: int) =
+            let mutable allocated = false
+
+            while not allocated && failure.IsNone do
+                match makeStdioChannel $"extra fd {targetFd}" with
+                | None -> ()
+                | Some(first, second) when extraTargets.Contains first || extraTargets.Contains second ->
+                    extraTargetReservations.Add first
+                    extraTargetReservations.Add second
+                | Some(parentFd, childFd) ->
+                    extraParentEnds[targetFd] <- parentFd
+                    extraChildEnds.Add(targetFd, childFd)
+                    childSideFds.Add childFd
+                    allocated <- true
+
+        for targetFd in config.ExtraFds do
+            makeExtraChannel targetFd
 
         // stdin / stdout / stderr. A PTY replaces the whole socketpair wiring (D3/D7): one pty master/
         // slave pair, the slave dup'd onto the child's 0/1/2 and the parent keeping the master as the
@@ -2092,10 +2278,23 @@ module internal Posix =
 
         let closeFd fd = close fd |> ignore
 
+        let closeExtraTargetReservations () =
+            for fd in extraTargetReservations do
+                closeFd fd
+
+            extraTargetReservations.Clear()
+
         let closeParentEnds () =
             stdinParentWrite |> Option.iter closeFd
             stdoutParentRead |> Option.iter closeFd
             stderrParentRead |> Option.iter closeFd
+
+            for fd in extraParentEnds.Values do
+                closeFd fd
+
+            extraParentEnds.Clear()
+
+            closeExtraTargetReservations ()
 
         match failure with
         | Some message ->
@@ -2190,10 +2389,18 @@ module internal Posix =
                         register "posix_spawn_file_actions_adddup2 (stderr)" (fun () ->
                             posix_spawn_file_actions_adddup2 (fileActions, stderrChildFd, 2))
 
-                    // After dup2, close the original child-side fds so only 0/1/2 remain in the child.
+                    for targetFd, childFd in extraChildEnds do
+                        register $"posix_spawn_file_actions_adddup2 (extra fd {targetFd})" (fun () ->
+                            posix_spawn_file_actions_adddup2 (fileActions, childFd, targetFd))
+
+                    // After dup2, close original child-side fds except any number that is also an extra
+                    // target. A higher target can have been free until a later stdio/file allocation used
+                    // that number; the extra dup2 above has now overwritten it with the intended channel,
+                    // so closing by the old source number here would close the final target.
                     for fd in childSideFds do
-                        register "posix_spawn_file_actions_addclose (child-side fd)" (fun () ->
-                            posix_spawn_file_actions_addclose (fileActions, fd))
+                        if not (extraTargets.Contains fd) then
+                            register "posix_spawn_file_actions_addclose (child-side fd)" (fun () ->
+                                posix_spawn_file_actions_addclose (fileActions, fd))
 
                     // Also close the parent-kept ends in the child. This is what guarantees EOF: a
                     // child must never inherit a writer to its own stdin. We do it explicitly rather
@@ -2201,19 +2408,26 @@ module internal Posix =
                     // fixed-signature P/Invoke on the AArch64 variadic ABI (Apple Silicon), so CLOEXEC
                     // never takes effect there and the child would block forever waiting for stdin.
                     stdinParentWrite
+                    |> Option.filter (extraTargets.Contains >> not)
                     |> Option.iter (fun fd ->
                         register "posix_spawn_file_actions_addclose (stdin parent end)" (fun () ->
                             posix_spawn_file_actions_addclose (fileActions, fd)))
 
                     stdoutParentRead
+                    |> Option.filter (extraTargets.Contains >> not)
                     |> Option.iter (fun fd ->
                         register "posix_spawn_file_actions_addclose (stdout parent end)" (fun () ->
                             posix_spawn_file_actions_addclose (fileActions, fd)))
 
                     stderrParentRead
+                    |> Option.filter (extraTargets.Contains >> not)
                     |> Option.iter (fun fd ->
                         register "posix_spawn_file_actions_addclose (stderr parent end)" (fun () ->
                             posix_spawn_file_actions_addclose (fileActions, fd)))
+
+                    for KeyValue(targetFd, fd) in extraParentEnds do
+                        register $"posix_spawn_file_actions_addclose (extra fd {targetFd} parent end)" (fun () ->
+                            posix_spawn_file_actions_addclose (fileActions, fd))
 
                     // CurrentDir → a child-side chdir. A non-zero rc from addchdir_np is an honest spawn
                     // error; its ABSENCE (EntryPointNotFoundException — the entry point arrived in glibc
@@ -2345,6 +2559,11 @@ module internal Posix =
                                 Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
                         else
                             // posix_spawnp succeeded: the child is running with pid `pid` (== its own pgid).
+                            // Target-number reservations protected the file-action construction only. The
+                            // child has now applied its dup2 actions and Linux/macOS closed the reservations
+                            // at exec, so release the parent's copies immediately; they are not user channels.
+                            closeExtraTargetReservations ()
+
                             // From here on ANY failure in the parent-side managed initialization — a refused
                             // `setpriority`, or a `Socket`/`NetworkStream` ctor that throws while wrapping a
                             // retained stream end — must not strand the live child. `postSpawnTeardown` kills the
@@ -2436,11 +2655,11 @@ module internal Posix =
                                     // the one master is closed exactly once by the owning stdout stream, and there
                                     // is no `dup` — hence no non-CLOEXEC duplicate to leak into a concurrent spawn
                                     // (R-02). `owns` is ignored on the socketpair path (always sole-owning there).
-                                    let pipeStream (label: string) (owns: bool) fd =
+                                    let pipeStream (label: string) (owns: bool) (isPtyStream: bool) fd =
                                         streamWrapFaultForTests |> Option.iter (fun fault -> fault label)
 
                                         let stream =
-                                            if config.Pty.IsSome then
+                                            if isPtyStream then
                                                 let owned =
                                                     new Microsoft.Win32.SafeHandles.SafeFileHandle(
                                                         nativeint fd,
@@ -2463,7 +2682,7 @@ module internal Posix =
                                     let stdoutStream =
                                         match stdoutParentRead with
                                         | Some fd ->
-                                            let stream = pipeStream "stdout" true fd
+                                            let stream = pipeStream "stdout" true config.Pty.IsSome fd
                                             stdoutParentRead <- None
                                             Some stream
                                         | None -> None
@@ -2471,7 +2690,7 @@ module internal Posix =
                                     let stderrStream =
                                         match stderrParentRead with
                                         | Some fd ->
-                                            let stream = pipeStream "stderr" true fd
+                                            let stream = pipeStream "stderr" true config.Pty.IsSome fd
                                             stderrParentRead <- None
                                             Some stream
                                         | None -> None
@@ -2480,7 +2699,7 @@ module internal Posix =
                                         match stdinParentWrite with
                                         | Some fd ->
                                             // Socketpair path: the parent-write end is its own owning stream.
-                                            let stream = pipeStream "stdin" true fd
+                                            let stream = pipeStream "stdin" true config.Pty.IsSome fd
                                             stdinParentWrite <- None
                                             Some stream
                                         | None when ptyStdinOverMaster && stdoutStream.IsSome ->
@@ -2488,14 +2707,22 @@ module internal Posix =
                                             // master fd the stdout stream already owns (no `dup`, so nothing extra
                                             // to close and nothing to leak — R-02). The stdout owner closes the one
                                             // master exactly once; disposing this view is a no-op on the fd.
-                                            Some(pipeStream "stdin" false ptyMasterFd)
+                                            Some(pipeStream "stdin" false true ptyMasterFd)
                                         | None -> None
+
+                                    let extraStreams =
+                                        [ for targetFd in config.ExtraFds do
+                                              let fd = extraParentEnds[targetFd]
+                                              let stream = pipeStream $"extra fd {targetFd}" true false fd
+                                              extraParentEnds.Remove targetFd |> ignore
+                                              yield targetFd, stream ]
 
                                     Ok
                                         { Handle = nativeint pid
                                           Stdout = stdoutStream
                                           Stderr = stderrStream
                                           Stdin = stdinStream
+                                          ExtraFds = extraStreams
                                           // POSIX signals the child's process group directly (killpg); the
                                           // Windows console-ctrl-group flag has no bearing here.
                                           WindowsCtrlGroup = false

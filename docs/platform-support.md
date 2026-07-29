@@ -214,6 +214,18 @@ requested — most ambient jobs forbid it, so asking would turn a working launch
 and a Linux child inherits your cgroup, so a `systemctl stop` of your unit still reaps it. Work that
 must survive that belongs with the platform's own supervisor, not with a child process.
 
+**Additional child file descriptors (`Command.ExtraFd`)**
+
+| Capability | Windows | Linux / macOS / BSD (POSIX) |
+|---|:---:|:---:|
+| Full-duplex channel at child fd 3+ | ❌ `ProcessError.Unsupported` | ✅ socketpair + explicit `dup2` |
+| Parent access through `RunningProcess.TakeExtraFd` | ❌ | ✅ one-time `Stream` claim |
+
+Each configured target must be unique and at least 3. The socketpair is close-on-exec by default and
+only the explicitly mapped child end survives the spawn, so concurrent children do not inherit one
+another's control channels. Pipelines, detached launches, and in-memory/cassette runners reject this
+feature because they cannot expose or preserve the per-run parent stream.
+
 **Reaping on sudden parent death (`Command.KillOnParentDeath`)**
 
 Kill-on-dispose covers the parent tearing the group down; it cannot cover the parent being killed
@@ -524,7 +536,8 @@ pipes, a second, conflicting one is refused rather than racing two readers on th
 / `OutputEventsAsync` throw `InvalidOperationException`. Pick one consumption model per handle.
 
 **Concurrency-friendly I/O.** Waiting on a running child no longer blocks a dedicated thread on either
-platform — Windows uses a thread-pool registered wait, and POSIX uses an event-driven `SIGCHLD`
+platform — Windows uses a thread-pool registered wait, Linux uses pidfd/epoll, macOS uses
+`EVFILT_PROC` on one shared kqueue, and the remaining POSIX fallback uses an event-driven `SIGCHLD`
 registration (see the [changelog](https://github.com/ZelAnton/ProcessKit-fSharp/blob/main/CHANGELOG.md)) — and the parent side of a child's pipes is now
 genuinely asynchronous on both: Windows uses overlapped named pipes over IOCP, and Linux/macOS wrap
 each stdio channel's parent end (an `AF_UNIX` socketpair) in a `Socket`/`NetworkStream` whose reads

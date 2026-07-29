@@ -107,6 +107,10 @@ try {
         Invoke-External 'dotnet' @('build', 'ProcessKit.slnx', '--configuration', 'Release')
     }
 
+    Invoke-Stage 'Dependency vulnerabilities' {
+        Invoke-External 'pwsh' @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'check-vulnerabilities.ps1'))
+    }
+
     Invoke-Stage 'Sample build' {
         Invoke-External 'dotnet' @('build', 'samples/Samples.slnx', '--configuration', 'Release')
     }

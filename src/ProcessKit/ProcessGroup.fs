@@ -203,7 +203,9 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// and the timeout/pump-fault kills) route every native kill through the same `sync`/`releasedFlag`
     /// lifecycle gate the tree-control/stat verbs use, plus a per-run `runTornDown` flag — see the
     /// `killWhenLive` comment below for why they must not reach the backend directly.
-    member private this.BuildHost(command: Command, ownsGroup: bool) : Result<RunningHost, ProcessError> =
+    member private this.BuildHost
+        (command: Command, ownsGroup: bool)
+        : Result<RunningHost * (int * Stream) list, ProcessError> =
         // Spawn+track AND read the child's pid atomically with the release transition, all under `sync`
         // (via `SpawnInto`/`WhenLive`): a `RunningProcess` is therefore never built over a backend whose
         // teardown has already begun, and reading the pid can't race the Job handle being closed. Once
@@ -473,17 +475,18 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                         // the group.
                         lock sync (fun () -> backend.Release spawned)
 
-                    ValueTask.CompletedTask })
+                    ValueTask.CompletedTask },
+            spawned.ExtraFds)
 
     /// Spawn `command` into the group and build a `RunningHost`. Disposing the resulting
     /// `RunningProcess` reaps this whole group (the group is owned by the running process).
-    member internal this.StartInternal(command: Command) : Result<RunningHost, ProcessError> =
+    member internal this.StartInternal(command: Command) : Result<RunningHost * (int * Stream) list, ProcessError> =
         this.BuildHost(command, ownsGroup = true)
 
     /// Spawn `command` into this *shared* group and build a `RunningHost`. Unlike `StartInternal`,
     /// disposing the resulting `RunningProcess` does **not** reap the group — the group owns the
     /// child's lifetime (reaped on `ShutdownAsync`/`Dispose`). Internal — `StartAsync` wraps it.
-    member internal this.StartShared(command: Command) : Result<RunningHost, ProcessError> =
+    member internal this.StartShared(command: Command) : Result<RunningHost * (int * Stream) list, ProcessError> =
         this.BuildHost(command, ownsGroup = false)
 
     /// Start `command` into this shared group and return a live `RunningProcess`. The **group** owns
@@ -503,11 +506,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             else
                 match this.StartShared command with
                 | Error error -> return Error error
-                | Ok host ->
+                | Ok(host, extraFds) ->
                     // `RunningProcess.buildGuarded` (shared with `JobRunner.start`) reaps the tree via
                     // `host.Teardown()` and re-raises should the constructor ever fault, so a shared
                     // group's spawn gets the same defence-in-depth as a private, per-run group.
-                    let! running = RunningProcess.buildGuarded host
+                    let! running = RunningProcess.buildGuardedWithExtraFds host extraFds
                     return Ok running
         }
 

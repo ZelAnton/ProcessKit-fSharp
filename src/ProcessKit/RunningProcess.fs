@@ -404,7 +404,7 @@ type internal JsonLinesEnumerable<'T>(program: string, source: IAsyncEnumerable<
 /// A live handle to a started process: stream its output, feed its stdin, wait for it, or
 /// collect it to completion. Disposing it reaps the whole process tree (kill-on-drop).
 [<Sealed>]
-type RunningProcess internal (host: RunningHost) =
+type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) list) =
 
     let config = host.Config
 
@@ -419,6 +419,11 @@ type RunningProcess internal (host: RunningHost) =
     let stateLock = obj ()
 
     let mutable stdinTaken = false
+    let extraFds = Dictionary<int, Stream>()
+
+    do
+        for targetFd, stream in extraFdStreams do
+            extraFds.Add(targetFd, stream)
     // Whether `StdoutLinesAsync()` — directly, or transitively through either `StdoutJsonLinesAsync`
     // overload, which both fold into it — has already handed out its one enumerator. Deliberately a
     // SEPARATE flag from `consumption`/`StartStdoutStreaming()`'s reentrant-by-design gate below: that
@@ -1102,6 +1107,8 @@ type RunningProcess internal (host: RunningHost) =
     // (`JobRunner.start`) adds a defence-in-depth teardown as a backstop for any non-observability fault.
     do Log.spawn config.Logger config.Program host.Pid runId
 
+    internal new(host: RunningHost) = RunningProcess(host, [])
+
     /// The pid, when known.
     member _.Pid = host.Pid
 
@@ -1135,6 +1142,19 @@ type RunningProcess internal (host: RunningHost) =
     /// (always `0` unless `Command.StreamBuffer` is configured with one of those modes) — the
     /// streaming analogue of a buffered verb's `ProcessResult.Truncated`.
     member _.DroppedStreamLineCount = Volatile.Read(&droppedStreamLineCount)
+
+    /// Take the parent side of the POSIX full-duplex channel connected to `targetFd` in the child.
+    /// Returns `Some` only for a descriptor configured with `Command.ExtraFd`, and only once.
+    member _.TakeExtraFd(targetFd: int) : Stream option =
+        if targetFd < 3 then
+            invalidArg (nameof targetFd) "An extra child file descriptor must be at least 3."
+
+        lock stateLock (fun () ->
+            match extraFds.TryGetValue targetFd with
+            | true, stream ->
+                extraFds.Remove targetFd |> ignore
+                Some stream
+            | false, _ -> None)
 
     /// Take the interactive stdin handle — `Some` only when the command kept stdin open
     /// (`Command.KeepStdinOpen`), and only once. With **no** source it is available immediately; with a
@@ -2291,18 +2311,11 @@ type RunningProcess internal (host: RunningHost) =
 /// `JobRunner.start` (a private, per-run group) and `ProcessGroup.StartAsync` (a shared group).
 module internal RunningProcess =
 
-    /// Build `RunningProcess host` in try/with. Constructing the handle is non-throwing in practice
-    /// — its observability (`Log.spawn` / `RunTelemetryScope.Start`) swallows any sink fault, see the
-    /// comment on those calls in the type above — but guard it anyway: should the constructor ever
-    /// fault after the native spawn, reap the tree and release the container via `host.Teardown()`
-    /// here so the child is deterministically killed/reaped instead of being orphaned to GC-time
-    /// kill-on-close, then re-raise the original fault (never a silent swallow of a genuine
-    /// construction bug — the caller still sees it, just without a leaked process tree).
-    let buildGuarded (host: RunningHost) : Task<RunningProcess> =
+    let private build (host: RunningHost) (extraFds: (int * Stream) list) : Task<RunningProcess> =
         task {
             let constructed =
                 try
-                    Ok(RunningProcess host)
+                    Ok(RunningProcess(host, extraFds))
                 with ex ->
                     Error ex
 
@@ -2313,3 +2326,15 @@ module internal RunningProcess =
                 ExceptionDispatchInfo.Throw ex
                 return Unchecked.defaultof<_>
         }
+
+    /// Build `RunningProcess host` in try/with. Constructing the handle is non-throwing in practice
+    /// — its observability (`Log.spawn` / `RunTelemetryScope.Start`) swallows any sink fault, see the
+    /// comment on those calls in the type above — but guard it anyway: should the constructor ever
+    /// fault after the native spawn, reap the tree and release the container via `host.Teardown()`
+    /// here so the child is deterministically killed/reaped instead of being orphaned to GC-time
+    /// kill-on-close, then re-raise the original fault (never a silent swallow of a genuine
+    /// construction bug — the caller still sees it, just without a leaked process tree).
+    let buildGuarded (host: RunningHost) : Task<RunningProcess> = build host []
+
+    let buildGuardedWithExtraFds (host: RunningHost) (extraFds: (int * Stream) list) : Task<RunningProcess> =
+        build host extraFds

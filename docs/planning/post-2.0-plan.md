@@ -99,8 +99,9 @@ Since this plan was written, the remaining gaps closed on both platforms:
   via IOCP instead of parking a thread-pool thread per stream.
 - **POSIX event-driven exit-wait.** `Native.Posix.waitPosix` (`src/ProcessKit/Native.Posix.fs:744`,
   `waitPosixCore` at `:716`) now waits via a per-child `pidfd` on one shared `epoll` reaper thread
-  on Linux ≥ 5.4 (probed once at first use, falling back to a shared `SIGCHLD` reaper on older
-  kernels/other POSIX hosts — see `:363-705`), instead of `Task.Run` around a blocking `waitpid`.
+  on Linux ≥ 5.4 and via `EVFILT_PROC` / `NOTE_EXIT` on one shared kqueue reaper thread on macOS
+  (falling back to a shared `SIGCHLD` reaper on older Linux and other POSIX hosts), instead of
+  `Task.Run` around a blocking `waitpid`.
   Reconciled with the existing teardown reaper (`reapLeader`, `:760`) so a child is never
   double-reaped.
 - **POSIX pipe reads are now genuinely async too**, not just the pidfd wait: parent-side stdio is

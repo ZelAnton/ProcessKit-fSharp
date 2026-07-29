@@ -954,6 +954,12 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 // Honour the cancelled-is-always-an-error contract on every mode: replay ignored the
                 // token entirely, and record should not capture a run the caller cancelled up front.
                 return Error(ProcessError.Cancelled command.Program)
+            elif command.Config.ExtraFds.Count > 0 then
+                return
+                    Error(
+                        ProcessError.Unsupported
+                            "RecordReplayRunner cannot record or replay extra POSIX file-descriptor channels"
+                    )
             else
                 match stdinDigest false command with
                 | Error error -> return Error error
@@ -1018,6 +1024,11 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         : Result<RunningProcess, ProcessError> =
         if cancellationToken.IsCancellationRequested then
             Error(ProcessError.Cancelled command.Program)
+        elif command.Config.ExtraFds.Count > 0 then
+            Error(
+                ProcessError.Unsupported
+                    "RecordReplayRunner cannot record or replay extra POSIX file-descriptor channels"
+            )
         else
             match mode with
             | RecordMode _ ->

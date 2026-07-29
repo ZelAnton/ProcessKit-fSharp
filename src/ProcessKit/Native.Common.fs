@@ -28,6 +28,9 @@ module internal Common =
             Stderr: Stream option
             /// Parent write stream for the child's stdin — `Some` only when a stdin pipe was created.
             Stdin: Stream option
+            /// Parent sides of POSIX-only full-duplex channels, keyed by the child fd each peer was
+            /// dup2'd onto. Empty on Windows and when no Command.ExtraFd was configured.
+            ExtraFds: (int * Stream) list
             /// Windows only: `true` when the child was spawned as its own console process group
             /// (`CREATE_NEW_PROCESS_GROUP`), so `ProcessGroup.Signal(Signal.Int/Term)` can deliver a
             /// best-effort `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to it. Always `false` on

@@ -101,7 +101,8 @@ What this means for a ProcessKit-using app:
 
 - **Zombie reaping for ProcessKit's own tree is already covered, PID 1 or not.** Whatever spawned a
   process — `Command`, a `ProcessGroup`, a `Supervisor` — is reaped by ProcessKit's own POSIX
-  backend: a shared `SIGCHLD`-driven `waitpid` (or the Linux `pidfd` fast path) reaps every process
+  backend: Linux uses the `pidfd`/epoll fast path, macOS uses a shared kqueue `NOTE_EXIT` reaper,
+  and the remaining POSIX fallback uses shared `SIGCHLD`-driven `waitpid`; each reaps every process
   it tracks the moment it exits, regardless of where in the process tree it ends up. This is not a
   `PID 1`-specific behavior — it is how the library always avoids leaving zombies behind for the
   processes it spawned.

@@ -17,6 +17,7 @@ type PosixEventDrivenWaitTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
     let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
+    let isMacOs = RuntimeInformation.IsOSPlatform OSPlatform.OSX
 
     let shell (script: string) =
         Command.create "/bin/sh" |> Command.args [ "-c"; script ]
@@ -266,6 +267,27 @@ type PosixEventDrivenWaitTests() =
                     $"the pidfd path and the SIGCHLD fallback disagreed for `{script}` \
                       (pidfdActive={Native.Posix.pidfdActive})"
                 )
+
+            if isMacOs then
+                Assert.That(Native.Posix.kqueueActive (), Is.True, "macOS did not initialize the kqueue reaper")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``macOS shared kqueue reaps a burst of exits without stranding waits``() : Task =
+        task {
+            if not isMacOs then
+                Assert.Ignore "macOS-only: exercises EVFILT_PROC NOTE_EXIT"
+
+            let runs = [ for _ in 1..200 -> (shell "exit 0").RunAsync() ]
+            let! results = Task.WhenAll runs
+
+            for result in results do
+                match result with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail error.Message
+
+            Assert.That(Native.Posix.kqueueActive (), Is.True)
         }
         :> Task
 

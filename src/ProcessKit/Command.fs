@@ -177,6 +177,9 @@ type internal CommandConfig =
       // `CliClient.WithDefaults` template. `Retry`/`RetryBackoff` reset this back to `false`, so the
       // last retry-policy/`RetryNever()` call in a chain wins, like every other builder knob.
       RetryDisabled: bool
+      // POSIX-only full-duplex parent/child channels. Each target fd is >= 3 and unique; the parent
+      // claims its managed Stream once through RunningProcess.TakeExtraFd.
+      ExtraFds: ImmutableList<int>
       UncheckedInPipe: bool
       OkCodes: int list
       CreateNoWindow: bool
@@ -302,6 +305,7 @@ module internal CommandConfig =
           Retry = None
           RetryJitterSource = fun () -> Random.Shared.NextDouble()
           RetryDisabled = false
+          ExtraFds = ImmutableList<int>.Empty
           UncheckedInPipe = false
           OkCodes = [ 0 ]
           CreateNoWindow = false
@@ -1189,6 +1193,21 @@ type Command internal (config: CommandConfig) =
     member _.RetryNever() =
         Command({ config with RetryDisabled = true })
 
+    /// Add a POSIX full-duplex channel at child file descriptor `targetFd` (3 or greater). After
+    /// `StartAsync`, claim the parent side once with `RunningProcess.TakeExtraFd(targetFd)`. Windows
+    /// reports `ProcessError.Unsupported`; pipelines, detached launches, and test doubles reject the
+    /// setting rather than silently dropping it.
+    member _.ExtraFd(targetFd: int) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(targetFd, 3)
+
+        if config.ExtraFds.Contains targetFd then
+            raise (ArgumentException($"extra file descriptor {targetFd} is already configured", nameof targetFd))
+
+        Command(
+            { config with
+                ExtraFds = config.ExtraFds.Add targetFd }
+        )
+
     /// Inside a pipeline, do not let this stage's non-zero exit fail the pipeline (it is still
     /// reported in the stage outcomes). Outside a pipeline this flag has no effect.
     member _.UncheckedInPipe() =
@@ -1640,6 +1659,10 @@ module Command =
     /// Explicitly disable retrying for this command, overriding any inherited `Retry` policy (e.g.
     /// from a `CliClient.WithDefaults` template). The command always runs exactly once.
     let retryNever (command: Command) = command.RetryNever()
+
+    /// Add a POSIX full-duplex parent/child channel at child fd `targetFd` (3 or greater). Claim the
+    /// parent stream once with `RunningProcess.TakeExtraFd(targetFd)` after starting the command.
+    let extraFd (targetFd: int) (command: Command) = command.ExtraFd targetFd
 
     /// Inside a pipeline, allow this stage to exit non-zero without failing the pipeline.
     let uncheckedInPipe (command: Command) = command.UncheckedInPipe()

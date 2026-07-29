@@ -423,6 +423,19 @@ For conversational, request/response stdin — write a line, read the answer,
 repeat — use `KeepStdinOpen` with the streaming API instead: see
 [Streaming & interactive I/O](streaming.md).
 
+### Additional POSIX file descriptors
+
+`Command.ExtraFd(targetFd)` (or `Command.extraFd targetFd`) creates a full-duplex
+socketpair and maps the child end to a unique descriptor numbered 3 or greater.
+After `StartAsync`, `RunningProcess.TakeExtraFd(targetFd)` claims the parent-side
+`Stream` once. The stream remains owned by the run and closes during teardown.
+
+This is intended for child protocols with a separate control or status channel.
+It is POSIX-only: Windows reports `ProcessError.Unsupported`. Pipelines have no
+single per-stage handle from which to claim the channel, and detached launches and
+the in-memory/cassette test runners cannot preserve its lifecycle, so they also
+reject the setting honestly instead of ignoring it.
+
 ## Output handling
 
 ### Stream modes

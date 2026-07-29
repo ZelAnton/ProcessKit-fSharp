@@ -35,6 +35,7 @@ type PosixIdentityReuseTests() =
           Stdout = None
           Stderr = None
           Stdin = None
+          ExtraFds = []
           WindowsCtrlGroup = false
           PtyControl = None }
 

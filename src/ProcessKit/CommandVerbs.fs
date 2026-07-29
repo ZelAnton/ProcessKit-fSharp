@@ -44,7 +44,13 @@ module internal DetachedLaunch =
     let incompatibleKnob (command: Command) : ProcessError option =
         let config = command.Config
 
-        if config.Pty.IsSome then
+        if config.ExtraFds.Count > 0 then
+            Some(
+                refuse
+                    "ExtraFd"
+                    "an extra descriptor is a live parent-side channel, and a detached launch returns no RunningProcess that could own or expose it"
+            )
+        elif config.Pty.IsSome then
             Some(
                 refuse
                     "Pty"

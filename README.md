@@ -805,6 +805,24 @@ if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and w
 
 *Deeper: [Streaming & interactive I/O](docs/streaming.md).*
 
+### Additional POSIX file-descriptor channels
+
+For protocols that use a control channel outside stdin/stdout/stderr, add a full-duplex child
+descriptor with `ExtraFd(3)` and claim its parent `Stream` once from the started process:
+
+```fsharp
+match! (Command.create "worker" |> Command.extraFd 3).StartAsync() with
+| Ok proc ->
+    use _ = proc
+    use channel = proc.TakeExtraFd(3) |> Option.defaultWith (fun () -> failwith "missing fd 3")
+    // Read and write the protocol through channel; the child uses fd 3.
+    ()
+| Error err -> eprintfn $"{err.Message}"
+```
+
+Targets must be unique and at least 3. Windows, pipelines, detached launches, and the in-memory
+testing/cassette runners return `ProcessError.Unsupported` rather than dropping the channel.
+
 ## Wrapping a CLI tool
 
 `CliClient` turns a typed wrapper around an external tool (`git`, `gh`, …) into just its parsers —

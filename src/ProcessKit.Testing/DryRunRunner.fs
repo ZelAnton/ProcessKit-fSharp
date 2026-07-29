@@ -42,9 +42,12 @@ type DryRunRunner() =
     // applies. A missed (cancelled) run is never recorded — `Seam.runner` guards cancellation before
     // this ever runs, matching `JobRunner` / `ScriptedRunner`.
     let resolve (command: Command) : Result<RunningProcess, ProcessError> =
-        let render = DryRunRunner.Render command
-        lock gate (fun () -> history.Add render)
-        Ok(FakeProcess.OfCommand(command).WithStdout(render).Build())
+        if command.Config.ExtraFds.Count > 0 then
+            Error(ProcessError.Unsupported "DryRunRunner cannot emulate extra POSIX file-descriptor channels")
+        else
+            let render = DryRunRunner.Render command
+            lock gate (fun () -> history.Add render)
+            Ok(FakeProcess.OfCommand(command).WithStdout(render).Build())
 
     let seam = Seam.runner resolve
 

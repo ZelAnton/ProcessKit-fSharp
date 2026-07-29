@@ -30,6 +30,7 @@ type private GracefulFaultBackend() =
                   Stdout = None
                   Stderr = None
                   Stdin = None
+                  ExtraFds = []
                   WindowsCtrlGroup = false
                   PtyControl = None }
 

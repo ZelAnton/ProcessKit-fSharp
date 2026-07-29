@@ -19,11 +19,11 @@ type JobRunner() =
                 | Error error ->
                     (group :> IDisposable).Dispose()
                     return Error error
-                | Ok host ->
+                | Ok(host, extraFds) ->
                     // Ownership of the freshly-spawned tree transfers to the caller through the returned
                     // handle. `RunningProcess.buildGuarded` (shared with `ProcessGroup.StartAsync`) reaps
                     // the tree via `host.Teardown()` and re-raises should the constructor ever fault.
-                    let! running = RunningProcess.buildGuarded host
+                    let! running = RunningProcess.buildGuardedWithExtraFds host extraFds
                     return Ok running
         }
 

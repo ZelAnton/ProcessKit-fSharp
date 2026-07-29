@@ -2312,6 +2312,7 @@ module internal Windows =
                                       Stdout = Some(outServer :> Stream)
                                       Stderr = None
                                       Stdin = stdinStream
+                                      ExtraFds = []
                                       WindowsCtrlGroup = config.WindowsCtrlSignals
                                       // Retain the pseudoconsole handle so `RunningProcess.ResizeAsync` can
                                       // `ResizePseudoConsole` it (Stage 4 / D6). The exit-wait still owns closing it
@@ -2958,6 +2959,7 @@ module internal Windows =
                           Stdout = outStream
                           Stderr = errStream
                           Stdin = stdinStream
+                          ExtraFds = []
                           WindowsCtrlGroup = config.WindowsCtrlSignals
                           // Not a PTY run — no pseudoconsole to resize (`ResizeAsync` → typed Unsupported).
                           PtyControl = None }
@@ -2974,7 +2976,11 @@ module internal Windows =
         // Reported one at a time; the first requested-but-unsupported knob names the failure.
         let config = command.Config
 
-        if config.StopSignal <> Signal.Term then
+        if config.ExtraFds.Count > 0 then
+            Error(
+                ProcessError.Unsupported "Command.ExtraFd is POSIX-only; Windows has no child file-descriptor namespace"
+            )
+        elif config.StopSignal <> Signal.Term then
             Error(
                 ProcessError.Unsupported
                     $"Command.StopSignal({config.StopSignal}) on Windows; graceful stop uses the existing WM_CLOSE/CTRL+BREAK mechanisms and only the default Signal.Term contract is representable"

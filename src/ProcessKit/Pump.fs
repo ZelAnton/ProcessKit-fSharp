@@ -921,11 +921,12 @@ module internal Pump =
                 ()
         }
 
-    /// Quietly dispose all three of a spawned child's parent-side pipe streams (teardown-race-safe).
+    /// Quietly dispose all of a spawned child's parent-side pipe streams (teardown-race-safe).
     let closeSpawned (spawned: Native.Common.Spawned) =
         spawned.Stdout |> Option.iter disposeQuietly
         spawned.Stderr |> Option.iter disposeQuietly
         spawned.Stdin |> Option.iter disposeQuietly
+        spawned.ExtraFds |> List.iter (snd >> disposeQuietly)
 
     /// Classify a stdin-feed exception. A genuine *source-acquisition* failure — the input could not
     /// be opened or accessed (a missing `FromFile` path, a directory in its place, no read

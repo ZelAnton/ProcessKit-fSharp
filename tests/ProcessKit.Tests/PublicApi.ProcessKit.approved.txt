@@ -32,6 +32,7 @@ class ProcessKit.Command
   member Env(System.String, System.String) : ProcessKit.Command
   member EnvClear() : ProcessKit.Command
   member EnvRemove(System.String) : ProcessKit.Command
+  member ExtraFd(System.Int32) : ProcessKit.Command
   member Gid(System.Int32) : ProcessKit.Command
   member Groups(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.Command
   member IdleTimeout(System.TimeSpan) : ProcessKit.Command
@@ -99,6 +100,7 @@ module ProcessKit.CommandModule
   static member env(System.String, System.String, ProcessKit.Command) : ProcessKit.Command
   static member envClear(ProcessKit.Command) : ProcessKit.Command
   static member envRemove(System.String, ProcessKit.Command) : ProcessKit.Command
+  static member extraFd(System.Int32, ProcessKit.Command) : ProcessKit.Command
   static member gid(System.Int32, ProcessKit.Command) : ProcessKit.Command
   static member groups(System.Collections.Generic.IEnumerable<System.Int32>, ProcessKit.Command) : ProcessKit.Command
   static member idleTimeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
@@ -1061,6 +1063,7 @@ class ProcessKit.RunningProcess
   member StdoutLinesAsync() : System.Collections.Generic.IAsyncEnumerable<System.String>
   member StopAsync() : System.Threading.Tasks.Task<ProcessKit.Outcome>
   member StopAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.Outcome>
+  member TakeExtraFd(System.Int32) : Microsoft.FSharp.Core.FSharpOption<System.IO.Stream>
   member TakeStdin() : Microsoft.FSharp.Core.FSharpOption<ProcessKit.ProcessStdin>
   member WaitAsync() : System.Threading.Tasks.Task<ProcessKit.Outcome>
   member WaitForAsync(System.Func<System.Threading.Tasks.Task<System.Boolean>>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>

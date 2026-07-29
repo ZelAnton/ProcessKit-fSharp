@@ -93,6 +93,7 @@ type internal SyntheticBackend() =
                   Stdout = None
                   Stderr = None
                   Stdin = None
+                  ExtraFds = []
                   WindowsCtrlGroup = false
                   PtyControl = None }
 
@@ -215,6 +216,7 @@ type internal CtrlSignalRaceBackend() =
                   Stdout = None
                   Stderr = None
                   Stdin = None
+                  ExtraFds = []
                   WindowsCtrlGroup = true
                   PtyControl = None }
 
@@ -662,7 +664,7 @@ type ContainmentBugTests() =
 
             let host =
                 match group.StartInternal(Command.create "synthetic") with
-                | Ok h -> h
+                | Ok(h, _) -> h
                 | Error e -> failwith $"owned start failed: {e}"
 
             let running = RunningProcess host
@@ -729,7 +731,7 @@ type ContainmentBugTests() =
 
             let host =
                 match group.StartInternal(Command.create "synthetic") with
-                | Ok h -> h
+                | Ok(h, _) -> h
                 | Error e -> failwith $"owned start failed: {e}"
 
             let running = RunningProcess host

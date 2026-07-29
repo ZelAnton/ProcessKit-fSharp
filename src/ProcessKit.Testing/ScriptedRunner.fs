@@ -37,33 +37,36 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
     // and differ only in the final projection `Seam.runner` applies. Cancellation and that projection
     // are shared with `DryRunRunner` via `Seam`, not duplicated here.
     let resolve (command: Command) : Result<RunningProcess, ProcessError> =
-        let matched =
-            rules
-            |> List.tryPick (fun (predicate, reply) -> if predicate command then Some reply else None)
+        if command.Config.ExtraFds.Count > 0 then
+            Error(ProcessError.Unsupported "ScriptedRunner cannot emulate extra POSIX file-descriptor channels")
+        else
+            let matched =
+                rules
+                |> List.tryPick (fun (predicate, reply) -> if predicate command then Some reply else None)
 
-        let reply =
-            match matched with
-            | Some reply -> reply
-            | None ->
-                match fallback with
+            let reply =
+                match matched with
                 | Some reply -> reply
-                | None -> invalidOp $"ScriptedRunner: no scripted reply matched command '{command.Program}'."
+                | None ->
+                    match fallback with
+                    | Some reply -> reply
+                    | None -> invalidOp $"ScriptedRunner: no scripted reply matched command '{command.Program}'."
 
-        match reply.ErrorOverride with
-        | Some error -> Error error
-        | None ->
-            let fake =
-                FakeProcess
-                    .OfCommand(command)
-                    .WithStdout(reply.StdoutText)
-                    .WithStderr(reply.StderrText)
-                    .WithOutcome(reply.Outcome)
+            match reply.ErrorOverride with
+            | Some error -> Error error
+            | None ->
+                let fake =
+                    FakeProcess
+                        .OfCommand(command)
+                        .WithStdout(reply.StdoutText)
+                        .WithStderr(reply.StderrText)
+                        .WithOutcome(reply.Outcome)
 
-            // `FakeProcess.Build` reads the command configuration, so `Command.MergeStderr()` replays as
-            // one stdout stream with no separate stderr channel. PTY additionally needs `WithPty()` for
-            // its recorded resize behavior.
-            let fake = if command.Config.Pty.IsSome then fake.WithPty() else fake
-            Ok(fake.Build())
+                // `FakeProcess.Build` reads the command configuration, so `Command.MergeStderr()` replays as
+                // one stdout stream with no separate stderr channel. PTY additionally needs `WithPty()` for
+                // its recorded resize behavior.
+                let fake = if command.Config.Pty.IsSome then fake.WithPty() else fake
+                Ok(fake.Build())
 
     let seam = Seam.runner resolve
 

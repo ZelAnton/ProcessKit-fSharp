@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - The Pages navigation now links to the ProcessKit CLI Runner immediately after the Rust implementation.
 - `Command.RetryBackoff` / `Command.retryBackoff` retries one operation with bounded exponential delays and optional jitter, using the command's `TimeProvider`.
+- `Command.ExtraFd` / `Command.extraFd` adds a full-duplex POSIX child channel at file descriptor 3 or greater, claimed once through `RunningProcess.TakeExtraFd`.
 - HTTP readiness and liveness probes now accept caller-owned `HttpClient` instances for custom headers, TLS validation, proxies, and transports without transferring ownership.
 - `RunningProcess.Signal` delivers a signal to one run's own contained tree, with matching signal recording in `FakeProcess`.
 - `Command.StopSignal` and `ProcessGroupOptions.WithStopSignal` select the soft signal used before graceful-stop escalation.
@@ -18,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Releases now include a CycloneDX JSON SBOM for each published NuGet package, covered by checksums and build-provenance attestations.
 
 ### Changed
+- macOS child exits now use one shared `kqueue` `EVFILT_PROC` reaper instead of rescanning every pending pid on each `SIGCHLD`.
+- Scheduled dependency audits now fail on vulnerable direct or transitive NuGet packages and run as part of the local full-verification script.
 - `StopAsync`, pipeline sessions, supervisors, hosted processes, timeout grace, and group shutdown now honor the configured soft-stop signal.
 - `Command.StopSignal` and `ProcessGroupOptions.WithStopSignal` now report invalid graceful-stop signals through one consistent validation contract.
 

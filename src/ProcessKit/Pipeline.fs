@@ -42,6 +42,14 @@ module internal PipelineStageGuard =
     let validate (paramName: string) (stageIndex: int) (command: Command) =
         let config = command.Config
 
+        if config.ExtraFds.Count > 0 then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets ExtraFd, but a pipeline exposes no per-stage RunningProcess from which the parent-side channel could be claimed. Run the command on its own.",
+                    paramName
+                )
+            )
+
         if config.StdoutFile.IsSome then
             raise (
                 ArgumentException(
