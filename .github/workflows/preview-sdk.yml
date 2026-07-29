@@ -1,0 +1,77 @@
+name: Preview SDK canary
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 4'
+
+permissions:
+  contents: read
+
+jobs:
+  preview-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The test assemblies still target net8.0/net10.0, so install their runtimes explicitly rather
+      # than relying on the hosted runner image. SDK selection below remains the newest installed SDK.
+      - name: Install supported runtimes
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Install latest preview SDK
+        id: preview
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: latest
+          dotnet-quality: preview
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-preview-nuget-${{ hashFiles('Directory.Packages.props', 'nuget.config') }}
+          restore-keys: ${{ runner.os }}-preview-nuget-
+
+      # SDK lookup starts at the CLI working directory, not at the project path. Running from the
+      # runner temp directory keeps the repository's stable global.json out of this canary while
+      # absolute project paths still place all build outputs in the checkout as usual.
+      - name: Verify preview SDK selection
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          resolved="$(dotnet --version)"
+          expected='${{ steps.preview.outputs.dotnet-version }}'
+          echo "Resolved preview SDK: $resolved"
+          test "$resolved" = "$expected"
+          dotnet --info
+
+      - name: Restore
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: dotnet restore "$GITHUB_WORKSPACE/ProcessKit.slnx"
+
+      - name: Build
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: dotnet build "$GITHUB_WORKSPACE/ProcessKit.slnx" --no-restore --configuration Release
+
+      - name: Test F# API
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: >-
+          dotnet test "$GITHUB_WORKSPACE/tests/ProcessKit.Tests/ProcessKit.Tests.fsproj"
+          --no-build --configuration Release
+
+      - name: Test C# API
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: >-
+          dotnet test "$GITHUB_WORKSPACE/tests/ProcessKit.CSharp.Tests/ProcessKit.CSharp.Tests.csproj"
+          --no-build --configuration Release
