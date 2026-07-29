@@ -98,6 +98,14 @@ module internal PipelineStageGuard =
                 )
             )
 
+        if stageIndex > 0 && config.StopSignal <> Signal.Term then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets StopSignal, but graceful stop broadcasts one signal to the whole chain. Set StopSignal on stage 0, which owns the pipeline-wide control configuration.",
+                    paramName
+                )
+            )
+
     /// Reject `MergeStderr` on a stage that is (or is about to become) a **non-last** pipeline stage. On
     /// an intermediate stage stdout is wired into the next stage's stdin, so an OS-level `2>&1` merge
     /// would inject that stage's stderr bytes into the downstream stage's input data — a silent change to
@@ -307,7 +315,8 @@ type PipelineSession
 /// logger (a per-stage `Logger` on any *other* stage has no effect — set it on stage 0, or observe an
 /// individual command by running it on its own); the `program` tag/label is a composite of every
 /// stage's name, joined `"a | b | c"` (built only from `Command.Program`, never argv/env, so the
-/// argv/env-never-logged invariant holds for a multi-stage run too).
+/// argv/env-never-logged invariant holds for a multi-stage run too). Stage 0 likewise owns
+/// `StopSignal`, because graceful shutdown broadcasts one soft signal to the whole chain.
 ///
 /// Per-stage config that is simply **inapplicable** inside a pipeline and has no effect: `StreamBuffer`
 /// (a policy for the streaming verbs, which a pipeline does not offer), and `KeepStdinOpen` /

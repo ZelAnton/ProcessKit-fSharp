@@ -86,9 +86,10 @@ mid-stream. There is also `Kill()` — "stop it now, I'll `WaitAsync()` for the
 
 To stop a long-running child *cleanly* — let it flush logs, release locks, and run its
 shutdown hooks — use `StopAsync(gracePeriod)` (or `StopAsync()` for a 2-second default,
-matching `ProcessGroupOptions.ShutdownTimeout`). It sends the tree a soft signal (SIGTERM),
+matching `ProcessGroupOptions.ShutdownTimeout`). It sends the tree the command's configured soft signal
+(`Command.StopSignal`, default `Signal.Term`),
 waits up to the grace window for it to exit on its own, then hard-kills whatever is still
-alive, reaps the tree, and returns the honest `Outcome` — the same SIGTERM → grace → SIGKILL
+alive, reaps the tree, and returns the honest `Outcome` — the same configured-soft-signal → grace → hard-kill
 escalation as [`Command.TimeoutGrace`](timeouts-and-cancellation.md) and
 [`ProcessGroup.ShutdownAsync`](process-groups.md). It drains the child's output while it
 shuts down and reuses an in-flight streaming/capturing session's wait, so it is safe to call
@@ -98,6 +99,12 @@ is idempotent with `Kill`/`Dispose`. A soft signal needs a mechanism that has on
 `group.StartAsync(cmd)` (no per-child graceful signal) the grace is skipped and the child is
 hard-killed at once — exactly as `TimeoutGrace` already degrades there. A handle from
 `StartAsync()` (its own private group) gets the full graceful stop on Unix.
+
+`Signal(signal)` is the non-consuming control verb for one live handle. It targets that run's own
+containment unit and leaves `WaitAsync`/streaming available afterwards; after teardown it fails without
+touching a potentially recycled pid. Use `ProcessGroup.Signal` when the intent is a group-wide broadcast.
+For a pipeline, stage 0 owns `StopSignal`; setting a custom value on a later stage is rejected because
+the chain has one broadcast soft-stop phase.
 
 A command's [`Timeout`](timeouts-and-cancellation.md) and `CancelOn` token **bound
 the stream**: at the deadline (or on cancellation) the tree is killed, the pipes

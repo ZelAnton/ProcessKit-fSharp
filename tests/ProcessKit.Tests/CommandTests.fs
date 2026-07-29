@@ -671,6 +671,27 @@ type CommandTests() =
         Assert.Throws<ArgumentException>(Action(fun () -> ((Command.create "cmd").InheritStdin()).Pty() |> ignore))
         |> ignore
 
+    // ---- StopSignal ---------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``StopSignal defaults to Term and module and instance builders agree``() =
+        Assert.That((Command.create "tool").Config.StopSignal, Is.EqualTo Signal.Term)
+
+        for command in
+            [ Command.create "tool" |> Command.stopSignal Signal.Usr1
+              Command("tool").StopSignal(Signal.Usr1) ] do
+            Assert.That(command.Config.StopSignal, Is.EqualTo Signal.Usr1)
+
+    [<Test>]
+    member _.``StopSignal rejects hard kill and non-deliverable raw numbers``() =
+        Assert.Throws<ArgumentException>(Action(fun () -> Command("tool").StopSignal(Signal.Kill) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> Command("tool").StopSignal(Signal.Other 0) |> ignore)
+        )
+        |> ignore
+
     // ---- LineTerminator -----------------------------------------------------------------------
 
     [<Test>]

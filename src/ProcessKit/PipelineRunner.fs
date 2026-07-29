@@ -977,9 +977,16 @@ module internal PipelineRunner =
                         let gracefulKillGated (grace: TimeSpan) : Task =
                             lock teardownGate (fun () ->
                                 if not tornDown then
-                                    group.GracefulKillTree grace
+                                    group.GracefulKillTree(stages[0].Config.StopSignal, grace)
                                 else
                                     Task.CompletedTask)
+
+                        let signalGated (signal: Signal) =
+                            lock teardownGate (fun () ->
+                                if not tornDown then
+                                    group.Signal signal
+                                else
+                                    Error(ProcessError.Unsupported "the pipeline has already been torn down"))
 
                         // Observe the whole chain through the shared reap-once choke point, drain the
                         // relay/stderr tail, build + stash the pipefail capture, and return the SAME
@@ -1134,6 +1141,7 @@ module internal PipelineRunner =
                               StdinError = (fun () -> None)
                               StdinFeedComplete = (fun () -> ())
                               StartKill = killTreeGated
+                              Signal = signalGated
                               GracefulKill = gracefulKillGated
                               ResizePty = None
                               TreeStats = None

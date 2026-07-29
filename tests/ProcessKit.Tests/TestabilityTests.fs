@@ -1,5 +1,6 @@
 namespace ProcessKit.Tests
 
+open System
 open System.Threading
 open System.Threading.Tasks
 open System.Text
@@ -586,4 +587,18 @@ type TestabilityTests() =
                 Is.EqualTo 0,
                 "a builder method returns a runner with its own journal"
             )
+        }
+
+    [<Test>]
+    member _.``FakeProcess records direct and graceful signals in order``() : Task =
+        task {
+            let fake = FakeProcess.Create()
+            use running = fake.Build()
+
+            match running.Signal Signal.Int with
+            | Error error -> Assert.Fail $"fake signal failed: {error}"
+            | Ok() -> ()
+
+            let! _ = running.StopAsync(TimeSpan.Zero)
+            CollectionAssert.AreEqual([| Signal.Int; Signal.Term |], fake.Signals)
         }

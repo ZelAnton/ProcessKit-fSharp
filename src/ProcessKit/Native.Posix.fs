@@ -3,6 +3,7 @@ namespace ProcessKit.Native
 open ProcessKit
 open System
 open System.Collections.Concurrent
+open System.Collections.Immutable
 open System.IO
 open System.Runtime.InteropServices
 open System.Net.Sockets
@@ -2668,6 +2669,41 @@ module internal Posix =
                     Program = resolved }
             )
         | None -> command
+
+    /// Resolve the target exactly as an ordinary POSIX spawn would, then wrap it in the system shell
+    /// long enough to apply `RLIMIT_CPU` immediately before `exec`. Resolving before the rewrite preserves
+    /// `PreferLocal`, PATH lookup, and the typed `NotFound` contract; arguments remain positional (`"$@"`),
+    /// so no user value is reparsed as shell text. The soft limit is rounded up to seconds and the hard
+    /// limit gets one extra second, allowing the child to observe SIGXCPU before unconditional termination.
+    let withCpuTimeLimit (duration: TimeSpan) (command: Command) : Result<Command, ProcessError> =
+        let command = applyPreferLocal command
+
+        match resolveCommandProgram command with
+        | Error error -> Error error
+        | Ok resolvedProgram ->
+            let seconds = max 1L (int64 (Math.Ceiling duration.TotalSeconds))
+            let config = command.Config
+
+            let args =
+                seq {
+                    yield "-c"
+
+                    yield
+                        "ulimit -S -t \"$1\" || exit 125; ulimit -H -t \"$(($1 + 1))\" || exit 125; shift; exec \"$@\""
+
+                    yield "processkit-rlimit"
+                    yield string seconds
+                    yield resolvedProgram
+                    yield! config.Args
+                }
+
+            Ok(
+                Command(
+                    { config with
+                        Program = "/bin/sh"
+                        Args = ImmutableList.CreateRange args }
+                )
+            )
 
     /// Rewrite a `setpriv`-helper `NotFound` (the helper is off PATH) into a typed `ProcessError.Spawn`
     /// against the ORIGINAL program, so a caller who never mentioned `setpriv` gets a message naming what

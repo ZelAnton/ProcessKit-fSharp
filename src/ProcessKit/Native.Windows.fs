@@ -1273,9 +1273,47 @@ module internal Windows =
             // let the unconditional hard kill proceed.
             0
 
+    /// Best-effort WM_CLOSE for one process whose caller keeps an open process handle while invoking
+    /// this function. The open handle pins `pid`, so the number cannot be recycled onto a foreign window
+    /// during enumeration. Returns the number of matching top-level windows posted to.
+    let postCloseToProcessWindows (pid: int) : int =
+        try
+            let targets = ResizeArray<nativeint>()
+
+            let collect =
+                EnumWindowsProc(fun hWnd _ ->
+                    let mutable owningPid = 0u
+                    GetWindowThreadProcessId(hWnd, &owningPid) |> ignore
+
+                    if int owningPid = pid then
+                        targets.Add hWnd
+
+                    true)
+
+            EnumWindows(collect, IntPtr.Zero) |> ignore
+            GC.KeepAlive collect
+
+            let mutable postedCount = 0
+
+            for hWnd in targets do
+                if PostMessageW(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero) then
+                    postedCount <- postedCount + 1
+
+            postedCount
+        with _ ->
+            // WM_CLOSE is a best-effort Windows analogue; a missing desktop must stay a typed
+            // unsupported delivery at the caller rather than faulting the process-control path.
+            0
+
     // Job-Object resource limits (the `limits` backend on Windows).
     [<Literal>]
     let private JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008u
+
+    [<Literal>]
+    let private JOB_OBJECT_LIMIT_JOB_TIME = 0x00000004u
+
+    [<Literal>]
+    let private JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME = 0x00000040u
 
     [<Literal>]
     let private JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200u
@@ -1393,7 +1431,10 @@ module internal Windows =
     /// A dimension left `None` simply does not set its flag, which IS the replace semantics: the block is
     /// written whole, so an unset flag means that cap is lifted. Affinity is no exception — dropping the
     /// pin needs no separate "disable" call (contrast the CPU rate control, which does).
-    let private extendedLimitBlockFor (limits: ResourceLimits) : Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION, string> =
+    let private extendedLimitBlockFor
+        (preserveJobTime: bool)
+        (limits: ResourceLimits)
+        : Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION, string> =
         let affinity =
             match limits.CpuAffinityCores with
             | Some cores -> windowsAffinityMask cores |> Result.map Some
@@ -1415,6 +1456,13 @@ module internal Windows =
             | Some bytes ->
                 flags <- flags ||| JOB_OBJECT_LIMIT_JOB_MEMORY
                 info.JobMemoryLimit <- unativeint (uint64 bytes)
+            | None -> ()
+
+            match limits.CpuTimeMax with
+            | Some _ when preserveJobTime -> flags <- flags ||| JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME
+            | Some duration ->
+                flags <- flags ||| JOB_OBJECT_LIMIT_JOB_TIME
+                info.BasicLimitInformation.PerJobUserTimeLimit <- duration.Ticks
             | None -> ()
 
             match affinityMask with
@@ -1457,7 +1505,11 @@ module internal Windows =
     /// restrictions on a Job that has none — issues no extra native call. Ahead of even that, the whole
     /// extended-limit block is resolved as a pure value (`extendedLimitBlockFor`), so a pin no affinity
     /// mask can express is refused with the Job untouched rather than half-updated.
-    let applyWindowsJobLimits (job: nativeint) (limits: ResourceLimits) : Result<unit, string> =
+    let private applyWindowsJobLimitsCore
+        (preserveJobTime: bool)
+        (job: nativeint)
+        (limits: ResourceLimits)
+        : Result<unit, string> =
         // (Re)write the Job's CPU rate control block. `controlFlags = 0` disables CPU rate control (the
         // replace-semantics "no CPU cap" state); the enable+hard-cap flags with a rate arm the cap. The
         // raw Win32 errno is returned on failure so the caller can classify it (see the `None` branch).
@@ -1555,7 +1607,7 @@ module internal Windows =
                 $"{message} (the requested CPU affinity pins the tree to core(s) {listed}; a Job's affinity mask must be a subset of this process's own, so every core named must exist on this host and be available to it)"
             | None -> message
 
-        match extendedLimitBlockFor limits with
+        match extendedLimitBlockFor preserveJobTime limits with
         | Error message ->
             // A pin no Job affinity mask can express. Refused before a single native write, so the Job
             // still carries exactly the caps it had.
@@ -1629,6 +1681,26 @@ module internal Windows =
                                     $"failed to apply the Job CPU rate cap ({cpuMessage}) and the Job's prior limits could not be captured to roll back; the Job's limits may be partially applied"
                                     uiNote
                             )
+
+    /// Replace every requested Job limit. A CPU-time limit is established relative to the Job's current
+    /// accounting, so this form is used for creation and for an explicit CpuTimeMax change.
+    let applyWindowsJobLimits (job: nativeint) (limits: ResourceLimits) : Result<unit, string> =
+        applyWindowsJobLimitsCore false job limits
+
+    /// Replace the non-time limits while preserving an already-running Job's absolute CPU-time deadline.
+    /// `JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME` prevents an unrelated live update from granting a fresh CPU
+    /// budget; callers use this only when CpuTimeMax remains unchanged and set.
+    let applyWindowsJobLimitsPreservingCpuTime (job: nativeint) (limits: ResourceLimits) : Result<unit, string> =
+        applyWindowsJobLimitsCore true job limits
+
+    /// Read back the Job's absolute user-time deadline in 100-nanosecond ticks, when enabled. Windows
+    /// normalizes a successful PRESERVE write back to `JOB_OBJECT_LIMIT_JOB_TIME`, so the persisted
+    /// deadline — not the transient input flag — is the useful verification seam.
+    let queryWindowsJobCpuTimeLimit (job: nativeint) : int64 option =
+        match queryExtendedLimit job with
+        | Some info when info.BasicLimitInformation.LimitFlags &&& JOB_OBJECT_LIMIT_JOB_TIME <> 0u ->
+            Some info.BasicLimitInformation.PerJobUserTimeLimit
+        | _ -> None
 
     let private buildWindowsEnvironment (command: Command) : nativeint =
         if not command.Config.ClearEnv && command.Config.EnvOverrides.IsEmpty then
@@ -2826,34 +2898,40 @@ module internal Windows =
         // Reported one at a time; the first requested-but-unsupported knob names the failure.
         let config = command.Config
 
-        match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups with
-        | Some _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
-        | _, Some _, _, _, _ -> Error(ProcessError.Unsupported "uid")
-        | _, _, Some _, _, _ -> Error(ProcessError.Unsupported "gid")
-        | _, _, _, true, _ -> Error(ProcessError.Unsupported "setsid")
-        | _, _, _, _, Some _ -> Error(ProcessError.Unsupported "groups")
-        | None, None, None, false, None ->
-            match config.Pty with
-            | Some pty ->
-                // ConPTY needs Windows 10 1809+; probe the export rather than blind-calling so a pre-1809
-                // host is a typed `ProcessError.Unsupported`, never a silent pipe downgrade (D9). The spawn
-                // takes `windowsSpawnLock` for the same reason the pipe path does: a concurrent pipe spawn
-                // with `bInheritHandles = true` must not snapshot this path's inheritable pipe-client ends
-                // in its own child (this path itself passes `bInheritHandles = false`).
-                if wantsHardenedToken config then
-                    // Defense in depth: the builder already refuses this pair, so a `CommandConfig` reaching
-                    // here with both set could only come from inside the library. The ConPTY spawn is a
-                    // different call (`CreateProcessExtended`) that does not carry the hardened token, so
-                    // running it would silently give the child the parent's full token — refused instead.
-                    Error(
-                        ProcessError.Unsupported
-                            "Pty with WindowsRestrictedToken/WindowsIntegrityLevel (the ConPTY spawn path cannot carry a hardened token)"
-                    )
-                elif not (conptyAvailable ()) then
-                    Error(ProcessError.Unsupported "Pty (needs Windows 10 1809+ / ConPTY)")
-                else
-                    lock windowsSpawnLock (fun () -> spawnWindowsPtyCore job command pty)
-            | None -> lock windowsSpawnLock (fun () -> spawnWindowsCore job command)
+        if config.StopSignal <> Signal.Term then
+            Error(
+                ProcessError.Unsupported
+                    $"Command.StopSignal({config.StopSignal}) on Windows; graceful stop uses the existing WM_CLOSE/CTRL+BREAK mechanisms and only the default Signal.Term contract is representable"
+            )
+        else
+            match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups with
+            | Some _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
+            | _, Some _, _, _, _ -> Error(ProcessError.Unsupported "uid")
+            | _, _, Some _, _, _ -> Error(ProcessError.Unsupported "gid")
+            | _, _, _, true, _ -> Error(ProcessError.Unsupported "setsid")
+            | _, _, _, _, Some _ -> Error(ProcessError.Unsupported "groups")
+            | None, None, None, false, None ->
+                match config.Pty with
+                | Some pty ->
+                    // ConPTY needs Windows 10 1809+; probe the export rather than blind-calling so a pre-1809
+                    // host is a typed `ProcessError.Unsupported`, never a silent pipe downgrade (D9). The spawn
+                    // takes `windowsSpawnLock` for the same reason the pipe path does: a concurrent pipe spawn
+                    // with `bInheritHandles = true` must not snapshot this path's inheritable pipe-client ends
+                    // in its own child (this path itself passes `bInheritHandles = false`).
+                    if wantsHardenedToken config then
+                        // Defense in depth: the builder already refuses this pair, so a `CommandConfig` reaching
+                        // here with both set could only come from inside the library. The ConPTY spawn is a
+                        // different call (`CreateProcessExtended`) that does not carry the hardened token, so
+                        // running it would silently give the child the parent's full token — refused instead.
+                        Error(
+                            ProcessError.Unsupported
+                                "Pty with WindowsRestrictedToken/WindowsIntegrityLevel (the ConPTY spawn path cannot carry a hardened token)"
+                        )
+                    elif not (conptyAvailable ()) then
+                        Error(ProcessError.Unsupported "Pty (needs Windows 10 1809+ / ConPTY)")
+                    else
+                        lock windowsSpawnLock (fun () -> spawnWindowsPtyCore job command pty)
+                | None -> lock windowsSpawnLock (fun () -> spawnWindowsCore job command)
 
     // ----------------------------------------------------------------------------------
     // Windows: the detached launch (Command.LaunchDetached) — deliberately NOT contained

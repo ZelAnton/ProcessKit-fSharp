@@ -454,6 +454,9 @@ device). The doubles model that observable shape:
 - **`ResizeAsync` is a recorded no-op success.** On a PTY fake `ResizeAsync(cols, rows)` returns
   `Ok ()` (not the typed `Unsupported` a non-PTY fake returns) and records the geometry — read
   the last requested `(cols, rows)` back through `FakeProcess.LastResize` for assertions.
+- **Signals are recorded.** `RunningProcess.Signal` appends the requested value to
+  `FakeProcess.Signals`; `StopAsync` appends the command's configured `StopSignal`, so control-flow
+  tests can assert both direct and graceful delivery without an OS process.
 - **`ScriptedRunner`** serves a command built with `Command.Pty()` as a merged-stream PTY fake
   automatically, so a scripted PTY scenario reads back the same way.
 - **Cassettes** record a `Pty` flag and geometry (schema v4) and replay as a merged-stream

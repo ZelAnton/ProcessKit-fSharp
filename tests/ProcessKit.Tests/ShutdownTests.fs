@@ -41,12 +41,13 @@ type private GracefulFaultBackend() =
         member _.KillChild(_spawned) = ()
         member _.KillTree() = ()
 
-        member _.GracefulKillTree(_grace) : Task =
+        member _.GracefulKillTree (_signal) (_grace) : Task =
             // The fault this backend exists to inject: `ShutdownAsync`'s graceful stage must still
             // guarantee `hardRelease()` runs, and must still propagate this exception to the caller.
             raise (InvalidOperationException "synthetic graceful-kill failure")
 
         member _.Members() = Ok []
+        member _.SignalChild(_spawned, _signal) = Ok()
         member _.Signal(_signal) = Ok()
         member _.Suspend() = Ok()
         member _.Resume() = Ok()
@@ -374,6 +375,68 @@ type ShutdownTests() =
             match outcome with
             | Outcome.Exited 42 -> Assert.Pass()
             | other -> Assert.Fail $"expected a clean Exited 42 from the SIGTERM handler, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``RunningProcess Signal targets this run and remains non-consuming``() : Task =
+        if isWindows then
+            Assert.Ignore "SIGUSR1 has no Windows mapping."
+
+        task {
+            let command =
+                shell "trap 'exit 43' USR1; echo ready; while :; do sleep 0.2 & wait $!; done"
+
+            let! proc = startProc command
+
+            match! proc.WaitForLineAsync((fun line -> line = "ready"), TimeSpan.FromSeconds 10.0) with
+            | Error error -> Assert.Fail $"child never became ready: {error}"
+            | Ok _ -> ()
+
+            match proc.Signal Signal.Usr1 with
+            | Error error -> Assert.Fail $"signal failed: {error}"
+            | Ok() -> ()
+
+            match! proc.WaitAsync() with
+            | Outcome.Exited 43 -> ()
+            | other -> Assert.Fail $"expected the SIGUSR1 handler to exit 43, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Command StopSignal controls the graceful signal used by StopAsync``() : Task =
+        if isWindows then
+            Assert.Ignore "custom POSIX stop signals are honestly unsupported on Windows."
+
+        task {
+            let command =
+                shell "trap 'exit 44' USR1; echo ready; while :; do sleep 0.2 & wait $!; done"
+                |> Command.stopSignal Signal.Usr1
+
+            let! proc = startProc command
+
+            match! proc.WaitForLineAsync((fun line -> line = "ready"), TimeSpan.FromSeconds 10.0) with
+            | Error error -> Assert.Fail $"child never became ready: {error}"
+            | Ok _ -> ()
+
+            match! proc.StopAsync(TimeSpan.FromSeconds 5.0) with
+            | Outcome.Exited 44 -> ()
+            | other -> Assert.Fail $"expected the configured SIGUSR1 handler to exit 44, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows refuses a custom Command StopSignal at spawn``() : Task =
+        if not isWindows then
+            Assert.Ignore "Windows-specific representability contract."
+
+        task {
+            match! (longSleeper.StopSignal Signal.Int).StartAsync() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | Error error -> Assert.Fail $"expected Unsupported, got {error}"
+            | Ok running ->
+                do! (running :> IAsyncDisposable).DisposeAsync().AsTask()
+                Assert.Fail "a custom Windows command stop signal was silently accepted"
         }
         :> Task
 

@@ -70,13 +70,14 @@ type WindowsUiRestrictions =
     /// not a GUI application.
     | All = 0x000000FF
 
-/// Resource limits enforced on a process group **as a whole** (not per process), applied to the
-/// kernel container at creation time.
+/// Resource limits applied at group creation. Most are enforced on the group **as a whole** by its
+/// kernel container; `CpuTimeMax` is the deliberate POSIX exception and is applied per spawned process
+/// through `RLIMIT_CPU` before exec.
 ///
-/// Enforcement needs a real container — a **Windows Job Object** or a **Linux cgroup v2**. On macOS
-/// and the Linux process-group fallback there is no whole-tree limit primitive, so requesting *any*
-/// limit there fails fast with `ProcessError.ResourceLimit` rather than silently leaving the tree
-/// unbounded. On Linux the cgroup v2 controllers can only be enabled when this process runs at the
+/// Whole-tree enforcement needs a real container — a **Windows Job Object** or a **Linux cgroup v2**.
+/// On macOS and the Linux process-group fallback, requesting memory/process/quota/affinity limits fails
+/// fast with `ProcessError.ResourceLimit`; CPU-time alone remains available through the per-child rlimit.
+/// On Linux the cgroup v2 controllers can only be enabled when this process runs at the
 /// real cgroup-v2 hierarchy root (not under a systemd scope, nor in an ordinary container); when
 /// they cannot, group creation fails fast for the same reason.
 [<Sealed>]
@@ -87,11 +88,12 @@ type ResourceLimits
         maxProcesses: int option,
         cpuQuota: float option,
         uiRestrictions: WindowsUiRestrictions,
-        cpuAffinity: int list option
+        cpuAffinity: int list option,
+        cpuTimeMax: TimeSpan option
     ) =
 
     /// No limits — the default.
-    static member None = ResourceLimits(None, None, None, WindowsUiRestrictions.None, None)
+    static member None = ResourceLimits(None, None, None, WindowsUiRestrictions.None, None, None)
 
     /// Maximum total memory for the tree, in bytes. `None` leaves memory unbounded.
     member _.MemoryMax = memoryMax
@@ -119,20 +121,24 @@ type ResourceLimits
     /// shape used by every other public collection here, while the native layer avoids re-copying.
     member internal _.CpuAffinityCores = cpuAffinity
 
+    /// Maximum CPU time consumed by the contained run. Windows enforces this for the Job as a whole;
+    /// POSIX applies `RLIMIT_CPU` independently to each spawned process before it execs.
+    member _.CpuTimeMax = cpuTimeMax
+
     /// A copy with the memory cap set. `bytes` must be positive — zero or negative is rejected
     /// (`ArgumentOutOfRangeException`): a non-positive cap could never let anything run, so it is a
     /// misconfiguration rather than a meaningful limit, and previously degraded silently (e.g. a
     /// negative value converting to a huge `unativeint` on Windows — effectively "unlimited").
     member _.WithMemoryMax(bytes: int64) =
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(bytes, 0L)
-        ResourceLimits(Some bytes, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity)
+        ResourceLimits(Some bytes, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax)
 
     /// A copy with the live-process cap set. `count` must be positive — zero or negative is rejected
     /// (`ArgumentOutOfRangeException`): the tree always has at least its own leader process, so a
     /// non-positive cap could never be satisfied.
     member _.WithMaxProcesses(count: int) =
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(count, 0)
-        ResourceLimits(memoryMax, Some count, cpuQuota, uiRestrictions, cpuAffinity)
+        ResourceLimits(memoryMax, Some count, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax)
 
     /// A copy with the CPU quota (in cores) set. `cores` must be a finite, strictly positive number —
     /// zero, negative, `NaN`, or `PositiveInfinity`/`NegativeInfinity` is rejected
@@ -158,7 +164,7 @@ type ResourceLimits
                 )
             )
 
-        ResourceLimits(memoryMax, maxProcesses, Some cores, uiRestrictions, cpuAffinity)
+        ResourceLimits(memoryMax, maxProcesses, Some cores, uiRestrictions, cpuAffinity, cpuTimeMax)
 
     /// A copy imposing the given Windows Job Object UI restrictions on the whole tree (see
     /// `WindowsUiRestrictions`). `WindowsUiRestrictions.None` clears them again — the set REPLACES the
@@ -181,7 +187,7 @@ type ResourceLimits
                 )
             )
 
-        ResourceLimits(memoryMax, maxProcesses, cpuQuota, restrictions, cpuAffinity)
+        ResourceLimits(memoryMax, maxProcesses, cpuQuota, restrictions, cpuAffinity, cpuTimeMax)
 
     /// A copy pinning the whole tree to `cores` — the CPU cores (zero-based logical processor indices)
     /// its processes may be scheduled on. The complement of `WithCpuQuota`: the quota bounds *how much*
@@ -240,14 +246,30 @@ type ResourceLimits
                 )
             )
 
-        ResourceLimits(memoryMax, maxProcesses, cpuQuota, uiRestrictions, Some(List.sort requested))
+        ResourceLimits(memoryMax, maxProcesses, cpuQuota, uiRestrictions, Some(List.sort requested), cpuTimeMax)
 
-    /// Whether any limit is set (so the group needs a limit-capable mechanism). UI restrictions count:
-    /// they too are applied through `SetInformationJobObject` and need the Job Object mechanism, so a
-    /// group asking only for them must still take the limit-capable path rather than skip the apply. So
-    /// does a CPU-affinity pin, for the same reason: only a Job Object or a cgroup v2 `cpuset` can hold
-    /// it, so a group asking only for it must not be handed the unpinned process-group fallback.
+    /// A copy limiting CPU time. `duration` must be finite and strictly positive. POSIX rounds the
+    /// soft `RLIMIT_CPU` up to whole seconds and gives the hard limit one additional second so the
+    /// process can observe `SIGXCPU`; Windows uses the Job Object's 100-nanosecond tick precision.
+    member _.WithCpuTimeMax(duration: TimeSpan) =
+        if duration <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof duration, duration, "CPU time must be positive and finite"))
+
+        ResourceLimits(memoryMax, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, Some duration)
+
+    /// Whether any limit is set. Windows uses this to decide whether the fresh Job needs a limit block.
+    /// POSIX dispatch uses `WholeTreeAny` below because CPU-time alone is enforceable without a container.
     member internal _.Any =
+        memoryMax.IsSome
+        || maxProcesses.IsSome
+        || cpuQuota.IsSome
+        || uiRestrictions <> WindowsUiRestrictions.None
+        || cpuAffinity.IsSome
+        || cpuTimeMax.IsSome
+
+    /// Whether a whole-tree container controller is needed. CPU-time alone is excluded because POSIX
+    /// can enforce it per child with `RLIMIT_CPU`, including on macOS and the Linux process-group fallback.
+    member internal _.WholeTreeAny =
         memoryMax.IsSome
         || maxProcesses.IsSome
         || cpuQuota.IsSome
@@ -271,13 +293,16 @@ type ResourceLimits
 /// Options applied when creating a `ProcessGroup`: the graceful-shutdown window and whole-tree
 /// resource limits.
 [<Sealed>]
-type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, limits: ResourceLimits) =
+type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, stopSignal: Signal, limits: ResourceLimits) =
 
-    /// The defaults: a 2-second shutdown grace, no limits.
-    new() = ProcessGroupOptions(Limits.DefaultStopGrace, ResourceLimits.None)
+    /// The defaults: a 2-second shutdown grace, `Signal.Term`, and no limits.
+    new() = ProcessGroupOptions(Limits.DefaultStopGrace, Signal.Term, ResourceLimits.None)
 
-    /// How long `ShutdownAsync` waits after SIGTERM before escalating to SIGKILL (Unix; default 2s).
+    /// How long `ShutdownAsync` waits after the configured `StopSignal` before escalating (default 2s).
     member _.ShutdownTimeout = shutdownTimeout
+
+    /// The soft signal sent by `ShutdownAsync` before hard-kill escalation (default `Signal.Term`).
+    member _.StopSignal = stopSignal
 
     /// The whole-tree resource caps applied at creation.
     member _.Limits = limits
@@ -286,37 +311,49 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, limits: ResourceLi
     /// (`ArgumentOutOfRangeException`); `TimeSpan.Zero` is valid (no grace — escalate immediately).
     member _.WithShutdownTimeout(timeout: TimeSpan) =
         ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero)
-        ProcessGroupOptions(timeout, limits)
+        ProcessGroupOptions(timeout, stopSignal, limits)
+
+    /// A copy using `signal` for graceful shutdown before escalation.
+    member _.WithStopSignal(signal: Signal) =
+        match signal with
+        | Signal.Kill -> raise (ArgumentException("Signal.Kill is not a graceful stop signal", nameof signal))
+        | Signal.Other number when number <= 0 ->
+            raise (ArgumentOutOfRangeException(nameof signal, signal, "a stop signal must be positive"))
+        | _ -> ProcessGroupOptions(shutdownTimeout, signal, limits)
 
     /// A copy capping the tree's total memory at `bytes`.
     member _.WithMemoryMax(bytes: int64) =
-        ProcessGroupOptions(shutdownTimeout, limits.WithMemoryMax bytes)
+        ProcessGroupOptions(shutdownTimeout, stopSignal, limits.WithMemoryMax bytes)
 
     /// A copy capping the number of live processes in the tree at `count`.
     member _.WithMaxProcesses(count: int) =
-        ProcessGroupOptions(shutdownTimeout, limits.WithMaxProcesses count)
+        ProcessGroupOptions(shutdownTimeout, stopSignal, limits.WithMaxProcesses count)
 
     /// A copy capping the tree's CPU at `cores` cores' worth.
     member _.WithCpuQuota(cores: float) =
-        ProcessGroupOptions(shutdownTimeout, limits.WithCpuQuota cores)
+        ProcessGroupOptions(shutdownTimeout, stopSignal, limits.WithCpuQuota cores)
+
+    /// A copy capping CPU time for each spawned run (or the whole Job on Windows).
+    member _.WithCpuTimeMax(duration: TimeSpan) =
+        ProcessGroupOptions(shutdownTimeout, stopSignal, limits.WithCpuTimeMax duration)
 
     /// A copy imposing the given Windows Job Object UI restrictions on the tree (clipboard, desktop,
     /// display/system settings, exit-Windows — see `WindowsUiRestrictions`). Windows-only: off Windows
     /// `ProcessGroup.Create` fails with `ProcessError.Unsupported` rather than silently running the
     /// tree unrestricted. See `ResourceLimits.WithUiRestrictions`.
     member _.WithUiRestrictions(restrictions: WindowsUiRestrictions) =
-        ProcessGroupOptions(shutdownTimeout, limits.WithUiRestrictions restrictions)
+        ProcessGroupOptions(shutdownTimeout, stopSignal, limits.WithUiRestrictions restrictions)
 
     /// A copy pinning the tree to `cores` — the CPU cores its processes may be scheduled on (the Windows
     /// Job Object affinity mask, the Linux cgroup v2 `cpuset.cpus`). Needs a limit-capable mechanism:
     /// elsewhere `ProcessGroup.Create` fails with `ProcessError.ResourceLimit` rather than silently
     /// running the tree on every core. See `ResourceLimits.WithCpuAffinity`.
     member _.WithCpuAffinity(cores: seq<int>) =
-        ProcessGroupOptions(shutdownTimeout, limits.WithCpuAffinity cores)
+        ProcessGroupOptions(shutdownTimeout, stopSignal, limits.WithCpuAffinity cores)
 
     /// A copy carrying a wholesale-replaced `ResourceLimits` set, keeping the shutdown window.
     /// Internal — used by `ProcessGroup.UpdateLimits` to refresh the `Options` snapshot a consumer
     /// reads back after a live limit update, so the whole limit set is swapped atomically rather than
     /// composed field-by-field.
     member internal _.WithLimits(newLimits: ResourceLimits) =
-        ProcessGroupOptions(shutdownTimeout, newLimits)
+        ProcessGroupOptions(shutdownTimeout, stopSignal, newLimits)

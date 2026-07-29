@@ -68,6 +68,7 @@ class ProcessKit.Command
   member StdoutTee(System.IO.Stream) : ProcessKit.Command
   member StdoutToFile(System.String) : ProcessKit.Command
   member StdoutToFile(System.String, System.Boolean) : ProcessKit.Command
+  member StopSignal(ProcessKit.Signal) : ProcessKit.Command
   member StreamBuffer(ProcessKit.StreamBufferPolicy) : ProcessKit.Command
   member TimeProvider(System.TimeProvider) : ProcessKit.Command
   member Timeout(System.TimeSpan) : ProcessKit.Command
@@ -130,6 +131,7 @@ module ProcessKit.CommandModule
   static member stdoutLineTerminator(ProcessKit.LineTerminator, ProcessKit.Command) : ProcessKit.Command
   static member stdoutTee(System.IO.Stream, ProcessKit.Command) : ProcessKit.Command
   static member stdoutToFile(System.String, System.Boolean, ProcessKit.Command) : ProcessKit.Command
+  static member stopSignal(ProcessKit.Signal, ProcessKit.Command) : ProcessKit.Command
   static member streamBuffer(ProcessKit.StreamBufferPolicy, ProcessKit.Command) : ProcessKit.Command
   static member timeProvider(System.TimeProvider, ProcessKit.Command) : ProcessKit.Command
   static member timeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
@@ -775,13 +777,16 @@ class ProcessKit.ProcessGroup
 class ProcessKit.ProcessGroupOptions
   member WithCpuAffinity(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.ProcessGroupOptions
   member WithCpuQuota(System.Double) : ProcessKit.ProcessGroupOptions
+  member WithCpuTimeMax(System.TimeSpan) : ProcessKit.ProcessGroupOptions
   member WithMaxProcesses(System.Int32) : ProcessKit.ProcessGroupOptions
   member WithMemoryMax(System.Int64) : ProcessKit.ProcessGroupOptions
   member WithShutdownTimeout(System.TimeSpan) : ProcessKit.ProcessGroupOptions
+  member WithStopSignal(ProcessKit.Signal) : ProcessKit.ProcessGroupOptions
   member WithUiRestrictions(ProcessKit.WindowsUiRestrictions) : ProcessKit.ProcessGroupOptions
   new()
   property Limits : ProcessKit.ResourceLimits { get }
   property ShutdownTimeout : System.TimeSpan { get }
+  property StopSignal : ProcessKit.Signal { get }
 
 class ProcessKit.ProcessGroupStats
   property ActiveProcessCount : System.Int32 { get }
@@ -934,11 +939,13 @@ class ProcessKit.PtySessionOptions
 class ProcessKit.ResourceLimits
   member WithCpuAffinity(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.ResourceLimits
   member WithCpuQuota(System.Double) : ProcessKit.ResourceLimits
+  member WithCpuTimeMax(System.TimeSpan) : ProcessKit.ResourceLimits
   member WithMaxProcesses(System.Int32) : ProcessKit.ResourceLimits
   member WithMemoryMax(System.Int64) : ProcessKit.ResourceLimits
   member WithUiRestrictions(ProcessKit.WindowsUiRestrictions) : ProcessKit.ResourceLimits
   property CpuAffinity : Microsoft.FSharp.Core.FSharpOption<System.Collections.Generic.IReadOnlyList<System.Int32>> { get }
   property CpuQuota : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
+  property CpuTimeMax : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
   property MaxProcesses : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property MemoryMax : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property None : ProcessKit.ResourceLimits { get }
@@ -1044,6 +1051,7 @@ class ProcessKit.RunningProcess
   member ProfileAsync() : System.Threading.Tasks.Task<ProcessKit.RunProfile>
   member ProfileAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.RunProfile>
   member ResizeAsync(System.Int32, System.Int32) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member Signal(ProcessKit.Signal) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member StdoutJsonLinesAsync<T>(System.Text.Json.JsonSerializerOptions) : System.Collections.Generic.IAsyncEnumerable<T>
   member StdoutJsonLinesAsync<T>(System.Text.Json.Serialization.Metadata.JsonTypeInfo<T>) : System.Collections.Generic.IAsyncEnumerable<T>
   member StdoutLinesAsync() : System.Collections.Generic.IAsyncEnumerable<System.String>

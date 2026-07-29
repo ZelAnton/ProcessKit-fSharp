@@ -325,6 +325,10 @@ How it behaves:
   budget, and storm guard apply. It is not a second, parallel restart mechanism. A single healthy
   attempt resets the run, so a brief blip that recovers does not restart the child. The first attempt
   runs one `LivenessInterval` after the child starts, a natural startup window.
+
+The soft phase is the supervised command's `Command.StopSignal` (default `Signal.Term`). The same
+setting is therefore honored by an explicit supervision-session `StopAsync`, a liveness restart, and
+the hosting extension's `StopAsync`; Windows refuses an unrepresentable custom signal at spawn.
 - **Each attempt is bounded.** One attempt gives the endpoint/predicate up to `LivenessTimeout` to
   prove healthy (reusing the same poll/deadline core as `RunningProcess.WaitForHttpAsync`); a
   `false` result, a network failure, a raised exception, or a hung probe all count as one failed

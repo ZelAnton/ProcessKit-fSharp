@@ -34,13 +34,15 @@ The selection at `ProcessGroup.Create` is deterministic per platform:
 - **Windows** always uses a **Job Object** (`Mechanism.JobObject`), with or without limits. When
   limits are requested they are applied to the job; if they cannot be applied, creation fails with
   `ProcessError.ResourceLimit`.
-- **Linux** uses a **cgroup v2** (`Mechanism.CgroupV2`) *only when resource limits are requested
+- **Linux** uses a **cgroup v2** (`Mechanism.CgroupV2`) *only when whole-tree resource limits are requested
   and cgroup v2 is mounted and usable at the real cgroup-v2 root*. Without limits, Linux uses the
   **POSIX process group** (`Mechanism.ProcessGroup`) — so an ordinary, limit-free group on Linux
-  reports `ProcessGroup`, not `CgroupV2`. If limits are requested but no usable cgroup exists,
+  reports `ProcessGroup`, not `CgroupV2`. A CPU-time-only group also uses `ProcessGroup` and applies
+  `RLIMIT_CPU` per spawned child. If whole-tree limits are requested but no usable cgroup exists,
   creation fails with `ProcessError.ResourceLimit` rather than running unbounded.
 - **macOS / BSD** always use a **POSIX process group** (`Mechanism.ProcessGroup`). They have no
-  whole-tree limit primitive, so requesting limits fails fast with `ProcessError.ResourceLimit`.
+  whole-tree limit primitive, so requesting one fails fast with `ProcessError.ResourceLimit`; a
+  CPU-time-only limit remains available per child.
 
 ### Reading the active mechanism
 
@@ -161,14 +163,14 @@ Legend: ✅ full support · 🟡 supported with a documented qualification · �
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
 |---|:---:|:---:|:---:|
 | Kill-on-dispose, whole tree | ✅ | ✅ | ✅ |
-| Graceful `ShutdownAsync` (TERM → grace → KILL) | 🟡 best-effort `WM_CLOSE` → grace → atomic kill | ✅ | ✅ |
+| Graceful `ShutdownAsync` (configured soft signal → grace → hard kill) | 🟡 best-effort `WM_CLOSE` → grace → atomic kill | ✅ | ✅ |
 
 `ShutdownAsync(grace)` on Windows has no per-job graceful signal, but a **windowed** child (Electron/GUI
 tool) closes gracefully on a best-effort `WM_CLOSE` posted to its top-level windows: the soft phase posts
 one to every member's windows, waits up to the grace window for the tree to drain, then unconditionally
 terminates the Job — so a child with no window (or one that vetoes the close) is still hard-killed exactly
-as before, and the kill-on-dispose guarantee is never weakened. On the Unix mechanisms it is `SIGTERM`,
-then a grace window, then `SIGKILL`.
+as before, and the kill-on-dispose guarantee is never weakened. On the Unix mechanisms it is the
+configured `ProcessGroupOptions.StopSignal` (default `Signal.Term`), then a grace window, then `SIGKILL`.
 
 **Adopting an external process (`Adopt`)**
 
@@ -293,13 +295,14 @@ live process count is available. Windows reads Job Object accounting; the cgroup
 | `WithMemoryMax` (whole tree) | ✅ | ✅ | ❌ `ProcessError.ResourceLimit` |
 | `WithMaxProcesses` | ✅ | ✅ | ❌ `ProcessError.ResourceLimit` |
 | `WithCpuQuota` | 🟡 approximate | ✅ | ❌ `ProcessError.ResourceLimit` |
+| `WithCpuTimeMax` | ✅ Job aggregate | ✅ per child `RLIMIT_CPU` | ✅ per child `RLIMIT_CPU` |
 | `WithCpuAffinity` (pin the tree to cores) | 🟡 `JOB_OBJECT_LIMIT_AFFINITY`, cores 0–63 only | ✅ `cpuset.cpus` (needs the `cpuset` controller) | ❌ `ProcessError.ResourceLimit` |
 | `WithUiRestrictions` (clipboard/desktop/exit-Windows) | ✅ `JOBOBJECT_BASIC_UI_RESTRICTIONS` | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` |
 
 `WithCpuQuota` is a fraction of a single core (`0.5` = half a core, `2.0` = two cores). On Windows
-it is converted against the host's CPU count and is approximate. Because limits need a real
-limit-capable container, the POSIX process-group mechanism cannot enforce any of them — requesting
-limits where none can apply fails at creation with `ProcessError.ResourceLimit` rather than
+it is converted against the host's CPU count and is approximate. Whole-tree limits need a real
+limit-capable container; the POSIX process-group mechanism supports only the per-child CPU-time
+rlimit. Any unsupported request fails at creation with `ProcessError.ResourceLimit` rather than
 returning a silently-unbounded group.
 
 `WithCpuAffinity` pins the tree to a set of zero-based core indices and carries two platform ceilings,
@@ -456,16 +459,15 @@ the whole tree is reaped with no opt-in (the Job Object's `KILL_ON_JOB_CLOSE` fi
 closes the dead parent's last Job handle during process rundown). On **macOS/BSD** there is no analog,
 so a request fails the spawn with `ProcessError.Unsupported` rather than pretending the cleanup happens.
 
-**Windows delivers only `Signal.Kill`.** Windows has no general signal abstraction. `Signal.Kill`
-maps to the Job Object terminate; every other `Signal` value (`Term`, `Int`, `Hup`, `Quit`,
-`Usr1`, `Usr2`, `Other n`) returns `ProcessError.Unsupported` on Windows. Portable code that needs
-a cooperative stop should drive the child another way (a known stdin command, a control file) and
-fall back to `ShutdownAsync` / `Signal.Kill` for the hard stop. On the Unix mechanisms the full set is
-delivered.
+**Windows has a narrow signal mapping.** `Signal.Kill` terminates the Job/run; `Signal.Int` and
+`Signal.Term` use best-effort CTRL+BREAK for opted-in console children and/or WM_CLOSE for windowed
+children. Other values return `ProcessError.Unsupported`. A custom `Command.StopSignal` is likewise
+refused at spawn on Windows instead of being silently replaced.
 
 **No whole-tree resource limits on macOS/BSD or the Linux process-group fallback.** Limits require
 a Windows Job Object or a Linux cgroup v2; the POSIX process-group mechanism has no primitive to
-cap a tree's memory, process count, or CPU. Requesting any limit there makes `ProcessGroup.Create`
+cap a tree's memory, process count, CPU quota, or affinity. `CpuTimeMax` is the exception: POSIX
+enforces it per spawned process through `RLIMIT_CPU`. Requesting any other limit there makes `ProcessGroup.Create`
 return `ProcessError.ResourceLimit` immediately — an unapplied cap is no protection, so the group
 is never created unbounded. See [Running in containers](containers.md#which-mechanism-you-actually-get-in-a-container)
 for what this means in practice inside Docker/Kubernetes.

@@ -108,17 +108,23 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         let withBackend (backend: IContainmentBackend) = Ok(new ProcessGroup(backend, options))
 
         if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
-            match Native.Windows.createWindowsJob () with
-            | Error error -> Error error
-            | Ok job ->
-                if limits.Any then
-                    match Native.Windows.applyWindowsJobLimits job limits with
-                    | Ok() -> withBackend (JobObjectBackend job)
-                    | Error message ->
-                        Native.Windows.closeWindowsHandle job
-                        Error(ProcessError.ResourceLimit message)
-                else
-                    withBackend (JobObjectBackend job)
+            if options.StopSignal <> Signal.Term then
+                Error(
+                    ProcessError.Unsupported
+                        $"ProcessGroupOptions.StopSignal({options.StopSignal}) on Windows; only the default Signal.Term contract maps to the existing WM_CLOSE/CTRL+BREAK graceful path"
+                )
+            else
+                match Native.Windows.createWindowsJob () with
+                | Error error -> Error error
+                | Ok job ->
+                    if limits.Any then
+                        match Native.Windows.applyWindowsJobLimits job limits with
+                        | Ok() -> withBackend (JobObjectBackend(job, limits))
+                        | Error message ->
+                            Native.Windows.closeWindowsHandle job
+                            Error(ProcessError.ResourceLimit message)
+                    else
+                        withBackend (JobObjectBackend(job, limits))
         else
             // Job Object UI restrictions are refused before any other off-Windows dispatch: unlike the
             // resource caps — which a cgroup v2 hierarchy CAN enforce, and whose absence is therefore a
@@ -128,17 +134,17 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             match limits.UiRestrictionsUnsupported with
             | Some error -> Error error
             | None ->
-                if RuntimeInformation.IsOSPlatform OSPlatform.Linux && limits.Any then
+                if RuntimeInformation.IsOSPlatform OSPlatform.Linux && limits.WholeTreeAny then
                     if Native.Cgroup.cgroupV2Available () then
                         match Native.Cgroup.createCgroup limits with
-                        | Ok path -> withBackend (CgroupBackend path)
+                        | Ok path -> withBackend (CgroupBackend(path, limits))
                         | Error message -> Error(ProcessError.ResourceLimit message)
                     else
                         Error(
                             ProcessError.ResourceLimit
                                 "cgroup v2 is not mounted; whole-tree resource limits need a Windows Job Object or Linux cgroup v2"
                         )
-                elif limits.Any then
+                elif limits.WholeTreeAny then
                     // macOS / BSD, or Linux without cgroup v2 — no whole-tree limit primitive.
                     Error(
                         ProcessError.ResourceLimit
@@ -146,7 +152,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     )
                 else
                     // No limits: the POSIX group forms when children are spawned (each becomes its own pgid).
-                    withBackend (ProcessGroupBackend())
+                    withBackend (ProcessGroupBackend limits)
 
     /// Test-only seam: wrap an arbitrary containment backend so the lifecycle guard (spawn / control /
     /// stat versus release) can be exercised against a synthetic backend, with no real OS handles.
@@ -266,10 +272,23 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                     if releasedFlag = 0 && not runTornDown then
                         nativeKill ())
 
+            let signalWhenLive (signal: Signal) : Result<unit, ProcessError> =
+                lock sync (fun () ->
+                    if releasedFlag = 0 && not runTornDown then
+                        if ownsGroup then
+                            // A private per-run group is this run's exact containment unit. Use the
+                            // backend's whole-container path (notably cgroup pidfd delivery) so the full
+                            // descendant tree receives the signal with the strongest identity guarantee.
+                            backend.Signal signal
+                        else
+                            backend.SignalChild(spawned, signal)
+                    else
+                        Error(ProcessError.Unsupported "the run has already been torn down"))
+
             // The graceful analogue for the owned tree kill (`StopAsync`/timeout-grace): begin the
             // bounded-by-grace graceful kill only on a live, not-torn-down run; otherwise a no-op. Its
-            // SIGTERM prefix runs under `sync` (safe against the release transition); the bounded
-            // poll+SIGKILL that follow run off the lock, exactly as `ShutdownAsync`'s own graceful wait is
+            // soft-signal prefix runs under `sync` (safe against the release transition); the bounded
+            // poll+hard-kill that follow run off the lock, exactly as `ShutdownAsync`'s own graceful wait is
             // deliberately kept off it.
             let gracefulKillWhenLive (nativeGracefulKill: unit -> Task) : Task =
                 lock sync (fun () ->
@@ -364,9 +383,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                      (fun () -> killWhenLive backend.KillTree)
                  else
                      (fun () -> killWhenLive (fun () -> backend.KillChild spawned)))
+              Signal = signalWhenLive
               GracefulKill =
                 (if ownsGroup then
-                     (fun grace -> gracefulKillWhenLive (fun () -> this.GracefulKillTree grace))
+                     (fun grace ->
+                         gracefulKillWhenLive (fun () -> this.GracefulKillTree(command.Config.StopSignal, grace)))
                  else
                      (fun _ ->
                          // Shared group: no per-child graceful signal, so this is the immediate child kill
@@ -739,19 +760,20 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             (fun () -> this.StartAsync(command, cancellationToken))
             consume
 
-    /// Gracefully kill the contained tree (SIGTERM, then SIGKILL after `grace`) WITHOUT releasing
-    /// the group — used by per-run timeouts (the run's own teardown releases the group). On Windows
-    /// there is no per-job graceful signal, so this is the atomic Job kill.
-    member internal _.GracefulKillTree(grace: TimeSpan) : Task = backend.GracefulKillTree grace
+    /// Gracefully kill the contained tree (the supplied soft signal, then a hard kill after `grace`)
+    /// WITHOUT releasing the group — used by per-run timeouts (the run's own teardown releases the group).
+    /// On Windows only the default soft-stop contract is representable.
+    member internal _.GracefulKillTree(signal: Signal, grace: TimeSpan) : Task = backend.GracefulKillTree signal grace
 
     // Deliberate divergence from ProcessKit-rs (`shutdown(escalate_to_kill = false)`): we do NOT offer a
-    // graceful shutdown that *keeps the group usable* by sparing the processes that ignore SIGTERM. That
+    // graceful shutdown that *keeps the group usable* by sparing processes that ignore the soft signal. That
     // mode makes kill-on-drop conditional (spared survivors outlive a drop), and this port keeps the
     // kill-on-drop tree guarantee UNCONDITIONAL. The four teardown needs are still covered without it:
     // immediate+terminal = `Dispose`; immediate+keep-usable = `KillAll`; graceful+terminal = `ShutdownAsync`.
 
-    /// Tear the group down gracefully, then release it. On Unix: SIGTERM, then SIGKILL if still
-    /// alive after `gracePeriod`. On Windows: an atomic Job kill. A negative `gracePeriod` is
+    /// Tear the group down gracefully, then release it. On Unix: the configured `Options.StopSignal`,
+    /// then SIGKILL if still alive after `gracePeriod`. On Windows: best-effort `WM_CLOSE`, then the
+    /// atomic Job kill. A negative `gracePeriod` is
     /// rejected with `ArgumentOutOfRangeException`; `TimeSpan.Zero` escalates immediately.
     /// Idempotent with `Dispose` in the sense that matters — the one-shot teardown (`hardRelease`)
     /// still runs exactly once no matter how many callers race `ShutdownAsync`/`Dispose`/`DisposeAsync`,
@@ -771,7 +793,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // the wait, so the one-shot teardown that follows runs exactly once.
             if claimRelease () then
                 try
-                    do! backend.GracefulKillTree gracePeriod
+                    do! backend.GracefulKillTree currentOptions.StopSignal gracePeriod
                 finally
                     // Guarantee `hardRelease`/`GC.SuppressFinalize` even if `GracefulKillTree` throws
                     // synchronously or its `Task` faults — mirroring how `RunTelemetryScope.Conclude`

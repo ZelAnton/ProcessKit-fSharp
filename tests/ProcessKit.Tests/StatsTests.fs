@@ -49,6 +49,7 @@ type StatsTests() =
           StdinError = fun () -> None
           StdinFeedComplete = ignore
           StartKill = ignore
+          Signal = fun _ -> Ok()
           GracefulKill = fun _ -> Task.CompletedTask
           ResizePty = None
           TreeStats = None

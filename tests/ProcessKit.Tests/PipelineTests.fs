@@ -965,6 +965,17 @@ type PipelineTests() =
         |> ignore
 
     [<Test>]
+    member _.``stage zero owns a pipeline custom StopSignal and later stages cannot override it``() =
+        // A pipeline has one containment group and therefore one soft-signal broadcast. Stage 0 owns
+        // that pipeline-wide setting, like its logger; accepting a later override would silently ignore it.
+        (emit [ "x" ] |> Command.stopSignal Signal.Usr1).Pipe(sortStage) |> ignore
+
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> (emit [ "x" ]).Pipe(sortStage |> Command.stopSignal Signal.Usr1) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
     member _.``a pipeline rejects per-stage stdout destinations it would otherwise replace``() =
         let withFile command =
             command |> Command.stdoutToFile "pipeline-output.txt" false

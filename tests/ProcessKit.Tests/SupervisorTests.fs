@@ -114,6 +114,7 @@ module private SessionTestHelpers =
               StdinError = fun () -> None
               StdinFeedComplete = ignore
               StartKill = startKill
+              Signal = fun _ -> Ok()
               GracefulKill = graceful
               ResizePty = None
               TreeStats = None

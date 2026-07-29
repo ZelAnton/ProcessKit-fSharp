@@ -44,7 +44,8 @@ type internal LimitContractBackend(initial: ResourceLimits, shouldFail: Resource
         member _.PidOf(_spawned) = None
         member _.KillChild(_spawned) = ()
         member _.KillTree() = ()
-        member _.GracefulKillTree(_grace) = Task.CompletedTask
+        member _.GracefulKillTree (_signal) (_grace) = Task.CompletedTask
+        member _.SignalChild(_spawned, _signal) = Ok()
         member _.Members() = Ok []
         member _.Signal(_signal) = Ok()
         member _.Suspend() = Ok()
@@ -168,11 +169,18 @@ type LimitsTests() =
     [<Test>]
     member _.``ProcessGroupOptions builders set the limits``() =
         let options =
-            ProcessGroupOptions().WithMemoryMax(256L * 1024L * 1024L).WithMaxProcesses(50).WithCpuQuota(1.5)
+            ProcessGroupOptions()
+                .WithMemoryMax(256L * 1024L * 1024L)
+                .WithMaxProcesses(50)
+                .WithCpuQuota(1.5)
+                .WithCpuTimeMax(TimeSpan.FromSeconds 3.0)
+                .WithStopSignal(Signal.Int)
 
         Assert.That(options.Limits.MemoryMax, Is.EqualTo(Some(256L * 1024L * 1024L)))
         Assert.That(options.Limits.MaxProcesses, Is.EqualTo(Some 50))
         Assert.That(options.Limits.CpuQuota, Is.EqualTo(Some 1.5))
+        Assert.That(options.Limits.CpuTimeMax, Is.EqualTo(Some(TimeSpan.FromSeconds 3.0)))
+        Assert.That(options.StopSignal, Is.EqualTo Signal.Int)
         Assert.That(ResourceLimits.None.Any, Is.False)
 
     [<Test>]
@@ -199,6 +207,156 @@ type LimitsTests() =
             Action(fun () -> ResourceLimits.None.WithCpuQuota Double.NaN |> ignore)
         )
         |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithCpuTimeMax TimeSpan.Zero |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithCpuTimeMax(TimeSpan.FromTicks -1L) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``CPU-time alone does not require a whole-tree container``() =
+        let limits = ResourceLimits.None.WithCpuTimeMax(TimeSpan.FromSeconds 1.0)
+        Assert.That(limits.Any, Is.True)
+        Assert.That(limits.WholeTreeAny, Is.False)
+
+    [<Test>]
+    member _.``Windows live updates preserve an unchanged cumulative CPU-time deadline``() =
+        if not isWindows then
+            Assert.Ignore "Windows Job-time preservation contract."
+
+        match Native.Windows.createWindowsJob () with
+        | Error error -> Assert.Fail $"could not create a Job Object: {error}"
+        | Ok job ->
+            let initial = ResourceLimits.None.WithCpuTimeMax(TimeSpan.FromSeconds 5.0)
+
+            match Native.Windows.applyWindowsJobLimits job initial with
+            | Error message ->
+                Native.Windows.closeWindowsHandle job
+                Assert.Fail $"could not establish the Job CPU-time limit: {message}"
+            | Ok() ->
+                let backend = JobObjectBackend(job, initial) :> IContainmentBackend
+                let originalDeadline = Native.Windows.queryWindowsJobCpuTimeLimit job
+
+                try
+                    let updated = initial.WithMemoryMax(256L * 1024L * 1024L)
+
+                    match backend.UpdateLimits updated with
+                    | Error error -> Assert.Fail $"unrelated live limit update failed: {error}"
+                    | Ok() ->
+                        Assert.That(
+                            Native.Windows.queryWindowsJobCpuTimeLimit job,
+                            Is.EqualTo originalDeadline,
+                            "an unrelated update granted the Job a fresh CPU-time budget"
+                        )
+                finally
+                    backend.HardRelease()
+
+    [<Test>]
+    member _.``Windows refuses a custom group stop signal instead of silently replacing it``() =
+        if not isWindows then
+            Assert.Ignore "Windows-specific representability contract."
+
+        match ProcessGroup.Create(ProcessGroupOptions().WithStopSignal Signal.Int) with
+        | Error(ProcessError.Unsupported _) -> ()
+        | Error error -> Assert.Fail $"expected Unsupported, got {error}"
+        | Ok group ->
+            (group :> IDisposable).Dispose()
+            Assert.Fail "a custom Windows group stop signal was silently accepted"
+
+    [<Test>]
+    member _.``CPU-time limit terminates a CPU-bound run``() : Task =
+        task {
+            let options = ProcessGroupOptions().WithCpuTimeMax(TimeSpan.FromMilliseconds 500.0)
+
+            match ProcessGroup.Create options with
+            | Error error -> Assert.Fail $"CPU-time limited group creation failed: {error}"
+            | Ok group ->
+                use group = group
+
+                let busy =
+                    if isWindows then
+                        Command.create "powershell.exe"
+                        |> Command.args [ "-NoLogo"; "-NoProfile"; "-NonInteractive"; "-Command"; "while ($true) { }" ]
+                    else
+                        Command.create "/bin/sh" |> Command.args [ "-c"; "while :; do :; done" ]
+
+                match! group.StartAsync busy with
+                | Error error -> Assert.Fail $"CPU-bound child failed to start: {error}"
+                | Ok running ->
+                    use running = running
+                    let completion = running.ExitTask
+                    let! winner = Task.WhenAny(completion :> Task, Task.Delay(TimeSpan.FromSeconds 15.0))
+
+                    if not (Object.ReferenceEquals(winner, completion)) then
+                        Assert.Fail "CPU-time limit did not terminate the CPU-bound child within 15 seconds"
+
+                    let! outcome = completion
+
+                    if isWindows then
+                        match outcome with
+                        | Outcome.Exited 0 -> Assert.Fail "CPU-bound child exited cleanly despite the CPU-time limit"
+                        | _ -> ()
+                    else
+                        match outcome with
+                        | Outcome.Signalled(Some _) -> ()
+                        | other -> Assert.Fail $"expected POSIX RLIMIT_CPU to surface a signal outcome, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``POSIX CPU-time wrapper preserves NotFound and PreferLocal resolution``() : Task =
+        if isWindows then
+            Assert.Ignore "POSIX-specific spawn-resolution contract."
+
+        task {
+            let options = ProcessGroupOptions().WithCpuTimeMax(TimeSpan.FromSeconds 2.0)
+
+            match ProcessGroup.Create options with
+            | Error error -> Assert.Fail $"CPU-time limited group creation failed: {error}"
+            | Ok group ->
+                use group = group
+
+                match! group.StartAsync(Command.create "processkit-cpu-limit-missing-program") with
+                | Error(ProcessError.NotFound _) -> ()
+                | Error error -> Assert.Fail $"expected typed NotFound before the shell wrapper, got {error}"
+                | Ok running ->
+                    use _running = running
+                    Assert.Fail "a missing CPU-limited target unexpectedly spawned"
+
+                let root =
+                    Path.Combine(Path.GetTempPath(), $"processkit-cpu-prefer-{Guid.NewGuid():N}")
+
+                Directory.CreateDirectory root |> ignore
+
+                try
+                    let program = "processkit-cpu-prefer-local"
+                    let executable = Path.Combine(root, program)
+                    File.WriteAllText(executable, "#!/bin/sh\nprintf local")
+
+                    File.SetUnixFileMode(
+                        executable,
+                        UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute
+                    )
+
+                    let command = Command.create program |> Command.preferLocal root |> Command.envClear
+
+                    match! group.StartAsync command with
+                    | Error error -> Assert.Fail $"PreferLocal CPU-limited child failed to start: {error}"
+                    | Ok running ->
+                        use running = running
+
+                        match! running.OutputStringAsync() with
+                        | Error error -> Assert.Fail $"PreferLocal CPU-limited child failed: {error}"
+                        | Ok result -> Assert.That(result.Stdout, Is.EqualTo "local")
+                finally
+                    Directory.Delete(root, true)
+        }
+        :> Task
 
     [<Test>]
     member _.``ResourceLimits.WithCpuQuota rejects infinities and a value that would overflow the cgroup quota``() =
@@ -241,6 +399,16 @@ type LimitsTests() =
 
         Assert.Throws<ArgumentOutOfRangeException>(
             Action(fun () -> ProcessGroupOptions().WithShutdownTimeout(TimeSpan.FromSeconds -1.0) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``ProcessGroupOptions.WithStopSignal rejects hard kill and non-deliverable raw numbers``() =
+        Assert.Throws<ArgumentException>(Action(fun () -> ProcessGroupOptions().WithStopSignal Signal.Kill |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ProcessGroupOptions().WithStopSignal(Signal.Other 0) |> ignore)
         )
         |> ignore
 

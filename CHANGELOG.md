@@ -10,9 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - The Pages navigation now links to the ProcessKit CLI Runner immediately after the Rust implementation.
 - HTTP readiness and liveness probes now accept caller-owned `HttpClient` instances for custom headers, TLS validation, proxies, and transports without transferring ownership.
+- `RunningProcess.Signal` delivers a signal to one run's own contained tree, with matching signal recording in `FakeProcess`.
+- `Command.StopSignal` and `ProcessGroupOptions.WithStopSignal` select the soft signal used before graceful-stop escalation.
+- `ResourceLimits.WithCpuTimeMax` and `ProcessGroupOptions.WithCpuTimeMax` cap CPU time through Windows Job Objects or POSIX `RLIMIT_CPU`.
 
 ### Changed
--
+- `StopAsync`, pipeline sessions, supervisors, hosted processes, timeout grace, and group shutdown now honor the configured soft-stop signal.
 
 ### Fixed
 - HTTP readiness and liveness probes now reject relative URIs immediately instead of surfacing raw transport errors or restarting healthy children.

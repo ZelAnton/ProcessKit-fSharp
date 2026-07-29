@@ -6,9 +6,8 @@ open System.Collections.Generic
 open System.Diagnostics
 open System.Threading.Tasks
 
-/// Shared graceful-teardown shape for the backends that support one (cgroup, POSIX process group):
-/// request termination (SIGTERM), poll until the tree is dead or `grace` elapses, then force-kill
-/// whatever remains.
+/// Shared graceful-teardown shape for all containment backends: request the platform/configured soft
+/// stop, poll until the tree is dead or `grace` elapses, then force-kill whatever remains.
 module private GracefulTeardown =
 
     let poll (terminate: unit -> unit) (alive: unit -> bool) (forceKill: unit -> unit) (grace: TimeSpan) : Task =
@@ -122,8 +121,11 @@ type internal IContainmentBackend =
     /// Hard-kill the whole contained tree now (no grace) without releasing the container.
     abstract KillTree: unit -> unit
 
-    /// Gracefully kill the tree (SIGTERM → grace → SIGKILL) without releasing the container.
-    abstract GracefulKillTree: TimeSpan -> Task
+    /// Gracefully kill the tree (configured soft signal → grace → hard kill) without releasing it.
+    abstract GracefulKillTree: Signal -> TimeSpan -> Task
+
+    /// Deliver a signal to one tracked child's own containment unit.
+    abstract SignalChild: Native.Common.Spawned * Signal -> Result<unit, ProcessError>
 
     /// The pids currently in the group — a point-in-time snapshot.
     abstract Members: unit -> Result<int list, ProcessError>
@@ -161,8 +163,9 @@ type internal IContainmentBackend =
 
 /// Windows Job Object backend. Closing the job handle triggers `KILL_ON_JOB_CLOSE`; the tracked
 /// process handles (closed on reap or teardown) are only for waiting.
-type internal JobObjectBackend(jobHandle: nativeint) =
+type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimits) =
     let children = TrackedChildren<nativeint>()
+    let mutable currentLimits = initialLimits
 
     // Children spawned with `Command.WindowsCtrlSignals()` (CREATE_NEW_PROCESS_GROUP), mapped by their
     // process HANDLE to their console process-group id (= pid), so `Signal.Int`/`Signal.Term` can
@@ -177,6 +180,8 @@ type internal JobObjectBackend(jobHandle: nativeint) =
     // CTRL+BREAK land on a recycled pid (the wrong-target class T-084 closed for POSIX kill / T-162 for the
     // Windows Job handle).
     let ctrlGroups = ConcurrentDictionary<nativeint, int>()
+
+    new(jobHandle: nativeint) = JobObjectBackend(jobHandle, ResourceLimits.None)
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.JobObject
@@ -225,7 +230,7 @@ type internal JobObjectBackend(jobHandle: nativeint) =
         member _.KillTree() =
             Native.Windows.terminateWindowsJob jobHandle
 
-        member _.GracefulKillTree(grace) =
+        member _.GracefulKillTree (_signal) (grace) =
             // A best-effort SOFT phase before the atomic Job kill. Windows has no per-job graceful
             // signal, but a WINDOWED child (Electron/GUI) closes gracefully on a `WM_CLOSE` posted to
             // its top-level windows — so post one to every member's windows, poll up to `grace` for the
@@ -268,6 +273,32 @@ type internal JobObjectBackend(jobHandle: nativeint) =
                         Native.Windows.closeWindowsHandle ownedJob
                 }
                 :> Task
+
+        member _.SignalChild(spawned, signal) =
+            match signal with
+            | Signal.Kill ->
+                Native.Windows.terminateWindowsProcess spawned.Handle
+                Ok()
+            | Signal.Int
+            | Signal.Term ->
+                let ctrlDelivered =
+                    match ctrlGroups.TryGetValue spawned.Handle with
+                    | true, groupId -> Native.Windows.sendConsoleCtrlBreakWindows groupId |> Result.isOk
+                    | false, _ -> false
+
+                let windowsClosed =
+                    match Native.Windows.processIdWindows spawned.Handle with
+                    | Some pid -> Native.Windows.postCloseToProcessWindows pid
+                    | None -> 0
+
+                if ctrlDelivered || windowsClosed > 0 then
+                    Ok()
+                else
+                    Error(
+                        ProcessError.Unsupported
+                            $"{signal} on this Windows run needs Command.WindowsCtrlSignals() with a shared console or a top-level window that can receive WM_CLOSE"
+                    )
+            | _ -> Error(ProcessError.Unsupported $"signal {signal} has no Windows per-run mapping")
 
         member _.Members() =
             // `membersWindows` already returns a `Result` — it grows the buffer to the whole job and
@@ -357,8 +388,16 @@ type internal JobObjectBackend(jobHandle: nativeint) =
             // OFF-lock graceful poll (K-025/T-162). `applyWindowsJobLimits` best-effort restores the prior
             // extended-limit block if the CPU-rate write fails after it, so a genuine apply failure is an
             // honest `ProcessError.ResourceLimit` AND the live Job is back on the previous set (T-207).
-            match Native.Windows.applyWindowsJobLimits jobHandle limits with
-            | Ok() -> Ok()
+            let result =
+                if currentLimits.CpuTimeMax.IsSome && limits.CpuTimeMax = currentLimits.CpuTimeMax then
+                    Native.Windows.applyWindowsJobLimitsPreservingCpuTime jobHandle limits
+                else
+                    Native.Windows.applyWindowsJobLimits jobHandle limits
+
+            match result with
+            | Ok() ->
+                currentLimits <- limits
+                Ok()
             | Error message -> Error(ProcessError.ResourceLimit message)
 
         member _.HardRelease() =
@@ -371,8 +410,9 @@ type internal JobObjectBackend(jobHandle: nativeint) =
 
 /// Linux cgroup v2 backend (the `limits` mechanism). Membership lives in `cgroup.procs`; the tree is
 /// reaped with `cgroup.kill` and the directory removed.
-type internal CgroupBackend(cgroupPath: string) =
+type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
     let children = TrackedChildren<int>()
+    let mutable currentLimits = initialLimits
 
     // The start-time identity token captured for each tracked leader pid at `Track` (see
     // `ProcessGroupBackend`), kept in a parallel dictionary keyed alongside `children`. The cgroup's own
@@ -404,6 +444,8 @@ type internal CgroupBackend(cgroupPath: string) =
 
         Native.Posix.processGroupStillTracked pid captured
 
+    new(cgroupPath: string) = CgroupBackend(cgroupPath, ResourceLimits.None)
+
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.CgroupV2
 
@@ -414,7 +456,14 @@ type internal CgroupBackend(cgroupPath: string) =
             // spawn->migrate window where a descendant forked in that first instant could escape the
             // limits. See `Native.Posix.spawnPosixIntoCgroup`. `Spawned.Handle` is the launcher pid,
             // which becomes the target's pid unchanged across `exec`.
-            Native.Posix.spawnPosixIntoCgroup command (System.IO.Path.Combine(cgroupPath, "cgroup.procs"))
+            let effective =
+                match currentLimits.CpuTimeMax with
+                | Some duration -> Native.Posix.withCpuTimeLimit duration command
+                | None -> Ok command
+
+            effective
+            |> Result.bind (fun wrapped ->
+                Native.Posix.spawnPosixIntoCgroup wrapped (System.IO.Path.Combine(cgroupPath, "cgroup.procs")))
 
         member _.Track(spawned) =
             let pid = int spawned.Handle
@@ -489,12 +538,30 @@ type internal CgroupBackend(cgroupPath: string) =
 
         member _.KillTree() = Native.Cgroup.killCgroup cgroupPath
 
-        member _.GracefulKillTree(grace) =
+        member _.GracefulKillTree (signal) (grace) =
+            let signalNum = Native.Posix.signalNumber signal
+
             GracefulTeardown.poll
-                (fun () -> Native.Cgroup.terminateCgroup cgroupPath)
+                (fun () -> Native.Cgroup.signalCgroup cgroupPath signalNum |> ignore)
                 (fun () -> Native.Cgroup.cgroupAlive cgroupPath)
                 (fun () -> Native.Cgroup.killCgroup cgroupPath)
                 grace
+
+        member _.SignalChild(spawned, signal) =
+            let pid = int spawned.Handle
+            let signalNum = Native.Posix.signalNumber signal
+
+            match Native.Posix.ensureDeliverable signalNum with
+            | Error error -> Error error
+            | Ok() when not (stillOurs pid) -> Ok()
+            | Ok() ->
+                match Native.Posix.signalProcessGroup pid signalNum with
+                | Native.Common.SignalDelivery.Delivered
+                | Native.Common.SignalDelivery.TargetGone -> Ok()
+                | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
+                    Error(
+                        ProcessError.Io $"failed to deliver signal {signalNum} to this run: {message} (errno {errno})"
+                    )
 
         member _.Members() =
             // `cgroupMembers` already distinguishes "read, and it's empty" from "the read failed" — surface
@@ -571,12 +638,20 @@ type internal CgroupBackend(cgroupPath: string) =
             // is refused up front with the same `Unsupported` `ProcessGroup.Create` gives here — the caps
             // in force are left exactly as they were, rather than a partial apply that silently dropped
             // the restriction half of the requested set.
-            match limits.UiRestrictionsUnsupported with
-            | Some error -> Error error
-            | None ->
-                match Native.Cgroup.updateCgroupLimits cgroupPath limits with
-                | Ok() -> Ok()
-                | Error message -> Error(ProcessError.ResourceLimit message)
+            if limits.CpuTimeMax <> currentLimits.CpuTimeMax then
+                Error(
+                    ProcessError.ResourceLimit
+                        "CPU-time is a per-child POSIX rlimit and cannot be changed for processes already running in this cgroup; create a new group for a different CpuTimeMax"
+                )
+            else
+                match limits.UiRestrictionsUnsupported with
+                | Some error -> Error error
+                | None ->
+                    match Native.Cgroup.updateCgroupLimits cgroupPath limits with
+                    | Ok() ->
+                        currentLimits <- limits
+                        Ok()
+                    | Error message -> Error(ProcessError.ResourceLimit message)
 
         member _.HardRelease() =
             Native.Cgroup.killCgroup cgroupPath
@@ -597,7 +672,7 @@ type internal CgroupBackend(cgroupPath: string) =
 
 /// POSIX process-group backend (macOS/BSD, or Linux without cgroup delegation). Every `posix_spawn`
 /// forms its own pgid, so a multi-child group holds several; `killpg` is the teardown.
-type internal ProcessGroupBackend() =
+type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
     let children = TrackedChildren<int>()
 
     // The start-time identity token captured for each tracked pgid at `Track`, kept in a parallel
@@ -653,9 +728,17 @@ type internal ProcessGroupBackend() =
         | None -> Ok()
         | Some(errno, message) -> Error(ProcessError.Io(describeFailure errno message))
 
+    new() = ProcessGroupBackend(ResourceLimits.None)
+
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.ProcessGroup
-        member _.Spawn(command) = Native.Posix.spawnPosix command
+
+        member _.Spawn(command) =
+            match initialLimits.CpuTimeMax with
+            | Some duration ->
+                Native.Posix.withCpuTimeLimit duration command
+                |> Result.bind Native.Posix.spawnPosix
+            | None -> Native.Posix.spawnPosix command
 
         member _.Track(spawned) =
             // Each posix_spawn already formed its own process group (pgid = child pid), so the child is
@@ -713,7 +796,7 @@ type internal ProcessGroupBackend() =
                 else
                     untrack pgid |> ignore
 
-        member _.GracefulKillTree(grace) =
+        member _.GracefulKillTree (signal) (grace) =
             // Snapshot the pgids and their identity tokens together. The poll runs off the lifecycle lock,
             // so concurrent HardRelease may remove live entries from `identities`; all three poll phases
             // must keep using the token captured while this graceful shutdown owned the pgid snapshot.
@@ -739,13 +822,30 @@ type internal ProcessGroupBackend() =
                 (fun () ->
                     for pgid in pgids do
                         if stillOursSnap pgid then
-                            Native.Posix.terminateProcessGroup pgid)
+                            Native.Posix.signalProcessGroup pgid (Native.Posix.signalNumber signal)
+                            |> ignore)
                 anyChildAliveSnap
                 (fun () ->
                     for pgid in pgids do
                         if stillOursSnap pgid then
                             Native.Posix.killProcessGroup pgid)
                 grace
+
+        member _.SignalChild(spawned, signal) =
+            let pgid = int spawned.Handle
+            let signalNum = Native.Posix.signalNumber signal
+
+            match Native.Posix.ensureDeliverable signalNum with
+            | Error error -> Error error
+            | Ok() when not (stillOurs pgid) -> Ok()
+            | Ok() ->
+                match Native.Posix.signalProcessGroup pgid signalNum with
+                | Native.Common.SignalDelivery.Delivered
+                | Native.Common.SignalDelivery.TargetGone -> Ok()
+                | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
+                    Error(
+                        ProcessError.Io $"failed to deliver signal {signalNum} to this run: {message} (errno {errno})"
+                    )
 
         member _.Members() =
             // Report only the pgids still ours and alive (choke-gated): a drained or recycled pgid is not
@@ -785,13 +885,21 @@ type internal ProcessGroupBackend() =
             // Object UI restriction is refused with `Unsupported` rather than `ResourceLimit`, matching
             // `Create`: a resource cap exists as a concept here and merely cannot be enforced, while a
             // clipboard/desktop restriction has no POSIX counterpart at all.
-            match limits.UiRestrictionsUnsupported with
-            | Some error -> Error error
-            | None ->
+            if limits.CpuTimeMax <> initialLimits.CpuTimeMax then
                 Error(
                     ProcessError.ResourceLimit
-                        "the POSIX process-group mechanism has no whole-tree resource-limit primitive to update (needs a Windows Job Object or Linux cgroup v2)"
+                        "CPU-time is applied with RLIMIT_CPU before each child exec and cannot be changed for processes already running; create a new group for a different CpuTimeMax"
                 )
+            elif not limits.WholeTreeAny then
+                Ok()
+            else
+                match limits.UiRestrictionsUnsupported with
+                | Some error -> Error error
+                | None ->
+                    Error(
+                        ProcessError.ResourceLimit
+                            "the POSIX process-group mechanism has no whole-tree resource-limit primitive to update (needs a Windows Job Object or Linux cgroup v2)"
+                    )
 
         member _.HardRelease() =
             // Each pgid's leader is a child we posix_spawned, so we must waitpid it ourselves — `killpg`

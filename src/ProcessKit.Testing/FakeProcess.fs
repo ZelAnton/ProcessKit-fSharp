@@ -37,6 +37,17 @@ type internal FakeStdinRecorder() =
     /// A snapshot of all bytes written so far, including after the stream has been disposed.
     member _.Bytes = stream.ToArray()
 
+[<Sealed>]
+type internal FakeSignalRecorder() =
+    let gate = obj ()
+    let signals = ResizeArray<Signal>()
+
+    member _.Record(signal: Signal) =
+        lock gate (fun () -> signals.Add signal)
+
+    member _.Snapshot =
+        lock gate (fun () -> signals.ToArray() :> Collections.Generic.IReadOnlyList<Signal>)
+
 /// Builds an in-memory `RunningProcess` for unit-testing code that consumes a live handle —
 /// `StdoutLinesAsync` / `OutputEventsAsync` / `FinishAsync` / the readiness probes / the buffered verbs — without
 /// spawning a real process. Immutable and fluent; `Build()` returns a real `RunningProcess` whose
@@ -58,13 +69,24 @@ type FakeProcess
         outcome: Outcome,
         pid: int option,
         pty: PtyResizeRecorder option,
-        stdin: FakeStdinRecorder
+        stdin: FakeStdinRecorder,
+        signals: FakeSignalRecorder
     ) =
 
     /// A fake of `program` that exits 0 with no output.
     static member Create(program: string) =
         ArgumentNullException.ThrowIfNull(program, nameof program)
-        FakeProcess(Command.create program, "", "", Outcome.Exited 0, None, None, FakeStdinRecorder())
+
+        FakeProcess(
+            Command.create program,
+            "",
+            "",
+            Outcome.Exited 0,
+            None,
+            None,
+            FakeStdinRecorder(),
+            FakeSignalRecorder()
+        )
 
     /// A fake (named `"fake"`) that exits 0 with no output.
     static member Create() = FakeProcess.Create "fake"
@@ -73,37 +95,37 @@ type FakeProcess
     /// buffer, line handlers — so it behaves like a real run of that command. Internal: `ScriptedRunner`
     /// uses it so `SpawnAsync` and the capture verbs agree on success/encoding semantics.
     static member internal OfCommand(command: Command) =
-        FakeProcess(command, "", "", Outcome.Exited 0, None, None, FakeStdinRecorder())
+        FakeProcess(command, "", "", Outcome.Exited 0, None, None, FakeStdinRecorder(), FakeSignalRecorder())
 
     /// The captured stdout the fake replays (split on `\n` into lines for the streaming verbs).
     member _.WithStdout(text: string) =
         ArgumentNullException.ThrowIfNull(text, nameof text)
-        FakeProcess(template, text, stderr, outcome, pid, pty, stdin)
+        FakeProcess(template, text, stderr, outcome, pid, pty, stdin, signals)
 
     /// The captured stdout as a sequence of lines (joined with `\n`).
     member _.WithStdoutLines(lines: seq<string>) =
         ArgumentNullException.ThrowIfNull(lines, nameof lines)
-        FakeProcess(template, String.Join('\n', lines), stderr, outcome, pid, pty, stdin)
+        FakeProcess(template, String.Join('\n', lines), stderr, outcome, pid, pty, stdin, signals)
 
     /// The captured stderr. On a PTY fake (see `WithPty`) or a `Command.MergeStderr()` fake there is no
     /// separate stderr stream: this text is folded into the single merged stdout stream rather than
     /// surfaced as `OutputEvent.Stderr`.
     member _.WithStderr(text: string) =
         ArgumentNullException.ThrowIfNull(text, nameof text)
-        FakeProcess(template, stdout, text, outcome, pid, pty, stdin)
+        FakeProcess(template, stdout, text, outcome, pid, pty, stdin, signals)
 
     /// Make the fake exit with `code`.
     member _.WithExit(code: int) =
-        FakeProcess(template, stdout, stderr, Outcome.Exited code, pid, pty, stdin)
+        FakeProcess(template, stdout, stderr, Outcome.Exited code, pid, pty, stdin, signals)
 
     /// Make the fake conclude with an explicit `Outcome` (e.g. `Outcome.TimedOut` or `Signalled`).
     member _.WithOutcome(value: Outcome) =
         ArgumentNullException.ThrowIfNull(value, nameof value)
-        FakeProcess(template, stdout, stderr, value, pid, pty, stdin)
+        FakeProcess(template, stdout, stderr, value, pid, pty, stdin, signals)
 
     /// Set the pid the handle reports.
     member _.WithPid(value: int) =
-        FakeProcess(template, stdout, stderr, outcome, Some value, pty, stdin)
+        FakeProcess(template, stdout, stderr, outcome, Some value, pty, stdin, signals)
 
     /// Model a pseudo-terminal (`Command.Pty`) run, so the built handle mirrors the observable
     /// merged-stream contract (ADR D3/D10):
@@ -133,7 +155,7 @@ type FakeProcess
     /// not reproducible here — only the *observable merged-stream shape* is. Test that child-tty
     /// behaviour against a real `Command.Pty` run. See `docs/testing.md`.
     member _.WithPty() =
-        FakeProcess(template, stdout, stderr, outcome, pid, Some(PtyResizeRecorder()), stdin)
+        FakeProcess(template, stdout, stderr, outcome, pid, Some(PtyResizeRecorder()), stdin, signals)
 
     /// Keep the built handle's stdin open, exactly as `Command.KeepStdinOpen()` does on a real run, so
     /// `TakeStdin()` hands back a writable pipe — and so a `PtySession` built over this fake can
@@ -143,7 +165,7 @@ type FakeProcess
     /// `Command` (through `ScriptedRunner`) already inherits that command's `KeepStdinOpen`. Applying
     /// it twice is harmless.
     member _.WithStdinOpen() =
-        FakeProcess(template.KeepStdinOpen(), stdout, stderr, outcome, pid, pty, stdin)
+        FakeProcess(template.KeepStdinOpen(), stdout, stderr, outcome, pid, pty, stdin, signals)
 
     /// The last `(cols, rows)` requested via `ResizeAsync` on this fake's built PTY handle, or `None`
     /// if this is not a PTY fake (see `WithPty`) or no resize has been requested. Shared across the
@@ -158,6 +180,9 @@ type FakeProcess
     /// The recorder is shared across this fake's fluent chain and remains readable after `FinishAsync` or
     /// process teardown closes the in-memory stream.
     member _.StdinBytes: byte[] = stdin.Bytes
+
+    /// Signals delivered through built handles, in call order.
+    member _.Signals = signals.Snapshot
 
     /// Build a real `RunningProcess` over in-memory streams.
     member _.Build() : RunningProcess =
@@ -221,7 +246,14 @@ type FakeProcess
               StdinError = fun () -> None
               StdinFeedComplete = ignore
               StartKill = fun () -> ()
-              GracefulKill = fun _ -> Task.CompletedTask
+              Signal =
+                fun signal ->
+                    signals.Record signal
+                    Ok()
+              GracefulKill =
+                fun _ ->
+                    signals.Record config.StopSignal
+                    Task.CompletedTask
               // A PTY fake models `ResizeAsync` as a RECORDED no-op success (D10): it has no real pty, so
               // there is nothing to resize, but the verb succeeds (`Ok ()`, not the typed `Unsupported`)
               // and the geometry — already range-validated by `RunningProcess.ResizeAsync` — is stored

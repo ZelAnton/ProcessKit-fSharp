@@ -156,6 +156,9 @@ type internal CommandConfig =
       StreamBuffer: StreamBufferPolicy option
       Timeout: TimeSpan option
       TimeoutGrace: TimeSpan option
+      // Soft signal used by graceful stop paths before escalation. SIGTERM preserves the historical
+      // default. Windows has no general signal equivalent, so a non-default value is refused at spawn.
+      StopSignal: Signal
       // Opt-in idle deadline: kill the run when neither stdout nor stderr produces output for this long
       // (each chunk of output resets it), independent of the total `Timeout`. `None` (the default) is no
       // idle deadline. A pipeline stage cannot honour it (rejected by `PipelineStageGuard`).
@@ -286,6 +289,7 @@ module internal CommandConfig =
           StreamBuffer = None
           Timeout = None
           TimeoutGrace = None
+          StopSignal = Signal.Term
           IdleTimeout = None
           CancelOn = None
           Retry = None
@@ -1049,8 +1053,9 @@ type Command internal (config: CommandConfig) =
         ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero)
         Command({ config with Timeout = Some duration })
 
-    /// On timeout, terminate gracefully (SIGTERM) and force-kill only if still alive after
-    /// `grace`. On Windows this degrades to the atomic Job kill. A negative `grace` is rejected
+    /// On timeout, send the configured `StopSignal` and force-kill only if still alive after `grace`.
+    /// On Windows the default signal uses the documented best-effort soft phase before the Job kill;
+    /// non-default stop signals are refused at spawn. A negative `grace` is rejected
     /// (`ArgumentOutOfRangeException`), matching `Timeout`.
     member _.TimeoutGrace(grace: TimeSpan) =
         ArgumentOutOfRangeException.ThrowIfLessThan(grace, TimeSpan.Zero)
@@ -1059,6 +1064,29 @@ type Command internal (config: CommandConfig) =
             { config with
                 TimeoutGrace = Some grace }
         )
+
+    /// Choose the soft signal sent by graceful stop paths before they escalate to a hard kill.
+    /// The default is `Signal.Term`. Windows refuses non-default values at spawn because it cannot
+    /// faithfully represent arbitrary POSIX signals; its existing WM_CLOSE/CTRL+BREAK mechanisms remain
+    /// available through the documented Windows control APIs.
+    member _.StopSignal(signal: Signal) =
+        match signal with
+        | Signal.Kill ->
+            raise (
+                ArgumentException(
+                    "Signal.Kill is not a graceful stop signal; use Kill() or leave StopSignal at Signal.Term",
+                    nameof signal
+                )
+            )
+        | Signal.Other number when number <= 0 ->
+            raise (
+                ArgumentOutOfRangeException(
+                    nameof signal,
+                    signal,
+                    "a graceful stop signal must be a positive, deliverable signal"
+                )
+            )
+        | _ -> Command({ config with StopSignal = signal })
 
     /// Kill the run when it produces **no output** — on neither stdout nor stderr — for `duration`,
     /// reporting the result as `Outcome.TimedOut`. Every chunk of output resets the deadline, so a run
@@ -1528,6 +1556,9 @@ module Command =
 
     /// Terminate gracefully on timeout, force-killing only after `grace`.
     let timeoutGrace (grace: TimeSpan) (command: Command) = command.TimeoutGrace grace
+
+    /// Choose the soft signal used by graceful stop paths before hard-kill escalation.
+    let stopSignal (signal: Signal) (command: Command) = command.StopSignal signal
 
     /// Kill the run when it produces no output (stdout or stderr) for `duration` — reset by each chunk
     /// of output — independent of the total `Command.Timeout`.

@@ -164,7 +164,7 @@ The current interface has 17 abstract members:
 
 `TrackedChildren<'T>` serializes `Add`, `Remove`, `Snapshot`, and `Drain` behind one lock. `Drain` is essential during teardown: it atomically transfers ownership of every recorded child to the teardown path. A mere snapshot would allow a racing cleanup to act twice on a recycled PID or handle.
 
-`GracefulTeardown.poll` supplies the graceful-stop shape shared by all three backends: post the soft stop, poll every 50 ms until empty or the grace period expires, then force-kill survivors. Only the soft stop differs per platform — `SIGTERM` on the POSIX/cgroup backends, a `WM_CLOSE` posted to members' top-level windows on Windows — while the poll-then-unconditional-hard-kill escalation is identical. `PosixReap.leader` pairs `killpg` with `waitpid`; killing a process group does not reap the direct child that ProcessKit owns.
+`GracefulTeardown.poll` supplies the graceful-stop shape shared by all three backends: post the soft stop, poll every 50 ms until empty or the grace period expires, then force-kill survivors. POSIX/cgroup delivery uses the command or group's configured `StopSignal` (default `Signal.Term`); Windows posts `WM_CLOSE` to members' top-level windows for its default soft phase. The poll-then-unconditional-hard-kill escalation is otherwise identical. `PosixReap.leader` pairs `killpg` with `waitpid`; killing a process group does not reap the direct child that ProcessKit owns.
 
 The implementation is split across four files. `Native.Windows.fs`, `Native.Posix.fs`, and `Native.Cgroup.fs` provide the OS-specific operations; `Backend.fs` composes them into `JobObjectBackend`, `ProcessGroupBackend`, and `CgroupBackend`, respectively, behind `IContainmentBackend`.
 
@@ -188,7 +188,7 @@ Tracked process handles pin PID identity until release, preventing a stored cons
 
 ### POSIX process groups
 
-`ProcessGroupBackend` is used on macOS/BSD and on Linux when limits are not requested. Every `posix_spawn` child becomes leader of its own process group (`pgid = pid`); one ProcessKit group may therefore track several pgids. `killpg` reaches descendants that remain in each group. Signals, `SIGSTOP`, and `SIGCONT` are broadcast per tracked pgid. Tracking records each leader's start-time identity so a recycled pgid is never signalled; graceful shutdown snapshots both the pgids and those identity tokens before its off-lock `SIGTERM` → poll → `SIGKILL` sequence, preserving that guard if concurrent teardown removes the live tracking entry.
+`ProcessGroupBackend` is used on macOS/BSD and on Linux when whole-tree limits are not requested. Every `posix_spawn` child becomes leader of its own process group (`pgid = pid`); one ProcessKit group may therefore track several pgids. `killpg` reaches descendants that remain in each group. Signals, `SIGSTOP`, and `SIGCONT` are broadcast per tracked pgid. Tracking records each leader's start-time identity so a recycled pgid is never signalled; graceful shutdown snapshots both the pgids and those identity tokens before its off-lock configured-soft-signal → poll → `SIGKILL` sequence, preserving that guard if concurrent teardown removes the live tracking entry. A CPU-time-only limit also uses this backend and wraps each spawn with `RLIMIT_CPU`; it does not require a whole-tree container.
 
 `Native.Posix` maintains a process-wide pending-wait registry keyed by PID and lazily installs one managed `SIGCHLD` registration. The handler performs non-blocking `waitpid(..., WNOHANG)` scans and completes the corresponding waiter. `reapLeader` uses a short bounded non-blocking retry loop for teardown, avoiding a permanently blocked teardown thread if a child is stuck in uninterruptible kernel sleep.
 
@@ -281,15 +281,15 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 
 | Capability | Windows Job Object | POSIX process group | Linux cgroup v2 |
 |---|---|---|---|
-| Selection | Windows, with or without limits | macOS/BSD; Linux without requested limits | Linux when limits are requested |
+| Selection | Windows, with or without limits | macOS/BSD; Linux without whole-tree limits (CPU-time-only is supported here) | Linux when whole-tree limits are requested |
 | Containment timing | Child suspended, assigned to Job, then resumed | Group created atomically by `posix_spawn` attributes | POSIX group at spawn; `/bin/sh` launcher joins the cgroup before `exec`ing the target (already contained on its first instruction) |
 | Adopt external process (`Adopt`) | `AssignProcessToJobObject` (opens a least-privilege handle, assigns, closes it — Job membership persists) | `ProcessError.Unsupported` — `setpgid` cannot relocate a foreign, already-`exec`ed process | Write the pid to `cgroup.procs` (limited groups only; the plain POSIX fallback is the middle column) |
 | Detached launch (`LaunchDetached`) | Created running, assigned to no Job, both handles closed at once | `POSIX_SPAWN_SETSID`: own session, no pgid tracking, no reap-ledger entry | Same as the middle column — a detached child joins no cgroup |
 | Whole-tree hard kill | Terminate Job or close kill-on-close Job handle | `killpg(SIGKILL)` for each tracked pgid | `cgroup.kill`; freeze-and-SIGKILL sweep fallback |
-| Graceful tree stop | Best-effort `WM_CLOSE` to members' windows, poll to grace, then hard Job kill | `SIGTERM`, poll, then `SIGKILL` | signal members with `SIGTERM`, poll, then cgroup hard kill |
+| Graceful tree stop | Best-effort `WM_CLOSE` to members' windows, poll to grace, then hard Job kill | configured soft signal, poll, then `SIGKILL` | identity-safe configured-signal sweep, poll, then cgroup hard kill |
 | General signals | Kill; Int/Term as best-effort CTRL+BREAK (`WindowsCtrlSignals()` child) and/or `WM_CLOSE` (windowed member) | `killpg` with mapped/raw signal | per-current-member signal sweep; Kill is atomic cgroup kill |
 | Suspend/resume | Best-effort per-thread; suspend counts stack | `SIGSTOP` / `SIGCONT` | `cgroup.freeze` best effort |
-| Resource controls | Job memory, active-process, CPU, CPU-affinity limits (live-updatable via `UpdateLimits`) | None (`UpdateLimits` → `ResourceLimit`) | `memory.max`, `pids.max`, `cpu.max`, `cpuset.cpus` (live-updatable via `UpdateLimits`) |
+| Resource controls | Job memory, active-process, CPU quota/time, and CPU-affinity limits (live-updatable via `UpdateLimits`) | Per-spawn `RLIMIT_CPU`; whole-tree limits and changing CPU-time live return `ResourceLimit` | `memory.max`, `pids.max`, `cpu.max`, `cpuset.cpus` plus per-spawn `RLIMIT_CPU` (controller limits live-updatable; CPU-time is spawn-time) |
 | Desktop-session restrictions | `JOBOBJECT_BASIC_UI_RESTRICTIONS` (clipboard, desktop, display/system parameters, atoms, exit-Windows) | `ProcessError.Unsupported` — no analogue | `ProcessError.Unsupported` — no analogue |
 | Child privilege reduction | Restricted token (`DISABLE_MAX_PRIVILEGE`) and/or a lowered integrity label, spawned via `CreateProcessAsUser` | `Uid`/`Gid`/`Groups`/`Umask` through the `setpriv` helper | same as the middle column |
 | Membership snapshot | All Job PIDs | Tracked group leaders, not every descendant PID | Current `cgroup.procs` PIDs |

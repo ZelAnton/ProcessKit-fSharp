@@ -159,7 +159,7 @@ task {
         use group = group
         let! _server = group.StartAsync(Command.create "some-server")
         // ... work ...
-        do! group.ShutdownAsync(TimeSpan.FromSeconds 5.0) // graceful: SIGTERM → wait → SIGKILL (Unix); atomic on Windows
+        do! group.ShutdownAsync(TimeSpan.FromSeconds 5.0) // configured soft signal → wait → hard kill
     | Error err -> eprintfn $"{err.Message}"
 }
 ```
@@ -192,7 +192,7 @@ Console.WriteLine(await new Command("sort").Stdin(Stdin.FromString("banana\nappl
 using var group = ProcessGroup.Create().GetValueOrThrow();
 await group.StartAsync(new Command("some-server"));
 // ... work ...
-await group.ShutdownAsync(TimeSpan.FromSeconds(5)); // graceful: SIGTERM → wait → SIGKILL (Unix); atomic on Windows
+await group.ShutdownAsync(TimeSpan.FromSeconds(5)); // configured soft signal → wait → hard kill
 ```
 
 ## Documentation
@@ -236,7 +236,7 @@ record-replay `RecordReplayRunner`, referenced only from test projects) and the
 | Capability | Where |
 |---|---|
 | Tree control — `Signal` / `Suspend` / `Resume` / `Members` | `ProcessGroup` |
-| Resource caps — memory / process count / CPU | `ProcessGroupOptions` → `ProcessGroup.Create` |
+| Resource caps — memory / process count / CPU quota, affinity, and time | `ProcessGroupOptions` → `ProcessGroup.Create` |
 | Stats & profiling — `Stats` / `SampleStatsAsync` / `ProfileAsync` | `ProcessGroup`, `RunningProcess` |
 | Test doubles — `ScriptedRunner` / `FakeProcess` | `ProcessKit.Testing` (separate package) |
 | Record / replay cassettes | `ProcessKit.Testing.RecordReplayRunner` (separate package) |
@@ -245,7 +245,7 @@ record-replay `RecordReplayRunner`, referenced only from test projects) and the
 
 ## Capping a group's resources
 
-`ProcessGroupOptions` can bound the whole tree's memory, process count, and CPU at creation, so a
+`ProcessGroupOptions` can bound memory, process count, CPU quota/affinity, and CPU time at creation, so a
 runaway or untrusted child tree can't exhaust the host:
 
 **F#**
@@ -257,6 +257,7 @@ task {
             .WithMemoryMax(512L * 1024L * 1024L) // 512 MiB across the tree
             .WithMaxProcesses(64)
             .WithCpuQuota(0.5)                    // half of one core
+            .WithCpuTimeMax(TimeSpan.FromSeconds 30.0)
 
     match ProcessGroup.Create options with
     | Ok group ->
@@ -273,7 +274,8 @@ task {
 var options = new ProcessGroupOptions()
     .WithMemoryMax(512L * 1024L * 1024L) // 512 MiB across the tree
     .WithMaxProcesses(64)
-    .WithCpuQuota(0.5);                   // half of one core
+    .WithCpuQuota(0.5)                    // half of one core
+    .WithCpuTimeMax(TimeSpan.FromSeconds(30));
 
 var created = ProcessGroup.Create(options);
 if (created is { IsOk: false, ErrorValue: var limitErr })
@@ -292,6 +294,9 @@ Windows it is converted against the host's CPU count and is approximate. Limits 
 container — a **Windows Job Object** or a **Linux cgroup v2** — so there is no whole-tree limit on
 macOS/BSD or the Linux process-group fallback. When a requested limit can't be enforced,
 `Create` returns `ProcessError.ResourceLimit` instead of a silently-unbounded group.
+`WithCpuTimeMax` is the exception to that container rule: Windows applies it to the Job as a whole,
+while POSIX applies `RLIMIT_CPU` to each spawned run before `exec`, so it also works on macOS/BSD and
+the Linux process-group fallback. Its live value cannot be changed for already-running POSIX children.
 
 *Deeper: [Process groups → resource limits](docs/process-groups.md#resource-limits).*
 
@@ -327,8 +332,9 @@ group.Suspend();          // freeze the whole tree…
 group.Resume();           // …and let it run again
 ```
 
-Signals are POSIX-only: on Windows just `Signal.Kill` is deliverable (it maps to the Job Object
-terminate) and anything else returns `ProcessError.Unsupported`. Suspend/resume work everywhere a
+`RunningProcess.Signal` targets one run without consuming the handle; `ProcessGroup.Signal` broadcasts.
+On Windows `Kill` maps to termination, while `Int`/`Term` use the documented best-effort
+CTRL+BREAK/WM_CLOSE paths and other signals return `ProcessError.Unsupported`. Suspend/resume work everywhere a
 container exists — `cgroup.freeze` on Linux, `SIGSTOP`/`SIGCONT` on macOS/BSD and the
 process-group fallback, per-thread suspension on Windows.
 

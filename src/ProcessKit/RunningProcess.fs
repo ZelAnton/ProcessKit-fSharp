@@ -51,7 +51,9 @@ type internal RunningHost =
         StdinFeedComplete: unit -> unit
         /// Signal the tree to die without waiting (start_kill).
         StartKill: unit -> unit
-        /// Gracefully kill the tree (SIGTERM, then SIGKILL after the grace period) without
+        /// Deliver a signal to this run's own contained process tree.
+        Signal: Signal -> Result<unit, ProcessError>
+        /// Gracefully kill the tree (configured soft signal, then SIGKILL after the grace period) without
         /// releasing the container — for timeouts.
         GracefulKill: TimeSpan -> Task
         /// Resize the child's pseudo-terminal to `(cols, rows)` — `Some` only for a `Command.Pty` run
@@ -1200,7 +1202,7 @@ type RunningProcess internal (host: RunningHost) =
         | Some resize -> Task.FromResult(resize (cols, rows))
         | None -> Task.FromResult(Error(ProcessError.Unsupported "Resize (not a PTY run)"))
 
-    /// Gracefully stop the process tree, then reap it: send the child a soft signal (SIGTERM), wait
+    /// Gracefully stop the process tree, then reap it: send the command's configured `StopSignal`, wait
     /// up to `gracePeriod` for it to exit on its own, then hard-kill whatever is still alive — the
     /// same graceful-kill machinery `Command.TimeoutGrace` and `ProcessGroup.ShutdownAsync` drive.
     /// Returns the honest `Outcome` of how the child *actually* concluded (a clean `Exited` if it
@@ -1228,7 +1230,7 @@ type RunningProcess internal (host: RunningHost) =
     /// there is no per-child graceful signal either, so this immediately hard-kills just this child
     /// (like `Kill()`), matching the documented `TimeoutGrace` fallback for a shared group. A handle
     /// from the default runner (`Command.StartAsync()` / `IProcessRunner.SpawnAsync`) owns a private
-    /// group and gets the full SIGTERM → grace → SIGKILL on Unix.
+    /// group and gets the full configured-soft-signal → grace → SIGKILL path on Unix.
     member this.StopAsync(gracePeriod: TimeSpan) : Task<Outcome> =
         ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
 
@@ -1257,6 +1259,12 @@ type RunningProcess internal (host: RunningHost) =
 
     /// `StopAsync` using the default 2-second grace window (matching `ProcessGroupOptions.ShutdownTimeout`).
     member this.StopAsync() : Task<Outcome> = this.StopAsync Limits.DefaultStopGrace
+
+    /// Deliver `signal` to this run's own contained process tree without consuming or reaping the
+    /// handle. Delivery is lifecycle-gated: after teardown it returns a typed `Unsupported` error and
+    /// never targets a recycled pid. On Windows only the documented Job/CTRL+BREAK/WM_CLOSE mappings are
+    /// available; unsupported signals fail honestly.
+    member _.Signal(signal: Signal) : Result<unit, ProcessError> = host.Signal signal
 
     /// Run to completion, capturing stdout as decoded text. A non-zero exit is data; the tree is
     /// reaped when the call returns.

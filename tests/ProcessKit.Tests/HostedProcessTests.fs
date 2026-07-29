@@ -63,6 +63,7 @@ type private BlockingRunner() =
                         fun () ->
                             killed.TrySetResult() |> ignore
                             finished.TrySetResult(Outcome.Signalled None) |> ignore
+                      Signal = fun _ -> Ok()
                       GracefulKill =
                         fun _ ->
                             stopRequested.TrySetResult() |> ignore
@@ -121,6 +122,7 @@ type private LateFaultingStopRunner() =
                       StdinError = fun () -> None
                       StdinFeedComplete = ignore
                       StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
+                      Signal = fun _ -> Ok()
                       GracefulKill =
                         fun _ ->
                             task {
@@ -218,6 +220,7 @@ type private SlowSpawnRunner() =
                       StdinError = fun () -> None
                       StdinFeedComplete = ignore
                       StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
+                      Signal = fun _ -> Ok()
                       GracefulKill =
                         fun _ ->
                             stopRequested.TrySetResult() |> ignore
@@ -281,6 +284,7 @@ type private CrashThenBackoffRunner() =
                       StdinError = fun () -> None
                       StdinFeedComplete = ignore
                       StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
+                      Signal = fun _ -> Ok()
                       GracefulKill =
                         fun _ ->
                             finished.TrySetResult(Outcome.Signalled None) |> ignore

@@ -1,6 +1,6 @@
 namespace ProcessKit
 
-/// A signal to broadcast to every process in a `ProcessGroup` via `ProcessGroup.Signal`.
+/// A signal delivered to one run via `RunningProcess.Signal` or broadcast through `ProcessGroup.Signal`.
 ///
 /// The curated variants map to the POSIX signal of the same name on Unix. On **Windows** `Kill` maps
 /// to the Job Object terminate (the same hard kill as `ProcessGroup.KillAll`), and `Int`/`Term` are a

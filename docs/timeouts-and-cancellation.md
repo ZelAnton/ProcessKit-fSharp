@@ -114,8 +114,9 @@ available on the error, not discarded.
 
 By default the deadline **hard-kills** the tree at once. Add
 `Command.TimeoutGrace(grace)` (mirror: `Command.timeoutGrace`) to give the tree a
-chance to clean up: at the deadline it is sent `SIGTERM`, allowed up to the grace
-window to exit, then `SIGKILL`ed — the same SIGTERM → wait → SIGKILL tier as
+chance to clean up: at the deadline it is sent the command's `StopSignal` (default
+`Signal.Term`), allowed up to the grace window to exit, then hard-killed — the same
+soft signal → wait → hard-kill tier as
 [`ProcessGroup.ShutdownAsync`](process-groups.md). A signal-handling child that exits
 ends the grace early.
 
@@ -126,7 +127,8 @@ task {
     let cmd =
         Command.create "slow-tool"
         |> Command.timeout (TimeSpan.FromSeconds 30.0)
-        |> Command.timeoutGrace (TimeSpan.FromSeconds 5.0) // SIGTERM, wait up to 5s, then SIGKILL
+        |> Command.stopSignal Signal.Usr1
+        |> Command.timeoutGrace (TimeSpan.FromSeconds 5.0) // SIGUSR1, wait up to 5s, then SIGKILL
 
     let! _ = cmd.OutputStringAsync()
     ()
@@ -138,15 +140,16 @@ task {
 ```csharp
 var cmd = new Command("slow-tool")
     .Timeout(TimeSpan.FromSeconds(30))
-    .TimeoutGrace(TimeSpan.FromSeconds(5)); // SIGTERM, wait up to 5s, then SIGKILL
+    .StopSignal(Signal.Usr1)
+    .TimeoutGrace(TimeSpan.FromSeconds(5)); // SIGUSR1, wait up to 5s, then SIGKILL
 
 await cmd.OutputStringAsync();
 ```
 
 `IsTimedOut` is `true` regardless of whether the child exited on the signal or was
-`SIGKILL`ed after the grace — the deadline is what fired. **On Windows there is no
-signal tier:** `TimeoutGrace` is accepted but the deadline kills the Job Object
-atomically, so the grace window has no effect there.
+hard-killed after the grace — the deadline is what fired. Windows refuses a non-default
+`StopSignal` at spawn rather than silently pretending to deliver it; the default preserves the
+existing best-effort WM_CLOSE phase followed by the Job Object hard-kill.
 
 ## Idle timeout
 
@@ -209,7 +212,7 @@ Key facts:
   started reading.
 - **Independent of `Timeout`.** Set both — each fires on its own condition, whichever comes
   first, with a single kill and a single reported outcome (no double kill). `IdleTimeout`
-  honours `TimeoutGrace` (SIGTERM → grace → SIGKILL) exactly as `Timeout` does.
+  honours `TimeoutGrace` (configured soft signal → grace → hard kill) exactly as `Timeout` does.
 - A negative `duration` is rejected (`ArgumentOutOfRangeException`); one larger than ~24.8
   days is treated as no idle deadline (as with `Timeout`).
 
@@ -451,7 +454,7 @@ The contract, path by path:
 | Situation | Behavior |
 |---|---|
 | Cancel during `RunAsync` / `OutputStringAsync` / `OutputBytesAsync` / `ExitCodeAsync` / `ProbeAsync` / `ParseAsync` | tree killed → `Error (ProcessError.Cancelled program)` |
-| Cancel on a live handle (`StdoutLinesAsync`/`FinishAsync` after `StartAsync`) | **not tracked** — the token is checked only before the spawn, and a live handle is caller-driven. Stop the handle yourself (or register the token to do it): `Kill`/dispose for an immediate hard kill, or `StopAsync(gracePeriod)` for a graceful SIGTERM → grace → SIGKILL stop; ProcessKit does not kill the child or surface `Cancelled` for you here |
+| Cancel on a live handle (`StdoutLinesAsync`/`FinishAsync` after `StartAsync`) | **not tracked** — the token is checked only before the spawn, and a live handle is caller-driven. Stop the handle yourself (or register the token to do it): `Kill`/dispose for an immediate hard kill, or `StopAsync(gracePeriod)` for the command's configured soft signal → grace → hard-kill stop; ProcessKit does not kill the child or surface `Cancelled` for you here |
 | Token already cancelled **before** the run | short-circuits before spawning — no process is ever created |
 | `FirstLineAsync` mid-run | surfaces `ProcessError.Cancelled` once the token fires (not `Ok None`) |
 | Under `Retry` | terminal — the built-in classifiers reject `Cancelled` and the loop stops re-trying |

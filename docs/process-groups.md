@@ -307,7 +307,7 @@ There are three ways out, from blunt to graceful:
 |---|---|---|
 | dispose (`use` / `Dispose()` / `DisposeAsync()`) | Immediate **hard kill** of the whole tree, then releases the container | The safety net — always on, even on an exception or early return |
 | `group.KillAll()` | The same hard kill, but the group **stays usable** for further spawns; idempotent | Explicit teardown mid-flight when you want to keep the group |
-| `group.ShutdownAsync()` / `group.ShutdownAsync(grace)` | **Graceful**: on Unix `SIGTERM` → wait the grace window → `SIGKILL` survivors; on Windows a best-effort `WM_CLOSE` to any GUI child's windows → wait the grace window → atomic Job kill of survivors. Releases the group | A clean service stop |
+| `group.ShutdownAsync()` / `group.ShutdownAsync(grace)` | **Graceful**: on Unix the configured `Options.StopSignal` → wait the grace window → `SIGKILL` survivors; on Windows the default uses best-effort `WM_CLOSE` → wait → atomic Job kill. Releases the group | A clean service stop |
 
 `ProcessGroup` implements both `IDisposable` and `IAsyncDisposable`, so a `use`
 binding reaps the tree deterministically on scope exit — disposing is a pure hard
@@ -348,7 +348,7 @@ await group.ShutdownAsync(TimeSpan.FromSeconds(5));
 
 `ShutdownAsync()` with no argument uses the group's configured
 `Options.ShutdownTimeout` (the default is 2 seconds; set it with
-`WithShutdownTimeout`). A child that handles `SIGTERM` and exits ends the grace
+`WithShutdownTimeout`). Select the soft signal with `WithStopSignal` (default `Signal.Term`). A child that handles it and exits ends the grace
 **early** — `ShutdownAsync` returns as soon as the tree is empty, not after the full
 window. `ShutdownAsync` and dispose are idempotent with each other, so a `use`-bound
 group you also `ShutdownAsync` explicitly is safe. Note that a *suspended* tree can
@@ -363,6 +363,10 @@ thaw the whole tree. All of these are synchronous and return
 `Result<unit, ProcessError>`.
 
 `Signal(signal)` delivers a portable `Signal` to every process in the group:
+
+For a single live handle, `RunningProcess.Signal(signal)` uses the same backend-safe delivery but
+targets only that run's own process group/Job child. It is non-consuming, so the caller can signal and
+then continue streaming or await the outcome; lifecycle gates prevent post-teardown PID reuse.
 
 **F#**
 
@@ -605,7 +609,7 @@ using var group = created.GetValueOrThrow();
 await group.StartAsync(new Command("untrusted-tool")); // ... runs within the limited group ...
 ```
 
-The four caps are:
+The five caps are:
 
 - `WithMemoryMax(bytes)` — a whole-tree memory ceiling, in bytes (`int64`).
 - `WithMaxProcesses(count)` — the maximum number of processes the tree may hold.
@@ -620,10 +624,13 @@ The four caps are:
   ones a latency-critical workload runs on. Windows writes a Job Object affinity
   mask (`JOB_OBJECT_LIMIT_AFFINITY`); Linux cgroup v2 writes `cpuset.cpus`. See
   [CPU affinity](#cpu-affinity) for the two platform ceilings.
+- `WithCpuTimeMax(duration)` — CPU time, not wall time. Windows applies the Job's
+  `PerJobUserTimeLimit`; POSIX installs `RLIMIT_CPU` before each child `exec` (soft limit rounded up
+  to seconds, hard limit one second later so `SIGXCPU` can be observed).
 
 The configured caps are also readable back: `group.Options.Limits` is a
 `ResourceLimits` whose `MemoryMax` (`int64 option`), `MaxProcesses` (`int option`),
-`CpuQuota` (`float option`), and `CpuAffinity` (`IReadOnlyList<int> option`, in
+`CpuQuota` (`float option`), `CpuTimeMax` (`TimeSpan option`), and `CpuAffinity` (`IReadOnlyList<int> option`, in
 ascending order) are `Some` only for the limits you set (`ResourceLimits.None` is
 the empty set). You can build a `ResourceLimits` value directly with the same
 `WithMemoryMax` / `WithMaxProcesses` / `WithCpuQuota` / `WithCpuAffinity` methods
@@ -636,6 +643,7 @@ Limits need a **real container** — a Windows Job Object or a Linux cgroup v2.
 | Memory cap | ✅ whole-tree | ✅ whole-tree (`memory.max`) | ❌ |
 | Process-count cap | ✅ | ✅ (`pids.max`) | ❌ |
 | CPU quota | 🟡 approximate | ✅ (`cpu.max`) | ❌ |
+| CPU-time maximum | ✅ whole Job | ✅ per spawned process (`RLIMIT_CPU`) | ✅ per spawned process (`RLIMIT_CPU`) |
 | [CPU affinity](#cpu-affinity) | ✅ mask, cores 0–63 | ✅ (`cpuset.cpus`) | ❌ |
 | [UI restrictions](#windows-ui-restrictions) | ✅ clipboard/desktop/exit-Windows | ❌ `Unsupported` | ❌ `Unsupported` |
 
@@ -853,6 +861,10 @@ Behaviour follows the mechanism, honestly and without a silent downgrade:
 | Windows Job Object | ✅ re-applies via `SetInformationJobObject` on the live job (caps, affinity mask, **and** UI restrictions) |
 | Linux cgroup v2 | ✅ rewrites `memory.max` / `pids.max` / `cpu.max` / `cpuset.cpus` in place (UI restrictions → `ProcessError.Unsupported`) |
 | POSIX process group / macOS / BSD | ❌ `ProcessError.ResourceLimit` (no whole-tree limit primitive to update) |
+
+`CpuTimeMax` is spawn-time on POSIX, including the cgroup backend. A live update that changes it is
+rejected before any controller file is written, so `UpdateLimits` never leaves a partially changed
+limit set. Windows can replace the Job time limit live with the other Job limits.
 
 On the POSIX process-group mechanism there is no container to re-tune, so
 `UpdateLimits` returns `ProcessError.ResourceLimit` — the same typed refusal
