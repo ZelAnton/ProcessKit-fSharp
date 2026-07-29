@@ -299,6 +299,21 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 
 On macOS, the POSIX backend is the only mechanism: whole-tree limits are rejected rather than approximated. `Native.Posix` also accounts for macOS `POSIX_SPAWN_CLOEXEC_DEFAULT` when preserving inherited standard descriptors, and current-directory support requires `posix_spawn_file_actions_addchdir_np` (macOS 10.15+). Signal and zombie-reaping semantics remain POSIX: `killpg` sends signals but never substitutes for reaping ProcessKit's direct child.
 
+## Local verification boundary
+
+`scripts/verify-all.ps1` is the repository's thin pre-push orchestrator. It owns
+ordering, availability checks, the final pass/fail/skip table, and the aggregate
+exit code; it does not reimplement any gate. Formatting stays in Fantomas, docs
+snippets in `verify-doc-snippets.ps1`, spelling in `check-spelling.ps1`, rendered
+sidebar structure in `check-sidebar-nav.py`, Linux execution in `test-linux.ps1`,
+and fuzzing in `fuzz.ps1`.
+
+Run `pwsh ./scripts/verify-all.ps1 -SkipLinux` for the ordinary host pass, or omit
+the switch for every locally available stage. `-SkipSnippets` and `-SkipLinks`
+are explicit fast-path opt-outs; `-LibFuzzer` enables the two fuzz smoke targets.
+Optional executables that are absent are recorded as skipped, while any invoked
+gate failure makes the aggregate command fail.
+
 ## Benchmarking hot paths
 
 `benchmarks/ProcessKit.Benchmarks` (BenchmarkDotNet) covers the pump's decode/frame loop (`Pump.readLines`, all four `LineTerminator` modes, with and without a `MaxLineLength` force-flush cap), the no-op cost of a disabled lifecycle log call, and concurrent spawn/capture fan-out (`OutputStringAsync`, `StartAsync` + `WaitAllAsync`). It runs BenchmarkDotNet's default, statistically-rigorous job in-process against the already-built `ProcessKit` assembly — see `Program.fs`'s doc comment for why in-process, not BenchmarkDotNet's usual out-of-process toolchain, is required here (this repo's `Reference` + `AssemblySearchPaths` convention has no equivalent in a regenerated isolated project).

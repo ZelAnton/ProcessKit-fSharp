@@ -17,14 +17,20 @@ Thanks for your interest in improving **ProcessKit**.
 ## Build and test
 
 ```sh
-dotnet tool restore
-dotnet build ProcessKit.slnx
-dotnet test  ProcessKit.slnx
-pwsh ./scripts/check-spelling.ps1
+pwsh ./scripts/verify-all.ps1 -SkipLinux
 ```
 
-The build treats **warnings as errors**, so a clean local build is required
-before opening a pull request. Run a single test with:
+This one command restores local tools, checks formatting and spelling when its
+CLI is installed, builds the solution and samples in Release, runs the F# and C#
+test projects on both target frameworks, compiles documentation
+snippets, verifies the CI-pinned rendered sidebar when mdBook 0.4.40 is available,
+and checks offline links when lychee is installed. Omit `-SkipLinux` for the full
+Docker/Rancher Desktop run; pass `-LibFuzzer /path/to/libfuzzer-dotnet` to include
+both fuzz smoke targets. Every unavailable optional tool is reported as `SKIP`
+in the final table rather than disappearing silently.
+
+The build treats **warnings as errors**, so every executed stage must pass before
+opening a pull request. Run a single test with:
 
 ```sh
 dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
@@ -35,7 +41,8 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
 - **Formatting** is governed by [Fantomas](https://fsprojects.github.io/fantomas/),
   this repo's style authority (the F# compiler does not enforce `.editorconfig`
   style the way Roslyn does for C#). F# source is indented with **spaces, not
-  tabs** — the compiler rejects tabs. Check before pushing:
+  tabs** — the compiler rejects tabs. The aggregate script checks it before building;
+  to run that stage alone:
   ```sh
   dotnet fantomas --check src tests
   ```

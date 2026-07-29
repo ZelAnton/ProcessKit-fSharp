@@ -487,6 +487,37 @@ type WhichResolutionTests() =
         }
         :> Task
 
+    [<Test>]
+    member _.``WindowsRawArg refuses an automatically resolved batch wrapper``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Automatic .cmd/.bat wrapping is Windows-only."
+            else
+                let dir =
+                    Path.Combine(Path.GetTempPath(), "processkit-rawbatch-" + Guid.NewGuid().ToString "N")
+
+                Directory.CreateDirectory dir |> ignore
+                let toolName = "raw-target"
+                let script = Path.Combine(dir, toolName + ".cmd")
+                File.WriteAllText(script, "@echo off\r\necho REACHED\r\n")
+                let originalPath = Environment.GetEnvironmentVariable "PATH"
+
+                try
+                    Environment.SetEnvironmentVariable("PATH", dir + ";" + originalPath)
+
+                    let! result =
+                        (Command.create toolName |> Command.windowsRawArg "\"opaque fragment\"").OutputStringAsync()
+
+                    match result with
+                    | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "cmd.exe explicitly")
+                    | Error other -> Assert.Fail $"expected Unsupported, got {other}"
+                    | Ok output -> Assert.Fail $"batch wrapper unexpectedly launched: {output.Stdout}"
+                finally
+                    Environment.SetEnvironmentVariable("PATH", originalPath)
+                    Directory.Delete(dir, true)
+        }
+        :> Task
+
     // ---- Command.PreferLocal (T-182): prefer-local program resolution ---------------------------------
     //
     // A marker tool named `baseName` in `dir` (created if absent) that prints `marker`, then its own

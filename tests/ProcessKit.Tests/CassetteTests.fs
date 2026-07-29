@@ -268,6 +268,39 @@ type CassetteTests() =
             })
 
     [<Test>]
+    member _.``Windows raw fragments are opaque cassette match tokens``() : Task =
+        withCassette (fun path ->
+            task {
+                let raw = "PROP=\"value with spaces\""
+                let recorder = RecordReplayRunner.Record(path, FixedRunner("recorded", 0))
+
+                let recorded =
+                    Command.create "tool" |> Command.arg "install" |> Command.windowsRawArg raw
+
+                let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
+                recorder.Save() |> ignore
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    let same =
+                        Command.create "tool" |> Command.arg "install" |> Command.windowsRawArg raw
+
+                    match! (runner replayer).OutputStringAsync(same, CancellationToken.None) with
+                    | Error error -> Assert.Fail $"same raw fragment should replay: {error}"
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded")
+
+                    let different =
+                        Command.create "tool"
+                        |> Command.arg "install"
+                        |> Command.windowsRawArg "PROP=other"
+
+                    match! (runner replayer).OutputStringAsync(different, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss _) -> ()
+                    | other -> Assert.Fail $"a different raw fragment should miss, got {other}"
+            })
+
+    [<Test>]
     member _.``the stdin source is part of the match key``() : Task =
         withCassette (fun path ->
             task {

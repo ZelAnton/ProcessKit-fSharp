@@ -197,15 +197,27 @@ module internal Windows =
     /// before). Fails only when a batch-wrapper argument (or script path) cannot be safely quoted for
     /// cmd.exe.
     let private buildWindowsCommandLine (command: Command) : Result<string, ProcessError> =
+        let appendRaw (quoted: string) =
+            if command.Config.WindowsRawArgs.IsEmpty then
+                quoted
+            else
+                quoted + " " + String.Join(" ", command.Config.WindowsRawArgs)
+
         match resolveWindowsLaunch command with
         | WindowsLaunch.AsIs ->
             let parts = command.Program :: List.ofSeq command.Config.Args
-            Ok(parts |> List.map quoteWindowsArg |> String.concat " ")
+            Ok(parts |> List.map quoteWindowsArg |> String.concat " " |> appendRaw)
         | WindowsLaunch.DirectPath resolved ->
             let parts = resolved :: List.ofSeq command.Config.Args
-            Ok(parts |> List.map quoteWindowsArg |> String.concat " ")
+            Ok(parts |> List.map quoteWindowsArg |> String.concat " " |> appendRaw)
         | WindowsLaunch.BatchWrapper resolved ->
-            buildBatchCommandLine command.Program resolved (List.ofSeq command.Config.Args)
+            if command.Config.WindowsRawArgs.IsEmpty then
+                buildBatchCommandLine command.Program resolved (List.ofSeq command.Config.Args)
+            else
+                Error(
+                    ProcessError.Unsupported
+                        "WindowsRawArg with an automatically resolved .cmd/.bat program; invoke cmd.exe explicitly so the raw fragment's parser and position are unambiguous"
+                )
 
     // ----------------------------------------------------------------------------------
     // Windows: Job Object + CREATE_SUSPENDED → assign → resume

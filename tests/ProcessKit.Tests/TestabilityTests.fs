@@ -188,6 +188,21 @@ type TestabilityTests() =
         }
 
     [<Test>]
+    member _.``ScriptedRunner matches a Windows raw fragment as one opaque token``() : Task =
+        task {
+            let raw = "\"property value\" /legacy"
+
+            let runner: IProcessRunner =
+                ScriptedRunner().On([ "tool"; raw ], Reply.Ok "matched")
+
+            let command = Command.create "tool" |> Command.windowsRawArg raw
+
+            match! runner.OutputStringAsync(command, CancellationToken.None) with
+            | Ok result -> Assert.That(result.Stdout, Is.EqualTo "matched")
+            | Error error -> Assert.Fail $"raw-fragment match failed: {error.Message}"
+        }
+
+    [<Test>]
     member _.``DelegatingProcessRunner forwards and lets a decorator intercept``() : Task =
         task {
             let scripted: IProcessRunner = ScriptedRunner().On([ "x" ], Reply.Ok "hi")

@@ -23,6 +23,26 @@ type CommandTests() =
         Assert.That(command.Arguments, Is.EqualTo(box [| "rev-parse"; "--short"; "HEAD" |]))
 
     [<Test>]
+    member _.``WindowsRawArg remains opaque and follows every ordinary argument``() =
+        let command =
+            Command.create "tool"
+            |> Command.windowsRawArg "--raw=\"one two\""
+            |> Command.arg "ordinary"
+            |> Command.windowsRawArg "/legacy:three"
+
+        Assert.That(command.Arguments, Is.EqualTo(box [| "ordinary"; "--raw=\"one two\""; "/legacy:three" |]))
+
+    [<Test>]
+    member _.``WindowsRawArg rejects null and embedded NUL``() =
+        let nullFragment = Unchecked.defaultof<string>
+
+        Assert.Throws<ArgumentNullException>(Action(fun () -> Command("tool").WindowsRawArg(nullFragment) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentException>(Action(fun () -> Command("tool").WindowsRawArg("a\000b") |> ignore))
+        |> ignore
+
+    [<Test>]
     member _.``the builder is immutable - each step returns a new command``() =
         let baseCommand = Command.create "git"
         let withArg = baseCommand |> Command.arg "status"

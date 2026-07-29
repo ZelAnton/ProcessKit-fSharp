@@ -20,6 +20,7 @@
 ---
 
 - [Comparison and migration guide](comparison.md)
+- [Coming from ProcessKit-rs](from-rust.md)
 - [Cookbook](cookbook.md)
 - [Scripting with F# Interactive](scripting.md)
 - [Running commands](commands.md)

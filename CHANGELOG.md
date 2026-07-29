@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RunningProcess.Signal` delivers a signal to one run's own contained tree, with matching signal recording in `FakeProcess`.
 - `Command.StopSignal` and `ProcessGroupOptions.WithStopSignal` select the soft signal used before graceful-stop escalation.
 - `ResourceLimits.WithCpuTimeMax` and `ProcessGroupOptions.WithCpuTimeMax` cap CPU time through Windows Job Objects or POSIX `RLIMIT_CPU`.
+- `Command.WindowsRawArg` appends a trusted Windows command-line fragment verbatim for programs with non-standard argument parsers, with typed refusal on POSIX and automatic batch wrappers.
 
 ### Changed
 - `StopAsync`, pipeline sessions, supervisors, hosted processes, timeout grace, and group shutdown now honor the configured soft-stop signal.

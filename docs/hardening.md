@@ -40,6 +40,14 @@ the source of truth.
 | A credential echoed to a PTY | `PtyConfig.Echo = false` | [Pseudo-terminal (PTY)](pty.md) |
 | Leaked inherited secrets in `env` | `Command.EnvClear` | [Running commands](commands.md) |
 | Secrets leaking into logs/traces/fixtures | The observability + record/replay secret invariants | [Observability](observability.md), [Testing your code](testing.md#record-and-replay) |
+| Command-line injection through a Windows legacy parser | Keep data in ordinary `Arg`/`Args`; never interpolate untrusted input into `WindowsRawArg` | [Running commands](commands.md#windows-raw-command-line-fragments) |
+
+> **Windows raw arguments bypass the safe boundary.** `Command.WindowsRawArg`
+> appends text directly to the child's Windows command line without quoting. It
+> exists only for trusted, fixed fragments required by non-standard parsers.
+> User input, environment values, filenames, and other variable data must remain
+> ordinary `Arg`/`Args` values; concatenating any of them into a raw fragment is
+> command-line injection by construction.
 
 ## Whole-tree resource limits
 

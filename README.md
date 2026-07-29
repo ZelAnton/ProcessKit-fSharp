@@ -211,6 +211,7 @@ projects covering capture, streaming readiness, pipelines, supervision, DI, and 
 | Guide | Covers |
 |---|---|
 | [Cookbook](docs/cookbook.md) | Task → snippet recipes for everything below; the fastest way in |
+| [Coming from ProcessKit-rs](docs/from-rust.md) | Rust-to-.NET mappings for verbs, ownership, errors, optional features, and test seams |
 | [Scripting with F# Interactive](docs/scripting.md) | `.fsx` setup, one-off helpers, reusable CLI clients, Ctrl+C cleanup, and portable tool resolution |
 | [Running commands](docs/commands.md) | The full `Command` builder and every consuming verb, with error semantics |
 | [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
@@ -242,6 +243,11 @@ record-replay `RecordReplayRunner`, referenced only from test projects) and the
 | Record / replay cassettes | `ProcessKit.Testing.RecordReplayRunner` (separate package) |
 | Observability — logging, tracing & metrics ([guide](docs/observability.md)) | `Command.Logger`, `ProcessKitDiagnostics` (`ActivitySource` / `Meter`) |
 | Dependency-injection wiring | `ProcessKit.Extensions.DependencyInjection` (separate package) |
+
+On Windows, `Command.WindowsRawArg` is an explicit escape hatch for trusted fixed fragments required
+by non-MSVCRT parsers. Ordinary arguments are still quoted first; raw fragments are appended verbatim,
+are rejected on POSIX and for automatically wrapped `.cmd`/`.bat` targets, and must never contain
+untrusted input. See the [full contract and examples](docs/commands.md#windows-raw-command-line-fragments).
 
 ## Capping a group's resources
 

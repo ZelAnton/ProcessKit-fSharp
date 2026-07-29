@@ -89,6 +89,42 @@ so there is no quoting, no word-splitting, and no injection surface. (When you
 actually want `a | b | c`, use a [pipeline](pipelines.md), which connects the
 stages in-process instead of invoking a shell.)
 
+### Windows raw command-line fragments
+
+`WindowsRawArg` is the deliberately loud exception for a Windows program whose
+parser does not follow the normal MSVCRT argument rules. Each fragment is appended
+to `lpCommandLine` verbatim, after every ordinary `Arg`/`Args` value; ordinary
+arguments keep their standard quoting, raw fragments keep their own insertion
+order. This is useful for a legacy parser such as `msiexec`, but it gives the
+caller complete responsibility for quoting and token boundaries:
+
+**F#**
+
+```fsharp
+let installer =
+    Command.create "msiexec.exe"
+    |> Command.args [ "/i"; "package.msi" ]
+    |> Command.windowsRawArg "INSTALLDIR=\"C:\\Program Files\\Example\""
+```
+
+**C#**
+
+```csharp
+var installer =
+    new Command("msiexec.exe")
+        .Args(["/i", "package.msi"])
+        .WindowsRawArg("INSTALLDIR=\"C:\\Program Files\\Example\"");
+```
+
+Never interpolate user-controlled data into a raw fragment: ProcessKit performs
+no escaping or validation beyond rejecting NUL. On POSIX, spawning such a command
+returns `ProcessError.Unsupported`. An automatically resolved `.cmd`/`.bat` target
+is also refused because its extra `cmd.exe` parser makes a safe raw-fragment
+contract ambiguous; invoke `cmd.exe` explicitly when raw command-line control is
+truly required. Test doubles and record/replay cassettes keep each raw fragment as
+one opaque match token — they do not try to parse it — and `DryRunRunner` renders
+that token verbatim after its ordinarily quoted arguments.
+
 The program name normally reaches the OS verbatim: a bare name is resolved on
 `PATH` by the OS, and setting a working directory does **not** re-anchor a
 *relative* program path against it (a relative path resolves against the current

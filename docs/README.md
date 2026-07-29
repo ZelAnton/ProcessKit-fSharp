@@ -109,6 +109,7 @@ for F# and C# users who want compiled examples instead of Markdown snippets.
 | Guide | Covers |
 |---|---|
 | [Comparison and migration guide](comparison.md) | How ProcessKit compares to `System.Diagnostics.Process`, CliWrap, Medallion.Shell, and SimpleExec, plus "was → now" migration snippets |
+| [Coming from ProcessKit-rs](from-rust.md) | The Rust-to-.NET vocabulary map: verbs, ownership, errors, cancellation, packages, encoding, PTY, supervision, and testing seams |
 | [Cookbook](cookbook.md) | "I want to …" → working snippet, for every capability; each recipe links to its deep guide |
 | [Scripting with F# Interactive](scripting.md) | Use ProcessKit from `.fsx`: NuGet loading, synchronous top-level boundaries, reusable CLI clients, shell-free pipelines, Ctrl+C cleanup, honest exit codes, and cross-platform tool resolution |
 | [Running commands](commands.md) | The `Command` builder end to end: args, env, stdin sources, encodings, buffer policies, line handlers, timeouts, retry — and every consuming verb (`RunAsync`, `OutputStringAsync`, `ProbeAsync`, …) with its error semantics |

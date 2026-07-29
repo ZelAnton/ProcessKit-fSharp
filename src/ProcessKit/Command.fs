@@ -93,6 +93,9 @@ type WindowsIntegrityLevel =
 type internal CommandConfig =
     { Program: string
       Args: ImmutableList<string>
+      // Windows-only command-line fragments appended after every ordinary argument without quoting.
+      // Deliberately separate from argv: callers opt into native parser-specific syntax.
+      WindowsRawArgs: ImmutableList<string>
       WorkingDirectory: string option
       // Priority directories searched (in the order they were added) BEFORE `PATH` when resolving a
       // bare-name program — see `Command.PreferLocal`. A match here is always launched by its resolved
@@ -264,6 +267,7 @@ module internal CommandConfig =
     let create (program: string) =
         { Program = program
           Args = ImmutableList<string>.Empty
+          WindowsRawArgs = ImmutableList<string>.Empty
           WorkingDirectory = None
           PreferLocal = ImmutableList<string>.Empty
           EnvOverrides = ImmutableList<string * string option>.Empty
@@ -637,8 +641,11 @@ type Command internal (config: CommandConfig) =
     /// The program to run.
     member _.Program = config.Program
 
-    /// The arguments, in order.
-    member _.Arguments: IReadOnlyList<string> = config.Args :> IReadOnlyList<string>
+    /// The ordinary arguments followed by any Windows raw fragments, in their respective append order.
+    /// Raw fragments are opaque values for test doubles and cassette matching; they are not portable argv
+    /// elements and a real POSIX spawn rejects them.
+    member _.Arguments: IReadOnlyList<string> =
+        Seq.append config.Args config.WindowsRawArgs |> Seq.toArray :> IReadOnlyList<string>
 
     /// The working directory, when overridden.
     member _.WorkingDirectory = config.WorkingDirectory
@@ -675,6 +682,20 @@ type Command internal (config: CommandConfig) =
         Command(
             { config with
                 Args = config.Args.AddRange materialized }
+        )
+
+    /// Append a Windows command-line fragment verbatim after all ordinarily quoted arguments. Raw
+    /// fragments retain their own insertion order, but ordinary `Arg`/`Args` values always precede them,
+    /// regardless of builder-call order. This is an explicit escape hatch for programs with non-MSVCRT
+    /// parsers; never place untrusted input in `fragment`. POSIX spawn returns typed `Unsupported`, and an
+    /// automatically resolved `.cmd`/`.bat` target is refused (invoke `cmd.exe` explicitly when needed).
+    member _.WindowsRawArg(fragment: string) =
+        ArgumentNullException.ThrowIfNull fragment
+        CommandConfig.rejectEmbeddedNul (nameof fragment) fragment
+
+        Command(
+            { config with
+                WindowsRawArgs = config.WindowsRawArgs.Add fragment }
         )
 
     /// Set the working directory for the run. `directory` must not contain an embedded NUL (`'\000'`)
@@ -1458,6 +1479,11 @@ module Command =
 
     /// Append several arguments, in order.
     let args (values: seq<string>) (command: Command) = command.Args values
+
+    /// Append a trusted Windows command-line fragment verbatim after every ordinary argument. Never
+    /// place untrusted input in `fragment`; a POSIX spawn and an automatically resolved batch wrapper
+    /// return typed `Unsupported`.
+    let windowsRawArg (fragment: string) (command: Command) = command.WindowsRawArg fragment
 
     /// Set the working directory for the run.
     let currentDir (directory: string) (command: Command) = command.CurrentDir directory

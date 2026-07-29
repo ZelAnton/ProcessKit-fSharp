@@ -79,6 +79,7 @@ class ProcessKit.Command
   member User(System.Int32, System.Int32) : ProcessKit.Command
   member WindowsCtrlSignals() : ProcessKit.Command
   member WindowsIntegrityLevel(ProcessKit.WindowsIntegrityLevel) : ProcessKit.Command
+  member WindowsRawArg(System.String) : ProcessKit.Command
   member WindowsRestrictedToken() : ProcessKit.Command
   new(System.String)
   property Arguments : System.Collections.Generic.IReadOnlyList<System.String> { get }
@@ -142,6 +143,7 @@ module ProcessKit.CommandModule
   static member user(System.Int32, System.Int32, ProcessKit.Command) : ProcessKit.Command
   static member windowsCtrlSignals(ProcessKit.Command) : ProcessKit.Command
   static member windowsIntegrityLevel(ProcessKit.WindowsIntegrityLevel, ProcessKit.Command) : ProcessKit.Command
+  static member windowsRawArg(System.String, ProcessKit.Command) : ProcessKit.Command
   static member windowsRestrictedToken(ProcessKit.Command) : ProcessKit.Command
 
 class ProcessKit.CommandVerbs

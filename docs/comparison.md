@@ -396,4 +396,4 @@ equivalent to CliWrap's event-stream callback style, without giving up buffered 
 
 ---
 
-Next: [Cookbook](cookbook.md)
+Next: [Coming from ProcessKit-rs](from-rust.md)

@@ -48,6 +48,8 @@ open ProcessKit
 [<TestFixture>]
 type ArgvEnvRoundTripTests() =
 
+    static let isWindows = OperatingSystem.IsWindows()
+
     // Modest FsCheck sample count per property: each sample spawns a real process (~0.1s), so the
     // default 100 would dominate `dotnet test`. The deterministic example tests below pin the exact
     // adversarial shapes regardless, so the property covers breadth, not guaranteed coverage.
@@ -330,6 +332,24 @@ return 0;
                 this.Echo "argv" [] argv = List.toArray argv)
 
         Check.One(Config.QuickThrowOnFailure.WithMaxTest iterations, property)
+
+    [<Test>]
+    member _.``WindowsRawArg reaches a non-MSVCRT parser verbatim and POSIX refuses it``() =
+        let command =
+            Command.create "dotnet"
+            |> Command.args [ "exec"; helperDll; "argv" ]
+            |> Command.windowsRawArg "\"raw one\" raw-two"
+            |> Command.timeout (TimeSpan.FromSeconds 60.0)
+
+        match command.OutputBytesAsync().GetAwaiter().GetResult() with
+        | Error(ProcessError.Unsupported _) when not isWindows -> ()
+        | Error error -> Assert.Fail $"raw-argument echo failed: {error}"
+        | Ok _ when not isWindows -> Assert.Fail "POSIX silently accepted a Windows raw command-line fragment"
+        | Ok result ->
+            let echoed =
+                JsonSerializer.Deserialize<string[]>(Encoding.UTF8.GetString result.Stdout)
+
+            Assert.That(echoed, Is.EqualTo<string[]>([| "raw one"; "raw-two" |]))
 
     // --- env round-trip ------------------------------------------------------------------------
 

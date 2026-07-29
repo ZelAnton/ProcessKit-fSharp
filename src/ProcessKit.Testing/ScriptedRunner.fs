@@ -77,7 +77,7 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
         let wanted = List.ofSeq tokens
 
         let predicate (command: Command) =
-            let haystack = command.Program :: List.ofSeq command.Config.Args
+            let haystack = command.Program :: List.ofSeq command.Arguments
             wanted |> List.forall (fun token -> List.contains token haystack)
 
         ScriptedRunner(rules @ [ predicate, reply ], fallback)

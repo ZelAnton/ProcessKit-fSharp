@@ -5,9 +5,10 @@ open System.Collections.Generic
 open ProcessKit
 
 /// A subprocess-free `IProcessRunner` for a `--dry-run` seam: instead of spawning anything, every verb
-/// renders the command to a deterministic string — the program, its arguments (quoted when they contain
-/// whitespace or a quote), and the working directory when the command set one — and returns that render
-/// as the successful stdout of the run. No member ever touches the filesystem or the network.
+/// renders the command to a deterministic string — the program, its ordinary arguments (quoted when they
+/// contain whitespace or a quote), any Windows raw fragments verbatim, and the working directory when the
+/// command set one — and returns that render as the successful stdout of the run. No member ever touches
+/// the filesystem or the network.
 ///
 /// `SpawnAsync` (and the streaming/readiness verbs a live handle feeds) is served exactly like the
 /// capture verbs: the render becomes a `FakeProcess`'s stdout, exiting `0` with no live pumping. This is
@@ -47,14 +48,15 @@ type DryRunRunner() =
 
     let seam = Seam.runner resolve
 
-    /// Render `command` deterministically: the program, then its arguments (quoted when needed), then
-    /// `(cwd: <directory>)` when the command set a working directory. Two commands built the same way
-    /// always render identically.
+    /// Render `command` deterministically: the program, ordinarily quoted arguments, Windows raw fragments
+    /// verbatim, then `(cwd: <directory>)` when the command set a working directory. Two commands built the
+    /// same way always render identically.
     static member Render(command: Command) : string =
         ArgumentNullException.ThrowIfNull command
 
-        let tokens =
-            command.Program :: (command.Arguments |> Seq.map quoteIfNeeded |> List.ofSeq)
+        let ordinary = command.Config.Args |> Seq.map quoteIfNeeded |> List.ofSeq
+        let raw = command.Config.WindowsRawArgs |> List.ofSeq
+        let tokens = command.Program :: (ordinary @ raw)
 
         let line = String.Join(" ", tokens)
 

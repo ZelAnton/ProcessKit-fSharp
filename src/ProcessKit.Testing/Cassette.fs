@@ -607,7 +607,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 )
 
     let keyOf (command: Command) (digest: string option) : Key =
-        let args = applyNormalizer options.ArgNormalizer (Seq.toArray command.Config.Args)
+        let args = applyNormalizer options.ArgNormalizer (Seq.toArray command.Arguments)
 
         command.Program,
         args,
@@ -652,7 +652,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         let signalled, signal = signalOf result.Outcome
 
         { Program = command.Program
-          Args = Seq.toArray command.Config.Args
+          Args = Seq.toArray command.Arguments
           Cwd = Option.toObj command.WorkingDirectory
           StdinDigest = Option.toObj digest
           HasStdin = command.Config.StdinSource.IsSome
@@ -678,7 +678,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         let signalled, signal = signalOf result.Outcome
 
         { Program = command.Program
-          Args = Seq.toArray command.Config.Args
+          Args = Seq.toArray command.Arguments
           Cwd = Option.toObj command.WorkingDirectory
           StdinDigest = Option.toObj digest
           HasStdin = command.Config.StdinSource.IsSome

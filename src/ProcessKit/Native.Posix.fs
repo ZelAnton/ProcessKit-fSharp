@@ -2741,8 +2741,13 @@ module internal Posix =
     /// `Setsid`/`Umask` — the two Unsupported gates are deliberate mirror images, so neither platform
     /// silently ignores the other's hardening request. Reported one at a time; the first requested knob
     /// names the failure.
-    let private windowsHardeningUnsupported (config: CommandConfig) : ProcessError option =
-        if config.WindowsRestrictedToken then
+    let private windowsOnlyOptionsUnsupported (config: CommandConfig) : ProcessError option =
+        if not config.WindowsRawArgs.IsEmpty then
+            Some(
+                ProcessError.Unsupported
+                    "WindowsRawArg is a Windows command-line escape hatch; POSIX launches an argv vector and cannot preserve a raw command-line fragment"
+            )
+        elif config.WindowsRestrictedToken then
             Some(
                 ProcessError.Unsupported
                     "WindowsRestrictedToken is a Win32 restricted-token (CreateRestrictedToken) primitive; POSIX has no equivalent (use Uid/Gid/Groups for a POSIX privilege drop)"
@@ -2771,7 +2776,7 @@ module internal Posix =
 
         // The Windows-only token knobs are refused first, before any other dispatch: a POSIX host has no
         // restricted token and no integrity label to honour them with.
-        match windowsHardeningUnsupported config with
+        match windowsOnlyOptionsUnsupported config with
         | Some error -> Error error
         | None ->
             if
@@ -2916,7 +2921,7 @@ module internal Posix =
         // the cgroup launch. The rest of the dispatch (Groups-need-a-drop, non-root drop precheck) is
         // shared with the non-pty path.
         let unsupportedGate =
-            match windowsHardeningUnsupported config with
+            match windowsOnlyOptionsUnsupported config with
             | Some error -> Some error
             | None -> if config.Pty.IsSome then ptyHostUnsupported () else None
 
@@ -3267,7 +3272,7 @@ module internal Posix =
 
         // The Windows-only token knobs are refused here too, before any launch work: a detached child gets
         // no weaker honesty guarantee than a contained one just because nothing tracks it afterwards.
-        match windowsHardeningUnsupported config with
+        match windowsOnlyOptionsUnsupported config with
         | Some error -> Error error
         | None ->
             match groupsRequireDropError command with

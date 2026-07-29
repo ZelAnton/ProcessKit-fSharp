@@ -415,6 +415,13 @@ a `%`, a `!`, or a line break — fails the spawn with a typed `ProcessError.Spa
 launching unsafely. A `.exe` match, a path-form program, and anything on POSIX are unaffected (POSIX
 has no `PATHEXT`; the OS resolves them exactly as before).
 
+**`Command.WindowsRawArg` is Windows-only.** It appends a trusted fragment verbatim after all
+ordinarily quoted arguments for children with a non-MSVCRT parser. POSIX has an argv vector rather
+than a mutable raw command line, so requesting it there fails with `ProcessError.Unsupported`.
+Automatic `.cmd`/`.bat` wrapping is also refused when raw fragments are present; invoke `cmd.exe`
+explicitly if its grammar is intentionally the parser. See
+[Running commands](commands.md#windows-raw-command-line-fragments) for ordering and injection rules.
+
 **POSIX process groups: a `setsid` child can escape.** The process-group mechanism tracks each
 child's pgid, and teardown signals those pgids. A descendant that deliberately starts a new
 session (a `setsid` call) gets a fresh process group that the parent group does not track, so it

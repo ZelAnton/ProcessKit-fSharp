@@ -49,6 +49,15 @@ type DryRunRunnerTests() =
         Assert.That(DryRunRunner.Render command, Is.EqualTo "echo \"hello world\"")
 
     [<Test>]
+    member _.``Windows raw fragments remain verbatim after quoted ordinary arguments``() =
+        let command =
+            Command.create "tool"
+            |> Command.windowsRawArg "\"raw one\" raw-two"
+            |> Command.arg "ordinary value"
+
+        Assert.That(DryRunRunner.Render command, Is.EqualTo "tool \"ordinary value\" \"raw one\" raw-two")
+
+    [<Test>]
     member _.``History records every command served, in call order``() : Task =
         task {
             let runner = DryRunRunner()
