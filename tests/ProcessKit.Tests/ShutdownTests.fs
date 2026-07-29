@@ -384,22 +384,38 @@ type ShutdownTests() =
             Assert.Ignore "SIGUSR1 has no Windows mapping."
 
         task {
+            let marker = tempMarker "signal-ready"
+
             let command =
-                shell "trap 'exit 43' USR1; echo ready; while :; do sleep 0.2 & wait $!; done"
+                Command.create "/bin/sh"
+                |> Command.args
+                    [ "-c"
+                      "trap 'exit 43' USR1; : > \"$1\"; while :; do sleep 0.2 & wait $!; done"
+                      "processkit-signal-test"
+                      marker ]
 
             let! proc = startProc command
 
-            match! proc.WaitForLineAsync((fun line -> line = "ready"), TimeSpan.FromSeconds 10.0) with
-            | Error error -> Assert.Fail $"child never became ready: {error}"
-            | Ok _ -> ()
+            try
+                let readiness = Stopwatch.StartNew()
 
-            match proc.Signal Signal.Usr1 with
-            | Error error -> Assert.Fail $"signal failed: {error}"
-            | Ok() -> ()
+                while not (File.Exists marker) && readiness.Elapsed < TimeSpan.FromSeconds 10.0 do
+                    do! Task.Delay 20
 
-            match! proc.WaitAsync() with
-            | Outcome.Exited 43 -> ()
-            | other -> Assert.Fail $"expected the SIGUSR1 handler to exit 43, got {other}"
+                if not (File.Exists marker) then
+                    do! (proc :> IAsyncDisposable).DisposeAsync().AsTask()
+                    Assert.Fail "child never created its readiness marker"
+
+                match proc.Signal Signal.Usr1 with
+                | Error error -> Assert.Fail $"signal failed: {error}"
+                | Ok() -> ()
+
+                match! proc.WaitAsync() with
+                | Outcome.Exited 43 -> ()
+                | other -> Assert.Fail $"expected the SIGUSR1 handler to exit 43, got {other}"
+            finally
+                if File.Exists marker then
+                    File.Delete marker
         }
         :> Task
 
