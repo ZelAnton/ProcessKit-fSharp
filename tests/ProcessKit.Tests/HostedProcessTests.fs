@@ -56,7 +56,12 @@ type private BlockingRunner() =
                       StartTime = DateTime.UtcNow
                       StartedTimestamp = Stopwatch.GetTimestamp()
                       StartTimeIdentity = None
-                      Wait = fun () -> finished.Task
+                      Wait =
+                        fun () ->
+                            // `Wait` starts only after `SupervisionSession.publishCurrent`, so `Started`
+                            // is an active-child barrier rather than the earlier SpawnAsync-return race.
+                            started.TrySetResult() |> ignore
+                            finished.Task
                       StdinError = fun () -> None
                       StdinFeedComplete = ignore
                       StartKill =
@@ -77,7 +82,6 @@ type private BlockingRunner() =
                             stderr.Dispose()
                             ValueTask.CompletedTask }
 
-                started.TrySetResult() |> ignore
                 Task.FromResult(Ok(new RunningProcess(host)))
 
         member _.CaptureStringAsync(_command, _cancellationToken) =
@@ -118,7 +122,11 @@ type private LateFaultingStopRunner() =
                       StartTime = DateTime.UtcNow
                       StartedTimestamp = Stopwatch.GetTimestamp()
                       StartTimeIdentity = None
-                      Wait = fun () -> finished.Task
+                      Wait =
+                        fun () ->
+                            // Signal after the session has published this handle as its active child.
+                            started.TrySetResult() |> ignore
+                            finished.Task
                       StdinError = fun () -> None
                       StdinFeedComplete = ignore
                       StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
@@ -142,7 +150,6 @@ type private LateFaultingStopRunner() =
                             stderr.Dispose()
                             ValueTask.CompletedTask }
 
-                started.TrySetResult() |> ignore
                 Task.FromResult(Ok(new RunningProcess(host)))
 
         member _.CaptureStringAsync(_command, _cancellationToken) =
@@ -493,11 +500,20 @@ type HostedProcessTests() =
         : Task =
         task {
             let runner = LateFaultingStopRunner()
-            let mutable unobserved = false
+            let mutable ownFaultUnobserved = 0
 
             let handler =
                 EventHandler<UnobservedTaskExceptionEventArgs>(fun _ args ->
-                    unobserved <- true
+                    let containsOwnFault =
+                        args.Exception.Flatten().InnerExceptions
+                        |> Seq.exists (fun error -> error.Message.Contains "late graceful-kill fault")
+
+                    if containsOwnFault then
+                        Interlocked.Exchange(&ownFaultUnobserved, 1) |> ignore
+
+                    // The event is process-wide, so an unrelated task from an earlier test can also be
+                    // finalized inside this deliberately forced GC window. Observe it without attributing
+                    // it to the uniquely marked stop-task fault this regression owns.
                     args.SetObserved())
 
             TaskScheduler.UnobservedTaskException.AddHandler handler
@@ -529,8 +545,8 @@ type HostedProcessTests() =
                 GC.Collect()
 
                 Assert.That(
-                    unobserved,
-                    Is.False,
+                    Volatile.Read(&ownFaultUnobserved),
+                    Is.EqualTo 0,
                     "the abandoned internal StopAsync task's late fault should be observed, not left unobserved"
                 )
             finally
