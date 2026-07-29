@@ -18,10 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `StopAsync`, pipeline sessions, supervisors, hosted processes, timeout grace, and group shutdown now honor the configured soft-stop signal.
+- `Command.StopSignal` and `ProcessGroupOptions.WithStopSignal` now report invalid graceful-stop signals through one consistent validation contract.
 
 ### Fixed
 - HTTP readiness and liveness probes now reject relative URIs immediately instead of surfacing raw transport errors or restarting healthy children.
 - HTTP readiness probes now reject empty acceptable-status sets and unrepresentable Unix-socket paths instead of silently consuming the full readiness timeout.
+- Failed Windows Job limit updates now restore the previous cumulative CPU-time deadline without granting the process tree a fresh budget.
+- `Command.Retry` now rejects negative delays at the builder boundary instead of silently retrying with no delay.
 
 ## [2.9.1] - 2026-07-26
 

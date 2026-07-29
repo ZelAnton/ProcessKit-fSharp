@@ -315,11 +315,8 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, stopSignal: Signal
 
     /// A copy using `signal` for graceful shutdown before escalation.
     member _.WithStopSignal(signal: Signal) =
-        match signal with
-        | Signal.Kill -> raise (ArgumentException("Signal.Kill is not a graceful stop signal", nameof signal))
-        | Signal.Other number when number <= 0 ->
-            raise (ArgumentOutOfRangeException(nameof signal, signal, "a stop signal must be positive"))
-        | _ -> ProcessGroupOptions(shutdownTimeout, signal, limits)
+        SignalValidation.gracefulStop (nameof signal) signal
+        ProcessGroupOptions(shutdownTimeout, signal, limits)
 
     /// A copy capping the tree's total memory at `bytes`.
     member _.WithMemoryMax(bytes: int64) =

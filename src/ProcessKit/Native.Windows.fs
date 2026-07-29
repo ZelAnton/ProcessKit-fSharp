@@ -1110,6 +1110,31 @@ module internal Windows =
             val mutable IoInfo: IO_COUNTERS
         end
 
+    let private queryWindowsJobUserTime (job: nativeint) : int64 option =
+        let size = Marshal.SizeOf<JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION>()
+        let buffer = Marshal.AllocHGlobal size
+
+        try
+            let mutable returnLength = 0u
+
+            if
+                QueryInformationJobObject(
+                    job,
+                    JobObjectBasicAndIoAccountingInformation,
+                    buffer,
+                    uint32 size,
+                    &returnLength
+                )
+            then
+                let accounting =
+                    Marshal.PtrToStructure<JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION> buffer
+
+                Some accounting.BasicInfo.TotalUserTime
+            else
+                None
+        finally
+            Marshal.FreeHGlobal buffer
+
     /// Snapshot a Job's accounting: active processes, total CPU, peak committed memory, and cumulative
     /// read/write I/O counters. `None` if either query fails (e.g. the job handle was closed). CPU is
     /// user + kernel (100ns units, the same as a `TimeSpan` tick).
@@ -1346,6 +1371,11 @@ module internal Windows =
     [<Literal>]
     let private JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4u
 
+    // Fault injection for the late CPU-rate write, after the extended-limit block has already landed.
+    // Production leaves this unset; the Windows rollback regression tests install and clear it in a
+    // `finally` block so the native rollback path is exercised deterministically.
+    let mutable cpuRateWriteErrorForTests: int option = None
+
     [<StructLayout(LayoutKind.Sequential)>]
     type private JOBOBJECT_CPU_RATE_CONTROL_INFORMATION =
         struct
@@ -1526,22 +1556,25 @@ module internal Windows =
         // replace-semantics "no CPU cap" state); the enable+hard-cap flags with a rate arm the cap. The
         // raw Win32 errno is returned on failure so the caller can classify it (see the `None` branch).
         let writeCpuRate (controlFlags: uint32) (rate: uint32) : Result<unit, int> =
-            let mutable cpuInfo = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
-            cpuInfo.ControlFlags <- controlFlags
-            cpuInfo.CpuRate <- rate
-            let cpuSize = Marshal.SizeOf<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>()
-            let cpuBuffer = Marshal.AllocHGlobal cpuSize
+            match cpuRateWriteErrorForTests with
+            | Some errno -> Error errno
+            | None ->
+                let mutable cpuInfo = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
+                cpuInfo.ControlFlags <- controlFlags
+                cpuInfo.CpuRate <- rate
+                let cpuSize = Marshal.SizeOf<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>()
+                let cpuBuffer = Marshal.AllocHGlobal cpuSize
 
-            try
-                Marshal.StructureToPtr<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>(cpuInfo, cpuBuffer, false)
+                try
+                    Marshal.StructureToPtr<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>(cpuInfo, cpuBuffer, false)
 
-                if SetInformationJobObject(job, JobObjectCpuRateControlInformation, cpuBuffer, uint32 cpuSize) then
-                    Ok()
-                else
-                    // Captured inline, before the `finally` runs any further P/Invoke that could reset it.
-                    Error(Marshal.GetLastWin32Error())
-            finally
-                Marshal.FreeHGlobal cpuBuffer
+                    if SetInformationJobObject(job, JobObjectCpuRateControlInformation, cpuBuffer, uint32 cpuSize) then
+                        Ok()
+                    else
+                        // Captured inline, before the `finally` runs any further P/Invoke that could reset it.
+                        Error(Marshal.GetLastWin32Error())
+                finally
+                    Marshal.FreeHGlobal cpuBuffer
 
         // Serialize an extended-limit block and hand it to `SetInformationJobObject`. Factored out so the
         // SAME primitive both applies the NEW block and restores a captured PRIOR block on a rollback.
@@ -1619,6 +1652,37 @@ module internal Windows =
                 $"{message} (the requested CPU affinity pins the tree to core(s) {listed}; a Job's affinity mask must be a subset of this process's own, so every core named must exist on this host and be available to it)"
             | None -> message
 
+        // Restore a captured extended-limit block without granting the Job fresh CPU time. Windows
+        // interprets a JOB_TIME write as a *remaining* budget and internally adds TotalUserTime, even
+        // though querying the same field returns the absolute deadline. When an unrelated update used
+        // PRESERVE, keep that deadline in place with another PRESERVE write. When the failed update had
+        // changed or removed CpuTimeMax, rebuild the prior absolute deadline from its remaining budget;
+        // accounting can advance between the query and write, so this path has unavoidable sub-tick race
+        // slop, and a fully-consumed prior budget is clamped to the smallest representable positive value.
+        let restoreExtendedLimit (prior: JOBOBJECT_EXTENDED_LIMIT_INFORMATION) =
+            let priorFlags = prior.BasicLimitInformation.LimitFlags
+
+            if priorFlags &&& JOB_OBJECT_LIMIT_JOB_TIME = 0u then
+                writeExtendedLimit prior
+            else
+                let mutable restored = prior
+
+                if preserveJobTime then
+                    restored.BasicLimitInformation.LimitFlags <-
+                        (priorFlags &&& ~~~JOB_OBJECT_LIMIT_JOB_TIME)
+                        ||| JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME
+
+                    restored.BasicLimitInformation.PerJobUserTimeLimit <- 0L
+                    writeExtendedLimit restored
+                else
+                    match queryWindowsJobUserTime job with
+                    | Some used ->
+                        restored.BasicLimitInformation.PerJobUserTimeLimit <-
+                            max 1L (prior.BasicLimitInformation.PerJobUserTimeLimit - used)
+
+                        writeExtendedLimit restored
+                    | None -> Error "could not query the Job's consumed user time for CPU-time rollback"
+
         match extendedLimitBlockFor preserveJobTime limits with
         | Error message ->
             // A pin no Job affinity mask can express. Refused before a single native write, so the Job
@@ -1679,7 +1743,7 @@ module internal Windows =
 
                         match priorExt with
                         | Some prior ->
-                            match writeExtendedLimit prior with
+                            match restoreExtendedLimit prior with
                             | Ok() -> Error(withUiNote cpuMessage uiNote)
                             | Error restoreMessage ->
                                 Error(

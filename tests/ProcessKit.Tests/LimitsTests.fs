@@ -257,6 +257,117 @@ type LimitsTests() =
                     backend.HardRelease()
 
     [<Test>]
+    member _.``Windows rollback preserves an unchanged cumulative CPU-time deadline after a late failure``() =
+        if not isWindows then
+            Assert.Ignore "Windows Job-time rollback contract."
+
+        match Native.Windows.createWindowsJob () with
+        | Error error -> Assert.Fail $"could not create a Job Object: {error}"
+        | Ok job ->
+            let initial = ResourceLimits.None.WithCpuTimeMax(TimeSpan.FromSeconds 30.0)
+
+            match Native.Windows.applyWindowsJobLimits job initial with
+            | Error message ->
+                Native.Windows.closeWindowsHandle job
+                Assert.Fail $"could not establish the Job CPU-time limit: {message}"
+            | Ok() ->
+                let originalDeadline = Native.Windows.queryWindowsJobCpuTimeLimit job
+
+                try
+                    Native.Windows.cpuRateWriteErrorForTests <- Some 5
+
+                    let attempted = initial.WithMemoryMax(256L * 1024L * 1024L).WithCpuQuota 1.0
+
+                    match Native.Windows.applyWindowsJobLimitsPreservingCpuTime job attempted with
+                    | Ok() -> Assert.Fail "the injected CPU-rate failure did not fail the update"
+                    | Error _ ->
+                        Assert.That(
+                            Native.Windows.queryWindowsJobCpuTimeLimit job,
+                            Is.EqualTo originalDeadline,
+                            "rollback granted a fresh cumulative CPU-time budget"
+                        )
+                finally
+                    Native.Windows.cpuRateWriteErrorForTests <- None
+                    Native.Windows.closeWindowsHandle job
+
+    [<Test>]
+    member _.``Windows rollback restores an absolute CPU-time deadline after a failed time-limit change``() : Task =
+        if not isWindows then
+            Assert.Ignore "Windows Job-time rollback contract."
+
+        task {
+            match Native.Windows.createWindowsJob () with
+            | Error error -> Assert.Fail $"could not create a Job Object: {error}"
+            | Ok job ->
+                let initial = ResourceLimits.None.WithCpuTimeMax(TimeSpan.FromSeconds 30.0)
+
+                match Native.Windows.applyWindowsJobLimits job initial with
+                | Error message ->
+                    Native.Windows.closeWindowsHandle job
+                    Assert.Fail $"could not establish the Job CPU-time limit: {message}"
+                | Ok() ->
+                    let backend = JobObjectBackend(job, initial) :> IContainmentBackend
+
+                    use group =
+                        ProcessGroup.FromBackend(
+                            backend,
+                            ProcessGroupOptions().WithCpuTimeMax(TimeSpan.FromSeconds 30.0)
+                        )
+
+                    let busy =
+                        Command.create "powershell.exe"
+                        |> Command.args [ "-NoLogo"; "-NoProfile"; "-NonInteractive"; "-Command"; "while ($true) { }" ]
+
+                    match! group.StartAsync busy with
+                    | Error error -> Assert.Fail $"CPU-bound child failed to start: {error}"
+                    | Ok running ->
+                        use running = running
+                        let accumulation = Diagnostics.Stopwatch.StartNew()
+                        let mutable accumulated = false
+
+                        while not accumulated && accumulation.Elapsed < TimeSpan.FromSeconds 10.0 do
+                            match group.Stats() with
+                            | Ok stats ->
+                                accumulated <-
+                                    stats.TotalCpuTime
+                                    |> Option.exists (fun time -> time >= TimeSpan.FromMilliseconds 250.0)
+                            | Error error -> Assert.Fail $"could not query Job accounting: {error}"
+
+                            if not accumulated then
+                                do! Task.Delay 20
+
+                        if not accumulated then
+                            Assert.Fail "the CPU-bound child did not accumulate enough Job user time"
+
+                        match group.Suspend() with
+                        | Error error -> Assert.Fail $"could not suspend the Job before rollback: {error}"
+                        | Ok() -> ()
+
+                        let originalDeadline = Native.Windows.queryWindowsJobCpuTimeLimit job
+
+                        try
+                            Native.Windows.cpuRateWriteErrorForTests <- Some 5
+
+                            let attempted =
+                                ResourceLimits.None.WithCpuTimeMax(TimeSpan.FromSeconds 60.0).WithCpuQuota 1.0
+
+                            match group.UpdateLimits attempted with
+                            | Ok() -> Assert.Fail "the injected CPU-rate failure did not fail the update"
+                            | Error(ProcessError.ResourceLimit _) ->
+                                Assert.That(
+                                    Native.Windows.queryWindowsJobCpuTimeLimit job,
+                                    Is.EqualTo originalDeadline,
+                                    "rollback rebased the prior absolute deadline as a fresh budget"
+                                )
+                            | Error error -> Assert.Fail $"expected ResourceLimit, got {error}"
+                        finally
+                            Native.Windows.cpuRateWriteErrorForTests <- None
+                            group.Resume() |> ignore
+                            running.Kill()
+        }
+        :> Task
+
+    [<Test>]
     member _.``Windows refuses a custom group stop signal instead of silently replacing it``() =
         if not isWindows then
             Assert.Ignore "Windows-specific representability contract."
@@ -404,13 +515,39 @@ type LimitsTests() =
 
     [<Test>]
     member _.``ProcessGroupOptions.WithStopSignal rejects hard kill and non-deliverable raw numbers``() =
-        Assert.Throws<ArgumentException>(Action(fun () -> ProcessGroupOptions().WithStopSignal Signal.Kill |> ignore))
-        |> ignore
+        let commandKill =
+            try
+                Command("tool").StopSignal Signal.Kill |> ignore
+                failwith "Command.StopSignal accepted Signal.Kill"
+            with :? ArgumentException as error ->
+                error
 
-        Assert.Throws<ArgumentOutOfRangeException>(
-            Action(fun () -> ProcessGroupOptions().WithStopSignal(Signal.Other 0) |> ignore)
-        )
-        |> ignore
+        let groupKill =
+            try
+                ProcessGroupOptions().WithStopSignal Signal.Kill |> ignore
+                failwith "ProcessGroupOptions.WithStopSignal accepted Signal.Kill"
+            with :? ArgumentException as error ->
+                error
+
+        Assert.That(groupKill.Message, Is.EqualTo commandKill.Message)
+        Assert.That(groupKill.ParamName, Is.EqualTo commandKill.ParamName)
+
+        let commandRaw =
+            try
+                Command("tool").StopSignal(Signal.Other 0) |> ignore
+                failwith "Command.StopSignal accepted Signal.Other 0"
+            with :? ArgumentOutOfRangeException as error ->
+                error
+
+        let groupRaw =
+            try
+                ProcessGroupOptions().WithStopSignal(Signal.Other 0) |> ignore
+                failwith "ProcessGroupOptions.WithStopSignal accepted Signal.Other 0"
+            with :? ArgumentOutOfRangeException as error ->
+                error
+
+        Assert.That(groupRaw.Message, Is.EqualTo commandRaw.Message)
+        Assert.That(groupRaw.ParamName, Is.EqualTo commandRaw.ParamName)
 
     [<Test>]
     member _.``a group with no limits behaves as the default mechanism``() : Task =

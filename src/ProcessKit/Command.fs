@@ -1091,23 +1091,8 @@ type Command internal (config: CommandConfig) =
     /// faithfully represent arbitrary POSIX signals; its existing WM_CLOSE/CTRL+BREAK mechanisms remain
     /// available through the documented Windows control APIs.
     member _.StopSignal(signal: Signal) =
-        match signal with
-        | Signal.Kill ->
-            raise (
-                ArgumentException(
-                    "Signal.Kill is not a graceful stop signal; use Kill() or leave StopSignal at Signal.Term",
-                    nameof signal
-                )
-            )
-        | Signal.Other number when number <= 0 ->
-            raise (
-                ArgumentOutOfRangeException(
-                    nameof signal,
-                    signal,
-                    "a graceful stop signal must be a positive, deliverable signal"
-                )
-            )
-        | _ -> Command({ config with StopSignal = signal })
+        SignalValidation.gracefulStop (nameof signal) signal
+        Command({ config with StopSignal = signal })
 
     /// Kill the run when it produces **no output** — on neither stdout nor stderr — for `duration`,
     /// reporting the result as `Outcome.TimedOut`. Every chunk of output resets the deadline, so a run
@@ -1152,9 +1137,11 @@ type Command internal (config: CommandConfig) =
     /// Run the command up to `maxAttempts` times **in total** (the initial run plus up to
     /// `maxAttempts - 1` retries), waiting `delay` between attempts, while `shouldRetry` returns true
     /// for the error. `maxAttempts` of `0` or `1` both mean a single run — a command always runs at
-    /// least once.
+    /// least once. A negative `delay` is rejected; delays beyond the maximum armable timer interval
+    /// are clamped when the retry runs.
     member _.Retry(maxAttempts: int, delay: TimeSpan, shouldRetry: Func<ProcessError, bool>) =
         ArgumentNullException.ThrowIfNull shouldRetry
+        ArgumentOutOfRangeException.ThrowIfLessThan(delay, TimeSpan.Zero)
 
         Command(
             { config with
@@ -1594,7 +1581,8 @@ module Command =
     let cancelOn (cancellationToken: CancellationToken) (command: Command) = command.CancelOn cancellationToken
 
     /// Run the command up to `maxAttempts` times in total (initial run plus retries), waiting `delay`
-    /// between attempts (`0`/`1` both mean a single run).
+    /// between attempts (`0`/`1` both mean a single run). A negative `delay` is rejected; delays
+    /// beyond the maximum armable timer interval are clamped when the retry runs.
     let retry (maxAttempts: int) (delay: TimeSpan) (shouldRetry: ProcessError -> bool) (command: Command) =
         command.Retry(maxAttempts, delay, Func<ProcessError, bool> shouldRetry)
 

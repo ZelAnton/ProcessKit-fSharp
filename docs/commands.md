@@ -839,7 +839,9 @@ Console.WriteLine(await cmd.RunAsync() switch
   retries, and `0`/`1` both mean a single run), waiting `delay` between attempts,
   while your classifier returns `true` for the error (`ProcessError.isTransient`
   covers spawn races and I/O blips). The classifier sees the typed `ProcessError`; a
-  cancelled token stops the loop.
+  cancelled token stops the loop. The delay must be zero or positive; negative
+  values are rejected when the command is built, while values beyond the runtime
+  timer maximum (about 24.8 days) are clamped when armed.
 - **`RetryNever`** explicitly disables retrying for this command — it always runs
   exactly once. This differs from simply never calling `Retry`: a `CliClient` built
   with `WithDefaults(fun c -> c.Retry(...))` applies that default `Retry` to every

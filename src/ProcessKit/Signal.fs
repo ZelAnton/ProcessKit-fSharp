@@ -1,5 +1,7 @@
 namespace ProcessKit
 
+open System
+
 /// A signal delivered to one run via `RunningProcess.Signal` or broadcast through `ProcessGroup.Signal`.
 ///
 /// The curated variants map to the POSIX signal of the same name on Unix. On **Windows** `Kill` maps
@@ -50,3 +52,24 @@ type Signal =
     /// a signal and is refused. Both fail with a typed `ProcessError` (not an exception) — never a
     /// silent success. Always unsupported on Windows.
     | Other of SignalNumber: int
+
+module internal SignalValidation =
+
+    let gracefulStop (paramName: string) (signal: Signal) =
+        match signal with
+        | Signal.Kill ->
+            raise (
+                ArgumentException(
+                    "Signal.Kill is not a graceful stop signal; use a soft signal or leave the default Signal.Term",
+                    paramName
+                )
+            )
+        | Signal.Other number when number <= 0 ->
+            raise (
+                ArgumentOutOfRangeException(
+                    paramName,
+                    signal,
+                    "a graceful stop signal must be a positive, deliverable signal"
+                )
+            )
+        | _ -> ()

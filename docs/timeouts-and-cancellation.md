@@ -300,6 +300,11 @@ plain `ProcessError -> bool` through the module mirror).
 `maxAttempts - 1` retries), so `Retry 3` runs the command at most three times, and
 `0`/`1` both mean a single run — a command always runs at least once.
 
+`delay` must be zero or positive; negative values, including
+`Timeout.InfiniteTimeSpan`, are rejected when the command is built. Delays beyond
+the maximum interval supported by the runtime timer (about 24.8 days) are clamped
+to that interval when armed.
+
 Retry delays use `TimeProvider.System` by default. Tests that need to advance retry time without
 sleeping can attach a deterministic provider with `Command.TimeProvider(provider)` (or
 `Command.timeProvider provider`); the same provider also drives readiness deadlines and a

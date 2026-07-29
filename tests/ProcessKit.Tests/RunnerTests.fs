@@ -117,6 +117,31 @@ type RunnerTests() =
         :> Task
 
     [<Test>]
+    member _.``Retry rejects negative delays at every builder entry point``() =
+        let shouldRetry = Func<ProcessError, bool>(fun _ -> true)
+
+        for delay in [ TimeSpan.FromTicks -1L; Timeout.InfiniteTimeSpan ] do
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () -> Command("svc").Retry(3, delay, shouldRetry) |> ignore)
+            )
+            |> ignore
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () -> Command.create "svc" |> Command.retry 3 delay (fun _ -> true) |> ignore)
+            )
+            |> ignore
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () ->
+                    CliClient("svc").WithDefaults(fun command -> command.Retry(3, delay, shouldRetry))
+                    |> ignore)
+            )
+            |> ignore
+
+        Command("svc").Retry(0, TimeSpan.Zero, shouldRetry) |> ignore
+        Command("svc").Retry(1, TimeSpan.Zero, shouldRetry) |> ignore
+
+    [<Test>]
     member _.``CancelOn interrupts a retry backoff``() : Task =
         task {
             use cancelOn = new CancellationTokenSource()
