@@ -152,6 +152,10 @@ services.AddHealthChecks().Add(
         tags: null));
 ```
 
+For a complete runnable Generic Host example — self-hosted child process, restart policy, keyed
+health reporting through `ILogger`, and graceful Ctrl+C shutdown — see
+[`samples/CSharp.WorkerService`](../samples/CSharp.WorkerService/README.md).
+
 ---
 
 Next: [Platform support](platform-support.md)

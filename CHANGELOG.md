@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Pages navigation now links to the ProcessKit CLI Runner immediately after the Rust implementation.
 - `Command.RetryBackoff` / `Command.retryBackoff` retries one operation with bounded exponential delays and optional jitter, using the command's `TimeProvider`.
 - `Command.ExtraFd` / `Command.extraFd` adds a full-duplex POSIX child channel at file descriptor 3 or greater, claimed once through `RunningProcess.TakeExtraFd`.
+- A runnable C# Generic Host sample demonstrates supervised worker-process restarts, keyed liveness health reporting, logging, and graceful host shutdown.
 - HTTP readiness and liveness probes now accept caller-owned `HttpClient` instances for custom headers, TLS validation, proxies, and transports without transferring ownership.
 - `RunningProcess.Signal` delivers a signal to one run's own contained tree, with matching signal recording in `FakeProcess`.
 - `Command.StopSignal` and `ProcessGroupOptions.WithStopSignal` select the soft signal used before graceful-stop escalation.

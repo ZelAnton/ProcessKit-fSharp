@@ -206,7 +206,8 @@ a narrative guide, browse the generated
 **[API reference](https://zelanton.github.io/ProcessKit-fSharp/api/)** alongside it.
 
 Prefer compiled examples? The [`samples/`](samples/) directory contains runnable F# and C# console
-projects covering capture, streaming readiness, pipelines, supervision, DI, and test doubles.
+projects covering capture, streaming readiness, pipelines, supervision, DI, a hosted worker service,
+health reporting, and test doubles.
 
 | Guide | Covers |
 |---|---|

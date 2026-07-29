@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFrameworks>net10.0</TargetFrameworks>
+		<OutputType>Exe</OutputType>
+		<IsPackable>false</IsPackable>
+		<GenerateDocumentationFile>false</GenerateDocumentationFile>
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.Hosting\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<FrameworkReference Include="Microsoft.AspNetCore.App" />
+		<PackageReference Include="FSharp.Core" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Reference Include="ProcessKit" />
+		<Reference Include="ProcessKit.Extensions.Hosting" />
+	</ItemGroup>
+
+</Project>
