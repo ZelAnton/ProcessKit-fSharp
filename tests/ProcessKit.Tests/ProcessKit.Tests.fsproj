@@ -46,6 +46,7 @@
 		<Compile Include="PtyTests.fs" />
 		<Compile Include="PtySessionTests.fs" />
 		<Compile Include="ContentLengthSessionTests.fs" />
+		<Compile Include="JsonRpcSessionTests.fs" />
 		<Compile Include="StdinInheritTests.fs" />
 		<Compile Include="DetachedLaunchTests.fs" />
 		<Compile Include="CorrectnessBugTests.fs" />

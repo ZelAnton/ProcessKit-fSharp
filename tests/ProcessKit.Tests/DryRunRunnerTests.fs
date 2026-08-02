@@ -106,6 +106,59 @@ type DryRunRunnerTests() =
         }
 
     [<Test>]
+    member _.``SpawnAsync models Command.Pty consistently with ScriptedRunner``() : Task =
+        task {
+            let command = Command.create "tui" |> Command.pty
+            let dryRun: IProcessRunner = DryRunRunner()
+            let scripted: IProcessRunner = ScriptedRunner().On([ "tui" ], Reply.Ok "tui")
+
+            let observe (runner: IProcessRunner) =
+                task {
+                    match! runner.SpawnAsync(command, CancellationToken.None) with
+                    | Error error -> return $"spawn error: {error.Message}", []
+                    | Ok proc ->
+                        use proc = proc
+                        let! resize = proc.ResizeAsync(120, 40)
+
+                        let resizeOutcome =
+                            match resize with
+                            | Ok() -> "ok"
+                            | Error(ProcessError.Unsupported _) -> "unsupported"
+                            | Error error -> $"error: {error.Message}"
+
+                        let events = ResizeArray<string * string>()
+                        let enumerator = proc.OutputEventsAsync().GetAsyncEnumerator()
+                        let mutable more = true
+
+                        while more do
+                            let! has = enumerator.MoveNextAsync()
+
+                            if has then
+                                match enumerator.Current with
+                                | OutputEvent.Stdout line -> events.Add("stdout", line.Text)
+                                | OutputEvent.Stderr line -> events.Add("stderr", line.Text)
+                            else
+                                more <- false
+
+                        do! enumerator.DisposeAsync()
+                        return resizeOutcome, List.ofSeq events
+                }
+
+            let! dryRunObservation = observe dryRun
+            let! scriptedObservation = observe scripted
+            let expected = "ok", [ "stdout", "tui" ]
+
+            let consistencyMessage =
+                "DryRunRunner and ScriptedRunner must expose the same PTY behavior"
+
+            let contractMessage =
+                "a PTY handle must resize successfully and expose only the merged stdout stream"
+
+            Assert.That(dryRunObservation, Is.EqualTo scriptedObservation, consistencyMessage)
+            Assert.That(dryRunObservation, Is.EqualTo expected, contractMessage)
+        }
+
+    [<Test>]
     member _.``a cancelled call is reported as an error and is not recorded``() : Task =
         task {
             let runner = DryRunRunner()

@@ -1174,6 +1174,20 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 Some stream
             | false, _ -> None)
 
+    // The once-only interactive-stdin claim shared by `TakeStdin` and `TakeStdinAsync`. Taken under
+    // `stateLock` so two concurrent callers can't both observe `not stdinTaken` and hand out the same
+    // stream twice. `host.Stdin` is `Some` exactly when the pipe is kept open: `KeepStdinOpen` with no
+    // source, or `KeepStdinOpen` WITH a source (a source WITHOUT `KeepStdinOpen` closes the pipe after
+    // draining, so its `host.Stdin` is `None`). Deliberately claims WITHOUT waiting for the source
+    // feeder: the wait must happen outside `stateLock`, and each caller below picks how to serve it.
+    member private _.ClaimInteractiveStdin() : Stream option =
+        lock stateLock (fun () ->
+            match host.Stdin with
+            | Some stream when config.KeepStdinOpen && not stdinTaken ->
+                stdinTaken <- true
+                Some stream
+            | _ -> None)
+
     /// Take the interactive stdin handle — `Some` only when the command kept stdin open
     /// (`Command.KeepStdinOpen`), and only once. With **no** source it is available immediately; with a
     /// `Command.Stdin(source)` it is available once the background feeder has finished draining that source
@@ -1182,20 +1196,8 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// thread, classic ASP.NET): the source feeder runs detached on the thread pool (see
     /// `Pump.feedStdin`'s `backgroundTask`), so it always makes progress while this thread is blocked here
     /// and is never waiting to post a continuation back to it.
-    member _.TakeStdin() : ProcessStdin option =
-        // Claim the interactive stdin under `stateLock` so two concurrent `TakeStdin` calls can't both
-        // observe `not stdinTaken` and hand out the same stream twice. `host.Stdin` is `Some` exactly when
-        // the pipe is kept open: `KeepStdinOpen` with no source, or `KeepStdinOpen` WITH a source (a source
-        // WITHOUT `KeepStdinOpen` closes the pipe after draining, so its `host.Stdin` is `None`).
-        let claimed =
-            lock stateLock (fun () ->
-                match host.Stdin with
-                | Some stream when config.KeepStdinOpen && not stdinTaken ->
-                    stdinTaken <- true
-                    Some stream
-                | _ -> None)
-
-        match claimed with
+    member this.TakeStdin() : ProcessStdin option =
+        match this.ClaimInteractiveStdin() with
         | Some stream ->
             // Wait — OUTSIDE `stateLock`, so it never blocks other verbs — for the source feeder to finish
             // before handing the stream over. A no-op when there is no source (interactive-only) or nothing
@@ -1205,6 +1207,30 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             host.StdinFeedComplete()
             Some(ProcessStdin(stream, host.Config.StdinEncoding))
         | None -> None
+
+    /// The non-blocking form of `TakeStdin`: the once-only claim above still happens SYNCHRONOUSLY, before
+    /// this returns (so a racing `TakeStdin` still loses, and a caller that gets a task is genuinely the
+    /// owner), but the wait for a `Command.Stdin(source)` feeder to finish draining moves into the returned
+    /// task — served on the thread pool, where parking a thread is safe, instead of on the caller's.
+    ///
+    /// Internal, for `ContentLengthSession`: its constructor claims stdin right after starting the framed
+    /// parse loop, and must return while the frames that loop is already producing are still unread. With a
+    /// bounded frame backlog (`Command.StreamBuffer`) a blocking claim there deadlocks the run — the parse
+    /// loop parks on a full channel whose only consumer is `FramesAsync()`, which the caller cannot reach
+    /// until the constructor returns; the child then blocks writing stdout, stops reading stdin, and the
+    /// very feeder this waits for never finishes.
+    member internal this.TakeStdinAsync() : Task<ProcessStdin option> =
+        match this.ClaimInteractiveStdin() with
+        | Some stream ->
+            task {
+                // The same blocking `host.StdinFeedComplete()` `TakeStdin` performs (it has no async form),
+                // moved onto the pool so awaiting it neither blocks the caller's thread nor needs the
+                // caller's `SynchronizationContext` to pump — the feeder itself already runs detached
+                // there (`Pump.feedStdin`'s `backgroundTask`), so it makes progress regardless.
+                do! Task.Run(fun () -> host.StdinFeedComplete())
+                return Some(ProcessStdin(stream, host.Config.StdinEncoding))
+            }
+        | None -> Task.FromResult None
 
     /// Signal the process tree to die without waiting (fire-and-forget, like `Process.Kill()`); the
     /// tree is fully reaped when the handle is disposed. For a blocking kill, dispose the handle.
@@ -2146,6 +2172,12 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// The `CommandConfig` this handle was started from. Internal: `PtySession` reads the program name
     /// and the terminal encoding from it.
     member internal _.Config: CommandConfig = config
+
+    /// Cancelled once this handle's own teardown begins. Internal: `ContentLengthSession` bounds its
+    /// framed channel's `StreamFullMode.Backpressure` wait (`StreamChannel.writeItem`'s
+    /// `disposalToken`) to this token, the same way `writeStreamItem` above bounds the stdout/event
+    /// channels — so a writer parked on a bounded frame backlog can't outlive an abandoned handle.
+    member internal _.DisposalToken: CancellationToken = disposalCts.Token
 
     /// Whether this run actually has a live pseudo-terminal behind it — what `PtySession` asks before
     /// choosing the carriage return a terminal expects for Enter over a plain pipe's line feed. Read

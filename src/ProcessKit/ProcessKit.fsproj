@@ -79,6 +79,7 @@
 		<Compile Include="ReadinessProbe.fs" />
 		<Compile Include="RunningProcess.fs" />
 		<Compile Include="ContentLengthSession.fs" />
+		<Compile Include="JsonRpcSession.fs" />
 		<Compile Include="PtySession.fs" />
 		<Compile Include="IProcessRunner.fs" />
 		<Compile Include="Runner.fs" />

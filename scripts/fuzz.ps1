@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Pump', 'Cassette')]
+    [ValidateSet('Pump', 'Cassette', 'Framing', 'Ansi')]
     [string] $Target,
 
     [Parameter(Mandatory)]

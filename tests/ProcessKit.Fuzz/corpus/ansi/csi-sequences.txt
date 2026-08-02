@@ -1,0 +1,2 @@
+[31mred[0m plain [1;32mgreen[0m
+[2J[Hcleared screen, cursor home

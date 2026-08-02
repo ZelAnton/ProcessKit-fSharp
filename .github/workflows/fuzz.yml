@@ -49,6 +49,20 @@ jobs:
           -LibFuzzer "$env:RUNNER_TEMP/libfuzzer-dotnet"
           -DurationSeconds 45 -SkipBuild
 
+      - name: Fuzz Content-Length framing
+        shell: pwsh
+        run: >-
+          ./scripts/fuzz.ps1 -Target Framing
+          -LibFuzzer "$env:RUNNER_TEMP/libfuzzer-dotnet"
+          -DurationSeconds 45 -SkipBuild
+
+      - name: Fuzz ANSI escape filter
+        shell: pwsh
+        run: >-
+          ./scripts/fuzz.ps1 -Target Ansi
+          -LibFuzzer "$env:RUNNER_TEMP/libfuzzer-dotnet"
+          -DurationSeconds 45 -SkipBuild
+
       - name: Upload fuzz findings
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

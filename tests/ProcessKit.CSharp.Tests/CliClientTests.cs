@@ -15,4 +15,14 @@ public class CliClientTests
         Assert.That(exception!.ParamName, Is.EqualTo("configure"));
         Assert.That(exception.Message, Does.Contain("configure"));
     }
+
+    [Test]
+    public void WithDefaults_changes_program_throws_ArgumentException()
+    {
+        var exception = Assert.Throws<ArgumentException>(() =>
+            new CliClient("tool").WithDefaults(_ => new Command("other-program")));
+
+        Assert.That(exception!.Message, Does.Contain("tool"));
+        Assert.That(exception.Message, Does.Contain("other-program"));
+    }
 }
