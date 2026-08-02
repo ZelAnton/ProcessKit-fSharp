@@ -300,6 +300,59 @@ type private GatedCaptureRunner() =
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             failwith "GatedCaptureRunner only scripts CaptureString"
 
+/// A spawn-capable runner whose every `SpawnAsync` fails with a *transient* error, so an incarnation
+/// ends without ever producing a `ProcessResult` — the state in which the supervision loop backs off
+/// holding no result to report. Counts its spawn attempts, so an incarnation launched despite a
+/// graceful stop is observable rather than silent.
+type private TransientSpawnFailureRunner() =
+    let mutable spawns = 0
+
+    member _.Spawns = Volatile.Read(&spawns)
+
+    interface IProcessRunner with
+        member _.SpawnAsync(command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
+            Interlocked.Increment(&spawns) |> ignore
+            Task.FromResult(Error(ProcessError.Spawn(command.Program, "scripted transient spawn failure")))
+
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "TransientSpawnFailureRunner uses SpawnAsync"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "TransientSpawnFailureRunner uses SpawnAsync"))
+
+/// A capture-only runner (the documented `NotSupportedException` capability marker) whose first
+/// incarnation fails transiently — producing no `ProcessResult` — while any later one runs to a full,
+/// successful completion. Counting the calls makes an extra incarnation observable rather than silent.
+type private TransientThenSuccessCaptureRunner() =
+    let mutable captures = 0
+
+    member _.Captures = Volatile.Read(&captures)
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(command, _cancellationToken) =
+            if Interlocked.Increment(&captures) = 1 then
+                Task.FromResult(Error(ProcessError.Io "scripted transient capture failure"))
+            else
+                Task.FromResult(
+                    Ok(
+                        ProcessResult<string>(
+                            command.Program,
+                            "extra incarnation ran",
+                            "",
+                            Outcome.Exited 0,
+                            TimeSpan.Zero,
+                            false,
+                            [ 0 ]
+                        )
+                    )
+                )
+
+        member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
+            raise (NotSupportedException "TransientThenSuccessCaptureRunner only scripts CaptureString")
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "TransientThenSuccessCaptureRunner only scripts CaptureString"
+
 /// A runner whose live-spawn primitive has a genuine synchronous bug. Its capture primitive is valid
 /// only so the regression can prove the supervisor does not silently fall back to it.
 type private FaultingSpawnRunner() =
@@ -1410,6 +1463,162 @@ type SupervisorTests() =
             | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
 
             Assert.That(session.Status.IsActive, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a graceful stop before any incarnation result ends supervision without spawning another child``
+        ()
+        : Task =
+        task {
+            let runner = TransientSpawnFailureRunner()
+
+            let inBackoff =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            // Every spawn fails transiently, so the loop parks in a long, jitter-free backoff holding NO
+            // incarnation result at all — the state in which a graceful stop used to fall through to a
+            // fresh incarnation and launch one more child only to stop it again.
+            let supervisor =
+                Supervisor(Command.create "worker")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.FromSeconds 30.0, 1.0)
+                    .Jitter(false)
+                    .OnRestart(fun _ -> inBackoff.TrySetResult() |> ignore)
+
+            let! session = supervisor.StartAsync()
+            do! waitUntil "the loop parked in its post-failure backoff" (fun () -> inBackoff.Task.IsCompleted)
+
+            let! outcome = session.StopAsync(TimeSpan.Zero)
+
+            // No incarnation ever produced a result, so there is none to report: supervision ends with the
+            // honest terminal error rather than a fabricated `SupervisionOutcome`.
+            match outcome with
+            | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "worker")
+            | other -> Assert.Fail $"a stop with no incarnation result must end with Cancelled, got {other}"
+
+            Assert.That(runner.Spawns, Is.EqualTo 1, "a graceful stop must not spawn a further incarnation")
+            Assert.That(session.Status.IsActive, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopActiveAsync before any incarnation result ends a capture-only session without another run``
+        ()
+        : Task =
+        task {
+            let runner = TransientThenSuccessCaptureRunner()
+
+            let inBackoff =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            // A capture-only runner exposes no live handle, and its `CaptureStringAsync` fallback has no
+            // stop path at all: an incarnation started after the stop would run the whole child out,
+            // hanging the shutdown behind it.
+            let supervisor =
+                Supervisor(Command.create "worker")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.FromSeconds 30.0, 1.0)
+                    .Jitter(false)
+                    .OnRestart(fun _ -> inBackoff.TrySetResult() |> ignore)
+
+            let! session = supervisor.StartAsync()
+            do! waitUntil "the loop parked in its post-failure backoff" (fun () -> inBackoff.Task.IsCompleted)
+
+            // The hosting wrapper stops through this internal seam (`HostedProcessService.StopAsync`): it
+            // finds no live child here, so ending the loop is entirely up to the pre-spawn stop check.
+            let! stopped = session.StopActiveAsync(TimeSpan.Zero, CancellationToken.None)
+            Assert.That(stopped.IsNone, Is.True, "a capture-only session has no live child to stop")
+
+            let! outcome = session.Completion
+
+            match outcome with
+            | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "worker")
+            | other -> Assert.Fail $"a stop with no incarnation result must end with Cancelled, got {other}"
+
+            Assert.That(runner.Captures, Is.EqualTo 1, "a graceful stop must not start a further incarnation")
+            Assert.That(session.Status.IsActive, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a graceful stop taken before the first incarnation never spawns a child``() : Task =
+        task {
+            // `StartAsync` returns while the loop is still parked on its opening `Task.Yield()`, so a stop
+            // requested immediately afterwards normally lands before the first spawn. Whether it does is a
+            // genuine race against the pool thread resuming the loop, so each attempt asserts the invariant
+            // for whichever side won, and the attempts repeat until the stop has provably won at least once
+            // — which it never can before the fix, where the loop spawned regardless of the pending stop.
+            let mutable stopsBeforeFirstSpawn = 0
+
+            for _ in 1..50 do
+                let runner = LivenessChildRunner()
+
+                let supervisor =
+                    Supervisor(Command.create "worker").WithRunner(runner).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+                let! session = supervisor.StartAsync()
+                let! outcome = session.StopAsync(TimeSpan.FromMilliseconds 100.0)
+
+                match runner.Spawns with
+                | 0 ->
+                    // The stop landed first: supervision ended without ever launching a child.
+                    stopsBeforeFirstSpawn <- stopsBeforeFirstSpawn + 1
+
+                    match outcome with
+                    | Error(ProcessError.Cancelled _) -> ()
+                    | other -> Assert.Fail $"a stop before the first spawn must end with Cancelled, got {other}"
+                | spawns ->
+                    // The loop won the race and published exactly that one child, which the pending stop
+                    // then ended through its own graceful path; no second incarnation may follow it.
+                    Assert.That(spawns, Is.EqualTo 1, "a pending graceful stop must not spawn a further child")
+
+            Assert.That(
+                stopsBeforeFirstSpawn,
+                Is.GreaterThan 0,
+                "a stop requested right after StartAsync must be able to end supervision before the first spawn"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a graceful stop taken before the first incarnation never starts a capture-only run``() : Task =
+        task {
+            // The same race on the capture-only fallback path, which has no stop of its own: an incarnation
+            // started after the stop runs to completion regardless, so it must never be started at all. The
+            // long backoff keeps a lost race from running a second incarnation for unrelated reasons.
+            let mutable stopsBeforeFirstCapture = 0
+
+            for _ in 1..50 do
+                let runner = TransientThenSuccessCaptureRunner()
+
+                let supervisor =
+                    Supervisor(Command.create "worker")
+                        .WithRunner(runner)
+                        .Backoff(TimeSpan.FromSeconds 30.0, 1.0)
+                        .Jitter(false)
+
+                let! session = supervisor.StartAsync()
+                let! outcome = session.StopAsync(TimeSpan.Zero)
+
+                match runner.Captures with
+                | 0 ->
+                    // The stop landed before the loop reached its first incarnation: nothing ran at all.
+                    stopsBeforeFirstCapture <- stopsBeforeFirstCapture + 1
+
+                    match outcome with
+                    | Error(ProcessError.Cancelled _) -> ()
+                    | other -> Assert.Fail $"a stop before the first incarnation must end with Cancelled, got {other}"
+                | captures ->
+                    // The loop won the race and ran exactly its first, transiently failing incarnation; the
+                    // pending stop must not add a second one on top of it.
+                    Assert.That(captures, Is.EqualTo 1, "a pending graceful stop must not start a further run")
+
+            Assert.That(
+                stopsBeforeFirstCapture,
+                Is.GreaterThan 0,
+                "a stop requested right after StartAsync must be able to end supervision before the first capture"
+            )
         }
         :> Task
 

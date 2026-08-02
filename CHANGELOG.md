@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A performance and scalability guide documents event-driven waits, buffer tuning, fleet sizing, and benchmark interpretation.
 
 ### Fixed
+- A supervision session stopped before any incarnation produced a result now ends without starting one more child, reporting `ProcessError.Cancelled` instead of a fabricated outcome.
 - Supervisor restarts now apply the restart policy to typed live-output pump failures and retain liveness-failure attribution without leaking it to later children.
 - Process-testing doubles now honour `Command.CancelOn` consistently for completion verbs.
 - `PtySession` now rejects null options with `ArgumentNullException` at its public entry points.

@@ -855,16 +855,28 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 while final.IsNone do
                     if cancellationToken.IsCancellationRequested then
                         final <- Some(Error(ProcessError.Cancelled program))
-                    elif isStopping () && lastResult.IsSome then
-                        // A graceful stop was requested while between incarnations (a backoff / storm
-                        // sleep was just interrupted by `stopCts`): end now with the last incarnation's
-                        // result rather than start another one.
+                    elif isStopping () then
+                        // A graceful stop is pending and no child is live right now — it was requested
+                        // before the first incarnation was ever spawned, or it interrupted the backoff /
+                        // storm sleep between two of them. Deciding HERE, *before* the spawn, is what
+                        // actually keeps a stop from launching one more child only to stop it again (and,
+                        // on a capture-only runner, from running a whole extra incarnation to completion
+                        // with no stop path at all). Checked independently of `lastResult`, because a
+                        // supervision that has not produced a result yet is exactly the case that used to
+                        // fall through to another incarnation.
                         match lastResult with
                         | Some last ->
+                            // At least one incarnation completed: report its honest result under
+                            // `Stopped`, same as a stop observed right after an incarnation ended.
                             final <- Some(Ok(SupervisionOutcome(last, restarts, StopReason.Stopped, stormPauses)))
                         | None ->
-                            // The guard above proves this unreachable; continue if concurrent state changes.
-                            ()
+                            // Nothing has ever produced a `ProcessResult`, so there is no honest
+                            // `SupervisionOutcome` to report — and fabricating one would invent a child
+                            // that never ran. Surface a terminal error instead, exactly as a stop does
+                            // when the incarnation it ended produced no result either (see the `Error`
+                            // branch below). `Cancelled` is the existing terminal "ended before it
+                            // produced anything" shape the loop already reports for a cancelled run.
+                            final <- Some(Error(ProcessError.Cancelled program))
                     else
                         match! captureIncarnation command with
                         | Ok result ->
@@ -1015,9 +1027,14 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
 
     /// Request a graceful stop with `gracePeriod`: stop the current live incarnation through its own
     /// graceful path (`RunningProcess.StopAsync`, honouring the grace window) and end the supervision
-    /// loop with `StopReason.Stopped` — reported as a normal `SupervisionOutcome`, never a crash or a
-    /// cancellation error. Interrupts an in-flight backoff / storm pause so a stop taken between
-    /// incarnations also ends promptly. Idempotent and race-safe against the loop and repeat calls.
+    /// loop with `StopReason.Stopped` — reported as a normal `SupervisionOutcome`, never a crash and
+    /// never a token cancellation. Interrupts an in-flight backoff / storm pause so a stop taken between
+    /// incarnations also ends promptly, and never launches a further incarnation. A stop that lands
+    /// before *any* incarnation has produced a result — before the very first spawn, or while backing
+    /// off after runs that only ever failed to start — has no result to report and no child of its own
+    /// to stop; supervision then ends with `Error(ProcessError.Cancelled)` rather than starting one more
+    /// child just to manufacture a `SupervisionOutcome`. Idempotent and race-safe against the loop and
+    /// repeat calls.
     /// Returns the session's `Completion`, so a caller can `await` the final outcome directly. A
     /// negative `gracePeriod` is rejected with `ArgumentOutOfRangeException`; `TimeSpan.Zero` escalates
     /// the child kill immediately.
@@ -1036,8 +1053,13 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 let! _ = running.StopAsync gracePeriod
                 return! completion
             | None ->
-                // No live child right now (capture-only runner, or a between-incarnations stop): the
-                // `stopping` flag + the `stopCts` cancellation above end the loop on their own.
+                // No live child to stop right now: a stop taken before the first spawn, between
+                // incarnations, or against a capture-only runner. The `stopCts` cancellation above cuts
+                // any in-flight backoff / storm sleep short, and it is the loop's own pre-spawn
+                // `isStopping ()` check that then ends supervision — without starting another
+                // incarnation. (A capture-only incarnation already in flight has no graceful stop path,
+                // so the loop ends through its ordinary post-capture stop branch once that capture
+                // returns.)
                 return! completion
         }
 
