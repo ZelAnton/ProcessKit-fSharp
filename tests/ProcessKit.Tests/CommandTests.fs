@@ -1,12 +1,20 @@
 namespace ProcessKit.Tests
 
 open System
+open System.IO
 open System.Runtime.InteropServices
 open NUnit.Framework
 open ProcessKit
 
 [<TestFixture>]
 type CommandTests() =
+
+    let assertArgumentExceptionMessages (expectedMessages: string list) (action: Action) =
+        match Assert.Throws<ArgumentException>(action) with
+        | null -> Assert.Fail "expected an ArgumentException"
+        | error ->
+            for expectedMessage in expectedMessages do
+                Assert.That(error.Message, Does.Contain expectedMessage)
 
     [<Test>]
     member _.``create sets the program``() =
@@ -114,6 +122,81 @@ type CommandTests() =
               Command.create("tool").Stdout(StdioMode.Null).Stderr(StdioMode.Null).Pty().IdleTimeout(idle) ]
 
         Assert.That(List.length commands, Is.EqualTo 4)
+
+    [<Test>]
+    member _.``stdout Null and Inherit reject handlers and tees set afterwards``() =
+        for mode in [ StdioMode.Null; StdioMode.Inherit ] do
+            let command = Command.create("tool").Stdout(mode)
+
+            assertArgumentExceptionMessages
+                [ "OnStdoutLine cannot be combined with Stdout(Null) or Stdout(Inherit)"
+                  "no separate parent-side stream" ]
+                (Action(fun () -> command.OnStdoutLine(Action<string>(fun _ -> ())) |> ignore))
+
+            use sink = new MemoryStream()
+
+            assertArgumentExceptionMessages
+                [ "StdoutTee cannot be combined with Stdout(Null) or Stdout(Inherit)"
+                  "no separate parent-side stream" ]
+                (Action(fun () -> command.StdoutTee(sink) |> ignore))
+
+    [<Test>]
+    member _.``stdout Null and Inherit reject handlers and tees set beforehand``() =
+        let withHandler = Command.create("tool").OnStdoutLine(Action<string>(fun _ -> ()))
+        use sink = new MemoryStream()
+        let withTee = Command.create("tool").StdoutTee(sink)
+
+        for mode in [ StdioMode.Null; StdioMode.Inherit ] do
+            assertArgumentExceptionMessages
+                [ "OnStdoutLine cannot be combined with Stdout(Null) or Stdout(Inherit)" ]
+                (Action(fun () -> withHandler.Stdout(mode) |> ignore))
+
+            assertArgumentExceptionMessages
+                [ "StdoutTee cannot be combined with Stdout(Null) or Stdout(Inherit)" ]
+                (Action(fun () -> withTee.Stdout(mode) |> ignore))
+
+    [<Test>]
+    member _.``stderr Null and Inherit reject handlers and tees set afterwards``() =
+        for mode in [ StdioMode.Null; StdioMode.Inherit ] do
+            let command = Command.create("tool").Stderr(mode)
+
+            assertArgumentExceptionMessages
+                [ "OnStderrLine cannot be combined with Stderr(Null) or Stderr(Inherit)"
+                  "no separate parent-side stream" ]
+                (Action(fun () -> command.OnStderrLine(Action<string>(fun _ -> ())) |> ignore))
+
+            use sink = new MemoryStream()
+
+            assertArgumentExceptionMessages
+                [ "StderrTee cannot be combined with Stderr(Null) or Stderr(Inherit)"
+                  "no separate parent-side stream" ]
+                (Action(fun () -> command.StderrTee(sink) |> ignore))
+
+    [<Test>]
+    member _.``stderr Null and Inherit reject handlers and tees set beforehand``() =
+        let withHandler = Command.create("tool").OnStderrLine(Action<string>(fun _ -> ()))
+        use sink = new MemoryStream()
+        let withTee = Command.create("tool").StderrTee(sink)
+
+        for mode in [ StdioMode.Null; StdioMode.Inherit ] do
+            assertArgumentExceptionMessages
+                [ "OnStderrLine cannot be combined with Stderr(Null) or Stderr(Inherit)" ]
+                (Action(fun () -> withHandler.Stderr(mode) |> ignore))
+
+            assertArgumentExceptionMessages
+                [ "StderrTee cannot be combined with Stderr(Null) or Stderr(Inherit)" ]
+                (Action(fun () -> withTee.Stderr(mode) |> ignore))
+
+    [<Test>]
+    member _.``stderr Null remains valid with stdout handlers and tees``() =
+        use sink = new MemoryStream()
+
+        let command =
+            Command.create("tool").Stderr(StdioMode.Null).OnStdoutLine(Action<string>(fun _ -> ())).StdoutTee(sink)
+
+        Assert.That(command.Config.StderrMode, Is.EqualTo StdioMode.Null)
+        Assert.That(command.Config.OnStdoutLine.IsSome, Is.True)
+        Assert.That(command.Config.StdoutTee.Value, Is.SameAs sink)
 
     [<Test>]
     member _.``preferLocal accumulates directories in the order added``() =

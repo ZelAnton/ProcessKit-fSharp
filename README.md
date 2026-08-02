@@ -61,7 +61,8 @@ signal to one pid:
   configured total, idle, or pipeline deadline that fired, while `ProcessResult.Duration` remains
   actual wall-clock time including teardown. If a custom `IProcessRunner` returns `Outcome.TimedOut`
   without that internal cause, the configured duration is unknown and the error honestly falls back
-  to the result's actual elapsed duration.
+  to the result's actual elapsed duration. Output handlers and tees are rejected with
+  `StdioMode.Null`/`Inherit`, where no parent-side stream exists for them to observe.
 - **Testable.** One interface seam (`IProcessRunner`) swaps the real spawner for scripted doubles,
   deterministic fault injection, or record/replay cassettes — no subprocess in your tests.
 
