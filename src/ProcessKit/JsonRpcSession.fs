@@ -106,9 +106,9 @@ type private DropCounter() =
     member _.Value = Interlocked.Read(&value)
 
 /// A typed JSON-RPC 2.0 conversation with a child process that speaks `Content-Length`-framed JSON — a
-/// language server (LSP), a debug adapter (DAP), a build server (BSP), or an MCP-style tool. It is the
-/// layer above `ContentLengthSession`: that type frames bytes, this one serializes values, allocates and
-/// correlates request ids, separates answers from notifications, and bounds the wait for a reply.
+/// language server (LSP), a build server (BSP), or an MCP-style tool. It is the layer above
+/// `ContentLengthSession`: that type frames bytes, this one serializes values, allocates and correlates
+/// request ids, separates answers from notifications, and bounds a call end to end.
 ///
 /// ```fsharp
 /// task {
@@ -125,6 +125,12 @@ type private DropCounter() =
 ///         | Error err -> eprintfn $"{err.Message}"
 /// }
 /// ```
+///
+/// **Not a debug-adapter (DAP) client.** DAP borrows LSP's `Content-Length` framing but not its
+/// envelope: its messages look like `{"seq":1,"type":"request","command":"next","arguments":{}}` — no
+/// `jsonrpc`, no `method`, no `id` — so they are not JSON-RPC, and this session ends on the first one
+/// with `ProcessError.Parse` rather than guessing. Drive a debug adapter with `ContentLengthSession`
+/// directly and decode that envelope yourself.
 ///
 /// **This session owns the run's framed transport.** Constructing it creates the one
 /// `ContentLengthSession` over the handle and immediately claims its frames, so the handle's stdout
@@ -143,9 +149,16 @@ type private DropCounter() =
 ///
 /// - the peer answered with an `error` object — `ProcessError.JsonRpc`, carrying its `code`, `message`,
 ///   and the raw JSON of `data`;
-/// - the request timed out — `ProcessError.Timeout` (per-request overloads only; without one a request
-///   waits until the peer answers, the peer's output ends, or the caller's token fires);
+/// - the request timed out — `ProcessError.Timeout` (per-request overloads only; the budget covers the
+///   whole call, writing the frame included, so a peer that stopped reading its own stdin cannot hang
+///   one. Without a timeout a request waits until the peer answers, the peer's output ends, or the
+///   caller's token fires);
 /// - the caller's `CancellationToken` fired — `ProcessError.Cancelled`;
+/// - either of those two interrupted a send: the frame may have reached the peer truncated, and no peer
+///   can resynchronize from that, so the failure also ends the conversation — pending requests fail with
+///   it and every later request/send reports it instead of writing into a stream the peer can no longer
+///   read. A torn *outgoing* frame does not corrupt what the peer says, so `MessagesAsync` keeps
+///   delivering incoming messages until the peer's output ends;
 /// - the peer's framed output ended (it exited, or closed stdout) while a request was pending —
 ///   `ProcessError.Io`, and every later verb fails the same way instead of waiting forever;
 /// - the peer sent something that is not a JSON-RPC message — `ProcessError.Parse`, which ends the whole
@@ -285,6 +298,19 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
 
     let currentFault () = lock gate (fun () -> ended)
 
+    // A send the caller's token or a request's deadline interrupted may have written only PART of a
+    // frame — the framing layer says exactly that ("abandon the session after it"), and a peer stuck
+    // mid-parse of a truncated payload reads whatever follows as the rest of that payload. Nothing sent
+    // afterwards can be understood, so the interruption becomes the session's terminal failure instead
+    // of a per-call error that pretends the conversation can continue. Other send failures tore nothing:
+    // `Unsupported` never wrote a byte, and a broken pipe is reported by the router when the peer's
+    // output ends.
+    let endTornSend (error: ProcessError) =
+        match error with
+        | ProcessError.Cancelled _
+        | ProcessError.Timeout _ -> endSession error
+        | _ -> ()
+
     // Decode one frame and either complete the request waiting for it or queue it for `MessagesAsync`.
     // Anything that is not a JSON-RPC message raises, ending the session (see the type's doc comment).
     let handleFrame (payload: byte[]) =
@@ -298,8 +324,8 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
         let root = document.RootElement
 
         if root.ValueKind <> JsonValueKind.Object then
-            // A JSON-RPC batch (an array) lands here too: LSP and DAP both forbid batching, and
-            // answering half a batch would be worse than refusing it.
+            // A JSON-RPC batch (an array) lands here too: LSP forbids batching, and answering half a
+            // batch would be worse than refusing it.
             raise (protocolFault "the peer sent a frame whose JSON root is not an object")
 
         let property (name: string) =
@@ -445,32 +471,34 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
         writer.Flush()
         buffer.WrittenSpan.ToArray()
 
-    // Wait for the answer to an already-sent request, bounded by `timeout` (when given) and the caller's
-    // token. Whichever ends the wait, the waiter is removed so a late answer is discarded rather than
-    // completing a call that has already reported a failure.
+    // Every outgoing frame goes through here so an interrupted write ends the session exactly once, in
+    // one place, whatever it was carrying (see `endTornSend`).
+    member private _.SendFramed
+        (payload: byte[], cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        task {
+            match! transport.SendAsync(payload, cancellationToken) with
+            | Ok() -> return Ok()
+            | Error error ->
+                endTornSend error
+                return Error error
+        }
+
+    // Wait for the answer to an already-sent request under the call's own deadline (`armed`, ticking
+    // since before the frame was written) and the caller's token, both already folded into `linkedToken`.
+    // Whichever ends the wait, the waiter is removed so a late answer is discarded rather than completing
+    // a call that has already reported a failure.
     member private _.AwaitAnswer
         (
             id: int64,
             completion: TaskCompletionSource<Result<string, ProcessError>>,
-            timeout: TimeSpan option,
+            armed: TimeSpan option,
+            linkedToken: CancellationToken,
             cancellationToken: CancellationToken
         ) : Task<Result<string, ProcessError>> =
         task {
-            // Clamped so an out-of-range span cannot throw out of the CTS constructor, and the CLAMPED
-            // value is what `ProcessError.Timeout` reports — the same rule the readiness probes follow,
-            // so a reported budget is always the one that was actually enforced.
-            let armed = timeout |> Option.map Timeouts.clampArmable
-
-            use deadline =
-                match armed with
-                | Some span -> new CancellationTokenSource(span, config.TimeProvider)
-                | None -> new CancellationTokenSource()
-
-            use linked =
-                CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, cancellationToken)
-
             try
-                return! completion.Task.WaitAsync linked.Token
+                return! completion.Task.WaitAsync linkedToken
             with :? OperationCanceledException ->
                 takePending id |> ignore
 
@@ -486,7 +514,8 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
                     | None -> return Error(ProcessError.Cancelled program)
         }
 
-    // The one request path: allocate an id, register the waiter, send the frame, wait for the answer.
+    // The one request path: allocate an id, register the waiter, arm the call's deadline, send the frame,
+    // wait for the answer.
     member private this.RequestCore
         (
             methodName: string,
@@ -517,11 +546,42 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
         | Error error -> Task.FromResult(Error error)
         | Ok() ->
             task {
-                match! transport.SendAsync(payload, cancellationToken) with
+                // Clamped so an out-of-range span cannot throw out of the CTS constructor, and the
+                // CLAMPED value is what `ProcessError.Timeout` reports — the same rule the readiness
+                // probes follow, so a reported budget is always the one that was actually enforced.
+                let armed = timeout |> Option.map Timeouts.clampArmable
+
+                // Armed BEFORE the frame is written, and kept for the wait that follows, so ONE budget
+                // covers the whole call. Writing is not free time: a peer that stopped reading its stdin
+                // blocks the write as soon as the pipe buffer fills, and a deadline that started only
+                // after a successful send would never fire on the very peer it was passed for.
+                use deadline =
+                    match armed with
+                    | Some span -> new CancellationTokenSource(span, config.TimeProvider)
+                    | None -> new CancellationTokenSource()
+
+                use linked =
+                    CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, cancellationToken)
+
+                match! transport.SendAsync(payload, linked.Token) with
                 | Error error ->
                     takePending id |> ignore
-                    return Error error
-                | Ok() -> return! this.AwaitAnswer(id, completion, timeout, cancellationToken)
+
+                    // The framing layer reports both interruptions as `Cancelled` — it only ever sees one
+                    // token — so who ended the send is decided here: this call's deadline is a timeout,
+                    // the caller's token a cancellation.
+                    let reported =
+                        match error, armed with
+                        | ProcessError.Cancelled _, Some span when
+                            deadline.IsCancellationRequested
+                            && not cancellationToken.IsCancellationRequested
+                            ->
+                            ProcessError.Timeout(program, span, "", "")
+                        | _ -> error
+
+                    endTornSend reported
+                    return Error reported
+                | Ok() -> return! this.AwaitAnswer(id, completion, armed, linked.Token, cancellationToken)
             }
 
     // Deserialize a request's raw `result` text into `'R`, reporting a value that does not fit as
@@ -563,7 +623,7 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
                         write writer
                     | None -> ())
 
-            transport.SendAsync(payload, cancellationToken)
+            this.SendFramed(payload, cancellationToken)
 
     member private this.SendResponse
         (request: JsonRpcMessage, writeBody: Utf8JsonWriter -> unit, cancellationToken: CancellationToken)
@@ -579,15 +639,21 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
                 )
             )
         | Some id ->
-            let payload =
-                this.Encode(fun writer ->
-                    writer.WritePropertyName "id"
-                    // Already-valid JSON: it came verbatim from the peer's own frame, so it is echoed
-                    // without re-validating (a string id keeps its quotes, a numeric one its shape).
-                    writer.WriteRawValue(id, true)
-                    writeBody writer)
+            // Checked here as it is for a notification: once the conversation is over — the peer stopped
+            // speaking the protocol, its output ended, or a send was torn mid-frame — an answer written
+            // into that stream would be pretending otherwise.
+            match currentFault () with
+            | Some error -> Task.FromResult(Error error)
+            | None ->
+                let payload =
+                    this.Encode(fun writer ->
+                        writer.WritePropertyName "id"
+                        // Already-valid JSON: it came verbatim from the peer's own frame, so it is echoed
+                        // without re-validating (a string id keeps its quotes, a numeric one its shape).
+                        writer.WriteRawValue(id, true)
+                        writeBody writer)
 
-            transport.SendAsync(payload, cancellationToken)
+                this.SendFramed(payload, cancellationToken)
 
     // ---- session state --------------------------------------------------------------------------
 
@@ -623,7 +689,7 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
     /// no `JsonTypeInfo` is needed, so it is always trim-/NativeAOT-safe, and a `result` of `null` comes
     /// back as the text `"null"` rather than failing a typed read.
     ///
-    /// Without a timeout the wait ends when the peer answers, its output ends, or `cancellationToken`
+    /// Without a timeout the call ends when the peer answers, its output ends, or `cancellationToken`
     /// fires — pass a timeout (or a token) for a peer that may go silent while still running.
     member this.RequestRawAsync
         (methodName: string, parametersJson: string | null, [<Optional>] cancellationToken: CancellationToken)
@@ -631,8 +697,10 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
         ArgumentException.ThrowIfNullOrEmpty(methodName, nameof methodName)
         this.RequestCore(methodName, JsonRpcSession.RawParams parametersJson, None, cancellationToken)
 
-    /// Like the overload above, but the wait is bounded by `timeout`: an unanswered request then fails
-    /// with `ProcessError.Timeout` and its waiter is dropped, so a late answer is discarded.
+    /// Like the overload above, but the whole call is bounded by `timeout` — writing the frame as well as
+    /// waiting for the answer, so a peer that stopped reading its stdin cannot hang it either. The call
+    /// then fails with `ProcessError.Timeout` and its waiter is dropped, so a late answer is discarded; a
+    /// send the deadline interrupted may have been truncated, and ends the session (see the type's docs).
     member this.RequestRawAsync
         (
             methodName: string,
@@ -671,8 +739,8 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
             JsonRpcSession.TypedResult resultTypeInfo
         )
 
-    /// Like the overload above, but the wait is bounded by `timeout` (`ProcessError.Timeout` when it
-    /// elapses).
+    /// Like the overload above, but the whole call is bounded by `timeout` — writing the frame as well as
+    /// waiting for the answer (`ProcessError.Timeout` when it elapses).
     member this.RequestAsync<'P, 'R>
         (
             methodName: string,
@@ -719,8 +787,8 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
             JsonRpcSession.ReflectedResult options
         )
 
-    /// Like the overload above, but the wait is bounded by `timeout` (`ProcessError.Timeout` when it
-    /// elapses).
+    /// Like the overload above, but the whole call is bounded by `timeout` — writing the frame as well as
+    /// waiting for the answer (`ProcessError.Timeout` when it elapses).
     ///
     /// **Trimming / AOT:** not trim-/AOT-safe — use the `JsonTypeInfo` overloads (or `RequestRawAsync`)
     /// in a trimmed/NativeAOT app.
