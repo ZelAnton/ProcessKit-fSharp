@@ -33,44 +33,48 @@ The files currently compile in this exact order. The headings are architectural 
 19. `Stats.fs` — group/run statistics and samplers.
 20. `Stdin.fs` — stdin source model.
 21. `Timeouts.fs` — timeout normalization.
-22. `Priority.fs` — priority model and native mapping.
-23. `LineTerminator.fs` — line-ending rules.
-24. `Command.fs` — immutable command configuration and builder API.
-25. `MemberInfo.fs` — per-member identity snapshot of a contained tree.
-26. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
+22. `Backoff.fs` — exponential-backoff and jitter math for retries and supervision.
+23. `Priority.fs` — priority model and native mapping.
+24. `LineTerminator.fs` — line-ending rules.
+25. `RotatingFileSink.fs` — size-rotating tee sink for long-lived logs.
+26. `Command.fs` — immutable command configuration and builder API.
+27. `MemberInfo.fs` — per-member identity snapshot of a contained tree.
+28. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
 
 ### Native and platform layer
 
-27. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
-28. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, console code page, limits, and accounting calls.
-29. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
-30. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
-31. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
+29. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
+30. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, console code page, limits, and accounting calls.
+31. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
+32. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
+33. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
 
 ### Backend, pump, and channels
 
-32. `Backend.fs` — containment interface and its three implementations.
-33. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
-34. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
-35. `ProcessStdin.fs` — interactive stdin handle.
-36. `ReadinessProbe.fs` — readiness polling.
-37. `RunningProcess.fs` — live-process state, streams, completion, and disposal.
+34. `Backend.fs` — containment interface and its three implementations.
+35. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
+36. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
+37. `ProcessStdin.fs` — interactive stdin handle.
+38. `ReadinessProbe.fs` — readiness polling.
+39. `RunningProcess.fs` — live-process state, streams, completion, and disposal.
 
 ### Runner and verbs
 
-38. `PtySession.fs` — expect-style interaction over a live handle.
-39. `IProcessRunner.fs` — injectable runner seam.
-40. `Runner.fs` — capture primitives and reusable verbs.
-41. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
-42. `DelegatingProcessRunner.fs` — runner decorator base.
-43. `ProcessGroup.fs` — containment owner and shared-group runner.
-44. `JobRunner.fs` — default private-group runner.
-45. `CommandVerbs.fs` — default-runner `Command` extensions.
-46. `PipelineRunner.fs` — internal pipeline execution.
-47. `Pipeline.fs` — pipeline public API.
-48. `Supervisor.fs` — restart supervision.
-49. `CliClient.fs` — configured command client.
-50. `Exec.fs` — concise execution entry points.
+40. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
+41. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
+42. `PtySession.fs` — expect-style interaction over a live handle.
+43. `IProcessRunner.fs` — injectable runner seam.
+44. `Runner.fs` — capture primitives and reusable verbs.
+45. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
+46. `DelegatingProcessRunner.fs` — runner decorator base.
+47. `ProcessGroup.fs` — containment owner and shared-group runner.
+48. `JobRunner.fs` — default private-group runner.
+49. `CommandVerbs.fs` — default-runner `Command` extensions.
+50. `PipelineRunner.fs` — internal pipeline execution.
+51. `Pipeline.fs` — pipeline public API.
+52. `Supervisor.fs` — restart supervision.
+53. `CliClient.fs` — configured command client.
+54. `Exec.fs` — concise execution entry points.
 
 When adding a file, place it after everything it consumes and before everything that consumes it. Alphabetical sorting or SDK globbing would silently destroy this ordering model.
 
@@ -111,6 +115,8 @@ termination: timeout/cancel/dispose -> KillChild or KillTree -> Wait/reap -> Rel
 Output pumps run concurrently with the wait. They must continuously drain piped stdout and stderr, even when capture retention is full, or the child can block in an OS pipe and never reach exit. Capture verbs accumulate output in `LineBuffer` or `RawBuffer`; streaming verbs feed channels. A channel configured for backpressure is the deliberate exception: it lets the consumer pace the pump and therefore may eventually pace the child.
 
 Interactive raw sessions share a fourth `Consumption` state alongside the buffered and two line-streaming ones. `RunningProcess.StartInteractiveSession`, the claim behind `PtySession`, drains the pipes through `Pump.readTextUntilDone` instead of `readLines`, feeding decoded chunks into an `ExpectWindow` (a bounded sliding window plus an optional transcript). A terminal prompt carries no line terminator, so a line pump would hold it until a newline that only arrives after the input the prompt is waiting for. `StartContentLengthSession` instead hands stdout to a byte parser that validates CRLF headers and emits exact payload frames while stderr drains independently. Both sessions retain the single claim, memoized exit wait reused by `ExitTask`, kill-on-pump-fault, teardown-race classification, and byte-exact tees; line-shaped observers have nothing to observe. A `PtySession` waiter's whole verdict — matched, still waiting, or ended — remains one locked `ExpectWindow` step, never a match test followed by a separate end-of-output test that could lose a final match racing EOF.
+
+Protocol layers stack on that framed claim rather than duplicating it. `JsonRpcSession` takes no claim of its own: it *creates* the one `ContentLengthSession` over the handle, enumerates its `FramesAsync()` exactly once from a detached `backgroundTask` router, and never exposes it — a second frame reader would tear one peer's messages between two consumers. The router is the only place protocol state is mutated: it decodes each frame, completes the waiter registered under that `id`, or queues a notification/peer request onto a bounded drop-oldest channel (dropping is counted, and blocking there would stall the very answers pending requests await). Waiter registration and the session's terminal error are decided under one lock, so a request racing the peer's exit either joins the routing table and is failed by it or fails immediately — never waits for an answer that can no longer arrive. Being a `backgroundTask` matters for the same reason it does in `Pump.feedStdin`: a caller may block on a request from a single-threaded `SynchronizationContext`, and a router that captured it would be waiting to resume on the thread blocked on it.
 
 A stream is *not* always a parent pipe. `StdioMode.Null`/`Inherit`, and `Command.StdoutToFile`/`StderrToFile`, hand the child a std handle/fd that never round-trips through the parent — for a file redirect it is an inheritable file handle in `STARTUPINFO` (Windows) or a file fd installed by a `posix_spawn` file action (POSIX), opened on the parent and dropped there right after the spawn, so the child owns it alone and writes the file directly with **no** parent pump. `Spawn` returns `None` for that stream, so no pump, capture buffer, or channel is created for it, and its capture verbs observe nothing — the redirected output lives only in the file, which keeps growing after the parent (or a pump draining a pipe) is gone. The builder rejects combining a file redirect with anything that needs a parent-side view of the same stream (the tees, per-line handlers, `MergeStderr`, `Pty`).
 

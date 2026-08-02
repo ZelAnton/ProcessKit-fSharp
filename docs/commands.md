@@ -1453,6 +1453,7 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 | `ProcessError.Timeout` | `program, timeout, stdout, stderr` | The run's own deadline killed it; whatever it captured before the kill is attached. |
 | `ProcessError.NotReady` | `program, timeout` | A [readiness probe](streaming.md) gave up — distinct from a timeout. |
 | `ProcessError.Parse` | `program, detail` | A `ParseAsync` / `TryParseAsync` parser rejected the output, or `OutputJsonAsync<'T>` couldn't deserialize it as valid JSON. |
+| `ProcessError.JsonRpc` | `program, method, code, detail, data: string option` | A [JSON-RPC session](streaming.md) peer answered a request with an `error` object instead of a `result`; `code`/`detail` are the peer's own, `data` its optional payload as raw JSON. |
 | `ProcessError.OutputTooLarge` | `program, lineLimit, byteLimit, totalLines, totalBytes` | A `FailLoud` (`OverflowMode.Error`) buffer ceiling was exceeded. |
 | `ProcessError.Stdin` | `program, detail` | The child's stdin source could not be read — a missing/unreadable `FromFile` path, say — on an otherwise-successful run. A routine broken pipe (the child closed stdin early, as `head` does) is never reported, and a louder exit/signal/timeout failure wins instead. Also surfaces for a pipeline's first stage. |
 | `ProcessError.CassetteMiss` | `program` | A record/replay cassette found no matching recording — kept distinct from not-found, so `isNotFound` is `false`. |

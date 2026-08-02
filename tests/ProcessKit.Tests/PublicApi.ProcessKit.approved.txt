@@ -219,6 +219,37 @@ class ProcessKit.JobRunner
   :> ProcessKit.IProcessRunner
   new()
 
+class ProcessKit.JsonRpcMessage
+  member ParamsAs<T>(System.Text.Json.JsonSerializerOptions) : Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>
+  member ParamsAs<T>(System.Text.Json.Serialization.Metadata.JsonTypeInfo<T>) : Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>
+  property Id : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property IsRequest : System.Boolean { get }
+  property Method : System.String { get }
+  property ParamsJson : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property Payload : System.Byte[] { get }
+
+class ProcessKit.JsonRpcSession
+  member FinishInputAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member MessagesAsync() : System.Collections.Generic.IAsyncEnumerable<ProcessKit.JsonRpcMessage>
+  member NotifyAsync<P>(System.String, P, System.Text.Json.JsonSerializerOptions, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member NotifyAsync<P>(System.String, P, System.Text.Json.Serialization.Metadata.JsonTypeInfo<P>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member NotifyRawAsync(System.String, System.String, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member RequestAsync<P, R>(System.String, P, System.Text.Json.JsonSerializerOptions, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<R, ProcessKit.ProcessError>>
+  member RequestAsync<P, R>(System.String, P, System.Text.Json.JsonSerializerOptions, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<R, ProcessKit.ProcessError>>
+  member RequestAsync<P, R>(System.String, P, System.Text.Json.Serialization.Metadata.JsonTypeInfo<P>, System.Text.Json.Serialization.Metadata.JsonTypeInfo<R>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<R, ProcessKit.ProcessError>>
+  member RequestAsync<P, R>(System.String, P, System.Text.Json.Serialization.Metadata.JsonTypeInfo<P>, System.Text.Json.Serialization.Metadata.JsonTypeInfo<R>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<R, ProcessKit.ProcessError>>
+  member RequestRawAsync(System.String, System.String, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  member RequestRawAsync(System.String, System.String, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  member RespondAsync<R>(ProcessKit.JsonRpcMessage, R, System.Text.Json.JsonSerializerOptions, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member RespondAsync<R>(ProcessKit.JsonRpcMessage, R, System.Text.Json.Serialization.Metadata.JsonTypeInfo<R>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member RespondErrorAsync(ProcessKit.JsonRpcMessage, System.Int32, System.String, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member RespondRawAsync(ProcessKit.JsonRpcMessage, System.String, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  new(ProcessKit.RunningProcess)
+  new(ProcessKit.RunningProcess, System.Int32)
+  new(ProcessKit.RunningProcess, System.Int32, System.Int32)
+  property DroppedMessages : System.Int64 { get }
+  property MaxFrameBytes : System.Int32 { get }
+
 class ProcessKit.KillOnParentDeathScope
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.KillOnParentDeathScope>
@@ -550,6 +581,7 @@ class ProcessKit.ProcessError
   member get_IsCassetteMiss() : System.Boolean
   member get_IsExit() : System.Boolean
   member get_IsIo() : System.Boolean
+  member get_IsJsonRpc() : System.Boolean
   member get_IsNotFound() : System.Boolean
   member get_IsNotReady() : System.Boolean
   member get_IsOutputTooLarge() : System.Boolean
@@ -569,6 +601,7 @@ class ProcessKit.ProcessError
   property IsCassetteMiss : System.Boolean { get }
   property IsExit : System.Boolean { get }
   property IsIo : System.Boolean { get }
+  property IsJsonRpc : System.Boolean { get }
   property IsNotFound : System.Boolean { get }
   property IsNotReady : System.Boolean { get }
   property IsOutputTooLarge : System.Boolean { get }
@@ -592,6 +625,7 @@ class ProcessKit.ProcessError
   static member NewCassetteMiss(System.String) : ProcessKit.ProcessError
   static member NewExit(System.String, System.Int32, System.String, System.String) : ProcessKit.ProcessError
   static member NewIo(System.String) : ProcessKit.ProcessError
+  static member NewJsonRpc(System.String, System.String, System.Int32, System.String, Microsoft.FSharp.Core.FSharpOption<System.String>) : ProcessKit.ProcessError
   static member NewNotFound(System.String, Microsoft.FSharp.Core.FSharpOption<System.String>) : ProcessKit.ProcessError
   static member NewNotReady(System.String, System.TimeSpan) : ProcessKit.ProcessError
   static member NewOutputTooLarge(System.String, Microsoft.FSharp.Core.FSharpOption<System.Int32>, Microsoft.FSharp.Core.FSharpOption<System.Int32>, System.Int32, System.Int32) : ProcessKit.ProcessError
@@ -641,6 +675,20 @@ class ProcessKit.ProcessError+Io : ProcessKit.ProcessError
   :> System.IEquatable<ProcessKit.ProcessError>
   member get_Detail() : System.String
   property Detail : System.String { get }
+
+class ProcessKit.ProcessError+JsonRpc : ProcessKit.ProcessError
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_Code() : System.Int32
+  member get_Data() : Microsoft.FSharp.Core.FSharpOption<System.String>
+  member get_Detail() : System.String
+  member get_Method() : System.String
+  member get_Program() : System.String
+  property Code : System.Int32 { get }
+  property Data : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property Detail : System.String { get }
+  property Method : System.String { get }
+  property Program : System.String { get }
 
 class ProcessKit.ProcessError+NotFound : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
@@ -720,6 +768,7 @@ module ProcessKit.ProcessError+Tags
   field literal CassetteMiss : System.Int32
   field literal Exit : System.Int32
   field literal Io : System.Int32
+  field literal JsonRpc : System.Int32
   field literal NotFound : System.Int32
   field literal NotReady : System.Int32
   field literal OutputTooLarge : System.Int32

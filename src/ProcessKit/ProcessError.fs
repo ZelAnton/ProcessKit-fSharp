@@ -39,6 +39,16 @@ type ProcessError =
     /// Parsing the captured output into a typed value failed.
     | Parse of Program: string * Detail: string
 
+    /// A JSON-RPC peer (`JsonRpcSession`) answered a request with an `error` object instead of a
+    /// `result` — the protocol's own way of saying "I understood you and I refuse", so it is a failure
+    /// of that call, never a successful result. `Method` is the request it answers, `Code` and `Detail`
+    /// are the peer's own `code`/`message` (`-32601` "method not found", `-32602` "invalid params", and
+    /// the rest of the reserved range are conventional), and `Data` is the raw JSON text of the
+    /// optional `data` member when the peer attached one. A transport failure of the same call — a
+    /// truncated frame, the peer's output ending, a timeout — is reported by its own case
+    /// (`Parse`/`Io`/`Timeout`), never folded in here.
+    | JsonRpc of Program: string * Method: string * Code: int * Detail: string * Data: string option
+
     /// Captured line output exceeded the configured `OutputBufferPolicy` ceiling
     /// (`OverflowMode.Error`). Carries the configured caps and the cumulative totals seen.
     | OutputTooLarge of
@@ -98,6 +108,11 @@ type ProcessError =
         | ProcessError.Cancelled program -> $"'{program}' was cancelled"
         | ProcessError.NotReady(program, timeout) -> $"'{program}' was not ready within {timeout.TotalSeconds}s"
         | ProcessError.Parse(program, detail) -> $"failed to parse output of '{program}': {detail}"
+        | ProcessError.JsonRpc(program, methodName, code, detail, _) ->
+            if System.String.IsNullOrEmpty detail then
+                $"'{program}' answered '{methodName}' with JSON-RPC error {code}"
+            else
+                $"'{program}' answered '{methodName}' with JSON-RPC error {code}: {detail}"
         | ProcessError.OutputTooLarge(program, _, _, totalLines, totalBytes) ->
             $"'{program}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
         | ProcessError.Stdin(program, detail) -> $"could not read the stdin source for '{program}': {detail}"
@@ -136,6 +151,7 @@ type ProcessError =
         | ProcessError.Cancelled program
         | ProcessError.NotReady(program, _)
         | ProcessError.Parse(program, _)
+        | ProcessError.JsonRpc(program, _, _, _, _)
         | ProcessError.OutputTooLarge(program, _, _, _, _)
         | ProcessError.Stdin(program, _)
         | ProcessError.CassetteMiss program -> Some program

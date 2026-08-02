@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RotatingFileSink` provides bounded parent-side log rotation for stdout and stderr tees.
 - `RunningProcess.ForwardParentSignals` forwards parent interrupts into one graceful tree stop with automatic unsubscription.
 - `ContentLengthSession` provides byte-exact full-duplex framing for LSP, DAP, BSP, and similar live protocols.
+- `JsonRpcSession` drives an LSP/DAP/MCP-style server over that framing with id-correlated requests, per-request timeouts, notifications, an incoming message stream, source-generated `JsonTypeInfo` overloads for NativeAOT, and typed protocol failures including the new `ProcessError.JsonRpc`.
 - `ProcessKit.Testing.FaultInjectingRunner` adds scripted, first-N, and seeded deterministic failure scenarios with virtual-time latency.
 - A performance and scalability guide documents event-driven waits, buffer tuning, fleet sizing, and benchmark interpretation.
 
