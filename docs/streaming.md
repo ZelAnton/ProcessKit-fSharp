@@ -757,6 +757,22 @@ The session is the sole stdout consumer: do not combine it with `OutputStringAsy
 streaming, `PtySession`, or another framed session on the same handle. Stderr is drained separately
 and still reaches `StderrTee`.
 
+`Command.StreamBuffer` bounds the *unread frame backlog* the same way it bounds a line stream, so a
+chatty server cannot grow the parent's memory without limit while your consumer lags. Only the two
+lossless full modes apply: `Backpressure` paces the parser — and, through the pipe, the child —
+against your consumer, and `Error` faults the frame stream at the cap. `DropOldest`/`DropNewest` are
+refused at construction with `ProcessError.Unsupported`: dropping a queued frame would delete a
+protocol message the peer is correlating with a request, and no consumer could tell. Leaving
+`StreamBuffer` unset keeps the default unbounded backlog.
+
+With a bounded backlog, drain `FramesAsync()` **concurrently** with your sends rather than awaiting a
+send first — backpressure deliberately stops the parser (and the child) once the backlog is full, so
+a consumer that only starts reading after some other await can stall the very child it waits on. The
+constructor itself never waits on the child: on a `Stdin(source)` + `KeepStdinOpen` run the source
+feeder is awaited by the first `SendAsync`/`FinishInputAsync` instead, so you always get the session
+back and can start draining frames (the interactive writer still never shares the pipe with the
+feeder).
+
 ## Readiness probes
 
 "Start a server, then use it" needs the server to be *ready*, not merely started.

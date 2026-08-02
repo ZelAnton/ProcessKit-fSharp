@@ -31,6 +31,15 @@ type ProcessError =
     | Unobserved of Program: string * Detail: string
 
     /// The run was cancelled through its `CancellationToken`. A cancellation is always an error.
+    ///
+    /// One further producer exists, and it is not a token: a supervision session
+    /// (`SupervisionSession.StopAsync` / `Supervisor`) whose graceful stop landed before its very first
+    /// incarnation was ever started ends here, because it has neither a `SupervisionOutcome` to report
+    /// nor a failure that kept the child from starting — and it will not launch a child just to
+    /// manufacture one. A stop that lands any later reports the honest result of the incarnation it
+    /// stopped, or the honest failure of the ones that never started. Code that must tell "my token
+    /// fired" apart from "I asked for a graceful stop" cannot rely on this case alone; on a session, ask
+    /// the token (`CancellationToken.IsCancellationRequested`).
     | Cancelled of Program: string
 
     /// A readiness probe (`WaitForLineAsync` / `WaitForPortAsync` / `WaitForHttpAsync` / `WaitForAsync`) did not succeed within its timeout.

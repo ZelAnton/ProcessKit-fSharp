@@ -1122,8 +1122,11 @@ type Command internal (config: CommandConfig) =
         Command({ config with OutputBuffer = policy })
 
     /// Opt in to a bounded/backpressure channel for the streaming verbs (`StdoutLinesAsync`/
-    /// `OutputEventsAsync`/`WaitForLineAsync`). Unset (the default) keeps the unbounded streaming
-    /// channel ProcessKit has always used. See
+    /// `OutputEventsAsync`/`WaitForLineAsync`) and `ContentLengthSession.FramesAsync` — which honours only
+    /// the two lossless full modes and refuses `DropOldest`/`DropNewest`, since a dropped protocol frame is
+    /// corruption its consumer could never detect. It is
+    /// inapplicable to `PtySession`, whose window and transcript have their own character bounds.
+    /// Unset (the default) keeps the unbounded streaming channel ProcessKit has always used. See
     /// <a href="https://zelanton.github.io/ProcessKit-fSharp/streaming.html">Streaming</a> for the backpressure
     /// deadlock footgun before opting in to `StreamFullMode.Backpressure`.
     member _.StreamBuffer(policy: StreamBufferPolicy) =
