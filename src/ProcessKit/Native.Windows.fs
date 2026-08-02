@@ -485,9 +485,18 @@ module internal Windows =
     let private isValidHandle (handle: nativeint) : bool =
         handle <> IntPtr.Zero && handle <> nativeint INVALID_HANDLE_VALUE
 
+    // Test seam: the `CloseHandle` behind `closeHandleIfValid` — and only that route; the direct
+    // `CloseHandle` calls on a child's process/thread handles stay real. Overridable so a
+    // fault-injection test can count the closes of one handle VALUE and make a cleanup step throw:
+    // a genuine double-close is not observable from managed code (Win32 reports the second
+    // `CloseHandle` as an ordinary success on whatever object has since taken the recycled value),
+    // so the seam is the only way to assert it never happens. Production always runs the real entry
+    // point; only the (sequential) tests reassign it, and restore it in a `finally`.
+    let mutable closeHandleIfValidHook: nativeint -> bool = CloseHandle
+
     let private closeHandleIfValid (handle: nativeint) =
         if isValidHandle handle then
-            CloseHandle handle |> ignore
+            closeHandleIfValidHook handle |> ignore
 
     /// An inheritable handle to the null device, for `StdioMode.Null`.
     let private inheritableNul (access: uint32) : nativeint =
@@ -1828,10 +1837,26 @@ module internal Windows =
     /// Wraps a raw Win32 handle for the pipe-setup unwind list (`createdPipes` in `spawnWindowsCore`):
     /// `Dispose` closes it, guarded by `closeHandleIfValid` — the list is a rescue mechanism run from
     /// an exception handler, so it must never call `CloseHandle` on a sentinel that was never really
-    /// opened.
+    /// opened — and guarded ONCE, however many times it is disposed. Each of these handles has two
+    /// owners: this unwind entry and the per-stream cleanup closure that drops the parent's copy once
+    /// the child has inherited it, in an order neither side controls (the cleanup may run before an
+    /// exception unwinds, after it, or not at all). Idempotence therefore has to live in the wrapper:
+    /// it cannot be recovered by inspection later, because `closeHandleIfValid` only rejects the
+    /// never-opened sentinels, and Win32 recycles a handle VALUE the moment it is freed — a second
+    /// `CloseHandle` on that value could hit an unrelated object this process has since opened. Same
+    /// discipline `spawnDetachedWindows`'s `releaseParentCopies` gets by emptying its list as it
+    /// closes. The flag is raised BEFORE the close, so even a close that throws is never retried.
     let private disposableHandle (handle: nativeint) : IDisposable =
+        // A ref cell, not a `let mutable`: F# object expressions cannot capture a mutable local.
+        // `Interlocked` rather than a plain write because this costs nothing here and keeps the
+        // guarantee if a future caller ever disposes from another thread (today every close runs on
+        // the spawning thread, under `windowsSpawnLock`).
+        let closed = ref 0
+
         { new IDisposable with
-            member _.Dispose() = closeHandleIfValid handle }
+            member _.Dispose() =
+                if Interlocked.Exchange(&closed.contents, 1) = 0 then
+                    closeHandleIfValid handle }
 
     let private createAsyncPipePair (serverDirection: PipeDirection) : NamedPipeServerStream * NamedPipeClientStream =
         let pipeName = "ProcessKit-" + Guid.NewGuid().ToString("N")
@@ -2711,7 +2736,10 @@ module internal Windows =
                 // is what goes to `STARTUPINFO.hStdInput`; `inStreams` is `Some (server, client)` only for
                 // the pipe path (the parent write end + the child read end); both paths register their
                 // handles in `createdPipes` for the exception unwind and drop the child's copy after spawn.
-                let stdinChild, inStreams =
+                // `stdinCleanup` is that drop for the inherit path (a no-op for the pipe path, whose ends
+                // are closed as streams) — the SAME one-shot guard that sits in `createdPipes`, so the
+                // unwind can never close the handle a second time. Mirrors `setupOut`'s shape below.
+                let stdinChild, inStreams, stdinCleanup =
                     if stdinInherit then
                         let handle = inheritableStdHandle STD_INPUT_HANDLE
 
@@ -2724,13 +2752,14 @@ module internal Windows =
                             failwith
                                 $"could not duplicate an inheritable copy of the parent's standard input handle: {message}"
 
-                        createdPipes.Add(disposableHandle handle)
-                        handle, None
+                        let guard = disposableHandle handle
+                        createdPipes.Add guard
+                        handle, None, (fun () -> guard.Dispose())
                     else
                         let inServer, inClient = createAsyncPipePair PipeDirection.Out
                         createdPipes.Add inServer
                         createdPipes.Add inClient
-                        inClient.SafePipeHandle.DangerousGetHandle(), Some(inServer, inClient)
+                        inClient.SafePipeHandle.DangerousGetHandle(), Some(inServer, inClient), (fun () -> ())
 
                 // For an output stream: the inheritable child-side handle, the parent read stream
                 // (`Some` only when piped), and a cleanup that drops the parent's copy of the child handle
@@ -2757,8 +2786,11 @@ module internal Windows =
 
                         // Registered in the unwind list immediately (like the NUL branch): if a LATER step in
                         // this spawn throws, this handle has not been handed to a child yet and must not leak.
-                        createdPipes.Add(disposableHandle handle)
-                        handle, None, (fun () -> closeHandleIfValid handle)
+                        // The cleanup below closes it THROUGH that same one-shot entry, so whichever runs
+                        // first is the only close — the unwind never re-closes a recycled handle value.
+                        let guard = disposableHandle handle
+                        createdPipes.Add guard
+                        handle, None, (fun () -> guard.Dispose())
                     | None ->
                         match mode with
                         | StdioMode.Piped ->
@@ -2782,9 +2814,11 @@ module internal Windows =
 
                             // Registered in the unwind list immediately: if the NEXT step in this same spawn
                             // (the `setupOut` call for stderr, when this was stdout's) throws afterwards, this
-                            // handle has not been handed to a child yet and must not leak.
-                            createdPipes.Add(disposableHandle handle)
-                            handle, None, (fun () -> closeHandleIfValid handle)
+                            // handle has not been handed to a child yet and must not leak. Closed through that
+                            // same one-shot entry below, so the unwind never closes it twice.
+                            let guard = disposableHandle handle
+                            createdPipes.Add guard
+                            handle, None, (fun () -> guard.Dispose())
                         | StdioMode.Inherit ->
                             let handle = inheritableStdHandle stdHandleId
 
@@ -2797,8 +2831,10 @@ module internal Windows =
                                 failwith
                                     $"could not duplicate an inheritable copy of the parent's std handle: {message}"
 
-                            createdPipes.Add(disposableHandle handle)
-                            handle, None, (fun () -> closeHandleIfValid handle)
+                            // Same one-shot entry/cleanup pairing as the two branches above.
+                            let guard = disposableHandle handle
+                            createdPipes.Add guard
+                            handle, None, (fun () -> guard.Dispose())
 
                 let outChild, outStream, outCleanup =
                     setupOut config.StdoutFile config.StdoutMode STD_OUTPUT_HANDLE
@@ -2894,8 +2930,9 @@ module internal Windows =
                         inClient.Dispose()
                         inServer.Dispose()
                     | None ->
-                        // Inherit: no pipe — just close the inheritable duplicate of the parent's std input.
-                        closeHandleIfValid stdinChild
+                        // Inherit: no pipe — just close the inheritable duplicate of the parent's std input,
+                        // through its one-shot guard (so the unwind below cannot close it again).
+                        stdinCleanup ()
 
                 if not created then
                     releaseStdio ()
@@ -2950,8 +2987,10 @@ module internal Windows =
                                 None
                         | None ->
                             // Inherit: the child now has its own inherited copy of the parent's std input, so
-                            // drop the parent's inheritable duplicate. There is no parent-side stdin stream.
-                            closeHandleIfValid stdinChild
+                            // drop the parent's inheritable duplicate — through its one-shot guard, so a
+                            // throw later on this success path cannot make the unwind close it again. There is
+                            // no parent-side stdin stream.
+                            stdinCleanup ()
                             None
 
                     Ok

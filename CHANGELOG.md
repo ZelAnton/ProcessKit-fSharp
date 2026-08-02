@@ -13,15 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RotatingFileSink` provides bounded parent-side log rotation for stdout and stderr tees.
 - `RunningProcess.ForwardParentSignals` forwards parent interrupts into one graceful tree stop with automatic unsubscription.
 - `ContentLengthSession` provides byte-exact full-duplex framing for LSP, DAP, BSP, and similar live protocols.
+- `JsonRpcSession` drives an LSP/BSP/MCP-style JSON-RPC 2.0 server over that framing with id-correlated requests, per-request timeouts covering the whole call, notifications, an incoming message stream, source-generated `JsonTypeInfo` overloads for NativeAOT, and typed protocol failures including the new `ProcessError.JsonRpc`.
 - `ProcessKit.Testing.FaultInjectingRunner` adds scripted, first-N, and seeded deterministic failure scenarios with virtual-time latency.
 - A performance and scalability guide documents event-driven waits, buffer tuning, fleet sizing, and benchmark interpretation.
 
 ### Fixed
+- A supervision session stopped before any incarnation produced a result no longer starts one more child just to report one, and ends with the failure that kept the child from starting — or `ProcessError.Cancelled` when no incarnation was ever started.
 - Supervisor restarts now apply the restart policy to typed live-output pump failures and retain liveness-failure attribution without leaking it to later children.
 - Process-testing doubles now honour `Command.CancelOn` consistently for completion verbs.
+- `DryRunRunner` now models PTY commands with a merged terminal stream and successful resize operations, consistently with the other process-testing doubles.
 - `PtySession` now rejects null options with `ArgumentNullException` at its public entry points.
 - Relative path-form programs now resolve and launch against `Command.CurrentDir` consistently on every platform.
 - Dependency-vulnerability checks now keep native stderr out of the JSON report while preserving failure diagnostics.
+- `ContentLengthSession` now honours a configured `Command.StreamBuffer` for its incoming-frame backlog instead of silently ignoring it, bounding memory against a slow consumer, and refuses the lossy `DropOldest`/`DropNewest` full modes rather than silently discarding protocol frames; `PtySession` documents `StreamBuffer` as inapplicable instead of silently no-opping it.
+- `CliClient.WithDefaults` now rejects configurators that change the client's program instead of silently retargeting later invocations.
+- Output line handlers and tees now reject `Null` or `Inherit` destinations instead of silently receiving no output.
 
 ## [2.10.0] - 2026-07-29
 

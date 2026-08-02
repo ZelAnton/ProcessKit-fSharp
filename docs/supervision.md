@@ -708,6 +708,17 @@ if (await supervised is { IsOk: false, ErrorValue: { IsCancelled: true } })
     Console.WriteLine("supervision cancelled");
 ```
 
+A **graceful stop** of a live supervision session (`Supervisor.StartAsync`, then
+`SupervisionSession.StopAsync`) normally ends supervision as `Ok` with `StopReason.Stopped`,
+reporting the honest result of the incarnation it stopped. A stop that lands before *any*
+incarnation has produced a result falls under the no-result rule above instead: it has nothing to
+report and the supervisor will not start one more child just to manufacture an outcome, so
+supervision ends as an `Error` carrying the last failure that kept the child from starting — or
+`ProcessError.Cancelled`, when the stop arrived before the very first incarnation was started at
+all and there is no failure to report either. That last shape is the one `Cancelled` ProcessKit
+produces without a cancelled token, so code that must tell "my token fired" apart from "I asked for
+a graceful stop" should consult the token rather than the error case.
+
 For the full model of captured-versus-raised deadlines and how cancellation differs from a
 timeout, see [timeouts-and-cancellation.md](timeouts-and-cancellation.md).
 
