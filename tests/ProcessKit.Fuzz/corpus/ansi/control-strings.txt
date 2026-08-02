@@ -1,0 +1,1 @@
+before dcs P1;2|q#dcs-payload;more\ between dcs and sos Xsos-payload here\ between sos and pm ^privacy message payload\ between pm and apc _application command payload\ after apc

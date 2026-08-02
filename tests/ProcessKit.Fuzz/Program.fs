@@ -129,12 +129,17 @@ module private Targets =
                                         $"accepted frame exceeded MaxFrameBytes ({frame.Length} > {maxFrameBytes})"
                             else
                                 reading <- false
-                    with :? ProcessException ->
-                        // A malformed header, a non-CRLF line ending, an unterminated header, or a
-                        // Content-Length over the configured limit is a documented parse failure (typed
-                        // `ProcessError.Parse`/`Io`) — the fuzz-worthy outcome is anything else escaping
-                        // unhandled from the framing parser.
-                        ()
+                    with :? ProcessException as ex ->
+                        match ex.Error with
+                        | ProcessError.Parse _
+                        | ProcessError.Io _ ->
+                            // A malformed header, a non-CRLF line ending, an unterminated header, or a
+                            // Content-Length over the configured limit is a documented parse failure
+                            // (typed `ProcessError.Parse`); a genuine stream fault surfaces as
+                            // `ProcessError.Io`. These are the only two typed outcomes the framing parser
+                            // documents — anything else escaping the parser is the fuzz-worthy failure.
+                            ()
+                        | other -> invalidOp $"framing target raised an undocumented ProcessError: {other}"
                 finally
                     enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult()
             })
@@ -175,12 +180,70 @@ module private Targets =
             index <- index + take
             chunkIndex <- chunkIndex + 1
 
+    /// Same chunking as `feedFiltered`, but drives a second, UNCAPPED `AnsiEscapeFilter` over the
+    /// identical chunks to build a ground-truth filtered stream (`oracle`), then — after EVERY chunk, not
+    /// only at the end — checks `window.Pending`/`window.Transcript` against the oracle's tail capped at
+    /// `windowChars`/`transcriptChars`, and that the truncation flags flip exactly when the oracle has
+    /// actually outgrown the corresponding cap. A final-size-only check (the caller's previous shape)
+    /// cannot see mid-stream duplication, loss, or an incorrectly-timed truncation flag once the window
+    /// itself is back under its cap on a later chunk — this compares the full trajectory instead (R-02).
+    let private feedFilteredWithOracle
+        (filter: AnsiEscapeFilter)
+        (window: ExpectWindow)
+        (windowChars: int)
+        (transcriptChars: int)
+        (text: string)
+        =
+        let oracleFilter = AnsiEscapeFilter()
+        let oracle = StringBuilder()
+        let mutable index = 0
+        let mutable chunkIndex = 0
+
+        while index < text.Length do
+            let take =
+                min ansiChunkSizes[chunkIndex % ansiChunkSizes.Length] (text.Length - index)
+
+            let chunk = text.Substring(index, take)
+            window.AppendFiltered(filter, chunk)
+            oracleFilter.Append(chunk.AsSpan(), oracle)
+
+            let oracleText = oracle.ToString()
+
+            let expectedWindow =
+                if oracleText.Length > windowChars then
+                    oracleText.Substring(oracleText.Length - windowChars)
+                else
+                    oracleText
+
+            if window.Pending <> expectedWindow then
+                invalidOp "AppendFiltered's window diverged from the independent filtering oracle mid-stream"
+
+            let expectedTranscript =
+                if oracleText.Length > transcriptChars then
+                    oracleText.Substring(oracleText.Length - transcriptChars)
+                else
+                    oracleText
+
+            if window.Transcript <> expectedTranscript then
+                invalidOp "AppendFiltered's transcript diverged from the independent filtering oracle mid-stream"
+
+            if oracleText.Length > windowChars && not window.WindowTruncated then
+                invalidOp "expect window exceeded its cap without setting WindowTruncated"
+
+            if oracleText.Length > transcriptChars && not window.TranscriptTruncated then
+                invalidOp "expect transcript exceeded its cap without setting TranscriptTruncated"
+
+            index <- index + take
+            chunkIndex <- chunkIndex + 1
+
     /// Feeds arbitrary decoded text to the internal `AnsiEscapeFilter` through `ExpectWindow.AppendFiltered`
     /// — the same accessible path `PtySession`'s filtered expect-window uses — in varying chunk sizes, so a
-    /// straddling escape sequence and the window/transcript caps both get exercised together. Checks two
-    /// invariants: the bounded window and transcript never grow past their configured caps, and text with
-    /// none of the filter's special control characters round-trips byte-for-byte regardless of where it was
-    /// chunked.
+    /// straddling escape sequence and the window/transcript caps both get exercised together. Checks three
+    /// invariants: the window/transcript's state after every chunk (not only the last) matches an
+    /// independent, uncapped filtering oracle — catching mid-stream duplication, loss, or a
+    /// wrongly-timed truncation flag (R-02); the bounded window and transcript never grow past their
+    /// configured caps; and text with none of the filter's special control characters round-trips
+    /// byte-for-byte regardless of where it was chunked.
     let ansi (input: ReadOnlySpan<byte>) : unit =
         if input.Length <= maxInputBytes then
             let text = Encoding.UTF8.GetString(input.ToArray())
@@ -189,7 +252,7 @@ module private Targets =
 
             let filter = AnsiEscapeFilter()
             let window = ExpectWindow(windowChars, Some transcriptChars)
-            feedFiltered filter window text
+            feedFilteredWithOracle filter window windowChars transcriptChars text
 
             if window.Pending.Length > windowChars then
                 invalidOp $"expect window exceeded its {windowChars}-char cap"
