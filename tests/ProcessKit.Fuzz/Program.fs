@@ -233,6 +233,12 @@ module private Targets =
             if oracleText.Length > transcriptChars && not window.TranscriptTruncated then
                 invalidOp "expect transcript exceeded its cap without setting TranscriptTruncated"
 
+            if oracleText.Length <= windowChars && window.WindowTruncated then
+                invalidOp "expect window truncation flag set before the cap was actually exceeded"
+
+            if oracleText.Length <= transcriptChars && window.TranscriptTruncated then
+                invalidOp "expect transcript truncation flag set before the cap was actually exceeded"
+
             index <- index + take
             chunkIndex <- chunkIndex + 1
 
