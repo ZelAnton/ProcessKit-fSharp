@@ -126,10 +126,13 @@ lookup of the last green run, are written next to the gate in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 The gate reports **skipped** instead of failing whenever it cannot compare honestly: no coverage
-reports arrived at all, fewer matrix legs delivered coverage than expected (merged coverage is a
-union over the legs, so a missing leg lowers it for reasons that have nothing to do with your
+reports arrived at all, the reports that arrived carry no coverage data (a collector that
+instruments nothing still writes valid but empty Cobertura files, and merging those reports zero
+assemblies and no percentage), fewer matrix legs delivered coverage than expected (merged coverage
+is a union over the legs, so a missing leg lowers it for reasons that have nothing to do with your
 change), or `lineCoverage` is `null`. A skipped run is a warning in the job summary, never a red
-build.
+build. Coverage that is genuinely zero is not one of these cases: it still reports assemblies and
+coverable lines, and is gated like any other number.
 
 Moving the baseline is deliberate and reviewable, and belongs in the same pull request as the change
 that moves coverage:

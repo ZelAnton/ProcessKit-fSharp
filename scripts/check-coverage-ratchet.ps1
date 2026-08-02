@@ -17,6 +17,13 @@
     Comparing such a run against a baseline recorded from the full matrix would be a false failure,
     so an incomplete matrix reports SKIPPED with a warning instead.
 
+    A run whose reports all arrived but carry no coverage data (the collector wrote well formed
+    Cobertura files with an empty `packages` element, so the merge reports zero assemblies and no
+    line coverage) is the same class of event: this run measured nothing. It also reports SKIPPED,
+    because reading the absent percentage as 0.00 % would announce a total loss of coverage that
+    never happened. Genuine zero coverage has a different shape (assemblies and coverable lines are
+    present, the percentage is 0) and is still gated.
+
 .PARAMETER CoverageRoot
     Directory the per leg coverage artifacts were downloaded into: one subdirectory per artifact,
     each holding one or more coverage.cobertura.xml files. Subdirectories are counted, not named,
@@ -39,7 +46,8 @@
 .NOTES
     Exit code contract:
       0 - the baseline is honoured, or the check was skipped on purpose (no coverage reports at
-          all, fewer matrix legs than expected, or a baseline that is deliberately unset).
+          all, reports that carry no coverage data, fewer matrix legs than expected, or a baseline
+          that is deliberately unset).
       1 - real regression: merged line coverage is below lineCoverage minus toleranceLinePoints.
       2 - the check could not run: missing or malformed baseline file, or a missing summary file
           that ReportGenerator was supposed to write. This is a configuration fault, not a
@@ -116,6 +124,16 @@ function Format-Percent {
     param([double] $Value)
 
     return $Value.ToString('0.00', [cultureinfo]::InvariantCulture)
+}
+
+function Format-Count {
+    param([bool] $HasValue, [int] $Value)
+
+    if ($HasValue) {
+        return [string] $Value
+    }
+
+    return 'not reported'
 }
 
 # --- Discover what this run actually delivered ------------------------------------------------
@@ -235,19 +253,71 @@ catch {
 }
 
 $summary = Get-Field $summaryDocument 'summary'
+$assemblies = Get-Field $summary 'assemblies'
 $coveredLines = Get-Field $summary 'coveredlines'
 $coverableLines = Get-Field $summary 'coverablelines'
 $reportedLineCoverage = Get-Field $summary 'linecoverage'
 
 $observed = 0.0
+$assemblyCount = 0
 $coveredLineCount = 0
 $coverableLineCount = 0
-$hasLineCounts =
-    $null -ne $coveredLines -and
-    $null -ne $coverableLines -and
-    [int]::TryParse([string] $coveredLines, [ref] $coveredLineCount) -and
-    [int]::TryParse([string] $coverableLines, [ref] $coverableLineCount) -and
-    $coverableLineCount -gt 0
+
+$hasAssemblyCount =
+    $null -ne $assemblies -and [int]::TryParse([string] $assemblies, [ref] $assemblyCount)
+$hasCoveredLineCount =
+    $null -ne $coveredLines -and [int]::TryParse([string] $coveredLines, [ref] $coveredLineCount)
+$hasCoverableLineCount =
+    $null -ne $coverableLines -and [int]::TryParse([string] $coverableLines, [ref] $coverableLineCount)
+
+# The `-gt 0` part is what makes the division below safe; keep it in this flag.
+$hasLineCounts = $hasCoveredLineCount -and $hasCoverableLineCount -and $coverableLineCount -gt 0
+
+# --- Degradation: the reports merged, but hold no coverage data ---------------------------------
+
+# A coverage collector that instruments nothing still writes a valid Cobertura file, just an empty
+# one (`<packages />`). Every leg then delivers its artifact, the leg count looks complete, and the
+# merge of those files reports zero assemblies, zero coverable lines and no line coverage at all.
+# This says the run measured nothing, exactly like a run that delivered no reports, and it is not a
+# statement about the code: reading the absent percentage as 0.00 % would fail the gate with a total
+# loss of coverage that never happened, and calling it a broken configuration would turn a red test
+# matrix into a second red job with a misleading reason.
+#
+# The signal is deliberately "no data was produced", not "the percentage is low": zero assemblies,
+# or no percentage at all next to a zero coverable line count. A run that genuinely covers nothing
+# reports its assemblies and its coverable lines and a `linecoverage` of 0, misses none of the three,
+# and is gated below like any other number.
+$mergeHasNoCoverageData =
+    ($hasAssemblyCount -and $assemblyCount -eq 0) -or
+    ($hasCoverableLineCount -and $coverableLineCount -eq 0 -and $null -eq $reportedLineCoverage)
+
+if ($mergeHasNoCoverageData) {
+    $assemblyText = Format-Count $hasAssemblyCount $assemblyCount
+    $coverableText = Format-Count $hasCoverableLineCount $coverableLineCount
+
+    Add-StepSummary @(
+        '',
+        '### Coverage ratchet: skipped',
+        '',
+        '| Metric | Value |',
+        '| --- | --- |',
+        "| Matrix legs with coverage | $legsPresent of $expectedLegCount |",
+        "| Cobertura reports merged | $($allReports.Count) |",
+        "| Assemblies in merged report | $assemblyText |",
+        "| Coverable lines | $coverableText |",
+        '',
+        "Skipped: the $($allReports.Count) merged Cobertura report(s) carry no coverage data at all (no",
+        'assemblies, no coverable lines, no line coverage), so this run produced no number to compare with',
+        'the baseline. Reports that parse but are empty mean the collection step measured nothing: a',
+        'coverlet.collector run that instruments no module writes exactly these files. That is not a drop in',
+        'coverage, and reading the absent percentage as 0.00 % would report a collapse that never happened,',
+        'so the baseline is not enforced for this run. Look at the Test step of the matrix legs, and at the',
+        'coverage artifacts they uploaded, to find out why nothing was instrumented.'
+    )
+    Write-Annotation warning ("Coverage ratchet skipped: the $($allReports.Count) merged coverage report(s) carry no " +
+        "coverage data (assemblies: $assemblyText, coverable lines: $coverableText); coverage was not collected.")
+    exit 0
+}
 
 if ($hasLineCounts) {
     # Preferred: the exact ratio behind the percentage. ReportGenerator rounds `linecoverage` to one
@@ -260,7 +330,9 @@ elseif ($null -ne $reportedLineCoverage -and [double]::TryParse(
     Write-Annotation notice 'Falling back to the rounded linecoverage field: the summary carried no line counts.'
 }
 else {
-    Write-Annotation error "ReportGenerator summary carries neither line counts nor a linecoverage value: $SummaryJson"
+    # Not the empty merge handled above (that one reports its zeros): the summary object does not
+    # carry the fields this script reads at all, so the schema is not the one it was written for.
+    Write-Annotation error "ReportGenerator summary carries neither line counts nor a linecoverage value, so its schema is not the expected JsonSummary: $SummaryJson"
     exit 2
 }
 

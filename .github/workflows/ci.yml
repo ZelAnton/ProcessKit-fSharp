@@ -387,6 +387,14 @@ jobs:
       # of the matrix and, if any leg is missing, degrades to a warning in the job summary instead
       # of failing. One skipped check costs less than one false failure.
       #
+      # Empty reports: a collector that instruments nothing still writes a valid Cobertura file, just
+      # one with an empty `packages` element, so a whole matrix can deliver the expected number of
+      # artifacts that hold no coverage at all. The merge of those files reports zero assemblies and
+      # no percentage, which says this run measured nothing -- the same class of event as a missing
+      # leg -- so the gate skips there too. Reading the absent percentage as 0.00 % would fail the
+      # job with a total loss of coverage that never happened. Coverage that is genuinely zero looks
+      # different (assemblies and coverable lines are reported, the percentage is 0) and is gated.
+      #
       # Updating the baseline: take the number from the Coverage ratchet table of a full matrix run
       # and write it into `coverage-baseline.json` in the same change that moves coverage, with the
       # reason in the description. `"lineCoverage": null` disarms the gate and makes it record the
