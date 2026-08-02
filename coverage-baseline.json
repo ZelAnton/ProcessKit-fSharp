@@ -1,0 +1,9 @@
+{
+	"lineCoverage": 72.0,
+	"toleranceLinePoints": 0.5,
+	"matrixLegs": 5,
+	"recordedOn": "2026-08-02",
+	"recordedFrom": "local windows run of the gated suite (both test projects, net8.0 and net10.0)",
+	"notes": "Merged line coverage of that run was 72.8 percent over 9569 coverable lines, rounded down to a whole point. One platform is a floor for the matrix union, which also covers the code paths only the Linux and macOS legs reach, so this value cannot fail a full matrix run. Raise it to the value the Coverage ratchet table reports for the first full matrix run on main.",
+	"howToUpdate": "CONTRIBUTING.md, section: Coverage baseline"
+}

@@ -194,6 +194,12 @@ jobs:
 
   test:
     if: github.event_name != 'schedule'
+    # Read by the coverage ratchet in `coverage-summary`, which has to tell "a leg did not deliver
+    # its coverage artifact" (skip the gate) from "the matrix simply has fewer legs now" (gate as
+    # usual). Taken from the matrix itself so that adding or removing an OS leg needs no edit here;
+    # `matrixLegs` in the baseline file is only the fallback for a run where this value is missing.
+    outputs:
+      matrix-legs: ${{ steps.matrix-size.outputs.legs }}
     strategy:
       fail-fast: false
       matrix:
@@ -204,6 +210,18 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, windows-11-arm, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # Every leg would write the same `strategy.job-total`, so one leg publishing it is enough;
+      # pinning that to the Linux leg keeps the step on a shell that is guaranteed to be there. It
+      # runs before checkout so the value still reaches `coverage-summary` when this leg fails
+      # later on. The matrix shares one output slot, so if this leg is cancelled -- or another
+      # leg's empty value wins the slot -- the ratchet falls back to the leg count recorded in the
+      # baseline file, which is the same number until someone changes the matrix.
+      - name: Publish matrix size
+        id: matrix-size
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: echo "legs=${{ strategy.job-total }}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
@@ -239,8 +257,9 @@ jobs:
       # concurrent spawns / randomized lifecycle interleavings, thread-pool/handle/memory baselines)
       # that would slow down and add noise to every ordinary PR/push run; they have their own
       # scheduled/workflow_dispatch stages below instead (`stress`, `interleaving`).
-      # Coverage is collected via the coverlet.collector data collector (visibility only —
-      # no threshold gate is enforced here). The Cobertura report lands under
+      # Coverage is collected via the coverlet.collector data collector. No threshold is enforced
+      # per leg: the gate lives in `coverage-summary`, which compares the coverage merged across the
+      # whole matrix with the committed baseline. The Cobertura report lands under
       # ./TestResults/<guid>/coverage.cobertura.xml.
       - name: Test
         run: >-
@@ -258,8 +277,10 @@ jobs:
           path: ./TestResults/*.trx
           if-no-files-found: ignore
 
-      # Coverage reports are published as a downloadable artifact per OS leg — no gate,
-      # just visibility (see the task that introduced this step for rationale).
+      # Coverage reports are published as a downloadable artifact per OS leg; `coverage-summary`
+      # merges them and gates on the merged number. A leg that produced none is tolerated on
+      # purpose (`if-no-files-found: ignore`), and the gate skips rather than fails when it sees
+      # fewer legs than the matrix has.
       - name: Upload coverage report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -293,8 +314,9 @@ jobs:
           dotnet tool install --tool-path ./.tools
           dotnet-reportgenerator-globaltool --version 5.5.10
 
-      # This remains visualization-only: a baseline-relative coverage ratchet is intentionally
-      # deferred until a follow-up can define and validate its main-branch comparison semantics.
+      # Renders the merged matrix coverage for a human and, in the same invocation, writes the
+      # machine readable JsonSummary that the ratchet step below reads. One merge with one set of
+      # assembly filters: the number that gates and the number a human reads cannot drift apart.
       - name: Publish merged coverage summary
         shell: bash
         run: |
@@ -326,11 +348,60 @@ jobs:
           ./.tools/reportgenerator \
             "-reports:$report_files" \
             "-targetdir:coverage-report" \
-            "-reporttypes:MarkdownSummaryGithub" \
+            "-reporttypes:MarkdownSummaryGithub;JsonSummary" \
             "-assemblyfilters:$assembly_filters" \
             "-title:ProcessKit cross-platform coverage"
 
           cat coverage-report/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Coverage ratchet. The note that used to sit above the summary step deferred this ("remains
+      # visualization only ... until a follow up can define and validate its main branch comparison
+      # semantics"); the semantics it was waiting for are written out here.
+      #
+      # Baseline source: `coverage-baseline.json`, committed in this repository, holding the merged
+      # line coverage to hold, the tolerance, and the number of matrix legs it was recorded from.
+      # Reading the last green run on main instead (through `gh api` or a retained artifact) was
+      # rejected on purpose: it needs a wider token scope, it depends on artifact retention and on
+      # that run still existing, it cannot work the same way on a fork, and it makes the verdict for
+      # a pull request depend on state living outside that pull request. A committed file is
+      # deterministic, and it turns every deliberate move of the baseline into a reviewable one line
+      # diff inside the change that causes it.
+      #
+      # Comparison: the merged line coverage of this run must be at least `lineCoverage` minus
+      # `toleranceLinePoints`, otherwise this job fails. The number comes from the JsonSummary the
+      # merge above already wrote, so the gated number and the published number are the same number.
+      #
+      # Tolerance: 0.5 line coverage points (authoritative value: `toleranceLinePoints` in the
+      # baseline file). Measured rather than guessed: two identical local runs of the same gated
+      # suite differed by 2 covered lines out of 9569 coverable ones, i.e. 0.02 points, because a
+      # few tests spawn real processes and take a timing dependent branch. At today's size 0.5
+      # points is roughly 48 lines, some twenty times that jitter, and still small enough to fail on
+      # a regression worth failing on: a new module of about 100 lines landing untested moves the
+      # number by about 0.75 points.
+      #
+      # Incomplete matrix: merged coverage is a union over the OS legs, and platform specific code
+      # (Job Objects, cgroups, POSIX signals) is covered only by its own leg, so a run that lost a
+      # leg reports several points less for reasons that have nothing to do with the change. Losing
+      # a leg is a normal outcome here -- artifacts are downloaded by pattern and a leg is allowed
+      # to publish none. The gate therefore compares how many legs delivered coverage with the size
+      # of the matrix and, if any leg is missing, degrades to a warning in the job summary instead
+      # of failing. One skipped check costs less than one false failure.
+      #
+      # Updating the baseline: take the number from the Coverage ratchet table of a full matrix run
+      # and write it into `coverage-baseline.json` in the same change that moves coverage, with the
+      # reason in the description. `"lineCoverage": null` disarms the gate and makes it record the
+      # observed value instead. CONTRIBUTING.md, section "Coverage baseline", has the procedure.
+      #
+      # The `needs.test.result` guard keeps a red matrix from producing a second, misleading
+      # failure: coverage collected from a run whose tests failed does not measure a working commit.
+      - name: Check coverage ratchet
+        if: needs.test.result == 'success'
+        shell: pwsh
+        run: >-
+          ./scripts/check-coverage-ratchet.ps1
+          -CoverageRoot coverage
+          -SummaryJson coverage-report/Summary.json
+          -ExpectedLegs '${{ needs.test.outputs.matrix-legs }}'
 
   # The Linux cgroup v2 `limits` backend can only enable controllers at the real cgroup root, so
   # it never engages under the unprivileged matrix legs (a systemd scope / private cgroup

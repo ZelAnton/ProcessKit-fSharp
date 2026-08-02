@@ -115,6 +115,42 @@ Every user-visible change ships its [`CHANGELOG.md`](CHANGELOG.md) entry in the
 same change set, under `## [Unreleased]`. Write the bullet for a consumer of the
 library, not the implementer. Pure internal refactors are exempt.
 
+## Coverage baseline
+
+The `coverage-summary` job merges the Cobertura reports from every leg of the test matrix,
+publishes the usual Markdown summary, and then compares the merged **line** coverage with
+[`coverage-baseline.json`](coverage-baseline.json). The job fails when merged coverage sits more
+than `toleranceLinePoints` below the recorded `lineCoverage`, so coverage cannot drift downwards one
+pull request at a time. The full semantics, and why the baseline is a committed file rather than a
+lookup of the last green run, are written next to the gate in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+The gate reports **skipped** instead of failing whenever it cannot compare honestly: no coverage
+reports arrived at all, fewer matrix legs delivered coverage than expected (merged coverage is a
+union over the legs, so a missing leg lowers it for reasons that have nothing to do with your
+change), or `lineCoverage` is `null`. A skipped run is a warning in the job summary, never a red
+build.
+
+Moving the baseline is deliberate and reviewable, and belongs in the same pull request as the change
+that moves coverage:
+
+1. Take `Merged line coverage` from the **Coverage ratchet** table in the `coverage-summary` job
+   summary of a run with the **full** matrix — a skipped run measured nothing.
+2. Set `lineCoverage` in `coverage-baseline.json` to that number, and refresh `recordedOn` and
+   `recordedFrom` so the next person can see where the number came from.
+3. Say in the pull request why it moved. Raising it after adding tests locks the gain in; lowering
+   it states on the record that this change trades coverage away on purpose.
+
+Adding or removing an OS leg in the matrix changes which platform specific code the union covers, so
+update `matrixLegs` and record `lineCoverage` again from a run of the new matrix. Setting
+`lineCoverage` to `null` disarms the gate and makes it print the observed value instead — the
+supported way to bootstrap a baseline, not a way to silence a regression.
+
+The check itself is [`scripts/check-coverage-ratchet.ps1`](scripts/check-coverage-ratchet.ps1). It
+reads the summary ReportGenerator already produced, so it needs a full set of matrix artifacts and
+cannot say anything useful about a local single platform run; its exit codes are 0 for honoured or
+skipped, 1 for a real regression, and 2 for a broken baseline or summary file.
+
 ## Link checking
 
 [`.github/workflows/link-check.yml`](.github/workflows/link-check.yml) checks Markdown
@@ -136,5 +172,5 @@ lychee --offline './docs/**/*.md' './*.md' './samples/**/README.md'
 
 - Keep changes focused; unrelated cleanups belong in their own PR.
 - Ensure CI (YAML lint, Fantomas formatting, build/test on Linux, Windows, and
-  macOS, and the internal Markdown link check) passes.
+  macOS, the coverage baseline gate, and the internal Markdown link check) passes.
 - Fill in the pull-request checklist.
