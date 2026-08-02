@@ -748,7 +748,10 @@ headers, bare-LF headers, and truncated payloads fail the enumerator with `Proce
 carrying `ProcessError.Parse` before a misleading partial frame is yielded. Extra headers such as
 `Content-Type` are accepted. `SendAsync` serializes concurrent callers so header/payload pairs never
 interleave; after cancelling a send, abandon the session because the child may have received a
-prefix. `FinishInputAsync` closes framed stdin and lets the child observe EOF.
+prefix — the exception being an interruption that lands while the call is still queued behind another
+send or waiting for a `Stdin(source)` feeder, which cannot have written a byte (`JsonRpcSession`, layered
+on this type, tells the two apart so a cancelled call does not end its conversation).
+`FinishInputAsync` closes framed stdin and lets the child observe EOF.
 
 Payloads remain raw for byte accuracy and NativeAOT-friendly caller control. For typed JSON, pass
 each frame to `JsonSerializer.Deserialize(frame, MyJsonContext.Default.Message)` (or the matching
@@ -870,6 +873,7 @@ Every failure is a typed `ProcessError`, never a raw exception and never a silen
 | The `CancellationToken` fired | `ProcessError.Cancelled` |
 | A timeout or token interrupted a send mid-frame | The same `ProcessError.Timeout`/`Cancelled` — and it ends the session, because the peer may have received a truncated frame |
 | A timeout or token ended a send before it wrote anything | The same `ProcessError.Timeout`/`Cancelled`, failing only that call — nothing reached the peer, so the session stays usable |
+| A `StreamBuffer` cap with `StreamFullMode.Error` filled up | `ProcessError.OutputTooLarge`, ending the session like a protocol failure (see the backlog note below) |
 | The peer's framed output ended before answering | `ProcessError.Io` — and every later verb fails the same way instead of waiting forever |
 | The `result` does not fit the requested type | `ProcessError.Parse` (a JSON `null` result included — read it with `RequestRawAsync`) |
 | The peer sent something that is not a JSON-RPC message | `ProcessError.Parse`, ending the session: pending requests all fail with it and `MessagesAsync` faults with `ProcessException` |
@@ -886,10 +890,22 @@ Incoming messages are unaffected (a torn *outgoing* frame does not corrupt what 
 keep arriving on `MessagesAsync` until the peer's output ends.
 
 A send that was interrupted **before** it wrote anything is the ordinary case, and it fails alone: an
-already-cancelled token, or a per-request timeout that elapses while the call is still queued behind
-another send, leaves the peer's stdin untouched. Cancelling one request — the completion an editor
-abandons on the next keystroke — therefore never ends the conversation, and a per-request timeout
-bounds its own call rather than the session.
+already-cancelled token, a per-request timeout that elapses while the call is still queued behind
+another send, or one that elapses while the very first send is still waiting for a `Stdin(source)`
+feeder to hand over the pipe, all leave the peer's stdin untouched. Cancelling one request — the
+completion an editor abandons on the next keystroke — therefore never ends the conversation, and a
+per-request timeout bounds its own call rather than the session. The framing layer underneath reports
+which of the two happened, so "the session is over" always means a frame really was being written.
+
+Two backlogs sit behind a session, with separate knobs. The third constructor argument
+(`messageBacklog`, 1024 by default) bounds the *decoded* messages waiting for `MessagesAsync`, dropping
+the oldest and counting them in `DroppedMessages`. `Command.StreamBuffer` bounds the *raw frame*
+backlog underneath, through the `ContentLengthSession` this session owns, and only its lossless full
+modes apply there: `Backpressure` paces the peer against the router, and `Error` ends the conversation
+with `ProcessError.OutputTooLarge` at the cap. `DropOldest`/`DropNewest` are refused when the session is
+constructed — the constructor throws `ProcessException` carrying `ProcessError.Unsupported`, since
+dropping a queued frame would delete a message the peer is correlating with a request. Leaving
+`StreamBuffer` unset keeps the default unbounded frame backlog.
 
 `MessagesAsync` is a single-consumer stream of everything that is *not* an answer to your own
 requests: notifications (`IsRequest` false) and the peer's own requests (`IsRequest` true, answer

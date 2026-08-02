@@ -160,9 +160,13 @@ type private DropCounter() =
 ///   conversation — pending requests fail with it and every later request/send reports it instead of
 ///   writing into a stream the peer can no longer read. A torn *outgoing* frame does not corrupt what
 ///   the peer says, so `MessagesAsync` keeps delivering incoming messages until the peer's output ends.
-///   An interruption that landed **before** the write began — a token that was already cancelled, or a
-///   deadline that elapsed while the call was still queued behind another send — wrote nothing, so it
-///   fails only that one call and leaves the conversation usable;
+///   An interruption that landed **before** the write began — a token that was already cancelled, a
+///   deadline that elapsed while the call was still queued behind another send, or one that elapsed
+///   while the first send was still waiting for a `Command.Stdin(source)` feeder to hand over the pipe —
+///   wrote nothing, so it fails only that one call and leaves the conversation usable;
+/// - the frame backlog underneath hit a `Command.StreamBuffer` cap configured with
+///   `StreamFullMode.Error` — `ProcessError.OutputTooLarge`, which ends the session exactly as a
+///   protocol failure does (see the backlog note below);
 /// - the peer's framed output ended (it exited, or closed stdout) while a request was pending —
 ///   `ProcessError.Io`, and every later verb fails the same way instead of waiting forever;
 /// - the peer sent something that is not a JSON-RPC message — `ProcessError.Parse`, which ends the whole
@@ -171,6 +175,16 @@ type private DropCounter() =
 ///
 /// An answer whose `id` matches no waiting request — typically a late reply to a request that already
 /// timed out — is discarded, since the caller has already been told the request failed.
+///
+/// **Two backlogs, two knobs.** `messageBacklog` (the third constructor argument, 1024 by default)
+/// bounds the DECODED incoming messages waiting for `MessagesAsync`, dropping the oldest and counting
+/// them in `DroppedMessages`. `Command.StreamBuffer` bounds the raw frame backlog underneath it, through
+/// the `ContentLengthSession` this session owns, and only its two LOSSLESS full modes apply there:
+/// `Backpressure` paces the peer against the router, and `Error` ends the conversation with
+/// `ProcessError.OutputTooLarge` at the cap. The two DROP modes are refused when this session is
+/// constructed — the constructor raises `ProcessException` carrying `ProcessError.Unsupported`, because
+/// silently deleting a queued frame would delete a message the peer is correlating with a request, and
+/// no consumer could tell. Leaving `StreamBuffer` unset keeps the default unbounded frame backlog.
 [<Sealed>]
 type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog: int) =
     do ArgumentNullException.ThrowIfNull(running, nameof running)
@@ -184,12 +198,14 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
     // exactly once, by the router below, and never handed out (KB K-031).
     let transport = ContentLengthSession(running, maxFrameBytes)
 
-    // This session's OWN send gate, held around a whole outgoing frame. It is what separates a send that
-    // was interrupted before it wrote a single byte — queued behind another send, or given a token that
-    // was already cancelled — from one interrupted mid-frame: only the second kind can leave the peer a
-    // truncated payload, and only it may end the conversation. Taking this gate first also means the
-    // framing layer's own gate is never contended (this session is the transport's only sender), so an
-    // interruption reported from inside it happened while the write was genuinely under way.
+    // This session's OWN send gate, held around a whole outgoing frame, so two calls can never interleave
+    // inside one. A call interrupted while queued HERE — behind another send, or given a token that was
+    // already cancelled — plainly wrote nothing, and `SendFramed` fails it alone without consulting
+    // anything else. Where an interruption past this gate landed is not something this layer can see: the
+    // framing layer is the one that knows whether it was still claiming the run's stdin (a
+    // `Command.Stdin(source)` feeder can own that pipe for as long as the source takes to drain) or
+    // genuinely writing, so it reports that stage through `SendStagedAsync` and only the writing kind may
+    // end the conversation.
     let sendGate = new SemaphoreSlim(1, 1)
 
     let gate = obj ()
@@ -310,19 +326,21 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
 
     let currentFault () = lock gate (fun () -> ended)
 
-    // A send the caller's token or a request's deadline interrupted ONCE IT HAD REACHED THE FRAMING
-    // LAYER may have written only PART of a frame — the framing layer says exactly that ("abandon the
-    // session after it"), and a peer stuck mid-parse of a truncated payload reads whatever follows as
-    // the rest of that payload. Nothing sent afterwards can be understood, so the interruption becomes
-    // the session's terminal failure instead of a per-call error that pretends the conversation can
-    // continue. Only sends that got past `sendGate` reach here, which is what keeps an ordinary
-    // cancelled or timed-out call — one that never began writing — from ending the conversation. Other
-    // send failures tore nothing either: `Unsupported` never wrote a byte, and a broken pipe is reported
-    // by the router when the peer's output ends.
-    let endTornSend (error: ProcessError) =
-        match error with
-        | ProcessError.Cancelled _
-        | ProcessError.Timeout _ -> endSession error
+    // A send the caller's token or a request's deadline interrupted ONCE ITS FRAME WAS BEING WRITTEN may
+    // have written only PART of it — the framing layer says exactly that ("abandon the session after
+    // it"), and a peer stuck mid-parse of a truncated payload reads whatever follows as the rest of that
+    // payload. Nothing sent afterwards can be understood, so the interruption becomes the session's
+    // terminal failure instead of a per-call error that pretends the conversation can continue.
+    //
+    // `FramedSendStage` is what keeps that judgement honest, and it is not optional: the framing layer
+    // reaches the pipe only after claiming the run's interactive stdin, which on a `Command.Stdin(source)`
+    // run waits for the source feeder to finish draining, so a `Cancelled`/`Timeout` coming out of it is
+    // NOT by itself evidence that anything was written. An interruption reported from before the first
+    // byte tore nothing and fails alone. Other send failures tore nothing either: `Unsupported` never
+    // wrote a byte, and a broken pipe is reported by the router when the peer's output ends.
+    let endTornSend (stage: FramedSendStage) (error: ProcessError) =
+        match stage, error with
+        | FramedSendStage.Writing, (ProcessError.Cancelled _ | ProcessError.Timeout _) -> endSession error
         | _ -> ()
 
     // Notifications and answers to the peer carry no deadline of their own: whatever interrupted their
@@ -490,10 +508,11 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
         buffer.WrittenSpan.ToArray()
 
     // Every outgoing frame goes through here, so the two ways a send can be interrupted are told apart
-    // in exactly one place, whatever the frame was carrying: an interruption while the call is still
-    // queued on `sendGate` wrote nothing and fails only that call, while one past the gate may have torn
-    // a frame and ends the session (see `endTornSend`). `classifyInterrupt` names which token ended it —
-    // a request's own deadline reports a timeout, anything else a cancellation.
+    // in exactly one place, whatever the frame was carrying: an interruption before the frame's first
+    // byte — queued on `sendGate`, or reported as such by the framing layer — wrote nothing and fails
+    // only that call, while one the framing layer reports from mid-write may have torn a frame and ends
+    // the session (see `endTornSend`). `classifyInterrupt` names which token ended it — a request's own
+    // deadline reports a timeout, anything else a cancellation.
     member private _.SendFramed
         (payload: byte[], cancellationToken: CancellationToken, classifyInterrupt: ProcessError -> ProcessError)
         : Task<Result<unit, ProcessError>> =
@@ -518,11 +537,11 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
                     if cancellationToken.IsCancellationRequested then
                         return Error(classifyInterrupt (ProcessError.Cancelled program))
                     else
-                        match! transport.SendAsync(payload, cancellationToken) with
+                        match! transport.SendStagedAsync(payload, cancellationToken) with
                         | Ok() -> return Ok()
-                        | Error error ->
+                        | Error(error, stage) ->
                             let reported = classifyInterrupt error
-                            endTornSend reported
+                            endTornSend stage reported
                             return Error reported
                 finally
                     sendGate.Release() |> ignore

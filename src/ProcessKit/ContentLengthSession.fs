@@ -112,6 +112,24 @@ type private ContentLengthReader(stream: Stream, tee: Stream option, invalid: st
                 returned <- true
                 ArrayPool<byte>.Shared.Return buffer
 
+/// How far a framed send had got when it failed: the difference between a failure the child cannot
+/// have observed and one that may have left it a partial frame.
+///
+/// Internal, because it exists for the layer built ON this transport — `JsonRpcSession` has to tell an
+/// ordinary interrupted call, which fails alone, from a torn frame, which ends the conversation. A
+/// session driven directly keeps the conservative public contract of `SendAsync`, which does not
+/// surface this.
+[<RequireQualifiedAccess>]
+type internal FramedSendStage =
+    /// Still waiting for the run's interactive stdin — a `Command.Stdin(source)` feeder may still own
+    /// the pipe — or queued on this session's send gate. Not one byte of the frame was handed to the
+    /// pipe, so the child's view of the stream is exactly what it was before the call.
+    | BeforeWrite
+
+    /// The header, the payload, or the flush that completes them was already under way: an interruption
+    /// here may have delivered a prefix no peer can resynchronize from.
+    | Writing
+
 /// A full-duplex Content-Length framed transport over a live process's stdin/stdout, suitable for
 /// LSP, DAP, BSP, and similar protocols. Construct it over a command started with
 /// `Command.KeepStdinOpen()`, enumerate `FramesAsync()`, and send raw payload bytes with `SendAsync`.
@@ -298,6 +316,64 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
     // reading stdin, and the feeder never completes.
     let stdin: Task<ProcessStdin option> = running.TakeStdinAsync()
 
+    let validatePayload (payload: byte[]) =
+        ArgumentNullException.ThrowIfNull(payload, nameof payload)
+
+        if payload.Length > maxFrameBytes then
+            raise (
+                ArgumentOutOfRangeException(nameof payload, payload.Length, $"payload exceeds {maxFrameBytes} bytes")
+            )
+
+    // The one send path, shared by the public verb and the staged one below. It reports WHERE a failure
+    // happened as well as what it was: everything up to the first `WriteAsync` is preparation the child
+    // cannot observe — claiming stdin from behind a `Command.Stdin(source)` feeder, then queueing on
+    // `sendGate` — while everything from it on may have left a partial frame in the pipe. Cancellation is
+    // reported as `ProcessError.Cancelled` from either side; only the stage tells them apart, and only
+    // the layer above consumes that (see `FramedSendStage`).
+    let sendStaged
+        (payload: byte[])
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError * FramedSendStage>> =
+        task {
+            let mutable stage = FramedSendStage.BeforeWrite
+
+            try
+                let! claimed = stdin.WaitAsync cancellationToken
+
+                match claimed with
+                | None ->
+                    return
+                        Error(
+                            ProcessError.Unsupported
+                                "Content-Length sending requires a command built with Command.KeepStdinOpen",
+                            stage
+                        )
+                | Some pipe ->
+                    do! sendGate.WaitAsync cancellationToken
+
+                    try
+                        let header = Encoding.ASCII.GetBytes($"Content-Length: {payload.Length}\r\n\r\n")
+
+                        // One last look before the first byte. A token that fired while this call was
+                        // still queued has written nothing, and a stream that throws for an already
+                        // cancelled token would otherwise be indistinguishable from one interrupted
+                        // mid-frame — which, one layer up, ends a conversation the child never noticed.
+                        if cancellationToken.IsCancellationRequested then
+                            return Error(ProcessError.Cancelled program, stage)
+                        else
+                            stage <- FramedSendStage.Writing
+                            do! pipe.WriteAsync(header, cancellationToken)
+                            do! pipe.WriteAsync(payload, cancellationToken)
+                            do! pipe.FlushAsync cancellationToken
+                            return Ok()
+                    finally
+                        sendGate.Release() |> ignore
+            with
+            | :? OperationCanceledException -> return Error(ProcessError.Cancelled program, stage)
+            | :? IOException as ex -> return Error(ProcessError.Io ex.Message, stage)
+            | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message, stage)
+        }
+
     /// A session using the default 16 MiB maximum payload size.
     new(running: RunningProcess) = ContentLengthSession(running, 16 * 1024 * 1024)
 
@@ -314,51 +390,38 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
         frames.Reader.ReadAllAsync()
 
     /// Send one byte-exact payload. Concurrent calls are serialized so their headers and payloads cannot
-    /// interleave. Cancellation may leave a partial frame in the child, so abandon the session after it.
+    /// interleave. Cancellation may leave a partial frame in the child, so abandon the session after it —
+    /// with one exception worth knowing: an interruption that lands while the call is still waiting for a
+    /// `Command.Stdin(source)` feeder, or queued behind another send, has not written a byte. Both are
+    /// reported the same way here; `JsonRpcSession`, layered on this type, tells them apart internally so
+    /// a cancelled call does not end its conversation.
     ///
     /// On a `Command.Stdin(source)` + `KeepStdinOpen` run this is where the source feeder is awaited (the
     /// constructor no longer blocks on it), so the first send completes only once the source has been
     /// drained and the interactive writer is the pipe's single writer — `cancellationToken` bounds that
     /// wait too, reported as `ProcessError.Cancelled` like any other cancelled send.
     member _.SendAsync(payload: byte[], cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
-        ArgumentNullException.ThrowIfNull(payload, nameof payload)
-
-        if payload.Length > maxFrameBytes then
-            raise (
-                ArgumentOutOfRangeException(nameof payload, payload.Length, $"payload exceeds {maxFrameBytes} bytes")
-            )
+        validatePayload payload
 
         task {
-            try
-                let! claimed = stdin.WaitAsync cancellationToken
-
-                match claimed with
-                | None ->
-                    return
-                        Error(
-                            ProcessError.Unsupported
-                                "Content-Length sending requires a command built with Command.KeepStdinOpen"
-                        )
-                | Some pipe ->
-                    do! sendGate.WaitAsync cancellationToken
-
-                    try
-                        let header = Encoding.ASCII.GetBytes($"Content-Length: {payload.Length}\r\n\r\n")
-                        do! pipe.WriteAsync(header, cancellationToken)
-                        do! pipe.WriteAsync(payload, cancellationToken)
-                        do! pipe.FlushAsync cancellationToken
-                        return Ok()
-                    finally
-                        sendGate.Release() |> ignore
-            with
-            | :? OperationCanceledException -> return Error(ProcessError.Cancelled program)
-            | :? IOException as ex -> return Error(ProcessError.Io ex.Message)
-            | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
+            match! sendStaged payload cancellationToken with
+            | Ok() -> return Ok()
+            | Error(error, _) -> return Error error
         }
 
     /// Send one payload without cancellation.
     member this.SendAsync(payload: byte[]) : Task<Result<unit, ProcessError>> =
         this.SendAsync(payload, CancellationToken.None)
+
+    /// The staged form of `SendAsync` for the JSON-RPC layer above: the same send, but a failure also
+    /// says whether it could have reached the child. Internal — this distinction exists so a session
+    /// built on this transport can keep a cancelled call from ending a conversation whose stream is
+    /// intact, not to widen the public surface.
+    member internal _.SendStagedAsync
+        (payload: byte[], cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError * FramedSendStage>> =
+        validatePayload payload
+        sendStaged payload cancellationToken
 
     /// Close the child's framed input so it observes EOF. Sending is unsupported when the command did
     /// not keep stdin open; repeated close calls follow `ProcessStdin.FinishAsync`'s idempotent contract.

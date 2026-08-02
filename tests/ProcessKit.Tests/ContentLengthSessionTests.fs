@@ -110,6 +110,40 @@ type private ChunkedFrameStream(chunks: byte[][]) =
             served[index - 1].TrySetResult() |> ignore
             ValueTask<int> chunk.Length
 
+/// A stdin double whose writes never finish on their own: the first one announces itself and then waits
+/// for its own cancellation token, the way a real pipe blocks once the child stops reading. Lets a test
+/// pin down a send interrupted WHILE it was writing, as opposed to one interrupted before its first byte.
+type private StallingStdinStream() =
+    inherit Stream()
+
+    let writing =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    /// Completes once a write has parked in this stream.
+    member _.Writing = writing.Task
+
+    override _.CanRead = false
+    override _.CanSeek = false
+    override _.CanWrite = true
+    override _.Length = 0L
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) = raise (NotSupportedException())
+
+    // Never the synchronous path: `ProcessStdin.WriteAsync` writes through the array-based async overload,
+    // and a base-class fallback to `Write` would silently accept bytes this test needs held.
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+
+    override _.WriteAsync(_buffer: byte[], _offset: int, _count: int, cancellationToken: CancellationToken) : Task =
+        writing.TrySetResult() |> ignore
+        Task.Delay(Timeout.Infinite, cancellationToken)
+
 [<TestFixture>]
 type ContentLengthSessionTests() =
 
@@ -398,6 +432,66 @@ type ContentLengthSessionTests() =
             finally
                 // Never leave the modelled feeder parked on a signal, whatever an assertion above decided.
                 stdout.ReleaseSignals()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an interrupted send reports whether it could have reached the child``() : Task =
+        task {
+            // Both interruptions below are the same `ProcessError.Cancelled` to a caller of `SendAsync`,
+            // which stays conservative ("abandon the session"). The staged form separates them, and that
+            // separation is load-bearing one layer up: `JsonRpcSession` ends a conversation only for a
+            // frame that was genuinely being written, never for a call parked ahead of the pipe.
+            let feeding =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let stdout = new MemoryStream()
+            let stdin = new StallingStdinStream()
+            let command = (Command.create "language-server").KeepStdinOpen()
+
+            use running =
+                new RunningProcess(
+                    hostForCommand
+                        command
+                        (stdout :> Stream)
+                        (Some(stdin :> Stream))
+                        (fun () -> feeding.Task.GetAwaiter().GetResult())
+                        (fun () -> ValueTask())
+                )
+
+            let session = ContentLengthSession running
+
+            try
+                use claimCancellation = new CancellationTokenSource()
+
+                // Parked waiting for the stdin source feeder: no gate taken, no byte written.
+                let claiming = session.SendStagedAsync([| 1uy |], claimCancellation.Token)
+
+                let parked = "a send must wait for the stdin source feeder before writing the pipe"
+                let! early = Task.WhenAny(claiming :> Task, Task.Delay 200)
+                Assert.That(obj.ReferenceEquals(early, claiming), Is.False, parked)
+
+                claimCancellation.Cancel()
+
+                match! claiming with
+                | Error(ProcessError.Cancelled _, FramedSendStage.BeforeWrite) -> ()
+                | other -> Assert.Fail $"expected a cancellation reported from before the first byte, got {other}"
+
+                // The feeder finishes, so the next send reaches the pipe and parks INSIDE the write —
+                // where the very same cancellation may have delivered the child a prefix.
+                feeding.TrySetResult() |> ignore
+                use writeCancellation = new CancellationTokenSource()
+                let writing = session.SendStagedAsync([| 2uy |], writeCancellation.Token)
+
+                do! stdin.Writing
+                writeCancellation.Cancel()
+
+                match! writing with
+                | Error(ProcessError.Cancelled _, FramedSendStage.Writing) -> ()
+                | other -> Assert.Fail $"expected a cancellation reported from inside the write, got {other}"
+            finally
+                // Never leave the modelled feeder parked on a pool thread, whatever an assertion decided.
+                feeding.TrySetResult() |> ignore
         }
         :> Task
 

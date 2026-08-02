@@ -11,6 +11,7 @@ open System.Threading.Channels
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+open ProcessKit.Testing
 
 /// Params/result shapes for the typed overloads. Public, because STJ's constructor-based
 /// deserialization needs an accessible constructor (same reason as `JsonVerbTests.Widget`).
@@ -237,7 +238,11 @@ type JsonRpcSessionTests() =
     let hoverResultTypeInfo =
         JsonSerializerOptions.Default.GetTypeInfo(typeof<RpcHoverResult>) :?> JsonTypeInfo<RpcHoverResult>
 
-    let peerHandle () =
+    // `feedComplete` stands in for `RunningHost.StdinFeedComplete` — the blocking wait for a
+    // `Command.Stdin(source)` feeder to finish draining, which is what holds the interactive pipe back on
+    // such a run. `ignore` models the interactive-only stdin every other test here wants; a blocking one
+    // models the window in which a send is parked before it can write a single byte.
+    let peerHandleFeeding (feedComplete: unit -> unit) =
         let stdout = new PeerOutputStream()
         let stdin = new PeerInputStream()
 
@@ -255,7 +260,7 @@ type JsonRpcSessionTests() =
               StartTimeIdentity = None
               Wait = fun () -> exit.Task
               StdinError = fun () -> None
-              StdinFeedComplete = ignore
+              StdinFeedComplete = feedComplete
               StartKill = ignore
               Signal = fun _ -> Ok()
               GracefulKill = fun _ -> Task.CompletedTask
@@ -270,6 +275,8 @@ type JsonRpcSessionTests() =
         { Running = new RunningProcess(host)
           Stdout = stdout
           Stdin = stdin }
+
+    let peerHandle () = peerHandleFeeding ignore
 
     let framed (json: string) =
         let payload = Encoding.UTF8.GetBytes json
@@ -440,6 +447,15 @@ type JsonRpcSessionTests() =
             use running = peer.Running
             let session = JsonRpcSession(running)
 
+            // One frame the peer does read first, so the run's interactive stdin has certainly been
+            // claimed and handed over before the stall below: what the deadline then interrupts can only
+            // be the write itself, never the claim ahead of it (which tears nothing and fails alone).
+            match! session.NotifyRawAsync("initialized", null) with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"the first notification must reach the peer, got {error}"
+
+            use! _claimed = nextFrame peer.Stdin
+
             // The peer stopped draining its stdin, so the write itself blocks — the half of the call a
             // deadline armed only around the wait for an answer would never bound.
             peer.Stdin.StallWrites()
@@ -484,6 +500,10 @@ type JsonRpcSessionTests() =
             let call =
                 session.RequestRawAsync("initialize", null, TimeSpan.FromSeconds 30.0, cancellation.Token)
 
+            // Cancelled only once the frame is genuinely being written — the stalled peer is holding that
+            // write — so this pins the torn-frame path instead of racing the send's own start-up, where
+            // the same token would (correctly) fail the call alone.
+            do! peer.Stdin.NextStalledWriteAsync()
             cancellation.Cancel()
 
             match! call with
@@ -537,6 +557,85 @@ type JsonRpcSessionTests() =
 
             let! answer = call
             assertRaw "\"still talking\"" answer
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an interruption while the stdin source feeder still owns the pipe fails alone``() : Task =
+        task {
+            // A `Stdin(source)` + `KeepStdinOpen` run: the framing layer claims the interactive pipe at
+            // once but is handed it only when the source feeder has finished draining, so a send parks
+            // there — ahead of every gate and every byte. An interruption in that window reaches this
+            // session as the same `Cancelled`/`Timeout` a torn frame does, and treating it as torn would
+            // kill a conversation whose stream the peer never even saw move.
+            let feeding =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let peer = peerHandleFeeding (fun () -> feeding.Task.GetAwaiter().GetResult())
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            use cancellation = new CancellationTokenSource()
+
+            try
+                // A per-request deadline that elapses while the send is parked on that feeder.
+                match! session.RequestRawAsync("textDocument/hover", null, TimeSpan.FromMilliseconds 150.0) with
+                | Error(ProcessError.Timeout(program, timeout, _, _)) ->
+                    Assert.That(program, Is.EqualTo "language-server")
+                    Assert.That(timeout, Is.EqualTo(TimeSpan.FromMilliseconds 150.0))
+                | other -> Assert.Fail $"expected the parked send to time out alone, got {other}"
+
+                // Probed with an already-cancelled token, which never reaches the pipe and so cannot park
+                // behind the feeder: `Cancelled` is that probe's own token and means the conversation is
+                // still open, while the deadline above coming back here would mean a call that wrote
+                // nothing had ended it.
+                use probeToken = new CancellationTokenSource()
+                probeToken.Cancel()
+
+                match! session.NotifyRawAsync("$/cancelRequest", null, probeToken.Token) with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"the parked deadline must not have ended the conversation, got {other}"
+
+                // ...and the caller's own token, the completion an editor abandons on the next keystroke.
+                let call =
+                    session.RequestRawAsync("textDocument/completion", null, cancellation.Token)
+
+                let parked =
+                    "the queued send returned at once: either it never waited for the stdin source feeder, or an interruption that wrote nothing had already ended the conversation"
+
+                let! early = Task.WhenAny(call :> Task, Task.Delay 200)
+                Assert.That(obj.ReferenceEquals(early, call), Is.False, parked)
+
+                cancellation.Cancel()
+
+                match! call with
+                | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
+                | other -> Assert.Fail $"expected the parked send to be cancelled alone, got {other}"
+
+                // The feeder finishes and the conversation must be intact: neither interruption above
+                // wrote a byte, so neither may have torn a frame.
+                feeding.TrySetResult() |> ignore
+
+                match! session.NotifyRawAsync("initialized", null) with
+                | Ok() -> ()
+                | Error error ->
+                    Assert.Fail $"an interruption before the first byte must not end the conversation, got {error}"
+
+                // It is also the FIRST frame the peer receives, which is what proves the two interrupted
+                // calls wrote nothing at all.
+                use! probe = nextFrame peer.Stdin
+                Assert.That(methodOf probe, Is.EqualTo "initialized")
+
+                // ...and the conversation still works end to end.
+                let next = session.RequestRawAsync("shutdown", null, TimeSpan.FromSeconds 30.0)
+
+                use! shutdown = nextFrame peer.Stdin
+                peer.Stdout.Emit(framed (responseJson (rawId shutdown) "null"))
+
+                let! answer = next
+                assertRaw "null" answer
+            finally
+                // Never leave the modelled feeder parked on a pool thread, whatever an assertion decided.
+                feeding.TrySetResult() |> ignore
         }
         :> Task
 
@@ -825,6 +924,38 @@ type JsonRpcSessionTests() =
             Assert.That(received, Is.True)
             Assert.That(messages.Current.Method, Is.EqualTo "note/3")
             do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a lossy frame backlog is refused when the session is constructed``() : Task =
+        task {
+            // The OTHER backlog: `messageBacklog` above bounds decoded messages and may drop the oldest,
+            // while `Command.StreamBuffer` bounds the raw frames underneath and may not — a dropped frame
+            // is a message the peer is still correlating with a request. This session inherits that
+            // refusal from the framing layer it owns, so the refusal surfaces out of ITS constructor.
+            let command =
+                (Command.create "language-server")
+                    .KeepStdinOpen()
+                    .StreamBuffer(StreamBufferPolicy.Bounded(2, StreamFullMode.DropNewest))
+
+            use running =
+                FakeProcess.OfCommand(command).WithContentLengthFrames([ Array.create 4 7uy ]).Build()
+
+            let refusal =
+                Assert.Throws<ProcessException>(Action(fun () -> JsonRpcSession running |> ignore))
+
+            match refusal with
+            | null -> Assert.Fail "expected a lossy frame backlog to be refused with a typed ProcessException"
+            | error ->
+                match error.Error with
+                | ProcessError.Unsupported detail -> Assert.That(detail, Does.Contain "DropNewest")
+                | other -> Assert.Fail $"expected Unsupported, got {other}"
+
+            // Refused before anything is claimed, so the handle is left exactly as it was found.
+            match! running.OutputStringAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"a refused session must leave stdout unclaimed, got {error}"
         }
         :> Task
 
