@@ -125,6 +125,47 @@ type ContentLengthSessionTests() =
         :> Task
 
     [<Test>]
+    member _.``a bounded StreamBuffer backpressures the frame parser instead of an unbounded backlog``() : Task =
+        task {
+            let payloads = [| for value in 0uy .. 4uy -> Array.create 4 value |]
+
+            let command =
+                (Command.create "language-server").StreamBuffer(StreamBufferPolicy.Bounded(2))
+
+            let fake = FakeProcess.OfCommand(command).WithContentLengthFrames(payloads)
+
+            use running = fake.Build()
+            let session = ContentLengthSession running
+
+            // Nobody is reading `FramesAsync()` yet, and the in-memory producer has no real I/O delay of
+            // its own — with an honestly bounded channel (capacity 2) the parser can enqueue at most 2 of
+            // the 5 scripted frames before its `WriteAsync` on the 3rd genuinely blocks, so the session's
+            // combined outcome (which that parse loop's completion resolves) cannot have finished yet. An
+            // unbounded backlog (today's bug) would instead let the parser race ahead and finish
+            // instantly, with nobody ever having paced it.
+            let! stillPending = Task.WhenAny(running.ExitTask, Task.Delay 300)
+
+            Assert.That(
+                obj.ReferenceEquals(stillPending, running.ExitTask),
+                Is.False,
+                "an unbounded channel would already have let the parser finish without any consumer"
+            )
+
+            let! actual = collect (session.FramesAsync())
+
+            Assert.That(actual.Length, Is.EqualTo payloads.Length)
+
+            for index in 0 .. payloads.Length - 1 do
+                Assert.That(Convert.ToHexString actual[index], Is.EqualTo(Convert.ToHexString payloads[index]))
+
+            // Backpressure only paces the parser; it must still deliver every frame, byte-exact, once a
+            // consumer starts draining.
+            let! outcome = running.ExitTask
+            Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+        }
+        :> Task
+
+    [<Test>]
     member _.``concurrent sends remain complete frames and record through FakeProcess stdin``() : Task =
         task {
             let first = Encoding.UTF8.GetBytes "first"

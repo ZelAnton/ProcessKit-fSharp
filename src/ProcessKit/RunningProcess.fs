@@ -2147,6 +2147,12 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// and the terminal encoding from it.
     member internal _.Config: CommandConfig = config
 
+    /// Cancelled once this handle's own teardown begins. Internal: `ContentLengthSession` bounds its
+    /// framed channel's `StreamFullMode.Backpressure` wait (`StreamChannel.writeItem`'s
+    /// `disposalToken`) to this token, the same way `writeStreamItem` above bounds the stdout/event
+    /// channels — so a writer parked on a bounded frame backlog can't outlive an abandoned handle.
+    member internal _.DisposalToken: CancellationToken = disposalCts.Token
+
     /// Whether this run actually has a live pseudo-terminal behind it — what `PtySession` asks before
     /// choosing the carriage return a terminal expects for Enter over a plain pipe's line feed. Read
     /// from the spawned host (`ResizePty` is `Some` exactly for a pty-backed run) as well as the

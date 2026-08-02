@@ -143,14 +143,16 @@ type StreamFullMode =
     | Error
 
 /// An opt-in bounded/backpressure policy for the streaming verbs (`StdoutLinesAsync` /
-/// `OutputEventsAsync` / `WaitForLineAsync`), set via `Command.StreamBuffer`. Unlike
+/// `OutputEventsAsync` / `WaitForLineAsync`) and `ContentLengthSession.FramesAsync`, set via
+/// `Command.StreamBuffer`. It is inapplicable to `PtySession`, whose raw match window and transcript
+/// have their own character bounds. Unlike
 /// `OutputBufferPolicy` — which bounds an in-memory *buffer* a one-shot verb assembles — this bounds
 /// the *channel* between the background pump and your live consumer. Leaving it unset keeps today's
 /// unbounded channel: an unbounded, uncapped in-flight backlog, exactly as before this policy existed.
 [<Sealed>]
 type StreamBufferPolicy internal (capacity: int, fullMode: StreamFullMode) =
 
-    /// The bounded channel capacity, in lines/events not yet read by the consumer.
+    /// The bounded channel capacity, in lines/events/frames not yet read by the consumer.
     member _.Capacity = capacity
 
     /// What happens once the channel reaches `Capacity`.

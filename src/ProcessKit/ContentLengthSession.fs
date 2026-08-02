@@ -116,6 +116,8 @@ type private ContentLengthReader(stream: Stream, tee: Stream option, invalid: st
 /// LSP, DAP, BSP, and similar protocols. Construct it over a command started with
 /// `Command.KeepStdinOpen()`, enumerate `FramesAsync()`, and send raw payload bytes with `SendAsync`.
 /// The session owns the run's stdout consumption; other output verbs on the same handle are refused.
+/// `Command.StreamBuffer` bounds the unread frame backlog and applies its configured full mode;
+/// leaving it unset preserves the default unbounded backlog.
 [<Sealed>]
 type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
     do ArgumentNullException.ThrowIfNull(running, nameof running)
@@ -123,8 +125,17 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
 
     let program = running.Config.Program
 
-    let frames =
-        Channel.CreateUnbounded<byte[]>(UnboundedChannelOptions(SingleReader = true, SingleWriter = true))
+    // Honestly apply `Command.StreamBuffer` to the incoming-frame backlog, the same channel
+    // construction `RunningProcess`'s own streaming verbs use (`StreamChannel.create`): bounded per
+    // the configured policy, or the unbounded single-reader/single-writer channel this session has
+    // always used when the config leaves it unset. Single writer: only this session's own parse loop
+    // ever writes a frame.
+    let frames: Channel<byte[]> = StreamChannel.create running.Config.StreamBuffer true
+
+    // The running count of frames written so far, fed to `StreamChannel.writeItem`'s `countSoFar` —
+    // only consulted by `StreamFullMode.Error`, to report how many frames had already arrived when the
+    // cap tripped.
+    let mutable writtenFrameCount = 0
 
     let sendGate = new SemaphoreSlim(1, 1)
     let mutable framesClaimed = 0
@@ -188,7 +199,18 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                         | None -> raise (invalid "frame is missing a Content-Length header")
                         | Some length ->
                             let! payload = reader.ReadExactlyAsync length
-                            do! frames.Writer.WriteAsync(payload).AsTask()
+                            writtenFrameCount <- writtenFrameCount + 1
+
+                            do!
+                                StreamChannel.writeItem
+                                    running.Config.StreamBuffer
+                                    program
+                                    running.DisposalToken
+                                    frames.Writer
+                                    frames.Reader
+                                    (fun () -> writtenFrameCount)
+                                    ignore
+                                    payload
             with
             | (:? ObjectDisposedException | :? IOException) when isTearingDown () ->
                 // The owning handle closed stdout during teardown; end the frame stream normally.
