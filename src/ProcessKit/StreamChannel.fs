@@ -5,11 +5,11 @@ open System.Threading
 open System.Threading.Tasks
 open System.Threading.Channels
 
-/// The low-level channel plumbing shared by `RunningProcess`'s two streaming sessions: constructing
-/// the stdout/event channel per the opt-in `StreamBufferPolicy`, the policy-aware per-item write
+/// The low-level channel plumbing shared by line/event streaming and `ContentLengthSession`:
+/// constructing a channel per the opt-in `StreamBufferPolicy`, the policy-aware per-item write
 /// (backpressure / drop / fail-loud), and the stream→line pump those writes are fed from. Factored
 /// out of `RunningProcess` so the channel/backpressure machinery lives in one place next to `Pump`;
-/// the sessions that own the channels stay in `RunningProcess`.
+/// the sessions that own the channels stay in `RunningProcess`/`ContentLengthSession`.
 module internal StreamChannel =
 
     // A bounded channel for an opt-in `StreamBufferPolicy`. `SingleReader = false` regardless of
