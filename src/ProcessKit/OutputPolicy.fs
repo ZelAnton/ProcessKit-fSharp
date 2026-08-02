@@ -130,11 +130,13 @@ type StreamFullMode =
     | Backpressure
 
     /// Ring-buffer / "tail" semantics: drop the oldest queued item to make room for the newest.
-    /// Lossy but bounded; sets `RunningProcess.DroppedStreamLineCount`.
+    /// Lossy but bounded; sets `RunningProcess.DroppedStreamLineCount`. Refused by
+    /// `ContentLengthSession`, whose items are protocol messages rather than log lines.
     | DropOldest
 
     /// "Head" semantics: keep what is already queued and drop the newest incoming item.
-    /// Lossy but bounded; sets `RunningProcess.DroppedStreamLineCount`.
+    /// Lossy but bounded; sets `RunningProcess.DroppedStreamLineCount`. Refused by
+    /// `ContentLengthSession`, whose items are protocol messages rather than log lines.
     | DropNewest
 
     /// Fail-loud ceiling: once the cap is reached, fault the stream with `ProcessError.OutputTooLarge`
@@ -143,7 +145,8 @@ type StreamFullMode =
     | Error
 
 /// An opt-in bounded/backpressure policy for the streaming verbs (`StdoutLinesAsync` /
-/// `OutputEventsAsync` / `WaitForLineAsync`) and `ContentLengthSession.FramesAsync`, set via
+/// `OutputEventsAsync` / `WaitForLineAsync`) and `ContentLengthSession.FramesAsync` (which honours the
+/// lossless full modes and refuses the two lossy ones), set via
 /// `Command.StreamBuffer`. It is inapplicable to `PtySession`, whose raw match window and transcript
 /// have their own character bounds. Unlike
 /// `OutputBufferPolicy` — which bounds an in-memory *buffer* a one-shot verb assembles — this bounds

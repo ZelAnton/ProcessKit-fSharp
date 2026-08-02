@@ -116,14 +116,48 @@ type private ContentLengthReader(stream: Stream, tee: Stream option, invalid: st
 /// LSP, DAP, BSP, and similar protocols. Construct it over a command started with
 /// `Command.KeepStdinOpen()`, enumerate `FramesAsync()`, and send raw payload bytes with `SendAsync`.
 /// The session owns the run's stdout consumption; other output verbs on the same handle are refused.
-/// `Command.StreamBuffer` bounds the unread frame backlog and applies its configured full mode;
-/// leaving it unset preserves the default unbounded backlog.
+///
+/// `Command.StreamBuffer` bounds the unread frame backlog; leaving it unset preserves the default
+/// unbounded backlog. Only its two LOSSLESS full modes are honoured here: `Backpressure` paces the
+/// parser (and, through the pipe, the child) against your consumer, and `Error` faults the frame stream
+/// at the cap. The two DROP modes are refused at construction with a typed
+/// `ProcessError.Unsupported` — a framed transport carries protocol messages a peer correlates with its
+/// requests, so quietly deleting a queued frame is a corruption no consumer could detect, and this
+/// library refuses inapplicable configuration rather than downgrading it silently.
+///
+/// With a bounded backlog, drain `FramesAsync()` concurrently with your sends rather than awaiting a send
+/// first: backpressure deliberately stops the parser (and the child) once the backlog is full, so a
+/// consumer that only starts reading after some other await can stall the child it is waiting on. The
+/// constructor itself never waits on the child — a `Command.Stdin(source)` feeder is awaited by the first
+/// `SendAsync`/`FinishInputAsync` instead, so the caller always gets the session back and can start
+/// draining frames.
 [<Sealed>]
 type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
     do ArgumentNullException.ThrowIfNull(running, nameof running)
     do ArgumentOutOfRangeException.ThrowIfLessThan(maxFrameBytes, 1, nameof maxFrameBytes)
 
     let program = running.Config.Program
+
+    let refuseLossyBacklog (mode: string) =
+        ProcessException(
+            ProcessError.Unsupported
+                $"StreamBuffer(StreamFullMode.{mode}) on a Content-Length session: a framed transport delivers protocol messages, so dropping a queued frame would silently delete a message the peer is correlating with a request and no consumer could tell. Use StreamFullMode.Backpressure to pace the child losslessly, StreamFullMode.Error to fail loudly at the cap, or drop StreamBuffer for an unbounded backlog."
+        )
+        :> exn
+
+    // Refuse the lossy full modes BEFORE claiming stdout below, so a refused configuration leaves the
+    // handle exactly as it found it (its capture/streaming verbs still available) — the same
+    // refuse-rather-than-downgrade stance `Command.LaunchDetached` takes on the knobs it cannot honour
+    // (`DetachedLaunch.incompatibleKnob`).
+    do
+        match running.Config.StreamBuffer with
+        | Some policy ->
+            match policy.FullMode with
+            | StreamFullMode.DropOldest -> raise (refuseLossyBacklog "DropOldest")
+            | StreamFullMode.DropNewest -> raise (refuseLossyBacklog "DropNewest")
+            | StreamFullMode.Backpressure
+            | StreamFullMode.Error -> ()
+        | None -> ()
 
     // Honestly apply `Command.StreamBuffer` to the incoming-frame backlog, the same channel
     // construction `RunningProcess`'s own streaming verbs use (`StreamChannel.create`): bounded per
@@ -209,11 +243,26 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                                     frames.Writer
                                     frames.Reader
                                     (fun () -> writtenFrameCount)
-                                    ignore
+                                    (fun () ->
+                                        // Unreachable by construction: `writeItem` calls `onDrop` only from
+                                        // its two DROP full modes, and both are refused for this session
+                                        // above. Kept fail-loud rather than `ignore` so a frame can never
+                                        // vanish silently if that guard is ever weakened — the parse loop
+                                        // below turns this into the frame stream's fault.
+                                        invalidOp
+                                            "ContentLengthSession must never drop a protocol frame; the lossy StreamBuffer full modes are refused at construction")
                                     payload
             with
             | (:? ObjectDisposedException | :? IOException) when isTearingDown () ->
                 // The owning handle closed stdout during teardown; end the frame stream normally.
+                ()
+            | :? OperationCanceledException when isTearingDown () ->
+                // The other way that same teardown reaches this loop: a bounded backlog's `Backpressure`
+                // write was parked waiting for the consumer to make room when the handle cancelled
+                // `DisposalToken`, the token that wait is deliberately bounded to (`StreamChannel.writeItem`,
+                // so an abandoned bounded stream's writer cannot outlive its handle). Disposal is not a
+                // parser fault, so end the frame stream normally here too — a consumer that disposes while
+                // behind must see a clean end, never a spurious cancellation out of its enumerator.
                 ()
             | ex -> fault <- Some(reportedFault ex)
 
@@ -240,7 +289,14 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
         | Ok() -> ()
         | Error error -> raise (InvalidOperationException error.Message)
 
-    let stdin = running.TakeStdin()
+    // Claim the interactive stdin the moment the parse loop above owns stdout, but do NOT wait here for a
+    // `Command.Stdin(source)` feeder to finish draining: `TakeStdinAsync` performs that once-only claim
+    // synchronously (a racing `TakeStdin` still loses, exactly as when this blocked) and hands the wait
+    // back as a task the send verbs await. Blocking the constructor on that feeder deadlocks a bounded
+    // frame backlog: the parse loop parks on the full channel, whose only consumer — `FramesAsync()` — the
+    // caller cannot reach until this constructor returns, so the child blocks writing stdout, stops
+    // reading stdin, and the feeder never completes.
+    let stdin: Task<ProcessStdin option> = running.TakeStdinAsync()
 
     /// A session using the default 16 MiB maximum payload size.
     new(running: RunningProcess) = ContentLengthSession(running, 16 * 1024 * 1024)
@@ -259,6 +315,11 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
 
     /// Send one byte-exact payload. Concurrent calls are serialized so their headers and payloads cannot
     /// interleave. Cancellation may leave a partial frame in the child, so abandon the session after it.
+    ///
+    /// On a `Command.Stdin(source)` + `KeepStdinOpen` run this is where the source feeder is awaited (the
+    /// constructor no longer blocks on it), so the first send completes only once the source has been
+    /// drained and the interactive writer is the pipe's single writer — `cancellationToken` bounds that
+    /// wait too, reported as `ProcessError.Cancelled` like any other cancelled send.
     member _.SendAsync(payload: byte[], cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
         ArgumentNullException.ThrowIfNull(payload, nameof payload)
 
@@ -267,17 +328,18 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                 ArgumentOutOfRangeException(nameof payload, payload.Length, $"payload exceeds {maxFrameBytes} bytes")
             )
 
-        match stdin with
-        | None ->
-            Task.FromResult(
-                Error(
-                    ProcessError.Unsupported
-                        "Content-Length sending requires a command built with Command.KeepStdinOpen"
-                )
-            )
-        | Some pipe ->
-            task {
-                try
+        task {
+            try
+                let! claimed = stdin.WaitAsync cancellationToken
+
+                match claimed with
+                | None ->
+                    return
+                        Error(
+                            ProcessError.Unsupported
+                                "Content-Length sending requires a command built with Command.KeepStdinOpen"
+                        )
+                | Some pipe ->
                     do! sendGate.WaitAsync cancellationToken
 
                     try
@@ -288,11 +350,11 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                         return Ok()
                     finally
                         sendGate.Release() |> ignore
-                with
-                | :? OperationCanceledException -> return Error(ProcessError.Cancelled program)
-                | :? IOException as ex -> return Error(ProcessError.Io ex.Message)
-                | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
-            }
+            with
+            | :? OperationCanceledException -> return Error(ProcessError.Cancelled program)
+            | :? IOException as ex -> return Error(ProcessError.Io ex.Message)
+            | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
+        }
 
     /// Send one payload without cancellation.
     member this.SendAsync(payload: byte[]) : Task<Result<unit, ProcessError>> =
@@ -300,17 +362,21 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
 
     /// Close the child's framed input so it observes EOF. Sending is unsupported when the command did
     /// not keep stdin open; repeated close calls follow `ProcessStdin.FinishAsync`'s idempotent contract.
+    /// Like `SendAsync`, this awaits a `Command.Stdin(source)` feeder first — closing the pipe under a
+    /// still-writing feeder would truncate the source.
     member _.FinishInputAsync() : Task<Result<unit, ProcessError>> =
-        match stdin with
-        | None ->
-            Task.FromResult(
-                Error(
-                    ProcessError.Unsupported "Content-Length input requires a command built with Command.KeepStdinOpen"
-                )
-            )
-        | Some pipe ->
-            task {
-                try
+        task {
+            try
+                let! claimed = stdin
+
+                match claimed with
+                | None ->
+                    return
+                        Error(
+                            ProcessError.Unsupported
+                                "Content-Length input requires a command built with Command.KeepStdinOpen"
+                        )
+                | Some pipe ->
                     do! sendGate.WaitAsync()
 
                     try
@@ -318,7 +384,7 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                         return Ok()
                     finally
                         sendGate.Release() |> ignore
-                with
-                | :? IOException as ex -> return Error(ProcessError.Io ex.Message)
-                | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
-            }
+            with
+            | :? IOException as ex -> return Error(ProcessError.Io ex.Message)
+            | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
+        }
