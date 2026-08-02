@@ -57,6 +57,59 @@ type private FaultingContentLengthStream() =
     override _.ReadAsync(_buffer: Memory<byte>, _cancellationToken: CancellationToken) =
         ValueTask<int>(Task.FromException<int>(IOException "synthetic read failure"))
 
+/// A stdout double that hands out exactly ONE pre-encoded frame per `ReadAsync`, so a test can pin down
+/// how far the framed parser has actually got instead of guessing with a delay: the parser asks for the
+/// next chunk only after it has parsed the previous one AND enqueued it, so "chunk n has been served"
+/// proves the loop is now committed to enqueueing frame n. Returns 0 (EOF) once every chunk is served.
+type private ChunkedFrameStream(chunks: byte[][]) =
+    inherit Stream()
+
+    let served =
+        Array.init chunks.Length (fun _ ->
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously))
+
+    let mutable index = 0
+
+    /// Completes once the `count`-th chunk (1-based) has been handed to the reader. The same `Task`
+    /// instance every call, so a test can compare it by reference against a `Task.WhenAny` winner.
+    member _.ServedAsync(count: int) : Task<unit> = served[count - 1].Task
+
+    /// Release every outstanding signal, so a failing test can never leave a helper parked on one.
+    member _.ReleaseSignals() =
+        for signal in served do
+            signal.TrySetResult() |> ignore
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = 0L
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = raise (NotSupportedException())
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) = raise (NotSupportedException())
+
+    override _.ReadAsync(buffer: Memory<byte>, _cancellationToken: CancellationToken) =
+        if index >= chunks.Length then
+            ValueTask<int> 0
+        else
+            let chunk = chunks[index]
+
+            if buffer.Length < chunk.Length then
+                // A test-harness invariant, not a library one: one read must carry a whole frame, and the
+                // framed reader's own buffer (8 KiB) dwarfs the tiny frames these tests script.
+                raise (InvalidOperationException "the framed reader's buffer must hold a whole test chunk")
+
+            chunk.AsSpan().CopyTo(buffer.Span)
+            index <- index + 1
+            served[index - 1].TrySetResult() |> ignore
+            ValueTask<int> chunk.Length
+
 [<TestFixture>]
 type ContentLengthSessionTests() =
 
@@ -72,6 +125,35 @@ type ContentLengthSessionTests() =
           Wait = fun () -> TaskCompletionSource<Outcome>().Task
           StdinError = fun () -> None
           StdinFeedComplete = ignore
+          StartKill = ignore
+          Signal = fun _ -> Ok()
+          GracefulKill = fun _ -> Task.CompletedTask
+          ResizePty = None
+          TreeStats = None
+          Teardown = teardown }
+
+    // A host for the sessions whose configuration matters (a bounded `StreamBuffer`, `KeepStdinOpen`) and
+    // whose stdin feeder has to be modelled: `feedComplete` stands in for `ProcessGroup`'s own blocking
+    // `stdinFeeder.Task.GetAwaiter().GetResult()`. `Wait` completes at once so disposal never depends on a
+    // parked pump, exactly as the `FakeProcess`-backed tests above run.
+    let hostForCommand
+        (command: Command)
+        (stdout: Stream)
+        (stdin: Stream option)
+        (feedComplete: unit -> unit)
+        (teardown: unit -> ValueTask)
+        : RunningHost =
+        { Config = command.Config
+          Pid = None
+          Stdout = Some stdout
+          Stderr = None
+          Stdin = stdin
+          StartTime = DateTime.UtcNow
+          StartedTimestamp = Stopwatch.GetTimestamp()
+          StartTimeIdentity = None
+          Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+          StdinError = fun () -> None
+          StdinFeedComplete = feedComplete
           StartKill = ignore
           Signal = fun _ -> Ok()
           GracefulKill = fun _ -> Task.CompletedTask
@@ -121,6 +203,201 @@ type ContentLengthSessionTests() =
             Assert.That(actual.Length, Is.EqualTo 2)
             Assert.That(Convert.ToHexString actual[0], Is.EqualTo(Convert.ToHexString small))
             Assert.That(Convert.ToHexString actual[1], Is.EqualTo(Convert.ToHexString large))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a bounded StreamBuffer backpressures the frame parser instead of an unbounded backlog``() : Task =
+        task {
+            let payloads = [| for value in 0uy .. 4uy -> Array.create 4 value |]
+
+            let command =
+                (Command.create "language-server").StreamBuffer(StreamBufferPolicy.Bounded(2))
+
+            let fake = FakeProcess.OfCommand(command).WithContentLengthFrames(payloads)
+
+            use running = fake.Build()
+            let session = ContentLengthSession running
+
+            // Nobody is reading `FramesAsync()` yet, and the in-memory producer has no real I/O delay of
+            // its own — with an honestly bounded channel (capacity 2) the parser can enqueue at most 2 of
+            // the 5 scripted frames before its `WriteAsync` on the 3rd genuinely blocks, so the session's
+            // combined outcome (which that parse loop's completion resolves) cannot have finished yet. An
+            // unbounded backlog (today's bug) would instead let the parser race ahead and finish
+            // instantly, with nobody ever having paced it.
+            let! stillPending = Task.WhenAny(running.ExitTask, Task.Delay 300)
+
+            Assert.That(
+                obj.ReferenceEquals(stillPending, running.ExitTask),
+                Is.False,
+                "an unbounded channel would already have let the parser finish without any consumer"
+            )
+
+            let! actual = collect (session.FramesAsync())
+
+            Assert.That(actual.Length, Is.EqualTo payloads.Length)
+
+            for index in 0 .. payloads.Length - 1 do
+                Assert.That(Convert.ToHexString actual[index], Is.EqualTo(Convert.ToHexString payloads[index]))
+
+            // Backpressure only paces the parser; it must still deliver every frame, byte-exact, once a
+            // consumer starts draining.
+            let! outcome = running.ExitTask
+            Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``lossy StreamBuffer full modes are refused instead of silently dropping frames``() : Task =
+        task {
+            let refused (mode: StreamFullMode) (name: string) =
+                task {
+                    let command =
+                        (Command.create "language-server").StreamBuffer(StreamBufferPolicy.Bounded(2, mode))
+
+                    use running =
+                        FakeProcess.OfCommand(command).WithContentLengthFrames([ Array.create 4 7uy ]).Build()
+
+                    let refusal =
+                        Assert.Throws<ProcessException>(Action(fun () -> ContentLengthSession running |> ignore))
+
+                    let missing = $"expected {name} to be refused with a typed ProcessException"
+
+                    match refusal with
+                    | null -> Assert.Fail missing
+                    | error ->
+                        match error.Error with
+                        | ProcessError.Unsupported detail ->
+                            // Naming the refused mode and the lossless way forward: dropping a frame is
+                            // undetectable corruption of a protocol stream, so the session refuses the knob
+                            // instead of quietly downgrading it (the stance detached launches already take).
+                            Assert.That(detail, Does.Contain name)
+                            Assert.That(detail, Does.Contain "Backpressure")
+                        | other -> Assert.Fail $"expected Unsupported, got {other}"
+
+                    // The refusal lands before the session claims stdout, so the handle is left exactly as
+                    // it was found — a refused knob must fail loudly without consuming the run.
+                    match! running.OutputStringAsync() with
+                    | Ok _ -> ()
+                    | Error error -> Assert.Fail $"a refused framed session must leave stdout unclaimed, got {error}"
+                }
+
+            do! refused StreamFullMode.DropOldest "DropOldest"
+            do! refused StreamFullMode.DropNewest "DropNewest"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``disposal while the bounded frame backlog is full ends the stream without a fault``() : Task =
+        task {
+            let payloads = [| for value in 1uy .. 3uy -> Array.create 4 value |]
+            let stdout = new ChunkedFrameStream(payloads |> Array.map encoded)
+
+            let command =
+                (Command.create "language-server").StreamBuffer(StreamBufferPolicy.Bounded 1)
+
+            let running =
+                new RunningProcess(
+                    hostForCommand command (stdout :> Stream) None ignore (fun () ->
+                        (stdout :> IDisposable).Dispose()
+                        ValueTask())
+                )
+
+            let session = ContentLengthSession running
+            let frames = session.FramesAsync().GetAsyncEnumerator()
+
+            // Capacity 1 with nobody draining: the parser enqueues frame 1, then parks in the bounded
+            // channel's `WriteAsync` on frame 2 — and it cannot ask the stream for anything more until that
+            // write lands, so once chunk 2 has been served the parked write is the only place it can be (a
+            // disposal that beats it there just makes the same `WriteAsync` throw on the cancelled token).
+            let parked = "the framed parser never reached its second frame"
+            let! served = Task.WhenAny(stdout.ServedAsync 2 :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(served, stdout.ServedAsync 2), Is.True, parked)
+
+            do! (running :> IAsyncDisposable).DisposeAsync().AsTask()
+
+            // Teardown cancels `DisposalToken` — the very token that parked frame write is bounded to. That
+            // is graceful disposal, not a parser fault: the consumer must still receive what was queued and
+            // then see a clean end of stream, never a spurious cancellation out of `MoveNextAsync`.
+            let delivered = "the frame queued before the disposal must still be delivered"
+            let! first = frames.MoveNextAsync()
+            Assert.That(first, Is.True, delivered)
+            Assert.That(Convert.ToHexString frames.Current, Is.EqualTo(Convert.ToHexString payloads[0]))
+
+            let clean =
+                "a disposal landing on a full frame backlog must end the frame stream cleanly, not fault it"
+
+            let! ended = frames.MoveNextAsync()
+            Assert.That(ended, Is.False, clean)
+            do! frames.DisposeAsync().AsTask()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a bounded frame backlog never deadlocks a session over a fed stdin source``() : Task =
+        task {
+            let payloads = [| for value in 1uy .. 6uy -> Array.create 4 value |]
+            let stdout = new ChunkedFrameStream(payloads |> Array.map encoded)
+            let stdin = new MemoryStream()
+            let initialize = Encoding.UTF8.GetBytes "{\"method\":\"initialize\"}"
+
+            // The stdin source feeder, wired exactly as `ProcessGroup` wires it: a BLOCKING wait that
+            // finishes only once the child has consumed the source. A real child consumes it while draining
+            // its own stdout writes, so gate it on the parser having pulled the 4th frame out of the stream
+            // — progress a capacity-1 backlog makes impossible until somebody drains `FramesAsync()`.
+            let feedComplete () =
+                stdout.ServedAsync(4).GetAwaiter().GetResult()
+
+            let command =
+                (Command.create "language-server").KeepStdinOpen().StreamBuffer(StreamBufferPolicy.Bounded 1)
+
+            use running =
+                new RunningProcess(
+                    hostForCommand command (stdout :> Stream) (Some(stdin :> Stream)) feedComplete (fun () ->
+                        ValueTask())
+                )
+
+            try
+                // The constructor claims stdin (so no racing `TakeStdin` can steal it) but must NOT wait for
+                // that feeder: it has just started the parse loop that fills the bounded backlog, whose only
+                // consumer is a `FramesAsync()` the caller cannot reach until construction returns. Waiting
+                // here is a four-way deadlock — parser parked on a full channel, child blocked writing
+                // stdout, child therefore not reading stdin, feeder never done.
+                let construction = Task.Run(fun () -> ContentLengthSession running)
+
+                let deadlocked =
+                    "the framed session constructor deadlocked: it waited for the stdin feeder while its own bounded frame backlog held the child back"
+
+                let! constructed = Task.WhenAny(construction :> Task, Task.Delay 10000)
+                Assert.That(obj.ReferenceEquals(constructed, construction), Is.True, deadlocked)
+
+                let! session = construction
+
+                // The wait is preserved, only moved: the interactive writer still may not touch the pipe
+                // while the source feeder is running, so the send stays pending while the backlog is unread.
+                let sending = session.SendAsync initialize
+
+                let tooEarly =
+                    "a send must still wait for the stdin source feeder before writing the pipe"
+
+                let! early = Task.WhenAny(sending :> Task, Task.Delay 200)
+                Assert.That(obj.ReferenceEquals(early, sending), Is.False, tooEarly)
+
+                // Draining the frames releases the whole chain: parser -> child -> feeder -> send.
+                let! frames = collect (session.FramesAsync())
+                Assert.That(frames.Length, Is.EqualTo payloads.Length)
+
+                for index in 0 .. payloads.Length - 1 do
+                    Assert.That(Convert.ToHexString frames[index], Is.EqualTo(Convert.ToHexString payloads[index]))
+
+                match! sending with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the deferred send must complete once the feeder finishes, got {error}"
+
+                Assert.That(Convert.ToHexString(stdin.ToArray()), Is.EqualTo(Convert.ToHexString(encoded initialize)))
+            finally
+                // Never leave the modelled feeder parked on a signal, whatever an assertion above decided.
+                stdout.ReleaseSignals()
         }
         :> Task
 

@@ -51,6 +51,14 @@ type CliClient internal (config: CliClientConfig) =
         let template = configure.Invoke config.Template
         ArgumentNullException.ThrowIfNull(template, nameof configure)
 
+        if template.Program <> config.Template.Program then
+            raise (
+                ArgumentException(
+                    $"'{config.Template.Program}' is the CliClient program and cannot be changed to '{template.Program}' by WithDefaults: configure shared defaults on the provided Command instead",
+                    nameof configure
+                )
+            )
+
         if Stdin.isOneShot template.Config.StdinSource then
             raise (
                 ArgumentException(

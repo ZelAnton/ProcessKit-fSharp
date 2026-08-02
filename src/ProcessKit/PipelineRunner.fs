@@ -253,6 +253,93 @@ module internal PipelineRunner =
                   TimedOut = timedOut }
         }
 
+    /// Wire ONE freshly spawned stage into the chain — stage 0's stdin feed, the inter-stage
+    /// stdout→stdin relay, and that stage's stderr drain — returning the stdout stream that becomes the
+    /// NEXT stage's upstream (`prevStdout`). This is the single definition of that wiring: the buffered
+    /// `run` and the streaming `start` both stage their chain through it, so the delicate parts below —
+    /// stage 0's "no interactive writer" invariant, the relay's close ORDER (both ends, downstream first)
+    /// and the per-stage stderr policy — cannot drift into two copies that each have to be fixed
+    /// separately (they had already begun to diverge in their comments).
+    ///
+    /// The caller keeps only what genuinely differs between the two paths: the spawn itself under the
+    /// T-061 staging gate, telemetry (`run` owns the whole-run scope; under `start` the session's
+    /// `RunningProcess` owns it), and what becomes of the LAST stage's stdout — `run` captures it, the
+    /// session streams it. This helper never touches that stream; it only hands it back.
+    ///
+    /// - `stages` — the pipeline's commands by stage index: stage 0's stdin encoding/source, and each
+    ///   stage's own `OutputBuffer` policy for its stderr drain.
+    /// - `copyTasks` / `stderrTasks` — the chain's relay and stderr-drain task lists, appended to here and
+    ///   awaited by the caller's teardown.
+    /// - `setStage0Feed` — receives stage 0's `StdinFeeder` (invoked for stage 0 only), which the caller
+    ///   stops on teardown and reads the source fault from.
+    /// - `prevStdout` — the previous stage's stdout; `None` for stage 0, and an unwired stage (either end
+    ///   missing) simply gets no relay.
+    let internal wireSpawnedStage
+        (stages: Command[])
+        (copyTasks: ResizeArray<Task>)
+        (stderrTasks: ResizeArray<Task<Pump.RawCapture>>)
+        (setStage0Feed: Pump.StdinFeeder -> unit)
+        (index: int)
+        (sp: Native.Common.Spawned)
+        (prevStdout: Stream option)
+        : Stream option =
+        // Dispose a pipe stream, swallowing the teardown-race exceptions (double close, or
+        // a broken pipe surfaced while flushing on dispose because the peer is gone).
+        let closeQuietly = Pump.disposeQuietly
+
+        if index = 0 then
+            // Only the first stage may carry its own stdin source; feed it and hand the feeder back so a
+            // genuine source-acquisition failure (a missing `FromFile` path, say) can surface as
+            // `ProcessError.Stdin` on an otherwise-successful pipeline — uniformly with a single command —
+            // instead of silently feeding the stage empty input, and so the feed can be stopped on
+            // teardown. Always close stage 0's stdin after its source (`keepStdinOpen = false`): a pipeline
+            // exposes no live handle, so `KeepStdinOpen`/`TakeStdin` are inert here (see `Pipeline`'s doc —
+            // "has no effect" on a stage), and leaving the pipe open would instead just deny stage 0 its
+            // EOF and hang the chain. This is the pipeline-equivalent of the single-command path's
+            // `command.Config.KeepStdinOpen`, which for stage 0 is always `false` in practice — plumbed as
+            // a literal so the "no interactive writer" invariant is explicit and cannot regress into a hang.
+            setStage0Feed (
+                Pump.feedStdinSourceWithEncoding
+                    stages[0].Config.StdinEncoding
+                    sp.Stdin
+                    stages[0].Config.StdinSource
+                    false
+            )
+        else
+            match prevStdout, sp.Stdin with
+            | Some upstream, Some downstream ->
+                copyTasks.Add(
+                    task {
+                        try
+                            do! upstream.CopyToAsync downstream
+                        with _ ->
+                            // A downstream stage that exits early stops reading (broken pipe),
+                            // or the stream is torn down during teardown. Fall through to close
+                            // both ends.
+                            ()
+
+                        // Close the write end (EOF to the downstream stage) AND the upstream read
+                        // end: if the downstream exited early, closing the read end propagates a
+                        // broken pipe up to the producing stage (SIGPIPE / failed write) so it
+                        // stops instead of blocking forever on a full stdout pipe.
+                        closeQuietly downstream
+                        closeQuietly upstream
+                    }
+                    :> Task
+                )
+            | _ -> ()
+
+        // Drain every stage's stderr so a full stderr pipe never blocks a stage, bounding retained
+        // memory by that stage's own `OutputBuffer` byte cap + `Overflow` mode — the same path
+        // (`Pump.captureRawOrEmpty`) the buffered run's last-stage stdout capture uses. A stage without
+        // `MaxBytes` set keeps its previous unbounded behaviour (`captureRawOrEmpty` falls back to
+        // `drainRawOrEmpty` in that case).
+        stderrTasks.Add(Pump.captureRawOrEmpty sp.Stderr None stages[index].Config.OutputBuffer CancellationToken.None)
+
+        // The upstream the NEXT stage relays from. For the last stage nothing relays it: it is the
+        // chain's output, captured by `run` / streamed by the session.
+        sp.Stdout
+
     /// Spawn every stage into one fresh shared group, wire each stage's stdout to the next stage's
     /// stdin (no shell involved), capture the last stage's stdout, and reap the whole tree on exit.
     /// Cancellation or the optional `timeout` hard-kill the tree.
@@ -313,10 +400,6 @@ module internal PipelineRunner =
                             lock stagingGate (fun () -> cancellationFired <- true)
                             group.KillTree())
 
-                    // Dispose a pipe stream, swallowing the teardown-race exceptions (double close, or
-                    // a broken pipe surfaced while flushing on dispose because the peer is gone).
-                    let closeQuietly = Pump.disposeQuietly
-
                     let spawned = ResizeArray<Native.Common.Spawned>()
                     let copyTasks = ResizeArray<Task>()
                     let stderrTasks = ResizeArray<Task<Pump.RawCapture>>()
@@ -336,6 +419,12 @@ module internal PipelineRunner =
                     // 0 carried no source. Observe `Fault` BEFORE stopping on the success path.
                     let stopStage0Feed () =
                         stage0Feed |> Option.iter (fun feeder -> feeder.Stop())
+
+                    // The shared "wire one spawned stage" mechanics (stage-0 feed / inter-stage relay /
+                    // stderr drain), bound to this run's stage list and task collections — the SAME helper
+                    // the streaming `start` stages through, so neither path can drift from the other.
+                    let wireStage =
+                        wireSpawnedStage stages copyTasks stderrTasks (fun feeder -> stage0Feed <- Some feeder)
 
                     // Set exactly once, the moment stage 0 actually spawns — mirroring the
                     // single-command rule that a spawn failure is never counted as a run
@@ -387,67 +476,10 @@ module internal PipelineRunner =
                                 telemetry <- Some(RunTelemetryScope.Start(programLabel, runId, startTimeUtc))
                                 Log.spawn logger programLabel None runId
 
-                                // Only the first stage may carry its own stdin source; feed it and keep the
-                                // feeder so a genuine source-acquisition failure (a missing `FromFile`
-                                // path, say) can surface as `ProcessError.Stdin` on an otherwise-successful
-                                // pipeline — uniformly with a single command — instead of silently feeding
-                                // the stage empty input, and so the feed can be stopped on teardown.
-                                // Always close stage 0's stdin after its source (`keepStdinOpen = false`): a
-                                // pipeline exposes no live handle, so `KeepStdinOpen`/`TakeStdin` are inert
-                                // here (see `Pipeline`'s doc — "has no effect" on a stage), and leaving the
-                                // pipe open would instead just deny stage 0 its EOF and hang the chain. This
-                                // is the pipeline-equivalent of the single-command path's
-                                // `command.Config.KeepStdinOpen`, which for stage 0 is always `false` in
-                                // practice — plumbed as a literal so the "no interactive writer" invariant
-                                // is explicit and cannot regress into a hang.
-                                stage0Feed <-
-                                    Some(
-                                        Pump.feedStdinSourceWithEncoding
-                                            stages[0].Config.StdinEncoding
-                                            sp.Stdin
-                                            stages[0].Config.StdinSource
-                                            false
-                                    )
-                            else
-                                match prevStdout, sp.Stdin with
-                                | Some upstream, Some downstream ->
-                                    copyTasks.Add(
-                                        task {
-                                            try
-                                                do! upstream.CopyToAsync downstream
-                                            with _ ->
-                                                // A downstream stage that exits early stops reading
-                                                // (broken pipe), or the stream is torn down during
-                                                // teardown. Fall through to close both ends.
-                                                ()
-
-                                            // Close the write end (EOF to the downstream stage) AND the
-                                            // upstream read end: if the downstream exited early, closing
-                                            // the read end propagates a broken pipe up to the producing
-                                            // stage (SIGPIPE / failed write) so it stops instead of
-                                            // blocking forever on a full stdout pipe.
-                                            closeQuietly downstream
-                                            closeQuietly upstream
-                                        }
-                                        :> Task
-                                    )
-                                | _ -> ()
-
-                            // Drain every stage's stderr so a full stderr pipe never blocks a stage,
-                            // bounding retained memory by that stage's own `OutputBuffer` byte cap +
-                            // `Overflow` mode — the same path (`Pump.captureRawOrEmpty`) the last
-                            // stage's stdout capture uses below. A stage without `MaxBytes` set keeps
-                            // its previous unbounded behaviour (`captureRawOrEmpty` falls back to
-                            // `drainRawOrEmpty` in that case).
-                            stderrTasks.Add(
-                                Pump.captureRawOrEmpty
-                                    sp.Stderr
-                                    None
-                                    stages[index].Config.OutputBuffer
-                                    CancellationToken.None
-                            )
-
-                            prevStdout <- sp.Stdout
+                            // Stage 0's stdin feed, or this stage's relay from the previous stage's stdout,
+                            // plus this stage's stderr drain — all through the shared `wireSpawnedStage`.
+                            // The stdout it returns feeds the next stage; the LAST stage's is captured below.
+                            prevStdout <- wireStage index sp prevStdout
 
                             // Test seam only (never set in production): let a regression test act in the
                             // exact window between this spawn and the next — see `stageSpawnedTestHook`.
@@ -765,13 +797,15 @@ module internal PipelineRunner =
     /// (K-016/K-043) — so there is no fifth independent copy of the wait/reap logic. Cancellation
     /// (`cancellationToken`/`cancelOn`) or the chain `timeout` hard-kill the tree.
     ///
-    /// The staging loop below deliberately mirrors `run`'s (spawn + stdout→stdin wiring + per-stage stderr
-    /// drain + stage-0 feed, all under the T-061 cancellation gate); keep the two in sync. It diverges only
-    /// in the tail: `run` reaps/captures inline and returns a `PipelineCapture`, whereas this hands the live
-    /// chain to a session and defers the reap to `Wait`/`Teardown`. Telemetry also lives elsewhere: the
-    /// session's `RunningProcess` owns the one whole-run `Diag`/`Log.spawn`/exit triple (composite
-    /// `programLabel`, shared `runId`, stage-0 logger), so this staging starts NO `RunTelemetryScope` and
-    /// logs no spawn of its own — avoiding the double-count a second telemetry owner would cause.
+    /// The staging loop below wires each stage through the SAME `wireSpawnedStage` the buffered `run` uses
+    /// (stage-0 feed + stdout→stdin relay + per-stage stderr drain), so that mechanics cannot drift between
+    /// the two paths; what this loop still mirrors by hand is `run`'s spawn under the T-061 cancellation
+    /// gate. It diverges in the tail: `run` reaps/captures inline and returns a `PipelineCapture`, whereas
+    /// this hands the live chain to a session and defers the reap to `Wait`/`Teardown`. Telemetry also
+    /// lives elsewhere: the session's `RunningProcess` owns the one whole-run `Diag`/`Log.spawn`/exit
+    /// triple (composite `programLabel`, shared `runId`, stage-0 logger), so this staging starts NO
+    /// `RunTelemetryScope` and logs no spawn of its own — avoiding the double-count a second telemetry
+    /// owner would cause.
     let start
         (commands: Command list)
         (timeout: TimeSpan option)
@@ -830,7 +864,6 @@ module internal PipelineRunner =
                             lock stagingGate (fun () -> cancellationFired <- true)
                             group.KillTree())
 
-                    let closeQuietly = Pump.disposeQuietly
                     let spawned = ResizeArray<Native.Common.Spawned>()
                     let copyTasks = ResizeArray<Task>()
                     let stderrTasks = ResizeArray<Task<Pump.RawCapture>>()
@@ -842,6 +875,11 @@ module internal PipelineRunner =
 
                     let stopStage0Feed () =
                         stage0Feed |> Option.iter (fun feeder -> feeder.Stop())
+
+                    // The same shared "wire one spawned stage" mechanics the buffered `run` stages through
+                    // (stage-0 feed / inter-stage relay / stderr drain) — one implementation, two callers.
+                    let wireStage =
+                        wireSpawnedStage stages copyTasks stderrTasks (fun feeder -> stage0Feed <- Some feeder)
 
                     while index < stages.Length && spawnError.IsNone && not stagingHalted do
                         // Force `Piped` stdout on every stage (the last stage's is the streamed output), and
@@ -864,49 +902,12 @@ module internal PipelineRunner =
                         | ValueSome(Ok sp) ->
                             spawned.Add sp
 
-                            if index = 0 then
-                                // Only stage 0 may carry a stdin source; close its pipe after the source
-                                // (`keepStdinOpen = false`) — a pipeline exposes no interactive writer.
-                                stage0Feed <-
-                                    Some(
-                                        Pump.feedStdinSourceWithEncoding
-                                            stages[0].Config.StdinEncoding
-                                            sp.Stdin
-                                            stages[0].Config.StdinSource
-                                            false
-                                    )
-                            else
-                                match prevStdout, sp.Stdin with
-                                | Some upstream, Some downstream ->
-                                    copyTasks.Add(
-                                        task {
-                                            try
-                                                do! upstream.CopyToAsync downstream
-                                            with _ ->
-                                                // Downstream exited early (broken pipe) or teardown tore the
-                                                // stream down; fall through to close both ends.
-                                                ()
-
-                                            closeQuietly downstream
-                                            closeQuietly upstream
-                                        }
-                                        :> Task
-                                    )
-                                | _ -> ()
-
-                            // Drain EVERY stage's stderr (including the last) under that stage's own
-                            // `OutputBuffer` byte cap — identical to `run`, so the pipefail classification
-                            // sees every stage's stderr uniformly. The last stage's stdout is NOT drained
-                            // here; the session's `RunningProcess` streams it.
-                            stderrTasks.Add(
-                                Pump.captureRawOrEmpty
-                                    sp.Stderr
-                                    None
-                                    stages[index].Config.OutputBuffer
-                                    CancellationToken.None
-                            )
-
-                            prevStdout <- sp.Stdout
+                            // Stage 0's stdin feed, or this stage's relay from the previous stage's stdout,
+                            // plus EVERY stage's stderr drain (including the last one's, so the pipefail
+                            // classification sees every stage's stderr) — all through the shared
+                            // `wireSpawnedStage`. The last stage's stdout it returns is NOT drained here:
+                            // the session's `RunningProcess` streams it.
+                            prevStdout <- wireStage index sp prevStdout
                             stageSpawnedTestHook |> Option.iter (fun hook -> hook index)
 
                         index <- index + 1

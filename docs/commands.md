@@ -445,6 +445,9 @@ Each stream is connected through a `StdioMode`, set with `Command.Stdout` /
 streaming, and per-line handlers to see anything. `StdioMode.Inherit` lets the
 child share the parent's stream (its output goes straight to your terminal and
 can't be captured); `StdioMode.Null` discards the stream without tying up a pipe.
+Because neither mode exposes a separate parent-side stream, the matching
+`OnStdoutLine`/`StdoutTee` or `OnStderrLine`/`StderrTee` setting is rejected with
+`ArgumentException` in either chaining order. The other stream remains independent.
 
 `Command.StdoutToFile(path, append)` / `Command.StderrToFile(path, append)` add a
 fourth destination: the stream is redirected **straight to a file at the OS
@@ -776,7 +779,8 @@ For a ready-made copy to a `System.IO.Stream` sink — a file, a socket, anythin
 reach for `StdoutTee` / `StderrTee`. Each tee copies the stream's **raw bytes**
 to the sink as they are read (byte-exact: no decoding, no added newline), in
 addition to capture, and runs independently of the line handlers — set both and
-both fire:
+both fire. Handlers and tees require the matching stream to remain `Piped`; combining
+one with `StdioMode.Null` or `StdioMode.Inherit` is rejected at the builder boundary:
 
 **F#**
 
@@ -1458,7 +1462,7 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 | `ProcessError.Stdin` | `program, detail` | The child's stdin source could not be read — a missing/unreadable `FromFile` path, say — on an otherwise-successful run. A routine broken pipe (the child closed stdin early, as `head` does) is never reported, and a louder exit/signal/timeout failure wins instead. Also surfaces for a pipeline's first stage. |
 | `ProcessError.CassetteMiss` | `program` | A record/replay cassette found no matching recording — kept distinct from not-found, so `isNotFound` is `false`. |
 | `ProcessError.Unsupported` | `operation` | The platform can't do what was asked (e.g. a POSIX signal on Windows) and silently skipping would be wrong. |
-| `ProcessError.Cancelled` | `program` | The run's `CancellationToken` fired. Always an error. |
+| `ProcessError.Cancelled` | `program` | The run's `CancellationToken` fired. Always an error. One further, token-free producer exists: a [supervision](supervision.md#errors-and-cancellation) session whose graceful `StopAsync` landed before its very first incarnation was started, leaving neither an outcome nor a start failure to report. |
 | `ProcessError.ResourceLimit` | `detail` | A requested [resource cap](process-groups.md) couldn't be enforced. |
 | `ProcessError.Io` | `detail` | A low-level I/O failure from ProcessKit's own machinery (driving a child, group control, cassette files). |
 
