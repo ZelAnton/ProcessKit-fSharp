@@ -544,6 +544,59 @@ module internal CommandConfig =
         if config.StderrFile.IsSome then
             raise (stderrFileConflict knob)
 
+    let private stdoutModeConflict (knob: string) =
+        let purpose =
+            if knob = "OnStdoutLine" then
+                "observe per-line updates"
+            else
+                "receive and copy captured bytes"
+
+        ArgumentException(
+            $"{knob} cannot be combined with Stdout(Null) or Stdout(Inherit): when stdout is Null or Inherit, there is no separate parent-side stream for {knob} to {purpose}. Drop one of the two.",
+            knob
+        )
+
+    let private stderrModeConflict (knob: string) =
+        let purpose =
+            if knob = "OnStderrLine" then
+                "observe per-line updates"
+            else
+                "receive and copy captured bytes"
+
+        ArgumentException(
+            $"{knob} cannot be combined with Stderr(Null) or Stderr(Inherit): when stderr is Null or Inherit, there is no separate parent-side stream for {knob} to {purpose}. Drop one of the two.",
+            knob
+        )
+
+    /// Guard `Stdout(Null|Inherit)`: reject it when a parent-side stdout observer is already set.
+    /// `MergeStderr` is deliberately not checked; it remains valid with every stdout destination.
+    let ensureStdoutModeCompatible (config: CommandConfig) (mode: StdioMode) =
+        if mode <> StdioMode.Piped then
+            if config.StdoutTee.IsSome then
+                raise (stdoutModeConflict "StdoutTee")
+
+            if config.OnStdoutLine.IsSome then
+                raise (stdoutModeConflict "OnStdoutLine")
+
+    /// Guard `Stderr(Null|Inherit)`: the stderr mirror of `ensureStdoutModeCompatible`.
+    let ensureStderrModeCompatible (config: CommandConfig) (mode: StdioMode) =
+        if mode <> StdioMode.Piped then
+            if config.StderrTee.IsSome then
+                raise (stderrModeConflict "StderrTee")
+
+            if config.OnStderrLine.IsSome then
+                raise (stderrModeConflict "OnStderrLine")
+
+    /// Guard `StdoutTee`/`OnStdoutLine`: reject them when stdout has no parent-side pipe.
+    let ensureStdoutPiped (config: CommandConfig) (knob: string) =
+        if config.StdoutMode <> StdioMode.Piped then
+            raise (stdoutModeConflict knob)
+
+    /// Guard `StderrTee`/`OnStderrLine`: reject them when stderr has no parent-side pipe.
+    let ensureStderrPiped (config: CommandConfig) (knob: string) =
+        if config.StderrMode <> StdioMode.Piped then
+            raise (stderrModeConflict knob)
+
     /// Guard `MergeStderr()`/`Pty(...)`: reject them when EITHER stream is already redirected to a file.
     /// `MergeStderr` needs a parent-observable stdout stream to fold stderr into (absent when stdout is a
     /// file) and no separate stderr stream (contradicted when stderr is a file); a `Pty` replaces all of
@@ -820,6 +873,8 @@ type Command internal (config: CommandConfig) =
     /// Set how the child's standard output is connected (default `Piped`). This is a stdout *destination*
     /// setter, so it also clears any prior `StdoutToFile` redirect — the last destination in a chain wins.
     member _.Stdout(mode: StdioMode) =
+        CommandConfig.ensureStdoutModeCompatible config mode
+
         let updated =
             { config with
                 StdoutMode = mode
@@ -831,6 +886,8 @@ type Command internal (config: CommandConfig) =
     /// Set how the child's standard error is connected (default `Piped`). Also clears any prior
     /// `StderrToFile` redirect — the last destination in a chain wins (see `Stdout`).
     member _.Stderr(mode: StdioMode) =
+        CommandConfig.ensureStderrModeCompatible config mode
+
         let updated =
             { config with
                 StderrMode = mode
@@ -977,10 +1034,11 @@ type Command internal (config: CommandConfig) =
         )
 
     /// Invoke `handler` for each captured stdout line, as it is pumped. Rejected (`ArgumentException`)
-    /// together with `StdoutToFile`, which redirects stdout straight to a file at the OS level, leaving no
-    /// parent-side stdout stream for the handler to observe.
+    /// when stdout is `Null`, `Inherit`, or redirected with `StdoutToFile`, because those destinations
+    /// leave no parent-side stdout stream for the handler to observe.
     member _.OnStdoutLine(handler: Action<string>) =
         ArgumentNullException.ThrowIfNull handler
+        CommandConfig.ensureStdoutPiped config "OnStdoutLine"
         CommandConfig.ensureNoStdoutFile config "OnStdoutLine"
 
         Command(
@@ -989,10 +1047,11 @@ type Command internal (config: CommandConfig) =
         )
 
     /// Invoke `handler` for each captured stderr line, as it is pumped. Rejected (`ArgumentException`)
-    /// together with `MergeStderr`, which folds stderr into stdout at the OS level, leaving no separate
-    /// stderr stream for the handler to observe.
+    /// when stderr is `Null`, `Inherit`, redirected with `StderrToFile`, or folded into stdout with
+    /// `MergeStderr`, because those configurations leave no separate parent-side stderr stream.
     member _.OnStderrLine(handler: Action<string>) =
         ArgumentNullException.ThrowIfNull handler
+        CommandConfig.ensureStderrPiped config "OnStderrLine"
         CommandConfig.ensureNoMergeStderr config "OnStderrLine"
         CommandConfig.ensureNoPty config "OnStderrLine"
         CommandConfig.ensureNoStderrFile config "OnStderrLine"
@@ -1003,18 +1062,20 @@ type Command internal (config: CommandConfig) =
         )
 
     /// Copy raw captured stdout bytes to `sink` (a tee), in addition to capture. Rejected
-    /// (`ArgumentException`) together with `StdoutToFile`, which redirects stdout straight to a file at the
-    /// OS level, leaving no parent-side stdout stream to tee.
+    /// (`ArgumentException`) when stdout is `Null`, `Inherit`, or redirected with `StdoutToFile`, because
+    /// those destinations leave no parent-side stdout stream to tee.
     member _.StdoutTee(sink: Stream) =
         ArgumentNullException.ThrowIfNull sink
+        CommandConfig.ensureStdoutPiped config "StdoutTee"
         CommandConfig.ensureNoStdoutFile config "StdoutTee"
         Command({ config with StdoutTee = Some sink })
 
     /// Copy raw captured stderr bytes to `sink` (a tee), in addition to capture. Rejected
-    /// (`ArgumentException`) together with `MergeStderr`, which folds stderr into stdout at the OS level,
-    /// leaving no separate stderr stream to tee.
+    /// (`ArgumentException`) when stderr is `Null`, `Inherit`, redirected with `StderrToFile`, or folded
+    /// into stdout with `MergeStderr`, because those configurations leave no separate parent-side stream.
     member _.StderrTee(sink: Stream) =
         ArgumentNullException.ThrowIfNull sink
+        CommandConfig.ensureStderrPiped config "StderrTee"
         CommandConfig.ensureNoMergeStderr config "StderrTee"
         CommandConfig.ensureNoPty config "StderrTee"
         CommandConfig.ensureNoStderrFile config "StderrTee"
