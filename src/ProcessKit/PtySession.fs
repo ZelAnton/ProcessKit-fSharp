@@ -114,6 +114,10 @@ type ExpectMatch internal (before: string, text: string) =
 /// prompt sits in the child's own buffer — that is the child's behaviour, and precisely what
 /// `Command.Pty` exists to change.
 ///
+/// **`StreamBuffer` is inapplicable here.** A session has no queued line/frame backlog: raw output
+/// feeds its sliding match window directly. `PtySessionOptions.WindowChars` and `TranscriptChars`
+/// are its explicit bounded-memory policy, so a `Command.StreamBuffer` setting has no effect.
+///
 /// **Secret-safety.** Sent input is never logged, traced, or added to `Transcript` — but a terminal
 /// echoes input back into its OUTPUT by default, so with `PtyConfig.Echo = true` a sent password
 /// arrives in the child's output stream and therefore in the transcript. For a credential exchange use

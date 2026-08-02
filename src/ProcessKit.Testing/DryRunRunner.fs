@@ -47,7 +47,9 @@ type DryRunRunner() =
         else
             let render = DryRunRunner.Render command
             lock gate (fun () -> history.Add render)
-            Ok(FakeProcess.OfCommand(command).WithStdout(render).Build())
+            let fake = FakeProcess.OfCommand(command).WithStdout(render)
+            let fake = if command.Config.Pty.IsSome then fake.WithPty() else fake
+            Ok(fake.Build())
 
     let seam = Seam.runner resolve
 
