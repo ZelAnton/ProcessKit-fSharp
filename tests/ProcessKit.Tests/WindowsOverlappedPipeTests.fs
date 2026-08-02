@@ -221,7 +221,7 @@ type WindowsOverlappedPipeTests() =
 
                 // Stdout is `Inherit` — the FIRST `setupOut` call succeeds and duplicates the parent's
                 // (untouched) STD_OUTPUT_HANDLE, registering that duplicate in the unwind list via the
-                // `createdPipes.Add(disposableHandle handle)` line this task adds to the `Inherit` branch.
+                // `disposableHandle` entry this task adds to the `Inherit` branch.
                 // Stderr is also `Inherit`, but its std handle is forced invalid above, so the SECOND
                 // `setupOut` call always throws. Before the fix, that new `Add` call did not exist, so
                 // the duplicated stdout handle from the first call was never registered in the unwind list
@@ -266,16 +266,93 @@ type WindowsOverlappedPipeTests() =
         }
         :> Task
 
+/// Windows P/Invoke for instrumenting the `CloseHandle` behind `Native.Windows.closeHandleIfValid`
+/// (through the `Windows.closeHandleIfValidHook` seam): the test performs the REAL close itself, so
+/// production behaviour is unchanged, while recording which handle VALUES were closed and making one
+/// cleanup step throw. Counting is the only way to see a double-close from managed code — Win32
+/// recycles a handle value the instant it is freed, so a second `CloseHandle` on it succeeds against
+/// whatever object has since taken the value over (that wrong-target close is precisely the hazard).
+/// `CreateFileW` supplies a real handle to stand in as this process's standard input, so the
+/// `InheritStdin` spawn branch can be exercised on any host — a test runner's own stdin is not
+/// guaranteed to be a handle `DuplicateHandle` accepts.
+module private WindowsCloseHandleInstrumentation =
+
+    [<Literal>]
+    let STD_INPUT_HANDLE = -10
+
+    [<Literal>]
+    let GENERIC_READ = 0x80000000u
+
+    [<Literal>]
+    let FILE_SHARE_READ_WRITE = 3u
+
+    [<Literal>]
+    let OPEN_EXISTING = 3u
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool CloseHandle(nativeint hObject)
+
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern nativeint CreateFileW(
+        string lpFileName,
+        uint32 dwDesiredAccess,
+        uint32 dwShareMode,
+        nativeint lpSecurityAttributes,
+        uint32 dwCreationDisposition,
+        uint32 dwFlagsAndAttributes,
+        nativeint hTemplateFile
+    )
+
 /// Deterministic fault injection at the Windows native containment boundary (`Native.Windows`): a forced
-/// `ResumeThread` failure on the CREATE_SUSPENDED spawn path, the Job-Object member-list buffer
-/// growth / query-failure classification, and the `IsProcessInJob` pid-recycle re-check on
-/// `suspend`/`resume` — all driven through the module's test seams so a genuinely failing WinAPI
-/// (which cannot be provoked on demand) and a job with thousands of members (which would otherwise
-/// need thousands of real processes) are exercised without touching production code.
+/// `ResumeThread` failure on the CREATE_SUSPENDED spawn path, a forced throw partway through the stdio
+/// teardown that follows it, the Job-Object member-list buffer growth / query-failure classification,
+/// and the `IsProcessInJob` pid-recycle re-check on `suspend`/`resume` — all driven through the
+/// module's test seams so a genuinely failing WinAPI (which cannot be provoked on demand) and a job
+/// with thousands of members (which would otherwise need thousands of real processes) are exercised
+/// without touching production code.
 [<TestFixture>]
 type WindowsNativeContainmentFaultTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+
+    // The message the injected cleanup failure carries, asserted on the returned `ProcessError.Spawn`
+    // so the test can tell "the fault took the intended route" from "the spawn failed earlier for an
+    // unrelated reason and never reached the teardown sequence under test".
+    let injectedCleanupFault =
+        "injected cleanup fault: a stdio cleanup step failed after its handle was closed"
+
+    /// Runs one spawn of `command` whose stdio teardown throws partway, and returns every handle value
+    /// production code asked `closeHandleIfValid` to close, in call order, alongside the spawn result.
+    /// The caller has already forced `ResumeThread` to fail, so the spawn reaches `releaseStdio()` —
+    /// the per-stream cleanups that close raw handles which are still listed in `createdPipes` for the
+    /// exception unwind. The seam really closes every handle it is handed, and throws once it has seen
+    /// `faultAfterCloses` of them, standing in for a cleanup step that fails after the earlier ones
+    /// succeeded (a throwing `NamedPipeServerStream.Dispose`, say). That exception reaches
+    /// `spawnWindowsCore`'s outer `with`, which unwinds `createdPipes` over entries whose handles are
+    /// already closed — the sequence a second `CloseHandle` used to escape in. `faultAfterCloses` is
+    /// therefore the coverage knob: only the cleanups that ran BEFORE the throw are being asserted
+    /// about, so each case sets it to the position of the last raw handle it wants covered.
+    let spawnWithThrowingCleanup (job: nativeint) (faultAfterCloses: int) (command: Command) =
+        let closes = ResizeArray<nativeint>()
+        let faulted = ref false
+        let original = Windows.closeHandleIfValidHook
+
+        try
+            Windows.closeHandleIfValidHook <-
+                fun handle ->
+                    closes.Add handle
+                    let closed = WindowsCloseHandleInstrumentation.CloseHandle handle
+
+                    if not faulted.Value && closes.Count >= faultAfterCloses then
+                        faulted.Value <- true
+                        failwith injectedCleanupFault
+
+                    closed
+
+            let result = Windows.spawnWindows job command
+            closes, result
+        finally
+            Windows.closeHandleIfValidHook <- original
 
     [<Test>]
     member _.``a forced ResumeThread failure terminates the suspended child and fails the spawn``() : Task =
@@ -353,6 +430,149 @@ type WindowsNativeContainmentFaultTests() =
                 Windows.resumeThreadHook <- original
                 Windows.terminateWindowsJob job
                 Windows.closeWindowsHandle job
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a stdio cleanup that throws never lets the spawn unwind close a raw handle twice``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: exercises spawnWindowsCore's raw-handle unwind list"
+
+            // Each of these configurations hands `spawnWindowsCore` a RAW Win32 handle with two owners:
+            // the `createdPipes` unwind entry and the per-stream cleanup closure that drops the parent's
+            // copy. The teardown below closes one of them and then throws, so the unwind runs over an
+            // already-closed entry. A second `CloseHandle` there would land on whatever object this
+            // process has since been given that recycled handle value — the wrong-target close
+            // `spawnDetachedWindows`'s `releaseParentCopies` has always guarded against, and which the
+            // contained path now guards against too (a one-shot `disposableHandle`, shared by both
+            // owners). Pipe ends are deliberately not the subject: `Stream.Dispose` is safe twice.
+            let job =
+                match Windows.createWindowsJob () with
+                | Ok job -> job
+                | Error error -> failwith $"createWindowsJob failed: {error}"
+
+            let redirectFile =
+                Path.Combine(Path.GetTempPath(), "processkit-unwind-" + Guid.NewGuid().ToString("N") + ".out")
+
+            // A real, valid handle for the `InheritStdin` case to duplicate: a test host's own standard
+            // input may be anything (including nothing), and this case is about the handle discipline,
+            // not about what the child would have read.
+            let nulStdin =
+                WindowsCloseHandleInstrumentation.CreateFileW(
+                    "NUL",
+                    WindowsCloseHandleInstrumentation.GENERIC_READ,
+                    WindowsCloseHandleInstrumentation.FILE_SHARE_READ_WRITE,
+                    IntPtr.Zero,
+                    WindowsCloseHandleInstrumentation.OPEN_EXISTING,
+                    0u,
+                    IntPtr.Zero
+                )
+
+            Assert.That(
+                nulStdin <> IntPtr.Zero && nulStdin <> IntPtr(-1),
+                Is.True,
+                "CreateFileW(\"NUL\") for the stand-in standard input failed"
+            )
+
+            let savedStdin =
+                WindowsStdHandleFaultInjection.GetStdHandle WindowsCloseHandleInstrumentation.STD_INPUT_HANDLE
+
+            let originalResume = Windows.resumeThreadHook
+
+            let baseCommand () =
+                Command.create "cmd.exe" |> Command.args [ "/c"; "rem" ]
+
+            // One case per raw-handle branch: `setupOut`'s file redirect, its `Null`, its `Inherit`, and
+            // the stdin-inherit branch. Each case pairs its subject with `Null` stderr, and the third
+            // element is how many of `releaseStdio()`'s closes must land before the injected throw —
+            // set so that every raw handle the case owns has been closed by its own cleanup closure by
+            // then, which is what makes the unwind's re-close visible. `releaseStdio()` closes stdout,
+            // then stderr, then (only for inherited stdin) the stdin duplicate; a piped stdin's ends go
+            // through `Stream.Dispose`, not this seam. If that order or count ever changes, the throw
+            // no longer fires and the injected-fault assertion below fails loudly rather than quietly
+            // testing less.
+            let cases =
+                [ "Null stdout + Null stderr",
+                  2,
+                  baseCommand () |> Command.stdout StdioMode.Null |> Command.stderr StdioMode.Null
+                  "file-redirect stdout + Null stderr",
+                  2,
+                  baseCommand ()
+                  |> Command.stdoutToFile redirectFile false
+                  |> Command.stderr StdioMode.Null
+                  "Inherit stdout + Null stderr",
+                  2,
+                  baseCommand ()
+                  |> Command.stdout StdioMode.Inherit
+                  |> Command.stderr StdioMode.Null
+                  "InheritStdin + Null stdout + Null stderr",
+                  3,
+                  baseCommand ()
+                  |> Command.inheritStdin
+                  |> Command.stdout StdioMode.Null
+                  |> Command.stderr StdioMode.Null ]
+
+            try
+                WindowsStdHandleFaultInjection.SetStdHandle(
+                    WindowsCloseHandleInstrumentation.STD_INPUT_HANDLE,
+                    nulStdin
+                )
+                |> ignore
+
+                // Real spawn, real Job assignment, forced `ResumeThread` failure: the branch that runs
+                // the full `releaseStdio()` teardown while every raw handle is still in `createdPipes`.
+                Windows.resumeThreadHook <- fun _ -> UInt32.MaxValue
+
+                for label, faultAfterCloses, command in cases do
+                    let closes, result = spawnWithThrowingCleanup job faultAfterCloses command
+
+                    match result with
+                    | Ok _ -> Assert.Fail $"{label}: expected the injected cleanup fault to fail the spawn"
+                    | Error(ProcessError.Spawn(_, message)) ->
+                        // Proves the fault took the intended route (a teardown that fails after every
+                        // raw handle of this case has really been closed) rather than the spawn failing
+                        // earlier, before there was anything that could be closed twice.
+                        StringAssert.Contains(injectedCleanupFault, message)
+                    | Error other -> Assert.Fail $"{label}: expected ProcessError.Spawn, got {other}"
+
+                    let repeated =
+                        closes
+                        |> Seq.countBy id
+                        |> Seq.filter (fun (_, count) -> count > 1)
+                        |> Seq.map (fun (handle, count) ->
+                            let value = handle.ToString("X")
+                            $"0x{value} closed {count} times")
+                        |> String.concat ", "
+
+                    Assert.That(
+                        repeated,
+                        Is.Empty,
+                        $"{label}: the exception unwind re-closed a raw handle the stdio cleanup had \
+                          already closed ({repeated}) — a recycled handle value could belong to an \
+                          unrelated object by then"
+                    )
+
+                    // Guards the assertion above against passing vacuously: every raw handle of this
+                    // case must really have reached the seam before the injected throw.
+                    Assert.That(
+                        closes.Count,
+                        Is.GreaterThanOrEqualTo faultAfterCloses,
+                        $"{label}: only {closes.Count} raw handle close(s) reached the seam — the spawn \
+                          never got as far as the cleanup/unwind sequence under test"
+                    )
+            finally
+                WindowsStdHandleFaultInjection.SetStdHandle(
+                    WindowsCloseHandleInstrumentation.STD_INPUT_HANDLE,
+                    savedStdin
+                )
+                |> ignore
+
+                WindowsCloseHandleInstrumentation.CloseHandle nulStdin |> ignore
+                Windows.resumeThreadHook <- originalResume
+                Windows.terminateWindowsJob job
+                Windows.closeWindowsHandle job
+                File.Delete redirectFile
         }
         :> Task
 
