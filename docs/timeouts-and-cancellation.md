@@ -487,7 +487,7 @@ auto-unsubscribes when the child exits, and leaves output consumption to the cal
 | Token already cancelled **before** the run | short-circuits before spawning — no process is ever created |
 | `FirstLineAsync` mid-run | surfaces `ProcessError.Cancelled` once the token fires (not `Ok None`) |
 | Under `Retry` | terminal — the built-in classifiers reject `Cancelled` and the loop stops re-trying |
-| Under a [supervision.md](supervision.md) `Supervisor` | terminal — supervision returns `Cancelled` instead of restarting into a still-cancelled token |
+| Under a [supervision.md](supervision.md) `Supervisor` | terminal — supervision returns `Cancelled` instead of restarting into a still-cancelled token. This row is about a *token*; supervision has one further, token-free producer of `Cancelled` — a session `StopAsync` that lands before the very first incarnation is started, which has neither an outcome nor a start failure to report (see [supervision.md](supervision.md#errors-and-cancellation)) |
 
 Unlike a timeout — whose expiry is *captured* as `IsTimedOut` — a cancellation is
 **always an error**: the run was abandoned, so there is no result to synthesize. A

@@ -1492,10 +1492,15 @@ type SupervisorTests() =
             let! outcome = session.StopAsync(TimeSpan.Zero)
 
             // No incarnation ever produced a result, so there is none to report: supervision ends with the
-            // honest terminal error rather than a fabricated `SupervisionOutcome`.
+            // honest terminal error rather than a fabricated `SupervisionOutcome`. The reason the child
+            // never came up is known here, so the stop must surface *it* — not a synthetic `Cancelled`,
+            // which would make the reported failure depend on whether the stop landed during the capture
+            // or during the backoff that follows it.
             match outcome with
-            | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "worker")
-            | other -> Assert.Fail $"a stop with no incarnation result must end with Cancelled, got {other}"
+            | Error(ProcessError.Spawn(program, detail)) ->
+                Assert.That(program, Is.EqualTo "worker")
+                Assert.That(detail, Is.EqualTo "scripted transient spawn failure")
+            | other -> Assert.Fail $"a stop during backoff must report the honest spawn failure, got {other}"
 
             Assert.That(runner.Spawns, Is.EqualTo 1, "a graceful stop must not spawn a further incarnation")
             Assert.That(session.Status.IsActive, Is.False)
@@ -1532,9 +1537,11 @@ type SupervisorTests() =
 
             let! outcome = session.Completion
 
+            // Same honest-cause rule on the capture-only path: the first incarnation failed transiently
+            // and that failure — not a synthetic `Cancelled` — is what the stopped supervision reports.
             match outcome with
-            | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "worker")
-            | other -> Assert.Fail $"a stop with no incarnation result must end with Cancelled, got {other}"
+            | Error(ProcessError.Io detail) -> Assert.That(detail, Is.EqualTo "scripted transient capture failure")
+            | other -> Assert.Fail $"a stop during backoff must report the honest capture failure, got {other}"
 
             Assert.That(runner.Captures, Is.EqualTo 1, "a graceful stop must not start a further incarnation")
             Assert.That(session.Status.IsActive, Is.False)
