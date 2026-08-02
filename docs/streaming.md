@@ -852,7 +852,8 @@ Every failure is a typed `ProcessError`, never a raw exception and never a silen
 | The peer answered with an `error` object | `ProcessError.JsonRpc` with its `Method`, `Code`, `Detail`, and the raw JSON of `Data` |
 | The request timed out (timeout overloads) | `ProcessError.Timeout`; the waiter is dropped, so a late answer is discarded |
 | The `CancellationToken` fired | `ProcessError.Cancelled` |
-| A timeout or token ended a send mid-frame | The same `ProcessError.Timeout`/`Cancelled` — and it ends the session, because the peer may have received a truncated frame |
+| A timeout or token interrupted a send mid-frame | The same `ProcessError.Timeout`/`Cancelled` — and it ends the session, because the peer may have received a truncated frame |
+| A timeout or token ended a send before it wrote anything | The same `ProcessError.Timeout`/`Cancelled`, failing only that call — nothing reached the peer, so the session stays usable |
 | The peer's framed output ended before answering | `ProcessError.Io` — and every later verb fails the same way instead of waiting forever |
 | The `result` does not fit the requested type | `ProcessError.Parse` (a JSON `null` result included — read it with `RequestRawAsync`) |
 | The peer sent something that is not a JSON-RPC message | `ProcessError.Parse`, ending the session: pending requests all fail with it and `MessagesAsync` faults with `ProcessException` |
@@ -862,11 +863,17 @@ by arrival order. Without a timeout a request waits until the peer answers, its 
 token fires; pass a timeout for a peer that can go silent while still running. That budget covers the
 whole call, not just the wait: a peer that stops reading its own stdin blocks the write once the pipe
 buffer fills, and the request fails with `ProcessError.Timeout` there too rather than hanging. Since
-such a write may have delivered only part of a frame — which no peer can resynchronize from — an
-interrupted send ends the conversation: pending requests fail with that same error and later
-requests/sends report it instead of writing into a stream the peer can no longer read. Incoming
-messages are unaffected (a torn *outgoing* frame does not corrupt what the peer says) and keep
-arriving on `MessagesAsync` until the peer's output ends.
+such a write may have delivered only part of a frame — which no peer can resynchronize from — a send
+interrupted *while it was writing* ends the conversation: pending requests fail with that same error
+and later requests/sends report it instead of writing into a stream the peer can no longer read.
+Incoming messages are unaffected (a torn *outgoing* frame does not corrupt what the peer says) and
+keep arriving on `MessagesAsync` until the peer's output ends.
+
+A send that was interrupted **before** it wrote anything is the ordinary case, and it fails alone: an
+already-cancelled token, or a per-request timeout that elapses while the call is still queued behind
+another send, leaves the peer's stdin untouched. Cancelling one request — the completion an editor
+abandons on the next keystroke — therefore never ends the conversation, and a per-request timeout
+bounds its own call rather than the session.
 
 `MessagesAsync` is a single-consumer stream of everything that is *not* an answer to your own
 requests: notifications (`IsRequest` false) and the peer's own requests (`IsRequest` true, answer

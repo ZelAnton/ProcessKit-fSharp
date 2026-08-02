@@ -92,9 +92,18 @@ type private PeerInputStream() =
     let frames =
         Channel.CreateUnbounded<byte[]>(UnboundedChannelOptions(SingleReader = true, SingleWriter = false))
 
+    // One entry per write that has begun waiting on the stall, so a test can observe that point instead
+    // of racing it with a sleep.
+    let stalledWrites =
+        Channel.CreateUnbounded<bool>(UnboundedChannelOptions(SingleReader = true, SingleWriter = false))
+
     let buffered = ResizeArray<byte>()
     let gate = obj ()
-    let mutable stalled = false
+
+    // `None` while the peer drains its stdin; a pending completion while it does not, which every write
+    // waits on — the way a real write blocks once the OS pipe buffer fills behind a peer that stopped
+    // reading — until `ResumeWrites` or the write's own cancellation token ends the wait.
+    let mutable stall: TaskCompletionSource option = None
 
     let headerEnd () =
         let mutable found = -1
@@ -138,12 +147,47 @@ type private PeerInputStream() =
             buffered.AddRange payload
             extract ())
 
+    let writeAsync (payload: byte[]) (cancellationToken: CancellationToken) : Task =
+        match lock gate (fun () -> stall) with
+        | None ->
+            append payload
+            Task.CompletedTask
+        | Some pending ->
+            // Announced before the wait, so a test can be sure a write is stuck here — and its caller
+            // therefore holding the session's send gate — rather than about to be.
+            stalledWrites.Writer.TryWrite true |> ignore
+
+            task {
+                do! pending.Task.WaitAsync cancellationToken
+                append payload
+            }
+            :> Task
+
     /// The next whole frame the session sent.
     member _.NextFrameAsync() : Task<byte[]> = frames.Reader.ReadAsync().AsTask()
 
     /// Stop draining this pipe, as a peer that stopped reading its own stdin does once the OS buffer
-    /// fills: every later write blocks until its cancellation token ends it.
-    member _.StallWrites() = stalled <- true
+    /// fills: every later write waits until `ResumeWrites` or its cancellation token ends it.
+    member _.StallWrites() =
+        lock gate (fun () ->
+            if stall.IsNone then
+                stall <- Some(TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)))
+
+    /// Start draining again, as a peer that resumed reading its stdin: the waiting writes go through.
+    member _.ResumeWrites() =
+        let waiting =
+            lock gate (fun () ->
+                let current = stall
+                stall <- None
+                current)
+
+        match waiting with
+        | Some pending -> pending.TrySetResult() |> ignore
+        | None -> ()
+
+    /// Completes once a write has begun waiting on the stall.
+    member _.NextStalledWriteAsync() : Task =
+        stalledWrites.Reader.ReadAsync().AsTask()
 
     override _.CanRead = false
     override _.CanSeek = false
@@ -167,18 +211,10 @@ type private PeerInputStream() =
     // through the array overload, whose base implementation would otherwise fall back to the synchronous
     // `Write` above and quietly accept bytes a stalled peer never read.
     override _.WriteAsync(buffer: byte[], offset: int, count: int, cancellationToken: CancellationToken) : Task =
-        if stalled then
-            Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
-        else
-            append (buffer.AsSpan(offset, count).ToArray())
-            Task.CompletedTask
+        writeAsync (buffer.AsSpan(offset, count).ToArray()) cancellationToken
 
     override _.WriteAsync(buffer: ReadOnlyMemory<byte>, cancellationToken: CancellationToken) : ValueTask =
-        if stalled then
-            ValueTask(Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken))
-        else
-            append (buffer.ToArray())
-            ValueTask()
+        ValueTask(writeAsync (buffer.ToArray()) cancellationToken)
 
 /// A live handle over the fake peer, plus the two ends the test drives it through.
 type private PeerHandle =
@@ -457,6 +493,94 @@ type JsonRpcSessionTests() =
             match! session.NotifyRawAsync("exit", null) with
             | Error(ProcessError.Cancelled _) -> ()
             | other -> Assert.Fail $"expected the torn session to refuse a later send, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an already-cancelled token fails only its own send, never the conversation``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            use cancellation = new CancellationTokenSource()
+            cancellation.Cancel()
+
+            // The token was already cancelled when either call began, so neither can have written a byte
+            // into the peer's stdin: nothing was torn, and the conversation must survive both.
+            match! session.RequestRawAsync("textDocument/completion", null, cancellation.Token) with
+            | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
+            | other -> Assert.Fail $"expected a cancellation, got {other}"
+
+            match! session.NotifyRawAsync("$/cancelRequest", null, cancellation.Token) with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected a cancellation, got {other}"
+
+            // A send with a live token is the cheap probe, and it comes first: a session wrongly ended by
+            // either call above refuses it outright, failing this test instead of hanging it on a frame
+            // that would never be written.
+            match! session.NotifyRawAsync("initialized", null) with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"a cancelled send must not end the conversation, got {error}"
+
+            // It is also the FIRST frame the peer receives, which is what proves the two cancelled calls
+            // wrote nothing at all.
+            use! probe = nextFrame peer.Stdin
+            Assert.That(methodOf probe, Is.EqualTo "initialized")
+
+            // ...and the conversation still works end to end.
+            let call =
+                session.RequestRawAsync("textDocument/hover", null, TimeSpan.FromSeconds 30.0)
+
+            use! sent = nextFrame peer.Stdin
+            Assert.That(methodOf sent, Is.EqualTo "textDocument/hover")
+            peer.Stdout.Emit(framed (responseJson (rawId sent) "\"still talking\""))
+
+            let! answer = call
+            assertRaw "\"still talking\"" answer
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a per-request timeout that elapses behind another send fails alone``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+
+            // The peer stops draining its stdin part-way through the first request's frame, so that
+            // request holds the session's send gate and everything else queues behind it.
+            peer.Stdin.StallWrites()
+
+            let held =
+                session.RequestRawAsync("textDocument/formatting", null, TimeSpan.FromSeconds 30.0)
+
+            do! peer.Stdin.NextStalledWriteAsync()
+
+            // The queued request's own 150 ms budget elapses while it is still waiting for that gate:
+            // not one byte of ITS frame was written, so it fails alone instead of ending the session.
+            match! session.RequestRawAsync("textDocument/hover", null, TimeSpan.FromMilliseconds 150.0) with
+            | Error(ProcessError.Timeout(program, timeout, _, _)) ->
+                Assert.That(program, Is.EqualTo "language-server")
+                Assert.That(timeout, Is.EqualTo(TimeSpan.FromMilliseconds 150.0))
+            | other -> Assert.Fail $"expected the queued request to time out alone, got {other}"
+
+            // The peer reads again: the first request's frame finishes and is answered — which a session
+            // killed by the timeout above could no longer do.
+            peer.Stdin.ResumeWrites()
+            use! sent = nextFrame peer.Stdin
+            Assert.That(methodOf sent, Is.EqualTo "textDocument/formatting")
+            peer.Stdout.Emit(framed (responseJson (rawId sent) "[]"))
+
+            let! answer = held
+            assertRaw "[]" answer
+
+            // ...and the conversation carries on past it.
+            let next = session.RequestRawAsync("shutdown", null, TimeSpan.FromSeconds 30.0)
+            use! shutdown = nextFrame peer.Stdin
+            peer.Stdout.Emit(framed (responseJson (rawId shutdown) "null"))
+
+            let! nextAnswer = next
+            assertRaw "null" nextAnswer
         }
         :> Task
 
