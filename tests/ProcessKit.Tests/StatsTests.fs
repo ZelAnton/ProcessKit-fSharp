@@ -266,110 +266,112 @@ type StatsTests() =
             current[unknownPid] <- None
             current[recycledPid] <- Some 11UL
 
-            Native.Posix.processGroupAliveForTests <- Some(fun _ -> true)
-
-            Native.Posix.readProcessIdentityForTests <-
-                Some(fun pid ->
-                    match current.TryGetValue pid with
-                    | true, identity -> identity
-                    | false, _ -> None)
-
-            Native.Posix.readMemberStatsForTests <- Some(fun pid -> Some(MemberStats(pid, None, None, None)))
-
-            let backend = ProcessGroupBackend() :> IContainmentBackend
-            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+            let originalProcessGroupAlive = Native.Posix.processGroupAliveForTests
+            let originalReadProcessIdentity = Native.Posix.readProcessIdentityForTests
+            let originalReadMemberStats = Native.Posix.readMemberStatsForTests
 
             try
-                backend.Track(syntheticSpawned unknownPid) |> ignore
-                backend.Track(syntheticSpawned recycledPid) |> ignore
-                current[recycledPid] <- Some 99UL
+                Native.Posix.processGroupAliveForTests <- Some(fun _ -> true)
 
-                match group.MemberStats() with
-                | Error error -> Assert.Fail $"MemberStats failed: {error}"
-                | Ok members ->
-                    Assert.That(
-                        members,
-                        Is.Empty,
-                        "unknown and recycled identities must not be represented by a numeric-pid fallback"
-                    )
+                Native.Posix.readProcessIdentityForTests <-
+                    Some(fun pid ->
+                        match current.TryGetValue pid with
+                        | true, identity -> identity
+                        | false, _ -> None)
+
+                Native.Posix.readMemberStatsForTests <- Some(fun pid -> Some(MemberStats(pid, None, None, None)))
+
+                let backend = ProcessGroupBackend() :> IContainmentBackend
+                let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+                try
+                    backend.Track(syntheticSpawned unknownPid) |> ignore
+                    backend.Track(syntheticSpawned recycledPid) |> ignore
+                    current[recycledPid] <- Some 99UL
+
+                    match group.MemberStats() with
+                    | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                    | Ok members ->
+                        Assert.That(
+                            members,
+                            Is.Empty,
+                            "unknown and recycled identities must not be represented by a numeric-pid fallback"
+                        )
+                finally
+                    (group :> IDisposable).Dispose()
             finally
-                (group :> IDisposable).Dispose()
-                Native.Posix.processGroupAliveForTests <- None
-                Native.Posix.readProcessIdentityForTests <- None
-                Native.Posix.readMemberStatsForTests <- None
+                Native.Posix.processGroupAliveForTests <- originalProcessGroupAlive
+                Native.Posix.readProcessIdentityForTests <- originalReadProcessIdentity
+                Native.Posix.readMemberStatsForTests <- originalReadMemberStats
 
     [<Test>]
     member _.``public MemberStats rejects a cgroup pid whose identity changes during sampling``() =
         if isWindows then
             Assert.Ignore "the cgroup identity gate is Linux/POSIX-only"
         else
-            let directory =
-                Path.Combine(Path.GetTempPath(), $"processkit-member-stats-cgroup-{Guid.NewGuid():N}")
-
-            Directory.CreateDirectory directory |> ignore
-
             let keptPid = 2_100_000_011
             let recycledPid = 2_100_000_012
+            let departedPid = 2_100_000_013
             let current = Dictionary<int, uint64>()
             current[keptPid] <- 101UL
             current[recycledPid] <- 202UL
+            current[departedPid] <- 203UL
 
-            Native.Posix.readProcessIdentityForTests <-
-                Some(fun pid ->
-                    match current.TryGetValue pid with
-                    | true, identity -> Some identity
-                    | false, _ -> None)
+            let pointInTimePids = [ keptPid; recycledPid; departedPid ]
+            let trackedIdentities = Dictionary<int, uint64 option>()
+            trackedIdentities[keptPid] <- Some 101UL
+            trackedIdentities[recycledPid] <- Some 202UL
+            trackedIdentities[departedPid] <- Some 203UL
+            let adoptedIdentities = Dictionary<int, uint64 option>()
+            let mutable currentMembers = pointInTimePids
 
-            Native.Posix.readMemberStatsForTests <-
-                Some(fun pid ->
-                    if pid = recycledPid then
-                        current[pid] <- 999UL
-
-                    Some(MemberStats(pid, None, None, None)))
-
-            let cgroupBackend = CgroupBackend directory :> IContainmentBackend
-
-            match cgroupBackend.Track(syntheticSpawned keptPid), cgroupBackend.Track(syntheticSpawned recycledPid) with
-            | Ok(), Ok() -> ()
-            | first, second -> Assert.Fail $"tracking synthetic cgroup members failed: {first}; {second}"
-
-            // Restore the point-in-time membership after Track's confirmation writes. The identity ledger
-            // now represents the original members, while the reader seam below can model a later recycle.
-            File.WriteAllText(Path.Combine(directory, "cgroup.procs"), $"{keptPid}\n{recycledPid}\n")
-
-            let backend =
-                MemberStatsSeamBackend(fun () -> cgroupBackend.MemberStats()) :> IContainmentBackend
-
-            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+            let originalReadProcessIdentity = Native.Posix.readProcessIdentityForTests
+            let originalReadMemberStats = Native.Posix.readMemberStatsForTests
 
             try
-                match group.MemberStats() with
-                | Error error -> Assert.Fail $"MemberStats failed: {error}"
-                | Ok members ->
-                    let pids = members |> Seq.map (fun stats -> stats.Pid) |> Set.ofSeq
-                    let expected = Set.singleton keptPid
-                    Assert.That((pids = expected), Is.True)
-            finally
-                (group :> IDisposable).Dispose()
-                Native.Posix.readProcessIdentityForTests <- None
-                Native.Posix.readMemberStatsForTests <- None
+                Native.Posix.readProcessIdentityForTests <-
+                    Some(fun pid ->
+                        match current.TryGetValue pid with
+                        | true, identity -> Some identity
+                        | false, _ -> None)
+
+                Native.Posix.readMemberStatsForTests <-
+                    Some(fun pid ->
+                        if pid = recycledPid then
+                            current[pid] <- 999UL
+
+                        Some(MemberStats(pid, None, None, None)))
+
+                let backend =
+                    MemberStatsSeamBackend(fun () ->
+                        CgroupMemberStats.sample pointInTimePids trackedIdentities adoptedIdentities (fun () ->
+                            Ok currentMembers)
+                        |> Result.mapError ProcessError.Io)
+                    :> IContainmentBackend
+
+                // The second membership read loses a stable member independently of the identity change.
+                currentMembers <- [ keptPid; recycledPid ]
+
+                let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
 
                 try
-                    Directory.Delete(directory, true)
-                with _ ->
-                    // best-effort cleanup of the synthetic cgroup directory after the seam test.
-                    ()
+                    match group.MemberStats() with
+                    | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                    | Ok members ->
+                        let pids = members |> Seq.map (fun stats -> stats.Pid) |> Set.ofSeq
+                        let expected = Set.singleton keptPid
+                        Assert.That((pids = expected), Is.True)
+                finally
+                    (group :> IDisposable).Dispose()
+            finally
+                Native.Posix.readProcessIdentityForTests <- originalReadProcessIdentity
+                Native.Posix.readMemberStatsForTests <- originalReadMemberStats
 
     [<Test>]
     member _.``cgroup MemberStats uses tracked identity across exit and same-cgroup reuse``() =
         if isWindows then
             Assert.Ignore "the cgroup identity ledger is Linux/POSIX-only"
         else
-            let directory =
-                Path.Combine(Path.GetTempPath(), $"processkit-member-stats-cgroup-reuse-{Guid.NewGuid():N}")
-
-            Directory.CreateDirectory directory |> ignore
-
             let keptPid = 2_100_000_041
             let recycledPid = 2_100_000_042
             let untrackedPid = 2_100_000_043
@@ -382,25 +384,25 @@ type StatsTests() =
             current[ambiguousPid] <- None
             current[descendantPid] <- Some 304UL
 
-            Native.Posix.readProcessIdentityForTests <-
-                Some(fun pid ->
-                    match current.TryGetValue pid with
-                    | true, identity -> identity
-                    | false, _ -> None)
+            let pointInTimePids =
+                [ keptPid; recycledPid; untrackedPid; ambiguousPid; descendantPid ]
 
-            Native.Posix.readMemberStatsForTests <- Some(fun pid -> Some(MemberStats(pid, None, None, None)))
-
-            let cgroupBackend = CgroupBackend directory :> IContainmentBackend
+            let trackedIdentities = Dictionary<int, uint64 option>()
+            trackedIdentities[keptPid] <- Some 301UL
+            trackedIdentities[recycledPid] <- Some 302UL
+            trackedIdentities[ambiguousPid] <- None
+            let adoptedIdentities = Dictionary<int, uint64 option>()
+            let originalReadProcessIdentity = Native.Posix.readProcessIdentityForTests
+            let originalReadMemberStats = Native.Posix.readMemberStatsForTests
 
             try
-                match
-                    cgroupBackend.Track(syntheticSpawned keptPid),
-                    cgroupBackend.Track(syntheticSpawned recycledPid),
-                    cgroupBackend.Track(syntheticSpawned ambiguousPid)
-                with
-                | Ok(), Ok(), Ok() -> ()
-                | first, second, third ->
-                    Assert.Fail $"tracking synthetic cgroup members failed: {first}; {second}; {third}"
+                Native.Posix.readProcessIdentityForTests <-
+                    Some(fun pid ->
+                        match current.TryGetValue pid with
+                        | true, identity -> identity
+                        | false, _ -> None)
+
+                Native.Posix.readMemberStatsForTests <- Some(fun pid -> Some(MemberStats(pid, None, None, None)))
 
                 // The original tracked process exited and its pid was reused by a different process that
                 // remains in this same cgroup. The cgroup file cannot tell those generations apart; the
@@ -409,43 +411,40 @@ type StatsTests() =
                 current[recycledPid] <- Some 9_999UL
                 current[ambiguousPid] <- Some 8_888UL
 
-                File.WriteAllText(
-                    Path.Combine(directory, "cgroup.procs"),
-                    $"{keptPid}\n{recycledPid}\n{untrackedPid}\n{ambiguousPid}\n{descendantPid}\n"
-                )
+                let backend =
+                    MemberStatsSeamBackend(fun () ->
+                        CgroupMemberStats.sample pointInTimePids trackedIdentities adoptedIdentities (fun () ->
+                            Ok pointInTimePids)
+                        |> Result.mapError ProcessError.Io)
+                    :> IContainmentBackend
 
-                match cgroupBackend.MemberStats() with
-                | Error error -> Assert.Fail $"MemberStats failed: {error}"
-                | Ok members ->
-                    let pids = members |> Seq.map (fun stats -> stats.Pid) |> Set.ofSeq
-                    let expected: Set<int> = set [ keptPid; untrackedPid; descendantPid ]
-
-                    Assert.That(
-                        pids,
-                        Is.EqualTo<Set<int>>(expected),
-                        "tracked identity must reject reuse while untracked descendants remain attributable"
-                    )
-            finally
-                Native.Posix.readProcessIdentityForTests <- None
-                Native.Posix.readMemberStatsForTests <- None
+                let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
 
                 try
-                    Directory.Delete(directory, true)
-                with _ ->
-                    // best-effort cleanup of the synthetic cgroup directory after the seam test.
-                    ()
+                    match group.MemberStats() with
+                    | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                    | Ok members ->
+                        let pids = members |> Seq.map (fun stats -> stats.Pid) |> Set.ofSeq
+                        let expected: Set<int> = set [ keptPid; untrackedPid; descendantPid ]
+
+                        Assert.That(
+                            pids,
+                            Is.EqualTo<Set<int>>(expected),
+                            "tracked identity must reject reuse while untracked descendants remain attributable"
+                        )
+                finally
+                    (group :> IDisposable).Dispose()
+            finally
+                Native.Posix.readProcessIdentityForTests <- originalReadProcessIdentity
+                Native.Posix.readMemberStatsForTests <- originalReadMemberStats
 
     [<Test>]
     member _.``cgroup MemberStats includes adopted and descendant members with identity-safe sampling``() =
         if isWindows then
             Assert.Ignore "cgroup membership is Linux/POSIX-only"
         else
-            let directory =
-                Path.Combine(Path.GetTempPath(), $"processkit-member-stats-cgroup-adopt-{Guid.NewGuid():N}")
-
-            Directory.CreateDirectory directory |> ignore
-
             let adoptedPid = 2_100_000_081
+            let adoptedWithoutIdentityPid = 2_100_000_080
             let descendantPid = 2_100_000_082
             let changingDescendantPid = 2_100_000_083
             let current = Dictionary<int, uint64>()
@@ -453,53 +452,60 @@ type StatsTests() =
             current[descendantPid] <- 502UL
             current[changingDescendantPid] <- 503UL
 
-            Native.Posix.readProcessIdentityForTests <-
-                Some(fun pid ->
-                    match current.TryGetValue pid with
-                    | true, identity -> Some identity
-                    | false, _ -> None)
+            let pointInTimePids =
+                [ adoptedPid; adoptedWithoutIdentityPid; descendantPid; changingDescendantPid ]
 
-            Native.Posix.readMemberStatsForTests <-
-                Some(fun pid ->
-                    if pid = changingDescendantPid then
-                        current[pid] <- 9_999UL
+            let trackedIdentities = Dictionary<int, uint64 option>()
+            let adoptedIdentities = Dictionary<int, uint64 option>()
+            adoptedIdentities[adoptedPid] <- Some 501UL
+            adoptedIdentities[adoptedWithoutIdentityPid] <- None
+            let currentMembers = pointInTimePids
 
-                    Some(MemberStats(pid, None, None, None)))
-
-            let cgroupBackend = CgroupBackend directory :> IContainmentBackend
+            let originalReadProcessIdentity = Native.Posix.readProcessIdentityForTests
+            let originalReadMemberStats = Native.Posix.readMemberStatsForTests
 
             try
-                match cgroupBackend.Adopt adoptedPid with
-                | Error error -> Assert.Fail $"adopting synthetic cgroup member failed: {error}"
-                | Ok() -> ()
+                Native.Posix.readProcessIdentityForTests <-
+                    Some(fun pid ->
+                        match current.TryGetValue pid with
+                        | true, identity -> Some identity
+                        | false, _ -> None)
 
-                // The adopted leader and both descendants are in the kernel membership snapshot. The
-                // adopted token is pinned at Adopt; descendants get a snapshot token before sampling.
-                File.WriteAllText(
-                    Path.Combine(directory, "cgroup.procs"),
-                    $"{adoptedPid}\n{descendantPid}\n{changingDescendantPid}\n"
-                )
+                Native.Posix.readMemberStatsForTests <-
+                    Some(fun pid ->
+                        if pid = changingDescendantPid then
+                            current[pid] <- 9_999UL
 
-                match cgroupBackend.MemberStats() with
-                | Error error -> Assert.Fail $"MemberStats failed: {error}"
-                | Ok members ->
-                    let pids = members |> Seq.map (fun stats -> stats.Pid) |> Set.ofSeq
-                    let expected: Set<int> = set [ adoptedPid; descendantPid ]
+                        Some(MemberStats(pid, None, None, None)))
 
-                    Assert.That(
-                        pids,
-                        Is.EqualTo<Set<int>>(expected),
-                        "adopted and stable descendant members must be retained, while changed identities are omitted"
-                    )
-            finally
-                Native.Posix.readProcessIdentityForTests <- None
-                Native.Posix.readMemberStatsForTests <- None
+                let backend =
+                    MemberStatsSeamBackend(fun () ->
+                        CgroupMemberStats.sample pointInTimePids trackedIdentities adoptedIdentities (fun () ->
+                            Ok currentMembers)
+                        |> Result.mapError ProcessError.Io)
+                    :> IContainmentBackend
+
+                // The adopted leader is pinned at adoption time, while descendants get a snapshot token
+                // immediately before sampling. An adopted member without an identity is fail-closed.
+                let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
 
                 try
-                    Directory.Delete(directory, true)
-                with _ ->
-                    // best-effort cleanup of the synthetic cgroup directory after the seam test.
-                    ()
+                    match group.MemberStats() with
+                    | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                    | Ok members ->
+                        let pids = members |> Seq.map (fun stats -> stats.Pid) |> Set.ofSeq
+                        let expected: Set<int> = set [ adoptedPid; descendantPid ]
+
+                        Assert.That(
+                            pids,
+                            Is.EqualTo<Set<int>>(expected),
+                            "adopted and stable descendant members must be retained, while changed or unknown identities are omitted"
+                        )
+                finally
+                    (group :> IDisposable).Dispose()
+            finally
+                Native.Posix.readProcessIdentityForTests <- originalReadProcessIdentity
+                Native.Posix.readMemberStatsForTests <- originalReadMemberStats
 
     [<Test>]
     member _.``public MemberStats retains an inaccessible Windows member and omits a gone member``() =

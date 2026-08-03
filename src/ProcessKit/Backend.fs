@@ -424,6 +424,43 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
 
             Native.Windows.closeWindowsHandle jobHandle
 
+/// The identity-safe cgroup member sampling pipeline. The production backend supplies the kernel's
+/// membership reads; tests can supply point-in-time membership and a deterministic reread without
+/// pretending that synthetic pids exist in a real cgroup.
+module internal CgroupMemberStats =
+
+    let sample
+        (pids: int list)
+        (trackedIdentities: IReadOnlyDictionary<int, uint64 option>)
+        (adoptedIdentities: IReadOnlyDictionary<int, uint64 option>)
+        (currentMembership: unit -> Result<int list, string>)
+        : Result<MemberStats list, string> =
+        let snapshot =
+            pids
+            |> List.choose (fun pid ->
+                // Tracked and adopted leaders have a pinned identity. Descendants and other
+                // externally-created members capture theirs immediately before sampling.
+                match trackedIdentities.TryGetValue pid with
+                | true, Some identity -> Some(pid, identity)
+                | true, None -> None
+                | false, _ ->
+                    match adoptedIdentities.TryGetValue pid with
+                    | true, Some identity -> Some(pid, identity)
+                    | true, None -> None
+                    | false, _ ->
+                        Native.Posix.readProcessIdentity pid
+                        |> Option.map (fun identity -> pid, identity))
+
+        let sampled =
+            snapshot
+            |> List.choose (fun (pid, identity) -> Native.Posix.readMemberStatsWithIdentity pid (Some identity))
+
+        match currentMembership () with
+        | Error message -> Error message
+        | Ok current ->
+            let currentPids = Set.ofList current
+            Ok(sampled |> List.filter (fun stats -> currentPids.Contains stats.Pid))
+
 /// Linux cgroup v2 backend (the `limits` mechanism). Membership lives in `cgroup.procs`; the tree is
 /// reaped with `cgroup.kill` and the directory removed.
 type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
@@ -652,38 +689,19 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                     ProcessError.Io $"could not read cgroup.procs for per-member stats (membership unknown): {message}"
                 )
             | Ok pids ->
-                // Tracked and adopted leaders use their pinned identity token. Descendants and other
-                // externally-created members are not in either ledger, so capture their identity from this
-                // membership snapshot immediately before sampling; the identity-gated reader checks it
-                // again after the native reads. This preserves the cgroup's whole-tree/adoption contract
-                // without turning a recycled numeric pid into an attribution.
-                let snapshot =
-                    pids
-                    |> List.choose (fun pid ->
-                        match identities.TryGetValue pid with
-                        | true, Some identity -> Some(pid, identity)
-                        | true, None -> None
-                        | false, _ ->
-                            match adoptedIdentities.TryGetValue pid with
-                            | true, Some identity -> Some(pid, identity)
-                            | true, None -> None
-                            | false, _ ->
-                                Native.Posix.readProcessIdentity pid
-                                |> Option.map (fun identity -> pid, identity))
-
-                let sampled =
-                    snapshot
-                    |> List.choose (fun (pid, identity) -> Native.Posix.readMemberStatsWithIdentity pid (Some identity))
-
-                match Native.Cgroup.cgroupMembers cgroupPath with
+                match
+                    CgroupMemberStats.sample
+                        pids
+                        (identities :> IReadOnlyDictionary<int, uint64 option>)
+                        (adoptedIdentities :> IReadOnlyDictionary<int, uint64 option>)
+                        (fun () -> Native.Cgroup.cgroupMembers cgroupPath)
+                with
                 | Error message ->
                     Error(
                         ProcessError.Io
                             $"could not re-read cgroup.procs after per-member stats (membership unknown): {message}"
                     )
-                | Ok current ->
-                    let currentPids = Set.ofList current
-                    Ok(sampled |> List.filter (fun stats -> currentPids.Contains stats.Pid))
+                | Ok sampled -> Ok sampled
 
         member _.UpdateLimits(limits) =
             // Rewrite the cgroup's controller files in place (`memory.max`/`memory.oom.group`/`pids.max`/`cpu.max`/
