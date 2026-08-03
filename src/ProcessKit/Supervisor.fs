@@ -207,7 +207,8 @@ type internal LivenessProbe =
     /// Evaluate an arbitrary async predicate each attempt; the child is healthy when it returns `true`.
     | Custom of probe: (unit -> Task<bool>)
 
-    /// Sample attributable whole-tree peak memory; healthy while it is at or below `maxBytes`.
+    /// Sample attributable whole-tree peak memory since the incarnation started; healthy while the
+    /// peak is at or below `maxBytes`. This is intentionally not a current-working-set sample.
     | Memory of maxBytes: int64
 
 /// The immutable configuration behind a `Supervisor`. Internal — built through the `Supervisor`
@@ -552,6 +553,9 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                     check, None
                 | LivenessProbe.Memory maxBytes ->
                     let check (_probeToken: CancellationToken) =
+                        // ProcessGroupStats.PeakMemoryBytes is monotonic for a private Job/cgroup
+                        // incarnation. A later lower working set therefore cannot forgive a peak that
+                        // already crossed the limit; this is the explicit memory-liveness contract.
                         match running.TreePeakMemoryBytes() with
                         | Ok bytes when bytes <= maxBytes -> Task.FromResult(Ok())
                         | Ok _ -> Task.FromResult(Error(ProcessError.NotReady(program, probeTimeout)))
@@ -1384,9 +1388,11 @@ type Supervisor internal (config: SupervisorConfig) =
         )
 
     /// Enable a whole-process-tree **memory liveness probe**. The supervisor samples attributable
-    /// peak resident memory every configured liveness interval and treats a value above `maxBytes`
-    /// as a failed attempt. After `LivenessFailures` consecutive failures it gracefully stops and
-    /// restarts the child through the ordinary liveness path. `maxBytes` must be positive.
+    /// peak resident memory since the incarnation started every configured liveness interval and
+    /// treats a value above `maxBytes` as a failed attempt. The peak is monotonic for that
+    /// incarnation: once it crosses the limit, later lower current usage does not produce a healthy
+    /// memory attempt. `LivenessFailures` therefore controls how many observations precede the
+    /// restart, but cannot forgive an already-crossed peak. `maxBytes` must be positive.
     ///
     /// Whole-tree accounting requires a private Job Object or cgroup. If the active backend cannot
     /// provide an attributable metric, supervision ends with a typed `ProcessError.Unsupported`
@@ -1410,10 +1416,12 @@ type Supervisor internal (config: SupervisorConfig) =
                 LivenessInterval = Liveness.clampInterval interval }
         )
 
-    /// How many **consecutive** failed liveness attempts trip a restart (default `3`). A single healthy
-    /// attempt resets the run, so a flaky endpoint that recovers does not restart the child. `count`
-    /// must be at least `1`. No effect unless a liveness probe (`LivenessHttp`/`LivenessCheck`/
-    /// `LivenessMemory`) is set.
+    /// How many **consecutive** failed liveness attempts trip a restart (default `3`). For HTTP and
+    /// predicate probes, a single healthy attempt resets the run, so a flaky endpoint that recovers
+    /// does not restart the child. For `LivenessMemory`, a healthy attempt resets the run only while
+    /// the incarnation's peak is still at or below the limit; after the monotonic peak crosses it,
+    /// later lower current usage remains failed. `count` must be at least `1`. No effect unless a
+    /// liveness probe (`LivenessHttp`/`LivenessCheck`/`LivenessMemory`) is set.
     member _.LivenessFailures(count: int) =
         ArgumentOutOfRangeException.ThrowIfLessThan(count, 1, nameof count)
         Supervisor({ config with LivenessFailures = count })

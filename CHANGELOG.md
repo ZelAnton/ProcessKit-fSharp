@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProcessKit.Testing.FaultInjectingRunner` adds scripted, first-N, and seeded deterministic failure scenarios with virtual-time latency.
 - A performance and scalability guide documents event-driven waits, buffer tuning, fleet sizing, and benchmark interpretation.
 
+### Changed
+- `Supervisor.LivenessMemory` now documents its intentional monotonic peak-memory contract: a transient peak is not forgiven by later lower usage, and `LivenessFailures` only delays the restart after the crossing.
+
 ### Fixed
 - Pipeline relays now surface genuine upstream read failures instead of treating truncated downstream input as successful, while keeping expected broken-pipe and teardown races quiet.
 - A supervision session stopped before any incarnation produced a result no longer starts one more child just to report one, and ends with the failure that kept the child from starting — or `ProcessError.Cancelled` when no incarnation was ever started.
