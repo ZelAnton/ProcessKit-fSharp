@@ -1970,6 +1970,69 @@ type SupervisorTests() =
         :> Task
 
     [<Test>]
+    member _.``healthy attributable memory samples do not restart before a peak crossing``() : Task =
+        task {
+            let maxBytes = 1024L
+            let healthySamples = [| 256L; 768L; 1024L |]
+            let observedSamples = ResizeArray<int64>()
+
+            let sampledEnough =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let mutable sampleIndex = 0
+            let mutable delayCalls = 0
+
+            let treeStats () =
+                let index = Interlocked.Increment(&sampleIndex) - 1
+                let bytes = healthySamples[min index (healthySamples.Length - 1)]
+                observedSamples.Add bytes
+
+                if index + 1 = healthySamples.Length then
+                    sampledEnough.TrySetResult() |> ignore
+
+                Some(ProcessGroupStats(1, None, Some bytes, None))
+
+            let deterministicDelay (_: TimeSpan) (cancellationToken: CancellationToken) : Task =
+                if Interlocked.Increment(&delayCalls) <= healthySamples.Length then
+                    Task.CompletedTask
+                else
+                    Task.Delay(Timeout.Infinite, cancellationToken)
+
+            let runner = MemoryLivenessRunner(Some treeStats)
+            let events = ResizeArray<SupervisorRestartEvent>()
+
+            let supervisor =
+                Supervisor(Command.create "memory-healthy")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .MaxRestarts(1)
+                    .LivenessMemory(maxBytes, TimeSpan.FromMilliseconds 1.0)
+                    .LivenessFailures(1)
+                    .LivenessGrace(TimeSpan.Zero)
+                    .OnRestart(fun event -> events.Add event)
+                    .WithLivenessDelay
+                    deterministicDelay
+
+            let! session = supervisor.StartAsync()
+            do! sampledEnough.Task.WaitAsync(TimeSpan.FromSeconds 10.0)
+
+            Assert.That(observedSamples |> Seq.toArray, Is.EqualTo<int64> healthySamples)
+            Assert.That(session.Status.Restarts, Is.EqualTo 0, "healthy memory samples do not restart the child")
+            Assert.That(events.Count, Is.EqualTo 0, "healthy memory samples do not emit liveness restart events")
+            Assert.That(runner.Spawns, Is.EqualTo 1, "the healthy incarnation remains the only spawn")
+
+            let! outcome = session.StopAsync(TimeSpan.FromMilliseconds 100.0)
+
+            match outcome with
+            | Ok result ->
+                Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+                Assert.That(result.Restarts, Is.EqualTo 0)
+            | Error error -> Assert.Fail $"expected a clean stop after healthy memory samples, got {error}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``whole-tree memory above the threshold uses the ordinary liveness restart path``() : Task =
         task {
             let mutable samples = 0
