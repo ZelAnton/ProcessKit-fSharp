@@ -110,6 +110,40 @@ type private ErroringStream(chunks: byte[] list, fault: exn) =
             ValueTask<int>(chunk.Length)
         | [] -> raise fault
 
+/// A byte stream double that returns caller-selected read boundaries, then cleanly reaches EOF. The
+/// chunk-streaming tests use it to distinguish byte preservation from accidental line/decoder framing.
+type private ChunkedByteStream(chunks: byte[] list) =
+    inherit Stream()
+    let mutable remaining = chunks
+    let mutable readCount = 0
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = ()
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) : int = raise (NotSupportedException())
+
+    member _.ReadCount = Volatile.Read(&readCount)
+
+    override _.ReadAsync(buffer: Memory<byte>, _cancellationToken: CancellationToken) : ValueTask<int> =
+        Interlocked.Increment(&readCount) |> ignore
+
+        match remaining with
+        | chunk :: rest ->
+            remaining <- rest
+            chunk.AsSpan().CopyTo(buffer.Span)
+            ValueTask<int>(chunk.Length)
+        | [] -> ValueTask<int>(0)
+
 [<TestFixture>]
 type StreamingTests() =
 
@@ -315,6 +349,172 @@ type StreamingTests() =
                 match finished with
                 | Ok _ -> ()
                 | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutChunks preserves binary bytes and read boundaries, then Finish reaps``() : Task =
+        task {
+            let chunks =
+                [ [| 0uy; 0xFFuy; 0uy |]; [| 0xC3uy; 0x28uy |]; [| 0uy; 1uy; 2uy; 255uy |] ]
+
+            use stdout = new ChunkedByteStream(chunks)
+            let config = (Command.create "test").Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            let! actualChunks = collect (running.StdoutChunksAsync())
+            CollectionAssert.AreEqual([| 3; 2; 4 |], actualChunks |> Seq.map (fun chunk -> chunk.Length))
+
+            let actual =
+                actualChunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+
+            let expected = chunks |> Seq.collect id |> Seq.toArray
+            CollectionAssert.AreEqual(expected, actual)
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutChunks is exclusive with buffered and line consumers and is one-shot``() : Task =
+        task {
+            use running = syntheticStdoutProcess (Command.create "test").Config "binary"
+            running.StdoutChunksAsync() |> ignore
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutChunksAsync() |> ignore))
+            |> ignore
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutLinesAsync() |> ignore))
+            |> ignore
+
+            match! running.OutputBytesAsync() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected an explicit consuming-verb refusal, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutChunks Backpressure bounds unread chunks without losing bytes``() : Task =
+        task {
+            let capacity = 3
+            let chunks = [ for i in 0..29 -> [| byte i |] ]
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded capacity))
+                    .Config
+
+            use stdout = new ChunkedByteStream(chunks)
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+            let enumerable = running.StdoutChunksAsync()
+
+            do! Task.Delay 200
+            Assert.That(stdout.ReadCount, Is.LessThanOrEqualTo(capacity + 2))
+
+            let! actualChunks = collect enumerable
+
+            let actual =
+                actualChunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+
+            CollectionAssert.AreEqual(chunks |> Seq.collect id |> Seq.toArray, actual)
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutChunks flushes a buffered tee at clean EOF``() : Task =
+        task {
+            let payload = [| 0uy; 0xFFuy; 0uy; 1uy |]
+            use underlying = new MemoryStream()
+            use tee = new BufferedStream(underlying, 65536)
+            use stdout = new ChunkedByteStream([ payload ])
+
+            let config = (Command.create "test" |> Command.stdoutTee tee).Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            let! chunks = collect (running.StdoutChunksAsync())
+            let actual = chunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+            CollectionAssert.AreEqual(payload, actual)
+            CollectionAssert.AreEqual(payload, underlying.ToArray())
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutChunks flushes a buffered tee before surfacing a genuine read fault``() : Task =
+        task {
+            let payload = [| 0uy; 0xFFuy; 0uy; 1uy |]
+            use underlying = new MemoryStream()
+            use tee = new BufferedStream(underlying, 65536)
+            use stdout = new ErroringStream([ payload ], IOException "disk read error")
+
+            let config = (Command.create "test" |> Command.stdoutTee tee).Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            let! drain = drainWithDeadline (running.StdoutChunksAsync()) 5000
+            let! error = processError drain
+
+            match error with
+            | Some(ProcessError.Io _) -> ()
+            | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+
+            CollectionAssert.AreEqual(payload, underlying.ToArray())
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync completes after an unread bounded chunk stream is abandoned``() : Task =
+        task {
+            let capacity = 1
+            let chunks = [ for i in 0..31 -> [| byte i |] ]
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded capacity))
+                    .Config
+
+            use stdout = new ChunkedByteStream(chunks)
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+            running.StdoutChunksAsync() |> ignore
+
+            do! Task.Delay 100
+            Assert.That(stdout.ReadCount, Is.GreaterThanOrEqualTo(capacity + 1))
+
+            let stop = running.StopAsync(TimeSpan.Zero)
+            let! winner = Task.WhenAny(stop :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, stop), Is.True, "StopAsync hung on abandoned backpressure")
+            let! _ = stop
+            return ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutChunks surfaces a genuine read fault as ProcessError.Io``() : Task =
+        task {
+            let fault = IOException "disk read error"
+            use stdout = new ErroringStream([ [| 0uy; 255uy; 0uy |] ], fault)
+
+            use running =
+                syntheticProcessOverStreams (Command.create "test").Config (Some(stdout :> Stream)) None
+
+            let! drain = drainWithDeadline (running.StdoutChunksAsync()) 5000
+            let! error = processError drain
+
+            match error with
+            | Some(ProcessError.Io _) -> ()
+            | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+
+            try
+                let! _ = running.FinishAsync()
+                Assert.Fail "expected FinishAsync to surface the same genuine read fault"
+            with :? ProcessException as pe ->
+                match pe.Error with
+                | ProcessError.Io _ -> ()
+                | other -> Assert.Fail $"expected ProcessError.Io from FinishAsync, got {other}"
         }
         :> Task
 
