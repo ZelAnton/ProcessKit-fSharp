@@ -646,7 +646,16 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             // is refused up front with the same `Unsupported` `ProcessGroup.Create` gives here — the caps
             // in force are left exactly as they were, rather than a partial apply that silently dropped
             // the restriction half of the requested set.
-            if limits.CpuTimeMax <> currentLimits.CpuTimeMax then
+            if
+                limits.IoMax.IsSome
+                && Native.Cgroup.cgroupV2Available ()
+                && not (Native.Cgroup.cgroupIoAvailable ())
+            then
+                Error(
+                    ProcessError.Unsupported
+                        "the Linux cgroup v2 hierarchy does not expose the io controller required by io.max"
+                )
+            elif limits.CpuTimeMax <> currentLimits.CpuTimeMax then
                 Error(
                     ProcessError.ResourceLimit
                         "CPU-time is a per-child POSIX rlimit and cannot be changed for processes already running in this cgroup; create a new group for a different CpuTimeMax"

@@ -45,17 +45,25 @@ module internal Cgroup =
     /// True when the usable hierarchy advertises the cgroup v2 `io` controller. A mounted v2
     /// hierarchy without `io` is a real but unsupported configuration for `io.max`, not a reason to
     /// fall back to the unbounded process-group backend.
+    ///
+    /// The internal override exists only for the focused live-update regression test, which needs to
+    /// model a hierarchy losing the controller without mutating the host's real cgroup configuration.
+    let mutable internal cgroupIoAvailableForTests: bool option = None
+
     let cgroupIoAvailable () =
-        match cgroupRoot () with
-        | None -> false
-        | Some root ->
-            try
-                File
-                    .ReadAllText(Path.Combine(root, "cgroup.controllers"))
-                    .Split([| ' '; '\n'; '\t' |], StringSplitOptions.RemoveEmptyEntries)
-                |> Array.contains "io"
-            with _ ->
-                false
+        match cgroupIoAvailableForTests with
+        | Some available -> available
+        | None ->
+            match cgroupRoot () with
+            | None -> false
+            | Some root ->
+                try
+                    File
+                        .ReadAllText(Path.Combine(root, "cgroup.controllers"))
+                        .Split([| ' '; '\n'; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.contains "io"
+                with _ ->
+                    false
 
     // This process's own cgroup path (the `0::<path>` line of /proc/self/cgroup), defaulting to "/".
     let private selfCgroupRelative () =
@@ -221,6 +229,19 @@ module internal Cgroup =
     let private restorePayload (prior: string) =
         if String.IsNullOrWhiteSpace prior then "\n" else prior
 
+    /// Test-only hook for the ordered controller-file writes below. It is deliberately invoked before
+    /// the real write so a test can fail a selected native-equivalent step while the rollback ledger still
+    /// contains every earlier successful write. Production leaves it unset.
+    let mutable internal controllerWriteTestHook: (string -> string -> unit) option =
+        None
+
+    let private writeControllerFile (file: string) (content: string) =
+        match controllerWriteTestHook with
+        | Some hook -> hook file content
+        | None -> ()
+
+        File.WriteAllText(file, content)
+
     /// Apply a new limit set to an EXISTING cgroup in place (the live `ProcessGroup.UpdateLimits` path),
     /// without recreating the cgroup or restarting its members. Enables any controller the new caps
     /// newly need in the parent's `cgroup.subtree_control`, then rewrites `memory.max`/`pids.max`/
@@ -267,18 +288,20 @@ module internal Cgroup =
                       "cpu.max", (limits.CpuQuota |> Option.map cpuMaxValue), "max"
                       "cpuset.cpus", (limits.CpuAffinityCores |> Option.map formatCpuList), "\n" ]
 
-                let ioPayload =
+                let ioPlan =
                     match previousLimits.IoMax, limits.IoMax with
-                    | None, None -> None
-                    | Some previous, None -> Some(formatIoMax (IoMax(previous.Target, None, None, None, None)))
-                    | None, Some requested -> Some(formatIoMax requested)
+                    | None, None -> []
+                    | Some previous, None -> [ "io.max", formatIoMax (IoMax(previous.Target, None, None, None, None)) ]
+                    | None, Some requested -> [ "io.max", formatIoMax requested ]
                     | Some previous, Some requested when previous.Target = requested.Target ->
-                        Some(formatIoMax requested)
+                        [ "io.max", formatIoMax requested ]
                     | Some previous, Some requested ->
                         let clearPrevious = formatIoMax (IoMax(previous.Target, None, None, None, None))
-                        Some(String.Join(Environment.NewLine, [ clearPrevious; formatIoMax requested ]))
+                        [ "io.max", clearPrevious; "io.max", formatIoMax requested ]
 
                 // Files already overwritten, with their PRIOR content, so a later failure can undo them.
+                // The same file may occur more than once (old io.max target, then new target); keeping both
+                // entries makes the reverse ledger restore each native step in the exact opposite order.
                 let applied = System.Collections.Generic.List<string * string>()
 
                 try
@@ -296,15 +319,13 @@ module internal Cgroup =
                             // Capture the current kernel value BEFORE overwriting it, so a rollback restores
                             // exactly this file's prior state.
                             let prior = File.ReadAllText file
-                            File.WriteAllText(file, text)
+                            writeControllerFile file text
                             applied.Add(file, prior)
 
-                    match ioPayload with
-                    | None -> ()
-                    | Some text ->
-                        let file = Path.Combine(cgroupPath, "io.max")
+                    for (fileName, text) in ioPlan do
+                        let file = Path.Combine(cgroupPath, fileName)
                         let prior = File.ReadAllText file
-                        File.WriteAllText(file, text)
+                        writeControllerFile file text
                         applied.Add(file, prior)
 
                     Ok()
@@ -316,7 +337,7 @@ module internal Cgroup =
                     // that distinctly so the caller never treats `Options.Limits` as authoritative.
                     try
                         for (file, prior) in Seq.rev applied do
-                            File.WriteAllText(file, restorePayload prior)
+                            writeControllerFile file (restorePayload prior)
 
                         Error writeEx.Message
                     with restoreEx ->

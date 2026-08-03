@@ -4,10 +4,53 @@ open System
 open System.Collections.Generic
 open System.IO
 open System.Runtime.InteropServices
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+
+module private WindowsIoRateControlTestSupport =
+
+    [<DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "QueryDosDeviceW")>]
+    extern uint32 queryDosDevice(string deviceName, StringBuilder targetPath, uint32 maxChars)
+
+    let private tryQueryNtVolume (root: string) : string option =
+        let deviceName = root.TrimEnd([| '\\'; '/' |])
+        let buffer = StringBuilder(1024)
+        let length = queryDosDevice (deviceName, buffer, uint32 buffer.Capacity)
+
+        if length = 0u then None else Some(buffer.ToString())
+
+    let volumeTargets () : string list =
+        if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
+            []
+        else
+            try
+                let systemRoots =
+                    match Path.GetPathRoot Environment.SystemDirectory with
+                    | null -> []
+                    | root -> [ root ]
+
+                let roots =
+                    [ yield! systemRoots
+                      for drive in DriveInfo.GetDrives() do
+                          if drive.IsReady then
+                              yield drive.RootDirectory.FullName ]
+
+                roots
+                |> List.choose (fun root ->
+                    if String.IsNullOrWhiteSpace root then
+                        None
+                    else
+                        tryQueryNtVolume root)
+                |> List.distinct
+            with
+            | :? IOException
+            | :? UnauthorizedAccessException ->
+                // A runner can expose a transient or inaccessible drive while the test process is starting;
+                // no NT volume target can be claimed honestly in that case, so the gated test skips.
+                []
 
 /// A zero-cost stand-in for a pidfd used by the identity-safe delivery seam tests below:
 /// `Native.Cgroup.deliverIdentitySafe` is generic over the pin handle, so a test pins with this token
@@ -1265,6 +1308,93 @@ type LimitsTests() =
             Directory.Delete(root, true)
 
     [<Test>]
+    member _.``updateCgroupLimits replaces an io.max target with separate writes and rolls back a failed replacement``
+        ()
+        =
+        let root = Directory.CreateTempSubdirectory("pk-io-target-rollback-").FullName
+
+        try
+            let cgroupPath = Path.Combine(root, "child")
+            Directory.CreateDirectory cgroupPath |> ignore
+            File.WriteAllText(Path.Combine(root, "cgroup.subtree_control"), "io")
+
+            let ioMaxFile = Path.Combine(cgroupPath, "io.max")
+            let previous = ResourceLimits.None.WithIoMax("8:16", 4096L, 4096L, 12L, 12L)
+            let requested = ResourceLimits.None.WithIoMax("8:32", 8192L, 8192L, 24L, 24L)
+
+            let priorContents =
+                match previous.IoMax with
+                | Some ioMax -> Native.Cgroup.formatIoMax ioMax
+                | None -> failwith "the previous I/O limit should contain a target"
+
+            File.WriteAllText(ioMaxFile, priorContents)
+
+            let mutable ioWriteCount = 0
+
+            Native.Cgroup.controllerWriteTestHook <-
+                Some(fun file _ ->
+                    if Path.GetFileName file = "io.max" then
+                        ioWriteCount <- ioWriteCount + 1
+
+                        if ioWriteCount = 2 then
+                            raise (IOException("injected second io.max write failure")))
+
+            try
+                match Native.Cgroup.updateCgroupLimitsWithPrevious cgroupPath previous requested with
+                | Ok() -> Assert.Fail "the injected second io.max write should fail"
+                | Error detail -> Assert.That(detail, Does.Contain "injected second io.max write failure")
+            finally
+                Native.Cgroup.controllerWriteTestHook <- None
+
+            Assert.That(
+                File.ReadAllText ioMaxFile,
+                Is.EqualTo priorContents,
+                "a failed target replacement must restore the old io.max contents"
+            )
+        finally
+            Directory.Delete(root, true)
+
+    [<Test>]
+    member _.``live cgroup I/O updates refuse before touching controllers when io is unavailable``() =
+        if not isLinux then
+            Assert.Ignore "live cgroup controller classification is Linux-only"
+        elif not (Native.Cgroup.cgroupV2Available ()) then
+            Assert.Ignore "no usable cgroup v2 hierarchy is mounted"
+        else
+            let root = Directory.CreateTempSubdirectory("pk-io-unsupported-").FullName
+
+            try
+                let cgroupPath = Path.Combine(root, "child")
+                Directory.CreateDirectory cgroupPath |> ignore
+                let subtreeControl = Path.Combine(root, "cgroup.subtree_control")
+                File.WriteAllText(subtreeControl, "memory")
+                let memoryMax = Path.Combine(cgroupPath, "memory.max")
+                File.WriteAllText(memoryMax, "1073741824")
+
+                let previous = ResourceLimits.None.WithMemoryMax(1073741824L)
+                let requested = previous.WithIoMax("8:16", 4096L, 4096L, 12L, 12L)
+                let backend = CgroupBackend(cgroupPath, previous) :> IContainmentBackend
+
+                use group =
+                    ProcessGroup.FromBackend(backend, ProcessGroupOptions().WithMemoryMax 1073741824L)
+
+                Native.Cgroup.cgroupIoAvailableForTests <- Some false
+
+                try
+                    match group.UpdateLimits requested with
+                    | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Does.Contain "io controller")
+                    | Error other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+                    | Ok() -> Assert.Fail "an unavailable io controller must refuse the live update"
+                finally
+                    Native.Cgroup.cgroupIoAvailableForTests <- None
+
+                Assert.That(File.ReadAllText subtreeControl, Is.EqualTo "memory")
+                Assert.That(File.ReadAllText memoryMax, Is.EqualTo "1073741824")
+                Assert.That(group.Options.Limits.IoMax, Is.EqualTo None)
+            finally
+                Directory.Delete(root, true)
+
+    [<Test>]
     member _.``updateCgroupLimits toggles memory oom group with replacement semantics``() =
         let root = Directory.CreateTempSubdirectory("pk-oom-group-").FullName
 
@@ -2034,3 +2164,113 @@ type IoMaxContractRegressionTests() =
         | Ok group ->
             (group :> IDisposable).Dispose()
             Assert.Fail "a POSIX process-group backend must not claim to enforce a whole-tree I/O rate"
+
+[<TestFixture>]
+type WindowsIoRateControlTests() =
+
+    let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+
+    let ioLimits (target: string) (bandwidth: int64) (iops: int64) =
+        ResourceLimits.None.WithIoMax(target, bandwidth, bandwidth, iops, iops)
+
+    let assertIoTarget (expected: ResourceLimits) (actual: ResourceLimits) =
+        match expected.IoMax, actual.IoMax with
+        | Some expectedIo, Some actualIo ->
+            Assert.That(actualIo.Target, Is.EqualTo expectedIo.Target)
+            Assert.That(actualIo.ReadBytesPerSecond, Is.EqualTo expectedIo.ReadBytesPerSecond)
+            Assert.That(actualIo.WriteBytesPerSecond, Is.EqualTo expectedIo.WriteBytesPerSecond)
+            Assert.That(actualIo.ReadOperationsPerSecond, Is.EqualTo expectedIo.ReadOperationsPerSecond)
+            Assert.That(actualIo.WriteOperationsPerSecond, Is.EqualTo expectedIo.WriteOperationsPerSecond)
+        | _ -> Assert.Fail "the Job's I/O policy presence differs from the requested policy"
+
+    [<Test>]
+    member _.``Windows Job I/O rate control creates updates and removes a real volume policy``() =
+        if not isWindows then
+            Assert.Ignore "Windows Job Object I/O rate control is Windows-only"
+
+        match WindowsIoRateControlTestSupport.volumeTargets () with
+        | [] -> Assert.Ignore "could not derive a valid NT volume target"
+        | target :: _ ->
+            let initial = ioLimits target 1048576L 1L
+            let options = ProcessGroupOptions().WithIoMax(target, 1048576L, 1048576L, 1L, 1L)
+
+            match ProcessGroup.Create options with
+            | Error(ProcessError.Unsupported detail) when Native.Windows.isIoRateControlUnsupported detail ->
+                Assert.Ignore detail
+            | Error error -> Assert.Fail $"a real Job Object should accept the I/O rate policy: {error}"
+            | Ok group ->
+                use group = group
+                Assert.That(group.Mechanism, Is.EqualTo Mechanism.JobObject)
+                assertIoTarget initial group.Options.Limits
+
+                let updated = ioLimits target 2097152L 2L
+
+                match group.UpdateLimits updated with
+                | Error error -> Assert.Fail $"same-volume I/O update failed: {error}"
+                | Ok() -> assertIoTarget updated group.Options.Limits
+
+                match group.UpdateLimits ResourceLimits.None with
+                | Error error -> Assert.Fail $"removing the Job I/O policy failed: {error}"
+                | Ok() -> Assert.That(group.Options.Limits.IoMax, Is.EqualTo None)
+
+    [<Test>]
+    member _.``Windows Job I/O rate control replaces a real volume target``() =
+        if not isWindows then
+            Assert.Ignore "Windows Job Object I/O rate control is Windows-only"
+
+        match WindowsIoRateControlTestSupport.volumeTargets () with
+        | first :: second :: _ ->
+            let initial = ioLimits first 1048576L 1L
+
+            match ProcessGroup.Create(ProcessGroupOptions().WithIoMax(first, 1048576L, 1048576L, 1L, 1L)) with
+            | Error(ProcessError.Unsupported detail) when Native.Windows.isIoRateControlUnsupported detail ->
+                Assert.Ignore detail
+            | Error error -> Assert.Fail $"a real Job Object should accept the first I/O target: {error}"
+            | Ok group ->
+                use group = group
+                let replacement = ioLimits second 1048576L 1L
+
+                match group.UpdateLimits replacement with
+                | Error error -> Assert.Fail $"replacing the Job I/O target failed: {error}"
+                | Ok() ->
+                    assertIoTarget replacement group.Options.Limits
+                    Assert.That(group.Options.Limits.IoMax, Is.Not.EqualTo initial.IoMax)
+        | _ -> Assert.Ignore "fewer than two accessible NT volume targets are available for replacement"
+
+    [<Test>]
+    member _.``Windows Job I/O rate-control failure restores the prior live limits``() =
+        if not isWindows then
+            Assert.Ignore "Windows Job Object I/O rate control is Windows-only"
+
+        match WindowsIoRateControlTestSupport.volumeTargets () with
+        | [] -> Assert.Ignore "could not derive a valid NT volume target"
+        | target :: _ ->
+            let initial = ioLimits target 1048576L 1L
+
+            match ProcessGroup.Create(ProcessGroupOptions().WithIoMax(target, 1048576L, 1048576L, 1L, 1L)) with
+            | Error(ProcessError.Unsupported detail) when Native.Windows.isIoRateControlUnsupported detail ->
+                Assert.Ignore detail
+            | Error error -> Assert.Fail $"a real Job Object should accept the initial I/O policy: {error}"
+            | Ok group ->
+                use group = group
+
+                try
+                    // The injected I/O failure occurs after the extended-limit write, so the live update
+                    // must restore that earlier Job block and keep the previously configured I/O policy.
+                    Native.Windows.ioRateWriteErrorForTests <- Some 5
+                    let attempted = initial.WithMemoryMax(256L * 1024L * 1024L)
+
+                    match group.UpdateLimits attempted with
+                    | Error(ProcessError.ResourceLimit detail) -> Assert.That(detail, Does.Contain "I/O")
+                    | Error error ->
+                        Assert.Fail $"expected a typed ResourceLimit for the injected native error, got {error}"
+                    | Ok() -> Assert.Fail "the injected Job I/O write failure must fail the live update"
+                finally
+                    Native.Windows.ioRateWriteErrorForTests <- None
+
+                assertIoTarget initial group.Options.Limits
+                Assert.That(group.Options.Limits.MemoryMax, Is.EqualTo None)
+
+                match group.UpdateLimits ResourceLimits.None with
+                | Error error -> Assert.Fail $"the prior I/O policy could not be removed after rollback: {error}"
+                | Ok() -> Assert.That(group.Options.Limits.IoMax, Is.EqualTo None)
