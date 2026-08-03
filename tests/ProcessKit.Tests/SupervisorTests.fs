@@ -2006,6 +2006,48 @@ type SupervisorTests() =
         :> Task
 
     [<Test>]
+    member _.``memory liveness keeps a recovered current sample failed after a peak crossing``() : Task =
+        task {
+            let mutable samples = 0
+            let mutable peakBytes = 0L
+
+            let treeStats () =
+                let sample = Interlocked.Increment(&samples)
+                // Model a transient current-use spike followed by recovery. The backend exposes the
+                // accumulated peak, so the second sample remains over the limit even though current
+                // usage has fallen back below it.
+                let currentBytes = if sample = 1 then 4096L else 512L
+                peakBytes <- max peakBytes currentBytes
+                Some(ProcessGroupStats(1, None, Some peakBytes, None))
+
+            let runner = MemoryLivenessRunner(Some treeStats)
+            let events = ResizeArray<SupervisorRestartEvent>()
+
+            let supervisor =
+                Supervisor(Command.create "memory-spike")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .MaxRestarts(1)
+                    .LivenessMemory(1024L, TimeSpan.FromMilliseconds 1.0)
+                    .LivenessFailures(2)
+                    .LivenessGrace(TimeSpan.Zero)
+                    .OnRestart(fun event -> events.Add event)
+
+            match! supervisor.RunAsync() with
+            | Ok outcome ->
+                Assert.That(outcome.Restarts, Is.EqualTo 1)
+                Assert.That(outcome.Stopped, Is.EqualTo StopReason.RestartsExhausted)
+                Assert.That(runner.Spawns, Is.EqualTo 2)
+                Assert.That(runner.GracefulStops, Is.EqualTo 2)
+                Assert.That(Volatile.Read(&samples), Is.GreaterThanOrEqualTo 4)
+                Assert.That(events.Count, Is.EqualTo 1)
+                Assert.That(events[0].Cause, Is.EqualTo RestartCause.Liveness)
+            | Error error -> Assert.Fail $"expected the peak violation to restart after recovery, got {error}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``memory liveness fails honestly when whole-tree accounting is unavailable``() : Task =
         task {
             let cases: (string * (unit -> ProcessGroupStats option) option) list =

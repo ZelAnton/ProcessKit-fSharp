@@ -523,6 +523,10 @@ of hammering restarts at backoff speed. Supervision runs through the `IProcessRu
 `.WithRunner(group)` to keep every incarnation in one shared kill-on-dispose group, or a
 `ScriptedRunner` to test supervision logic hermetically.
 
+The optional `LivenessMemory` probe intentionally samples attributable **peak** tree memory for each
+incarnation. A transient peak remains a violation after current usage falls, so choose a threshold above
+expected startup spikes when they should not cause a restart; unsupported backends return a typed error.
+
 *Deeper: [Supervision](docs/supervision.md).*
 
 ## Waiting for a child to be ready

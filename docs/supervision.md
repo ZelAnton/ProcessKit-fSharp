@@ -296,9 +296,12 @@ var byMemory = new Supervisor(new Command("worker"))
 `LivenessMemory(maxBytes)` uses the current liveness interval; the two-argument overload sets it in
 the same call. It samples whole-tree peak resident memory from the run's private Job Object or cgroup,
 so descendants count and a value that crosses the threshold remains over it for that incarnation.
-ProcessKit never substitutes leader-only or shared-group memory: when the active backend cannot
-provide an attributable tree metric, supervision stops the live child and returns a typed
-`ProcessError.Unsupported`.
+This is deliberately a peak contract, not a current-working-set contract: a transient spike is still a
+memory-liveness violation after current usage falls, and `LivenessFailures` only delays the restart
+after that crossing. Set `maxBytes` above expected startup/transient peaks when those peaks should not
+restart the child. ProcessKit never substitutes leader-only or shared-group memory: when the active
+backend cannot provide an attributable tree metric, supervision stops the live child and returns a
+typed `ProcessError.Unsupported` (including the POSIX process-group fallback).
 
 Every `LivenessHttp` form also accepts a caller-owned `HttpClient` immediately after the URI. Use it
 for authentication headers, custom certificate validation, proxies, or a custom transport such as HTTP
@@ -336,9 +339,12 @@ How it behaves:
 - **When it restarts.** After `LivenessFailures` **consecutive** failed attempts, the supervisor
   gracefully stops the child (a `LivenessGrace` soft-stop window, then a hard kill) and restarts it
   through the **ordinary** restart path — the same `RestartPolicy`, backoff, jitter, `MaxRestarts`
-  budget, and storm guard apply. It is not a second, parallel restart mechanism. A single healthy
-  attempt resets the run, so a brief blip that recovers does not restart the child. The first attempt
-  runs one `LivenessInterval` after the child starts, a natural startup window.
+  budget, and storm guard apply. It is not a second, parallel restart mechanism. For HTTP and
+  predicate probes, a single healthy attempt resets the run, so a brief blip that recovers does not
+  restart the child. Memory uses the monotonic peak described above: healthy samples reset the run
+  only before the peak crosses `maxBytes`, and lower current usage afterward cannot make the sample
+  healthy again. The first attempt runs one `LivenessInterval` after the child starts, a natural
+  startup window.
 
 The soft phase is the supervised command's `Command.StopSignal` (default `Signal.Term`). The same
 setting is therefore honored by an explicit supervision-session `StopAsync`, a liveness restart, and
