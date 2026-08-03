@@ -241,7 +241,7 @@ record-replay `RecordReplayRunner`, referenced only from test projects) and the
 | Capability | Where |
 |---|---|
 | Tree control — `Signal` / `Suspend` / `Resume` / `Members` | `ProcessGroup` |
-| Resource caps — memory / process count / CPU quota, affinity, and time | `ProcessGroupOptions` → `ProcessGroup.Create` |
+| Resource caps — memory / process count / CPU quota, affinity, time, and disk I/O | `ProcessGroupOptions` → `ProcessGroup.Create` |
 | Stats & profiling — `Stats` / `SampleStatsAsync` / `ProfileAsync` | `ProcessGroup`, `RunningProcess` |
 | Test doubles — `ScriptedRunner` / `FakeProcess` | `ProcessKit.Testing` (separate package) |
 | Record / replay cassettes | `ProcessKit.Testing.RecordReplayRunner` (separate package) |
@@ -268,6 +268,7 @@ task {
             .WithMaxProcesses(64)
             .WithCpuQuota(0.5)                    // half of one core
             .WithCpuTimeMax(TimeSpan.FromSeconds 30.0)
+            .WithIoMax("259:0", 100L * 1024L * 1024L, 100L * 1024L * 1024L, 1000L, 1000L)
 
     match ProcessGroup.Create options with
     | Ok group ->
@@ -307,6 +308,15 @@ macOS/BSD or the Linux process-group fallback. When a requested limit can't be e
 `WithCpuTimeMax` is the exception to that container rule: Windows applies it to the Job as a whole,
 while POSIX applies `RLIMIT_CPU` to each spawned run before `exec`, so it also works on macOS/BSD and
 the Linux process-group fallback. Its live value cannot be changed for already-running POSIX children.
+
+`WithIoMax` adds directional disk-bandwidth and IOPS ceilings for one target. On Linux, use a cgroup
+v2 device key such as `259:0`; the four rates are independent `io.max` fields. On Windows, use the
+NT volume device name (for example, `\Device\HarddiskVolume3`); the Job Object applies aggregate
+bandwidth and IOPS ceilings, so each read/write pair must match. The `int64` overload uses `0` for
+an unbounded direction; the option overload uses `None`. Every supplied rate must be positive and
+at least one direction must be bounded. This is an enforce-or-refuse capability: a missing Linux
+`io` controller, an unavailable Windows I/O controller, or any POSIX process-group backend returns
+typed `ProcessError.Unsupported` rather than creating an unrestricted group.
 
 *Deeper: [Process groups → resource limits](docs/process-groups.md#resource-limits).*
 
