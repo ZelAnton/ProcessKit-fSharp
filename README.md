@@ -619,6 +619,11 @@ succeed). For a consumer that legitimately stops reading early (the `producer | 
 mark that stage `Command.uncheckedInPipe` and pipefail skips it. `Pipeline.Timeout` bounds the
 whole chain.
 
+A genuine failure while reading an upstream stage's stdout in the inter-stage relay is returned as
+`ProcessError.Io`, even if the downstream stage receives a truncated EOF and exits successfully. This
+is distinct from an expected downstream broken-pipe or whole-chain teardown race when a consumer exits
+early or the pipeline is cancelled; those races remain quiet and are classified from the process outcomes.
+
 *Deeper: [Pipelines](docs/pipelines.md).*
 
 ## Environment and spawn flags

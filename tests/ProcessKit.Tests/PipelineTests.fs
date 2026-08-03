@@ -73,6 +73,37 @@ type private BlockingTee() =
         firstWrite.TrySetResult() |> ignore
         ValueTask(release.Task)
 
+/// A relay-source double that yields one complete payload and then raises a real upstream read error.
+/// The pipeline test seam installs it only for the inter-stage source, while the downstream stage and
+/// both public completion paths remain real process plumbing.
+type private RelayReadFaultStream(payload: byte[], message: string) =
+    inherit Stream()
+
+    let mutable payloadPending = true
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_, _) = raise (NotSupportedException())
+    override _.SetLength _ = raise (NotSupportedException())
+    override _.Write(_, _, _) = raise (NotSupportedException())
+    override _.Read(_, _, _) = raise (NotSupportedException())
+
+    override _.ReadAsync(buffer: Memory<byte>, _: CancellationToken) : ValueTask<int> =
+        if payloadPending then
+            payloadPending <- false
+            payload.AsSpan().CopyTo(buffer.Span)
+            ValueTask<int>(payload.Length)
+        else
+            raise (IOException message)
+
 // --- T-069 stdin-feeder test doubles, shared across PipelineTests / ProcessControlTests / PumpTests.
 // Defined here (non-private) because PipelineTests is the earliest of the three in the .fsproj compile
 // order, so the later two can reuse these instead of redefining them. Interfaces are fully qualified to
@@ -665,6 +696,78 @@ type PipelineTests() =
             match! pipeline.RunAsync() with
             | Ok _ -> Assert.Pass()
             | Error error -> Assert.Fail $"expected success (last stage unchecked), got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``buffered pipeline surfaces an upstream relay read fault and leaves normal runs healthy``() : Task =
+        task {
+            let upstream = shell "exit 0"
+            let pipeline = upstream.Pipe sortStage
+            let faultMessage = "injected upstream relay read failure"
+
+            PipelineRunner.relaySourceTestHook <-
+                Some(fun _ _ ->
+                    new RelayReadFaultStream(Encoding.UTF8.GetBytes "relay-payload\n", faultMessage) :> Stream)
+
+            try
+                match! pipeline.OutputStringAsync() with
+                | Error(ProcessError.Io detail) ->
+                    Assert.That(detail, Does.Contain upstream.Program)
+                    Assert.That(detail, Does.Contain faultMessage)
+                | Error error -> Assert.Fail $"expected ProcessError.Io, got {error}"
+                | Ok output -> Assert.Fail $"a relay read fault must not become successful truncated output: {output}"
+            finally
+                PipelineRunner.relaySourceTestHook <- None
+
+            // The faulted chain has completed both public stages before returning. A fresh real pipeline
+            // must still transfer data and reap normally, catching a lost Task.WhenAll/reap lifecycle.
+            match! (emit [ "banana"; "apple" ]).Pipe(sortStage).OutputStringAsync() with
+            | Ok output -> Assert.That(lines output.Stdout, Is.EqualTo(box [ "apple"; "banana" ]))
+            | Error error -> Assert.Fail $"a later normal pipeline failed after relay cleanup: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``streaming pipeline FinishAsync surfaces an upstream relay read fault and cleans up``() : Task =
+        task {
+            let upstream = shell "exit 0"
+            let pipeline = upstream.Pipe sortStage
+            let faultMessage = "injected upstream relay read failure"
+
+            PipelineRunner.relaySourceTestHook <-
+                Some(fun _ _ ->
+                    new RelayReadFaultStream(Encoding.UTF8.GetBytes "relay-payload\n", faultMessage) :> Stream)
+
+            try
+                match! pipeline.StartAsync() with
+                | Error error -> Assert.Fail $"streaming pipeline failed to start: {error}"
+                | Ok session ->
+                    use session = session
+                    let! streamed = collect (session.StdoutLinesAsync())
+
+                    let got =
+                        streamed
+                        |> Seq.map (fun line -> line.Trim())
+                        |> Seq.filter (fun line -> line.Length > 0)
+                        |> Seq.toList
+
+                    Assert.That(got, Is.EqualTo(box [ "relay-payload" ]))
+
+                    match! session.FinishAsync() with
+                    | Error(ProcessError.Io detail) ->
+                        Assert.That(detail, Does.Contain upstream.Program)
+                        Assert.That(detail, Does.Contain faultMessage)
+                    | Error error -> Assert.Fail $"expected ProcessError.Io from FinishAsync, got {error}"
+                    | Ok finished ->
+                        Assert.Fail $"FinishAsync must not accept a downstream-successful truncated stream: {finished}"
+            finally
+                PipelineRunner.relaySourceTestHook <- None
+
+            // Dispose/FinishAsync must have reaped the whole chain; prove the next public run is clean.
+            match! (emit [ "cherry"; "apple" ]).Pipe(sortStage).OutputStringAsync() with
+            | Ok output -> Assert.That(lines output.Stdout, Is.EqualTo(box [ "apple"; "cherry" ]))
+            | Error error -> Assert.Fail $"a later normal pipeline failed after streaming cleanup: {error}"
         }
         :> Task
 

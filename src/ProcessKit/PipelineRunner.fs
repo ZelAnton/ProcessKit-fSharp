@@ -165,6 +165,12 @@ module internal PipelineRunner =
     /// returns. `None` (the default) in every production run; nothing but a test ever sets it.
     let mutable stageSpawnedTestHook: (int -> unit) option = None
 
+    /// Internal test seam: replaces an inter-stage upstream stream just before its relay starts. This
+    /// keeps pipeline-level read-fault tests deterministic without changing process spawning or the
+    /// production relay path; `None` (the default) leaves every production run untouched. The argument is
+    /// the zero-based upstream stage index.
+    let mutable relaySourceTestHook: (int -> Stream -> Stream) option = None
+
     /// The terminal observation of every pipeline stage, as seen when the whole chain has finished:
     /// each stage's final `Outcome` (left-to-right), whether the chain's own proactive teardown caught
     /// it (`TornDown` victim — de-prioritized by the pipefail fold so a killed sibling never steals the
@@ -317,13 +323,18 @@ module internal PipelineRunner =
         else
             match prevStdout, sp.Stdin with
             | Some upstream, Some downstream ->
+                let relaySource =
+                    relaySourceTestHook
+                    |> Option.map (fun hook -> hook (index - 1) upstream)
+                    |> Option.defaultValue upstream
+
                 copyTasks.Add(
                     task {
                         let! fault =
                             Pump.copyToAsync
                                 stages[index - 1].Program
                                 stages[index].Program
-                                upstream
+                                relaySource
                                 downstream
                                 isTearingDown
                                 CancellationToken.None
@@ -333,7 +344,13 @@ module internal PipelineRunner =
                         // broken pipe up to the producing stage (SIGPIPE / failed write) so it
                         // stops instead of blocking forever on a full stdout pipe.
                         closeQuietly downstream
-                        closeQuietly upstream
+
+                        closeQuietly relaySource
+
+                        if not (obj.ReferenceEquals(relaySource, upstream)) then
+                            // A test replacement does not own the real child stream; close both sides so
+                            // the seam cannot alter the production relay's resource lifecycle.
+                            closeQuietly upstream
 
                         return fault
                     }
