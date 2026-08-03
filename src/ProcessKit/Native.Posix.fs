@@ -462,8 +462,9 @@ module internal Posix =
     [<Literal>]
     let private PROC_PIDTASKINFO = 4
 
+    // proc_taskinfo is six uint64 values followed by twelve int32 values (96 bytes) on macOS.
     [<Literal>]
-    let private procTaskInfoSize = 144
+    let private procTaskInfoSize = 96
 
     [<Literal>]
     let private procBsdInfoSize = 136
