@@ -782,6 +782,31 @@ if (finished.Outcome is not { IsExited: true, Code.Value: 0 }) // anything but a
 The command's `Timeout` **bounds the stream**: at the deadline the tree is killed, the pipes
 close, and the stream ends.
 
+### Stream stdout as bytes
+
+`RunningProcess.StdoutChunksAsync()` yields byte-exact `ReadOnlyMemory<byte>` chunks without decoding
+or line framing. It is the exclusive stdout consumer for that process, so choose it instead of
+`StdoutLinesAsync()` (and any other stdout-consuming verb); call `FinishAsync()` afterwards to collect
+the outcome and drained stderr:
+
+**C#**
+
+```csharp
+await using var proc = (await new Command("producer")
+    .StreamBuffer(StreamBufferPolicy.Bounded(64, StreamFullMode.Backpressure))
+    .StartAsync()).GetValueOrThrow();
+
+await using var destination = Console.OpenStandardOutput();
+await foreach (var chunk in proc.StdoutChunksAsync())
+    await destination.WriteAsync(chunk);
+
+var finished = (await proc.FinishAsync()).GetValueOrThrow();
+```
+
+`StreamBuffer` bounds queued chunks; `Backpressure` preserves every byte while slowing the child
+when the consumer falls behind. See [Streaming & interactive I/O](docs/streaming.md) for the full
+streaming and lifecycle contract.
+
 ### Interactive stdin — write requests, read responses
 
 Keep stdin open with `KeepStdinOpen`, take the writer with `TakeStdin()`, then interleave writes
