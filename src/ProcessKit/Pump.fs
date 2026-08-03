@@ -745,9 +745,11 @@ module internal Pump =
         }
         :> Task
 
-    /// `readBytesBody` for a background stdout chunk pump: a disposal/broken-pipe race is quiet once
-    /// the caller's teardown flag is set, while the same exception caught before teardown remains a
-    /// genuine read failure for the caller to classify as `ProcessError.Io`.
+    /// Read raw chunks for a background stdout pump, flushing the tee on every exit path. A
+    /// disposal/broken-pipe race is quiet once the caller's teardown flag is set, while the same
+    /// exception caught before teardown remains a genuine read failure for the caller to classify as
+    /// `ProcessError.Io`. The read/write fault is saved while the tee flush runs so flushing cannot
+    /// hide the original error.
     let readBytesUntilDone
         (stream: Stream)
         (tee: Stream option)
@@ -756,8 +758,19 @@ module internal Pump =
         (cancellationToken: CancellationToken)
         : Task =
         task {
+            let mutable fault: exn option = None
+
             try
                 do! readBytesBody stream tee onChunk cancellationToken
+            with ex ->
+                fault <- Some ex
+
+            do! flushTeeQuietly tee
+
+            try
+                match fault with
+                | Some ex -> ExceptionDispatchInfo.Throw ex
+                | None -> ()
             with
             | :? ObjectDisposedException as ex ->
                 match genuineReadFault isTearingDown ex with

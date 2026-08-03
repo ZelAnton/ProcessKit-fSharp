@@ -427,6 +427,72 @@ type StreamingTests() =
         :> Task
 
     [<Test>]
+    member _.``StdoutChunks flushes a buffered tee at clean EOF``() : Task =
+        task {
+            let payload = [| 0uy; 0xFFuy; 0uy; 1uy |]
+            use underlying = new MemoryStream()
+            use tee = new BufferedStream(underlying, 65536)
+            use stdout = new ChunkedByteStream([ payload ])
+
+            let config = (Command.create "test" |> Command.stdoutTee tee).Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            let! chunks = collect (running.StdoutChunksAsync())
+            let actual = chunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+            CollectionAssert.AreEqual(payload, actual)
+            CollectionAssert.AreEqual(payload, underlying.ToArray())
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StdoutChunks flushes a buffered tee before surfacing a genuine read fault``() : Task =
+        task {
+            let payload = [| 0uy; 0xFFuy; 0uy; 1uy |]
+            use underlying = new MemoryStream()
+            use tee = new BufferedStream(underlying, 65536)
+            use stdout = new ErroringStream([ payload ], IOException "disk read error")
+
+            let config = (Command.create "test" |> Command.stdoutTee tee).Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            let! drain = drainWithDeadline (running.StdoutChunksAsync()) 5000
+            let! error = processError drain
+
+            match error with
+            | Some(ProcessError.Io _) -> ()
+            | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+
+            CollectionAssert.AreEqual(payload, underlying.ToArray())
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync completes after an unread bounded chunk stream is abandoned``() : Task =
+        task {
+            let capacity = 1
+            let chunks = [ for i in 0..31 -> [| byte i |] ]
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded capacity))
+                    .Config
+
+            use stdout = new ChunkedByteStream(chunks)
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+            running.StdoutChunksAsync() |> ignore
+
+            do! Task.Delay 100
+            Assert.That(stdout.ReadCount, Is.GreaterThanOrEqualTo(capacity + 1))
+
+            let stop = running.StopAsync(TimeSpan.Zero)
+            let! winner = Task.WhenAny(stop :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, stop), Is.True, "StopAsync hung on abandoned backpressure")
+            let! _ = stop
+            return ()
+        }
+        :> Task
+
+    [<Test>]
     member _.``StdoutChunks surfaces a genuine read fault as ProcessError.Io``() : Task =
         task {
             let fault = IOException "disk read error"
