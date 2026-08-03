@@ -70,6 +70,26 @@ type WindowsUiRestrictions =
     /// not a GUI application.
     | All = 0x000000FF
 
+/// Directional disk I/O rate limits for one device or volume. Linux uses `Target` as a cgroup v2
+/// `major:minor` device key. Windows uses it as the NT device name of one volume; Windows Job Objects
+/// enforce one aggregate read/write bandwidth and IOPS ceiling for that volume.
+[<Sealed>]
+type IoMax
+    internal
+    (
+        target: string,
+        readBytesPerSecond: int64 option,
+        writeBytesPerSecond: int64 option,
+        readOperationsPerSecond: int64 option,
+        writeOperationsPerSecond: int64 option
+    ) =
+
+    member _.Target = target
+    member _.ReadBytesPerSecond = readBytesPerSecond
+    member _.WriteBytesPerSecond = writeBytesPerSecond
+    member _.ReadOperationsPerSecond = readOperationsPerSecond
+    member _.WriteOperationsPerSecond = writeOperationsPerSecond
+
 /// Resource limits applied at group creation. Most are enforced on the group **as a whole** by its
 /// kernel container; `CpuTimeMax` is the deliberate POSIX exception and is applied per spawned process
 /// through `RLIMIT_CPU` before exec.
@@ -90,12 +110,13 @@ type ResourceLimits
         cpuQuota: float option,
         uiRestrictions: WindowsUiRestrictions,
         cpuAffinity: int list option,
-        cpuTimeMax: TimeSpan option
+        cpuTimeMax: TimeSpan option,
+        ioMax: IoMax option
     ) =
 
     /// No limits — the default.
     static member None =
-        ResourceLimits(None, false, None, None, WindowsUiRestrictions.None, None, None)
+        ResourceLimits(None, false, None, None, WindowsUiRestrictions.None, None, None, None)
 
     /// Maximum total memory for the tree, in bytes. `None` leaves memory unbounded.
     member _.MemoryMax = memoryMax
@@ -131,25 +152,30 @@ type ResourceLimits
     /// POSIX applies `RLIMIT_CPU` independently to each spawned process before it execs.
     member _.CpuTimeMax = cpuTimeMax
 
+    /// The directional disk I/O ceiling for one explicit device/volume, or `None` when no I/O cap is
+    /// requested. The target and rates are preserved exactly so `ProcessGroup.Options` reflects the
+    /// full limit set that the backend accepted.
+    member _.IoMax = ioMax
+
     /// A copy with the memory cap set. `bytes` must be positive — zero or negative is rejected
     /// (`ArgumentOutOfRangeException`): a non-positive cap could never let anything run, so it is a
     /// misconfiguration rather than a meaningful limit, and previously degraded silently (e.g. a
     /// negative value converting to a huge `unativeint` on Windows — effectively "unlimited").
     member _.WithMemoryMax(bytes: int64) =
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(bytes, 0L)
-        ResourceLimits(Some bytes, oomGroupKill, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax)
+        ResourceLimits(Some bytes, oomGroupKill, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax, ioMax)
 
     /// A copy that asks Linux cgroup v2 to treat the cgroup as one OOM unit (`memory.oom.group=1`),
     /// so the kernel kills the whole tree instead of selecting one victim. Unsupported outside cgroup v2.
     member _.WithOomGroupKill() =
-        ResourceLimits(memoryMax, true, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax)
+        ResourceLimits(memoryMax, true, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax, ioMax)
 
     /// A copy with the live-process cap set. `count` must be positive — zero or negative is rejected
     /// (`ArgumentOutOfRangeException`): the tree always has at least its own leader process, so a
     /// non-positive cap could never be satisfied.
     member _.WithMaxProcesses(count: int) =
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(count, 0)
-        ResourceLimits(memoryMax, oomGroupKill, Some count, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax)
+        ResourceLimits(memoryMax, oomGroupKill, Some count, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax, ioMax)
 
     /// A copy with the CPU quota (in cores) set. `cores` must be a finite, strictly positive number —
     /// zero, negative, `NaN`, or `PositiveInfinity`/`NegativeInfinity` is rejected
@@ -175,7 +201,16 @@ type ResourceLimits
                 )
             )
 
-        ResourceLimits(memoryMax, oomGroupKill, maxProcesses, Some cores, uiRestrictions, cpuAffinity, cpuTimeMax)
+        ResourceLimits(
+            memoryMax,
+            oomGroupKill,
+            maxProcesses,
+            Some cores,
+            uiRestrictions,
+            cpuAffinity,
+            cpuTimeMax,
+            ioMax
+        )
 
     /// A copy imposing the given Windows Job Object UI restrictions on the whole tree (see
     /// `WindowsUiRestrictions`). `WindowsUiRestrictions.None` clears them again — the set REPLACES the
@@ -198,7 +233,7 @@ type ResourceLimits
                 )
             )
 
-        ResourceLimits(memoryMax, oomGroupKill, maxProcesses, cpuQuota, restrictions, cpuAffinity, cpuTimeMax)
+        ResourceLimits(memoryMax, oomGroupKill, maxProcesses, cpuQuota, restrictions, cpuAffinity, cpuTimeMax, ioMax)
 
     /// A copy pinning the whole tree to `cores` — the CPU cores (zero-based logical processor indices)
     /// its processes may be scheduled on. The complement of `WithCpuQuota`: the quota bounds *how much*
@@ -264,7 +299,8 @@ type ResourceLimits
             cpuQuota,
             uiRestrictions,
             Some(List.sort requested),
-            cpuTimeMax
+            cpuTimeMax,
+            ioMax
         )
 
     /// A copy limiting CPU time. `duration` must be finite and strictly positive. POSIX rounds the
@@ -274,7 +310,91 @@ type ResourceLimits
         if duration <= TimeSpan.Zero then
             raise (ArgumentOutOfRangeException(nameof duration, duration, "CPU time must be positive and finite"))
 
-        ResourceLimits(memoryMax, oomGroupKill, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, Some duration)
+        ResourceLimits(
+            memoryMax,
+            oomGroupKill,
+            maxProcesses,
+            cpuQuota,
+            uiRestrictions,
+            cpuAffinity,
+            Some duration,
+            ioMax
+        )
+
+    /// A copy applying directional disk I/O ceilings to one explicit device or volume. `target` is
+    /// a Linux cgroup v2 `major:minor` key or a Windows NT volume device name. A `None` rate leaves
+    /// that direction unbounded; at least one rate must be supplied. `Some` rates must be positive.
+    /// Linux can enforce all four directions independently. Windows has one aggregate bandwidth and
+    /// one aggregate IOPS field, so it accepts the request only when read/write pairs are equal.
+    member _.WithIoMax
+        (
+            target: string,
+            readBytesPerSecond: int64 option,
+            writeBytesPerSecond: int64 option,
+            readOperationsPerSecond: int64 option,
+            writeOperationsPerSecond: int64 option
+        ) =
+        ArgumentNullException.ThrowIfNull(target, nameof target)
+
+        if String.IsNullOrWhiteSpace target then
+            raise (ArgumentException("the I/O limit target must not be empty", nameof target))
+
+        let validateRate (name: string) (rate: int64 option) =
+            match rate with
+            | Some value when value <= 0L ->
+                raise (ArgumentOutOfRangeException(name, value, "an I/O rate must be positive; use None to remove it"))
+            | _ -> ()
+
+        validateRate (nameof readBytesPerSecond) readBytesPerSecond
+        validateRate (nameof writeBytesPerSecond) writeBytesPerSecond
+        validateRate (nameof readOperationsPerSecond) readOperationsPerSecond
+        validateRate (nameof writeOperationsPerSecond) writeOperationsPerSecond
+
+        if
+            readBytesPerSecond.IsNone
+            && writeBytesPerSecond.IsNone
+            && readOperationsPerSecond.IsNone
+            && writeOperationsPerSecond.IsNone
+        then
+            raise (ArgumentException("at least one I/O rate must be supplied", nameof readBytesPerSecond))
+
+        let ioMax =
+            IoMax(target, readBytesPerSecond, writeBytesPerSecond, readOperationsPerSecond, writeOperationsPerSecond)
+
+        ResourceLimits(
+            memoryMax,
+            oomGroupKill,
+            maxProcesses,
+            cpuQuota,
+            uiRestrictions,
+            cpuAffinity,
+            cpuTimeMax,
+            Some ioMax
+        )
+
+    /// Convenience overload for callers that use zero as the unbounded sentinel. Positive values set
+    /// a ceiling; zero removes that directional ceiling. Negative values are rejected.
+    member this.WithIoMax
+        (
+            target: string,
+            readBytesPerSecond: int64,
+            writeBytesPerSecond: int64,
+            readOperationsPerSecond: int64,
+            writeOperationsPerSecond: int64
+        ) =
+        let asOption (name: string) (value: int64) =
+            if value < 0L then
+                raise (ArgumentOutOfRangeException(name, value, "an I/O rate cannot be negative"))
+
+            if value = 0L then None else Some value
+
+        this.WithIoMax(
+            target,
+            asOption (nameof readBytesPerSecond) readBytesPerSecond,
+            asOption (nameof writeBytesPerSecond) writeBytesPerSecond,
+            asOption (nameof readOperationsPerSecond) readOperationsPerSecond,
+            asOption (nameof writeOperationsPerSecond) writeOperationsPerSecond
+        )
 
     /// Whether any limit is set. Windows uses this to decide whether the fresh Job needs a limit block.
     /// POSIX dispatch uses `WholeTreeAny` below because CPU-time alone is enforceable without a container.
@@ -286,6 +406,7 @@ type ResourceLimits
         || uiRestrictions <> WindowsUiRestrictions.None
         || cpuAffinity.IsSome
         || cpuTimeMax.IsSome
+        || ioMax.IsSome
 
     /// Whether a whole-tree container controller is needed. CPU-time alone is excluded because POSIX
     /// can enforce it per child with `RLIMIT_CPU`, including on macOS and the Linux process-group fallback.
@@ -296,6 +417,7 @@ type ResourceLimits
         || cpuQuota.IsSome
         || uiRestrictions <> WindowsUiRestrictions.None
         || cpuAffinity.IsSome
+        || ioMax.IsSome
 
     /// The honest typed refusal for a mechanism that cannot impose UI restrictions, or `None` when
     /// none were requested. One definition shared by `ProcessGroup.Create` and both non-Job backends'
@@ -309,6 +431,16 @@ type ResourceLimits
             Some(
                 ProcessError.Unsupported
                     $"Job Object UI restrictions ({uiRestrictions}) are a Windows-only primitive; this mechanism has no equivalent"
+            )
+
+    /// The honest typed refusal for disk I/O on a mechanism without a whole-tree I/O controller.
+    member internal _.IoMaxUnsupported: ProcessError option =
+        if ioMax.IsNone then
+            Option.None
+        else
+            Some(
+                ProcessError.Unsupported
+                    "whole-tree disk I/O rate limits require Linux cgroup v2 io.max or a Windows Job Object I/O rate controller; this mechanism has no equivalent"
             )
 
 /// Options applied when creating a `ProcessGroup`: the graceful-shutdown window and whole-tree
@@ -359,6 +491,49 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, stopSignal: Signal
     /// A copy capping CPU time for each spawned run (or the whole Job on Windows).
     member _.WithCpuTimeMax(duration: TimeSpan) =
         ProcessGroupOptions(shutdownTimeout, stopSignal, limits.WithCpuTimeMax duration)
+
+    /// A copy applying directional disk I/O ceilings to one explicit Linux device or Windows volume;
+    /// see `ResourceLimits.WithIoMax` for target syntax and platform semantics.
+    member _.WithIoMax
+        (
+            target: string,
+            readBytesPerSecond: int64 option,
+            writeBytesPerSecond: int64 option,
+            readOperationsPerSecond: int64 option,
+            writeOperationsPerSecond: int64 option
+        ) =
+        ProcessGroupOptions(
+            shutdownTimeout,
+            stopSignal,
+            limits.WithIoMax(
+                target,
+                readBytesPerSecond,
+                writeBytesPerSecond,
+                readOperationsPerSecond,
+                writeOperationsPerSecond
+            )
+        )
+
+    /// Convenience overload using zero as the unbounded sentinel; see `ResourceLimits.WithIoMax`.
+    member _.WithIoMax
+        (
+            target: string,
+            readBytesPerSecond: int64,
+            writeBytesPerSecond: int64,
+            readOperationsPerSecond: int64,
+            writeOperationsPerSecond: int64
+        ) =
+        ProcessGroupOptions(
+            shutdownTimeout,
+            stopSignal,
+            limits.WithIoMax(
+                target,
+                readBytesPerSecond,
+                writeBytesPerSecond,
+                readOperationsPerSecond,
+                writeOperationsPerSecond
+            )
+        )
 
     /// A copy imposing the given Windows Job Object UI restrictions on the tree (clipboard, desktop,
     /// display/system settings, exit-Windows — see `WindowsUiRestrictions`). Windows-only: off Windows

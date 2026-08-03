@@ -1380,10 +1380,29 @@ module internal Windows =
     [<Literal>]
     let private JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4u
 
+    [<Literal>]
+    let private JOB_OBJECT_IO_RATE_CONTROL_ENABLE = 0x1u
+
+    [<Literal>]
+    let private ERROR_INVALID_FUNCTION = 1
+
+    [<Literal>]
+    let private ERROR_NOT_SUPPORTED = 50
+
+    [<Literal>]
+    let private ERROR_CALL_NOT_IMPLEMENTED = 120
+
+    [<Literal>]
+    let private ERROR_PROC_NOT_FOUND = 127
+
     // Fault injection for the late CPU-rate write, after the extended-limit block has already landed.
     // Production leaves this unset; the Windows rollback regression tests install and clear it in a
     // `finally` block so the native rollback path is exercised deterministically.
     let mutable cpuRateWriteErrorForTests: int option = None
+
+    // Fault injection for the Job I/O rate write. Production leaves this unset; Windows-gated tests
+    // use it to force a late native failure and verify that the previous Job configuration is restored.
+    let mutable ioRateWriteErrorForTests: int option = None
 
     [<StructLayout(LayoutKind.Sequential)>]
     type private JOBOBJECT_CPU_RATE_CONTROL_INFORMATION =
@@ -1392,6 +1411,20 @@ module internal Windows =
             // Union member: the hard-cap rate as 1/100ths of a percent of total system CPU (1..10000).
             val mutable CpuRate: uint32
         end
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private JOBOBJECT_IO_RATE_CONTROL_INFORMATION =
+        struct
+            val mutable MaxIops: int64
+            val mutable MaxBandwidth: int64
+            val mutable ReservationIops: int64
+            val mutable VolumeName: nativeint
+            val mutable BaseIoSize: uint32
+            val mutable ControlFlags: uint32
+        end
+
+    [<DllImport("kernel32.dll", SetLastError = true, EntryPoint = "SetIoRateControlInformationJobObject")>]
+    extern uint32 private SetIoRateControlInformationJobObject(nativeint hJob, nativeint ioRateControlInfo)
 
     // Job Object UI restrictions (`ProcessGroupOptions.WithUiRestrictions`): one flags word denying the
     // contained tree clipboard/desktop/display/exit-Windows access. The `WindowsUiRestrictions` values are
@@ -1524,6 +1557,113 @@ module internal Windows =
 
             info.BasicLimitInformation.LimitFlags <- flags
             Ok info
+
+    let private ioRateUnsupportedPrefix =
+        "Windows Job Object I/O rate control is unavailable"
+
+    /// Exposed to the backend only for classifying the documented unsupported native API outcome as
+    /// `ProcessError.Unsupported`; all other SetIoRate failures remain `ProcessError.ResourceLimit`.
+    let isIoRateControlUnsupported (message: string) =
+        message.StartsWith(ioRateUnsupportedPrefix, StringComparison.Ordinal)
+
+    let private ioRateErrorMessage (code: int) =
+        let nativeMessage = Win32Exception(code).Message
+
+        if
+            code = ERROR_INVALID_FUNCTION
+            || code = ERROR_NOT_SUPPORTED
+            || code = ERROR_CALL_NOT_IMPLEMENTED
+            || code = ERROR_PROC_NOT_FOUND
+        then
+            $"{ioRateUnsupportedPrefix} (Win32 error {code}: {nativeMessage})"
+        else
+            $"SetIoRateControlInformationJobObject failed (Win32 error {code}: {nativeMessage})"
+
+    let private writeIoRateControl
+        (job: nativeint)
+        (target: string)
+        (maxBandwidth: int64)
+        (maxIops: int64)
+        (enabled: bool)
+        : Result<unit, string> =
+        let mutable info = JOBOBJECT_IO_RATE_CONTROL_INFORMATION()
+        info.MaxBandwidth <- maxBandwidth
+        info.MaxIops <- maxIops
+        info.ReservationIops <- 0L
+        info.BaseIoSize <- 0u
+        info.ControlFlags <- if enabled then JOB_OBJECT_IO_RATE_CONTROL_ENABLE else 0u
+
+        let volumeBuffer = Marshal.StringToHGlobalUni target
+        let infoSize = Marshal.SizeOf<JOBOBJECT_IO_RATE_CONTROL_INFORMATION>()
+        let infoBuffer = Marshal.AllocHGlobal infoSize
+
+        try
+            info.VolumeName <- volumeBuffer
+            Marshal.StructureToPtr<JOBOBJECT_IO_RATE_CONTROL_INFORMATION>(info, infoBuffer, false)
+
+            let result =
+                match ioRateWriteErrorForTests with
+                | Some code -> Error code
+                | None ->
+                    try
+                        if SetIoRateControlInformationJobObject(job, infoBuffer) <> 0u then
+                            Ok()
+                        else
+                            Error(Marshal.GetLastWin32Error())
+                    with
+                    | :? EntryPointNotFoundException -> Error ERROR_PROC_NOT_FOUND
+                    | :? DllNotFoundException -> Error ERROR_PROC_NOT_FOUND
+
+            result |> Result.mapError ioRateErrorMessage
+        finally
+            Marshal.FreeHGlobal infoBuffer
+            Marshal.FreeHGlobal volumeBuffer
+
+    let private ioRateValues (ioMax: IoMax) : Result<int64 * int64, string> =
+        if ioMax.ReadBytesPerSecond <> ioMax.WriteBytesPerSecond then
+            Error "Windows Job Object I/O rate control is per-volume and aggregate; read/write byte ceilings must match"
+        elif ioMax.ReadOperationsPerSecond <> ioMax.WriteOperationsPerSecond then
+            Error
+                "Windows Job Object I/O rate control is per-volume and aggregate; read/write operation ceilings must match"
+        else
+            Ok(Option.defaultValue 0L ioMax.ReadBytesPerSecond, Option.defaultValue 0L ioMax.ReadOperationsPerSecond)
+
+    let private writeIoMax (job: nativeint) (ioMax: IoMax) : Result<unit, string> =
+        ioRateValues ioMax
+        |> Result.bind (fun (bandwidth, iops) -> writeIoRateControl job ioMax.Target bandwidth iops true)
+
+    let private disableIoMax (job: nativeint) (ioMax: IoMax) =
+        writeIoRateControl job ioMax.Target 0L 0L false
+
+    /// Replace the one recorded Job I/O policy. Disable is only sent when `previous` is Some, so an
+    /// already-unset Job never receives the native invalid-parameter disable request (K-054).
+    let private updateIoMax (job: nativeint) (previous: IoMax option) (requested: IoMax option) : Result<unit, string> =
+        let restore prior error =
+            match prior with
+            | None -> Error error
+            | Some old ->
+                match writeIoMax job old with
+                | Ok() -> Error error
+                | Error restoreError ->
+                    Error(
+                        $"{error}; the previous Windows Job I/O rate could not be restored ({restoreError}), so it may be partially applied"
+                    )
+
+        match previous, requested with
+        | None, None -> Ok()
+        | None, Some next -> writeIoMax job next
+        | Some old, None -> disableIoMax job old
+        | Some old, Some next when old.Target = next.Target ->
+            match writeIoMax job next with
+            | Ok() -> Ok()
+            | Error error -> restore (Some old) error
+        | Some old, Some next ->
+            match disableIoMax job old with
+            | Error error -> Error error
+            | Ok() ->
+                match writeIoMax job next with
+                | Ok() -> Ok()
+                | Error error -> restore (Some old) error
 
     /// Apply resource limits to a Job: a memory cap (`JobMemoryLimit`), an active-process cap, a
     /// CPU hard cap (a fraction of *total* system CPU, so per-core quota is approximate), the CPU-affinity
@@ -1770,13 +1910,42 @@ module internal Windows =
     /// Replace every requested Job limit. A CPU-time limit is established relative to the Job's current
     /// accounting, so this form is used for creation and for an explicit CpuTimeMax change.
     let applyWindowsJobLimits (job: nativeint) (limits: ResourceLimits) : Result<unit, string> =
-        applyWindowsJobLimitsCore false job limits
+        match applyWindowsJobLimitsCore false job limits with
+        | Error error -> Error error
+        | Ok() -> updateIoMax job None limits.IoMax
 
     /// Replace the non-time limits while preserving an already-running Job's absolute CPU-time deadline.
     /// `JOB_OBJECT_LIMIT_PRESERVE_JOB_TIME` prevents an unrelated live update from granting a fresh CPU
     /// budget; callers use this only when CpuTimeMax remains unchanged and set.
     let applyWindowsJobLimitsPreservingCpuTime (job: nativeint) (limits: ResourceLimits) : Result<unit, string> =
-        applyWindowsJobLimitsCore true job limits
+        match applyWindowsJobLimitsCore true job limits with
+        | Error error -> Error error
+        | Ok() -> updateIoMax job None limits.IoMax
+
+    /// Replace a live Job's limits while retaining the previously recorded I/O policy long enough to
+    /// disable an old volume, update a new one, and restore it if a later native block fails. The core
+    /// Job limit block is applied first; if I/O fails, that block is reapplied from `previous` so the
+    /// caller never observes a mixed resource set.
+    let applyWindowsJobLimitsWithPrevious
+        (job: nativeint)
+        (previous: ResourceLimits)
+        (limits: ResourceLimits)
+        : Result<unit, string> =
+        let preserveJobTime =
+            previous.CpuTimeMax.IsSome && limits.CpuTimeMax = previous.CpuTimeMax
+
+        match applyWindowsJobLimitsCore preserveJobTime job limits with
+        | Error error -> Error error
+        | Ok() ->
+            match updateIoMax job previous.IoMax limits.IoMax with
+            | Ok() -> Ok()
+            | Error ioError ->
+                match applyWindowsJobLimitsCore preserveJobTime job previous with
+                | Ok() -> Error ioError
+                | Error restoreError ->
+                    Error(
+                        $"failed to apply the Windows Job I/O rate ({ioError}) and could not restore the previous Job limits ({restoreError}); the Job's limits may be partially applied"
+                    )
 
     /// Read back the Job's absolute user-time deadline in 100-nanosecond ticks, when enabled. Windows
     /// normalizes a successful PRESERVE write back to `JOB_OBJECT_LIMIT_JOB_TIME`, so the persisted

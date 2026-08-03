@@ -31,7 +31,7 @@ the source of truth.
 
 | Threat | Measure | Chapter |
 |---|---|---|
-| Runaway memory / fork bomb / CPU hog | `ProcessGroupOptions` resource limits | [Process groups](process-groups.md#resource-limits) |
+| Runaway memory / fork bomb / CPU hog / disk flood | `ProcessGroupOptions` resource limits, including `WithIoMax` | [Process groups](process-groups.md#resource-limits) |
 | Log/output flood | `Command.OutputBuffer` / `Command.StreamBuffer` | [Running commands](commands.md), [Streaming](streaming.md#bounding-the-streaming-backlog) |
 | Hangs / stuck children | `Command.Timeout` / `IdleTimeout` / `TimeoutGrace` | [Timeouts, retries & cancellation](timeouts-and-cancellation.md) |
 | Excess privilege, escaping the containing session (Unix) | `Command.Uid` / `Gid` / `Groups` / `Umask` / `Setsid` | [Running commands](commands.md) |
@@ -65,15 +65,39 @@ tool in an unsafe or corrupted state. The kernel then treats the cgroup as one O
 the whole tree. The option is deliberately `ProcessError.Unsupported` on Windows and other POSIX
 platforms rather than pretending that their different memory-limit semantics are equivalent.
 
+For a disk-flooding child, `ProcessGroupOptions.WithIoMax` adds directional bandwidth and IOPS
+ceilings for one explicit target. On Linux, `target` is a cgroup v2 `major:minor` device key and
+the four rates (`readBytesPerSecond`, `writeBytesPerSecond`, `readOperationsPerSecond`, and
+`writeOperationsPerSecond`) are independent fields written to `io.max`; on Windows, `target` is
+the NT volume device name and the Job Object applies one aggregate bandwidth and one aggregate
+IOPS ceiling for that volume, so each read/write pair must match. The option overload that takes
+`int64` uses zero for an unbounded direction; the option overload uses `None`. Every supplied rate
+must be positive, and at least one direction must be bounded.
+
+This is a refusal-or-enforce contract. Linux requires a cgroup v2 hierarchy with the `io` controller
+delegated. If cgroup v2 is available but its `io` controller is not, creation and update return
+`ProcessError.Unsupported`; the library never creates an unrestricted group as a fallback. Windows
+requires the Job Object I/O-rate API; an unavailable API is likewise reported as
+`ProcessError.Unsupported`, while an invalid volume or an aggregate read/write mismatch is a
+`ProcessError.ResourceLimit`. macOS, BSD, and the POSIX process-group fallback have no whole-tree
+I/O controller and always return typed `ProcessError.Unsupported` for this option.
+
+A failed live update restores the previous controller or Job configuration before returning its
+typed error; `ProcessGroup.Options.Limits` changes only after the backend confirms the replacement
+set. The limit still applies only to the selected device/volume, not to every mounted filesystem,
+and it is not a filesystem permission boundary or an encryption mechanism.
+
 The load-bearing fact for a hardening perimeter: caps need a **real container** — a
-Windows Job Object or a Linux cgroup v2. On macOS/BSD and the Linux
-process-group fallback there is no whole-tree limit primitive at all, so
-`ProcessGroup.Create` **fails fast** with `ProcessError.ResourceLimit` rather than
-silently handing back an unbounded group — a limit you asked for and didn't get is
-a bug you can catch at creation time, not a silent gap discovered during an
-incident. Treat a caught `ProcessError.ResourceLimit` as "this host cannot sandbox
-this child the way you asked" and decide accordingly (refuse to run it, or accept
-the narrower containment the platform *can* offer).
+Windows Job Object or a Linux cgroup v2. On macOS/BSD and the Linux process-group
+fallback there is no whole-tree limit primitive at all, so `ProcessGroup.Create`
+**fails fast** rather than silently handing back an unbounded group. For ordinary
+whole-tree memory/process/CPU-affinity caps this is `ProcessError.ResourceLimit`;
+for `WithIoMax` it is the more specific `ProcessError.Unsupported`, because the
+platform has no I/O controller concept to attempt. A limit you asked for and didn't
+get is a bug you can catch at creation time, not a silent gap discovered during an
+incident. Treat either typed error as "this host cannot sandbox this child the way
+you asked" and decide accordingly (refuse to run it, or choose a platform with the
+required primitive).
 
 ## Capping the output flood
 

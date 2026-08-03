@@ -73,6 +73,17 @@ type LimitsTests() =
     let isMacOs = RuntimeInformation.IsOSPlatform OSPlatform.OSX
     let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
 
+    let assertIoMaxEqual (expected: IoMax option) (actual: IoMax option) =
+        match expected, actual with
+        | None, None -> ()
+        | Some expected, Some actual ->
+            Assert.That(actual.Target, Is.EqualTo expected.Target)
+            Assert.That(actual.ReadBytesPerSecond, Is.EqualTo expected.ReadBytesPerSecond)
+            Assert.That(actual.WriteBytesPerSecond, Is.EqualTo expected.WriteBytesPerSecond)
+            Assert.That(actual.ReadOperationsPerSecond, Is.EqualTo expected.ReadOperationsPerSecond)
+            Assert.That(actual.WriteOperationsPerSecond, Is.EqualTo expected.WriteOperationsPerSecond)
+        | _ -> Assert.Fail "I/O limit presence differs"
+
     // The pinned cores as an option-of-list, so an assertion can compare against exactly the set it asked
     // for. Deliberately NOT a bare `int list`: NUnit's `Is.EqualTo` cannot disambiguate its `'T` and
     // `'T seq` overloads for an F# list (FS0041), whereas an option is not a sequence, so
@@ -1909,3 +1920,117 @@ type LimitsTests() =
                 )
             finally
                 killAndReap child
+
+    [<Test>]
+    member _.``I/O limit builders preserve directional rates and ProcessGroupOptions forwards them``() =
+        let limits = ResourceLimits.None.WithIoMax("8:16", Some 4096L, None, Some 12L, None)
+
+        match limits.IoMax with
+        | Some ioMax ->
+            Assert.That(ioMax.Target, Is.EqualTo "8:16")
+            Assert.That(ioMax.ReadBytesPerSecond, Is.EqualTo(Some 4096L))
+            Assert.That(ioMax.WriteBytesPerSecond, Is.EqualTo None)
+            Assert.That(ioMax.ReadOperationsPerSecond, Is.EqualTo(Some 12L))
+            Assert.That(ioMax.WriteOperationsPerSecond, Is.EqualTo None)
+        | None -> Assert.Fail "WithIoMax must retain the requested I/O policy"
+
+        let options = ProcessGroupOptions().WithIoMax("8:16", 4096L, 0L, 12L, 0L)
+
+        assertIoMaxEqual limits.IoMax options.Limits.IoMax
+
+    [<Test>]
+    member _.``I/O limit builders reject empty targets and invalid rates``() =
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () ->
+                ResourceLimits.None.WithIoMax(Unchecked.defaultof<string>, 1L, 0L, 0L, 0L)
+                |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentException>(Action(fun () -> ResourceLimits.None.WithIoMax("", 1L, 0L, 0L, 0L) |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> ResourceLimits.None.WithIoMax("8:16", None, None, None, None) |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithIoMax("8:16", Some 0L, None, None, None) |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> ResourceLimits.None.WithIoMax("8:16", -1L, 0L, 0L, 0L) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``Linux io.max rendering uses max for unbounded directions``() =
+        let limits = ResourceLimits.None.WithIoMax("8:16", Some 4096L, None, Some 12L, None)
+
+        match limits.IoMax with
+        | Some ioMax ->
+            Assert.That(Native.Cgroup.formatIoMax ioMax, Is.EqualTo "8:16 rbps=4096 wbps=max riops=12 wiops=max")
+        | None -> Assert.Fail "WithIoMax must create an I/O policy"
+
+    [<Test>]
+    member _.``ProcessGroup.UpdateLimits carries I/O limits through the backend contract``() =
+        let backend = LimitContractBackend(ResourceLimits.None, fun _ -> false)
+
+        use group =
+            ProcessGroup.FromBackend(backend :> IContainmentBackend, ProcessGroupOptions())
+
+        let requested =
+            ResourceLimits.None.WithIoMax("8:16", Some 4096L, None, Some 12L, None)
+
+        match group.UpdateLimits requested with
+        | Error error -> Assert.Fail $"the synthetic backend should accept the I/O policy: {error}"
+        | Ok() ->
+            assertIoMaxEqual requested.IoMax group.Options.Limits.IoMax
+            assertIoMaxEqual requested.IoMax backend.InForce.IoMax
+
+    [<Test>]
+    member _.``I/O limits are honestly Unsupported on macOS``() =
+        if not isMacOs then
+            Assert.Ignore "macOS is the POSIX whole-tree backend without an I/O controller"
+
+        let options = ProcessGroupOptions().WithIoMax("8:16", 4096L, 0L, 12L, 0L)
+
+        match ProcessGroup.Create options with
+        | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Does.Contain "disk I/O")
+        | Error other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+        | Ok group ->
+            (group :> IDisposable).Dispose()
+            Assert.Fail "macOS must not claim to enforce a whole-tree I/O rate"
+
+[<TestFixture>]
+type IoMaxContractRegressionTests() =
+
+    [<Test>]
+    member _.``I/O limit validation rejects a request with no bounded direction``() =
+        let error =
+            Assert.Throws<ArgumentException>(
+                Action(fun () -> ResourceLimits.None.WithIoMax("8:16", None, None, None, None) |> ignore)
+            )
+
+        match error with
+        | null -> Assert.Fail "expected an ArgumentException"
+        | error -> Assert.That(error.Message, Does.Contain "at least one I/O rate")
+
+    [<Test>]
+    member _.``unsupported POSIX process-group backends refuse I/O limits``() =
+        if
+            RuntimeInformation.IsOSPlatform OSPlatform.Windows
+            || RuntimeInformation.IsOSPlatform OSPlatform.Linux
+        then
+            Assert.Ignore "Windows and Linux have dedicated I/O containment backends"
+
+        let options = ProcessGroupOptions().WithIoMax("8:16", 4096L, 0L, 12L, 0L)
+
+        match ProcessGroup.Create options with
+        | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Does.Contain "disk I/O")
+        | Error other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+        | Ok group ->
+            (group :> IDisposable).Dispose()
+            Assert.Fail "a POSIX process-group backend must not claim to enforce a whole-tree I/O rate"

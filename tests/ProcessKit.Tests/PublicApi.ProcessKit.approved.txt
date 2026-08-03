@@ -215,6 +215,13 @@ interface ProcessKit.IProcessRunner
   member CaptureStringAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   member SpawnAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
 
+class ProcessKit.IoMax
+  property ReadBytesPerSecond : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property ReadOperationsPerSecond : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property Target : System.String { get }
+  property WriteBytesPerSecond : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property WriteOperationsPerSecond : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+
 class ProcessKit.JobRunner
   :> ProcessKit.IProcessRunner
   new()
@@ -842,6 +849,8 @@ class ProcessKit.ProcessGroupOptions
   member WithCpuAffinity(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.ProcessGroupOptions
   member WithCpuQuota(System.Double) : ProcessKit.ProcessGroupOptions
   member WithCpuTimeMax(System.TimeSpan) : ProcessKit.ProcessGroupOptions
+  member WithIoMax(System.String, Microsoft.FSharp.Core.FSharpOption<System.Int64>, Microsoft.FSharp.Core.FSharpOption<System.Int64>, Microsoft.FSharp.Core.FSharpOption<System.Int64>, Microsoft.FSharp.Core.FSharpOption<System.Int64>) : ProcessKit.ProcessGroupOptions
+  member WithIoMax(System.String, System.Int64, System.Int64, System.Int64, System.Int64) : ProcessKit.ProcessGroupOptions
   member WithMaxProcesses(System.Int32) : ProcessKit.ProcessGroupOptions
   member WithMemoryMax(System.Int64) : ProcessKit.ProcessGroupOptions
   member WithOomGroupKill() : ProcessKit.ProcessGroupOptions
@@ -1005,6 +1014,8 @@ class ProcessKit.ResourceLimits
   member WithCpuAffinity(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.ResourceLimits
   member WithCpuQuota(System.Double) : ProcessKit.ResourceLimits
   member WithCpuTimeMax(System.TimeSpan) : ProcessKit.ResourceLimits
+  member WithIoMax(System.String, Microsoft.FSharp.Core.FSharpOption<System.Int64>, Microsoft.FSharp.Core.FSharpOption<System.Int64>, Microsoft.FSharp.Core.FSharpOption<System.Int64>, Microsoft.FSharp.Core.FSharpOption<System.Int64>) : ProcessKit.ResourceLimits
+  member WithIoMax(System.String, System.Int64, System.Int64, System.Int64, System.Int64) : ProcessKit.ResourceLimits
   member WithMaxProcesses(System.Int32) : ProcessKit.ResourceLimits
   member WithMemoryMax(System.Int64) : ProcessKit.ResourceLimits
   member WithOomGroupKill() : ProcessKit.ResourceLimits
@@ -1012,6 +1023,7 @@ class ProcessKit.ResourceLimits
   property CpuAffinity : Microsoft.FSharp.Core.FSharpOption<System.Collections.Generic.IReadOnlyList<System.Int32>> { get }
   property CpuQuota : Microsoft.FSharp.Core.FSharpOption<System.Double> { get }
   property CpuTimeMax : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
+  property IoMax : Microsoft.FSharp.Core.FSharpOption<ProcessKit.IoMax> { get }
   property MaxProcesses : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property MemoryMax : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property None : ProcessKit.ResourceLimits { get }

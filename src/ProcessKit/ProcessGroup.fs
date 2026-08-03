@@ -127,7 +127,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                         | Ok() -> withBackend (JobObjectBackend(job, limits))
                         | Error message ->
                             Native.Windows.closeWindowsHandle job
-                            Error(ProcessError.ResourceLimit message)
+
+                            if limits.IoMax.IsSome && Native.Windows.isIoRateControlUnsupported message then
+                                Error(ProcessError.Unsupported message)
+                            else
+                                Error(ProcessError.ResourceLimit message)
                     else
                         withBackend (JobObjectBackend(job, limits))
         else
@@ -138,6 +142,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // runs its tree unrestricted.
             match limits.UiRestrictionsUnsupported with
             | Some error -> Error error
+            | None when limits.IoMax.IsSome && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux) ->
+                Error(
+                    ProcessError.Unsupported
+                        "whole-tree disk I/O rate limits require Linux cgroup v2 io.max or a Windows Job Object I/O rate controller"
+                )
             | None when limits.OomGroupKill && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux) ->
                 Error(
                     ProcessError.Unsupported
@@ -145,7 +154,16 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                 )
             | None ->
                 if RuntimeInformation.IsOSPlatform OSPlatform.Linux && limits.WholeTreeAny then
-                    if Native.Cgroup.cgroupV2Available () then
+                    if
+                        Native.Cgroup.cgroupV2Available ()
+                        && limits.IoMax.IsSome
+                        && not (Native.Cgroup.cgroupIoAvailable ())
+                    then
+                        Error(
+                            ProcessError.Unsupported
+                                "the Linux cgroup v2 hierarchy does not expose the io controller required by io.max"
+                        )
+                    elif Native.Cgroup.cgroupV2Available () then
                         match Native.Cgroup.createCgroup limits with
                         | Ok path -> withBackend (CgroupBackend(path, limits))
                         | Error message -> Error(ProcessError.ResourceLimit message)

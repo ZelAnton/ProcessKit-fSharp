@@ -42,6 +42,21 @@ module internal Cgroup =
     /// non-empty) — including the systemd hybrid mount at /sys/fs/cgroup/unified when it has controllers.
     let cgroupV2Available () = (cgroupRoot ()).IsSome
 
+    /// True when the usable hierarchy advertises the cgroup v2 `io` controller. A mounted v2
+    /// hierarchy without `io` is a real but unsupported configuration for `io.max`, not a reason to
+    /// fall back to the unbounded process-group backend.
+    let cgroupIoAvailable () =
+        match cgroupRoot () with
+        | None -> false
+        | Some root ->
+            try
+                File
+                    .ReadAllText(Path.Combine(root, "cgroup.controllers"))
+                    .Split([| ' '; '\n'; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.contains "io"
+            with _ ->
+                false
+
     // This process's own cgroup path (the `0::<path>` line of /proc/self/cgroup), defaulting to "/".
     let private selfCgroupRelative () =
         try
@@ -81,6 +96,27 @@ module internal Cgroup =
         |> List.map (fun (lo, hi) -> if lo = hi then string lo else $"{lo}-{hi}")
         |> String.concat ","
 
+    /// Render one cgroup v2 `io.max` device line. The kernel's unbounded sentinel is the literal
+    /// `max` per nested key; omitting a key would preserve an older live value during replacement.
+    let formatIoMax (ioMax: IoMax) : string =
+        let parts = ioMax.Target.Split(':', StringSplitOptions.None)
+
+        let validDevice =
+            parts.Length = 2
+            && parts
+               |> Array.forall (fun part ->
+                   match UInt32.TryParse part with
+                   | true, _ -> part.Length > 0
+                   | false, _ -> false)
+
+        if not validDevice then
+            raise (ArgumentException($"I/O target '{ioMax.Target}' is not a Linux major:minor device key"))
+
+        let render value =
+            value |> Option.map string |> Option.defaultValue "max"
+
+        $"{ioMax.Target} rbps={render ioMax.ReadBytesPerSecond} wbps={render ioMax.WriteBytesPerSecond} riops={render ioMax.ReadOperationsPerSecond} wiops={render ioMax.WriteOperationsPerSecond}"
+
     // Enable the controllers the given limits need (only the missing ones) in the parent's
     // `cgroup.subtree_control`. Shared by creation and the live update, so both enable exactly the
     // controllers their cap set requires. Raises on failure (notably EBUSY writing subtree_control when
@@ -96,7 +132,9 @@ module internal Cgroup =
               if limits.CpuQuota.IsSome then
                   "cpu"
               if limits.CpuAffinityCores.IsSome then
-                  "cpuset" ]
+                  "cpuset"
+              if limits.IoMax.IsSome then
+                  "io" ]
 
         let subtreeFile = Path.Combine(parent, "cgroup.subtree_control")
 
@@ -136,6 +174,10 @@ module internal Cgroup =
 
         match limits.CpuAffinityCores with
         | Some cores -> File.WriteAllText(Path.Combine(cgroupPath, "cpuset.cpus"), formatCpuList cores)
+        | None -> ()
+
+        match limits.IoMax with
+        | Some ioMax -> File.WriteAllText(Path.Combine(cgroupPath, "io.max"), formatIoMax ioMax)
         | None -> ()
 
     // A process-wide counter making each cgroup name unique without relying on `CreateDirectory`
@@ -198,7 +240,11 @@ module internal Cgroup =
     /// kernel had. So an `Error` return means the cgroup is back on the previous set (nothing net changed),
     /// never a silent mix that `Options.Limits` would misreport (T-207). Only if even that restore fails is
     /// the state genuinely indeterminate, and the error says so distinctly.
-    let updateCgroupLimits (cgroupPath: string) (limits: ResourceLimits) : Result<unit, string> =
+    let updateCgroupLimitsWithPrevious
+        (cgroupPath: string)
+        (previousLimits: ResourceLimits)
+        (limits: ResourceLimits)
+        : Result<unit, string> =
         try
             // The cgroup is always a subdirectory of its parent (`.../<parent>/processkit-<pid>-<id>`),
             // so `GetDirectoryName` yields the real parent; the null case (a root/empty path) can't arise
@@ -221,6 +267,17 @@ module internal Cgroup =
                       "cpu.max", (limits.CpuQuota |> Option.map cpuMaxValue), "max"
                       "cpuset.cpus", (limits.CpuAffinityCores |> Option.map formatCpuList), "\n" ]
 
+                let ioPayload =
+                    match previousLimits.IoMax, limits.IoMax with
+                    | None, None -> None
+                    | Some previous, None -> Some(formatIoMax (IoMax(previous.Target, None, None, None, None)))
+                    | None, Some requested -> Some(formatIoMax requested)
+                    | Some previous, Some requested when previous.Target = requested.Target ->
+                        Some(formatIoMax requested)
+                    | Some previous, Some requested ->
+                        let clearPrevious = formatIoMax (IoMax(previous.Target, None, None, None, None))
+                        Some(String.Join(Environment.NewLine, [ clearPrevious; formatIoMax requested ]))
+
                 // Files already overwritten, with their PRIOR content, so a later failure can undo them.
                 let applied = System.Collections.Generic.List<string * string>()
 
@@ -242,6 +299,14 @@ module internal Cgroup =
                             File.WriteAllText(file, text)
                             applied.Add(file, prior)
 
+                    match ioPayload with
+                    | None -> ()
+                    | Some text ->
+                        let file = Path.Combine(cgroupPath, "io.max")
+                        let prior = File.ReadAllText file
+                        File.WriteAllText(file, text)
+                        applied.Add(file, prior)
+
                     Ok()
                 with writeEx ->
                     // A cap write failed partway. Put the already-changed files back to their prior kernel
@@ -259,6 +324,12 @@ module internal Cgroup =
                             $"failed to apply the cgroup limits ({writeEx.Message}) and could not roll the already-written controller files back to the previous set ({restoreEx.Message}); the cgroup's limits may be partially applied"
         with ex ->
             Error ex.Message
+
+    /// Backwards-compatible test seam for a direct file update with no previously configured I/O
+    /// policy. Live backends use `updateCgroupLimitsWithPrevious` so a target change can clear the old
+    /// device key and restore it on a later-write failure.
+    let updateCgroupLimits (cgroupPath: string) (limits: ResourceLimits) : Result<unit, string> =
+        updateCgroupLimitsWithPrevious cgroupPath ResourceLimits.None limits
 
     // Raw libc for the cgroup.procs write. Done via `open`/`write`/`close` rather than
     // `File.WriteAllText` so the exact errno is available (`Marshal.GetLastWin32Error`), which is what

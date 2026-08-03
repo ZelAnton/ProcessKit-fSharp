@@ -395,15 +395,17 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
                 )
             else
                 let result =
-                    if currentLimits.CpuTimeMax.IsSome && limits.CpuTimeMax = currentLimits.CpuTimeMax then
-                        Native.Windows.applyWindowsJobLimitsPreservingCpuTime jobHandle limits
-                    else
-                        Native.Windows.applyWindowsJobLimits jobHandle limits
+                    Native.Windows.applyWindowsJobLimitsWithPrevious jobHandle currentLimits limits
 
                 match result with
                 | Ok() ->
                     currentLimits <- limits
                     Ok()
+                | Error message when
+                    (currentLimits.IoMax.IsSome || limits.IoMax.IsSome)
+                    && Native.Windows.isIoRateControlUnsupported message
+                    ->
+                    Error(ProcessError.Unsupported message)
                 | Error message -> Error(ProcessError.ResourceLimit message)
 
         member _.HardRelease() =
@@ -653,7 +655,7 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                 match limits.UiRestrictionsUnsupported with
                 | Some error -> Error error
                 | None ->
-                    match Native.Cgroup.updateCgroupLimits cgroupPath limits with
+                    match Native.Cgroup.updateCgroupLimitsWithPrevious cgroupPath currentLimits limits with
                     | Ok() ->
                         currentLimits <- limits
                         Ok()
@@ -899,6 +901,11 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
             elif limits.OomGroupKill then
                 Error(
                     ProcessError.Unsupported "whole-tree OOM kill requires a Linux cgroup v2 memory.oom.group mechanism"
+                )
+            elif limits.IoMax.IsSome then
+                Error(
+                    ProcessError.Unsupported
+                        "whole-tree disk I/O rate limits require Linux cgroup v2 io.max or a Windows Job Object I/O rate controller"
                 )
             elif not limits.WholeTreeAny then
                 Ok()
