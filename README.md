@@ -482,6 +482,16 @@ Console.WriteLine($"exit={profile.ExitCode} took={profile.Duration} peak={profil
 `Stats()`/`SampleStatsAsync` report full CPU/memory on Windows and the Linux cgroup backend, and active
 counts only on the POSIX process-group fallback; `ProfileAsync` samples the started child itself.
 
+For attribution inside a shared tree, `MemberStats()` returns a point-in-time `MemberStats` record for
+each member: its `Pid`, cumulative `CpuTime`, current `ResidentMemoryBytes`, and optional per-process
+I/O counters (`IoReadBytes`, `IoWriteBytes`, `IoReadOperations`, and `IoWriteOperations`). Windows reads
+each Job member through a verified query-only process handle; if access is denied, it retains the PID with
+`None` metrics only when a fresh Job membership query confirms that it is still in the Job. A PID absent
+from that refresh is omitted as a possible reused foreign process. Linux reads `/proc` (including per-process
+I/O when available). A member that exits during the sample is omitted, and unsupported metrics remain
+`None` rather than becoming zeroes. The call returns the same typed lifecycle error as `Stats()` after
+the group is released.
+
 *Deeper: [Process groups → stats](docs/process-groups.md#stats) ·
 [Streaming → profiling a run](docs/streaming.md#profiling-a-run).*
 

@@ -56,6 +56,8 @@ type private GracefulFaultBackend() =
         member _.Stats() =
             Ok(ProcessGroupStats(0, None, None, None))
 
+        member _.MemberStats() = Ok []
+
         member _.UpdateLimits(_limits) = Ok()
 
         member _.HardRelease() =

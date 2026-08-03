@@ -57,6 +57,39 @@ type ProcessGroupStats
 
     member internal _.IoCounters = ioCounters
 
+/// A point-in-time resource snapshot of one live `ProcessGroup` member.
+///
+/// `Pid` is the member identity from the group's native membership snapshot. CPU time and resident
+/// memory are optional because the operating system may not expose them for every process/platform;
+/// I/O counters are optional as a group because the per-process interface is not available everywhere.
+/// Missing values remain `None` rather than being represented by fabricated zeroes. A member that exits
+/// while it is being sampled is omitted from the returned list.
+[<Sealed>]
+type MemberStats
+    internal
+    (pid: int, cpuTime: TimeSpan option, residentMemoryBytes: int64 option, ioCounters: ProcessIoCounters option) =
+
+    /// The process id from the group's point-in-time membership snapshot.
+    member _.Pid = pid
+
+    /// Cumulative user plus kernel CPU time, when the platform reports it for this member.
+    member _.CpuTime = cpuTime
+
+    /// Current resident memory (RSS/working set) in bytes, when the platform reports it.
+    member _.ResidentMemoryBytes = residentMemoryBytes
+
+    /// Bytes read by this member, when per-process I/O counters are available.
+    member _.IoReadBytes = ioCounters |> Option.map _.ReadBytes
+
+    /// Bytes written by this member, when per-process I/O counters are available.
+    member _.IoWriteBytes = ioCounters |> Option.map _.WriteBytes
+
+    /// Read operations performed by this member, when per-process I/O counters are available.
+    member _.IoReadOperations = ioCounters |> Option.map _.ReadOperations
+
+    /// Write operations performed by this member, when per-process I/O counters are available.
+    member _.IoWriteOperations = ioCounters |> Option.map _.WriteOperations
+
 /// Resource summary of one finished run — produced by `RunningProcess.ProfileAsync`.
 ///
 /// CPU and memory come from the started child process (the same source as `RunningProcess.CpuTime`

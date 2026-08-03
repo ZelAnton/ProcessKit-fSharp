@@ -124,7 +124,7 @@ Natural exit, explicit kill, timeout, cancellation, and disposal converge on wai
 
 ## Containment backend contract
 
-`Backend.fs` defines the complete internal contract as follows (comments omitted here; signatures are unchanged):
+`Backend.fs` defines the complete internal contract as follows (comments omitted here):
 
 ```fsharp
 type internal IContainmentBackend =
@@ -137,17 +137,19 @@ type internal IContainmentBackend =
     abstract PidOf: Native.Common.Spawned -> int option
     abstract KillChild: Native.Common.Spawned -> unit
     abstract KillTree: unit -> unit
-    abstract GracefulKillTree: TimeSpan -> Task
+    abstract GracefulKillTree: Signal -> TimeSpan -> Task
+    abstract SignalChild: Native.Common.Spawned * Signal -> Result<unit, ProcessError>
     abstract Members: unit -> Result<int list, ProcessError>
     abstract Signal: Signal -> Result<unit, ProcessError>
     abstract Suspend: unit -> Result<unit, ProcessError>
     abstract Resume: unit -> Result<unit, ProcessError>
     abstract Stats: unit -> Result<ProcessGroupStats, ProcessError>
+    abstract MemberStats: unit -> Result<MemberStats list, ProcessError>
     abstract UpdateLimits: ResourceLimits -> Result<unit, ProcessError>
     abstract HardRelease: unit -> unit
 ```
 
-The current interface has 17 abstract members:
+The current interface has 19 abstract members:
 
 - `Mechanism` identifies the primitive honestly.
 - `Spawn` starts a child, initially not in the backend's tracking collection.
@@ -163,6 +165,12 @@ The current interface has 17 abstract members:
 - `Signal` broadcasts a signal.
 - `Suspend` and `Resume` control the tree.
 - `Stats` snapshots resource use.
+- `MemberStats` snapshots per-member CPU, resident-memory, and optional I/O counters. The backend owns
+  membership enumeration and the native identity gate: a vanished member is omitted, an unknown or
+  changed POSIX start-time token is excluded, and Windows retains a query-inaccessible member with `None`
+  metrics only after a fresh Job membership query confirms that pid is still in this Job. An inaccessible
+  pid absent from that refresh is omitted as a possible reused foreign process. The public `ProcessGroup`
+  call runs this operation under the lifecycle gate, so it cannot race container teardown.
 - `UpdateLimits` re-applies a full replacement resource-limit set to the live container (Job Object / cgroup v2); the process-group mechanism has no primitive to update and returns `ProcessError.ResourceLimit`. Because the caps land through several sequential native writes, a limit-capable backend captures the container's prior caps and best-effort restores them if a write fails partway, so an `Error` leaves the live container on the previous set — never a silent mix that `Options.Limits` would misreport (only an also-failed restore is indeterminate, and its `ProcessError.ResourceLimit` message says so).
 - `HardRelease` performs the once-only hard teardown and frees the container.
 
@@ -304,6 +312,7 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 | Child privilege reduction | Restricted token (`DISABLE_MAX_PRIVILEGE`) and/or a lowered integrity label, spawned via `CreateProcessAsUser` | `Uid`/`Gid`/`Groups`/`Umask` through the `setpriv` helper | same as the middle column |
 | Membership snapshot | All Job PIDs | Tracked group leaders, not every descendant PID | Current `cgroup.procs` PIDs |
 | Accounting | Active count, CPU, peak committed memory | Live group count only | Active members, CPU use, peak memory when files exist |
+| Per-member resource sampling | Query-denied members remain with `None` metrics only after a fresh Job membership confirmation; inaccessible pids absent from that refresh are omitted | Tracked members require a known matching start-time token; vanished, recycled, or unknown-identity pids are omitted | Each `cgroup.procs` pid is bound to its snapshot start-time token and checked again after sampling; vanished, recycled, or unknown-identity pids are omitted |
 | Reaping obligation | Handles close; Job kills on close | ProcessKit `waitpid`s direct leaders; other descendants reparent | cgroup kill plus `waitpid` of direct leaders |
 | Main failure mode | Job creation/assignment or console delivery failure | No tree limits; PID/pgid reuse if ownership rules are broken | Missing/delegation-denied controllers, migration failure (honest `ResourceLimit`), older-kernel kill fallback |
 

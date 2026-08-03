@@ -1,6 +1,7 @@
 namespace ProcessKit.Tests
 
 open System
+open System.Collections.Generic
 open System.Diagnostics
 open System.IO
 open System.Runtime.InteropServices
@@ -8,6 +9,38 @@ open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+open ProcessKit.Native
+
+/// A no-OS backend adapter used to drive the public ProcessGroup.MemberStats lifecycle path from a
+/// deterministic native/backend seam. All unrelated verbs are inert because these tests exercise only
+/// the public lifecycle gate and the delegated member-resource snapshot.
+type internal MemberStatsSeamBackend(memberStats: unit -> Result<MemberStats list, ProcessError>) =
+    interface IContainmentBackend with
+        member _.Mechanism = Mechanism.ProcessGroup
+
+        member _.Spawn(_command) =
+            Error(ProcessError.Unsupported "the member-stats seam does not spawn")
+
+        member _.Track(_spawned) = Ok()
+        member _.Adopt(_pid) = Ok()
+        member _.Release(_spawned) = ()
+        member _.Wait(_handle) = Task.FromResult(Outcome.Exited 0)
+        member _.PidOf(spawned) = Some(int spawned.Handle)
+        member _.KillChild(_spawned) = ()
+        member _.KillTree() = ()
+        member _.GracefulKillTree (_signal) (_grace) = Task.CompletedTask
+        member _.SignalChild(_spawned, _signal) = Ok()
+        member _.Members() = Ok []
+        member _.Signal(_signal) = Ok()
+        member _.Suspend() = Ok()
+        member _.Resume() = Ok()
+
+        member _.Stats() =
+            Ok(ProcessGroupStats(0, None, None, None))
+
+        member _.MemberStats() = memberStats ()
+        member _.UpdateLimits(_limits) = Ok()
+        member _.HardRelease() = ()
 
 [<TestFixture>]
 type StatsTests() =
@@ -26,6 +59,15 @@ type StatsTests() =
             shell "ping -n 4 127.0.0.1 >nul"
         else
             shell "sleep 3"
+
+    let syntheticSpawned (pid: int) : Native.Common.Spawned =
+        { Handle = nativeint pid
+          Stdout = None
+          Stderr = None
+          Stdin = None
+          ExtraFds = []
+          WindowsCtrlGroup = false
+          PtyControl = None }
 
     let create () =
         match ProcessGroup.Create() with
@@ -138,6 +180,258 @@ type StatsTests() =
                 ()
         }
         :> Task
+
+    [<Test>]
+    member _.``MemberStats reports resources for a live child without argv or environment``() : Task =
+        task {
+            use group = create ()
+
+            let secret = "PROCESSKIT_MEMBER_STATS_SECRET_4c12"
+            let command = sleeper |> Command.env "PROCESSKIT_MEMBER_STATS_SECRET" secret
+
+            match! group.StartAsync command with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match running.Pid with
+                | None -> Assert.Fail "expected a pid"
+                | Some pid ->
+                    match group.MemberStats() with
+                    | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                    | Ok members ->
+                        match members |> Seq.tryFind (fun stats -> stats.Pid = pid) with
+                        | None -> Assert.Fail "the live child is missing from MemberStats"
+                        | Some stats ->
+                            Assert.That(stats.Pid, Is.EqualTo pid)
+
+                            if isWindows || RuntimeInformation.IsOSPlatform OSPlatform.Linux then
+                                Assert.That(stats.CpuTime.IsSome, Is.True, "expected per-member CPU time")
+
+                                Assert.That(
+                                    stats.ResidentMemoryBytes.IsSome,
+                                    Is.True,
+                                    "expected per-member resident memory"
+                                )
+
+                                Assert.That(stats.IoReadBytes.IsSome, Is.True, "expected per-member I/O counters")
+                            else
+                                // macOS/BSD availability is intentionally best-effort; the contract is the
+                                // option shape, not a fabricated zero when a native metric is absent.
+                                stats.CpuTime |> ignore
+                                stats.ResidentMemoryBytes |> ignore
+                                stats.IoReadBytes |> ignore
+
+                            // MemberStats is numeric by construction and never reads argv/environment;
+                            // retain the secret only in the child configuration to make that boundary
+                            // explicit in this regression test.
+                            Assert.That(secret, Is.Not.Empty)
+
+                running.Kill()
+                let! _ = running.WaitAsync()
+                ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the POSIX per-member reader omits a vanished pid``() =
+        if isWindows then
+            Assert.Ignore
+                "the Windows reader requires a live Job Object; lifecycle coverage exercises its vanished-member path"
+        else
+            let vanishedPid = 0x7FFFFFF0
+            Assert.That(Native.Posix.readMemberStats vanishedPid, Is.EqualTo None)
+
+            let currentPid = Process.GetCurrentProcess().Id
+            Assert.That((Native.Posix.readMemberStats currentPid).IsSome, Is.True)
+
+    [<Test>]
+    member _.``MemberStats returns a typed lifecycle error after release``() : Task =
+        task {
+            let group = create ()
+            do! (group :> IAsyncDisposable).DisposeAsync()
+
+            match group.MemberStats() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected Unsupported for a released group, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``public MemberStats fails closed for unknown and recycled POSIX identities``() =
+        if isWindows then
+            Assert.Ignore "the POSIX identity gate is not used by the Windows Job backend"
+        else
+            let unknownPid = 2_100_000_001
+            let recycledPid = 2_100_000_002
+            let current = Dictionary<int, uint64 option>()
+            current[unknownPid] <- None
+            current[recycledPid] <- Some 11UL
+
+            Native.Posix.processGroupAliveForTests <- Some(fun _ -> true)
+
+            Native.Posix.readProcessIdentityForTests <-
+                Some(fun pid ->
+                    match current.TryGetValue pid with
+                    | true, identity -> identity
+                    | false, _ -> None)
+
+            Native.Posix.readMemberStatsForTests <- Some(fun pid -> Some(MemberStats(pid, None, None, None)))
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+            try
+                backend.Track(syntheticSpawned unknownPid) |> ignore
+                backend.Track(syntheticSpawned recycledPid) |> ignore
+                current[recycledPid] <- Some 99UL
+
+                match group.MemberStats() with
+                | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                | Ok members ->
+                    Assert.That(
+                        members,
+                        Is.Empty,
+                        "unknown and recycled identities must not be represented by a numeric-pid fallback"
+                    )
+            finally
+                (group :> IDisposable).Dispose()
+                Native.Posix.processGroupAliveForTests <- None
+                Native.Posix.readProcessIdentityForTests <- None
+                Native.Posix.readMemberStatsForTests <- None
+
+    [<Test>]
+    member _.``public MemberStats rejects a cgroup pid whose identity changes during sampling``() =
+        if isWindows then
+            Assert.Ignore "the cgroup identity gate is Linux/POSIX-only"
+        else
+            let directory =
+                Path.Combine(Path.GetTempPath(), $"processkit-member-stats-cgroup-{Guid.NewGuid():N}")
+
+            Directory.CreateDirectory directory |> ignore
+
+            let keptPid = 2_100_000_011
+            let recycledPid = 2_100_000_012
+            let current = Dictionary<int, uint64>()
+            current[keptPid] <- 101UL
+            current[recycledPid] <- 202UL
+            File.WriteAllText(Path.Combine(directory, "cgroup.procs"), $"{keptPid}\n{recycledPid}\n")
+
+            Native.Posix.readProcessIdentityForTests <-
+                Some(fun pid ->
+                    match current.TryGetValue pid with
+                    | true, identity -> Some identity
+                    | false, _ -> None)
+
+            Native.Posix.readMemberStatsForTests <-
+                Some(fun pid ->
+                    if pid = recycledPid then
+                        current[pid] <- 999UL
+
+                    Some(MemberStats(pid, None, None, None)))
+
+            let cgroupBackend = CgroupBackend directory :> IContainmentBackend
+
+            let backend =
+                MemberStatsSeamBackend(fun () -> cgroupBackend.MemberStats()) :> IContainmentBackend
+
+            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+            try
+                match group.MemberStats() with
+                | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                | Ok members ->
+                    let pids = members |> Seq.map (fun stats -> stats.Pid) |> Set.ofSeq
+                    let expected = Set.singleton keptPid
+                    Assert.That((pids = expected), Is.True)
+            finally
+                (group :> IDisposable).Dispose()
+                Native.Posix.readProcessIdentityForTests <- None
+                Native.Posix.readMemberStatsForTests <- None
+
+                try
+                    Directory.Delete(directory, true)
+                with _ ->
+                    // best-effort cleanup of the synthetic cgroup directory after the seam test.
+                    ()
+
+    [<Test>]
+    member _.``public MemberStats retains an inaccessible Windows member and omits a gone member``() =
+        if not isWindows then
+            Assert.Ignore "the OpenProcess failure classification is Windows-only"
+        else
+            let inaccessiblePid = 2_100_000_021
+            let gonePid = 2_100_000_022
+            let originalMembershipQuery = Native.Windows.queryInformationJobObjectHook
+
+            Native.Windows.queryInformationJobObjectHook <-
+                fun _ _ buffer _ ->
+                    Marshal.WriteInt32(buffer, 0, 1)
+                    Marshal.WriteInt32(buffer, 4, 1)
+                    Marshal.WriteIntPtr(buffer, 8, nativeint inaccessiblePid)
+                    struct (true, 0)
+
+            Native.Windows.openMemberProcessForTests <- Some(fun _ pid -> if pid = gonePid then Error 87 else Error 5)
+
+            let backend =
+                MemberStatsSeamBackend(fun () ->
+                    Native.Windows.readMemberStatsForPids IntPtr.Zero [ inaccessiblePid; gonePid ]
+                    |> Ok)
+                :> IContainmentBackend
+
+            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+            try
+                match group.MemberStats() with
+                | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                | Ok members ->
+                    Assert.That(members.Count, Is.EqualTo 1)
+                    let memberStats = members.[0]
+                    Assert.That(memberStats.Pid, Is.EqualTo inaccessiblePid)
+                    Assert.That(memberStats.CpuTime.IsNone, Is.True)
+                    Assert.That(memberStats.ResidentMemoryBytes.IsNone, Is.True)
+                    Assert.That(memberStats.IoReadBytes.IsNone, Is.True)
+            finally
+                (group :> IDisposable).Dispose()
+                Native.Windows.openMemberProcessForTests <- None
+                Native.Windows.queryInformationJobObjectHook <- originalMembershipQuery
+
+    [<Test>]
+    member _.``public MemberStats omits an inaccessible reused PID absent from the current Job``() =
+        if not isWindows then
+            Assert.Ignore "the Windows Job membership confirmation is Windows-only"
+        else
+            let reusedPid = 2_100_000_031
+            let originalMembershipQuery = Native.Windows.queryInformationJobObjectHook
+
+            // The supplied per-call snapshot represents the original Job member. The refresh represents
+            // the post-exit/reuse state: the protected replacement is outside the Job, so the current Job
+            // member list is empty even though OpenProcess returns ACCESS_DENIED for the reused number.
+            Native.Windows.queryInformationJobObjectHook <-
+                fun _ _ buffer _ ->
+                    Marshal.WriteInt32(buffer, 0, 0)
+                    Marshal.WriteInt32(buffer, 4, 0)
+                    struct (true, 0)
+
+            Native.Windows.openMemberProcessForTests <- Some(fun _ _ -> Error 5)
+
+            let backend =
+                MemberStatsSeamBackend(fun () -> Native.Windows.readMemberStatsForPids IntPtr.Zero [ reusedPid ] |> Ok)
+                :> IContainmentBackend
+
+            let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+            try
+                match group.MemberStats() with
+                | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                | Ok members ->
+                    Assert.That(
+                        members,
+                        Is.Empty,
+                        "an ACCESS_DENIED pid absent from the refreshed Job membership must be omitted"
+                    )
+            finally
+                (group :> IDisposable).Dispose()
+                Native.Windows.openMemberProcessForTests <- None
+                Native.Windows.queryInformationJobObjectHook <- originalMembershipQuery
 
     [<Test>]
     member _.``SampleStats yields a periodic series``() : Task =

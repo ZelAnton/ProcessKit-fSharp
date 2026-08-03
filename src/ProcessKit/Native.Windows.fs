@@ -767,6 +767,12 @@ module internal Windows =
     [<Literal>]
     let private PROCESS_QUERY_LIMITED_INFORMATION = 0x1000u
 
+    // The documented process-query right required by GetProcessTimes, GetProcessIoCounters, and
+    // GetProcessMemoryInfo. Per-member sampling opens a short-lived handle with query rights only — no
+    // terminate, VM-write, or handle-inheritance capability.
+    [<Literal>]
+    let private PROCESS_QUERY_INFORMATION = 0x0400u
+
     // The two access rights `AssignProcessToJobObject` requires on the target process handle: it must be
     // able to set the process's quota (Job limits are quotas) and to terminate it (the Job owns its
     // lifetime once assigned). `adoptIntoJob` opens a foreign process with exactly these (plus
@@ -784,6 +790,12 @@ module internal Windows =
     [<Literal>]
     let private ERROR_ACCESS_DENIED = 5
 
+    /// Test seam (internal, not public API): replaces the two query-handle OpenProcess attempts used by
+    /// per-member sampling. The result carries a Win32 error code on failure so tests can distinguish a
+    /// proven missing pid (`ERROR_INVALID_PARAMETER`) from an inaccessible live member.
+    let mutable openMemberProcessForTests: (uint32 -> int -> Result<nativeint, int>) option =
+        None
+
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private QueryInformationJobObject(
         nativeint hJob,
@@ -798,6 +810,43 @@ module internal Windows =
 
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private IsProcessInJob(nativeint processHandle, nativeint jobHandle, bool& result)
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private FILETIME_NATIVE =
+        struct
+            val mutable LowDateTime: uint32
+            val mutable HighDateTime: uint32
+        end
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private PROCESS_MEMORY_COUNTERS =
+        struct
+            val mutable cb: uint32
+            val mutable PageFaultCount: uint32
+            val mutable PeakWorkingSetSize: unativeint
+            val mutable WorkingSetSize: unativeint
+            val mutable QuotaPeakPagedPoolUsage: unativeint
+            val mutable QuotaPagedPoolUsage: unativeint
+            val mutable QuotaPeakNonPagedPoolUsage: unativeint
+            val mutable QuotaNonPagedPoolUsage: unativeint
+            val mutable PagefileUsage: unativeint
+            val mutable PeakPagefileUsage: unativeint
+        end
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private GetProcessTimes(
+        nativeint hProcess,
+        FILETIME_NATIVE& lpCreationTime,
+        FILETIME_NATIVE& lpExitTime,
+        FILETIME_NATIVE& lpKernelTime,
+        FILETIME_NATIVE& lpUserTime
+    )
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private GetProcessIoCounters(nativeint hProcess, IO_COUNTERS& lpIoCounters)
+
+    [<DllImport("psapi.dll", SetLastError = true)>]
+    extern bool private GetProcessMemoryInfo(nativeint Process, PROCESS_MEMORY_COUNTERS& ppsmemCounters, uint32 cb)
 
     // NtSuspendProcess/NtResumeProcess freeze/thaw every thread of a process in one call. They are
     // undocumented ntdll entry points but stable and the standard way to suspend a whole process;
@@ -994,6 +1043,149 @@ module internal Windows =
                     // Enumerated as a group member but not present in the whole-system snapshot: it exited
                     // between the two reads — omit it, never fabricate its metadata.
                     None)
+
+    let private fileTimeTicks (value: FILETIME_NATIVE) : int64 =
+        let combined = (uint64 value.HighDateTime <<< 32) ||| uint64 value.LowDateTime
+
+        if combined > uint64 Int64.MaxValue then
+            Int64.MaxValue
+        else
+            int64 combined
+
+    let private saturatingAdd (left: int64) (right: int64) =
+        if right > 0L && left > Int64.MaxValue - right then
+            Int64.MaxValue
+        else
+            left + right
+
+    /// Read one process's resources through a short-lived query-only process handle. The handle is
+    /// re-checked against the Job before any metric API is called, so a pid that vanished and was reused
+    /// by a foreign process cannot leak that process's metrics into the group result. Individual native
+    /// metric failures remain `None`; an opened, verified member is still represented by its pid.
+    let private readMemberStatsFromHandle (pid: int) (job: nativeint) (handle: nativeint) : MemberStats option =
+        let mutable stillMember = false
+
+        if not (IsProcessInJob(handle, job, &stillMember) && stillMember) then
+            None
+        else
+            let cpu =
+                let mutable creation = FILETIME_NATIVE()
+                let mutable exit = FILETIME_NATIVE()
+                let mutable kernel = FILETIME_NATIVE()
+                let mutable user = FILETIME_NATIVE()
+
+                if GetProcessTimes(handle, &creation, &exit, &kernel, &user) then
+                    let total = saturatingAdd (fileTimeTicks user) (fileTimeTicks kernel)
+                    Some(TimeSpan.FromTicks total)
+                else
+                    None
+
+            let residentMemory =
+                let mutable counters = PROCESS_MEMORY_COUNTERS()
+                counters.cb <- uint32 (Marshal.SizeOf<PROCESS_MEMORY_COUNTERS>())
+
+                if GetProcessMemoryInfo(handle, &counters, counters.cb) then
+                    let bytes = uint64 counters.WorkingSetSize
+
+                    if bytes > uint64 Int64.MaxValue then
+                        Some Int64.MaxValue
+                    else
+                        Some(int64 bytes)
+                else
+                    None
+
+            let ioCounters =
+                let mutable io = IO_COUNTERS()
+
+                if GetProcessIoCounters(handle, &io) then
+                    let count (value: uint64) =
+                        if value > uint64 Int64.MaxValue then
+                            Int64.MaxValue
+                        else
+                            int64 value
+
+                    Some
+                        { ReadBytes = count io.ReadTransferCount
+                          WriteBytes = count io.WriteTransferCount
+                          ReadOperations = count io.ReadOperationCount
+                          WriteOperations = count io.WriteOperationCount }
+                else
+                    None
+
+            Some(MemberStats(pid, cpu, residentMemory, ioCounters))
+
+    type private MemberProcessOpen =
+        | Opened of nativeint
+        | Inaccessible
+        | Gone
+
+    let private openMemberProcess (pid: int) : MemberProcessOpen =
+        let openWith access =
+            match openMemberProcessForTests with
+            | Some opener -> opener access pid
+            | None ->
+                let handle = OpenProcess(access, false, uint32 pid)
+
+                if handle = IntPtr.Zero then
+                    Error(Marshal.GetLastWin32Error())
+                else
+                    Ok handle
+
+        let fullQuery =
+            openWith (PROCESS_QUERY_INFORMATION ||| PROCESS_QUERY_LIMITED_INFORMATION)
+
+        match fullQuery with
+        | Ok handle -> Opened handle
+        | Error ERROR_INVALID_PARAMETER -> Gone
+        | Error _ ->
+            // A protected process can deny the broad query right while still allowing the limited right.
+            // Try the narrower handle before classifying the member as inaccessible.
+            match openWith PROCESS_QUERY_LIMITED_INFORMATION with
+            | Ok handle -> Opened handle
+            | Error ERROR_INVALID_PARAMETER -> Gone
+            | Error _ -> Inaccessible
+
+    /// Sample a supplied Job-member snapshot with a safe query-only handle. This internal helper is also
+    /// the deterministic backend seam for tests: membership enumeration remains separate from the
+    /// OpenProcess failure classification. An inaccessible pid is retained only after a fresh Job-member
+    /// query confirms that the same numeric pid is still in this Job; a query failure or a missing pid is
+    /// fail-closed and omits the record.
+    let internal readMemberStatsForPids (job: nativeint) (pids: int list) : MemberStats list =
+        let stats = ResizeArray<MemberStats>()
+
+        for pid in pids do
+            match openMemberProcess pid with
+            | Opened handle ->
+                try
+                    match readMemberStatsFromHandle pid job handle with
+                    | Some value -> stats.Add value
+                    | None -> ()
+                finally
+                    CloseHandle handle |> ignore
+            | Inaccessible ->
+                // ACCESS_DENIED proves only that metrics cannot be queried. Refresh the Job membership
+                // before retaining the pid, so a protected process that reused the number outside this
+                // Job is omitted rather than exposed as a stale member with None metrics.
+                match membersWindows job with
+                | Ok current when current |> List.contains pid -> stats.Add(MemberStats(pid, None, None, None))
+                | _ ->
+                    // A failed membership refresh or a pid absent from the fresh Job snapshot is not a
+                    // confirmed current member, so fail closed.
+                    ()
+            | Gone ->
+                // ERROR_INVALID_PARAMETER proves that the process no longer exists between enumeration
+                // and opening, so the vanished member is omitted.
+                ()
+
+        List.ofSeq stats
+
+    /// Sample every current Job member with a safe query-only handle. A process that exits between Job
+    /// enumeration and handle verification is omitted; a member whose individual metrics are denied is
+    /// retained with `None` for those metrics rather than a fabricated zero.
+    let readMemberStats (job: nativeint) : Result<MemberStats list, ProcessError> =
+        match membersWindows job with
+        | Error error -> Error error
+        | Ok pids -> Ok(readMemberStatsForPids job pids)
 
     // Suspend / resume every member process of a Job over the COMPLETE `membersWindows` snapshot (the
     // buffer grows to fit the whole job, so no member is dropped by an artificial cap). Best-effort and

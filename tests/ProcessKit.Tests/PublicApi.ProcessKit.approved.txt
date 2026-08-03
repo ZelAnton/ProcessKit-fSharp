@@ -358,6 +358,15 @@ class ProcessKit.MemberInfo
   property Ppid : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property StartTime : Microsoft.FSharp.Core.FSharpOption<System.DateTime> { get }
 
+class ProcessKit.MemberStats
+  property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
+  property IoReadBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property IoReadOperations : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property IoWriteBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property IoWriteOperations : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property Pid : System.Int32 { get }
+  property ResidentMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+
 class ProcessKit.Outcome
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.Outcome>
@@ -829,6 +838,7 @@ class ProcessKit.ProcessGroup
   member Adopt(System.Diagnostics.Process) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member Finalize() : System.Void
   member KillAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member MemberStats() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<ProcessKit.MemberStats>, ProcessKit.ProcessError>
   member Members() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<System.Int32>, ProcessKit.ProcessError>
   member MembersInfo() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<ProcessKit.MemberInfo>, ProcessKit.ProcessError>
   member Resume() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>

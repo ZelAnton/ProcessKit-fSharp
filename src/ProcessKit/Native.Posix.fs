@@ -148,6 +148,14 @@ module internal Posix =
     [<DllImport("libc", SetLastError = true)>]
     extern int kill(int pid, int signalNumber)
 
+    // Linux's `/proc/<pid>/stat` CPU counters are measured in clock ticks. `sysconf` keeps the
+    // conversion honest on hosts whose kernel is configured with a tick rate other than the common 100.
+    [<Literal>]
+    let private SC_CLK_TCK = 2
+
+    [<DllImport("libc", SetLastError = true)>]
+    extern int64 private sysconf(int name)
+
     // POSIX pty (pseudo-terminal) master/slave allocation for `Command.Pty` (see `openPtyPair`).
     // `posix_openpt`/`grantpt`/`unlockpt`/`ptsname` are ALL in libc — portable across glibc versions and
     // back to old glibc where `openpty(3)` lived only in `libutil` — and `posix_openpt` accepts O_CLOEXEC,
@@ -304,6 +312,10 @@ module internal Posix =
     /// real process whose start time it cannot control. Production leaves it `None`.
     let mutable readProcessIdentityForTests: (int -> uint64 option) option = None
 
+    /// Test seam (internal, not public API): replaces the native member-resource read so backend identity
+    /// gates can be tested without racing a real process exit or pid recycle. Production leaves it `None`.
+    let mutable readMemberStatsForTests: (int -> MemberStats option) option = None
+
     /// Test seam (internal, not public API): invoked with the target pgid/pid by every process-group
     /// delivery primitive (`killProcessGroup` / `terminateProcessGroup` / `signalProcessGroup` /
     /// `suspendProcessGroup` / `resumeProcessGroup`) and the per-child raw kill (`killProcess`, the cgroup
@@ -434,7 +446,8 @@ module internal Posix =
     // differs from the captured one is a recycled stranger (`processGroupStillTracked` reports it gone,
     // so callers prune it and never signal it). An unknown token on either side — a non-Linux/macOS
     // POSIX with no reader, a process already gone, or a leader reaped while descendants keep the pgid
-    // alive — defers to the by-number liveness verdict, so no platform loses coverage.
+    // alive — defers to the by-number liveness verdict for process-group control paths, while the
+    // per-member resource path fails closed because metrics must never use a numeric pid as identity.
 
     // proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, buffer, buffersize) fills a `proc_bsdinfo` (macOS/Apple
     // only) whose pbi_start_tvsec/pbi_start_tvusec is the process creation time (stable across `exec`,
@@ -442,6 +455,15 @@ module internal Posix =
     // at 128 in the 136-byte struct) rather than a `[<StructLayout>]` type. Lives in libproc, not libc.
     [<Literal>]
     let private PROC_PIDTBSDINFO = 3
+
+    // proc_pidinfo(PROC_PIDTASKINFO) supplies current resident bytes and cumulative user/system CPU
+    // time on macOS. The offsets below are the stable proc_taskinfo layout used by the existing
+    // proc_pidinfo start-time reader; I/O counters have no equally portable per-process reader here.
+    [<Literal>]
+    let private PROC_PIDTASKINFO = 4
+
+    [<Literal>]
+    let private procTaskInfoSize = 144
 
     [<Literal>]
     let private procBsdInfoSize = 136
@@ -468,6 +490,52 @@ module internal Posix =
                 | _ -> None
             else
                 None
+
+    /// Parse cumulative user + kernel CPU time from Linux `/proc/<pid>/stat` fields 14 and 15. The
+    /// returned value is deliberately optional: malformed or unavailable clock-rate data must not turn
+    /// into a made-up zero CPU reading.
+    let parseLinuxCpuTime (stat: string) : TimeSpan option =
+        let closeParen = stat.LastIndexOf ')'
+
+        if closeParen < 0 then
+            None
+        else
+            let fields =
+                stat.Substring(closeParen + 1).Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)
+
+            if fields.Length <= 12 then
+                None
+            else
+                match Int64.TryParse fields.[11], Int64.TryParse fields.[12] with
+                | (true, user), (true, kernel) when user >= 0L && kernel >= 0L ->
+                    let clockTicks =
+                        try
+                            sysconf SC_CLK_TCK
+                        with _ ->
+                            // An unavailable libc clock rate means this host cannot provide a trustworthy
+                            // conversion from `/proc` ticks to a TimeSpan.
+                            -1L
+
+                    if clockTicks <= 0L then
+                        None
+                    else
+                        let total =
+                            if user > Int64.MaxValue - kernel then
+                                Int64.MaxValue
+                            else
+                                user + kernel
+
+                        let wholeSeconds = total / clockTicks
+                        let remainder = total % clockTicks
+                        let ticksPerSecond = TimeSpan.TicksPerSecond
+
+                        if wholeSeconds > Int64.MaxValue / ticksPerSecond then
+                            Some(TimeSpan.MaxValue)
+                        else
+                            let wholeTicks = wholeSeconds * ticksPerSecond
+                            let fractionalTicks = (remainder * ticksPerSecond) / clockTicks
+                            Some(TimeSpan.FromTicks(wholeTicks + fractionalTicks))
+                | _ -> None
 
     let private readLinuxStartTime (pid: int) : uint64 option =
         try
@@ -500,8 +568,8 @@ module internal Posix =
 
     /// Read a stable start-time identity token for `pid`, or `None` when unreadable/unavailable (a
     /// non-Linux/macOS POSIX with no reader, a process already gone, or a denied read). See the section
-    /// comment above: an unknown token is never proof of anything — the caller defers to the by-number
-    /// liveness verdict, so no platform is weakened.
+    /// comment above: an unknown token is never proof of anything — process-group control paths may defer
+    /// to numeric liveness, but per-member resource sampling excludes the record.
     let readProcessIdentity (pid: int) : uint64 option =
         match readProcessIdentityForTests with
         | Some hook -> hook pid
@@ -559,6 +627,154 @@ module internal Posix =
         | :? UnauthorizedAccessException ->
             // Denied by permissions — likewise no readable metadata for this member.
             None
+
+    let private parseLinuxResidentMemory (status: string) : int64 option =
+        status.Split([| '\n' |], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.tryPick (fun line ->
+            if line.StartsWith("VmRSS:", StringComparison.Ordinal) then
+                let fields =
+                    line
+                        .Substring("VmRSS:".Length)
+                        .Trim()
+                        .Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+
+                match fields with
+                | [| value; unit |] when unit.Equals("kB", StringComparison.OrdinalIgnoreCase) ->
+                    match Int64.TryParse value with
+                    | true, kilobytes when kilobytes >= 0L && kilobytes <= Int64.MaxValue / 1024L ->
+                        Some(kilobytes * 1024L)
+                    | _ -> None
+                | _ -> None
+            else
+                None)
+
+    let private parseLinuxIoCounters (io: string) : ProcessIoCounters option =
+        let mutable readBytes = None
+        let mutable writeBytes = None
+        let mutable readOperations = None
+        let mutable writeOperations = None
+
+        for line in io.Split([| '\n' |], StringSplitOptions.RemoveEmptyEntries) do
+            let separator = line.IndexOf ':'
+
+            if separator > 0 then
+                let key = line.Substring(0, separator).Trim()
+                let valueText = line.Substring(separator + 1).Trim()
+
+                match Int64.TryParse valueText with
+                | true, value when value >= 0L ->
+                    if key = "read_bytes" then
+                        readBytes <- Some value
+                    elif key = "write_bytes" then
+                        writeBytes <- Some value
+                    elif key = "syscr" then
+                        readOperations <- Some value
+                    elif key = "syscw" then
+                        writeOperations <- Some value
+                | _ -> ()
+
+        match readBytes, writeBytes, readOperations, writeOperations with
+        | Some readBytes, Some writeBytes, Some readOperations, Some writeOperations ->
+            Some
+                { ReadBytes = readBytes
+                  WriteBytes = writeBytes
+                  ReadOperations = readOperations
+                  WriteOperations = writeOperations }
+        | _ ->
+            // A partially readable `/proc/<pid>/io` file is not a complete counter snapshot. Keep all
+            // four members unavailable rather than filling omitted fields with fabricated zeroes.
+            None
+
+    let private readLinuxMemberStats (pid: int) : MemberStats option =
+        match tryReadProcFile $"/proc/{pid}/stat" with
+        | None -> None
+        | Some firstStat ->
+            let identity = parseLinuxStartTime firstStat
+            let cpu = parseLinuxCpuTime firstStat
+
+            let resident =
+                tryReadProcFile $"/proc/{pid}/status" |> Option.bind parseLinuxResidentMemory
+
+            let io = tryReadProcFile $"/proc/{pid}/io" |> Option.bind parseLinuxIoCounters
+
+            // Read stat a second time. If the start-time token changed, the pid was recycled while the
+            // other files were being read; discarding the sample prevents foreign metrics from escaping.
+            match tryReadProcFile $"/proc/{pid}/stat" with
+            | None -> None
+            | Some secondStat ->
+                match identity, parseLinuxStartTime secondStat with
+                | Some first, Some second when first <> second -> None
+                | _ -> Some(MemberStats(pid, cpu, resident, io))
+
+    let private readMacMemberStats (pid: int) : MemberStats option =
+        let buffer = Marshal.AllocHGlobal procTaskInfoSize
+
+        try
+            let got = proc_pidinfo (pid, PROC_PIDTASKINFO, 0UL, buffer, procTaskInfoSize)
+
+            if got = procTaskInfoSize then
+                // proc_taskinfo: resident size @8, total user @16, total system @24; CPU values are ns.
+                let resident = Marshal.ReadInt64(buffer, 8)
+                let user = Marshal.ReadInt64(buffer, 16)
+                let system = Marshal.ReadInt64(buffer, 24)
+
+                let cpu =
+                    if user >= 0L && system >= 0L then
+                        let total =
+                            if user > Int64.MaxValue - system then
+                                Int64.MaxValue
+                            else
+                                user + system
+
+                        Some(TimeSpan.FromTicks(total / 100L))
+                    else
+                        None
+
+                let memory = if resident >= 0L then Some resident else None
+                Some(MemberStats(pid, cpu, memory, None))
+            else
+                // 0 / -1 (gone, EPERM) or a short read means that the member cannot be sampled now.
+                None
+        finally
+            Marshal.FreeHGlobal buffer
+
+    /// Read one member's resources using the platform's native per-process reader. A missing process is
+    /// returned as `None`; a live process with an unsupported metric is returned with that metric absent.
+    /// This function never reads argv or environment.
+    let readMemberStats (pid: int) : MemberStats option =
+        match readMemberStatsForTests with
+        | Some reader -> reader pid
+        | None ->
+            if RuntimeInformation.IsOSPlatform OSPlatform.Linux then
+                readLinuxMemberStats pid
+            elif isMacOs then
+                readMacMemberStats pid
+            else
+                // Other POSIX systems do not have a reader in this layer. A successful BCL existence check
+                // still lets us represent the member honestly with unavailable metrics rather than a fake 0.
+                try
+                    use proc = System.Diagnostics.Process.GetProcessById pid
+                    Some(MemberStats(pid, None, None, None))
+                with _ ->
+                    None
+
+    /// Identity-gated variant used by the tracked POSIX process-group backend. The expected token is
+    /// captured in the membership snapshot; an unknown token, a different current token, or a token that
+    /// changes during sampling excludes the member. A numeric pid alone is never enough to attribute
+    /// metrics to a tracked process.
+    let readMemberStatsWithIdentity (pid: int) (expectedIdentity: uint64 option) : MemberStats option =
+        match expectedIdentity with
+        | None -> None
+        | Some expected ->
+            match readProcessIdentity pid with
+            | Some current when current = expected ->
+                match readMemberStats pid with
+                | None -> None
+                | Some stats ->
+                    match readProcessIdentity pid with
+                    | Some current when current = expected -> Some stats
+                    | _ -> None
+            | _ -> None
 
     let private readLinuxMemberInfo (pid: int) : MemberInfo option =
         match tryReadProcFile $"/proc/{pid}/stat" with

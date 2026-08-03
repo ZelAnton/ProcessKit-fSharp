@@ -142,6 +142,11 @@ type internal IContainmentBackend =
     /// A snapshot of the group's resource usage.
     abstract Stats: unit -> Result<ProcessGroupStats, ProcessError>
 
+    /// A point-in-time resource snapshot for each currently contained process. The backend owns the
+    /// membership enumeration and platform-specific sampling so callers cannot accidentally sample a
+    /// pid outside the container or turn a vanished member into a fabricated record.
+    abstract MemberStats: unit -> Result<MemberStats list, ProcessError>
+
     /// Apply a new whole-tree resource-limit set to the LIVE container, replacing the caps in force
     /// without recreating it or restarting its children. A limit-capable mechanism (Windows Job Object
     /// / Linux cgroup v2) re-applies the caps to its live handle/controllers; a mechanism with no
@@ -376,6 +381,9 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
             match Native.Windows.jobStatsWindows jobHandle with
             | Some(active, cpu, peak, io) -> Ok(ProcessGroupStats(active, Some cpu, Some peak, Some io))
             | None -> Error(ProcessError.Io "failed to query Job Object accounting")
+
+        member _.MemberStats() =
+            Native.Windows.readMemberStats jobHandle
 
         member _.UpdateLimits(limits) =
             // Re-apply the whole limit set to the live Job via `SetInformationJobObject` (the UI
@@ -624,6 +632,40 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                 let active = List.length members
                 let cpu, peak, io = Native.Cgroup.cgroupStats cgroupPath
                 Ok(ProcessGroupStats(active, cpu, peak, io))
+
+        member _.MemberStats() =
+            // The cgroup membership read is the authoritative point-in-time list. A second membership
+            // read after per-pid sampling removes a recycled pid that became a foreign process while the
+            // `/proc` files were being read; a failure is propagated rather than treated as an empty set.
+            match Native.Cgroup.cgroupMembers cgroupPath with
+            | Error message ->
+                Error(
+                    ProcessError.Io $"could not read cgroup.procs for per-member stats (membership unknown): {message}"
+                )
+            | Ok pids ->
+                // Bind every sampled pid to the start-time identity observed in this membership
+                // snapshot. An unknown token is excluded, and the identity-gated reader checks the
+                // token again after sampling, so a pid recycled during the read cannot contribute foreign
+                // metrics even if the numeric pid appears in the cgroup again.
+                let snapshot =
+                    pids
+                    |> List.choose (fun pid ->
+                        Native.Posix.readProcessIdentity pid
+                        |> Option.map (fun identity -> pid, identity))
+
+                let sampled =
+                    snapshot
+                    |> List.choose (fun (pid, identity) -> Native.Posix.readMemberStatsWithIdentity pid (Some identity))
+
+                match Native.Cgroup.cgroupMembers cgroupPath with
+                | Error message ->
+                    Error(
+                        ProcessError.Io
+                            $"could not re-read cgroup.procs after per-member stats (membership unknown): {message}"
+                    )
+                | Ok current ->
+                    let currentPids = Set.ofList current
+                    Ok(sampled |> List.filter (fun stats -> currentPids.Contains stats.Pid))
 
         member _.UpdateLimits(limits) =
             // Rewrite the cgroup's controller files in place (`memory.max`/`memory.oom.group`/`pids.max`/`cpu.max`/
@@ -893,6 +935,19 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
         member _.Stats() =
             let active = children.Snapshot() |> List.filter stillOurs |> List.length
             Ok(ProcessGroupStats(active, None, None, None))
+
+        member _.MemberStats() =
+            let pids = children.Snapshot() |> List.filter stillOurs
+
+            pids
+            |> List.choose (fun pid ->
+                let identity =
+                    match identities.TryGetValue pid with
+                    | true, token -> token
+                    | false, _ -> None
+
+                Native.Posix.readMemberStatsWithIdentity pid identity)
+            |> Ok
 
         member _.UpdateLimits(limits) =
             // The POSIX process-group mechanism has no whole-tree limit primitive to update — the exact

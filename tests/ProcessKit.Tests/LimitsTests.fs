@@ -97,6 +97,8 @@ type internal LimitContractBackend(initial: ResourceLimits, shouldFail: Resource
         member _.Stats() =
             Ok(ProcessGroupStats(0, None, None, None))
 
+        member _.MemberStats() = Ok []
+
         member _.UpdateLimits(limits) =
             if shouldFail limits then
                 // Model a limit-capable backend whose native apply failed partway and then best-effort

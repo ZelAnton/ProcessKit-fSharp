@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ProcessGroup.MemberStats()` exposes per-member PID, CPU time, resident memory, and optional I/O counters with native Windows and POSIX sampling; vanished members are omitted, and Windows retains unavailable metrics only for PIDs confirmed by a fresh Job membership query.
 - `ResourceLimits.WithIoMax` and `ProcessGroupOptions.WithIoMax` cap directional disk bandwidth and IOPS through Linux cgroup v2 `io.max` or Windows Job Object I/O rate control.
 - `RunningProcess.StdoutChunksAsync` streams stdout as byte-exact `ReadOnlyMemory<byte>` chunks with configurable channel backpressure.
 - `Supervisor.LivenessMemory` restarts a live child whose attributable process-tree peak memory remains above a configured byte threshold.

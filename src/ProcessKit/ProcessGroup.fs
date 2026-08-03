@@ -675,6 +675,15 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
             List.toArray infos :> IReadOnlyList<MemberInfo>)
 
+    /// Return a point-in-time resource snapshot for each current member. CPU time and resident memory
+    /// are optional per member, and I/O counters are optional on platforms without a per-process
+    /// counter API. The native backend owns both membership enumeration and metric reads under this
+    /// lifecycle gate: a member that vanishes during sampling is omitted, and a recycled pid cannot
+    /// contribute metrics from a foreign process.
+    member this.MemberStats() : Result<IReadOnlyList<MemberStats>, ProcessError> =
+        this.WhenLive(fun () -> backend.MemberStats())
+        |> Result.map (fun stats -> List.toArray stats :> IReadOnlyList<MemberStats>)
+
     /// Broadcast `signal` to every process in the group. A member that has already exited (or an
     /// already-empty group) is a best-effort success — that races the target's own exit, not a
     /// caller error. `Signal.Other 0` (a liveness *probe* that delivers nothing) and a negative

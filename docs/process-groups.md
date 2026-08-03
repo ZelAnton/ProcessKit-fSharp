@@ -960,6 +960,37 @@ tree aggregates (cgroup bytes/operations come from block-device `io.stat` when t
 I/O controller is delegated to that hierarchy). On the POSIX process-group backend
 only the live count is reported and all optional metrics stay `None`.
 
+`MemberStats()` provides the per-member view when a tree aggregate is not enough:
+
+**F#**
+
+```fsharp
+match group.MemberStats() with
+| Ok members ->
+    for memberStats in members do
+        printfn $"pid={memberStats.Pid} cpu={memberStats.CpuTime} rss={memberStats.ResidentMemoryBytes} read={memberStats.IoReadBytes}"
+| Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+if (group.MemberStats() is { IsOk: true, ResultValue: var members })
+    foreach (var member in members)
+        Console.WriteLine($"pid={member.Pid} cpu={member.CpuTime} rss={member.ResidentMemoryBytes}");
+```
+
+The returned list is a best-effort subset of the membership snapshot: a process that
+exits between enumeration and its metric reads is omitted. Windows uses a verified
+query-only handle for each Job member; if query access is denied, a fresh Job
+membership query must still confirm the PID before it is retained with `None`
+metrics. A PID absent from that refresh is omitted as a possible reused foreign
+process. Linux reads `/proc/<pid>` and rechecks the pid identity, while macOS uses
+`proc_pidinfo`. Metrics unavailable on a platform or for a confirmed inaccessible
+member are `None`, never fabricated zeroes. `MemberStats()`
+holds the same lifecycle gate as `Members()` and `Stats()`, and returns the typed
+released-group error after teardown. It never reads command lines or environments.
+
 `SampleStatsAsync(interval)` turns the snapshot into a periodic series as an
 `IAsyncEnumerable<ProcessGroupStats>` — the first sample immediately, then one per
 `interval`:
