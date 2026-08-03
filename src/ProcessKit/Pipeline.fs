@@ -164,7 +164,9 @@ module internal PipelineStageGuard =
 /// (the rightmost checked stage that did not exit with an accepted code, or a `TimedOut`/`Cancelled`
 /// for the whole chain), and `Finished.Stderr` is that representative stage's stderr — identical to what
 /// `Pipeline.RunAsync` would report, never a final-stage-only view. Stopping or disposing tears down
-/// EVERY stage (including a partially started chain), never just the last.
+/// EVERY stage (including a partially started chain), never just the last. A genuine read failure in an
+/// upstream inter-stage relay is returned by `FinishAsync` as `ProcessError.Io`, even if the downstream
+/// stage observed the resulting EOF and exited successfully; a downstream broken pipe remains routine.
 [<Sealed>]
 type PipelineSession
     internal (inner: RunningProcess, commands: Command list, capture: Task<PipelineCapture>, wasCancelled: unit -> bool)
@@ -179,14 +181,17 @@ type PipelineSession
         if wasCancelled () then
             Error(ProcessError.Cancelled (List.last commands).Program)
         else
-            match PipelineClassify.outputTooLargeError commands capture with
+            match PipelineClassify.copyError capture with
             | Some error -> Error error
             | None ->
-                let stage = PipelineClassify.representative capture
-
-                match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
+                match PipelineClassify.outputTooLargeError commands capture with
                 | Some error -> Error error
-                | None -> Ok(Finished(stage.Outcome, stage.Stderr))
+                | None ->
+                    let stage = PipelineClassify.representative capture
+
+                    match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
+                    | Some error -> Error error
+                    | None -> Ok(Finished(stage.Outcome, stage.Stderr))
 
     /// Stream the FINAL stage's stdout line by line as it arrives — the pipeline analogue of
     /// `RunningProcess.StdoutLinesAsync`. Hands out its ONE enumerator exactly once; a second streaming
@@ -229,7 +234,9 @@ type PipelineSession
     /// `Outcome`) plus that stage's stderr — with the same classification `Pipeline.RunAsync` applies:
     /// an `OutputTooLarge` on any stage's fail-loud stream, or a stage-0 stdin-source failure on an
     /// otherwise-successful run, surfaces as `Error`, and a whole-chain cancellation is `Cancelled`. A
-    /// non-zero pipefail exit is *data* in `Finished.Outcome`, not an `Error`. Reaps the whole tree.
+    /// genuine upstream relay read fault also surfaces as `ProcessError.Io`; a downstream broken pipe is
+    /// routine early-consumer teardown. A non-zero pipefail exit is *data* in `Finished.Outcome`, not an
+    /// `Error`. Reaps the whole tree.
     /// Pairs with `StdoutLinesAsync` (it rejoins that stdout-streaming session); called with no prior
     /// streaming it buffers and discards the final stdout, then reports the outcome.
     member _.FinishAsync() : Task<Result<Finished, ProcessError>> =
@@ -418,28 +425,31 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             match! this.Execute cancellationToken with
             | Error error -> return Error error
             | Ok capture ->
-                match PipelineClassify.outputTooLargeError commands capture with
+                match PipelineClassify.copyError capture with
                 | Some error -> return Error error
                 | None ->
-                    let stage = PipelineClassify.representative capture
-
-                    match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
-                    | Some err -> return Error err
+                    match PipelineClassify.outputTooLargeError commands capture with
+                    | Some error -> return Error error
                     | None ->
-                        return
-                            Ok(
-                                ProcessResult<byte[]>(
-                                    stage.Program,
-                                    capture.LastStdout,
-                                    stage.Stderr,
-                                    stage.Outcome,
-                                    capture.Duration,
-                                    capture.LastStdoutTruncated,
-                                    stage.OkCodes,
-                                    ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None),
-                                    stdoutEncoding = (List.last commands).Config.StdoutEncoding
+                        let stage = PipelineClassify.representative capture
+
+                        match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
+                        | Some err -> return Error err
+                        | None ->
+                            return
+                                Ok(
+                                    ProcessResult<byte[]>(
+                                        stage.Program,
+                                        capture.LastStdout,
+                                        stage.Stderr,
+                                        stage.Outcome,
+                                        capture.Duration,
+                                        capture.LastStdoutTruncated,
+                                        stage.OkCodes,
+                                        ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None),
+                                        stdoutEncoding = (List.last commands).Config.StdoutEncoding
+                                    )
                                 )
-                            )
         }
 
     /// Run the pipeline to completion, capturing the last stage's stdout as decoded text (using the
@@ -451,31 +461,34 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
             match! this.Execute cancellationToken with
             | Error error -> return Error error
             | Ok capture ->
-                match PipelineClassify.outputTooLargeError commands capture with
+                match PipelineClassify.copyError capture with
                 | Some error -> return Error error
                 | None ->
-                    let stage = PipelineClassify.representative capture
-
-                    match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
-                    | Some err -> return Error err
+                    match PipelineClassify.outputTooLargeError commands capture with
+                    | Some error -> return Error error
                     | None ->
-                        let encoding = (List.last commands).Config.StdoutEncoding
-                        let text = encoding.GetString capture.LastStdout
+                        let stage = PipelineClassify.representative capture
 
-                        return
-                            Ok(
-                                ProcessResult<string>(
-                                    stage.Program,
-                                    text,
-                                    stage.Stderr,
-                                    stage.Outcome,
-                                    capture.Duration,
-                                    capture.LastStdoutTruncated,
-                                    stage.OkCodes,
-                                    ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None),
-                                    stdoutEncoding = encoding
+                        match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
+                        | Some err -> return Error err
+                        | None ->
+                            let encoding = (List.last commands).Config.StdoutEncoding
+                            let text = encoding.GetString capture.LastStdout
+
+                            return
+                                Ok(
+                                    ProcessResult<string>(
+                                        stage.Program,
+                                        text,
+                                        stage.Stderr,
+                                        stage.Outcome,
+                                        capture.Duration,
+                                        capture.LastStdoutTruncated,
+                                        stage.OkCodes,
+                                        ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None),
+                                        stdoutEncoding = encoding
+                                    )
                                 )
-                            )
         }
 
     // The capture-derived verbs share one implementation with the `Runner` module (`CaptureVerbs`),

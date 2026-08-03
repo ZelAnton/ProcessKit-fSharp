@@ -15,6 +15,12 @@ the relay's downstream is gone. On POSIX the OS may deliver that as `SIGPIPE`; W
 has no `SIGPIPE`, so there it surfaces as a failed write instead. See
 [Unchecked stages](#unchecked-stages) for why that distinction matters.
 
+The relay keeps read-side and write-side failures separate. A genuine failure while reading
+an upstream stage's stdout is reported as `ProcessError.Io` instead of being mistaken for EOF,
+including when the downstream stage observes a truncated stream. A downstream broken pipe,
+or an `IOException`/`ObjectDisposedException` caused by whole-chain teardown, remains a normal
+termination race and stays quiet.
+
 The samples below run inside a `task { }` block and use `match!`; from C# the same
 surface is `await`-able fluent methods.
 
@@ -128,8 +134,9 @@ Every verb also accepts an optional `CancellationToken` — `pipeline.RunAsync(t
 chain-level [`CancelOn`](#timeouts-and-cancellation).
 
 An `Error` from a capture verb such as `OutputStringAsync` means a stage couldn't be *started
-or driven* at all — a spawn failure, a not-found program, broken plumbing — **never** a
-mere non-zero exit. A non-zero exit is data in the `ProcessResult`.
+or driven* at all — a spawn failure, a not-found program, broken plumbing, or a genuine
+upstream relay read failure — **never** a mere non-zero exit. A non-zero exit is data in the
+`ProcessResult`.
 
 The buffering verbs above run the whole chain to completion before returning. For a
 **long-running or interactive** pipeline whose final output you want to read *line by line
@@ -497,7 +504,9 @@ session `StdoutLinesAsync` started — call it *after* streaming lines; after
 that did not exit with an accepted code, or a `TimedOut`/`Cancelled` for the whole chain),
 and `Finished.Stderr` is that stage's stderr — identical to what `RunAsync` reports, never
 a final-stage-only view. A non-zero pipefail exit is *data* in `Finished.Outcome`; a
-fail-loud [output overflow](#fail-loud-output-overflow) on any stage or a stage-0
+genuine upstream relay read failure is returned as `ProcessError.Io`, while a downstream
+broken pipe and teardown race remain quiet. A fail-loud [output overflow](#fail-loud-output-overflow)
+on any stage or a stage-0
 stdin-source failure surfaces as `Error`. The chain-level
 [`Timeout`/`CancelOn`](#timeouts-and-cancellation) still apply — either firing hard-kills
 the tree, and `FinishAsync` then reports `TimedOut`/`Cancelled`. Stopping or disposing

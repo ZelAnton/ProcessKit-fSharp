@@ -989,6 +989,94 @@ module internal Pump =
             Unchecked.defaultof<'T>
         | ex -> raise (StdinSourceFault ex)
 
+    /// Read one inter-stage relay chunk while retaining the fact that the exception came from the
+    /// upstream stream. `Stream.CopyToAsync` combines the read and write sides into one task, so its
+    /// caller cannot tell a genuine upstream read fault from the downstream process closing its input.
+    let private readCopyChunk
+        (source: Stream)
+        (buffer: byte[])
+        (cancellationToken: CancellationToken)
+        : Task<Result<int, exn>> =
+        task {
+            try
+                let! read = source.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).AsTask()
+                return Ok read
+            with ex ->
+                // Preserve the source-side provenance; the relay classifies this separately from a
+                // downstream write failure after the read step returns.
+                return Error ex
+        }
+
+    /// Classify one inter-stage copy. A write-side broken pipe (the downstream stage stopped reading)
+    /// and a write-side teardown race are routine and return `None`. A read-side IOException or
+    /// ObjectDisposedException is quiet only when this pipeline's teardown has already begun; the same
+    /// exception before teardown is a genuine upstream read failure and becomes a typed `ProcessError.Io`.
+    /// Other read/write exceptions are also surfaced as I/O failures rather than being allowed to turn a
+    /// truncated downstream input into a successful pipeline. The task itself never faults, so callers'
+    /// `Task.WhenAll` observations cannot lose the first copy-pump failure.
+    let copyToAsync
+        (upstreamProgram: string)
+        (downstreamProgram: string)
+        (source: Stream)
+        (destination: Stream)
+        (isTearingDown: unit -> bool)
+        (cancellationToken: CancellationToken)
+        : Task<ProcessError option> =
+        task {
+            let buffer = Array.zeroCreate<byte> 8192
+            let mutable reading = true
+            let mutable fault: ProcessError option = None
+
+            while reading && fault.IsNone do
+                let! readResult = readCopyChunk source buffer cancellationToken
+
+                match readResult with
+                | Error ex ->
+                    match ex with
+                    | (:? ObjectDisposedException | :? IOException) when isTearingDown () ->
+                        // The pipeline is already tearing down and closed the relay under an in-flight
+                        // upstream read; the terminal stage outcome remains authoritative.
+                        reading <- false
+                    | _ ->
+                        fault <-
+                            Some(ProcessError.Io $"pipeline stage '{upstreamProgram}' stdout read failed: {ex.Message}")
+
+                        reading <- false
+                | Ok read when read = 0 -> reading <- false
+                | Ok read ->
+                    try
+                        do! destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken)
+                    with
+                    | :? IOException ->
+                        // The downstream stage closed its input early; the resulting broken pipe is the
+                        // normal `producer | head` relay outcome, not a copy-pump error.
+                        reading <- false
+                    | :? ObjectDisposedException ->
+                        // Teardown or an early downstream exit disposed the write end; close the relay
+                        // quietly and let the observed process outcomes decide pipefail.
+                        reading <- false
+                    | :? OperationCanceledException when isTearingDown () ->
+                        // A teardown cancellation raced the write even though the relay normally uses an
+                        // uncancelled token; no data fault should be reported for this routine race.
+                        reading <- false
+                    | :? OperationCanceledException as ex ->
+                        fault <-
+                            Some(
+                                ProcessError.Io $"pipeline stage '{downstreamProgram}' stdin write failed: {ex.Message}"
+                            )
+
+                        reading <- false
+                    | ex ->
+                        fault <-
+                            Some(
+                                ProcessError.Io $"pipeline stage '{downstreamProgram}' stdin write failed: {ex.Message}"
+                            )
+
+                        reading <- false
+
+            return fault
+        }
+
     /// Copy `source` to `destination` chunk-by-chunk, reading via `readSource` so a read-side fault
     /// against a `FromFile`/`FromStream` source is distinguishable, by where it was thrown, from a
     /// write-side broken pipe. Used instead of `Stream.CopyToAsync`, which performs both sides in one

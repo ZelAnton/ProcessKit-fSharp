@@ -37,7 +37,9 @@ type internal PipelineStage =
 /// `OverflowMode.Error` stderr overflow on any stage — not just the final stdout — is surfaced), the
 /// wall-clock duration, whether the pipeline timed out, and a genuine stage-0 stdin source-acquisition
 /// failure observed by the feeder (surfaced by `Pipeline` as `ProcessError.Stdin` on an
-/// otherwise-successful run, like a single command).
+/// otherwise-successful run, like a single command). An inter-stage upstream read failure is retained
+/// separately from the process outcomes so both the buffering and streaming paths surface it as a typed
+/// `ProcessError.Io` instead of accepting a downstream stage's truncated EOF as success.
 type internal PipelineCapture =
     { LastStdout: byte[]
       LastStdoutTruncated: bool
@@ -46,7 +48,8 @@ type internal PipelineCapture =
       Stages: PipelineStage list
       Duration: TimeSpan
       TimedOut: bool
-      Stdin0Error: exn option }
+      Stdin0Error: exn option
+      CopyError: ProcessError option }
 
 /// The pipefail classification over a finished `PipelineCapture` — the rightmost-checked-failure fold,
 /// the stage-0 stdin-source-error rule, and the leftmost-stage output-overflow rule. Extracted from the
@@ -55,6 +58,11 @@ type internal PipelineCapture =
 /// than the streaming path re-deriving a divergent (possibly truncated) classification. Pure functions
 /// over the capture — no I/O, no reap — so both consumers share one source of truth.
 module internal PipelineClassify =
+
+    /// A genuine upstream relay-read failure is a pipeline I/O error even when the downstream stage
+    /// observed the relay's resulting EOF and exited successfully. The relay records it in the capture
+    /// so buffering and streaming completion use the same error channel and precedence.
+    let copyError (capture: PipelineCapture) : ProcessError option = capture.CopyError
 
     /// The representative stage carrying the program/outcome/stderr for the verb result: pipefail's
     /// rightmost *checked* stage that did not exit with an accepted code; if every checked stage
@@ -276,9 +284,10 @@ module internal PipelineRunner =
     ///   missing) simply gets no relay.
     let internal wireSpawnedStage
         (stages: Command[])
-        (copyTasks: ResizeArray<Task>)
+        (copyTasks: ResizeArray<Task<ProcessError option>>)
         (stderrTasks: ResizeArray<Task<Pump.RawCapture>>)
         (setStage0Feed: Pump.StdinFeeder -> unit)
+        (isTearingDown: unit -> bool)
         (index: int)
         (sp: Native.Common.Spawned)
         (prevStdout: Stream option)
@@ -310,13 +319,14 @@ module internal PipelineRunner =
             | Some upstream, Some downstream ->
                 copyTasks.Add(
                     task {
-                        try
-                            do! upstream.CopyToAsync downstream
-                        with _ ->
-                            // A downstream stage that exits early stops reading (broken pipe),
-                            // or the stream is torn down during teardown. Fall through to close
-                            // both ends.
-                            ()
+                        let! fault =
+                            Pump.copyToAsync
+                                stages[index - 1].Program
+                                stages[index].Program
+                                upstream
+                                downstream
+                                isTearingDown
+                                CancellationToken.None
 
                         // Close the write end (EOF to the downstream stage) AND the upstream read
                         // end: if the downstream exited early, closing the read end propagates a
@@ -324,8 +334,9 @@ module internal PipelineRunner =
                         // stops instead of blocking forever on a full stdout pipe.
                         closeQuietly downstream
                         closeQuietly upstream
+
+                        return fault
                     }
-                    :> Task
                 )
             | _ -> ()
 
@@ -373,6 +384,10 @@ module internal PipelineRunner =
                     use group = group
                     let startedAt = Stopwatch.GetTimestamp()
                     use timeoutCts = new CancellationTokenSource()
+                    // Copy relays poll this token when an in-flight upstream read raises an
+                    // IOException/ObjectDisposedException. It is cancelled before any pipeline-owned
+                    // kill/close so teardown races stay quiet without hiding a genuine read fault.
+                    use teardownCts = new CancellationTokenSource()
 
                     use linkedCts =
                         CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
@@ -398,10 +413,11 @@ module internal PipelineRunner =
                     use _registration =
                         linkedCts.Token.Register(fun () ->
                             lock stagingGate (fun () -> cancellationFired <- true)
+                            teardownCts.Cancel()
                             group.KillTree())
 
                     let spawned = ResizeArray<Native.Common.Spawned>()
-                    let copyTasks = ResizeArray<Task>()
+                    let copyTasks = ResizeArray<Task<ProcessError option>>()
                     let stderrTasks = ResizeArray<Task<Pump.RawCapture>>()
                     let mutable prevStdout: Stream option = None
                     let mutable spawnError = None
@@ -420,11 +436,20 @@ module internal PipelineRunner =
                     let stopStage0Feed () =
                         stage0Feed |> Option.iter (fun feeder -> feeder.Stop())
 
+                    let beginTeardown () =
+                        teardownCts.Cancel()
+                        group.KillTree()
+
                     // The shared "wire one spawned stage" mechanics (stage-0 feed / inter-stage relay /
                     // stderr drain), bound to this run's stage list and task collections — the SAME helper
                     // the streaming `start` stages through, so neither path can drift from the other.
                     let wireStage =
-                        wireSpawnedStage stages copyTasks stderrTasks (fun feeder -> stage0Feed <- Some feeder)
+                        wireSpawnedStage
+                            stages
+                            copyTasks
+                            stderrTasks
+                            (fun feeder -> stage0Feed <- Some feeder)
+                            (fun () -> teardownCts.IsCancellationRequested)
 
                     // Set exactly once, the moment stage 0 actually spawns — mirroring the
                     // single-command rule that a spawn failure is never counted as a run
@@ -508,10 +533,10 @@ module internal PipelineRunner =
                     // without this they would leak). The last stage's stdout capture is NOT closed here: the
                     // normal path awaits it just before calling this, so it is fully drained before these
                     // `closeSpawned` calls dispose that stream.
-                    let drainChain (killFirst: bool) : Task<Outcome[] * Pump.RawCapture[]> =
+                    let drainChain (killFirst: bool) : Task<Outcome[] * Pump.RawCapture[] * ProcessError option> =
                         task {
                             if killFirst then
-                                group.KillTree()
+                                beginTeardown ()
                                 stopStage0Feed ()
 
                             let! outcomes =
@@ -523,13 +548,15 @@ module internal PipelineRunner =
                                 else
                                     Task.FromResult(Array.empty<Outcome>)
 
-                            do! Task.WhenAll(copyTasks.ToArray())
+                            let! copyErrors = Task.WhenAll(copyTasks.ToArray())
                             let! captures = Task.WhenAll(stderrTasks.ToArray())
+
+                            let copyError = copyErrors |> Array.tryPick id
 
                             for sp in spawned do
                                 Pump.closeSpawned sp
 
-                            return outcomes, captures
+                            return outcomes, captures, copyError
                         }
 
                     match spawnError with
@@ -563,7 +590,7 @@ module internal PipelineRunner =
                         // happen-before the waits, so the reap can never block on a raced stage the callback
                         // had not reached yet; this path keeps the reap outcomes and stderr captures to build
                         // its stage list.
-                        let! killedOutcomes, stderrCaptures = drainChain true
+                        let! killedOutcomes, stderrCaptures, _ = drainChain true
 
                         let duration = Stopwatch.GetElapsedTime startedAt
                         let timedOut = timeoutCts.IsCancellationRequested
@@ -642,7 +669,8 @@ module internal PipelineRunner =
                                       Stages = stageResults
                                       Duration = duration
                                       TimedOut = true
-                                      Stdin0Error = None }
+                                      Stdin0Error = None
+                                      CopyError = None }
                     | None ->
                         let lastSpawned = spawned[spawned.Count - 1]
 
@@ -694,7 +722,7 @@ module internal PipelineRunner =
                             observeStages
                                 waits
                                 isCheckedFailure
-                                group.KillTree
+                                beginTeardown
                                 (fun () -> linkedCts.IsCancellationRequested)
                                 (fun () -> timeoutCts.IsCancellationRequested)
                                 disarmTimeout
@@ -709,7 +737,7 @@ module internal PipelineRunner =
                         // only lazily inside `observeStages`, the reap is already done there (never re-reap),
                         // and stage 0's feed is stopped later once its fault has been observed below.
                         let! lastCapture = captureTask
-                        let! _, stderrCaptures = drainChain false
+                        let! _, stderrCaptures, copyError = drainChain false
 
                         let duration = Stopwatch.GetElapsedTime startedAt
                         let timedOut = observation.TimedOut
@@ -777,7 +805,8 @@ module internal PipelineRunner =
                                       Stages = stageResults
                                       Duration = duration
                                       TimedOut = timedOut
-                                      Stdin0Error = stdin0Error }
+                                      Stdin0Error = stdin0Error
+                                      CopyError = copyError }
         }
 
     /// The live materials a streaming pipeline session (`Pipeline.StartAsync`) is built from. `Host` is a
@@ -837,6 +866,10 @@ module internal PipelineRunner =
                     let startedAt = Stopwatch.GetTimestamp()
                     let startTimeUtc = DateTime.UtcNow
                     let timeoutCts = new CancellationTokenSource()
+                    // Copy relays poll this token when an in-flight upstream read raises an
+                    // IOException/ObjectDisposedException. It is cancelled before any pipeline-owned
+                    // kill/close so teardown races stay quiet without hiding a genuine read fault.
+                    let teardownCts = new CancellationTokenSource()
 
                     // Link the verb token, the chain-level `CancelOn`, and the deadline into one token whose
                     // firing hard-kills the whole tree. The session owns (and disposes) all three CTS /
@@ -862,10 +895,11 @@ module internal PipelineRunner =
                     let registration =
                         linkedCts.Token.Register(fun () ->
                             lock stagingGate (fun () -> cancellationFired <- true)
+                            teardownCts.Cancel()
                             group.KillTree())
 
                     let spawned = ResizeArray<Native.Common.Spawned>()
-                    let copyTasks = ResizeArray<Task>()
+                    let copyTasks = ResizeArray<Task<ProcessError option>>()
                     let stderrTasks = ResizeArray<Task<Pump.RawCapture>>()
                     let mutable prevStdout: Stream option = None
                     let mutable spawnError = None
@@ -879,7 +913,12 @@ module internal PipelineRunner =
                     // The same shared "wire one spawned stage" mechanics the buffered `run` stages through
                     // (stage-0 feed / inter-stage relay / stderr drain) — one implementation, two callers.
                     let wireStage =
-                        wireSpawnedStage stages copyTasks stderrTasks (fun feeder -> stage0Feed <- Some feeder)
+                        wireSpawnedStage
+                            stages
+                            copyTasks
+                            stderrTasks
+                            (fun feeder -> stage0Feed <- Some feeder)
+                            (fun () -> teardownCts.IsCancellationRequested)
 
                     while index < stages.Length && spawnError.IsNone && not stagingHalted do
                         // Force `Piped` stdout on every stage (the last stage's is the streamed output), and
@@ -918,6 +957,7 @@ module internal PipelineRunner =
                         // stages are already live, later ones never started) so no stage is orphaned, then
                         // return an error — no session is handed back. Reap goes through `group.WaitHandle`,
                         // the reap-once choke point, exactly like `run`'s abort branch.
+                        teardownCts.Cancel()
                         group.KillTree()
                         stopStage0Feed ()
 
@@ -927,7 +967,7 @@ module internal PipelineRunner =
                             |> Seq.toArray
                             |> Task.WhenAll
 
-                        do! Task.WhenAll(copyTasks.ToArray())
+                        let! _ = Task.WhenAll(copyTasks.ToArray())
                         let! _ = Task.WhenAll(stderrTasks.ToArray())
 
                         for sp in spawned do
@@ -935,6 +975,7 @@ module internal PipelineRunner =
 
                         registration.Dispose()
                         (group :> IDisposable).Dispose()
+                        teardownCts.Dispose()
                         timeoutCts.Dispose()
                         linkedCts.Dispose()
 
@@ -973,11 +1014,13 @@ module internal PipelineRunner =
                         let killTreeGated () =
                             lock teardownGate (fun () ->
                                 if not tornDown then
+                                    teardownCts.Cancel()
                                     group.KillTree())
 
                         let gracefulKillGated (grace: TimeSpan) : Task =
                             lock teardownGate (fun () ->
                                 if not tornDown then
+                                    teardownCts.Cancel()
                                     group.GracefulKillTree(stages[0].Config.StopSignal, grace)
                                 else
                                     Task.CompletedTask)
@@ -1017,8 +1060,9 @@ module internal PipelineRunner =
                                         (fun () -> timeoutCts.IsCancellationRequested)
                                         disarmTimeout
 
-                                do! Task.WhenAll(copyTasks.ToArray())
+                                let! copyErrors = Task.WhenAll(copyTasks.ToArray())
                                 let! stderrCaptures = Task.WhenAll(stderrTasks.ToArray())
+                                let copyError = copyErrors |> Array.tryPick id
                                 let duration = Stopwatch.GetElapsedTime startedAt
                                 let outcomes = observation.Outcomes
 
@@ -1044,7 +1088,8 @@ module internal PipelineRunner =
                                       Stages = stageResults
                                       Duration = duration
                                       TimedOut = observation.TimedOut
-                                      Stdin0Error = stdin0Error }
+                                      Stdin0Error = stdin0Error
+                                      CopyError = copyError }
 
                                 captureTcs.TrySetResult capture |> ignore
 
@@ -1072,6 +1117,7 @@ module internal PipelineRunner =
                                 // double-reaps nor leaks a zombie. On the normal path (a terminal verb reaped
                                 // through `observeStages` already) these waits hit the warm linger cache and
                                 // return promptly; their discarded outcomes don't matter here.
+                                teardownCts.Cancel()
                                 group.KillTree()
                                 stopStage0Feed ()
 
@@ -1081,7 +1127,7 @@ module internal PipelineRunner =
                                     |> Seq.toArray
                                     |> Task.WhenAll
 
-                                do! Task.WhenAll(copyTasks.ToArray())
+                                let! _ = Task.WhenAll(copyTasks.ToArray())
                                 let! _ = Task.WhenAll(stderrTasks.ToArray())
 
                                 for sp in spawned do
@@ -1093,6 +1139,7 @@ module internal PipelineRunner =
                                 lock teardownGate (fun () -> tornDown <- true)
                                 registration.Dispose()
                                 (group :> IDisposable).Dispose()
+                                teardownCts.Dispose()
                                 timeoutCts.Dispose()
                                 linkedCts.Dispose()
                             }

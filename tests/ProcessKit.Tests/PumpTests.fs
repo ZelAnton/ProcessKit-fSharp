@@ -170,6 +170,88 @@ type PumpTests() =
         let feeder = Pump.feedStdinSource (Some stdin) (Some source) false
         feeder.Task.Result
 
+    // --- T-289: inter-stage copy-pump provenance and teardown classification ---
+
+    [<Test>]
+    member _.``copyToAsync preserves a genuine upstream read failure through Task.WhenAll``() =
+        use source =
+            new ErroringReadStream([ bytesOf "partial" ], IOException "upstream read failed")
+
+        use destination = new MemoryStream()
+
+        let observed =
+            Task
+                .WhenAll(
+                    [| Pump.copyToAsync
+                           "upstream-program"
+                           "downstream-program"
+                           (source :> Stream)
+                           (destination :> Stream)
+                           (fun () -> false)
+                           CancellationToken.None |]
+                )
+                .Result.[0]
+
+        match observed with
+        | Some(ProcessError.Io detail) ->
+            Assert.That(detail, Does.Contain "upstream-program")
+            Assert.That(detail, Does.Contain "upstream read failed")
+        | _ -> Assert.Fail "Expected the upstream read failure to be retained."
+
+        Assert.That(Encoding.UTF8.GetString(destination.ToArray()), Is.EqualTo "partial")
+
+    [<Test>]
+    member _.``copyToAsync quiets an upstream teardown race``() =
+        use source = new ErroringReadStream([], IOException "pipe closed during teardown")
+        use destination = new MemoryStream()
+
+        let result =
+            (Pump.copyToAsync
+                "upstream-program"
+                "downstream-program"
+                (source :> Stream)
+                (destination :> Stream)
+                (fun () -> true)
+                CancellationToken.None)
+                .Result
+
+        Assert.That(result.IsNone, Is.True)
+
+    [<Test>]
+    member _.``copyToAsync quiets a downstream broken pipe``() =
+        use source = new MemoryStream(bytesOf "payload")
+        use destination = new BrokenPipeStdinStream()
+
+        let result =
+            (Pump.copyToAsync
+                "upstream-program"
+                "downstream-program"
+                (source :> Stream)
+                (destination :> Stream)
+                (fun () -> false)
+                CancellationToken.None)
+                .Result
+
+        Assert.That(result.IsNone, Is.True)
+
+    [<Test>]
+    member _.``copyToAsync completes a normal inter-stage copy``() =
+        use source = new MemoryStream(bytesOf "payload")
+        use destination = new MemoryStream()
+
+        let result =
+            (Pump.copyToAsync
+                "upstream-program"
+                "downstream-program"
+                (source :> Stream)
+                (destination :> Stream)
+                (fun () -> false)
+                CancellationToken.None)
+                .Result
+
+        Assert.That(result.IsNone, Is.True)
+        Assert.That(Encoding.UTF8.GetString(destination.ToArray()), Is.EqualTo "payload")
+
     [<Test>]
     member _.``readLines strips a leading UTF-8 BOM``() =
         let bytes =
