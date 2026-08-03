@@ -1404,9 +1404,35 @@ module internal Windows =
     // tests use it to force one late native failure while allowing the rollback write to reach the OS.
     let mutable ioRateWriteErrorForTests: int option = None
 
-    // Successful native I/O writes observed by Windows-gated rollback tests. Production leaves this
-    // empty; the seam proves that a rollback write reached and was accepted by the Job Object.
-    let mutable ioRateWriteSuccessesForTests: (string * int64 * int64 * bool) list = []
+    // Successful native I/O writes observed by Windows-gated rollback tests. Production leaves capture
+    // disabled, and the bounded buffer is protected because groups can update concurrently.
+    let private ioRateWriteSuccessesGate = obj ()
+    let private maxIoRateWriteSuccessesForTests = 32
+    let mutable private ioRateWriteSuccessCaptureEnabledForTests = 0
+
+    let mutable private ioRateWriteSuccessesStateForTests: (string * int64 * int64 * bool) list =
+        []
+
+    let enableIoRateWriteSuccessCaptureForTests () =
+        lock ioRateWriteSuccessesGate (fun () ->
+            ioRateWriteSuccessesStateForTests <- []
+            Interlocked.Exchange(&ioRateWriteSuccessCaptureEnabledForTests, 1) |> ignore)
+
+    let disableIoRateWriteSuccessCaptureForTests () =
+        lock ioRateWriteSuccessesGate (fun () ->
+            Interlocked.Exchange(&ioRateWriteSuccessCaptureEnabledForTests, 0) |> ignore
+            ioRateWriteSuccessesStateForTests <- [])
+
+    let ioRateWriteSuccessesForTests () =
+        lock ioRateWriteSuccessesGate (fun () -> ioRateWriteSuccessesStateForTests)
+
+    let private captureIoRateWriteSuccessForTests entry =
+        if Interlocked.CompareExchange(&ioRateWriteSuccessCaptureEnabledForTests, 0, 0) = 1 then
+            lock ioRateWriteSuccessesGate (fun () ->
+                if Interlocked.CompareExchange(&ioRateWriteSuccessCaptureEnabledForTests, 0, 0) = 1 then
+                    ioRateWriteSuccessesStateForTests <-
+                        (entry :: ioRateWriteSuccessesStateForTests)
+                        |> List.truncate maxIoRateWriteSuccessesForTests)
 
     [<StructLayout(LayoutKind.Sequential)>]
     type private JOBOBJECT_CPU_RATE_CONTROL_INFORMATION =
@@ -1620,7 +1646,7 @@ module internal Windows =
 
             match result with
             | Ok() ->
-                ioRateWriteSuccessesForTests <- (target, maxBandwidth, maxIops, enabled) :: ioRateWriteSuccessesForTests
+                captureIoRateWriteSuccessForTests (target, maxBandwidth, maxIops, enabled)
 
                 Ok()
             | Error code -> Error(ioRateErrorMessage code)

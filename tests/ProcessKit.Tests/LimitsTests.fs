@@ -2254,10 +2254,16 @@ type WindowsIoRateControlTests() =
             | Ok group ->
                 use group = group
 
+                Assert.That(
+                    Native.Windows.ioRateWriteSuccessesForTests (),
+                    Is.Empty,
+                    "successful native I/O writes must not be retained unless test capture is enabled"
+                )
+
                 try
-                    // Clear creation's successful write, then inject one failure after the extended-limit
-                    // write. The one-shot seam must let the rollback write restore the prior Job policy.
-                    Native.Windows.ioRateWriteSuccessesForTests <- []
+                    // Enable capture before injecting one failure after the extended-limit write. The
+                    // one-shot seam must let the rollback write restore the prior Job policy.
+                    Native.Windows.enableIoRateWriteSuccessCaptureForTests ()
                     Native.Windows.ioRateWriteErrorForTests <- Some 5
                     let attempted = initial.WithMemoryMax(256L * 1024L * 1024L)
 
@@ -2269,14 +2275,14 @@ type WindowsIoRateControlTests() =
                     | Ok() -> Assert.Fail "the injected Job I/O write failure must fail the live update"
 
                     Assert.That(
-                        Native.Windows.ioRateWriteSuccessesForTests,
+                        Native.Windows.ioRateWriteSuccessesForTests (),
                         Does.Contain((target, 1048576L, 1L, true)),
                         "rollback must successfully re-apply the previous Job I/O policy after the late failure"
                     )
 
                 finally
                     Native.Windows.ioRateWriteErrorForTests <- None
-                    Native.Windows.ioRateWriteSuccessesForTests <- []
+                    Native.Windows.disableIoRateWriteSuccessCaptureForTests ()
 
                 assertIoTarget initial group.Options.Limits
                 Assert.That(group.Options.Limits.MemoryMax, Is.EqualTo None)
