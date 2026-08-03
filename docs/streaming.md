@@ -168,6 +168,8 @@ compressed data, and other output where text is the wrong abstraction.
 **F#**
 
 ```fsharp
+open System.IO
+
 task {
     match! (Command.create "git" |> Command.args [ "archive"; "HEAD" ]).StartAsync() with
     | Error err -> eprintfn $"{err.Message}"
@@ -199,6 +201,8 @@ task {
 **C#**
 
 ```csharp
+using System.IO;
+
 await using var proc = (await new Command("git").Args(["archive", "HEAD"]).StartAsync()).GetValueOrThrow();
 using var destination = Stream.Null;
 
