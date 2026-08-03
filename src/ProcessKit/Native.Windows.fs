@@ -1400,9 +1400,13 @@ module internal Windows =
     // `finally` block so the native rollback path is exercised deterministically.
     let mutable cpuRateWriteErrorForTests: int option = None
 
-    // Fault injection for the Job I/O rate write. Production leaves this unset; Windows-gated tests
-    // use it to force a late native failure and verify that the previous Job configuration is restored.
+    // One-shot fault injection for the Job I/O rate write. Production leaves this unset; Windows-gated
+    // tests use it to force one late native failure while allowing the rollback write to reach the OS.
     let mutable ioRateWriteErrorForTests: int option = None
+
+    // Successful native I/O writes observed by Windows-gated rollback tests. Production leaves this
+    // empty; the seam proves that a rollback write reached and was accepted by the Job Object.
+    let mutable ioRateWriteSuccessesForTests: (string * int64 * int64 * bool) list = []
 
     [<StructLayout(LayoutKind.Sequential)>]
     type private JOBOBJECT_CPU_RATE_CONTROL_INFORMATION =
@@ -1602,7 +1606,7 @@ module internal Windows =
             Marshal.StructureToPtr<JOBOBJECT_IO_RATE_CONTROL_INFORMATION>(info, infoBuffer, false)
 
             let result =
-                match ioRateWriteErrorForTests with
+                match Interlocked.Exchange(&ioRateWriteErrorForTests, None) with
                 | Some code -> Error code
                 | None ->
                     try
@@ -1614,7 +1618,12 @@ module internal Windows =
                     | :? EntryPointNotFoundException -> Error ERROR_PROC_NOT_FOUND
                     | :? DllNotFoundException -> Error ERROR_PROC_NOT_FOUND
 
-            result |> Result.mapError ioRateErrorMessage
+            match result with
+            | Ok() ->
+                ioRateWriteSuccessesForTests <- (target, maxBandwidth, maxIops, enabled) :: ioRateWriteSuccessesForTests
+
+                Ok()
+            | Error code -> Error(ioRateErrorMessage code)
         finally
             Marshal.FreeHGlobal infoBuffer
             Marshal.FreeHGlobal volumeBuffer

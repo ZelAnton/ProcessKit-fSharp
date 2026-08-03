@@ -2255,18 +2255,28 @@ type WindowsIoRateControlTests() =
                 use group = group
 
                 try
-                    // The injected I/O failure occurs after the extended-limit write, so the live update
-                    // must restore that earlier Job block and keep the previously configured I/O policy.
+                    // Clear creation's successful write, then inject one failure after the extended-limit
+                    // write. The one-shot seam must let the rollback write restore the prior Job policy.
+                    Native.Windows.ioRateWriteSuccessesForTests <- []
                     Native.Windows.ioRateWriteErrorForTests <- Some 5
                     let attempted = initial.WithMemoryMax(256L * 1024L * 1024L)
 
                     match group.UpdateLimits attempted with
-                    | Error(ProcessError.ResourceLimit detail) -> Assert.That(detail, Does.Contain "I/O")
+                    | Error(ProcessError.ResourceLimit detail) ->
+                        Assert.That(detail, Does.Contain "SetIoRateControlInformationJobObject")
                     | Error error ->
                         Assert.Fail $"expected a typed ResourceLimit for the injected native error, got {error}"
                     | Ok() -> Assert.Fail "the injected Job I/O write failure must fail the live update"
+
+                    Assert.That(
+                        Native.Windows.ioRateWriteSuccessesForTests,
+                        Does.Contain((target, 1048576L, 1L, true)),
+                        "rollback must successfully re-apply the previous Job I/O policy after the late failure"
+                    )
+
                 finally
                     Native.Windows.ioRateWriteErrorForTests <- None
+                    Native.Windows.ioRateWriteSuccessesForTests <- []
 
                 assertIoTarget initial group.Options.Limits
                 Assert.That(group.Options.Limits.MemoryMax, Is.EqualTo None)

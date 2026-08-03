@@ -25,6 +25,7 @@ suspend/resume, member listing, resource limits, or stats.
 - [Signals and suspend/resume](#signals-and-suspendresume)
 - [Listing members](#listing-members)
 - [Resource limits](#resource-limits)
+- [Disk I/O rate limits](#disk-io-rate-limits)
 - [Stats](#stats)
 
 ## Creating a group
@@ -609,7 +610,7 @@ using var group = created.GetValueOrThrow();
 await group.StartAsync(new Command("untrusted-tool")); // ... runs within the limited group ...
 ```
 
-The five caps are:
+The six caps are:
 
 - `WithMemoryMax(bytes)` — a whole-tree memory ceiling, in bytes (`int64`).
 - `WithMaxProcesses(count)` — the maximum number of processes the tree may hold.
@@ -627,6 +628,10 @@ The five caps are:
 - `WithCpuTimeMax(duration)` — CPU time, not wall time. Windows applies the Job's
   `PerJobUserTimeLimit`; POSIX installs `RLIMIT_CPU` before each child `exec` (soft limit rounded up
   to seconds, hard limit one second later so `SIGXCPU` can be observed).
+- `WithIoMax(target, readBytesPerSecond, writeBytesPerSecond, readOperationsPerSecond, writeOperationsPerSecond)` —
+  directional disk bandwidth and IOPS ceilings for one explicit device or volume. The overload using
+  `int64` treats zero as unbounded; the option overload uses `None`. At least one direction must be
+  bounded, and every supplied rate must be positive.
 
 Linux cgroup v2 also offers the `WithOomGroupKill()` policy. It writes
 `memory.oom.group=1`, so an OOM event kills every process in the contained tree as one unit instead
@@ -638,10 +643,11 @@ triggered by an ancestor cgroup.
 The configured caps are also readable back: `group.Options.Limits` is a
 `ResourceLimits` whose `MemoryMax` (`int64 option`), `MaxProcesses` (`int option`),
 `CpuQuota` (`float option`), `CpuTimeMax` (`TimeSpan option`), `OomGroupKill` (`bool`), and `CpuAffinity` (`IReadOnlyList<int> option`, in
-ascending order) are `Some` only for the limits you set (`ResourceLimits.None` is
-the empty set). You can build a `ResourceLimits` value directly with the same
-`WithMemoryMax` / `WithMaxProcesses` / `WithCpuQuota` / `WithCpuAffinity` methods
-if you want to inspect or compose limits before applying them.
+ascending order), plus `IoMax` (`IoMax option`), are `Some` only for the limits you set
+(`ResourceLimits.None` is the empty set). `IoMax` reads back the target and all four
+directional rates accepted by the backend. You can build a `ResourceLimits` value directly
+with the same `WithMemoryMax` / `WithMaxProcesses` / `WithCpuQuota` / `WithCpuAffinity` /
+`WithIoMax` methods if you want to inspect or compose limits before applying them.
 
 Limits need a **real container** — a Windows Job Object or a Linux cgroup v2.
 
@@ -653,6 +659,7 @@ Limits need a **real container** — a Windows Job Object or a Linux cgroup v2.
 | CPU quota | 🟡 approximate | ✅ (`cpu.max`) | ❌ |
 | CPU-time maximum | ✅ whole Job | ✅ per spawned process (`RLIMIT_CPU`) | ✅ per spawned process (`RLIMIT_CPU`) |
 | [CPU affinity](#cpu-affinity) | ✅ mask, cores 0–63 | ✅ (`cpuset.cpus`) | ❌ |
+| [Disk I/O rate](#disk-io-rate-limits) | ✅ per-volume aggregate | ✅ per-device (`io.max`) | ❌ `Unsupported` |
 | [UI restrictions](#windows-ui-restrictions) | ✅ clipboard/desktop/exit-Windows | ❌ `Unsupported` | ❌ `Unsupported` |
 
 Where a requested cap can't be enforced, `Create` **fails fast** with
@@ -664,6 +671,44 @@ run at the **real cgroup v2 root** (cgroup v2's "no internal processes" rule let
 the controllers be enabled only there) — so an ordinary container or a
 systemd-managed process fails too. The prerequisites are spelled out in
 [platform-support.md](platform-support.md).
+
+### Disk I/O rate limits
+
+`WithIoMax` applies one directional I/O policy to one explicit target and is exposed
+through both `ResourceLimits.WithIoMax` and `ProcessGroupOptions.WithIoMax`. The target
+and rates are preserved in `group.Options.Limits.IoMax` after a successful create or
+live update, so callers can read back the accepted policy without reconstructing it
+from the builder.
+
+The target has platform-specific meaning:
+
+- **Linux cgroup v2** treats `target` as a `major:minor` block-device key in
+  `io.max`. Read bandwidth (`rbps`), write bandwidth (`wbps`), read IOPS (`riops`),
+  and write IOPS (`wiops`) are independent; an unbounded direction is rendered as
+  `max`. The `io` controller must be delegated. Replacing one target with another
+  is two separate `io.max` writes — first clearing the old device key, then writing
+  the new key — because each nested device key is updated independently. If a later
+  write fails, the backend rolls back the already-applied writes in reverse order,
+  including the old target.
+- **Windows Job Objects** treats `target` as an NT volume device name. The Job
+  Object I/O rate controller provides one aggregate bandwidth ceiling and one
+  aggregate IOPS ceiling per volume, so read/write byte rates must match and
+  read/write operation rates must match. An unavailable Job I/O API is reported as
+  `ProcessError.Unsupported`; an invalid volume or incompatible rates remain a
+  typed `ProcessError.ResourceLimit`.
+
+`UpdateLimits` is a full replacement on both limit-capable mechanisms. Passing
+`ResourceLimits.None` removes the I/O policy; changing only the rates updates the
+same target, while changing the target performs the separate disable/write sequence
+described above. A failed live update restores the previous native policy before
+returning its typed error, and `group.Options.Limits` changes only after the complete
+replacement succeeds.
+
+macOS, BSD, and the Linux POSIX process-group fallback have no whole-tree I/O
+controller. `Create` and `UpdateLimits` therefore return
+`ProcessError.Unsupported` for `WithIoMax` instead of running the tree without the
+requested cap. A Linux cgroup v2 hierarchy without the delegated `io` controller
+also returns `Unsupported` before attempting controller writes.
 
 **F#**
 
