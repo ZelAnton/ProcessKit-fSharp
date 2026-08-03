@@ -1143,6 +1143,7 @@ class ProcessKit.RunningProcess
   member ProfileAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.RunProfile>
   member ResizeAsync(System.Int32, System.Int32) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member Signal(ProcessKit.Signal) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member StdoutChunksAsync() : System.Collections.Generic.IAsyncEnumerable<System.ReadOnlyMemory<System.Byte>>
   member StdoutJsonLinesAsync<T>(System.Text.Json.JsonSerializerOptions) : System.Collections.Generic.IAsyncEnumerable<T>
   member StdoutJsonLinesAsync<T>(System.Text.Json.Serialization.Metadata.JsonTypeInfo<T>) : System.Collections.Generic.IAsyncEnumerable<T>
   member StdoutLinesAsync() : System.Collections.Generic.IAsyncEnumerable<System.String>

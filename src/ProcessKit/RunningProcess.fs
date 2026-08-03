@@ -80,13 +80,14 @@ type WaitAnyResult internal (index: int, outcome: Outcome) =
     member _.Outcome = outcome
 
 /// The single output consumption a `RunningProcess` has been claimed for. Its output pipes are
-/// pumped exactly once: a buffered one-shot verb, a stdout-streaming session, or an event-streaming
-/// session — never two readers on the same pipe.
+/// pumped exactly once: a buffered one-shot verb, a stdout-streaming session, a byte-chunk session, or
+/// an event-streaming session — never two readers on the same pipe.
 [<RequireQualifiedAccess>]
 type internal Consumption =
     | Fresh
     | Buffered
     | StdoutStreaming
+    | StdoutChunkStreaming
     | EventStreaming
     | Interactive
 
@@ -435,11 +436,16 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // handle that never gets past that gate (a buffered/event-streaming verb claimed first) never has
     // this flag poisoned by an attempt that was refused for an unrelated reason.
     let mutable stdoutLinesClaimed = false
+    // The chunk-streaming analogue of `stdoutLinesClaimed`: the session setup is deliberately
+    // reentrant for `FinishAsync`/`ExitTask`, but the public enumerator is handed out only once.
+    let mutable stdoutChunksClaimed = false
     let mutable stdoutLineCount = 0
+    let mutable stdoutChunkCount = 0
     let mutable stderrLineCount = 0
     let mutable droppedStreamLineCount = 0
     let mutable stderrStreamBuffer = Unchecked.defaultof<Pump.LineBuffer>
     let mutable streamOutcome = Unchecked.defaultof<Task<Outcome>>
+    let mutable chunkOutcome = Unchecked.defaultof<Task<Outcome>>
 
     let bumpDroppedStreamLine () =
         Interlocked.Increment(&droppedStreamLineCount) |> ignore
@@ -451,10 +457,14 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     let bumpStdoutLine () =
         Interlocked.Increment(&stdoutLineCount) |> ignore
 
+    let bumpStdoutChunk () =
+        Interlocked.Increment(&stdoutChunkCount) |> ignore
+
     let bumpStderrLine () =
         Interlocked.Increment(&stderrLineCount) |> ignore
 
     let readStdoutLineCount () = Volatile.Read(&stdoutLineCount)
+    let readStdoutChunkCount () = Volatile.Read(&stdoutChunkCount)
     let readStderrLineCount () = Volatile.Read(&stderrLineCount)
 
     // One sequence domain for both event pumps. The atomic increment records the order in which the
@@ -494,6 +504,11 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // is written by exactly one pump, the event channel by two (stdout + stderr), and either is bounded
     // when `config.StreamBuffer` opts in (else unbounded, as before).
     let stdoutChannel: Channel<string> = StreamChannel.create config.StreamBuffer true
+
+    // The byte-chunk session has its own channel type but shares the same configured capacity and
+    // full-mode policy. It remains dormant unless `StdoutChunksAsync` claims this handle.
+    let stdoutChunkChannel: Channel<ReadOnlyMemory<byte>> =
+        StreamChannel.create config.StreamBuffer true
 
     let eventChannel: Channel<OutputEvent> =
         StreamChannel.create config.StreamBuffer false
@@ -1156,9 +1171,10 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// Total stderr lines pumped so far.
     member _.StderrLineCount = readStderrLineCount ()
 
-    /// Lines dropped so far by a bounded streaming policy's `StreamFullMode.DropOldest`/`DropNewest`
-    /// (always `0` unless `Command.StreamBuffer` is configured with one of those modes) — the
-    /// streaming analogue of a buffered verb's `ProcessResult.Truncated`.
+    /// Stream items dropped so far by a bounded streaming policy's `StreamFullMode.DropOldest`/
+    /// `DropNewest` (always `0` unless `Command.StreamBuffer` is configured with one of those modes).
+    /// For line/event streams this counts dropped lines/events; for `StdoutChunksAsync` it counts
+    /// dropped chunks. It is the streaming analogue of a buffered verb's `ProcessResult.Truncated`.
     member _.DroppedStreamLineCount = Volatile.Read(&droppedStreamLineCount)
 
     /// Take the parent side of the POSIX full-duplex channel connected to `targetFd` in the child.
@@ -1779,6 +1795,113 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
 
                 true)
 
+    // The byte-chunk counterpart to `StartStdoutStreaming`. It owns the same stdout pipe and stderr
+    // capture, but its pump deliberately does no decoding or line framing: one channel item is one
+    // non-empty OS read. The setup is reentrant for `FinishAsync`/`ExitTask`, while the public
+    // `StdoutChunksAsync` method below has its own one-enumerator guard.
+    member private _.StartStdoutChunkStreaming() : bool =
+        lock stateLock (fun () ->
+            if consumption = Consumption.StdoutChunkStreaming then
+                true
+            elif consumption <> Consumption.Fresh then
+                false
+            else
+                consumption <- Consumption.StdoutChunkStreaming
+                let stderrBuffer = Pump.LineBuffer(config.OutputBuffer)
+                stderrStreamBuffer <- stderrBuffer
+
+                let stdoutPump =
+                    task {
+                        try
+                            match stdoutStream with
+                            | Some stream ->
+                                do!
+                                    Pump.readBytesUntilDone
+                                        stream
+                                        config.StdoutTee
+                                        (fun chunk ->
+                                            bumpStdoutChunk ()
+
+                                            writeStreamItem
+                                                stdoutChunkChannel.Writer
+                                                stdoutChunkChannel.Reader
+                                                readStdoutChunkCount
+                                                bumpDroppedStreamLine
+                                                chunk)
+                                        (fun () -> disposalCts.Token.IsCancellationRequested)
+                                        CancellationToken.None
+                            | None -> ()
+
+                            stdoutChunkChannel.Writer.TryComplete() |> ignore
+                        with
+                        | :? OperationCanceledException when disposalCts.Token.IsCancellationRequested ->
+                            // Disposal cancels a backpressured writer so the abandoned chunk pump can
+                            // finish without turning routine handle teardown into a stream fault.
+                            stdoutChunkChannel.Writer.TryComplete() |> ignore
+                        | ex ->
+                            // A genuine read fault, a throwing tee, or a bounded-channel failure must
+                            // wake the chunk consumer and remain visible through `chunkOutcome`.
+                            let reported = reportedPumpFault ex
+                            stdoutChunkChannel.Writer.TryComplete reported |> ignore
+                            ExceptionDispatchInfo.Throw reported
+                    }
+
+                let stderrPump =
+                    task {
+                        try
+                            do!
+                                StreamChannel.pumpLines
+                                    stderrStream
+                                    config.StderrEncoding
+                                    config.StderrLineTerminator
+                                    config.StderrTee
+                                    (fun line ->
+                                        invokeLine config.OnStderrLine line
+                                        bumpStderrLine ()
+                                        stderrBuffer.Add line
+                                        ValueTask.CompletedTask)
+                                    config.OutputBuffer.MaxBytes
+                                    (fun () -> disposalCts.Token.IsCancellationRequested)
+                        with ex ->
+                            // Complete stdout on a sibling failure so a consumer cannot wait forever for
+                            // a channel whose stderr pump has already made the combined session fail.
+                            let reported = reportedPumpFault ex
+                            stdoutChunkChannel.Writer.TryComplete reported |> ignore
+                            ExceptionDispatchInfo.Throw reported
+                    }
+
+                killTreeOnPumpFault (stdoutPump :> Task)
+                killTreeOnPumpFault (stderrPump :> Task)
+
+                chunkOutcome <-
+                    task {
+                        let! outcome = waitWithTimeout ()
+                        do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
+                        return outcome
+                    }
+
+                // The enumerator may be abandoned without a subsequent FinishAsync; keep the combined
+                // task observed while preserving its original exception for a real awaiter.
+                observeFault chunkOutcome
+
+                true)
+
+    /// Stream stdout as raw byte chunks. Each item is a non-empty `ReadOnlyMemory<byte>` containing
+    /// exactly one underlying read, including NUL bytes, invalid UTF-8, and arbitrary read boundaries.
+    /// The returned memory owns its backing array and remains valid after the next item is produced.
+    /// Call `FinishAsync()` afterwards for stderr and the process outcome.
+    member this.StdoutChunksAsync() : IAsyncEnumerable<ReadOnlyMemory<byte>> =
+        if not (this.StartStdoutChunkStreaming()) then
+            raise (InvalidOperationException alreadyConsumedMessage)
+
+        lock stateLock (fun () ->
+            if stdoutChunksClaimed then
+                raise (InvalidOperationException alreadyConsumedMessage)
+            else
+                stdoutChunksClaimed <- true)
+
+        stdoutChunkChannel.Reader.ReadAllAsync()
+
     /// Stream stdout line by line as it arrives. Call `FinishAsync` afterwards for stderr + outcome.
     /// Hands out its ONE enumerator exactly once per handle — a second call (directly, or via
     /// `StdoutJsonLinesAsync`, which itself calls this) throws `InvalidOperationException`, same as any
@@ -1856,21 +1979,25 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
 
     /// After streaming stdout, wait for exit and return the captured stderr. Reaps the tree.
     member this.FinishAsync() : Task<Result<Finished, ProcessError>> =
-        if not (this.StartStdoutStreaming()) then
-            Task.FromResult(Error(alreadyConsumedError ()))
-        else
+        let outcomeTask =
+            if this.StartStdoutStreaming() then Some streamOutcome
+            elif this.StartStdoutChunkStreaming() then Some chunkOutcome
+            else None
 
+        match outcomeTask with
+        | None -> Task.FromResult(Error(alreadyConsumedError ()))
+        | Some outcome ->
             task {
                 use _reap = reapGuard ()
-                let! outcome = streamOutcome
-                conclude outcome
+                let! settled = outcome
+                conclude settled
 
                 if stderrStreamBuffer.TooLarge then
                     return Error(tooLargeError stderrStreamBuffer.TotalLines stderrStreamBuffer.TotalBytes)
                 else
-                    match stdinErrorOnSuccess outcome with
+                    match stdinErrorOnSuccess settled with
                     | Some err -> return Error err
-                    | None -> return Ok(Finished(outcome, stderrStreamBuffer.Text))
+                    | None -> return Ok(Finished(settled, stderrStreamBuffer.Text))
             }
 
     // Returns false when a different consumption (a buffered verb, or stdout streaming) already owns the
@@ -2416,6 +2543,8 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 exitTaskValue <-
                     if consumption = Consumption.StdoutStreaming then
                         streamOutcome
+                    elif consumption = Consumption.StdoutChunkStreaming then
+                        chunkOutcome
                     elif consumption = Consumption.EventStreaming then
                         // The event pumps already drain both pipes; reuse their shared outcome rather than
                         // starting our own drains here, which would race a second reader on the same streams.

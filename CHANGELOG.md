@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `RunningProcess.StdoutChunksAsync` streams stdout as byte-exact `ReadOnlyMemory<byte>` chunks with configurable channel backpressure.
 - `Supervisor.LivenessMemory` restarts a live child whose attributable process-tree peak memory remains above a configured byte threshold.
 - `ResourceLimits.WithOomGroupKill` makes Linux cgroup v2 kill a contained process tree as one unit on OOM.
 - `RotatingFileSink` provides bounded parent-side log rotation for stdout and stderr tees.

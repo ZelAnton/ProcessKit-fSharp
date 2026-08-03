@@ -715,6 +715,65 @@ module internal Pump =
         }
         :> Task
 
+    /// Read `stream` to EOF as raw byte chunks, preserving the exact boundaries returned by each
+    /// `ReadAsync`. Every non-empty read owns a fresh byte array, so a consumer may retain the
+    /// `ReadOnlyMemory<byte>` after the pump advances to the next read. The raw tee receives the same
+    /// bytes before the chunk is handed to the consumer.
+    let private readBytesBody
+        (stream: Stream)
+        (tee: Stream option)
+        (onChunk: ReadOnlyMemory<byte> -> ValueTask)
+        (cancellationToken: CancellationToken)
+        : Task =
+        task {
+            let mutable reading = true
+
+            while reading do
+                let buffer = Array.zeroCreate<byte> 8192
+                let! read = stream.ReadAsync(buffer.AsMemory(), cancellationToken)
+
+                if read = 0 then
+                    reading <- false
+                else
+                    let chunk = buffer.AsMemory(0, read)
+
+                    match tee with
+                    | Some sink -> do! sink.WriteAsync(chunk, cancellationToken)
+                    | None -> ()
+
+                    do! onChunk (ReadOnlyMemory<byte>(buffer, 0, read))
+        }
+        :> Task
+
+    /// `readBytesBody` for a background stdout chunk pump: a disposal/broken-pipe race is quiet once
+    /// the caller's teardown flag is set, while the same exception caught before teardown remains a
+    /// genuine read failure for the caller to classify as `ProcessError.Io`.
+    let readBytesUntilDone
+        (stream: Stream)
+        (tee: Stream option)
+        (onChunk: ReadOnlyMemory<byte> -> ValueTask)
+        (isTearingDown: unit -> bool)
+        (cancellationToken: CancellationToken)
+        : Task =
+        task {
+            try
+                do! readBytesBody stream tee onChunk cancellationToken
+            with
+            | :? ObjectDisposedException as ex ->
+                match genuineReadFault isTearingDown ex with
+                | Some fault -> ExceptionDispatchInfo.Throw fault
+                | None ->
+                    // The stream was torn down while reading. Stop quietly.
+                    ()
+            | :? IOException as ex ->
+                match genuineReadFault isTearingDown ex with
+                | Some fault -> ExceptionDispatchInfo.Throw fault
+                | None ->
+                    // The pipe broke during teardown. Stop; the run's outcome reflects the child.
+                    ()
+        }
+        :> Task
+
     /// Read `stream` to EOF, discarding everything (so the child never blocks on a full pipe).
     let drainDiscard (stream: Stream) (cancellationToken: CancellationToken) : Task =
         task {

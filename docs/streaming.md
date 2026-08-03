@@ -7,6 +7,7 @@ hand it back when the child exits. For a long-running or conversational child yo
 want the output *as it arrives* — and sometimes a back-channel to write to it.
 `Command.StartAsync()` (and the equivalent `IProcessRunner.Start` / `ProcessGroup.Start`)
 returns a live `RunningProcess` you drive yourself: stream stdout line by line,
+stream stdout as byte chunks,
 interleave stdout and stderr, write stdin incrementally, wait for the child to
 become *ready*, race several children, or profile a run end to end.
 
@@ -17,6 +18,7 @@ streams are `await foreach`.
 
 - [Lifecycle](#lifecycle)
 - [Streaming stdout line by line](#streaming-stdout-line-by-line)
+- [Streaming stdout as byte chunks](#streaming-stdout-as-byte-chunks)
 - [Streaming NDJSON / JSON Lines](#streaming-ndjson--json-lines)
 - [Interleaving stdout and stderr](#interleaving-stdout-and-stderr)
 - [Bounding the streaming backlog](#bounding-the-streaming-backlog)
@@ -77,7 +79,7 @@ Consume the handle **exactly one way** — stdout is read once:
 - `FinishAsync()` — after streaming stdout, collect the `Outcome` and drained stderr.
 - `ProfileAsync()` — capture plus periodic resource samples ([profiling](#profiling-a-run)).
 
-`StdoutLinesAsync()` / `OutputEventsAsync()` need a **piped** stdout, which is the default for
+`StdoutLinesAsync()` / `StdoutChunksAsync()` / `OutputEventsAsync()` need a **piped** stdout, which is the default for
 `StartAsync()`; if you set `Command.Stdout` to `StdioMode.Inherit` or `StdioMode.Null`
 there is nothing to stream. The live gauges `Pid`, `Elapsed`, `StartTime`,
 `StdoutLineCount`, and `StderrLineCount` are cheap to read at any time, including
@@ -154,6 +156,78 @@ While you stream stdout, stderr is drained in the background, so a noisy child c
 never block on a full stderr pipe. The `OnStdoutLine` / `OnStderrLine` handlers and
 the output buffer policy from [Running commands](commands.md) still apply to a
 streamed run — a handler sees each line on the pump, in addition to your loop.
+
+## Streaming stdout as byte chunks
+
+`StdoutChunksAsync()` returns an `IAsyncEnumerable<ReadOnlyMemory<byte>>`. It performs no text
+decoding or line framing: each non-empty item contains exactly the bytes returned by one underlying
+read, including NUL bytes, invalid UTF-8, and boundaries inside a multibyte character. Every item owns
+its backing array, so it remains valid after the next chunk arrives. Use this for archives, media,
+compressed data, and other output where text is the wrong abstraction.
+
+**F#**
+
+```fsharp
+task {
+    match! (Command.create "git" |> Command.args [ "archive"; "HEAD" ]).StartAsync() with
+    | Error err -> eprintfn $"{err.Message}"
+    | Ok proc ->
+        use _ = proc
+        let destination = Stream.Null
+
+        let e = proc.StdoutChunksAsync().GetAsyncEnumerator()
+
+        try
+            let mutable go = true
+
+            while go do
+                let! more = e.MoveNextAsync()
+
+                if more then
+                    do! destination.WriteAsync(e.Current)
+                else
+                    go <- false
+        finally
+            e.DisposeAsync().AsTask().Wait()
+
+        match! proc.FinishAsync() with
+        | Ok finished -> printfn $"archive finished: {finished.Outcome}"
+        | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+**C#**
+
+```csharp
+await using var proc = (await new Command("git").Args(["archive", "HEAD"]).StartAsync()).GetValueOrThrow();
+using var destination = Stream.Null;
+
+await foreach (var chunk in proc.StdoutChunksAsync())
+    await destination.WriteAsync(chunk);
+
+var finished = (await proc.FinishAsync()).GetValueOrThrow();
+```
+
+The chunk stream uses the configured `StdoutTee` as a raw byte tee. `MergeStderr` is supported: the
+merged bytes arrive through stdout in the order supplied by the operating system. `Pty` is also
+supported, but the terminal remains a terminal — its normal echo, newline, and other line-discipline
+behaviour can transform bytes before ProcessKit reads them. `Inherit` and `Null` stdout have nothing
+to stream.
+
+Chunk streaming claims the stdout pipe exactly once. `OutputStringAsync()`, `OutputBytesAsync()`,
+`WaitAsync()`, `StdoutLinesAsync()`, `OutputEventsAsync()`, and framed/interactive sessions are
+refused on the same handle; a second `StdoutChunksAsync()` is refused too. After consuming chunks,
+call `FinishAsync()` to await the process and obtain drained stderr. `StopAsync()` and disposal remain
+valid lifecycle operations; `WaitAsync()` is not a companion to a claimed streaming session.
+
+The default channel is unbounded for compatibility with the other streaming verbs. For bounded
+memory, set `Command.StreamBuffer`: its capacity counts unread chunks, and `Backpressure` pauses
+the stdout pump before it reads more when the channel is full, preserving every byte. The two drop
+modes intentionally trade byte preservation for bounded lossy output (`DroppedStreamLineCount` is
+the existing dropped-stream-item counter); `Error` ends the stream with `ProcessError.OutputTooLarge`.
+`OutputBuffer`'s line/byte caps do not apply to chunk contents. A genuine stdout read failure ends
+the enumerator and `FinishAsync()` with `ProcessError.Io`; an `IOException`/`ObjectDisposedException`
+caused by this handle's teardown is quiet.
 
 ## Streaming NDJSON / JSON Lines
 
@@ -376,7 +450,7 @@ instances for stdout and stderr.
 
 ## Bounding the streaming backlog
 
-By default, the channel that feeds `StdoutLinesAsync()` / `OutputEventsAsync()` / `WaitForLineAsync()`
+By default, the channel that feeds `StdoutLinesAsync()` / `StdoutChunksAsync()` / `OutputEventsAsync()` / `WaitForLineAsync()`
 is **unbounded**: a producer far outrunning your consumer (a chatty child, a slow line handler) just
 grows the in-flight backlog — exactly the behavior ProcessKit has always had. `Command.StreamBuffer`
 opts in to a bounded channel instead, capping that backlog with one of four `StreamFullMode`s:
@@ -386,15 +460,16 @@ opts in to a bounded channel instead, capping that backlog with one of four `Str
   full stdout/stderr pipe until your consumer catches up. Bounds memory losslessly, at the cost of the
   child's timing — pick this for a *trusted* producer you genuinely want to pace against your consumer
   (tailing a log, a pipeline stage).
-- **`DropOldest`** — "tail" semantics: once full, the oldest queued line is discarded to make room for
-  the newest. Lossy but bounded.
-- **`DropNewest`** — "head" semantics: once full, the incoming line is discarded and what's already
+- **`DropOldest`** — "tail" semantics: once full, the oldest queued item is discarded to make room for
+  the newest. Lossy but bounded (for chunks, this deliberately drops bytes).
+- **`DropNewest`** — "head" semantics: once full, the incoming item is discarded and what's already
   queued is kept.
 - **`Error`** — fail loud: once the cap is reached, the streaming enumerator throws (carrying
   `ProcessError.OutputTooLarge`) instead of silently dropping anything.
 
 Both `DropOldest` and `DropNewest` bump `RunningProcess.DroppedStreamLineCount` — a live counter (like
-`StdoutLineCount`/`StderrLineCount`) so a lossy policy's drops are always visible, never silent:
+`StdoutLineCount`/`StderrLineCount`; for byte streaming it counts dropped chunks) so a lossy policy's
+drops are always visible, never silent:
 
 **F#**
 
@@ -463,7 +538,7 @@ blocks the child) or `Error` (fails loud instead of stalling) over `Backpressure
 
 ## Finishing a streamed run
 
-When the stream ends (stdout closed), collect the rest with `FinishAsync()`, which returns
+When a line or chunk stream ends (stdout closed), collect the rest with `FinishAsync()`, which returns
 `Result<Finished, ProcessError>`. `Finished` carries the `Outcome` and the `Stderr`
 that was drained while you streamed:
 
