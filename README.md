@@ -484,11 +484,13 @@ counts only on the POSIX process-group fallback; `ProfileAsync` samples the star
 
 For attribution inside a shared tree, `MemberStats()` returns a point-in-time `MemberStats` record for
 each member: its `Pid`, cumulative `CpuTime`, current `ResidentMemoryBytes`, and optional per-process
-I/O counters (`IoReadBytes`, `IoWriteBytes`, `IoReadOperations`, and `IoWriteOperations`). Windows reads
-each Job member through a verified query-only process handle; if access is denied, it retains the PID with
-`None` metrics only when a fresh Job membership query confirms that it is still in the Job. A PID absent
-from that refresh is omitted as a possible reused foreign process. Linux reads `/proc` (including per-process
-I/O when available). A member that exits during the sample is omitted, and unsupported metrics remain
+I/O counters (`IoReadBytes`, `IoWriteBytes`, `IoReadOperations`, and `IoWriteOperations`). Windows binds
+each Job PID snapshot to a pre-sampling process identity before opening the query handle; protected or
+otherwise inaccessible members are retained with `None` metrics only when that identity and current Job
+membership still match. A PID whose generation changed is omitted, including reuse inside the same Job.
+Linux reads `/proc` (including per-process I/O when available) for the whole cgroup membership: tracked and
+adopted leaders use pinned identities, while descendants use a snapshot identity checked again after the
+read. A member that exits or changes identity during the sample is omitted, and unsupported metrics remain
 `None` rather than becoming zeroes. The call returns the same typed lifecycle error as `Stats()` after
 the group is released.
 

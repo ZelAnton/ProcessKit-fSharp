@@ -167,10 +167,12 @@ The current interface has 19 abstract members:
 - `Stats` snapshots resource use.
 - `MemberStats` snapshots per-member CPU, resident-memory, and optional I/O counters. The backend owns
   membership enumeration and the native identity gate: a vanished member is omitted, an unknown or
-  changed POSIX start-time token is excluded, and Windows retains a query-inaccessible member with `None`
-  metrics only after a fresh Job membership query confirms that pid is still in this Job. An inaccessible
-  pid absent from that refresh is omitted as a possible reused foreign process. The public `ProcessGroup`
-  call runs this operation under the lifecycle gate, so it cannot race container teardown.
+  changed POSIX start-time token is excluded, and Windows binds the Job PID snapshot to a pre-sampling
+  process identity before opening the query handle. A query-inaccessible Windows member is retained with
+  `None` metrics only when a fresh Job membership and identity check still confirm that generation. Linux
+  cgroup sampling preserves adopted and descendant members: tracked/adopted leaders use pinned tokens,
+  while other members use an identity captured from the cgroup snapshot and checked again after reading.
+  The public `ProcessGroup` call runs this operation under the lifecycle gate, so it cannot race teardown.
 - `UpdateLimits` re-applies a full replacement resource-limit set to the live container (Job Object / cgroup v2); the process-group mechanism has no primitive to update and returns `ProcessError.ResourceLimit`. Because the caps land through several sequential native writes, a limit-capable backend captures the container's prior caps and best-effort restores them if a write fails partway, so an `Error` leaves the live container on the previous set — never a silent mix that `Options.Limits` would misreport (only an also-failed restore is indeterminate, and its `ProcessError.ResourceLimit` message says so).
 - `HardRelease` performs the once-only hard teardown and frees the container.
 

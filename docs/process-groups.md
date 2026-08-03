@@ -981,13 +981,16 @@ if (group.MemberStats() is { IsOk: true, ResultValue: var members })
 ```
 
 The returned list is a best-effort subset of the membership snapshot: a process that
-exits between enumeration and its metric reads is omitted. Windows uses a verified
-query-only handle for each Job member; if query access is denied, a fresh Job
-membership query must still confirm the PID before it is retained with `None`
-metrics. A PID absent from that refresh is omitted as a possible reused foreign
-process. Linux reads `/proc/<pid>` and rechecks the pid identity, while macOS uses
-`proc_pidinfo`. Metrics unavailable on a platform or for a confirmed inaccessible
-member are `None`, never fabricated zeroes. `MemberStats()`
+exits between enumeration and its metric reads is omitted. Windows binds each Job
+PID snapshot to a pre-sampling process identity before opening its verified
+query-only handle. If query access is denied, a fresh Job membership and process
+identity check must still confirm the same generation before the PID is retained
+with `None` metrics; same-Job PID reuse is omitted. Linux cgroup reads `/proc/<pid>`
+for every whole-tree member: tracked and adopted leaders use pinned identities,
+while descendants use a snapshot identity checked again after the read. The POSIX
+process-group fallback samples its tracked leaders. Metrics unavailable on a
+platform or for a confirmed inaccessible member are `None`, never fabricated zeroes.
+`MemberStats()`
 holds the same lifecycle gate as `Members()` and `Stats()`, and returns the typed
 released-group error after teardown. It never reads command lines or environments.
 

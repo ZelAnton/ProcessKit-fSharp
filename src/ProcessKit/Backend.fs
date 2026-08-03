@@ -438,6 +438,12 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
     // unreadable, degrading that reap to the by-number kill exactly as before.
     let identities = ConcurrentDictionary<int, uint64 option>()
 
+    // Adoption is whole-cgroup containment, but adopted processes are not our children and therefore do
+    // not belong in `children` or its wait/reap ledger. Keep their start-time tokens separately so their
+    // per-member stats remain identity-safe after an exit/reuse, while descendants and other cgroup
+    // members are resolved from the point-in-time cgroup membership snapshot below.
+    let adoptedIdentities = ConcurrentDictionary<int, uint64 option>()
+
     // Pull and remove the captured identity for `pid` (defaulting to `None`), so the shared reap can gate
     // its `killpg` on it. Removal keeps `identities` in lockstep with `children`.
     let takeIdentity (pid: int) : uint64 option =
@@ -527,7 +533,9 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             // `killpg` would be a wrong-target kill) — see K-016. cgroup.kill alone SIGKILLs it at teardown;
             // its real parent/init reaps it.
             match Native.Cgroup.adoptIntoCgroup cgroupPath pid with
-            | Ok() -> Ok()
+            | Ok() ->
+                adoptedIdentities[pid] <- Native.Posix.readProcessIdentity pid
+                Ok()
             | Error detail -> Error(ProcessError.Adopt(pid, detail))
 
         member _.Release(spawned) =
@@ -535,6 +543,7 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             // (The kernel already removed it from cgroup.procs.)
             let pid = int spawned.Handle
             identities.TryRemove pid |> ignore
+            adoptedIdentities.TryRemove pid |> ignore
             children.Remove pid |> ignore
 
         member _.Wait(handle) = Native.Posix.waitPosix handle
@@ -643,15 +652,24 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                     ProcessError.Io $"could not read cgroup.procs for per-member stats (membership unknown): {message}"
                 )
             | Ok pids ->
-                // Bind every sampled pid to the start-time identity observed in this membership
-                // snapshot. An unknown token is excluded, and the identity-gated reader checks the
-                // token again after sampling, so a pid recycled during the read cannot contribute foreign
-                // metrics even if the numeric pid appears in the cgroup again.
+                // Tracked and adopted leaders use their pinned identity token. Descendants and other
+                // externally-created members are not in either ledger, so capture their identity from this
+                // membership snapshot immediately before sampling; the identity-gated reader checks it
+                // again after the native reads. This preserves the cgroup's whole-tree/adoption contract
+                // without turning a recycled numeric pid into an attribution.
                 let snapshot =
                     pids
                     |> List.choose (fun pid ->
-                        Native.Posix.readProcessIdentity pid
-                        |> Option.map (fun identity -> pid, identity))
+                        match identities.TryGetValue pid with
+                        | true, Some identity -> Some(pid, identity)
+                        | true, None -> None
+                        | false, _ ->
+                            match adoptedIdentities.TryGetValue pid with
+                            | true, Some identity -> Some(pid, identity)
+                            | true, None -> None
+                            | false, _ ->
+                                Native.Posix.readProcessIdentity pid
+                                |> Option.map (fun identity -> pid, identity))
 
                 let sampled =
                     snapshot
@@ -727,6 +745,7 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             for pid in children.Drain() do
                 PosixReap.leader pid (takeIdentity pid)
 
+            adoptedIdentities.Clear()
             Native.Cgroup.removeCgroup cgroupPath
 
 /// POSIX process-group backend (macOS/BSD, or Linux without cgroup delegation). Every `posix_spawn`

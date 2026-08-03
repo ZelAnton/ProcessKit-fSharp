@@ -313,7 +313,6 @@ type StatsTests() =
             let current = Dictionary<int, uint64>()
             current[keptPid] <- 101UL
             current[recycledPid] <- 202UL
-            File.WriteAllText(Path.Combine(directory, "cgroup.procs"), $"{keptPid}\n{recycledPid}\n")
 
             Native.Posix.readProcessIdentityForTests <-
                 Some(fun pid ->
@@ -329,6 +328,14 @@ type StatsTests() =
                     Some(MemberStats(pid, None, None, None)))
 
             let cgroupBackend = CgroupBackend directory :> IContainmentBackend
+
+            match cgroupBackend.Track(syntheticSpawned keptPid), cgroupBackend.Track(syntheticSpawned recycledPid) with
+            | Ok(), Ok() -> ()
+            | first, second -> Assert.Fail $"tracking synthetic cgroup members failed: {first}; {second}"
+
+            // Restore the point-in-time membership after Track's confirmation writes. The identity ledger
+            // now represents the original members, while the reader seam below can model a later recycle.
+            File.WriteAllText(Path.Combine(directory, "cgroup.procs"), $"{keptPid}\n{recycledPid}\n")
 
             let backend =
                 MemberStatsSeamBackend(fun () -> cgroupBackend.MemberStats()) :> IContainmentBackend
@@ -354,6 +361,147 @@ type StatsTests() =
                     ()
 
     [<Test>]
+    member _.``cgroup MemberStats uses tracked identity across exit and same-cgroup reuse``() =
+        if isWindows then
+            Assert.Ignore "the cgroup identity ledger is Linux/POSIX-only"
+        else
+            let directory =
+                Path.Combine(Path.GetTempPath(), $"processkit-member-stats-cgroup-reuse-{Guid.NewGuid():N}")
+
+            Directory.CreateDirectory directory |> ignore
+
+            let keptPid = 2_100_000_041
+            let recycledPid = 2_100_000_042
+            let untrackedPid = 2_100_000_043
+            let ambiguousPid = 2_100_000_044
+            let descendantPid = 2_100_000_045
+            let current = Dictionary<int, uint64 option>()
+            current[keptPid] <- Some 301UL
+            current[recycledPid] <- Some 302UL
+            current[untrackedPid] <- Some 303UL
+            current[ambiguousPid] <- None
+            current[descendantPid] <- Some 304UL
+
+            Native.Posix.readProcessIdentityForTests <-
+                Some(fun pid ->
+                    match current.TryGetValue pid with
+                    | true, identity -> identity
+                    | false, _ -> None)
+
+            Native.Posix.readMemberStatsForTests <- Some(fun pid -> Some(MemberStats(pid, None, None, None)))
+
+            let cgroupBackend = CgroupBackend directory :> IContainmentBackend
+
+            try
+                match
+                    cgroupBackend.Track(syntheticSpawned keptPid),
+                    cgroupBackend.Track(syntheticSpawned recycledPid),
+                    cgroupBackend.Track(syntheticSpawned ambiguousPid)
+                with
+                | Ok(), Ok(), Ok() -> ()
+                | first, second, third ->
+                    Assert.Fail $"tracking synthetic cgroup members failed: {first}; {second}; {third}"
+
+                // The original tracked process exited and its pid was reused by a different process that
+                // remains in this same cgroup. The cgroup file cannot tell those generations apart; the
+                // tracked ledger omits that PID, while the genuinely untracked descendant members are
+                // admitted through their own snapshot identity.
+                current[recycledPid] <- Some 9_999UL
+                current[ambiguousPid] <- Some 8_888UL
+
+                File.WriteAllText(
+                    Path.Combine(directory, "cgroup.procs"),
+                    $"{keptPid}\n{recycledPid}\n{untrackedPid}\n{ambiguousPid}\n{descendantPid}\n"
+                )
+
+                match cgroupBackend.MemberStats() with
+                | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                | Ok members ->
+                    let pids = members |> Seq.map (fun stats -> stats.Pid) |> Set.ofSeq
+                    let expected: Set<int> = set [ keptPid; untrackedPid; descendantPid ]
+
+                    Assert.That(
+                        pids,
+                        Is.EqualTo<Set<int>>(expected),
+                        "tracked identity must reject reuse while untracked descendants remain attributable"
+                    )
+            finally
+                Native.Posix.readProcessIdentityForTests <- None
+                Native.Posix.readMemberStatsForTests <- None
+
+                try
+                    Directory.Delete(directory, true)
+                with _ ->
+                    // best-effort cleanup of the synthetic cgroup directory after the seam test.
+                    ()
+
+    [<Test>]
+    member _.``cgroup MemberStats includes adopted and descendant members with identity-safe sampling``() =
+        if isWindows then
+            Assert.Ignore "cgroup membership is Linux/POSIX-only"
+        else
+            let directory =
+                Path.Combine(Path.GetTempPath(), $"processkit-member-stats-cgroup-adopt-{Guid.NewGuid():N}")
+
+            Directory.CreateDirectory directory |> ignore
+
+            let adoptedPid = 2_100_000_081
+            let descendantPid = 2_100_000_082
+            let changingDescendantPid = 2_100_000_083
+            let current = Dictionary<int, uint64>()
+            current[adoptedPid] <- 501UL
+            current[descendantPid] <- 502UL
+            current[changingDescendantPid] <- 503UL
+
+            Native.Posix.readProcessIdentityForTests <-
+                Some(fun pid ->
+                    match current.TryGetValue pid with
+                    | true, identity -> Some identity
+                    | false, _ -> None)
+
+            Native.Posix.readMemberStatsForTests <-
+                Some(fun pid ->
+                    if pid = changingDescendantPid then
+                        current[pid] <- 9_999UL
+
+                    Some(MemberStats(pid, None, None, None)))
+
+            let cgroupBackend = CgroupBackend directory :> IContainmentBackend
+
+            try
+                match cgroupBackend.Adopt adoptedPid with
+                | Error error -> Assert.Fail $"adopting synthetic cgroup member failed: {error}"
+                | Ok() -> ()
+
+                // The adopted leader and both descendants are in the kernel membership snapshot. The
+                // adopted token is pinned at Adopt; descendants get a snapshot token before sampling.
+                File.WriteAllText(
+                    Path.Combine(directory, "cgroup.procs"),
+                    $"{adoptedPid}\n{descendantPid}\n{changingDescendantPid}\n"
+                )
+
+                match cgroupBackend.MemberStats() with
+                | Error error -> Assert.Fail $"MemberStats failed: {error}"
+                | Ok members ->
+                    let pids = members |> Seq.map (fun stats -> stats.Pid) |> Set.ofSeq
+                    let expected: Set<int> = set [ adoptedPid; descendantPid ]
+
+                    Assert.That(
+                        pids,
+                        Is.EqualTo<Set<int>>(expected),
+                        "adopted and stable descendant members must be retained, while changed identities are omitted"
+                    )
+            finally
+                Native.Posix.readProcessIdentityForTests <- None
+                Native.Posix.readMemberStatsForTests <- None
+
+                try
+                    Directory.Delete(directory, true)
+                with _ ->
+                    // best-effort cleanup of the synthetic cgroup directory after the seam test.
+                    ()
+
+    [<Test>]
     member _.``public MemberStats retains an inaccessible Windows member and omits a gone member``() =
         if not isWindows then
             Assert.Ignore "the OpenProcess failure classification is Windows-only"
@@ -361,6 +509,7 @@ type StatsTests() =
             let inaccessiblePid = 2_100_000_021
             let gonePid = 2_100_000_022
             let originalMembershipQuery = Native.Windows.queryInformationJobObjectHook
+            let originalIdentitySnapshot = Native.Windows.processIdentitySnapshotForTests
 
             Native.Windows.queryInformationJobObjectHook <-
                 fun _ _ buffer _ ->
@@ -368,6 +517,8 @@ type StatsTests() =
                     Marshal.WriteInt32(buffer, 4, 1)
                     Marshal.WriteIntPtr(buffer, 8, nativeint inaccessiblePid)
                     struct (true, 0)
+
+            Native.Windows.processIdentitySnapshotForTests <- Some(fun () -> Some(Map.ofList [ inaccessiblePid, 101L ]))
 
             Native.Windows.openMemberProcessForTests <- Some(fun _ pid -> if pid = gonePid then Error 87 else Error 5)
 
@@ -392,6 +543,7 @@ type StatsTests() =
             finally
                 (group :> IDisposable).Dispose()
                 Native.Windows.openMemberProcessForTests <- None
+                Native.Windows.processIdentitySnapshotForTests <- originalIdentitySnapshot
                 Native.Windows.queryInformationJobObjectHook <- originalMembershipQuery
 
     [<Test>]
@@ -401,6 +553,7 @@ type StatsTests() =
         else
             let reusedPid = 2_100_000_031
             let originalMembershipQuery = Native.Windows.queryInformationJobObjectHook
+            let originalIdentitySnapshot = Native.Windows.processIdentitySnapshotForTests
 
             // The supplied per-call snapshot represents the original Job member. The refresh represents
             // the post-exit/reuse state: the protected replacement is outside the Job, so the current Job
@@ -412,6 +565,7 @@ type StatsTests() =
                     struct (true, 0)
 
             Native.Windows.openMemberProcessForTests <- Some(fun _ _ -> Error 5)
+            Native.Windows.processIdentitySnapshotForTests <- Some(fun () -> Some(Map.ofList [ reusedPid, 201L ]))
 
             let backend =
                 MemberStatsSeamBackend(fun () -> Native.Windows.readMemberStatsForPids IntPtr.Zero [ reusedPid ] |> Ok)
@@ -431,6 +585,140 @@ type StatsTests() =
             finally
                 (group :> IDisposable).Dispose()
                 Native.Windows.openMemberProcessForTests <- None
+                Native.Windows.processIdentitySnapshotForTests <- originalIdentitySnapshot
+                Native.Windows.queryInformationJobObjectHook <- originalMembershipQuery
+
+    [<Test>]
+    member _.``Windows MemberStats rejects exit-after-pre-read and same-Job identity reuse``() =
+        if not isWindows then
+            Assert.Ignore "the Windows process-handle identity gate is Windows-only"
+        else
+            let originalOpen = Native.Windows.openMemberProcessForTests
+            let originalMembership = Native.Windows.isProcessInJobForTests
+            let originalTimes = Native.Windows.getProcessTimesForTests
+            let originalIdentitySnapshot = Native.Windows.processIdentitySnapshotForTests
+            let pid = 2_100_000_051
+
+            try
+                // A zero handle is sufficient because every native read used by this seam is replaced;
+                // CloseHandle(NULL) is a harmless failed close in the test-only path.
+                Native.Windows.openMemberProcessForTests <- Some(fun _ _ -> Ok IntPtr.Zero)
+                Native.Windows.isProcessInJobForTests <- Some(fun _ _ -> true)
+
+                let run (expectedIdentity: int64) (times: (int64 * int64 * int64 * int64) list) =
+                    let mutable index = 0
+
+                    Native.Windows.processIdentitySnapshotForTests <-
+                        Some(fun () -> Some(Map.ofList [ pid, expectedIdentity ]))
+
+                    Native.Windows.getProcessTimesForTests <-
+                        Some(fun _ ->
+                            if index >= times.Length then
+                                None
+                            else
+                                let value = times[index]
+                                index <- index + 1
+                                Some value)
+
+                    Native.Windows.readMemberStatsForPids IntPtr.Zero [ pid ]
+
+                let exitedAfterPreRead = run 101L [ (101L, 0L, 1L, 2L); (101L, 1L, 1L, 2L) ]
+
+                Assert.That(
+                    exitedAfterPreRead,
+                    Is.Empty,
+                    "a member that exits after the pre-read must not be returned from its still-valid handle"
+                )
+
+                let reusedWithinJob = run 201L [ (201L, 0L, 1L, 2L); (202L, 0L, 1L, 2L) ]
+
+                Assert.That(
+                    reusedWithinJob,
+                    Is.Empty,
+                    "a same-Job PID whose stable creation identity changes must be omitted"
+                )
+            finally
+                Native.Windows.openMemberProcessForTests <- originalOpen
+                Native.Windows.isProcessInJobForTests <- originalMembership
+                Native.Windows.getProcessTimesForTests <- originalTimes
+                Native.Windows.processIdentitySnapshotForTests <- originalIdentitySnapshot
+
+    [<Test>]
+    member _.``Windows MemberStats rejects same-Job PID reuse before OpenProcess``() =
+        if not isWindows then
+            Assert.Ignore "the Windows process identity snapshot is Windows-only"
+        else
+            let originalOpen = Native.Windows.openMemberProcessForTests
+            let originalMembership = Native.Windows.isProcessInJobForTests
+            let originalTimes = Native.Windows.getProcessTimesForTests
+            let originalIdentitySnapshot = Native.Windows.processIdentitySnapshotForTests
+            let pid = 2_100_000_061
+            let mutable currentIdentity = 301L
+
+            try
+                // The identity snapshot sees the original member. The OpenProcess seam then models the
+                // original exiting and a new process in the SAME Job reusing the numeric pid before the
+                // sampling handle is opened; both pre/post handle checks would otherwise see the new one.
+                Native.Windows.processIdentitySnapshotForTests <- Some(fun () -> Some(Map.ofList [ pid, 301L ]))
+
+                Native.Windows.openMemberProcessForTests <-
+                    Some(fun _ _ ->
+                        currentIdentity <- 302L
+                        Ok IntPtr.Zero)
+
+                Native.Windows.isProcessInJobForTests <- Some(fun _ _ -> true)
+                Native.Windows.getProcessTimesForTests <- Some(fun _ -> Some(currentIdentity, 0L, 1L, 2L))
+
+                let members = Native.Windows.readMemberStatsForPids IntPtr.Zero [ pid ]
+
+                Assert.That(
+                    members,
+                    Is.Empty,
+                    "a same-Job PID reused before OpenProcess must be rejected by the pre-sampling identity ledger"
+                )
+            finally
+                Native.Windows.openMemberProcessForTests <- originalOpen
+                Native.Windows.isProcessInJobForTests <- originalMembership
+                Native.Windows.getProcessTimesForTests <- originalTimes
+                Native.Windows.processIdentitySnapshotForTests <- originalIdentitySnapshot
+
+    [<Test>]
+    member _.``Windows MemberStats rejects inaccessible same-Job PID reuse before OpenProcess``() =
+        if not isWindows then
+            Assert.Ignore "the Windows process identity snapshot is Windows-only"
+        else
+            let originalOpen = Native.Windows.openMemberProcessForTests
+            let originalIdentitySnapshot = Native.Windows.processIdentitySnapshotForTests
+            let originalMembershipQuery = Native.Windows.queryInformationJobObjectHook
+            let pid = 2_100_000_071
+            let mutable currentIdentity = 401L
+
+            try
+                Native.Windows.processIdentitySnapshotForTests <-
+                    Some(fun () -> Some(Map.ofList [ pid, currentIdentity ]))
+
+                Native.Windows.openMemberProcessForTests <-
+                    Some(fun _ _ ->
+                        currentIdentity <- 402L
+                        Error 5)
+
+                Native.Windows.queryInformationJobObjectHook <-
+                    fun _ _ buffer _ ->
+                        Marshal.WriteInt32(buffer, 0, 1)
+                        Marshal.WriteInt32(buffer, 4, 1)
+                        Marshal.WriteIntPtr(buffer, 8, nativeint pid)
+                        struct (true, 0)
+
+                let members = Native.Windows.readMemberStatsForPids IntPtr.Zero [ pid ]
+
+                Assert.That(
+                    members,
+                    Is.Empty,
+                    "an inaccessible same-Job PID whose generation changed before OpenProcess must be omitted"
+                )
+            finally
+                Native.Windows.openMemberProcessForTests <- originalOpen
+                Native.Windows.processIdentitySnapshotForTests <- originalIdentitySnapshot
                 Native.Windows.queryInformationJobObjectHook <- originalMembershipQuery
 
     [<Test>]

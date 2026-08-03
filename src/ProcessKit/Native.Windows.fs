@@ -796,6 +796,24 @@ module internal Windows =
     let mutable openMemberProcessForTests: (uint32 -> int -> Result<nativeint, int>) option =
         None
 
+    /// Test seam (internal, not public API): replaces the `IsProcessInJob` calls made around a member's
+    /// resource read. Production leaves it `None`; tests use it with a synthetic handle so the
+    /// exit-after-pre-read and same-Job identity checks can be driven without a real PID-reuse race.
+    let mutable isProcessInJobForTests: (nativeint -> nativeint -> bool) option = None
+
+    /// Test seam (internal, not public API): replaces `GetProcessTimes` for a synthetic member handle.
+    /// The tuple is `(creation, exit, kernel, user)` in Windows' 100-nanosecond ticks. A test can return
+    /// one stable creation time followed by a non-zero exit time or a different creation time to model
+    /// the two identity failures the production post-read gate must reject.
+    let mutable getProcessTimesForTests: (nativeint -> (int64 * int64 * int64 * int64) option) option =
+        None
+
+    /// Test seam (internal, not public API): replaces the pre-sampling Windows process-identity snapshot.
+    /// The map is keyed by PID and contains the kernel creation-time token. Tests can mutate the token
+    /// after this hook returns, before `OpenProcess`, to model same-Job PID reuse in that exact window.
+    let mutable processIdentitySnapshotForTests: (unit -> Map<int, int64> option) option =
+        None
+
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private QueryInformationJobObject(
         nativeint hJob,
@@ -848,6 +866,20 @@ module internal Windows =
     [<DllImport("psapi.dll", SetLastError = true)>]
     extern bool private GetProcessMemoryInfo(nativeint Process, PROCESS_MEMORY_COUNTERS& ppsmemCounters, uint32 cb)
 
+    // `NtQuerySystemInformation(SystemProcessInformation)` exposes the process creation token without
+    // opening a per-process handle. It is the identity source for protected processes, which may reject
+    // both query-handle opens and `GetProcessTimes`; the Job PID list itself carries no generation data.
+    [<Literal>]
+    let private SystemProcessInformation = 5
+
+    [<DllImport("ntdll.dll")>]
+    extern int private NtQuerySystemInformation(
+        int systemInformationClass,
+        nativeint systemInformation,
+        uint32 systemInformationLength,
+        uint32& returnLength
+    )
+
     // NtSuspendProcess/NtResumeProcess freeze/thaw every thread of a process in one call. They are
     // undocumented ntdll entry points but stable and the standard way to suspend a whole process;
     // the documented alternative (snapshot every thread + SuspendThread) is far more code.
@@ -873,6 +905,105 @@ module internal Windows =
     // it starts right at offset 8 on 64-bit; the header itself is already 8 bytes).
     [<Literal>]
     let private processIdListHeaderSize = 8
+
+    [<Literal>]
+    let private STATUS_SUCCESS = 0
+
+    // NtQuerySystemInformation returns this NTSTATUS when the caller's buffer is too small.
+    [<Literal>]
+    let private STATUS_INFO_LENGTH_MISMATCH = -1073741820
+
+    [<Literal>]
+    let private initialProcessIdentityBufferSize = 1024 * 1024
+
+    [<Literal>]
+    let private maxIdentityQueryAttempts = 8
+
+    // SYSTEM_PROCESS_INFORMATION is a variable-length linked record. The fields needed here are stable
+    // across supported Windows versions: CreateTime is at byte 32, while UniqueProcessId follows the
+    // pointer-sized UNICODE_STRING and BasePriority fields (offset 80 on x64, 68 on x86).
+    let private systemProcessIdOffset = if IntPtr.Size = 8 then 80 else 68
+
+    let private readNativeProcessId (buffer: nativeint) (offset: int) : int option =
+        let value =
+            if IntPtr.Size = 8 then
+                Marshal.ReadInt64(buffer, offset)
+            else
+                int64 (Marshal.ReadInt32(buffer, offset))
+
+        if value > 0L && value <= int64 Int32.MaxValue then
+            Some(int value)
+        else
+            None
+
+    let private systemProcessIdentitySnapshot () : Map<int, int64> option =
+        match processIdentitySnapshotForTests with
+        | Some hook -> hook ()
+        | None ->
+            let rec query (bufferSize: int) (attempt: int) : Map<int, int64> option =
+                let buffer = Marshal.AllocHGlobal bufferSize
+
+                try
+                    let mutable returnLength = 0u
+
+                    let status =
+                        NtQuerySystemInformation(SystemProcessInformation, buffer, uint32 bufferSize, &returnLength)
+
+                    if status = STATUS_SUCCESS then
+                        let reportedLength =
+                            if returnLength > 0u && returnLength <= uint32 bufferSize then
+                                int returnLength
+                            else
+                                bufferSize
+
+                        let minimumRecordSize = systemProcessIdOffset + IntPtr.Size
+                        let mutable offset = 0
+                        let mutable finished = false
+                        let mutable valid = true
+                        let identities = ResizeArray<int * int64>()
+
+                        while not finished && valid do
+                            if offset < 0 || offset + minimumRecordSize > reportedLength then
+                                valid <- false
+                            else
+                                let nextOffset = Marshal.ReadInt32(buffer, offset)
+
+                                if nextOffset < 0 || (nextOffset <> 0 && nextOffset < minimumRecordSize) then
+                                    valid <- false
+                                else
+                                    match readNativeProcessId buffer (offset + systemProcessIdOffset) with
+                                    | Some pid ->
+                                        let creationTime = Marshal.ReadInt64(buffer, offset + 32)
+
+                                        if creationTime > 0L then
+                                            identities.Add(pid, creationTime)
+                                    | None -> ()
+
+                                    if nextOffset = 0 then
+                                        finished <- true
+                                    elif offset > reportedLength - nextOffset then
+                                        valid <- false
+                                    else
+                                        offset <- offset + nextOffset
+
+                        if valid && finished then
+                            Some(Map.ofSeq identities)
+                        else
+                            None
+                    elif status = STATUS_INFO_LENGTH_MISMATCH && attempt < maxIdentityQueryAttempts then
+                        let required =
+                            if returnLength > uint32 bufferSize then
+                                int returnLength + 4096
+                            else
+                                bufferSize * 2
+
+                        query (min (16 * 1024 * 1024) required) (attempt + 1)
+                    else
+                        None
+                finally
+                    Marshal.FreeHGlobal buffer
+
+            query initialProcessIdentityBufferSize 1
 
     // Test seam: one `QueryInformationJobObject` call — the caller passes a buffer of `bufferSize` bytes,
     // the call writes the process-id list into it and returns `struct (succeeded, lastError)`. The real
@@ -1058,61 +1189,94 @@ module internal Windows =
         else
             left + right
 
-    /// Read one process's resources through a short-lived query-only process handle. The handle is
-    /// re-checked against the Job before any metric API is called, so a pid that vanished and was reused
-    /// by a foreign process cannot leak that process's metrics into the group result. Individual native
-    /// metric failures remain `None`; an opened, verified member is still represented by its pid.
-    let private readMemberStatsFromHandle (pid: int) (job: nativeint) (handle: nativeint) : MemberStats option =
-        let mutable stillMember = false
+    let private isProcessInJob (handle: nativeint) (job: nativeint) : bool =
+        match isProcessInJobForTests with
+        | Some hook -> hook handle job
+        | None ->
+            let mutable stillMember = false
+            IsProcessInJob(handle, job, &stillMember) && stillMember
 
-        if not (IsProcessInJob(handle, job, &stillMember) && stillMember) then
+    let private readProcessTimes (handle: nativeint) : (int64 * int64 * int64 * int64) option =
+        match getProcessTimesForTests with
+        | Some hook -> hook handle
+        | None ->
+            let mutable creation = FILETIME_NATIVE()
+            let mutable exit = FILETIME_NATIVE()
+            let mutable kernel = FILETIME_NATIVE()
+            let mutable user = FILETIME_NATIVE()
+
+            if GetProcessTimes(handle, &creation, &exit, &kernel, &user) then
+                Some(fileTimeTicks creation, fileTimeTicks exit, fileTimeTicks kernel, fileTimeTicks user)
+            else
+                None
+
+    /// Read one process's resources through a short-lived query-only process handle. The expected creation
+    /// token was captured before the Job PID snapshot and before this handle was opened, so a PID reused by
+    /// a different process in the gap is rejected before any metric is trusted. The handle is checked
+    /// against the Job before and after the metric read, while `GetProcessTimes` supplies the same stable
+    /// process identity and exit-state checks on both sides.
+    let private readMemberStatsFromHandle
+        (pid: int)
+        (job: nativeint)
+        (expectedIdentity: int64)
+        (handle: nativeint)
+        : MemberStats option =
+        if not (isProcessInJob handle job) then
             None
         else
-            let cpu =
-                let mutable creation = FILETIME_NATIVE()
-                let mutable exit = FILETIME_NATIVE()
-                let mutable kernel = FILETIME_NATIVE()
-                let mutable user = FILETIME_NATIVE()
-
-                if GetProcessTimes(handle, &creation, &exit, &kernel, &user) then
-                    let total = saturatingAdd (fileTimeTicks user) (fileTimeTicks kernel)
+            match readProcessTimes handle with
+            | None -> None
+            | Some(creation, exit, _, _) when creation <= 0L || creation <> expectedIdentity || exit <> 0L -> None
+            | Some(creation, _, kernel, user) ->
+                let cpu =
+                    let total = saturatingAdd user kernel
                     Some(TimeSpan.FromTicks total)
-                else
-                    None
 
-            let residentMemory =
-                let mutable counters = PROCESS_MEMORY_COUNTERS()
-                counters.cb <- uint32 (Marshal.SizeOf<PROCESS_MEMORY_COUNTERS>())
+                let residentMemory =
+                    let mutable counters = PROCESS_MEMORY_COUNTERS()
+                    counters.cb <- uint32 (Marshal.SizeOf<PROCESS_MEMORY_COUNTERS>())
 
-                if GetProcessMemoryInfo(handle, &counters, counters.cb) then
-                    let bytes = uint64 counters.WorkingSetSize
+                    if GetProcessMemoryInfo(handle, &counters, counters.cb) then
+                        let bytes = uint64 counters.WorkingSetSize
 
-                    if bytes > uint64 Int64.MaxValue then
-                        Some Int64.MaxValue
-                    else
-                        Some(int64 bytes)
-                else
-                    None
-
-            let ioCounters =
-                let mutable io = IO_COUNTERS()
-
-                if GetProcessIoCounters(handle, &io) then
-                    let count (value: uint64) =
-                        if value > uint64 Int64.MaxValue then
-                            Int64.MaxValue
+                        if bytes > uint64 Int64.MaxValue then
+                            Some Int64.MaxValue
                         else
-                            int64 value
+                            Some(int64 bytes)
+                    else
+                        None
 
-                    Some
-                        { ReadBytes = count io.ReadTransferCount
-                          WriteBytes = count io.WriteTransferCount
-                          ReadOperations = count io.ReadOperationCount
-                          WriteOperations = count io.WriteOperationCount }
-                else
-                    None
+                let ioCounters =
+                    let mutable io = IO_COUNTERS()
 
-            Some(MemberStats(pid, cpu, residentMemory, ioCounters))
+                    if GetProcessIoCounters(handle, &io) then
+                        let count (value: uint64) =
+                            if value > uint64 Int64.MaxValue then
+                                Int64.MaxValue
+                            else
+                                int64 value
+
+                        Some
+                            { ReadBytes = count io.ReadTransferCount
+                              WriteBytes = count io.WriteTransferCount
+                              ReadOperations = count io.ReadOperationCount
+                              WriteOperations = count io.WriteOperationCount }
+                    else
+                        None
+
+                // The process handle keeps referring to the same kernel process object, so a changed
+                // creation time is a deterministic identity failure rather than a new member. A non-zero
+                // exit time proves the original member ended after the pre-read, even though the handle
+                // itself remains valid; the second Job check closes the membership race as well.
+                match readProcessTimes handle with
+                | Some(postCreation, postExit, _, _) when
+                    postCreation = expectedIdentity
+                    && postCreation = creation
+                    && postExit = 0L
+                    && isProcessInJob handle job
+                    ->
+                    Some(MemberStats(pid, cpu, residentMemory, ioCounters))
+                | _ -> None
 
     type private MemberProcessOpen =
         | Opened of nativeint
@@ -1145,47 +1309,70 @@ module internal Windows =
             | Error ERROR_INVALID_PARAMETER -> Gone
             | Error _ -> Inaccessible
 
-    /// Sample a supplied Job-member snapshot with a safe query-only handle. This internal helper is also
-    /// the deterministic backend seam for tests: membership enumeration remains separate from the
-    /// OpenProcess failure classification. An inaccessible pid is retained only after a fresh Job-member
-    /// query confirms that the same numeric pid is still in this Job; a query failure or a missing pid is
-    /// fail-closed and omits the record.
-    let internal readMemberStatsForPids (job: nativeint) (pids: int list) : MemberStats list =
+    /// Sample a supplied Job-member snapshot with a safe query-only handle. `identities` is captured before
+    /// the member PID list, so it remains the generation ledger even when a pid is reused before
+    /// `OpenProcess`. An inaccessible pid is retained only when a fresh Job query AND a fresh system
+    /// identity snapshot still match the captured generation; a missing identity is fail-closed.
+    let private readMemberStatsForPidsWithIdentities
+        (job: nativeint)
+        (identities: Map<int, int64>)
+        (pids: int list)
+        : MemberStats list =
         let stats = ResizeArray<MemberStats>()
 
         for pid in pids do
-            match openMemberProcess pid with
-            | Opened handle ->
-                try
-                    match readMemberStatsFromHandle pid job handle with
-                    | Some value -> stats.Add value
-                    | None -> ()
-                finally
-                    CloseHandle handle |> ignore
-            | Inaccessible ->
-                // ACCESS_DENIED proves only that metrics cannot be queried. Refresh the Job membership
-                // before retaining the pid, so a protected process that reused the number outside this
-                // Job is omitted rather than exposed as a stale member with None metrics.
-                match membersWindows job with
-                | Ok current when current |> List.contains pid -> stats.Add(MemberStats(pid, None, None, None))
-                | _ ->
-                    // A failed membership refresh or a pid absent from the fresh Job snapshot is not a
-                    // confirmed current member, so fail closed.
+            match Map.tryFind pid identities with
+            | None -> ()
+            | Some expectedIdentity ->
+                match openMemberProcess pid with
+                | Opened handle ->
+                    try
+                        match readMemberStatsFromHandle pid job expectedIdentity handle with
+                        | Some value -> stats.Add value
+                        | None -> ()
+                    finally
+                        CloseHandle handle |> ignore
+                | Inaccessible ->
+                    // ACCESS_DENIED proves only that metrics cannot be queried. Refresh both the Job
+                    // membership and the process-generation snapshot before retaining a None-metric row.
+                    // This keeps a protected PID from being mistaken for a same-number replacement.
+                    match membersWindows job, systemProcessIdentitySnapshot () with
+                    | Ok current, Some currentIdentities when
+                        current |> List.contains pid
+                        && Map.tryFind pid currentIdentities = Some expectedIdentity
+                        ->
+                        stats.Add(MemberStats(pid, None, None, None))
+                    | _ ->
+                        // A failed refresh, a changed generation, or a pid absent from the fresh Job
+                        // snapshot is not a confirmed current member, so fail closed.
+                        ()
+                | Gone ->
+                    // ERROR_INVALID_PARAMETER proves that the process no longer exists between
+                    // enumeration and opening, so the vanished member is omitted.
                     ()
-            | Gone ->
-                // ERROR_INVALID_PARAMETER proves that the process no longer exists between enumeration
-                // and opening, so the vanished member is omitted.
-                ()
 
         List.ofSeq stats
 
+    /// Test seam (internal, not public API): sample an explicit PID list after taking the same identity
+    /// snapshot that the production Job path takes before membership enumeration.
+    let internal readMemberStatsForPids (job: nativeint) (pids: int list) : MemberStats list =
+        match systemProcessIdentitySnapshot () with
+        | Some identities -> readMemberStatsForPidsWithIdentities job identities pids
+        | None -> []
+
     /// Sample every current Job member with a safe query-only handle. A process that exits between Job
     /// enumeration and handle verification is omitted; a member whose individual metrics are denied is
-    /// retained with `None` for those metrics rather than a fabricated zero.
+    /// retained with `None` for those metrics only when its pre-sampling identity still matches.
     let readMemberStats (job: nativeint) : Result<MemberStats list, ProcessError> =
-        match membersWindows job with
-        | Error error -> Error error
-        | Ok pids -> Ok(readMemberStatsForPids job pids)
+        match systemProcessIdentitySnapshot () with
+        | None ->
+            // Without a generation ledger, a numeric Job PID cannot safely be attributed. Returning an
+            // empty best-effort result is safer than exposing a possible recycled process.
+            Ok []
+        | Some identities ->
+            match membersWindows job with
+            | Error error -> Error error
+            | Ok pids -> Ok(readMemberStatsForPidsWithIdentities job identities pids)
 
     // Suspend / resume every member process of a Job over the COMPLETE `membersWindows` snapshot (the
     // buffer grows to fit the whole job, so no member is dropped by an artificial cap). Best-effort and
