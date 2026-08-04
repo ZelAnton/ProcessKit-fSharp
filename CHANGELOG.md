@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Supervisor.LivenessMemory` now documents its intentional monotonic peak-memory contract: a transient peak is not forgiven by later lower usage, and `LivenessFailures` only delays the restart after the crossing.
 
 ### Fixed
+- Windows graceful stops and `Signal.Int`/`Signal.Term` now confirm that a window is still owned by the expected child immediately before posting `WM_CLOSE`, so a child window that closed and had its window handle reused by another application can no longer be closed on the child's behalf; a window the child still owns is closed exactly as before.
+- Windows `Signal.Int`/`Signal.Term` on a whole group now count only `WM_CLOSE` posts the OS accepted, so a group whose every post was refused reports the honest `ProcessError.Unsupported` instead of success — matching how the per-run signal path already counted.
 - Windows `ProcessGroup.Suspend()` and `Resume()` now report a `ProcessError.Io` naming the job members they failed to freeze or thaw, instead of claiming success, while a member that exited concurrently or whose PID was recycled stays a successful no-op.
 - Windows `ProcessGroup.MemberStats()` now binds each Job PID snapshot to a pre-sampling process identity, including inaccessible members, and omits exit/reuse generations.
 - Linux cgroup `ProcessGroup.MemberStats()` now preserves adopted and descendant members while pinning tracked/adopted or snapshot identities to omit recycled PIDs.
