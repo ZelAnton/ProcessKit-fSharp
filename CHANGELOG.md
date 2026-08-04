@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows `ProcessGroup.MemberStats()` now binds each Job PID snapshot to a pre-sampling process identity, including inaccessible members, and omits exit/reuse generations.
 - Linux cgroup `ProcessGroup.MemberStats()` now preserves adopted and descendant members while pinning tracked/adopted or snapshot identities to omit recycled PIDs.
 - Pipeline relays now surface genuine upstream read failures instead of treating truncated downstream input as successful, while keeping expected broken-pipe and teardown races quiet.
+- Pipeline `OutputTooLarge` diagnostics now report only the byte limits that apply to raw captures, with `LineLimit = None`.
 - A supervision session stopped before any incarnation produced a result no longer starts one more child just to report one, and ends with the failure that kept the child from starting — or `ProcessError.Cancelled` when no incarnation was ever started.
 - Supervisor restarts now apply the restart policy to typed live-output pump failures and retain liveness-failure attribution without leaking it to later children.
 - Process-testing doubles now honour `Command.CancelOn` consistently for completion verbs.
