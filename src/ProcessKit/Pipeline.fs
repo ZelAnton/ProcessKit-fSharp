@@ -333,8 +333,8 @@ type PipelineSession
 /// argv/env-never-logged invariant holds for a multi-stage run too). Stage 0 likewise owns
 /// `StopSignal`, because graceful shutdown broadcasts one soft signal to the whole chain.
 ///
-/// `StreamBuffer` depends on how the pipeline is run. For buffered verbs (`RunAsync`, `OutputAsync`,
-/// `ExitCodeAsync`, and similar verbs used without `StartAsync`), it is inapplicable because there is
+/// `StreamBuffer` depends on how the pipeline is run. For buffered verbs (`RunAsync`, `OutputStringAsync`,
+/// `OutputBytesAsync`, `ExitCodeAsync`, and similar verbs used without `StartAsync`), it is inapplicable because there is
 /// no streaming consumer to receive the policy. `StartAsync`, however, returns a live
 /// `PipelineSession`: the last stage's `StreamBuffer` policy is applied to the session's stdout channel,
 /// including its bounded-buffer/backpressure behavior.
