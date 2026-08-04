@@ -136,7 +136,7 @@ module internal PipelineClassify =
 
         let build (index: int) (totalBytes: int) =
             let policy = cmds[index].Config.OutputBuffer
-            ProcessError.OutputTooLarge(cmds[index].Program, policy.MaxLines, policy.MaxBytes, 0, totalBytes)
+            ProcessError.OutputTooLarge(cmds[index].Program, None, policy.MaxBytes, 0, totalBytes)
 
         // Overflow candidates keyed by `(stageIndex, streamRank)`: a lower stageIndex is further left in
         // the chain (higher precedence); within one stage stdout (rank 0) precedes stderr (rank 1). Sorting

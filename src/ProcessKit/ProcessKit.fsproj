@@ -110,9 +110,8 @@
 		<!-- The coverage-guided harness drives Pump.readLines and LineBuffer without widening the
 		     consumer-facing API. -->
 		<InternalsVisibleTo Include="ProcessKit.Fuzz" />
-		<!-- The hosting wrapper reads Supervisor.CurrentStopWhen so it can combine the caller's
-		     already-configured StopWhen predicate with its own host-driven stop condition instead of
-		     silently replacing it. -->
+		<!-- HostedProcessService uses the internal SupervisionSession.StopActiveAsync, Status, and
+		     Completion members for graceful stop, live telemetry, and hard teardown delegation. -->
 		<InternalsVisibleTo Include="ProcessKit.Extensions.Hosting" />
 	</ItemGroup>
 

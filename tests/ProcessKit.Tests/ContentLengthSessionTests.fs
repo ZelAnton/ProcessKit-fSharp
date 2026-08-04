@@ -321,6 +321,76 @@ type ContentLengthSessionTests() =
         }
         :> Task
 
+    // T-297: a frame is a whole protocol message, never a line — the fail-loud `OutputTooLarge` this
+    // session raises on overflow must not claim a `LineLimit`/`TotalLines` this channel never had, and
+    // must carry an honest `TotalBytes` (the cumulative payload bytes actually parsed) instead of the
+    // hardcoded `0` every `StreamChannel.writeItem` caller used to get.
+    [<Test>]
+    member _.``StreamBuffer Error on a full frame backlog reports frame bytes, not a false LineLimit``() : Task =
+        task {
+            let payloads = [| for value in 0uy .. 9uy -> Array.create 4 value |]
+            let capacity = 2
+
+            let command =
+                (Command.create "language-server")
+                    .StreamBuffer(StreamBufferPolicy.Bounded(capacity, StreamFullMode.Error))
+
+            let fake = FakeProcess.OfCommand(command).WithContentLengthFrames(payloads)
+
+            use running = fake.Build()
+            let session = ContentLengthSession running
+            let frames = session.FramesAsync()
+
+            // Nobody drains `FramesAsync()` until the parse task settles, so the parser enqueues exactly
+            // `capacity` frames before its next `TryWrite` finds the channel full and
+            // faults it with `ProcessError.OutputTooLarge` — the same fail-loud path a throwing handler
+            // already goes through, never a block (StreamFullMode.Error never awaits room) nor a silent
+            // drop (both DROP modes are refused for this session).
+            let exit = running.ExitTask
+            let! exitWinner = Task.WhenAny(exit :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(exitWinner, exit), Is.True, "the framed parser never overflowed")
+
+            try
+                let! _ = exit
+                Assert.Fail "expected the framed parser to fault"
+            with :? ProcessException ->
+                ()
+
+            let drain =
+                task {
+                    try
+                        let! _ = collect frames
+                        return None
+                    with :? ProcessException as pe ->
+                        return Some pe.Error
+                }
+
+            let! winner = Task.WhenAny(drain :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, drain), Is.True, "the full frame backlog never faulted the stream")
+
+            match! drain with
+            | Some((ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes) as overflow)) ->
+                Assert.That(lineLimit, Is.EqualTo None, "a Content-Length frame is not a line")
+                Assert.That(byteLimit, Is.EqualTo None, "the channel's capacity bounds queued frames, not bytes")
+                Assert.That(totalLines, Is.EqualTo 0, "frames have no line structure to count")
+
+                let expectedBytes =
+                    payloads
+                    |> Array.take (capacity + 1)
+                    |> Array.sumBy (fun payload -> payload.Length)
+
+                Assert.That(totalBytes, Is.EqualTo expectedBytes)
+
+                Assert.That(
+                    overflow.Message,
+                    Is.EqualTo("'language-server' produced too much protocol output (12 bytes)")
+                )
+
+                Assert.That(overflow.Message, Does.Not.Contain("line"))
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
     [<Test>]
     member _.``disposal while the bounded frame backlog is full ends the stream without a fault``() : Task =
         task {
