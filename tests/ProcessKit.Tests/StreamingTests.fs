@@ -429,6 +429,23 @@ type StreamingTests() =
         }
         :> Task
 
+    // T-303: a second `OutputEventsAsync()` on the same handle must not silently hand out a second
+    // enumerator over `eventChannel` (`StreamChannel.create` creates it with `SingleReader = true`) — it
+    // must throw the same already-consumed `InvalidOperationException` as a repeat `StdoutLinesAsync()`/
+    // `StdoutChunksAsync()` call, by the same one-shot guard-flag pattern.
+    [<Test>]
+    member _.``OutputEventsAsync is one-shot``() : Task =
+        task {
+            use running =
+                syntheticStdoutProcess (Command.create "test").Config "line-1\nline-2\n"
+
+            running.OutputEventsAsync() |> ignore
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.OutputEventsAsync() |> ignore))
+            |> ignore
+        }
+        :> Task
+
     [<Test>]
     member _.``StdoutChunks Backpressure bounds unread chunks without losing bytes``() : Task =
         task {
