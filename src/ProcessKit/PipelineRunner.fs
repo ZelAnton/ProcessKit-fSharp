@@ -990,21 +990,23 @@ module internal PipelineRunner =
                         for sp in spawned do
                             Pump.closeSpawned sp
 
+                        let externallyCancelled =
+                            cancellationToken.IsCancellationRequested
+                            || (cancelOn |> Option.exists (fun token -> token.IsCancellationRequested))
+
+                        let timedOut = timeoutCts.IsCancellationRequested
+
                         registration.Dispose()
                         (group :> IDisposable).Dispose()
                         teardownCts.Dispose()
                         timeoutCts.Dispose()
                         linkedCts.Dispose()
 
-                        let externallyCancelled =
-                            cancellationToken.IsCancellationRequested
-                            || (cancelOn |> Option.exists (fun token -> token.IsCancellationRequested))
-
                         match spawnError with
                         | Some error -> return Error error
                         | None when externallyCancelled ->
                             return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
-                        | None when timeoutCts.IsCancellationRequested ->
+                        | None when timedOut ->
                             // The deadline won while staging: preserve its configured duration instead of
                             // silently downgrading it to Cancelled merely because no session was created.
                             match timeout with

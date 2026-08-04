@@ -209,6 +209,72 @@ type ShutdownTests() =
         | Outcome.Signalled _ -> ()
         | other -> Assert.Fail $"expected a terminal Exited/Signalled outcome, got {other}"
 
+    // A pid no window in these tests is ever really owned by: it stands for the unrelated GUI application
+    // that took over a recycled window handle (or that simply owns a window of its own).
+    let foreignOwnerPid = 424242u
+
+    // A window handle value with no meaning of its own — every native call that would interpret it is a
+    // seam in the tests below, so it is never dereferenced.
+    let syntheticWindow (value: int) = nativeint value
+
+    // Drive the Windows WM_CLOSE paths against synthetic windows. A window handle that was destroyed and
+    // had its value recycled onto a FOREIGN process's window cannot be provoked on demand against the real
+    // OS, so the three window primitives are taken over: `windows` is what the single enumeration pass
+    // reports, `ownerNow` answers the owner query the delivery guard takes immediately before each post
+    // (return a different pid to model the recycle), and every window actually posted to is recorded.
+    // Returns the path's own count alongside that record. The seams are process-wide mutables, always
+    // restored in a `finally` (NUnit runs a fixture's tests sequentially, so no test races another).
+    let withWindowSeams
+        (windows: (nativeint * uint32) list)
+        (ownerNow: nativeint -> uint32)
+        (body: unit -> int)
+        : int * nativeint list =
+        let originalEnumerate = Native.Windows.enumerateTopLevelWindowsHook
+        let originalOwner = Native.Windows.windowOwnerPidHook
+        let originalPost = Native.Windows.postWindowCloseHook
+        let posted = ResizeArray<nativeint>()
+
+        try
+            Native.Windows.enumerateTopLevelWindowsHook <- fun () -> windows
+            Native.Windows.windowOwnerPidHook <- ownerNow
+
+            Native.Windows.postWindowCloseHook <-
+                fun hWnd ->
+                    posted.Add hWnd
+                    true // the OS accepted the post; the paths count exactly these
+
+            let count = body ()
+            count, List.ofSeq posted
+        finally
+            Native.Windows.enumerateTopLevelWindowsHook <- originalEnumerate
+            Native.Windows.windowOwnerPidHook <- originalOwner
+            Native.Windows.postWindowCloseHook <- originalPost
+
+    // Answer the two Job-membership questions `postCloseToJobWindows` asks BEFORE it decides to post, so
+    // that every gate predating the stale-window guard passes: the job lists `memberPid`, and the
+    // `IsProcessInJob` re-check confirms that pid is still a live member of THIS job. Whatever the path
+    // then does with a window is therefore down to the window-identity gate alone. `memberPid` is the test
+    // process itself, so the real `OpenProcess`/`CloseHandle` the path runs against it genuinely succeed.
+    let withLiveJobMember (memberPid: int) (body: unit -> int * nativeint list) : int * nativeint list =
+        let originalMembers = Native.Windows.queryInformationJobObjectHook
+        let originalInJob = Native.Windows.isProcessInJobForTests
+
+        try
+            Native.Windows.queryInformationJobObjectHook <-
+                fun _job _infoClass buffer _bufferSize ->
+                    // The `JOBOBJECT_BASIC_PROCESS_ID_LIST` layout `membersWindows` reads back: the assigned
+                    // count, the returned count, then the pid array.
+                    Marshal.WriteInt32(buffer, 0, 1)
+                    Marshal.WriteInt32(buffer, 4, 1)
+                    Marshal.WriteIntPtr(buffer, 8, nativeint memberPid)
+                    struct (true, 0)
+
+            Native.Windows.isProcessInJobForTests <- Some(fun _handle _job -> true)
+            body ()
+        finally
+            Native.Windows.queryInformationJobObjectHook <- originalMembers
+            Native.Windows.isProcessInJobForTests <- originalInJob
+
     [<Test>]
     member _.``Shutdown reaps a running process promptly``() : Task =
         task {
@@ -841,3 +907,101 @@ type ShutdownTests() =
                 assertTerminal outcome
         }
         :> Task
+
+    [<Test>]
+    member _.``Windows: a Job member window whose handle was recycled gets no WM_CLOSE``() =
+        if not isWindows then
+            Assert.Ignore "The WM_CLOSE soft close and its window-identity guard are Windows-only concerns."
+
+        // Every gate that predates the fix passes here: the job lists the owning pid AND the
+        // `IsProcessInJob` re-check confirms it is still a live member — which proves only that the PROCESS
+        // is still ours, never that it still owns this WINDOW. The member's window has since been destroyed
+        // and its handle value handed out to an unrelated GUI application, so posting WM_CLOSE would close
+        // a stranger's window. Only the owner re-query taken immediately before the post can see that.
+        let memberPid = Environment.ProcessId
+        let recycled = syntheticWindow 0x00DA0001
+
+        let count, posted =
+            withLiveJobMember memberPid (fun () ->
+                withWindowSeams [ recycled, uint32 memberPid ] (fun _ -> foreignOwnerPid) (fun () ->
+                    Native.Windows.postCloseToJobWindows IntPtr.Zero))
+
+        Assert.That(posted, Is.Empty, "WM_CLOSE reached a window the Job member no longer owns")
+
+        Assert.That(count, Is.EqualTo 0, "a window that was never posted to must not be counted as closed")
+
+    [<Test>]
+    member _.``Windows: a Job member window that is still its own gets WM_CLOSE``() =
+        if not isWindows then
+            Assert.Ignore "The WM_CLOSE soft close and its window-identity guard are Windows-only concerns."
+
+        // The other half of the contract: the guard must not suppress a legitimate delivery. The member
+        // still owns its window at the moment of the post, so it is closed exactly as before the fix — and
+        // the window belonging to an unrelated process is left alone, as it always was.
+        let memberPid = Environment.ProcessId
+        let memberWindow = syntheticWindow 0x00DA0002
+        let foreignWindow = syntheticWindow 0x00DA0003
+
+        let count, posted =
+            withLiveJobMember memberPid (fun () ->
+                withWindowSeams
+                    [ memberWindow, uint32 memberPid; foreignWindow, foreignOwnerPid ]
+                    (fun hWnd ->
+                        if hWnd = memberWindow then
+                            uint32 memberPid
+                        else
+                            foreignOwnerPid)
+                    (fun () -> Native.Windows.postCloseToJobWindows IntPtr.Zero))
+
+        Assert.That(
+            posted,
+            Is.EqualTo<nativeint list>([ memberWindow ]),
+            "the live member window did not get its WM_CLOSE"
+        )
+
+        Assert.That(count, Is.EqualTo 1, "the count must report the window that was really posted to")
+
+    [<Test>]
+    member _.``Windows: a per-run window whose handle was recycled gets no WM_CLOSE``() =
+        if not isWindows then
+            Assert.Ignore "The WM_CLOSE soft close and its window-identity guard are Windows-only concerns."
+
+        // Same stale-window hazard on the per-run `SignalChild` path. The caller's open process handle pins
+        // the PID against recycling, which is why this path never needed a membership re-check — but it
+        // pins nothing about the WINDOW, so the enumerated handle can name an unrelated application's
+        // window by the time the post is made unless the owner is confirmed at that moment.
+        let runPid = Environment.ProcessId
+        let recycled = syntheticWindow 0x00DA0004
+
+        let count, posted =
+            withWindowSeams [ recycled, uint32 runPid ] (fun _ -> foreignOwnerPid) (fun () ->
+                Native.Windows.postCloseToProcessWindows runPid)
+
+        Assert.That(posted, Is.Empty, "WM_CLOSE reached a window the signalled process no longer owns")
+
+        Assert.That(count, Is.EqualTo 0, "a window that was never posted to must not be counted as closed")
+
+    [<Test>]
+    member _.``Windows: a per-run window that is still its own gets WM_CLOSE``() =
+        if not isWindows then
+            Assert.Ignore "The WM_CLOSE soft close and its window-identity guard are Windows-only concerns."
+
+        // And the per-run path keeps delivering to a window its process still owns, while a window owned by
+        // an unrelated process stays untouched.
+        let runPid = Environment.ProcessId
+        let runWindow = syntheticWindow 0x00DA0005
+        let foreignWindow = syntheticWindow 0x00DA0006
+
+        let count, posted =
+            withWindowSeams
+                [ runWindow, uint32 runPid; foreignWindow, foreignOwnerPid ]
+                (fun hWnd -> if hWnd = runWindow then uint32 runPid else foreignOwnerPid)
+                (fun () -> Native.Windows.postCloseToProcessWindows runPid)
+
+        Assert.That(
+            posted,
+            Is.EqualTo<nativeint list>([ runWindow ]),
+            "the live window of the signalled process got no WM_CLOSE"
+        )
+
+        Assert.That(count, Is.EqualTo 1, "the count must report the window that was really posted to")

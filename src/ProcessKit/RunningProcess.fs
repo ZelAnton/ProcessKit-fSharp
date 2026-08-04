@@ -439,6 +439,12 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // The chunk-streaming analogue of `stdoutLinesClaimed`: the session setup is deliberately
     // reentrant for `FinishAsync`/`ExitTask`, but the public enumerator is handed out only once.
     let mutable stdoutChunksClaimed = false
+    // The event-streaming analogue of `stdoutLinesClaimed`/`stdoutChunksClaimed`. Unlike stdout
+    // line/chunk streaming, `StartEventStreaming()` has no companion verb that needs to rejoin an
+    // already-claimed session (`ExitTask`/`StopAsync` reuse `eventOutcome` directly, never
+    // `StartEventStreaming()` itself), so this flag lives right in the claim gate below instead of
+    // a separate public verb. Set only once, the moment `StartEventStreaming()` first succeeds.
+    let mutable eventStreamClaimed = false
     let mutable stdoutLineCount = 0L
     let mutable stdoutChunkCount = 0
     let mutable stderrLineCount = 0L
@@ -2086,17 +2092,29 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             }
 
     // Returns false when a different consumption (a buffered verb, or stdout streaming) already owns the
-    // pipes; true once the event streaming session is (or already was) ours. As with
+    // pipes, OR when the event-streaming session itself was already claimed by an earlier
+    // `OutputEventsAsync()` call; true only for the ONE call that first claims the session. As with
     // `StartStdoutStreaming`, the whole check + claim + setup runs under `stateLock`, so a concurrent
     // second `OutputEventsAsync` observes a fully-constructed session or is atomically refused.
     member private _.StartEventStreaming() : bool =
         lock stateLock (fun () ->
             if consumption = Consumption.EventStreaming then
-                true
+                // `eventChannel` is created with `SingleReader = true` (`StreamChannel.create`), so a
+                // second concurrent reader relies on undefined behaviour of a single-consumer-optimized
+                // channel — refuse it instead of reentrantly handing out a second enumerator. No internal
+                // caller re-enters this method to rejoin an already-claimed session (`ExitTask`/
+                // `StopAsync` reuse `eventOutcome` directly), so this branch only ever serves a repeat
+                // `OutputEventsAsync()` call.
+                if eventStreamClaimed then
+                    false
+                else
+                    eventStreamClaimed <- true
+                    true
             elif consumption <> Consumption.Fresh then
                 false
             else
                 consumption <- Consumption.EventStreaming
+                eventStreamClaimed <- true
                 // Each pump completes the shared event channel on its own fault (carrying the error), so an
                 // `OutputEventsAsync` consumer observes a throwing handler promptly rather than hanging until the
                 // process exits — `eventOutcome` below only completes the channel after the exit wait, which
