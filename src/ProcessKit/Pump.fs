@@ -47,7 +47,7 @@ module internal Pump =
         // time.
         let retained = LinkedList<struct (string * int)>()
         let mutable retainedBytes = 0
-        let mutable totalLines = 0
+        let mutable totalLines = 0L
         let mutable totalBytes = 0L
         let mutable truncated = false
         let mutable tooLarge = false
@@ -70,7 +70,7 @@ module internal Pump =
             | Some cap -> retainedBytes + addition > cap
             | None -> false
 
-        member _.TotalLines = totalLines
+        member _.TotalLines = int (min totalLines (int64 Int32.MaxValue))
         member _.TotalBytes = int (min totalBytes (int64 Int32.MaxValue))
         member _.Truncated = truncated
         member _.TooLarge = tooLarge
@@ -81,7 +81,10 @@ module internal Pump =
         /// accounted byte cost is derived (its own UTF-8 bytes plus one separator byte).
         member _.Add(line: string) =
             let bytes = if needBytes then Encoding.UTF8.GetByteCount line + 1 else 0
-            totalLines <- totalLines + 1
+
+            if totalLines < Int64.MaxValue then
+                totalLines <- totalLines + 1L
+
             let byteCount = int64 bytes
 
             totalBytes <-

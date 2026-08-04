@@ -492,11 +492,14 @@ type PipelineTests() =
     [<Test>]
     member _.``pipeline last-stage Error trips OutputTooLarge once the byte cap is exceeded``() : Task =
         task {
-            match!
-                pipelineBytes (Some((OutputBufferPolicy.Unbounded.WithMaxBytes 3).WithOverflow OverflowMode.Error))
-            with
-            | Error(ProcessError.OutputTooLarge(_, _, byteLimit, _, totalBytes)) ->
+            let policy =
+                OutputBufferPolicy.Unbounded.WithMaxLines(1).WithMaxBytes(3).WithOverflow OverflowMode.Error
+
+            match! pipelineBytes (Some policy) with
+            | Error(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes)) ->
+                Assert.That(lineLimit, Is.EqualTo(None), "a raw stdout capture does not enforce MaxLines")
                 Assert.That(byteLimit, Is.EqualTo(Some 3))
+                Assert.That(totalLines, Is.EqualTo 0, "a raw stdout capture has no line structure")
                 Assert.That(totalBytes, Is.GreaterThan 3)
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
         }
@@ -569,11 +572,14 @@ type PipelineTests() =
             let cap = 16
 
             let noisy =
-                stderrStage 50 ((OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow OverflowMode.Error)
+                stderrStage
+                    50
+                    (OutputBufferPolicy.Unbounded.WithMaxLines(1).WithMaxBytes(cap).WithOverflow OverflowMode.Error)
 
             match! (noisy.Pipe sortStage).OutputBytesAsync() with
-            | Error(ProcessError.OutputTooLarge(program, _, byteLimit, totalLines, totalBytes)) ->
+            | Error(ProcessError.OutputTooLarge(program, lineLimit, byteLimit, totalLines, totalBytes)) ->
                 Assert.That(program, Is.EqualTo noisy.Program, "the error must name the overflowing stage")
+                Assert.That(lineLimit, Is.EqualTo(None), "a raw stderr capture does not enforce MaxLines")
                 Assert.That(byteLimit, Is.EqualTo(Some cap), "the limit must be the offending stage's own cap")
                 Assert.That(totalLines, Is.EqualTo 0, "a raw stderr byte capture has no line structure")
                 Assert.That(totalBytes, Is.GreaterThan cap, "the totals must reflect the overflow past the cap")
