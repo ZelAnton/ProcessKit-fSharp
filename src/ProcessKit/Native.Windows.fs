@@ -801,6 +801,12 @@ module internal Windows =
     /// exit-after-pre-read and same-Job identity checks can be driven without a real PID-reuse race.
     let mutable isProcessInJobForTests: (nativeint -> nativeint -> bool) option = None
 
+    /// Test seam (internal, not public API): replaces the `OpenProcess` call the suspend/resume walk makes
+    /// for each Job member. The result carries a Win32 error code on failure, so a test can drive the
+    /// "proven gone" (`ERROR_INVALID_PARAMETER`) and "refused for some other reason" classifications apart
+    /// without racing a real member exit or pid recycle. Production leaves it `None`.
+    let mutable openControlHandleForTests: (int -> Result<nativeint, int>) option = None
+
     /// Test seam (internal, not public API): replaces `GetProcessTimes` for a synthetic member handle.
     /// The tuple is `(creation, exit, kernel, user)` in Windows' 100-nanosecond ticks. A test can return
     /// one stable creation time followed by a non-zero exit time or a different creation time to model
@@ -889,6 +895,16 @@ module internal Windows =
     [<DllImport("ntdll.dll")>]
     extern int private NtResumeProcess(nativeint hProcess)
 
+    // Test seams: the two entry points the suspend/resume walk delivers through, overridable so a
+    // fault-injection test can return a chosen NTSTATUS deterministically — a genuinely failing suspend or
+    // resume on a live member of our own job cannot be provoked on a healthy host, and that failure is
+    // exactly what must reach the caller as `ProcessError.Io`. Production always runs the real entry
+    // points; only the (sequential) tests reassign these, and restore them in a `finally`. Mirrors the
+    // existing `resumeThreadHook` fault seam above.
+    let mutable suspendProcessHook: nativeint -> int = NtSuspendProcess
+
+    let mutable resumeProcessHook: nativeint -> int = NtResumeProcess
+
     // `QueryInformationJobObject` signals "your buffer was too small" for `JobObjectBasicProcessIdList`
     // by returning FALSE with this last-error (as well as, on some paths, returning TRUE but reporting a
     // `NumberOfAssignedProcesses` larger than the list it could fit); both are handled by growing.
@@ -912,6 +928,14 @@ module internal Windows =
     // NtQuerySystemInformation returns this NTSTATUS when the caller's buffer is too small.
     [<Literal>]
     let private STATUS_INFO_LENGTH_MISMATCH = -1073741820
+
+    // 0xC000010A. The kernel's suspend/resume primitive answers with it for a process that has already
+    // begun (or finished) exiting while its process object is still referenced — the routine benign
+    // outcome for the suspend/resume walk, because a member can leave between the Job snapshot and the
+    // call, and a process on its way out has nothing left to freeze or thaw. It is the Windows shape of
+    // the POSIX "target gone" (ESRCH) no-op that `Suspend`/`Resume` already document as a success.
+    [<Literal>]
+    let private STATUS_PROCESS_IS_TERMINATING = -1073741558
 
     [<Literal>]
     let private initialProcessIdentityBufferSize = 1024 * 1024
@@ -1374,6 +1398,89 @@ module internal Windows =
             | Error error -> Error error
             | Ok pids -> Ok(readMemberStatsForPidsWithIdentities job identities pids)
 
+    // Open ONE Job member for the suspend/resume walk: PROCESS_SUSPEND_RESUME to deliver the operation,
+    // PROCESS_QUERY_LIMITED_INFORMATION so the SAME handle can answer `IsProcessInJob` — the least
+    // privilege this walk needs, and no second open. The Win32 error is captured immediately after the
+    // call, so the classification below works off a returned value rather than thread-global state.
+    let private openControlHandle (pid: int) : Result<nativeint, int> =
+        match openControlHandleForTests with
+        | Some opener -> opener pid
+        | None ->
+            let handle =
+                OpenProcess(PROCESS_SUSPEND_RESUME ||| PROCESS_QUERY_LIMITED_INFORMATION, false, uint32 pid)
+
+            if handle = IntPtr.Zero then
+                Error(Marshal.GetLastWin32Error())
+            else
+                Ok handle
+
+    // How many failed pids the aggregated error names before it summarises the rest. A job can hold
+    // thousands of processes; this keeps the message actionable instead of turning it into a pid dump.
+    [<Literal>]
+    let private maxReportedFailedMembers = 8
+
+    // Second opinion on a member the walk could neither open nor verify — the deliberately conservative
+    // side of the one classification that cannot be made from the failed call alone (an open or a
+    // membership query can be refused for reasons that do NOT prove the process is gone, e.g.
+    // ERROR_ACCESS_DENIED). Only the JOB is authoritative about who its members are, so ask it again:
+    //   * the pid has left the job — benign, this was the exit/recycle race the fail-safe skip exists for;
+    //   * the job still lists it — a member we genuinely failed to touch, and the caller must hear it;
+    //   * the re-query itself failed — the doubt cannot be resolved, so report rather than fabricate a
+    //     success, matching how `membersWindows` already treats its own query failures.
+    // Only reached on a failure, so the extra query costs nothing on the healthy path.
+    let private unresolvedMemberFailure (job: nativeint) (pid: int) : string option =
+        match membersWindows job with
+        | Ok pids when pids |> List.contains pid -> Some "the job still lists it as a member"
+        | Ok _ -> None
+        | Error error -> Some $"its job membership could not be re-checked ({error.Message})"
+
+    // Suspend or resume ONE member, classifying every way the attempt can end. `None` = nothing to report
+    // (the member got the operation, or is provably not ours, or is provably gone); `Some detail` = a real
+    // member did NOT get it, and `detail` says why.
+    let private controlOneMember
+        (job: nativeint)
+        (operation: string)
+        (action: nativeint -> int)
+        (pid: int)
+        : string option =
+        match openControlHandle pid with
+        | Error ERROR_INVALID_PARAMETER ->
+            // Proven benign: the pid does not exist, so this member exited between the snapshot and the
+            // open (the ordinary exit race of a short-lived grandchild). Nothing left to freeze or thaw.
+            None
+        | Error errno ->
+            unresolvedMemberFailure job pid
+            |> Option.map (fun reason -> $"could not be opened ({Win32Exception(errno).Message}) and {reason}")
+        | Ok handle ->
+            try
+                let mutable stillMember = false
+
+                if not (IsProcessInJob(handle, job, &stillMember)) then
+                    // Membership is unverifiable, so this handle must never be touched (an unverified
+                    // process could be a stranger). Same ambiguity as a refused open — ask the job.
+                    let errno = Marshal.GetLastWin32Error()
+
+                    unresolvedMemberFailure job pid
+                    |> Option.map (fun reason ->
+                        $"its job membership could not be verified ({Win32Exception(errno).Message}) and {reason}")
+                elif not stillMember then
+                    // The opened process is NOT in this job: the member exited and its pid was reused by an
+                    // unrelated process. Benign by definition — a stranger is not a member we failed to
+                    // suspend, and diverting the operation onto it is exactly what this re-check prevents.
+                    None
+                else
+                    // Confirmed live (the handle opened) and confirmed ours (the job says so), so the
+                    // NTSTATUS is about a real member and cannot be discarded.
+                    match action handle with
+                    | STATUS_SUCCESS -> None
+                    | STATUS_PROCESS_IS_TERMINATING ->
+                        // It began exiting between the membership check and this call — the same benign
+                        // race as a vanished pid, one window later.
+                        None
+                    | status -> Some $"the native {operation} failed (NTSTATUS 0x{status:X8})"
+            finally
+                CloseHandle handle |> ignore
+
     // Suspend / resume every member process of a Job over the COMPLETE `membersWindows` snapshot (the
     // buffer grows to fit the whole job, so no member is dropped by an artificial cap). Best-effort and
     // not atomic: a process can still spawn between the snapshot and the suspend — the only documented
@@ -1385,34 +1492,58 @@ module internal Windows =
     //
     // Recycle-safe: the member pid list is a snapshot, so a member (typically a handle-less
     // grandchild) can exit and its pid be reused by an unrelated process between the snapshot and
-    // `OpenProcess` below. Re-verify with `IsProcessInJob` that the just-opened handle is STILL a
-    // member of THIS job before invoking `action` (`NtSuspendProcess`/`NtResumeProcess`), so a
-    // recycled pid can never divert a suspend/resume onto a foreign process. Fail-safe: any failure
-    // to open the process or query its membership is treated as "not our member" — an uncertain
-    // result never touches the process.
-    let private forEachMemberHandle (job: nativeint) (action: nativeint -> unit) : Result<unit, ProcessError> =
+    // `OpenProcess`. `controlOneMember` re-verifies with `IsProcessInJob` that the just-opened handle is
+    // STILL a member of THIS job before invoking `action` (`NtSuspendProcess`/`NtResumeProcess`), so a
+    // recycled pid can never divert a suspend/resume onto a foreign process; an uncertain result never
+    // touches the process.
+    //
+    // Honest: uncertainty about WHOM to touch is not the same as success. Every member that was confirmed
+    // ours and still failed is aggregated here and reported as one `ProcessError.Io`, so a caller can no
+    // longer be told the whole tree is frozen while some of it kept running. Delivery is not rolled back
+    // for the members that did succeed — a partial suspend is reported, not undone, because unfreezing
+    // them would be a second guess at what the caller wants (and Windows suspend counts make it lossy).
+    let private forEachMemberHandle
+        (job: nativeint)
+        (operation: string)
+        (action: nativeint -> int)
+        : Result<unit, ProcessError> =
         match membersWindows job with
         | Error error -> Error error
         | Ok pids ->
+            let failures = ResizeArray<int * string>()
+
             for pid in pids do
-                let handle =
-                    OpenProcess(PROCESS_SUSPEND_RESUME ||| PROCESS_QUERY_LIMITED_INFORMATION, false, uint32 pid)
+                match controlOneMember job operation action pid with
+                | Some detail -> failures.Add(pid, detail)
+                | None -> ()
 
-                if handle <> IntPtr.Zero then
-                    let mutable stillMember = false
+            if failures.Count = 0 then
+                Ok()
+            else
+                let named =
+                    failures
+                    |> Seq.truncate maxReportedFailedMembers
+                    |> Seq.map (fst >> string)
+                    |> String.concat ", "
 
-                    if IsProcessInJob(handle, job, &stillMember) && stillMember then
-                        action handle
+                let listed =
+                    if failures.Count > maxReportedFailedMembers then
+                        $"{named} and {failures.Count - maxReportedFailedMembers} more"
+                    else
+                        named
 
-                    CloseHandle handle |> ignore
+                let firstPid, firstDetail = failures[0]
 
-            Ok()
+                Error(
+                    ProcessError.Io
+                        $"could not {operation} {failures.Count} of {List.length pids} job members (pids {listed}); first failure: pid {firstPid} — {firstDetail}"
+                )
 
     let suspendWindows (job: nativeint) : Result<unit, ProcessError> =
-        forEachMemberHandle job (fun handle -> NtSuspendProcess handle |> ignore)
+        forEachMemberHandle job "suspend" suspendProcessHook
 
     let resumeWindows (job: nativeint) : Result<unit, ProcessError> =
-        forEachMemberHandle job (fun handle -> NtResumeProcess handle |> ignore)
+        forEachMemberHandle job "resume" resumeProcessHook
 
     /// Adopt an already-running external process into `job` via `AssignProcessToJobObject`. Opens our own
     /// least-privilege handle to `pid` (PROCESS_SET_QUOTA + PROCESS_TERMINATE — the two rights the assign

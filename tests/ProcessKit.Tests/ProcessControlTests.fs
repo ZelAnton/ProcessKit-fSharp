@@ -9,6 +9,61 @@ open NUnit.Framework
 open ProcessKit
 open ProcessKit.Native
 
+/// Windows-only helpers for the suspend/resume delivery-failure tests. `openLikeProduction` opens exactly
+/// the least-privilege handle the production walk opens, so a test that takes over the walk's open seam
+/// can still hand it a REAL handle for a REAL member (one `IsProcessInJob` confirms and `NtSuspendProcess`
+/// accepts) while answering for a member that has vanished. The walk closes every handle it is given, so
+/// these are never closed here.
+module private WindowsMemberControlInterop =
+
+    [<Literal>]
+    let PROCESS_SUSPEND_RESUME = 0x0800u
+
+    [<Literal>]
+    let PROCESS_QUERY_LIMITED_INFORMATION = 0x1000u
+
+    /// `OpenProcess`'s "this pid does not exist" answer — the only open failure that PROVES a member is
+    /// gone, and so the only one the walk may treat as a benign no-op.
+    [<Literal>]
+    let ERROR_INVALID_PARAMETER = 87
+
+    /// An open refused WITHOUT proving the process is gone; the walk must not read it as a success.
+    [<Literal>]
+    let ERROR_ACCESS_DENIED = 5
+
+    /// STATUS_ACCESS_DENIED (0xC0000022): a genuine native refusal — deliberately NOT
+    /// STATUS_PROCESS_IS_TERMINATING (0xC000010A), which means the member is already on its way out.
+    [<Literal>]
+    let STATUS_ACCESS_DENIED = -1073741790
+
+    /// STATUS_PROCESS_IS_TERMINATING (0xC000010A): the member exited between the membership check and the
+    /// native call — nothing left to freeze or thaw, so a successful no-op rather than a failure.
+    [<Literal>]
+    let STATUS_PROCESS_IS_TERMINATING = -1073741558
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern nativeint OpenProcess(uint32 dwDesiredAccess, bool bInheritHandle, uint32 dwProcessId)
+
+    let openLikeProduction (pid: int) : Result<nativeint, int> =
+        let handle =
+            OpenProcess(PROCESS_SUSPEND_RESUME ||| PROCESS_QUERY_LIMITED_INFORMATION, false, uint32 pid)
+
+        if handle = IntPtr.Zero then
+            Error(Marshal.GetLastWin32Error())
+        else
+            Ok handle
+
+    /// Fill a `JOBOBJECT_BASIC_PROCESS_ID_LIST` buffer with `pids` — the shape
+    /// `Windows.queryInformationJobObjectHook` must produce for `membersWindows`.
+    let writeMemberList (buffer: nativeint) (pids: int list) =
+        Marshal.WriteInt32(buffer, 0, pids.Length) // NumberOfAssignedProcesses
+        Marshal.WriteInt32(buffer, 4, pids.Length) // NumberOfProcessIdsInList
+
+        pids
+        |> List.iteri (fun i pid -> Marshal.WriteIntPtr(buffer, 8 + i * IntPtr.Size, nativeint pid))
+
+        struct (true, 0)
+
 [<TestFixture>]
 type ProcessControlTests() =
 
@@ -381,6 +436,235 @@ type ProcessControlTests() =
                 | other -> Assert.Fail $"{other}"
         }
         :> Task
+
+    // --- T-298: Windows suspend/resume must report a member it did not touch. The walk is best-effort in
+    // WHAT it can reach, never in what it CLAIMS: a member that is confirmed live and confirmed ours and
+    // still fails becomes a `ProcessError.Io`, while the exit and pid-recycle races stay successful no-ops
+    // (a caller may not be told the whole tree is frozen while part of it kept running). The native calls
+    // cannot be made to fail on demand on a healthy host, so the two seams under test replace exactly the
+    // `OpenProcess` and `NtSuspendProcess`/`NtResumeProcess` calls and nothing else. ---
+
+    [<Test>]
+    member _.``Windows Suspend and Resume surface a native delivery failure on a live member``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: the NtSuspendProcess/NtResumeProcess delivery path."
+
+            use group = create ()
+
+            match! group.StartAsync(sleeper |> Command.timeout (TimeSpan.FromSeconds 15.0)) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let pid =
+                    match running.Pid with
+                    | Some pid -> pid
+                    | None -> failwith "expected a pid"
+
+                let originalSuspend = Windows.suspendProcessHook
+                let originalResume = Windows.resumeProcessHook
+
+                try
+                    // The member is real, live, and confirmed by IsProcessInJob to be ours — only the
+                    // native call fails. There is no benign reading of that: the process kept running.
+                    Windows.suspendProcessHook <- fun _ -> WindowsMemberControlInterop.STATUS_ACCESS_DENIED
+
+                    Windows.resumeProcessHook <- fun _ -> WindowsMemberControlInterop.STATUS_ACCESS_DENIED
+
+                    match group.Suspend() with
+                    | Error(ProcessError.Io message) ->
+                        Assert.That(
+                            message,
+                            Does.Contain(string pid),
+                            "the error must name the member that was not suspended"
+                        )
+
+                        Assert.That(message, Does.Contain "suspend", "the error must name the operation")
+
+                        Assert.That(
+                            message,
+                            Does.Contain "0xC0000022",
+                            "the error must carry the NTSTATUS the native call refused with"
+                        )
+                    | other -> Assert.Fail $"expected Error(ProcessError.Io) from Suspend, got {other}"
+
+                    match group.Resume() with
+                    | Error(ProcessError.Io message) ->
+                        Assert.That(message, Does.Contain(string pid))
+                        Assert.That(message, Does.Contain "resume", "the error must name the operation")
+                    | other -> Assert.Fail $"expected Error(ProcessError.Io) from Resume, got {other}"
+                finally
+                    Windows.suspendProcessHook <- originalSuspend
+                    Windows.resumeProcessHook <- originalResume
+
+                // The failed delivery changed nothing about the tree (the seam replaced the whole native
+                // call), so the child is still running and still killable.
+                running.Kill()
+                let! _ = running.WaitAsync()
+                ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows Suspend treats a member that is already terminating as a successful no-op``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: the NtSuspendProcess NTSTATUS classification."
+
+            use group = create ()
+
+            match! group.StartAsync(sleeper |> Command.timeout (TimeSpan.FromSeconds 15.0)) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let originalSuspend = Windows.suspendProcessHook
+
+                try
+                    // A member that exits between the membership check and the native call is the ordinary
+                    // short-lived-grandchild race, not a delivery failure — freezing what is already gone
+                    // is a no-op, and failing the whole verb over it would be a false alarm.
+                    Windows.suspendProcessHook <- fun _ -> WindowsMemberControlInterop.STATUS_PROCESS_IS_TERMINATING
+
+                    match group.Suspend() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"a terminating member must not fail Suspend, got {error}"
+                finally
+                    Windows.suspendProcessHook <- originalSuspend
+
+                running.Kill()
+                let! _ = running.WaitAsync()
+                ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows Suspend skips a member that vanished before the open and still reaches the rest``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: the OpenProcess classification of the suspend/resume walk."
+
+            use group = create ()
+
+            // Sleeps briefly then prints; the 10s timeout turns a suspend that was never resumed into a
+            // TimedOut outcome instead of a hung test.
+            let printer =
+                shell "ping -n 2 127.0.0.1 >nul & echo done"
+                |> Command.timeout (TimeSpan.FromSeconds 10.0)
+
+            match! group.StartAsync printer with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let livePid =
+                    match running.Pid with
+                    | Some pid -> pid
+                    | None -> failwith "expected a pid"
+
+                // A pid the walk is told is a member but that no longer exists. Driven through the open
+                // seam ("this pid does not exist") rather than by guessing a dead pid number, which a live
+                // process could take at any moment.
+                let vanishedPid = 424242
+
+                let originalMembers = Windows.queryInformationJobObjectHook
+                let originalOpen = Windows.openControlHandleForTests
+                let originalSuspend = Windows.suspendProcessHook
+                let suspended = ResizeArray<nativeint>()
+
+                try
+                    Windows.queryInformationJobObjectHook <-
+                        fun _job _infoClass buffer _bufferSize ->
+                            WindowsMemberControlInterop.writeMemberList buffer [ vanishedPid; livePid ]
+
+                    Windows.openControlHandleForTests <-
+                        Some(fun pid ->
+                            if pid = vanishedPid then
+                                Error WindowsMemberControlInterop.ERROR_INVALID_PARAMETER
+                            else
+                                WindowsMemberControlInterop.openLikeProduction pid)
+
+                    // Count the deliveries, then run the real native call: the surviving member must be
+                    // suspended for real (and resumed for real), the vanished one never touched.
+                    Windows.suspendProcessHook <-
+                        fun handle ->
+                            suspended.Add handle
+                            originalSuspend handle
+
+                    match group.Suspend() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"a vanished member must not fail Suspend, got {error}"
+
+                    match group.Resume() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"a vanished member must not fail Resume, got {error}"
+                finally
+                    Windows.queryInformationJobObjectHook <- originalMembers
+                    Windows.openControlHandleForTests <- originalOpen
+                    Windows.suspendProcessHook <- originalSuspend
+
+                Assert.That(
+                    suspended.Count,
+                    Is.EqualTo 1,
+                    "exactly the surviving member should have been suspended — the vanished pid must never reach the native call"
+                )
+
+                let! outcome = running.WaitAsync()
+
+                match outcome with
+                | Outcome.Exited _ -> Assert.Pass()
+                | Outcome.TimedOut -> Assert.Fail "process stayed suspended — Resume did not thaw it"
+                | other -> Assert.Fail $"{other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows Suspend reports a member it could not open while the job still lists it``() =
+        // No real processes: both native calls the walk would make are seams, so the classification itself
+        // is what is under test. ERROR_ACCESS_DENIED proves only that the open was refused — NOT that the
+        // member is gone — and the job still reports the pid, so this is a member that did not get the
+        // operation and the caller must hear about it.
+        let originalMembers = Windows.queryInformationJobObjectHook
+        let originalOpen = Windows.openControlHandleForTests
+
+        try
+            Windows.queryInformationJobObjectHook <-
+                fun _job _infoClass buffer _bufferSize -> WindowsMemberControlInterop.writeMemberList buffer [ 4242 ]
+
+            Windows.openControlHandleForTests <- Some(fun _ -> Error WindowsMemberControlInterop.ERROR_ACCESS_DENIED)
+
+            match Windows.suspendWindows IntPtr.Zero with
+            | Error(ProcessError.Io message) ->
+                Assert.That(message, Does.Contain "4242", "the error must name the member that was missed")
+            | other -> Assert.Fail $"expected Error(ProcessError.Io), got {other}"
+        finally
+            Windows.queryInformationJobObjectHook <- originalMembers
+            Windows.openControlHandleForTests <- originalOpen
+
+    [<Test>]
+    member _.``Windows Suspend accepts a member it could not open once the job no longer lists it``() =
+        // Same refused open, opposite verdict: by the time the walk asks the job for a second opinion the
+        // pid has left it, which is exactly the exit/recycle race the fail-safe skip exists for. The job
+        // is the only authority on its own membership, so this one is a benign no-op, not a failure.
+        let originalMembers = Windows.queryInformationJobObjectHook
+        let originalOpen = Windows.openControlHandleForTests
+        let mutable queries = 0
+
+        try
+            Windows.queryInformationJobObjectHook <-
+                fun _job _infoClass buffer _bufferSize ->
+                    queries <- queries + 1
+
+                    if queries = 1 then
+                        WindowsMemberControlInterop.writeMemberList buffer [ 4242 ]
+                    else
+                        WindowsMemberControlInterop.writeMemberList buffer []
+
+            Windows.openControlHandleForTests <- Some(fun _ -> Error WindowsMemberControlInterop.ERROR_ACCESS_DENIED)
+
+            match Windows.suspendWindows IntPtr.Zero with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"a member that left the job must not fail Suspend, got {error}"
+
+            Assert.That(queries, Is.GreaterThan 1, "the refused open must be re-checked against the job")
+        finally
+            Windows.queryInformationJobObjectHook <- originalMembers
+            Windows.openControlHandleForTests <- originalOpen
 
     [<Test>]
     member _.``a ProcessGroup is an IProcessRunner that runs into the shared group``() : Task =

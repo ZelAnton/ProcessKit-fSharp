@@ -24,18 +24,46 @@ type internal PtyResizeRecorder() =
     /// The last `(cols, rows)` requested, or `None` if no resize has been requested yet.
     member _.Last = lock gate (fun () -> last)
 
-/// Stores the bytes written to a `FakeProcess`'s interactive stdin. The backing `MemoryStream` stays
-/// inspectable through `ToArray` after the built `RunningProcess` has disposed it, matching a test's
-/// natural write-then-assert flow.
+/// A `MemoryStream` handed out to exactly one built `RunningProcess` handle. Disposing it (via
+/// `ProcessStdin.FinishAsync` or process teardown) tears down only this stream — it never touches any
+/// other stream the owning `FakeStdinRecorder` has handed out to a sibling handle. Every write is also
+/// mirrored to `onWrite` so the recorder's aggregate log survives this stream's disposal.
+[<Sealed>]
+type private RecordingStream(onWrite: byte[] -> int -> int -> unit) =
+    inherit MemoryStream()
+
+    override _.Write(buffer: byte[], offset: int, count: int) =
+        base.Write(buffer, offset, count)
+        onWrite buffer offset count
+
+    override _.Write(buffer: ReadOnlySpan<byte>) =
+        base.Write buffer
+        // `Stream.WriteAsync(ReadOnlyMemory<byte>, _)` routes here rather than through the byte[]
+        // overload above; a copy is the price of mirroring that path into the byte[]-shaped callback.
+        let copy = buffer.ToArray()
+        onWrite copy 0 copy.Length
+
+/// Records the bytes written to a `FakeProcess`'s interactive stdin across every handle built from it
+/// (`Build()` on a `KeepStdinOpen` fake may be called more than once — see `FakeProcess.Build`). Each
+/// call to `NewStream` hands out its own independent `MemoryStream`, so tearing down one built handle's
+/// stdin (`ProcessStdin.FinishAsync`, process teardown) never disturbs another handle built from the same
+/// fake. Every byte written through any of those streams is also appended to this recorder's own
+/// aggregate log, so `Bytes` stays a readable snapshot of the fake's *total* stdin activity — across all
+/// built handles, in write order — even after any one handle's stream has since been disposed.
 [<Sealed>]
 type internal FakeStdinRecorder() =
-    let stream = new MemoryStream()
+    let gate = obj ()
+    let aggregate = new MemoryStream()
 
-    /// The writable in-memory stdin stream for a built keep-open fake.
-    member _.Stream = stream :> Stream
+    let append (buffer: byte[]) (offset: int) (count: int) =
+        lock gate (fun () -> aggregate.Write(buffer, offset, count))
 
-    /// A snapshot of all bytes written so far, including after the stream has been disposed.
-    member _.Bytes = stream.ToArray()
+    /// A new, independent writable stdin stream for one `Build()`'s handle.
+    member _.NewStream() : Stream = new RecordingStream(append) :> Stream
+
+    /// A snapshot of all bytes written through every stream this recorder has handed out, in write
+    /// order, including after the writing stream(s) have been disposed.
+    member _.Bytes = lock gate (fun () -> aggregate.ToArray())
 
 [<Sealed>]
 type internal FakeSignalRecorder() =
@@ -53,7 +81,10 @@ type internal FakeSignalRecorder() =
 /// spawning a real process. Immutable and fluent; `Build()` returns a real `RunningProcess` whose
 /// observable stdout/stderr are `MemoryStream`s of scripted text when the command pipes that stream;
 /// file redirects and `Null`/`Inherit` destinations expose no parent-side stream, just like a real
-/// spawn. Its wait resolves to the scripted outcome, and kill/teardown are no-ops.
+/// spawn. Its wait resolves to the scripted outcome, and kill/teardown are no-ops. `Build()` may be
+/// called more than once on the same instance — the type stays immutable (`With*` never mutates the
+/// receiver), and each built handle gets its own independent stdout/stderr/stdin streams (see `Build`),
+/// while `StdinBytes`/`Signals` report the combined activity of every handle built so far.
 ///
 /// Call `WithPty()` to model a pseudo-terminal (`Command.Pty`) run: the built handle then exposes a
 /// **single merged stream** (`OutputEvent.Stderr` is never produced) and `ResizeAsync` is a recorded
@@ -197,14 +228,30 @@ type FakeProcess
 
     /// A snapshot of bytes written through `TakeStdin()` on built `KeepStdinOpen` handles. The fake
     /// records raw bytes so tests can assert a command's exact stdin payload without an encoding assumption.
-    /// The recorder is shared across this fake's fluent chain and remains readable after `FinishAsync` or
-    /// process teardown closes the in-memory stream.
+    /// The recorder is shared across this fake's fluent chain, so this aggregates writes from **every**
+    /// handle `Build()` has produced from this instance, in write order — including a handle whose own
+    /// stdin stream has since been closed by `FinishAsync` or process teardown (that only ends *that*
+    /// handle's writes; it does not truncate what it already wrote here, and it does not affect any other
+    /// built handle's own, independent stdin stream — see `Build`).
     member _.StdinBytes: byte[] = stdin.Bytes
 
-    /// Signals delivered through built handles, in call order.
+    /// Signals delivered through built handles, in call order. Aggregated the same way as `StdinBytes`:
+    /// every `Build()` on this instance shares the one recorder, so a signal sent to any built handle
+    /// shows up here regardless of which handle received it.
     member _.Signals = signals.Snapshot
 
     /// Build a real `RunningProcess` over in-memory streams.
+    ///
+    /// Calling `Build()` more than once on the same `FakeProcess` is supported and produces independent
+    /// handles: each gets its own stdout/stderr/stdin `MemoryStream`s, so disposing one handle's stdin
+    /// (`ProcessStdin.FinishAsync`, or the handle's own teardown) never raises `ObjectDisposedException`
+    /// on a write to a different, still-live handle built from the same fake. `StdinBytes` and `Signals`
+    /// still read as a single combined log across every built handle (see their docs) — that plural
+    /// "handles" wording describes exactly this multi-`Build()` scenario, not just distinct restart
+    /// incarnations each with its own `FakeProcess`. Concurrent writers on different handles do not
+    /// interleave within a single handle's own stream, but the combined `StdinBytes` log's ordering across
+    /// *different* handles is whatever order the underlying writes happened to land in — script one
+    /// handle's conversation before starting the next if the test asserts an exact combined byte sequence.
     member _.Build() : RunningProcess =
         let config = template.Config
         let isPty = pty.IsSome
@@ -255,7 +302,11 @@ type FakeProcess
         // Match the real spawn's capability boundary: `TakeStdin` has a writable pipe exactly for a
         // KeepStdinOpen run. A fake does not feed `Command.Stdin` sources, so this in-memory sink is ready
         // immediately and `StdinFeedComplete` below remains a no-op.
-        let stdinStream = if config.KeepStdinOpen then Some stdin.Stream else None
+        let stdinStream =
+            if config.KeepStdinOpen then
+                Some(stdin.NewStream())
+            else
+                None
 
         let host: RunningHost =
             { Config = config
