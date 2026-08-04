@@ -108,6 +108,31 @@ type TestabilityTests() =
         }
 
     [<Test>]
+    member _.``FakeProcess gives each Build() its own stdin, aggregated into StdinBytes``() : Task =
+        task {
+            let command = Command.create "svc" |> Command.keepStdinOpen
+            let fake = FakeProcess.OfCommand(command)
+            use first = fake.Build()
+            use second = fake.Build()
+
+            match first.TakeStdin() with
+            | Some stdin ->
+                do! stdin.WriteLineAsync "first"
+                do! stdin.FinishAsync()
+            | None -> Assert.Fail "expected an interactive stdin handle on the first built handle"
+
+            // Tearing down the first handle's stdin must not disturb the second, independently built
+            // handle's own stdin stream (T-302) — no ObjectDisposedException here.
+            match second.TakeStdin() with
+            | Some stdin -> do! stdin.WriteLineAsync "second"
+            | None -> Assert.Fail "expected an interactive stdin handle on the second built handle"
+
+            // StdinBytes aggregates every built handle's writes, in write order, surviving the first
+            // handle's own stream disposal.
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes "first\nsecond\n", fake.StdinBytes)
+        }
+
+    [<Test>]
     member _.``ProcessStdin honours the command text-stdin encoding``() : Task =
         task {
             let command =

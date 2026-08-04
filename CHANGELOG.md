@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ContentLengthSession` now honours a configured `Command.StreamBuffer` for its incoming-frame backlog instead of silently ignoring it, bounding memory against a slow consumer, and refuses the lossy `DropOldest`/`DropNewest` full modes rather than silently discarding protocol frames; `PtySession` documents `StreamBuffer` as inapplicable instead of silently no-opping it.
 - `CliClient.WithDefaults` now rejects configurators that change the client's program instead of silently retargeting later invocations.
 - Output line handlers and tees now reject `Null` or `Inherit` destinations instead of silently receiving no output.
+- `FakeProcess.Build()` now hands each built handle its own stdin `MemoryStream` instead of sharing one across every `Build()` call on the same fake, so closing one handle's stdin no longer breaks writes on another already-built handle; `StdinBytes` still aggregates every built handle's writes.
 
 ## [2.10.0] - 2026-07-29
 
