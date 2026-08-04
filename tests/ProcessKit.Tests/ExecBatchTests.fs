@@ -190,6 +190,90 @@ type ExecBatchTests() =
         Assert.That(runner.CaptureCount, Is.Zero)
 
     [<Test>]
+    member _.``outputAll rejects zero concurrency before starting capture``() =
+        let runner = BoundaryValidationRunner()
+
+        let ex =
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () ->
+                    Exec.outputAll
+                        0
+                        (runner :> IProcessRunner)
+                        [ Command.create "must-not-run" ]
+                        CancellationToken.None
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail("Assert.Throws did not return an exception.")
+        | ex -> Assert.That(ex.ParamName, Is.EqualTo "concurrency")
+
+        Assert.That(runner.CaptureCount, Is.Zero)
+
+    [<Test>]
+    member _.``outputAll rejects negative concurrency before starting capture``() =
+        let runner = BoundaryValidationRunner()
+
+        let ex =
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () ->
+                    Exec.outputAll
+                        -1
+                        (runner :> IProcessRunner)
+                        [ Command.create "must-not-run" ]
+                        CancellationToken.None
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail("Assert.Throws did not return an exception.")
+        | ex -> Assert.That(ex.ParamName, Is.EqualTo "concurrency")
+
+        Assert.That(runner.CaptureCount, Is.Zero)
+
+    [<Test>]
+    member _.``outputAllBytes rejects zero concurrency before starting capture``() =
+        let runner = BoundaryValidationRunner()
+
+        let ex =
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () ->
+                    Exec.outputAllBytes
+                        0
+                        (runner :> IProcessRunner)
+                        [ Command.create "must-not-run" ]
+                        CancellationToken.None
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail("Assert.Throws did not return an exception.")
+        | ex -> Assert.That(ex.ParamName, Is.EqualTo "concurrency")
+
+        Assert.That(runner.CaptureCount, Is.Zero)
+
+    [<Test>]
+    member _.``outputAllBytes rejects negative concurrency before starting capture``() =
+        let runner = BoundaryValidationRunner()
+
+        let ex =
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () ->
+                    Exec.outputAllBytes
+                        -1
+                        (runner :> IProcessRunner)
+                        [ Command.create "must-not-run" ]
+                        CancellationToken.None
+                    |> ignore)
+            )
+
+        match ex with
+        | null -> Assert.Fail("Assert.Throws did not return an exception.")
+        | ex -> Assert.That(ex.ParamName, Is.EqualTo "concurrency")
+
+        Assert.That(runner.CaptureCount, Is.Zero)
+
+    [<Test>]
     member _.``outputAll cancels queued commands without changing completed results``() : Task =
         task {
             let runner = QueueBlockingRunner()

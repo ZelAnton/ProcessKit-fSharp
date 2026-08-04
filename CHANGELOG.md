@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `Supervisor.LivenessMemory` now documents its intentional monotonic peak-memory contract: a transient peak is not forgiven by later lower usage, and `LivenessFailures` only delays the restart after the crossing.
+- `Exec.outputAll`/`Exec.outputAllBytes` now reject `concurrency < 1` with `ArgumentOutOfRangeException` before running any command, instead of silently coercing it to sequential execution.
 
 ### Fixed
 - Windows `ProcessGroup.Suspend()` and `Resume()` now report a `ProcessError.Io` naming the job members they failed to freeze or thaw, instead of claiming success, while a member that exited concurrently or whose PID was recycled stays a successful no-op.

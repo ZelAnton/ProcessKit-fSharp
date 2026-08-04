@@ -56,7 +56,8 @@ module Exec =
 
     // Validate and materialize a batch before starting any capture. This keeps programmer errors out
     // of the per-command exception boundary, where they would otherwise be misreported as `Io`.
-    let private prepareBatch (runner: IProcessRunner) (commands: seq<Command>) : Command[] =
+    let private prepareBatch (concurrency: int) (runner: IProcessRunner) (commands: seq<Command>) : Command[] =
+        ArgumentOutOfRangeException.ThrowIfLessThan(concurrency, 1, nameof concurrency)
         ArgumentNullException.ThrowIfNull(runner, nameof runner)
         ArgumentNullException.ThrowIfNull(commands, nameof commands)
 
@@ -77,8 +78,7 @@ module Exec =
         (capture: IProcessRunner -> Command -> Task<Result<ProcessResult<'T>, ProcessError>>)
         : Task<Result<ProcessResult<'T>, ProcessError>[]> =
         task {
-            let limit = max 1 concurrency
-            use gate = new SemaphoreSlim(limit, limit)
+            use gate = new SemaphoreSlim(concurrency, concurrency)
 
             let runOne (command: Command) =
                 task {
@@ -124,7 +124,7 @@ module Exec =
         // Route through the verb layer (not the raw seam) so each command's own `Retry` policy applies,
         // matching `cmd.OutputStringAsync()` / `CliClient.OutputStringAsync` — retry still fires only on a genuine
         // error, never on a non-zero exit (which stays data).
-        let items = prepareBatch runner commands
+        let items = prepareBatch concurrency runner commands
         runAll concurrency runner items cancellationToken (fun r c -> Runner.outputString r cancellationToken c)
 
     /// The raw-bytes companion to `outputAll` — captures each command's stdout as bytes.
@@ -134,5 +134,5 @@ module Exec =
         (commands: seq<Command>)
         (cancellationToken: CancellationToken)
         =
-        let items = prepareBatch runner commands
+        let items = prepareBatch concurrency runner commands
         runAll concurrency runner items cancellationToken (fun r c -> Runner.outputBytes r cancellationToken c)
