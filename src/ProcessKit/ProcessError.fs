@@ -58,8 +58,8 @@ type ProcessError =
     /// (`Parse`/`Io`/`Timeout`), never folded in here.
     | JsonRpc of Program: string * Method: string * Code: int * Detail: string * Data: string option
 
-    /// Captured line output exceeded the configured `OutputBufferPolicy` ceiling
-    /// (`OverflowMode.Error`). Carries the configured caps and the cumulative totals seen.
+    /// Captured or streamed output exceeded a configured fail-loud ceiling. Metrics are populated only
+    /// when their unit applies to that channel (lines, bytes, merged events, or protocol frames).
     | OutputTooLarge of
         Program: string *
         LineLimit: int option *
@@ -122,8 +122,13 @@ type ProcessError =
                 $"'{program}' answered '{methodName}' with JSON-RPC error {code}"
             else
                 $"'{program}' answered '{methodName}' with JSON-RPC error {code}: {detail}"
-        | ProcessError.OutputTooLarge(program, _, _, totalLines, totalBytes) ->
-            $"'{program}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
+        | ProcessError.OutputTooLarge(program, lineLimit, byteLimit, totalLines, totalBytes) ->
+            match lineLimit, byteLimit, totalLines with
+            | Some _, _, _ -> $"'{program}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
+            | None, Some _, _ -> $"'{program}' produced too much byte output ({totalBytes} bytes)"
+            | None, None, events when events > 0 ->
+                $"'{program}' produced too many events ({events} events / {totalBytes} bytes)"
+            | None, None, _ -> $"'{program}' produced too much protocol output ({totalBytes} bytes)"
         | ProcessError.Stdin(program, detail) -> $"could not read the stdin source for '{program}': {detail}"
         | ProcessError.ResourceLimit detail -> $"resource limit could not be enforced: {detail}"
         | ProcessError.Adopt(pid, detail) -> $"could not adopt process {pid} into the group: {detail}"
