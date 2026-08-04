@@ -796,8 +796,9 @@ module internal Windows =
     let mutable openMemberProcessForTests: (uint32 -> int -> Result<nativeint, int>) option =
         None
 
-    /// Test seam (internal, not public API): replaces the `IsProcessInJob` calls made around a member's
-    /// resource read. Production leaves it `None`; tests use it with a synthetic handle so the
+    /// Test seam (internal, not public API): replaces the `IsProcessInJob` membership question — the calls
+    /// made around a member's resource read, and the one `postCloseToJobWindows` asks before every
+    /// WM_CLOSE. Production leaves it `None`; tests use it with a synthetic handle so the
     /// exit-after-pre-read and same-Job identity checks can be driven without a real PID-reuse race.
     let mutable isProcessInJobForTests: (nativeint -> nativeint -> bool) option = None
 
@@ -1738,12 +1739,14 @@ module internal Windows =
     // `Command.WindowsCtrlSignals()`: a GUI child has no console to CTRL+BREAK, and a console child has
     // no top-level window to WM_CLOSE, so the two mechanisms cover disjoint child classes.
     //
-    // Targeted strictly by pid via `GetWindowThreadProcessId`, so — unlike a console CTRL event — it can
-    // never reach a window outside the Job (no `CREATE_NEW_PROCESS_GROUP` requirement, no risk of hitting
-    // the caller's own console group). That is why it is an UNCONDITIONAL addition to the soft phase for
-    // every child, not a new opt-in builder: a child with no top-level window is simply a no-op, never a
-    // regression. Honest and best-effort: a window may prompt/veto the close (WM_CLOSE is a request), and
-    // the unconditional `TerminateJobObject` after the grace window remains the deterministic guarantee.
+    // Targeted strictly by pid via `GetWindowThreadProcessId` — and re-confirmed by a SECOND owner query
+    // taken immediately before each post (`postCloseIfStillOwnedBy`) — so, unlike a console CTRL event, it
+    // can never reach a window outside the Job (no `CREATE_NEW_PROCESS_GROUP` requirement, no risk of
+    // hitting the caller's own console group). That is why it is an UNCONDITIONAL addition to the soft
+    // phase for every child, not a new opt-in builder: a child with no top-level window is simply a no-op,
+    // never a regression. Honest and best-effort: a window may prompt/veto the close (WM_CLOSE is a
+    // request), and the unconditional `TerminateJobObject` after the grace window remains the deterministic
+    // guarantee.
 
     [<Literal>]
     let private WM_CLOSE = 0x0010u
@@ -1765,17 +1768,95 @@ module internal Windows =
     [<DllImport("user32.dll", SetLastError = true)>]
     extern bool private PostMessageW(nativeint hWnd, uint32 Msg, nativeint wParam, nativeint lParam)
 
+    // Who owns `hWnd` at this instant. `0` is the documented "the owner could not be determined" answer —
+    // also what a window handle that no longer names a live window reports — and is never a real pid, so
+    // every caller below treats it as "not ours" rather than as a match.
+    let private windowOwnerPid (hWnd: nativeint) : uint32 =
+        let mutable owningPid = 0u
+        GetWindowThreadProcessId(hWnd, &owningPid) |> ignore
+        owningPid
+
+    /// Test seam: the window → owning-pid query (`GetWindowThreadProcessId`). Both WM_CLOSE paths below ask
+    /// it AGAIN immediately before every post, so a test can model an HWND that was destroyed and whose
+    /// handle value was recycled onto a FOREIGN process's window in exactly that gap — a race that cannot
+    /// be provoked against the real OS on demand. Production always runs the real entry point; only the
+    /// (sequential) tests reassign it, and restore it in a `finally`.
+    let mutable windowOwnerPidHook: nativeint -> uint32 = windowOwnerPid
+
+    // ONE `EnumWindows` pass over the caller's desktop, as `(window, owning pid)` pairs. Windows are
+    // collected here and acted on afterwards, so posting can never perturb an enumeration in flight.
+    let private enumerateTopLevelWindows () : (nativeint * uint32) list =
+        let collected = ResizeArray<nativeint * uint32>()
+
+        let collect =
+            EnumWindowsProc(fun hWnd _ ->
+                collected.Add((hWnd, windowOwnerPidHook hWnd))
+                true) // keep enumerating every remaining top-level window
+
+        // EnumWindows walks the desktop synchronously, so `collect` is alive for the whole call;
+        // `GC.KeepAlive` pins it against an over-eager collection, and its `bool` result is ignored
+        // (FALSE here only signals an early stop / empty desktop — neither an error for this pass).
+        EnumWindows(collect, IntPtr.Zero) |> ignore
+        GC.KeepAlive collect
+        List.ofSeq collected
+
+    /// Test seam: the single desktop enumeration pass, so a regression test can hand the WM_CLOSE paths
+    /// synthetic `(window, owning pid)` pairs instead of whatever windows the test host's desktop happens
+    /// to show. Production always runs the real enumeration; only the (sequential) tests reassign it, and
+    /// restore it in a `finally`.
+    let mutable enumerateTopLevelWindowsHook: unit -> (nativeint * uint32) list =
+        enumerateTopLevelWindows
+
+    /// Test seam: the `PostMessage(WM_CLOSE)` delivery itself, so a regression test can assert exactly
+    /// WHICH windows were posted to without standing up a real message pump. Production always runs the
+    /// real entry point; only the (sequential) tests reassign it, and restore it in a `finally`.
+    let mutable postWindowCloseHook: nativeint -> bool =
+        fun hWnd -> PostMessageW(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero)
+
+    // The stale-window guard EVERY post goes through. A window handle is only meaningful while its window
+    // lives: an HWND collected by the enumeration pass above can have its window destroyed a moment later
+    // and its numeric value handed straight back out to the next window created on the desktop — quite
+    // possibly a window of an unrelated GUI application. Neither caller's existing check rules that out:
+    // the Job path's `IsProcessInJob` re-check proves only that the OWNING PID is still a live member, and
+    // the per-run path's open process handle pins only the PID NUMBER — neither says anything about who
+    // owns THIS window now. So ask exactly that, as the last thing before posting: the post happens only if
+    // the window's CURRENT owner is still the process the caller verified.
+    //
+    // Why this is the narrowest window the API allows. Win32 has no atomic "post to this window if it is
+    // still owned by that process" primitive, so the owner query and the post cannot be fused; ordering the
+    // query LAST leaves only the handful of instructions between the two calls, against the whole
+    // enumeration pass plus a per-target `OpenProcess`/`IsProcessInJob` round-trip before this guard
+    // existed. It is a comparison of process IDENTITY, not of a bare number, because both callers hold an
+    // open handle to the expected owner across this call — Windows cannot recycle a pid while a handle to
+    // that process object is open (the same invariant the `ctrlGroups` CTRL+BREAK path already relies on),
+    // so "same pid" here means "same process". Closing the residual gap completely would need a mechanism
+    // that does not exist; what remains requires a destroy + create + identical-handle-value reuse inside
+    // those few instructions, and a post to an already-destroyed window fails
+    // (`ERROR_INVALID_WINDOW_HANDLE`) rather than reaching anything, which is why only a post the OS
+    // accepted is counted as a delivery.
+    let private postCloseIfStillOwnedBy (expectedPid: uint32) (hWnd: nativeint) : bool =
+        let currentOwner = windowOwnerPidHook hWnd
+
+        if currentOwner <> 0u && currentOwner = expectedPid then
+            // A REQUEST, not a guarantee: the window's own close handler may prompt or veto. That is why
+            // the post-grace `TerminateJobObject` is the unconditional backstop.
+            postWindowCloseHook hWnd
+        else
+            false
+
     /// Best-effort soft close for a Windows GUI tree: enumerate the caller's desktop top-level windows
-    /// ONCE, keep those owned by a process currently in `job`, then `PostMessage(WM_CLOSE)` to each.
-    /// Returns the number of windows posted to — `0` means the tree has no top-level window (a no-op,
-    /// NOT an error), matching how `sendConsoleCtrlBreakWindows`/`membersWindows` honestly distinguish
-    /// "nothing to signal" from "the request failed". NEVER throws: a failed member query, a failed
-    /// enumeration (e.g. a session with no interactive desktop), or a failed post is just reported as
-    /// zero-or-fewer windows closed, never an exception that could derail the graceful-kill path that
-    /// calls it. Windows are collected first and posted to afterwards, so posting can never perturb the
-    /// enumeration in flight. Before each post, the owning pid is re-opened and verified to still belong
-    /// to this Job; a member that exited and whose pid was recycled can therefore never close a foreign
-    /// application's window.
+    /// ONCE, keep those owned by a process currently in `job`, then `PostMessage(WM_CLOSE)` to each window
+    /// still owned by that member at the moment of the post. Returns the number of windows a post was
+    /// accepted for — `0` means the tree has no top-level window (a no-op, NOT an error), matching how
+    /// `sendConsoleCtrlBreakWindows`/`membersWindows` honestly distinguish "nothing to signal" from "the
+    /// request failed". NEVER throws: a failed member query, a failed enumeration (e.g. a session with no
+    /// interactive desktop), or a failed post is just reported as fewer windows closed, never an exception
+    /// that could derail the graceful-kill path that calls it. TWO identity gates stand between the
+    /// enumeration and each post: the owning pid must still be a member of THIS job (`IsProcessInJob` on a
+    /// freshly opened handle — a member that exited and whose PID was recycled can never close a foreign
+    /// application's window), and the window must still be owned by that same, handle-pinned process
+    /// (`postCloseIfStillOwnedBy` — a member window that was destroyed and whose HWND value was recycled
+    /// onto a foreign window can never be closed either).
     let postCloseToJobWindows (job: nativeint) : int =
         try
             let memberPids =
@@ -1786,24 +1867,11 @@ module internal Windows =
             if Set.isEmpty memberPids then
                 0
             else
-                let targets = ResizeArray<nativeint * uint32>()
-
-                let collect =
-                    EnumWindowsProc(fun hWnd _ ->
-                        let mutable owningPid = 0u
-                        GetWindowThreadProcessId(hWnd, &owningPid) |> ignore
-                        // `owningPid = 0` is the documented "could not determine the owner" result — never a
-                        // real pid, so it can't spuriously match a member and is skipped.
-                        if owningPid <> 0u && Set.contains (int owningPid) memberPids then
-                            targets.Add((hWnd, owningPid))
-
-                        true) // keep enumerating every remaining top-level window
-
-                // EnumWindows walks the desktop synchronously, so `collect` is alive for the whole call;
-                // `GC.KeepAlive` pins it against an over-eager collection, and its `bool` result is ignored
-                // (FALSE here only signals an early stop / empty desktop — neither an error for this pass).
-                EnumWindows(collect, IntPtr.Zero) |> ignore
-                GC.KeepAlive collect
+                let targets =
+                    enumerateTopLevelWindowsHook ()
+                    // `owningPid = 0` is the documented "could not determine the owner" result — never a
+                    // real pid, so it can't spuriously match a member and is skipped.
+                    |> List.filter (fun (_, owningPid) -> owningPid <> 0u && Set.contains (int owningPid) memberPids)
 
                 let mutable postedCount = 0
 
@@ -1812,13 +1880,14 @@ module internal Windows =
 
                     if handle <> IntPtr.Zero then
                         try
-                            let mutable stillMember = false
-
-                            if IsProcessInJob(handle, job, &stillMember) && stillMember then
-                                // A REQUEST, not a guarantee: the window's own close handler may prompt or veto.
-                                // That is why the post-grace `TerminateJobObject` is the unconditional backstop.
-                                PostMessageW(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero) |> ignore
-                                postedCount <- postedCount + 1
+                            // Gate 1 — is the owner still one of ours? Necessary (it rejects a member that
+                            // exited and had its pid recycled), but NOT sufficient: it says nothing about
+                            // who owns `hWnd` now. Holding this handle open across gate 2 below is what
+                            // keeps `owningPid` bound to this one process object for the rest of the loop.
+                            if isProcessInJob handle job then
+                                // Gate 2 — is that member still the owner of THIS window?
+                                if postCloseIfStillOwnedBy owningPid hWnd then
+                                    postedCount <- postedCount + 1
                         finally
                             CloseHandle handle |> ignore
 
@@ -1830,29 +1899,25 @@ module internal Windows =
             0
 
     /// Best-effort WM_CLOSE for one process whose caller keeps an open process handle while invoking
-    /// this function. The open handle pins `pid`, so the number cannot be recycled onto a foreign window
-    /// during enumeration. Returns the number of matching top-level windows posted to.
+    /// this function. The open handle pins `pid`, so the number cannot be recycled onto a foreign process
+    /// during enumeration; the WINDOW handles it names are not pinned that way, so each window's current
+    /// owner is re-checked immediately before its own post (`postCloseIfStillOwnedBy`) — a window that was
+    /// destroyed and whose HWND value was recycled onto a foreign application's window in that gap is
+    /// skipped instead of being closed. Returns the number of matching top-level windows a post was
+    /// accepted for.
     let postCloseToProcessWindows (pid: int) : int =
         try
-            let targets = ResizeArray<nativeint>()
+            let expectedPid = uint32 pid
 
-            let collect =
-                EnumWindowsProc(fun hWnd _ ->
-                    let mutable owningPid = 0u
-                    GetWindowThreadProcessId(hWnd, &owningPid) |> ignore
-
-                    if int owningPid = pid then
-                        targets.Add hWnd
-
-                    true)
-
-            EnumWindows(collect, IntPtr.Zero) |> ignore
-            GC.KeepAlive collect
+            let targets =
+                enumerateTopLevelWindowsHook ()
+                |> List.filter (fun (_, owningPid) -> owningPid <> 0u && owningPid = expectedPid)
+                |> List.map fst
 
             let mutable postedCount = 0
 
             for hWnd in targets do
-                if PostMessageW(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero) then
+                if postCloseIfStillOwnedBy expectedPid hWnd then
                     postedCount <- postedCount + 1
 
             postedCount
