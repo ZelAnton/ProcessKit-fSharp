@@ -439,9 +439,9 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // The chunk-streaming analogue of `stdoutLinesClaimed`: the session setup is deliberately
     // reentrant for `FinishAsync`/`ExitTask`, but the public enumerator is handed out only once.
     let mutable stdoutChunksClaimed = false
-    let mutable stdoutLineCount = 0
+    let mutable stdoutLineCount = 0L
     let mutable stdoutChunkCount = 0
-    let mutable stderrLineCount = 0
+    let mutable stderrLineCount = 0L
     let mutable droppedStreamLineCount = 0
     // Cumulative bytes actually pumped into the stdout LINE streaming channel / the raw stdout CHUNK
     // channel, tracked only to feed an honest `ProcessError.OutputTooLarge.TotalBytes` on
@@ -450,6 +450,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // (if any) ever trips; `readStdoutStreamedByteCount`/`readStdoutChunkStreamedByteCount` below
     // saturate the read back down to `int` the same way `Pump.LineBuffer.TotalBytes` does.
     let mutable stdoutStreamedByteCount = 0L
+    let mutable stderrStreamedByteCount = 0L
     let mutable stdoutChunkStreamedByteCount = 0L
     let mutable stderrStreamBuffer = Unchecked.defaultof<Pump.LineBuffer>
     let mutable streamOutcome = Unchecked.defaultof<Task<Outcome>>
@@ -471,12 +472,33 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     let bumpStderrLine () =
         Interlocked.Increment(&stderrLineCount) |> ignore
 
-    let readStdoutLineCount () = Volatile.Read(&stdoutLineCount)
-    let readStdoutChunkCount () = Volatile.Read(&stdoutChunkCount)
-    let readStderrLineCount () = Volatile.Read(&stderrLineCount)
+    let saturateInt64ToInt (value: int64) = int (min value (int64 Int32.MaxValue))
 
-    let bumpStdoutStreamedBytes (delta: int) =
-        Interlocked.Add(&stdoutStreamedByteCount, int64 delta) |> ignore
+    let readStdoutLineCount64 () = Volatile.Read(&stdoutLineCount)
+
+    let readStdoutLineCount () =
+        readStdoutLineCount64 () |> saturateInt64ToInt
+
+    let readStdoutChunkCount () = Volatile.Read(&stdoutChunkCount)
+    let readStderrLineCount64 () = Volatile.Read(&stderrLineCount)
+
+    let readStderrLineCount () =
+        readStderrLineCount64 () |> saturateInt64ToInt
+
+    let readCombinedLineCount () =
+        let stdout = readStdoutLineCount64 ()
+        let stderr = readStderrLineCount64 ()
+
+        if stdout >= int64 Int32.MaxValue || stderr >= int64 Int32.MaxValue then
+            Int32.MaxValue
+        else
+            int (min (stdout + stderr) (int64 Int32.MaxValue))
+
+    let bumpStdoutStreamedBytes (delta: int64) =
+        Interlocked.Add(&stdoutStreamedByteCount, delta) |> ignore
+
+    let bumpStderrStreamedBytes (delta: int64) =
+        Interlocked.Add(&stderrStreamedByteCount, delta) |> ignore
 
     let bumpStdoutChunkStreamedBytes (delta: int) =
         Interlocked.Add(&stdoutChunkStreamedByteCount, int64 delta) |> ignore
@@ -484,10 +506,19 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // Saturating reads, mirroring `Pump.LineBuffer.TotalBytes` — these only ever feed an `int`-typed
     // `ProcessError.OutputTooLarge.TotalBytes`.
     let readStdoutStreamedByteCount () =
-        int (min (Volatile.Read &stdoutStreamedByteCount) (int64 Int32.MaxValue))
+        Volatile.Read(&stdoutStreamedByteCount) |> saturateInt64ToInt
+
+    let readCombinedStreamedByteCount () =
+        let stdout = Volatile.Read(&stdoutStreamedByteCount)
+        let stderr = Volatile.Read(&stderrStreamedByteCount)
+
+        if stdout >= int64 Int32.MaxValue || stderr >= int64 Int32.MaxValue then
+            Int32.MaxValue
+        else
+            int (min (stdout + stderr) (int64 Int32.MaxValue))
 
     let readStdoutChunkStreamedByteCount () =
-        int (min (Volatile.Read &stdoutChunkStreamedByteCount) (int64 Int32.MaxValue))
+        Volatile.Read(&stdoutChunkStreamedByteCount) |> saturateInt64ToInt
 
     // One sequence domain for both event pumps. The atomic increment records the order in which the
     // two independently-drained streams reach ProcessKit's line-framing boundary.
@@ -530,14 +561,15 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // The streaming channels and their policy-aware writer live in `StreamChannel`: the stdout channel
     // is written by exactly one pump, the event channel by two (stdout + stderr), and either is bounded
     // when `config.StreamBuffer` opts in (else unbounded, as before).
-    let stdoutChannel: Channel<string> = StreamChannel.create config.StreamBuffer true
+    let stdoutChannel: StreamChannel.Channel<string> =
+        StreamChannel.create config.StreamBuffer true
 
     // The byte-chunk session has its own channel type but shares the same configured capacity and
     // full-mode policy. It remains dormant unless `StdoutChunksAsync` claims this handle.
-    let stdoutChunkChannel: Channel<ReadOnlyMemory<byte>> =
+    let stdoutChunkChannel: StreamChannel.Channel<ReadOnlyMemory<byte>> =
         StreamChannel.create config.StreamBuffer true
 
-    let eventChannel: Channel<OutputEvent> =
+    let eventChannel: StreamChannel.Channel<OutputEvent> =
         StreamChannel.create config.StreamBuffer false
 
     // Write one item to a line/event streaming channel per `config.StreamBuffer` (see
@@ -545,29 +577,23 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // Bound `Backpressure` to `disposalCts.Token` so these writers preserve the existing lifecycle
     // behavior and can't outlive this handle.
     let writeStreamItem
-        (writer: ChannelWriter<'T>)
-        (reader: ChannelReader<'T>)
+        (channel: StreamChannel.Channel<'T>)
         (buildOverflowError: StreamBufferPolicy -> ProcessError)
         (onDrop: unit -> unit)
         (item: 'T)
         : ValueTask =
-        StreamChannel.writeItem config.StreamBuffer disposalCts.Token writer reader buildOverflowError onDrop item
+        StreamChannel.writeItem config.StreamBuffer disposalCts.Token channel buildOverflowError onDrop item
 
     // Raw stdout byte chunks (`Pump.readBytesUntilDone`'s items) have no line structure — one item is
     // whatever the OS handed back on a single read — so neither `LineLimit` nor `TotalLines` means
     // anything for this channel; T-297's bug reported the channel's item capacity as a fabricated line
     // limit regardless of that. `TotalBytes` is the one honest total this site can offer: the real
     // cumulative size, in bytes, of every chunk pumped into the channel so far.
-    let writeChunkItem
-        (writer: ChannelWriter<ReadOnlyMemory<byte>>)
-        (reader: ChannelReader<ReadOnlyMemory<byte>>)
-        (item: ReadOnlyMemory<byte>)
-        : ValueTask =
+    let writeChunkItem (item: ReadOnlyMemory<byte>) : ValueTask =
         StreamChannel.writeItem
             config.StreamBuffer
             chunkBackpressureCts.Token
-            writer
-            reader
+            stdoutChunkChannel
             (fun _policy ->
                 ProcessError.OutputTooLarge(config.Program, None, None, 0, readStdoutChunkStreamedByteCount ()))
             bumpDroppedStreamLine
@@ -1525,7 +1551,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                     return
                         Error(
                             tooLargeError
-                                (outBuf.TotalLines + errBuf.TotalLines)
+                                (int (min (int64 outBuf.TotalLines + int64 errBuf.TotalLines) (int64 Int32.MaxValue)))
                                 (int (min (int64 outBuf.TotalBytes + int64 errBuf.TotalBytes) (int64 Int32.MaxValue)))
                         )
                 else
@@ -1773,11 +1799,10 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                     (fun line ->
                                         invokeLine config.OnStdoutLine line
                                         bumpStdoutLine ()
-                                        bumpStdoutStreamedBytes (Encoding.UTF8.GetByteCount line + 1)
+                                        bumpStdoutStreamedBytes (int64 (Encoding.UTF8.GetByteCount line) + 1L)
 
                                         writeStreamItem
-                                            stdoutChannel.Writer
-                                            stdoutChannel.Reader
+                                            stdoutChannel
                                             (fun policy ->
                                                 // One channel item is one framed stdout line, 1:1, so the
                                                 // channel's item capacity IS a genuine line limit and
@@ -1802,7 +1827,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                     None
                                     (fun () -> disposalCts.Token.IsCancellationRequested)
 
-                            stdoutChannel.Writer.Complete()
+                            stdoutChannel.TryComplete() |> ignore
                         with ex ->
                             // A pump fault — a throwing `OnStdoutLine` handler, `StreamFullMode.Error`
                             // tripping its cap, or a genuine OS read fault (reclassified into
@@ -1812,7 +1837,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                             // original stack; `reraise` is unavailable inside a task CE) so `streamOutcome`
                             // / `FinishAsync` surface the same fault.
                             let reported = reportedPumpFault ex
-                            stdoutChannel.Writer.Complete reported
+                            stdoutChannel.TryComplete reported |> ignore
                             ExceptionDispatchInfo.Throw reported
                     }
 
@@ -1887,22 +1912,22 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                             bumpStdoutChunk ()
                                             bumpStdoutChunkStreamedBytes chunk.Length
 
-                                            writeChunkItem stdoutChunkChannel.Writer stdoutChunkChannel.Reader chunk)
+                                            writeChunkItem chunk)
                                         (fun () -> disposalCts.Token.IsCancellationRequested)
                                         CancellationToken.None
                             | None -> ()
 
-                            stdoutChunkChannel.Writer.TryComplete() |> ignore
+                            stdoutChunkChannel.TryComplete() |> ignore
                         with
                         | :? OperationCanceledException when chunkBackpressureCts.Token.IsCancellationRequested ->
                             // The dedicated chunk backpressure token cancels an abandoned writer; this is
                             // routine completion, not a read/tee fault for the chunk stream.
-                            stdoutChunkChannel.Writer.TryComplete() |> ignore
+                            stdoutChunkChannel.TryComplete() |> ignore
                         | ex ->
                             // A genuine read fault, a throwing tee, or a bounded-channel failure must
                             // wake the chunk consumer and remain visible through `chunkOutcome`.
                             let reported = reportedPumpFault ex
-                            stdoutChunkChannel.Writer.TryComplete reported |> ignore
+                            stdoutChunkChannel.TryComplete reported |> ignore
                             ExceptionDispatchInfo.Throw reported
                     }
 
@@ -1926,7 +1951,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                             // Complete stdout on a sibling failure so a consumer cannot wait forever for
                             // a channel whose stderr pump has already made the combined session fail.
                             let reported = reportedPumpFault ex
-                            stdoutChunkChannel.Writer.TryComplete reported |> ignore
+                            stdoutChunkChannel.TryComplete reported |> ignore
                             ExceptionDispatchInfo.Throw reported
                     }
 
@@ -2085,6 +2110,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                     tee
                     (onLine: Action<string> option)
                     (bump: unit -> unit)
+                    (bumpBytes: int64 -> unit)
                     (wrap: OutputLine -> OutputEvent)
                     =
                     task {
@@ -2109,10 +2135,10 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
 
                                         invokeLine onLine line
                                         bump ()
+                                        bumpBytes (int64 (Encoding.UTF8.GetByteCount line) + 1L)
 
                                         writeStreamItem
-                                            eventChannel.Writer
-                                            eventChannel.Reader
+                                            eventChannel
                                             (fun _policy ->
                                                 // The event channel merges stdout's and stderr's framed
                                                 // lines into ONE shared backlog, so its item capacity
@@ -2123,17 +2149,16 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                                 // honest and available at this site: the combined count of
                                                 // framed lines both pumps have produced so far (each event
                                                 // wraps exactly one line, so this total is real — just not
-                                                // tied to a channel-capacity-shaped limit). No cumulative
-                                                // byte count is tracked for this shared, two-producer
-                                                // channel, so `ByteLimit`/`TotalBytes` stay `None`/`0`; a
-                                                // consumer that needs a line's bytes already has its text
-                                                // on the delivered `OutputEvent` itself.
+                                                // tied to a channel-capacity-shaped limit). `ByteLimit`
+                                                // stays `None`; `TotalBytes` uses the same UTF-8-plus-
+                                                // separator accounting as stdout line streaming, summed
+                                                // across both event producers including this event.
                                                 ProcessError.OutputTooLarge(
                                                     config.Program,
                                                     None,
                                                     None,
-                                                    readStdoutLineCount () + readStderrLineCount (),
-                                                    0
+                                                    readCombinedLineCount (),
+                                                    readCombinedStreamedByteCount ()
                                                 ))
                                             bumpDroppedStreamLine
                                             (wrap outputLine))
@@ -2143,7 +2168,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                             // A genuine OS read fault is reclassified into `ProcessError.Io` (T-087)
                             // before it completes the channel / faults `eventOutcome` below.
                             let reported = reportedPumpFault ex
-                            eventChannel.Writer.TryComplete reported |> ignore
+                            eventChannel.TryComplete reported |> ignore
                             ExceptionDispatchInfo.Throw reported
                     }
 
@@ -2155,6 +2180,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                         config.StdoutTee
                         config.OnStdoutLine
                         bumpStdoutLine
+                        bumpStdoutStreamedBytes
                         OutputEvent.Stdout
 
                 let stderrPump =
@@ -2165,6 +2191,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                         config.StderrTee
                         config.OnStderrLine
                         bumpStderrLine
+                        bumpStderrStreamedBytes
                         OutputEvent.Stderr
 
                 // A fault in either pump kills the tree at once, so a still-producing child can't wedge
@@ -2183,14 +2210,14 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                             outcome <- settled
                             // Await both pumps together so neither is left unobserved if the other faults.
                             do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
-                            eventChannel.Writer.TryComplete() |> ignore
+                            eventChannel.TryComplete() |> ignore
                         with ex ->
                             error <- Some ex
                             // A fault (a throwing handler, or the exit wait itself) completes the channel WITH
                             // the error so an `OutputEventsAsync` consumer observes it instead of hanging — idempotent
                             // with the per-pump completion above. The fault is otherwise consumed here (and by
                             // the ContinueWith below) rather than surfacing as an unobserved task exception.
-                            eventChannel.Writer.TryComplete ex |> ignore
+                            eventChannel.TryComplete ex |> ignore
 
                         // Surface the outcome, or re-raise the fault for a concurrent ExitTask (WaitAny/WaitAll
                         // on this handle). The ContinueWith below observes that fault, so the OutputEvents-only

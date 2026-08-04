@@ -182,7 +182,8 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
     // the configured policy, or the unbounded single-reader/single-writer channel this session has
     // always used when the config leaves it unset. Single writer: only this session's own parse loop
     // ever writes a frame.
-    let frames: Channel<byte[]> = StreamChannel.create running.Config.StreamBuffer true
+    let frames: StreamChannel.Channel<byte[]> =
+        StreamChannel.create running.Config.StreamBuffer true
 
     // The running cumulative payload bytes of every frame parsed so far, consulted only by the
     // `StreamFullMode.Error` overflow closure below (T-297) to report an honest total when the cap
@@ -265,8 +266,7 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                                 StreamChannel.writeItem
                                     running.Config.StreamBuffer
                                     running.DisposalToken
-                                    frames.Writer
-                                    frames.Reader
+                                    frames
                                     (fun _policy ->
                                         // A frame is a whole protocol message, never a line, so `LineLimit`/
                                         // `TotalLines` would claim a unit this channel never had (T-297) —
@@ -311,9 +311,9 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                     fault <- Some(reportedFault flushEx)
 
             match fault with
-            | None -> frames.Writer.TryComplete() |> ignore
+            | None -> frames.TryComplete() |> ignore
             | Some ex ->
-                frames.Writer.TryComplete ex |> ignore
+                frames.TryComplete ex |> ignore
                 ExceptionDispatchInfo.Throw ex
         }
         :> Task

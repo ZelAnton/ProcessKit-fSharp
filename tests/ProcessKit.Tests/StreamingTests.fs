@@ -144,6 +144,40 @@ type private ChunkedByteStream(chunks: byte[] list) =
             ValueTask<int>(chunk.Length)
         | [] -> ValueTask<int>(0)
 
+/// A one-chunk stream whose first read waits for `gate`. The sibling-pump regression uses it to let
+/// stderr fault and close the shared event channel before stdout attempts its own channel write.
+type private GatedByteStream(payload: byte[], gate: Task) =
+    inherit Stream()
+    let mutable served = 0
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = ()
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) : int = raise (NotSupportedException())
+
+    override _.ReadAsync(buffer: Memory<byte>, _cancellationToken: CancellationToken) : ValueTask<int> =
+        ValueTask<int>(
+            task {
+                do! gate
+
+                if Interlocked.Exchange(&served, 1) = 0 then
+                    payload.AsSpan().CopyTo(buffer.Span)
+                    return payload.Length
+                else
+                    return 0
+            }
+        )
+
 [<TestFixture>]
 type StreamingTests() =
 
@@ -1913,16 +1947,24 @@ type StreamingTests() =
     [<Test>]
     member _.``StreamBuffer Error faults the streaming enumerator with OutputTooLarge at the cap``() : Task =
         task {
-            let total = 20
             let capacity = 3
+            let total = capacity + 1
 
             let config =
                 (Command.create "test"
                  |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.Error)))
                     .Config
 
-            use running = syntheticStdoutProcess config (linesPayload total)
-            let! drain = drainWithDeadline (running.StdoutLinesAsync()) 5000
+            let payload = linesPayload total
+            use running = syntheticStdoutProcess config payload
+            let lines = running.StdoutLinesAsync()
+
+            // Do not enumerate until the in-memory producer has settled. With no reader, exactly
+            // `capacity` items enter the backlog and item `capacity + 1` deterministically trips Error.
+            let! exitError = processError (running.ExitTask :> Task)
+            Assert.That(exitError.IsSome, Is.True, "the producer should fault before enumeration starts")
+
+            let! drain = drainWithDeadline lines 5000
             let! error = processError drain
 
             // T-297: one stdout streaming channel item is one framed line, 1:1, so the channel's item
@@ -1933,14 +1975,9 @@ type StreamingTests() =
             | Some(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes)) ->
                 Assert.That(lineLimit, Is.EqualTo(Some capacity), "the channel's item capacity is the line limit here")
                 Assert.That(byteLimit, Is.EqualTo None)
-
-                Assert.That(
-                    totalLines,
-                    Is.GreaterThanOrEqualTo capacity,
-                    "must have produced at least `capacity` lines before overflowing"
-                )
-
-                Assert.That(totalBytes, Is.GreaterThan 0, "TotalBytes must no longer be the hardcoded 0")
+                Assert.That(totalLines, Is.EqualTo total, "the triggering line must be included exactly once")
+                Assert.That(totalLines, Is.GreaterThan capacity)
+                Assert.That(totalBytes, Is.EqualTo(Encoding.UTF8.GetByteCount payload))
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
         }
         :> Task
@@ -1950,16 +1987,31 @@ type StreamingTests() =
         ()
         : Task =
         task {
-            let total = 20
             let capacity = 3
+            let stdoutLines = [ "stdout-1"; "stdout-2" ]
+            let stderrLines = [ "stderr-1"; "stderr-2" ]
+            let payload (lines: string list) = String.Join("\n", lines) + "\n"
+            let stdoutPayload = payload stdoutLines
+            let stderrPayload = payload stderrLines
+            let total = stdoutLines.Length + stderrLines.Length
+            let expectedBytes = Encoding.UTF8.GetByteCount(stdoutPayload + stderrPayload)
 
             let config =
                 (Command.create "test"
                  |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.Error)))
                     .Config
 
-            use running = syntheticStdoutProcess config (linesPayload total)
-            let! drain = drainWithDeadline (running.OutputEventsAsync()) 5000
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes stdoutPayload)
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes stderrPayload)
+
+            use running =
+                syntheticProcessOverStreams config (Some(stdout :> Stream)) (Some(stderr :> Stream))
+
+            let events = running.OutputEventsAsync()
+            let! exitError = processError (running.ExitTask :> Task)
+            Assert.That(exitError.IsSome, Is.True, "the merged producer should fault before enumeration starts")
+
+            let! drain = drainWithDeadline events 5000
             let! error = processError drain
 
             // T-297: the event channel merges stdout's and stderr's framed lines into ONE shared backlog,
@@ -1968,7 +2020,7 @@ type StreamingTests() =
             // `TotalLines` still reports something honest and available here: the combined line count both
             // pumps have produced so far, never the hardcoded `0`/mismatched capacity of the old code.
             match error with
-            | Some(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes)) ->
+            | Some((ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes) as overflow)) ->
                 Assert.That(
                     lineLimit,
                     Is.EqualTo None,
@@ -1977,14 +2029,65 @@ type StreamingTests() =
 
                 Assert.That(byteLimit, Is.EqualTo None)
 
-                Assert.That(
-                    totalLines,
-                    Is.GreaterThanOrEqualTo capacity,
-                    "TotalLines must report an honest combined line count"
-                )
-
-                Assert.That(totalBytes, Is.EqualTo 0)
+                Assert.That(totalLines, Is.EqualTo total, "stdout and stderr events must both contribute")
+                Assert.That(totalLines, Is.EqualTo(capacity + 1))
+                Assert.That(totalBytes, Is.EqualTo expectedBytes)
+                Assert.That(overflow.Message, Does.Contain("too many events"))
+                Assert.That(overflow.Message, Does.Not.Contain("line output"))
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputEvents preserves a sibling pump fault when the completed channel rejects a write``() : Task =
+        task {
+            let siblingFault = InvalidOperationException "sibling boom"
+
+            let releaseStdout =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded(1, StreamFullMode.Error))
+                 |> Command.onStderrLine (fun _ -> raise siblingFault))
+                    .Config
+
+            use stdout =
+                new GatedByteStream(Encoding.UTF8.GetBytes "out-1\n", releaseStdout.Task)
+
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes "err-1\n")
+
+            let host: RunningHost =
+                { Config = config
+                  Pid = None
+                  Stdout = Some(stdout :> Stream)
+                  Stderr = Some(stderr :> Stream)
+                  Stdin = None
+                  StartTime = DateTime.UtcNow
+                  StartedTimestamp = Stopwatch.GetTimestamp()
+                  StartTimeIdentity = None
+                  Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+                  StdinError = fun () -> None
+                  StdinFeedComplete = ignore
+                  StartKill = fun () -> releaseStdout.TrySetResult() |> ignore
+                  Signal = fun _ -> Ok()
+                  GracefulKill = fun _ -> Task.CompletedTask
+                  ResizePty = None
+                  TreeStats = None
+                  Teardown = fun () -> ValueTask() }
+
+            use running = new RunningProcess(host)
+            running.OutputEventsAsync() |> ignore
+            let exit = running.ExitTask
+            let! winner = Task.WhenAny(exit :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, exit), Is.True, "the sibling pumps did not settle")
+
+            try
+                let! _ = exit
+                Assert.Fail "expected the original sibling fault"
+            with
+            | :? InvalidOperationException as ex -> Assert.That(ex, Is.SameAs siblingFault)
+            | :? ProcessException as ex -> Assert.Fail $"channel closure was misreported as {ex.Error}"
         }
         :> Task
 

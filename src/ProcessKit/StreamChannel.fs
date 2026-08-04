@@ -1,6 +1,7 @@
 namespace ProcessKit
 
 open System.IO
+open System.Runtime.ExceptionServices
 open System.Threading
 open System.Threading.Tasks
 open System.Threading.Channels
@@ -11,6 +12,46 @@ open System.Threading.Channels
 /// out of `RunningProcess` so the channel/backpressure machinery lives in one place next to `Pump`;
 /// the sessions that own the channels stay in `RunningProcess`/`ContentLengthSession`.
 module internal StreamChannel =
+
+    /// A channel together with the first completion cause supplied by its owner. `ChannelWriter.TryWrite`
+    /// returns `false` for both a full bounded channel and a completed channel, while
+    /// `ChannelReader.Completion` does not settle until an already-buffered completed channel is drained.
+    /// Keeping the owner's completion state beside the channel is therefore the only non-blocking way for
+    /// `writeItem` to distinguish those cases without changing bounded-write scheduling.
+    type Channel<'T> internal (inner: System.Threading.Channels.Channel<'T>) =
+        let completionGate = obj ()
+        let mutable completion: exn option option = None
+
+        member _.Reader = inner.Reader
+        member _.Writer = inner.Writer
+
+        member internal _.Completion = lock completionGate (fun () -> completion)
+
+        member private _.TryCompleteCore(error: exn option) =
+            lock completionGate (fun () ->
+                match completion with
+                | Some _ -> false
+                | None ->
+                    // Publish the cause before closing the writer. Any concurrent failed `TryWrite`
+                    // can then recover this exact cause instead of fabricating an overflow.
+                    completion <- Some error
+
+                    match error with
+                    | Some cause -> inner.Writer.TryComplete cause
+                    | None -> inner.Writer.TryComplete())
+
+        member this.TryComplete() = this.TryCompleteCore None
+        member this.TryComplete(error: exn) = this.TryCompleteCore(Some error)
+
+    let private rethrow<'T> (error: exn) : 'T =
+        ExceptionDispatchInfo.Capture(error).Throw()
+        Unchecked.defaultof<'T>
+
+    let private ensureNotCompleted (channel: Channel<'T>) =
+        match channel.Completion with
+        | None -> ()
+        | Some None -> raise (ChannelClosedException())
+        | Some(Some error) -> rethrow error
 
     // A bounded channel for an opt-in `StreamBufferPolicy`. `SingleReader = false` regardless of
     // `FullMode` (not just for `DropOldest`, which needs the writer to evict via `Reader.TryRead`) —
@@ -35,9 +76,16 @@ module internal StreamChannel =
     /// policy is set, else an unbounded single-reader channel with `singleWriter` as given (the stdout
     /// channel has one pump, the event channel two).
     let create<'T> (streamBuffer: StreamBufferPolicy option) (singleWriter: bool) : Channel<'T> =
-        match streamBuffer with
-        | Some policy -> Channel.CreateBounded<'T>(boundedOptions policy.Capacity singleWriter)
-        | None -> Channel.CreateUnbounded<'T>(UnboundedChannelOptions(SingleReader = true, SingleWriter = singleWriter))
+        let inner =
+            match streamBuffer with
+            | Some policy ->
+                System.Threading.Channels.Channel.CreateBounded<'T>(boundedOptions policy.Capacity singleWriter)
+            | None ->
+                System.Threading.Channels.Channel.CreateUnbounded<'T>(
+                    UnboundedChannelOptions(SingleReader = true, SingleWriter = singleWriter)
+                )
+
+        Channel inner
 
     // Write one item to a (possibly bounded) channel per `streamBuffer` (`None` = the default
     // unbounded `TryWrite`, unchanged). `Backpressure` awaits room via `WriteAsync`, bounded to
@@ -59,21 +107,26 @@ module internal StreamChannel =
     let writeItem
         (streamBuffer: StreamBufferPolicy option)
         (disposalToken: CancellationToken)
-        (writer: ChannelWriter<'T>)
-        (reader: ChannelReader<'T>)
+        (channel: Channel<'T>)
         (buildOverflowError: StreamBufferPolicy -> ProcessError)
         (onDrop: unit -> unit)
         (item: 'T)
         : ValueTask =
+        let writer = channel.Writer
+        let reader = channel.Reader
+
         match streamBuffer with
         | None ->
-            writer.TryWrite item |> ignore
+            if not (writer.TryWrite item) then
+                ensureNotCompleted channel
+
             ValueTask.CompletedTask
         | Some policy ->
             match policy.FullMode with
             | StreamFullMode.Backpressure -> writer.WriteAsync(item, disposalToken)
             | StreamFullMode.DropNewest ->
                 if not (writer.TryWrite item) then
+                    ensureNotCompleted channel
                     onDrop ()
 
                 ValueTask.CompletedTask
@@ -86,32 +139,36 @@ module internal StreamChannel =
                 // stdout-only stream always succeeds on the first iteration).
                 //
                 // Bounded to genuine progress: if a sibling pump has completed the channel (its own
-                // fault path — a throwing handler, a decode/IO error — calls `Writer.TryComplete ex`),
+                // fault path — a throwing handler, a decode/IO error — calls `channel.TryComplete ex`),
                 // both `TryRead` and `TryWrite` permanently return `false`; without this check the loop
                 // would spin forever (a livelock pinning a CPU core, and `eventOutcome`/`FinishAsync`
                 // would never complete). Capacity is always >= 1 (`StreamBufferPolicy.Bounded` rejects
                 // less), so a non-completed channel reporting `TryWrite` full always has something to
-                // evict — `TryRead` failing here is therefore only possible once the channel is done.
+                // evict unless the consumer raced us and drained it first. In that case the immediate
+                // retry below uses the newly freed slot; if a sibling writer wins it, the loop continues.
                 let mutable written = writer.TryWrite item
-                let mutable canRetry = true
 
-                while not written && canRetry do
+                while not written do
                     let evicted, _ = reader.TryRead()
 
                     if evicted then
                         onDrop ()
                         written <- writer.TryWrite item
                     else
-                        // Nothing left to evict and nowhere to write: the channel is done. This item
-                        // can't be delivered either way — count it dropped and stop instead of spinning.
-                        onDrop ()
-                        canRetry <- false
+                        // Either the consumer drained the full slot first, or the channel is done.
+                        // Preserve a completion cause; otherwise retry the write against the freed slot.
+                        ensureNotCompleted channel
+                        written <- writer.TryWrite item
 
                 ValueTask.CompletedTask
             | StreamFullMode.Error ->
                 if writer.TryWrite item then
                     ValueTask.CompletedTask
                 else
+                    // `TryWrite = false` also means completed. In particular, one event pump may have
+                    // faulted and closed the shared channel while its sibling was framing a line. The
+                    // original fault must win over a synthetic `OutputTooLarge` from that sibling.
+                    ensureNotCompleted channel
                     raise (ProcessException(buildOverflowError policy))
 
     // Pump one stream's lines through `onLine` until the stream ends — the streaming-verb analogue

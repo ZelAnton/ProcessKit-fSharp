@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ContentLengthSession` now honours a configured `Command.StreamBuffer` for its incoming-frame backlog instead of silently ignoring it, bounding memory against a slow consumer, and refuses the lossy `DropOldest`/`DropNewest` full modes rather than silently discarding protocol frames; `PtySession` documents `StreamBuffer` as inapplicable instead of silently no-opping it.
 - `CliClient.WithDefaults` now rejects configurators that change the client's program instead of silently retargeting later invocations.
 - Output line handlers and tees now reject `Null` or `Inherit` destinations instead of silently receiving no output.
-- A bounded stream/event/chunk channel or `ContentLengthSession` frame backlog configured with `StreamFullMode.Error` now reports `ProcessError.OutputTooLarge` with an honest limit/total for its own channel (line, byte, or frame count as applicable) instead of a hardcoded zero byte total and a line limit borrowed from an unrelated channel.
+- Fixed incorrect cumulative totals (`TotalLines`, `TotalBytes`, `OutputTooLarge` message) reported for bounded-channel overflow in stdout streaming, event streaming, and content-length frame parsing.
 
 ## [2.10.0] - 2026-07-29
 
