@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Supervisor.LivenessMemory` now documents its intentional monotonic peak-memory contract: a transient peak is not forgiven by later lower usage, and `LivenessFailures` only delays the restart after the crossing.
 
 ### Fixed
+- Windows `ProcessGroup.Suspend()` and `Resume()` now report a `ProcessError.Io` naming the job members they failed to freeze or thaw, instead of claiming success, while a member that exited concurrently or whose PID was recycled stays a successful no-op.
 - Windows `ProcessGroup.MemberStats()` now binds each Job PID snapshot to a pre-sampling process identity, including inaccessible members, and omits exit/reuse generations.
 - Linux cgroup `ProcessGroup.MemberStats()` now preserves adopted and descendant members while pinning tracked/adopted or snapshot identities to omit recycled PIDs.
 - Pipeline relays now surface genuine upstream read failures instead of treating truncated downstream input as successful, while keeping expected broken-pipe and teardown races quiet.
@@ -38,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ContentLengthSession` now honours a configured `Command.StreamBuffer` for its incoming-frame backlog instead of silently ignoring it, bounding memory against a slow consumer, and refuses the lossy `DropOldest`/`DropNewest` full modes rather than silently discarding protocol frames; `PtySession` documents `StreamBuffer` as inapplicable instead of silently no-opping it.
 - `CliClient.WithDefaults` now rejects configurators that change the client's program instead of silently retargeting later invocations.
 - Output line handlers and tees now reject `Null` or `Inherit` destinations instead of silently receiving no output.
+- Fixed incorrect cumulative totals (`TotalLines`, `TotalBytes`, `OutputTooLarge` message) reported for bounded-channel overflow in stdout streaming, event streaming, and content-length frame parsing.
 
 ## [2.10.0] - 2026-07-29
 
