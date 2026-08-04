@@ -317,8 +317,8 @@ module internal Posix =
     let mutable readMemberStatsForTests: (int -> MemberStats option) option = None
 
     /// Test seam (internal, not public API): invoked with the target pgid/pid by every process-group
-    /// delivery primitive (`killProcessGroup` / `terminateProcessGroup` / `signalProcessGroup` /
-    /// `suspendProcessGroup` / `resumeProcessGroup`) and the per-child raw kill (`killProcess`, the cgroup
+    /// delivery primitive (`killProcessGroup` / `signalProcessGroup` / `suspendProcessGroup` /
+    /// `resumeProcessGroup`) and the per-child raw kill (`killProcess`, the cgroup
     /// backend's `KillChild`) just before its syscall, so a test can record which pgids/pids a path
     /// actually delivered to — proving a recycled number is pruned and NEVER signalled/killed, and a
     /// matching one still is. Production leaves it `None`.
@@ -410,11 +410,6 @@ module internal Posix =
     let killProcessGroup (pgid: int) =
         observeGroupDelivery pgid
         killpg (pgid, SIGKILL) |> ignore
-
-    /// Ask an entire POSIX process group to terminate gracefully (SIGTERM).
-    let terminateProcessGroup (pgid: int) =
-        observeGroupDelivery pgid
-        killpg (pgid, SIGTERM) |> ignore
 
     /// True while any process remains in the group (signal 0 probes existence). `ESRCH` means the group
     /// is gone; `EPERM` and unknown probe failures conservatively keep it tracked because they do not

@@ -485,7 +485,7 @@ module internal Cgroup =
     /// "the read itself failed" (EACCES/EIO, a race with teardown removing the directory, …). Folding
     /// both into `[]` (the previous behaviour) made a transient read failure indistinguishable from a
     /// genuinely drained group — every fail-safe decision below (`cgroupAlive`, the `killCgroup` sweep,
-    /// `terminateCgroup`, `signalCgroup`, `CgroupBackend.Members`/`Stats`) depends on telling them apart.
+    /// `signalCgroup`, `CgroupBackend.Members`/`Stats`) depends on telling them apart.
     let cgroupMembers (cgroupPath: string) : Result<int list, string> =
         try
             File.ReadAllLines(Path.Combine(cgroupPath, "cgroup.procs"))
@@ -513,8 +513,8 @@ module internal Cgroup =
     /// sweep.
     ///
     /// That fallback sweep is deliberately **best-effort, not identity-safe against pid recycling** — it is
-    /// NOT presented as TOCTOU-safe. Unlike `signalCgroup`/`terminateCgroup` (which pin each pid with a
-    /// pidfd before delivering, see `deliverIdentitySafe`), it signals raw pid numbers snapshotted from
+    /// NOT presented as TOCTOU-safe. Unlike `signalCgroup` (which pins each pid with a pidfd before
+    /// delivering, see `deliverIdentitySafe`), it signals raw pid numbers snapshotted from
     /// `cgroup.procs`, so in the tiny window between the snapshot and the `kill` a member could exit and its
     /// number be recycled by an unrelated process that then receives the SIGKILL. This is an accepted
     /// trade-off confined to teardown on ancient kernels: the freeze halts new forks while the sweep runs,
@@ -548,7 +548,7 @@ module internal Cgroup =
                 match cgroupMembers cgroupPath with
                 | Ok members ->
                     // Best-effort raw sweep (see the docstring): NOT identity-safe against pid recycling,
-                    // unlike the pidfd-pinned `signalCgroup`/`terminateCgroup` path. Confined to teardown on
+                    // unlike the pidfd-pinned `signalCgroup` path. Confined to teardown on
                     // kernels < 5.14 that lack the atomic `cgroup.kill`; the freeze above halts new forks
                     // while it runs, and SIGKILL is the least-harmful signal to misdirect in the tiny
                     // snapshot->kill window.
@@ -695,19 +695,6 @@ module internal Cgroup =
             match firstFailure with
             | Some failure -> failure
             | None -> SignalDelivery.Delivered
-
-    /// SIGTERM every member (graceful); the caller polls then escalates with `killCgroup`. Each delivery is
-    /// identity-safe (see `broadcastIdentitySafe`/`deliverIdentitySafe`): a pid recycled by a process
-    /// outside the cgroup is never SIGTERM'd. The aggregated outcome is deliberately discarded — this is
-    /// the graceful attempt tier, and `GracefulKillTree`'s poll loop relies on `cgroupAlive` (not this
-    /// call's return) to decide whether to escalate. That preserves the old fail-safe: an unreadable
-    /// membership signals nobody but must not look like "the group is already empty," and the poll loop's
-    /// `cgroupAlive` (a read failure reads as "not drained") still drives escalation to `killCgroup`. On a
-    /// kernel without pidfd every delivery fails safe (no raw kill), so nothing is signalled and the poll
-    /// loop escalates to `killCgroup`'s atomic teardown — an honest degradation to a hard kill, never a
-    /// misdirected SIGTERM.
-    let terminateCgroup (cgroupPath: string) =
-        broadcastIdentitySafe cgroupPath SIGTERM |> ignore
 
     /// Broadcast a raw signal to every member of a cgroup, aggregating the per-pid outcomes: a member
     /// that already exited (or whose pid left the cgroup) does not abort the broadcast — every member
