@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Supervisor.LivenessMemory` now documents its intentional monotonic peak-memory contract: a transient peak is not forgiven by later lower usage, and `LivenessFailures` only delays the restart after the crossing.
 
 ### Fixed
+- Windows `ProcessGroup.Suspend()` and `Resume()` now report a `ProcessError.Io` naming the job members they failed to freeze or thaw, instead of claiming success, while a member that exited concurrently or whose PID was recycled stays a successful no-op.
 - Windows `ProcessGroup.MemberStats()` now binds each Job PID snapshot to a pre-sampling process identity, including inaccessible members, and omits exit/reuse generations.
 - Linux cgroup `ProcessGroup.MemberStats()` now preserves adopted and descendant members while pinning tracked/adopted or snapshot identities to omit recycled PIDs.
 - Pipeline relays now surface genuine upstream read failures instead of treating truncated downstream input as successful, while keeping expected broken-pipe and teardown races quiet.
