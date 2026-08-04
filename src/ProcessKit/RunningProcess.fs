@@ -443,6 +443,14 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     let mutable stdoutChunkCount = 0
     let mutable stderrLineCount = 0
     let mutable droppedStreamLineCount = 0
+    // Cumulative bytes actually pumped into the stdout LINE streaming channel / the raw stdout CHUNK
+    // channel, tracked only to feed an honest `ProcessError.OutputTooLarge.TotalBytes` on
+    // `StreamFullMode.Error` overflow (T-297) — neither channel's own consumption path needs them.
+    // `int64` because a long-running stream can plausibly exceed `Int32.MaxValue` bytes before the cap
+    // (if any) ever trips; `readStdoutStreamedByteCount`/`readStdoutChunkStreamedByteCount` below
+    // saturate the read back down to `int` the same way `Pump.LineBuffer.TotalBytes` does.
+    let mutable stdoutStreamedByteCount = 0L
+    let mutable stdoutChunkStreamedByteCount = 0L
     let mutable stderrStreamBuffer = Unchecked.defaultof<Pump.LineBuffer>
     let mutable streamOutcome = Unchecked.defaultof<Task<Outcome>>
     let mutable chunkOutcome = Unchecked.defaultof<Task<Outcome>>
@@ -451,9 +459,9 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         Interlocked.Increment(&droppedStreamLineCount) |> ignore
 
     // `stdoutLineCount`/`stderrLineCount` are written by a background pump task and read from the
-    // consumer's thread via `StdoutLineCount`/`StderrLineCount` and the `countSoFar` callbacks below —
-    // `Interlocked.Increment` to publish each write, `Volatile.Read` (see the two members) to read a
-    // fresh value, the same atomic approach `droppedStreamLineCount` already uses.
+    // consumer's thread via `StdoutLineCount`/`StderrLineCount` and the `OutputTooLarge`-building
+    // closures below — `Interlocked.Increment` to publish each write, `Volatile.Read` (see the two
+    // members) to read a fresh value, the same atomic approach `droppedStreamLineCount` already uses.
     let bumpStdoutLine () =
         Interlocked.Increment(&stdoutLineCount) |> ignore
 
@@ -466,6 +474,20 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     let readStdoutLineCount () = Volatile.Read(&stdoutLineCount)
     let readStdoutChunkCount () = Volatile.Read(&stdoutChunkCount)
     let readStderrLineCount () = Volatile.Read(&stderrLineCount)
+
+    let bumpStdoutStreamedBytes (delta: int) =
+        Interlocked.Add(&stdoutStreamedByteCount, int64 delta) |> ignore
+
+    let bumpStdoutChunkStreamedBytes (delta: int) =
+        Interlocked.Add(&stdoutChunkStreamedByteCount, int64 delta) |> ignore
+
+    // Saturating reads, mirroring `Pump.LineBuffer.TotalBytes` — these only ever feed an `int`-typed
+    // `ProcessError.OutputTooLarge.TotalBytes`.
+    let readStdoutStreamedByteCount () =
+        int (min (Volatile.Read &stdoutStreamedByteCount) (int64 Int32.MaxValue))
+
+    let readStdoutChunkStreamedByteCount () =
+        int (min (Volatile.Read &stdoutChunkStreamedByteCount) (int64 Int32.MaxValue))
 
     // One sequence domain for both event pumps. The atomic increment records the order in which the
     // two independently-drained streams reach ProcessKit's line-framing boundary.
@@ -525,20 +547,17 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     let writeStreamItem
         (writer: ChannelWriter<'T>)
         (reader: ChannelReader<'T>)
-        (countSoFar: unit -> int)
+        (buildOverflowError: StreamBufferPolicy -> ProcessError)
         (onDrop: unit -> unit)
         (item: 'T)
         : ValueTask =
-        StreamChannel.writeItem
-            config.StreamBuffer
-            config.Program
-            disposalCts.Token
-            writer
-            reader
-            countSoFar
-            onDrop
-            item
+        StreamChannel.writeItem config.StreamBuffer disposalCts.Token writer reader buildOverflowError onDrop item
 
+    // Raw stdout byte chunks (`Pump.readBytesUntilDone`'s items) have no line structure — one item is
+    // whatever the OS handed back on a single read — so neither `LineLimit` nor `TotalLines` means
+    // anything for this channel; T-297's bug reported the channel's item capacity as a fabricated line
+    // limit regardless of that. `TotalBytes` is the one honest total this site can offer: the real
+    // cumulative size, in bytes, of every chunk pumped into the channel so far.
     let writeChunkItem
         (writer: ChannelWriter<ReadOnlyMemory<byte>>)
         (reader: ChannelReader<ReadOnlyMemory<byte>>)
@@ -546,11 +565,11 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         : ValueTask =
         StreamChannel.writeItem
             config.StreamBuffer
-            config.Program
             chunkBackpressureCts.Token
             writer
             reader
-            readStdoutChunkCount
+            (fun _policy ->
+                ProcessError.OutputTooLarge(config.Program, None, None, 0, readStdoutChunkStreamedByteCount ()))
             bumpDroppedStreamLine
             item
 
@@ -1754,11 +1773,30 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                     (fun line ->
                                         invokeLine config.OnStdoutLine line
                                         bumpStdoutLine ()
+                                        bumpStdoutStreamedBytes (Encoding.UTF8.GetByteCount line + 1)
 
                                         writeStreamItem
                                             stdoutChannel.Writer
                                             stdoutChannel.Reader
-                                            readStdoutLineCount
+                                            (fun policy ->
+                                                // One channel item is one framed stdout line, 1:1, so the
+                                                // channel's item capacity IS a genuine line limit and
+                                                // `readStdoutLineCount()` is the true count of lines
+                                                // produced before the cap tripped — both stayed honest
+                                                // already. `TotalBytes` was hardcoded `0` before T-297; it
+                                                // now reports the UTF-8 size of those lines using the same
+                                                // "own bytes + 1 separator byte" accounting
+                                                // `Pump.LineBuffer`'s doc comment explains (a small,
+                                                // deliberate over-count, never an under-count) — this
+                                                // streaming channel retains nothing to re-scan, so the cost
+                                                // is tracked incrementally instead.
+                                                ProcessError.OutputTooLarge(
+                                                    config.Program,
+                                                    Some policy.Capacity,
+                                                    None,
+                                                    readStdoutLineCount (),
+                                                    readStdoutStreamedByteCount ()
+                                                ))
                                             bumpDroppedStreamLine
                                             line)
                                     None
@@ -1847,6 +1885,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                         config.StdoutTee
                                         (fun chunk ->
                                             bumpStdoutChunk ()
+                                            bumpStdoutChunkStreamedBytes chunk.Length
 
                                             writeChunkItem stdoutChunkChannel.Writer stdoutChunkChannel.Reader chunk)
                                         (fun () -> disposalCts.Token.IsCancellationRequested)
@@ -2046,7 +2085,6 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                     tee
                     (onLine: Action<string> option)
                     (bump: unit -> unit)
-                    (countSoFar: unit -> int)
                     (wrap: OutputLine -> OutputEvent)
                     =
                     task {
@@ -2075,7 +2113,28 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                         writeStreamItem
                                             eventChannel.Writer
                                             eventChannel.Reader
-                                            countSoFar
+                                            (fun _policy ->
+                                                // The event channel merges stdout's and stderr's framed
+                                                // lines into ONE shared backlog, so its item capacity
+                                                // bounds their COMBINED count, never either stream's own
+                                                // line count alone — reporting it as a `LineLimit` (T-297's
+                                                // bug) claimed a per-stream cap that never existed here.
+                                                // `LineLimit = None`. `TotalLines` still reports something
+                                                // honest and available at this site: the combined count of
+                                                // framed lines both pumps have produced so far (each event
+                                                // wraps exactly one line, so this total is real — just not
+                                                // tied to a channel-capacity-shaped limit). No cumulative
+                                                // byte count is tracked for this shared, two-producer
+                                                // channel, so `ByteLimit`/`TotalBytes` stay `None`/`0`; a
+                                                // consumer that needs a line's bytes already has its text
+                                                // on the delivered `OutputEvent` itself.
+                                                ProcessError.OutputTooLarge(
+                                                    config.Program,
+                                                    None,
+                                                    None,
+                                                    readStdoutLineCount () + readStderrLineCount (),
+                                                    0
+                                                ))
                                             bumpDroppedStreamLine
                                             (wrap outputLine))
                                     None
@@ -2096,7 +2155,6 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                         config.StdoutTee
                         config.OnStdoutLine
                         bumpStdoutLine
-                        readStdoutLineCount
                         OutputEvent.Stdout
 
                 let stderrPump =
@@ -2107,7 +2165,6 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                         config.StderrTee
                         config.OnStderrLine
                         bumpStderrLine
-                        readStderrLineCount
                         OutputEvent.Stderr
 
                 // A fault in either pump kills the tree at once, so a still-producing child can't wedge

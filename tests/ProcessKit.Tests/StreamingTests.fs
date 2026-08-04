@@ -518,6 +518,42 @@ type StreamingTests() =
         }
         :> Task
 
+    // T-297: a raw stdout byte chunk (`StdoutChunksAsync`'s items) has no line structure — one item is
+    // whatever the OS handed back on a single read — so the fail-loud `OutputTooLarge` this channel
+    // raises on overflow must not claim a `LineLimit`/`TotalLines` it never had, and must carry an
+    // honest `TotalBytes` (the cumulative chunk bytes actually pumped) instead of the hardcoded `0`.
+    [<Test>]
+    member _.``StreamBuffer Error on StdoutChunksAsync reports byte totals, not a false LineLimit``() : Task =
+        task {
+            let capacity = 2
+            let chunks = [ for i in 0..19 -> [| byte i |] ]
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.Error)))
+                    .Config
+
+            use stdout = new ChunkedByteStream(chunks)
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            let! drain = drainWithDeadline (running.StdoutChunksAsync()) 5000
+            let! error = processError drain
+
+            match error with
+            | Some(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes)) ->
+                Assert.That(lineLimit, Is.EqualTo None, "a raw stdout byte chunk is not a line")
+                Assert.That(byteLimit, Is.EqualTo None, "the channel's capacity bounds queued chunks, not bytes")
+                Assert.That(totalLines, Is.EqualTo 0)
+
+                Assert.That(
+                    totalBytes,
+                    Is.GreaterThan 0,
+                    "TotalBytes must report the real cumulative chunk bytes, not the hardcoded 0"
+                )
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
     // --- RunningProcess.StdoutJsonLinesAsync (NDJSON / JSON Lines) ---
 
     [<Test>]
@@ -1889,8 +1925,65 @@ type StreamingTests() =
             let! drain = drainWithDeadline (running.StdoutLinesAsync()) 5000
             let! error = processError drain
 
+            // T-297: one stdout streaming channel item is one framed line, 1:1, so the channel's item
+            // capacity genuinely IS a line limit and the running line count genuinely IS the total lines
+            // produced — both must stay honest. `TotalBytes` used to be hardcoded `0`; it must now report
+            // the real (UTF-8) size of the lines produced before the cap tripped.
             match error with
-            | Some(ProcessError.OutputTooLarge _) -> Assert.Pass()
+            | Some(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes)) ->
+                Assert.That(lineLimit, Is.EqualTo(Some capacity), "the channel's item capacity is the line limit here")
+                Assert.That(byteLimit, Is.EqualTo None)
+
+                Assert.That(
+                    totalLines,
+                    Is.GreaterThanOrEqualTo capacity,
+                    "must have produced at least `capacity` lines before overflowing"
+                )
+
+                Assert.That(totalBytes, Is.GreaterThan 0, "TotalBytes must no longer be the hardcoded 0")
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StreamBuffer Error on OutputEventsAsync reports the combined line total, not a false LineLimit``
+        ()
+        : Task =
+        task {
+            let total = 20
+            let capacity = 3
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.Error)))
+                    .Config
+
+            use running = syntheticStdoutProcess config (linesPayload total)
+            let! drain = drainWithDeadline (running.OutputEventsAsync()) 5000
+            let! error = processError drain
+
+            // T-297: the event channel merges stdout's and stderr's framed lines into ONE shared backlog,
+            // so its item capacity bounds their COMBINED count, never one stream's own line count alone —
+            // reporting it as a `LineLimit` (the bug) claimed a per-stream cap that never existed.
+            // `TotalLines` still reports something honest and available here: the combined line count both
+            // pumps have produced so far, never the hardcoded `0`/mismatched capacity of the old code.
+            match error with
+            | Some(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes)) ->
+                Assert.That(
+                    lineLimit,
+                    Is.EqualTo None,
+                    "the shared event channel's item capacity is not a single stream's line limit"
+                )
+
+                Assert.That(byteLimit, Is.EqualTo None)
+
+                Assert.That(
+                    totalLines,
+                    Is.GreaterThanOrEqualTo capacity,
+                    "TotalLines must report an honest combined line count"
+                )
+
+                Assert.That(totalBytes, Is.EqualTo 0)
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
         }
         :> Task

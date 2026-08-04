@@ -184,10 +184,13 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
     // ever writes a frame.
     let frames: Channel<byte[]> = StreamChannel.create running.Config.StreamBuffer true
 
-    // The running count of frames written so far, fed to `StreamChannel.writeItem`'s `countSoFar` —
-    // only consulted by `StreamFullMode.Error`, to report how many frames had already arrived when the
-    // cap tripped.
-    let mutable writtenFrameCount = 0
+    // The running cumulative payload bytes of every frame parsed so far, consulted only by the
+    // `StreamFullMode.Error` overflow closure below (T-297) to report an honest total when the cap
+    // trips. A frame isn't a "line", so this never feeds `ProcessError.OutputTooLarge`'s `LineLimit`/
+    // `TotalLines`; it becomes that error's `TotalBytes` instead — the one structured field that
+    // genuinely applies to a whole protocol frame. Plain mutable int: this is the parse loop's own
+    // single-writer state, never touched concurrently.
+    let mutable writtenFrameBytes = 0
 
     let sendGate = new SemaphoreSlim(1, 1)
     let mutable framesClaimed = 0
@@ -251,16 +254,29 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                         | None -> raise (invalid "frame is missing a Content-Length header")
                         | Some length ->
                             let! payload = reader.ReadExactlyAsync length
-                            writtenFrameCount <- writtenFrameCount + 1
+
+                            writtenFrameBytes <-
+                                if writtenFrameBytes > Int32.MaxValue - payload.Length then
+                                    Int32.MaxValue
+                                else
+                                    writtenFrameBytes + payload.Length
 
                             do!
                                 StreamChannel.writeItem
                                     running.Config.StreamBuffer
-                                    program
                                     running.DisposalToken
                                     frames.Writer
                                     frames.Reader
-                                    (fun () -> writtenFrameCount)
+                                    (fun _policy ->
+                                        // A frame is a whole protocol message, never a line, so `LineLimit`/
+                                        // `TotalLines` would claim a unit this channel never had (T-297) —
+                                        // both stay `None`/`0`. `ByteLimit` stays `None` too: the channel's
+                                        // capacity bounds queued FRAMES, not bytes, so there is no honest
+                                        // byte cap to report either. `TotalBytes` is the one field that
+                                        // genuinely fits — the cumulative payload bytes of every frame
+                                        // parsed so far — so it carries `writtenFrameBytes` instead of a
+                                        // hardcoded `0`.
+                                        ProcessError.OutputTooLarge(program, None, None, 0, writtenFrameBytes))
                                     (fun () ->
                                         // Unreachable by construction: `writeItem` calls `onDrop` only from
                                         // its two DROP full modes, and both are refused for this session

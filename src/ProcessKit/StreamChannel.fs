@@ -43,16 +43,25 @@ module internal StreamChannel =
     // unbounded `TryWrite`, unchanged). `Backpressure` awaits room via `WriteAsync`, bounded to
     // `disposalToken` so an abandoned bounded stream's writer can't outlive its handle.
     // `DropNewest`/`DropOldest` keep the channel's item count bounded losslessly but the CONTENT is
-    // lossy, bumping `onDrop`. `Error` faults the pump with `ProcessError.OutputTooLarge` once full —
+    // lossy, bumping `onDrop`. `Error` faults the pump with the caller-built `ProcessError` once full —
     // reusing the exact fault path a throwing per-line handler already goes through (the caller's
-    // `try`/`with` completes the channel and re-raises). `program`/`countSoFar` only feed that fault.
+    // `try`/`with` completes the channel and re-raises).
+    //
+    // `buildOverflowError` is a closure rather than a fixed `ProcessError.OutputTooLarge` construction
+    // here on purpose: this one function backs several distinct channels (stdout line streaming, the
+    // merged stdout+stderr event channel, raw stdout byte chunks, and `ContentLengthSession`'s protocol
+    // frames), and only the caller knows what unit its own items are actually counted in. Building a
+    // fixed case here once meant every caller reported the channel's item *capacity* as a `LineLimit`
+    // and a hardcoded `TotalBytes = 0`, regardless of whether its items were lines at all (T-297) — see
+    // each call site's own comment for how it now maps its channel onto the honest fields. The closure
+    // is evaluated only on the `StreamFullMode.Error` overflow path, never on every write, and receives
+    // the tripped `policy` so a caller need not re-derive `streamBuffer.Value` itself.
     let writeItem
         (streamBuffer: StreamBufferPolicy option)
-        (program: string)
         (disposalToken: CancellationToken)
         (writer: ChannelWriter<'T>)
         (reader: ChannelReader<'T>)
-        (countSoFar: unit -> int)
+        (buildOverflowError: StreamBufferPolicy -> ProcessError)
         (onDrop: unit -> unit)
         (item: 'T)
         : ValueTask =
@@ -103,11 +112,7 @@ module internal StreamChannel =
                 if writer.TryWrite item then
                     ValueTask.CompletedTask
                 else
-                    raise (
-                        ProcessException(
-                            ProcessError.OutputTooLarge(program, Some policy.Capacity, None, countSoFar (), 0)
-                        )
-                    )
+                    raise (ProcessException(buildOverflowError policy))
 
     // Pump one stream's lines through `onLine` until the stream ends — the streaming-verb analogue
     // of `Pump`'s buffered capture (which captures to a `LineBuffer` instead). No-op when the stream
