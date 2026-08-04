@@ -333,11 +333,16 @@ type PipelineSession
 /// argv/env-never-logged invariant holds for a multi-stage run too). Stage 0 likewise owns
 /// `StopSignal`, because graceful shutdown broadcasts one soft signal to the whole chain.
 ///
-/// Per-stage config that is simply **inapplicable** inside a pipeline and has no effect: `StreamBuffer`
-/// (a policy for the streaming verbs, which a pipeline does not offer), and `KeepStdinOpen` /
-/// `RunningProcess.TakeStdin` (a pipeline exposes no live handle to write stdin into — it wires each
-/// stage after the first from the previous stage's stdout itself, and a `KeepStdinOpen` there is an
-/// internal wiring detail, not user-reachable).
+/// `StreamBuffer` depends on how the pipeline is run. For buffered verbs (`RunAsync`, `OutputAsync`,
+/// `ExitCodeAsync`, and similar verbs used without `StartAsync`), it is inapplicable because there is
+/// no streaming consumer to receive the policy. `StartAsync`, however, returns a live
+/// `PipelineSession`: the last stage's `StreamBuffer` policy is applied to the session's stdout channel,
+/// including its bounded-buffer/backpressure behavior.
+///
+/// `KeepStdinOpen` / `RunningProcess.TakeStdin` remain inapplicable. Although `PipelineSession` is a
+/// live handle, it does not expose interactive stdin: the pipeline wires each stage after the first from
+/// the previous stage's stdout itself, and a `KeepStdinOpen` there is an internal wiring detail with no
+/// user-reachable `RunningProcess.TakeStdin` handle.
 [<Sealed>]
 type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancelOn: CancellationToken option) =
 
