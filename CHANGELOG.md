@@ -24,9 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Supervisor.LivenessMemory` now documents its intentional monotonic peak-memory contract: a transient peak is not forgiven by later lower usage, and `LivenessFailures` only delays the restart after the crossing.
 
 ### Fixed
+- Windows `ProcessGroup.Suspend()` and `Resume()` now report a `ProcessError.Io` naming the job members they failed to freeze or thaw, instead of claiming success, while a member that exited concurrently or whose PID was recycled stays a successful no-op.
 - Windows `ProcessGroup.MemberStats()` now binds each Job PID snapshot to a pre-sampling process identity, including inaccessible members, and omits exit/reuse generations.
 - Linux cgroup `ProcessGroup.MemberStats()` now preserves adopted and descendant members while pinning tracked/adopted or snapshot identities to omit recycled PIDs.
 - Pipeline relays now surface genuine upstream read failures instead of treating truncated downstream input as successful, while keeping expected broken-pipe and teardown races quiet.
+- Pipeline `OutputTooLarge` diagnostics now report only the byte limits that apply to raw captures, with `LineLimit = None`.
 - A supervision session stopped before any incarnation produced a result no longer starts one more child just to report one, and ends with the failure that kept the child from starting — or `ProcessError.Cancelled` when no incarnation was ever started.
 - Supervisor restarts now apply the restart policy to typed live-output pump failures and retain liveness-failure attribution without leaking it to later children.
 - Process-testing doubles now honour `Command.CancelOn` consistently for completion verbs.
@@ -37,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ContentLengthSession` now honours a configured `Command.StreamBuffer` for its incoming-frame backlog instead of silently ignoring it, bounding memory against a slow consumer, and refuses the lossy `DropOldest`/`DropNewest` full modes rather than silently discarding protocol frames; `PtySession` documents `StreamBuffer` as inapplicable instead of silently no-opping it.
 - `CliClient.WithDefaults` now rejects configurators that change the client's program instead of silently retargeting later invocations.
 - Output line handlers and tees now reject `Null` or `Inherit` destinations instead of silently receiving no output.
+- `FakeProcess.Build()` now hands each built handle its own stdin `MemoryStream` instead of sharing one across every `Build()` call on the same fake, so closing one handle's stdin no longer breaks writes on another already-built handle; `StdinBytes` still aggregates every built handle's writes.
+- Fixed incorrect cumulative totals (`TotalLines`, `TotalBytes`, `OutputTooLarge` message) reported for bounded-channel overflow in stdout streaming, event streaming, and content-length frame parsing.
 
 ## [2.10.0] - 2026-07-29
 
