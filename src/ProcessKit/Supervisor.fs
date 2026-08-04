@@ -1455,26 +1455,6 @@ type Supervisor internal (config: SupervisorConfig) =
     member internal _.WithLivenessDelay(delay: TimeSpan -> CancellationToken -> Task) =
         Supervisor({ config with LivenessDelay = delay })
 
-    /// Internal seam for hosting-style wrappers (e.g. `ProcessKit.Extensions.Hosting`) that need to
-    /// combine an already-configured `StopWhen` with their own host-driven stop condition, without
-    /// silently dropping whichever predicate the caller supplied via `StopWhen` before the wrapper
-    /// ran. `Supervisor.StopWhen` itself *replaces* `config.StopWhen`, so a wrapper cannot safely
-    /// call it again without first reading whatever predicate (if any) is already there.
-    member internal _.CurrentStopWhen: (ProcessResult<string> -> bool) option =
-        config.StopWhen
-
-    /// Same seam as `CurrentStopWhen`, for `OnRestart`: lets a hosting-style wrapper chain its own
-    /// live-restart tracking (e.g. an observable restart counter) onto whatever handler the caller
-    /// already installed via `OnRestart`, instead of silently replacing it.
-    member internal _.CurrentOnRestart: (SupervisorRestartEvent -> unit) option =
-        config.OnRestart
-
-    /// Same seam as `CurrentStopWhen`, for `OnStormPause`: lets a hosting-style wrapper chain its own
-    /// live storm-pause tracking (e.g. an observable "currently paused" flag) onto whatever handler
-    /// the caller already installed via `OnStormPause`, instead of silently replacing it.
-    member internal _.CurrentOnStormPause: (SupervisorStormPauseEvent -> unit) option =
-        config.OnStormPause
-
     /// Start supervising and return a live `SupervisionSession` handle — the interactive counterpart to
     /// `RunAsync`. Supervision runs in the background from the moment this returns; poll the session's
     /// `Status` for a live snapshot (activity, restart count, storm-pause flag, current child pid/start
