@@ -77,6 +77,9 @@ type ProcessControlTests() =
             Command.create "/bin/sh" |> Command.args [ "-c"; script ]
 
     // Sleeps ~3s; killed well before that by every test here.
+    // Sporadic ping.exe/whoami.exe STATUS_DLL_INIT_FAILED "Application Popup" dialogs observed under
+    // the Codex workspace-write sandbox are a known host-environment behavior, not a ProcessKit bug;
+    // see K-119 in the local project knowledge base.
     let sleeper =
         if isWindows then
             shell "ping -n 4 127.0.0.1 >nul"
