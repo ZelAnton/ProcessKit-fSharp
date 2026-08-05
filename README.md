@@ -52,6 +52,9 @@ signal to one pid:
   grandchildren included. Where a mechanism has a genuine weakness (a `setsid` child escapes a
   POSIX process group), the active `Mechanism` is reported instead of pretending — never a silent
   downgrade.
+- **Detached failures are cleaned up.** The explicit `Command.LaunchDetached()` opt-out still
+  tears down the whole fresh POSIX session and reaps its leader if post-spawn priority setup fails,
+  before returning the typed `ProcessError.Spawn`.
 - **Async-first.** Run-and-capture, line/Content-Length streaming, interactive stdin, readiness
   probes, shell-free pipelines, supervision — all return `Task<…>` and stream as
   `IAsyncEnumerable<…>`.
