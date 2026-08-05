@@ -1074,6 +1074,31 @@ type PipelineTests() =
         |> ignore
 
     [<Test>]
+    member _.``KeepStdinOpen is rejected on any stage when piped``() =
+        let keepOpen (command: Command) = command.KeepStdinOpen()
+
+        // Regression: stage 0 has no Stdin source, so accepting KeepStdinOpen used to leave its pipe
+        // open forever with no writer and hang the chain instead of delivering EOF.
+        match
+            Assert.Throws<ArgumentException>(Action(fun () -> (keepOpen (emit [ "x" ])).Pipe sortStage |> ignore))
+        with
+        | null -> Assert.Fail("Expected KeepStdinOpen to be rejected on pipeline stage 0")
+        | stage0Error ->
+            Assert.That(stage0Error.Message, Does.Contain("pipeline stage 0"))
+            Assert.That(stage0Error.Message, Does.Contain((emit [ "x" ]).Program))
+            Assert.That(stage0Error.Message, Does.Contain("KeepStdinOpen"))
+
+        // The initial Pipe extension rejects the second stage (index 1) too.
+        Assert.Throws<ArgumentException>(Action(fun () -> (emit [ "x" ]).Pipe(keepOpen sortStage) |> ignore))
+        |> ignore
+
+        // Appending through Pipeline.Pipe exercises the instance builder for a still-later stage.
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> (emit [ "x" ]).Pipe(sortStage).Pipe(keepOpen sortStage) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
     member _.``stage zero owns a pipeline custom StopSignal and later stages cannot override it``() =
         // A pipeline has one containment group and therefore one soft-signal broadcast. Stage 0 owns
         // that pipeline-wide setting, like its logger; accepting a later override would silently ignore it.

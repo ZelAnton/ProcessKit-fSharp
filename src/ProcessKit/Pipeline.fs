@@ -33,6 +33,8 @@ module internal PipelineStageGuard =
     /// - a per-stage `CancelOn` on **any** stage — a stage's own `Command.CancelOn` is a verb-layer
     ///   token the direct stage spawn bypasses; only the chain-level `Pipeline.CancelOn` cancels a
     ///   pipeline;
+    /// - `KeepStdinOpen` on **any** stage — a pipeline exposes no per-stage `RunningProcess.TakeStdin`
+    ///   handle through which the caller could use the kept-open pipe;
     /// - a `Stdin` source on a stage **after the first** — every stage past stage 0 reads from the
     ///   previous stage's stdout, so only stage 0 may feed a source.
     /// - `StdoutToFile` on **any** stage — every stage's stdout is owned by the pipeline: intermediate
@@ -94,6 +96,14 @@ module internal PipelineStageGuard =
             raise (
                 ArgumentException(
                     $"pipeline stage {stageIndex} ('{command.Program}') sets a per-stage CancelOn, which a pipeline cannot honour: a stage's own cancellation token is a verb-layer mechanism and pipeline stages are spawned directly, bypassing it. Cancel the pipeline as a whole with Pipeline.CancelOn instead.",
+                    paramName
+                )
+            )
+
+        if config.KeepStdinOpen then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets KeepStdinOpen, which a pipeline cannot honour: a pipeline exposes no per-stage RunningProcess.TakeStdin handle through which the caller could use the kept-open stdin pipe. Run the command on its own for interactive stdin.",
                     paramName
                 )
             )
@@ -311,9 +321,11 @@ type PipelineSession
 /// per-stage `Retry` on any stage (retry is a verb-layer mechanism, and stages spawn directly,
 /// bypassing it), and a per-stage `CancelOn` on any stage (a stage's own `Command.CancelOn` token is
 /// likewise a verb-layer mechanism the direct stage spawn bypasses; only the chain-level
-/// `Pipeline.CancelOn` cancels a pipeline), `StdoutToFile` on any stage (stdout is instead pipeline
-/// wiring or final captured output), and `Stdout(StdioMode.Null|Inherit)` on any stage (the pipeline
-/// must use a pipe rather than silently override that destination). `StderrToFile` remains supported:
+/// `Pipeline.CancelOn` cancels a pipeline), `KeepStdinOpen` on any stage (the pipeline exposes no
+/// per-stage `RunningProcess.TakeStdin` handle through which the kept-open pipe could be used),
+/// `StdoutToFile` on any stage (stdout is instead pipeline wiring or final captured output), and
+/// `Stdout(StdioMode.Null|Inherit)` on any stage (the pipeline must use a pipe rather than silently
+/// override that destination). `StderrToFile` remains supported:
 /// it directs that stage's diagnostics to the requested file while the chain continues to carry stdout.
 /// Set the deadline on the pipeline, cancel the whole chain with `Pipeline.CancelOn`, feed stage 0, or
 /// run the command on its own.
@@ -339,17 +351,18 @@ type PipelineSession
 /// `PipelineSession`: the last stage's `StreamBuffer` policy is applied to the session's stdout channel,
 /// including its bounded-buffer/backpressure behavior.
 ///
-/// `KeepStdinOpen` / `RunningProcess.TakeStdin` remain inapplicable. Although `PipelineSession` is a
-/// live handle, it does not expose interactive stdin: the pipeline wires each stage after the first from
-/// the previous stage's stdout itself, and a `KeepStdinOpen` there is an internal wiring detail with no
-/// user-reachable `RunningProcess.TakeStdin` handle.
+/// `KeepStdinOpen` is rejected with `ArgumentException`, not accepted as a silent no-op. Although
+/// `PipelineSession` is a live handle, it does not expose interactive stdin: the pipeline wires each
+/// stage after the first from the previous stage's stdout itself, and exposes no user-reachable
+/// `RunningProcess.TakeStdin` handle.
 [<Sealed>]
 type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancelOn: CancellationToken option) =
 
     /// Append another stage; its stdin is fed from the current last stage's stdout. Rejects
-    /// (`ArgumentException`) a stage that sets a per-stage `Timeout`/`IdleTimeout`/`Retry`/`CancelOn`,
-    /// `StdoutToFile`, non-piped `Stdout`, or a `Stdin` source — a pipeline cannot honour those (see the
-    /// type doc); the appended stage is always after the first.
+    /// (`ArgumentException`) a stage that sets a per-stage
+    /// `Timeout`/`IdleTimeout`/`Retry`/`CancelOn`, `KeepStdinOpen`, `StdoutToFile`, non-piped `Stdout`, or
+    /// a `Stdin` source — a pipeline cannot honour those (see the type doc); the appended stage is always
+    /// after the first.
     member _.Pipe(command: Command) =
         ArgumentNullException.ThrowIfNull command
         PipelineStageGuard.validate (nameof command) commands.Length command
@@ -571,9 +584,10 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
 type PipelineExtensions =
 
     /// Start a pipeline that feeds this command's stdout into `next`'s stdin. Rejects
-    /// (`ArgumentException`) either stage setting a per-stage `Timeout`/`IdleTimeout`/`Retry`/`CancelOn`,
-    /// or `next` (stage 1) setting a `Stdin` source — a pipeline cannot honour those (see the `Pipeline`
-    /// type doc). `command` is stage 0, so a `Stdin` source on it (feeding the whole chain) is allowed.
+    /// (`ArgumentException`) either stage setting a per-stage `Timeout`/`IdleTimeout`/`Retry`/`CancelOn`
+    /// or `KeepStdinOpen`, or `next` (stage 1) setting a `Stdin` source — a pipeline cannot honour those
+    /// (see the `Pipeline` type doc). `command` is stage 0, so a `Stdin` source on it (feeding the whole
+    /// chain) is allowed.
     [<Extension>]
     static member Pipe(command: Command, next: Command) =
         ArgumentNullException.ThrowIfNull command

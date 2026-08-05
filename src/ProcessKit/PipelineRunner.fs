@@ -308,11 +308,10 @@ module internal PipelineRunner =
             // `ProcessError.Stdin` on an otherwise-successful pipeline — uniformly with a single command —
             // instead of silently feeding the stage empty input, and so the feed can be stopped on
             // teardown. Always close stage 0's stdin after its source (`keepStdinOpen = false`): a pipeline
-            // exposes no live handle, so `KeepStdinOpen`/`TakeStdin` are inert here (see `Pipeline`'s doc —
-            // "has no effect" on a stage), and leaving the pipe open would instead just deny stage 0 its
-            // EOF and hang the chain. This is the pipeline-equivalent of the single-command path's
-            // `command.Config.KeepStdinOpen`, which for stage 0 is always `false` in practice — plumbed as
-            // a literal so the "no interactive writer" invariant is explicit and cannot regress into a hang.
+            // exposes no live `TakeStdin` handle, so a user-supplied `KeepStdinOpen` is rejected by the
+            // pipeline builder. Keep the literal `false` here as defence in depth: if validation were ever
+            // bypassed, leaving the pipe open would deny stage 0 its EOF and hang the chain. This makes the
+            // "no interactive writer" invariant explicit at the wiring boundary too.
             setStage0Feed (
                 Pump.feedStdinSourceWithEncoding
                     stages[0].Config.StdinEncoding

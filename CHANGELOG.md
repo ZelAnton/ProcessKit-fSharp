@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Exec.outputAll`/`Exec.outputAllBytes` now reject `concurrency < 1` with `ArgumentOutOfRangeException` before running any command, instead of silently coercing it to sequential execution.
 
 ### Fixed
+- Pipeline construction now rejects `KeepStdinOpen` on every stage with `ArgumentException` instead of silently accepting an unusable open stdin pipe that can hang the chain.
 - `RunningProcess.OutputEventsAsync()` now rejects a second call on the same handle with `InvalidOperationException`, matching `StdoutLinesAsync`/`StdoutChunksAsync`, instead of silently handing out a second enumerator over the shared single-reader event channel.
 - Windows graceful stops and `Signal.Int`/`Signal.Term` now confirm that a window is still owned by the expected child immediately before posting `WM_CLOSE`, so a child window that closed and had its window handle reused by another application can no longer be closed on the child's behalf; a window the child still owns is closed exactly as before.
 - Windows `Signal.Int`/`Signal.Term` on a whole group now count only `WM_CLOSE` posts the OS accepted, so a group whose every post was refused reports the honest `ProcessError.Unsupported` instead of success — matching how the per-run signal path already counted.
