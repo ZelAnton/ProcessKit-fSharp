@@ -533,9 +533,11 @@ side. Two things to know before opting in:
   `Backpressure` with `Command.Timeout` bounds the *child's* lifetime, not necessarily your consumer's.
 - Give your **own** consumption loop a deadline (a `CancellationToken` passed to
   `GetAsyncEnumerator(token)`, or a read-side timeout around each `MoveNextAsync()`), and make sure you
-  `Dispose`/`DisposeAsync` the `RunningProcess` promptly if you give up on it — disposal always
-  unblocks a writer parked on backpressure, so the pump can wind down instead of leaking forever as an
-  abandoned background task.
+  `Dispose`/`DisposeAsync` the `RunningProcess` promptly if you give up on it. If you deliberately hand
+  the run to a terminal operation after abandoning the stream, `FinishAsync()`, `StopAsync()`,
+  `WaitAnyAsync`/`WaitAllAsync`, and `DisposeAsync` cancel a writer parked on backpressure before
+  waiting for the shared outcome; the pump winds down and queued items remain readable until the
+  channel ends. Real pump/I/O faults still surface unchanged.
 
 If you can't reason about your consumer always resuming, prefer `DropOldest`/`DropNewest` (never
 blocks the child) or `Error` (fails loud instead of stalling) over `Backpressure`.
@@ -855,6 +857,11 @@ feeder is awaited by the first `SendAsync`/`FinishInputAsync` instead, so you al
 back and can start draining frames (the interactive writer still never shares the pipe with the
 feeder).
 
+If a frame consumer is abandoned, `StopAsync`, `WaitAnyAsync`/`WaitAllAsync`, and `DisposeAsync`
+release a parser parked on a full backpressure channel before waiting for the process outcome. The
+frames already queued are still delivered and the frame stream ends cleanly; genuine parser or I/O
+faults remain errors.
+
 ## JSON-RPC sessions (LSP / BSP / MCP)
 
 Framing bytes is only half of driving a language server. The other half is the protocol those
@@ -862,6 +869,9 @@ frames carry: JSON-RPC 2.0, where every request needs a unique `id`, every answe
 back to the call that is waiting for it, and the peer sends notifications and its own requests down
 the same stream at any time. `JsonRpcSession` is that layer — it owns one `ContentLengthSession`
 over the handle and turns it into `RequestAsync` / `NotifyAsync` / a stream of incoming messages.
+Every inbound frame must carry a string `jsonrpc` member whose value is exactly `"2.0"`; a missing,
+non-string, or different value is rejected before the frame can be routed as a request, notification,
+or response, ending the session with a typed `ProcessError.Parse`.
 
 **Debug adapters are not JSON-RPC peers.** DAP borrows LSP's `Content-Length` framing but not its
 envelope — its messages are `{"seq":1,"type":"request","command":"next","arguments":{}}` and
@@ -955,7 +965,7 @@ Every failure is a typed `ProcessError`, never a raw exception and never a silen
 | A `StreamBuffer` cap with `StreamFullMode.Error` filled up | `ProcessError.OutputTooLarge`, ending the session like a protocol failure (see the backlog note below) |
 | The peer's framed output ended before answering | `ProcessError.Io` — and every later verb fails the same way instead of waiting forever |
 | The `result` does not fit the requested type | `ProcessError.Parse` (a JSON `null` result included — read it with `RequestRawAsync`) |
-| The peer sent something that is not a JSON-RPC message | `ProcessError.Parse`, ending the session: pending requests all fail with it and `MessagesAsync` faults with `ProcessException` |
+| The peer sent something that is not a JSON-RPC 2.0 message, including a missing, non-string, or non-`"2.0"` `jsonrpc` member | `ProcessError.Parse`, ending the session before routing: pending requests all fail with it and `MessagesAsync` faults with `ProcessException` |
 
 Requests may be issued concurrently — each gets its own `id`, and answers are routed by `id`, never
 by arrival order. Without a timeout a request waits until the peer answers, its output ends, or the
