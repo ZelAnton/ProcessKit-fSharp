@@ -169,6 +169,176 @@ type RunnerTests() =
         :> Task
 
     [<Test>]
+    member _.``a throwing retry predicate returns a typed terminal error with the original attempt``() : Task =
+        task {
+            let mutable calls = 0
+
+            let alwaysFailing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Error(ProcessError.Exit("svc", 7, "stdout", "stderr")))
+
+                    member _.CaptureBytesAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let throwing = fun _ -> raise (InvalidOperationException "classifier boom")
+
+            let commands =
+                [ Command.create "svc" |> Command.retry 3 TimeSpan.Zero throwing
+                  Command.create "svc"
+                  |> Command.retryBackoff 3 TimeSpan.Zero 2.0 TimeSpan.Zero false throwing ]
+
+            for command in commands do
+                let! result = command |> Runner.run alwaysFailing CancellationToken.None
+
+                match result with
+                | Error(ProcessError.RetryPredicate(program, original, detail)) ->
+                    Assert.That(program, Is.EqualTo "svc")
+                    Assert.That(original, Is.EqualTo(ProcessError.Exit("svc", 7, "stdout", "stderr")))
+                    Assert.That(original.Stdout, Is.EqualTo(Some "stdout"))
+                    Assert.That(original.Stderr, Is.EqualTo(Some "stderr"))
+                    Assert.That(detail, Does.Contain "classifier boom")
+                | other -> Assert.Fail $"expected RetryPredicate, got {other}"
+
+            Assert.That(calls, Is.EqualTo 2, "a throwing predicate must not start another attempt")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing retry predicate is typed across capture and exit verbs``() : Task =
+        task {
+            let mutable calls = 0
+
+            let failing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Error(ProcessError.Exit("svc", 7, "stdout", "stderr")))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Error(ProcessError.Exit("svc", 7, "stdout", "stderr")))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let throwing = fun _ -> raise (InvalidOperationException "classifier boom")
+            let command = Command.create "svc" |> Command.retry 3 TimeSpan.Zero throwing
+
+            let assertRetryPredicate label result =
+                match result with
+                | Error(ProcessError.RetryPredicate(program, original, detail)) ->
+                    Assert.That(program, Is.EqualTo "svc")
+                    Assert.That(original, Is.EqualTo(ProcessError.Exit("svc", 7, "stdout", "stderr")))
+                    Assert.That(detail, Does.Contain "classifier boom")
+                | other -> Assert.Fail $"{label} returned {other}"
+
+            let! outputStringResult = command |> Runner.outputString failing CancellationToken.None
+            assertRetryPredicate "outputString" outputStringResult
+
+            let! outputBytesResult = command |> Runner.outputBytes failing CancellationToken.None
+            assertRetryPredicate "outputBytes" outputBytesResult
+
+            let! runResult = command |> Runner.run failing CancellationToken.None
+            assertRetryPredicate "run" runResult
+
+            let! runUnitResult = command |> Runner.runUnit failing CancellationToken.None
+            assertRetryPredicate "runUnit" runUnitResult
+
+            let! exitCodeResult = command |> Runner.exitCode failing CancellationToken.None
+            assertRetryPredicate "exitCode" exitCodeResult
+
+            let! probeResult = command |> Runner.probe failing CancellationToken.None
+            assertRetryPredicate "probe" probeResult
+
+            Assert.That(calls, Is.EqualTo 6, "each common withRetry surface should stop after the callback fault")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing retry predicate is not called when the retry budget has no retry``() : Task =
+        task {
+            let mutable calls = 0
+            let mutable predicateCalls = 0
+
+            let alwaysFailing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Error(ProcessError.Exit("svc", 3, "", "failed")))
+
+                    member _.CaptureBytesAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let throwing =
+                fun _ ->
+                    predicateCalls <- predicateCalls + 1
+                    raise (InvalidOperationException "must not run")
+
+            let command = Command.create "svc" |> Command.retry 1 TimeSpan.Zero throwing
+            let! result = command |> Runner.run alwaysFailing CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Exit("svc", 3, "", "failed")) -> ()
+            | other -> Assert.Fail $"expected the original terminal Exit, got {other}"
+
+            Assert.That(calls, Is.EqualTo 1)
+            Assert.That(predicateCalls, Is.EqualTo 0)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``non-throwing retry predicates keep their true and false decisions``() : Task =
+        let runWith predicate =
+            task {
+                let mutable calls = 0
+
+                let flaky =
+                    { new IProcessRunner with
+                        member _.CaptureStringAsync(_, _) =
+                            calls <- calls + 1
+
+                            if calls < 3 then
+                                Task.FromResult(Error(ProcessError.Exit("svc", 1, "", "retryable")))
+                            else
+                                Task.FromResult(Ok(ProcessResult.Success "ok"))
+
+                        member _.CaptureBytesAsync(command, _) =
+                            Task.FromResult(Error(ProcessError.Unsupported command.Program))
+
+                        member _.SpawnAsync(command, _) =
+                            Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+                let command = Command.create "svc" |> Command.retry 3 TimeSpan.Zero predicate
+                let! result = command |> Runner.run flaky CancellationToken.None
+                return result, calls
+            }
+
+        task {
+            let! falseResult, falseCalls = runWith (fun _ -> false)
+            let! trueResult, trueCalls = runWith (fun _ -> true)
+
+            match falseResult with
+            | Error(ProcessError.Exit("svc", 1, "", "retryable")) -> ()
+            | other -> Assert.Fail $"false shouldRetry should keep the first error, got {other}"
+
+            match trueResult with
+            | Ok "ok" -> ()
+            | other -> Assert.Fail $"true shouldRetry should reach the successful attempt, got {other}"
+
+            Assert.That(falseCalls, Is.EqualTo 1)
+            Assert.That(trueCalls, Is.EqualTo 3)
+        }
+        :> Task
+
+    [<Test>]
     member _.``Retry rejects negative delays at every builder entry point``() =
         let shouldRetry = Func<ProcessError, bool>(fun _ -> true)
 

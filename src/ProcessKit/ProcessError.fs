@@ -48,6 +48,10 @@ type ProcessError =
     /// Parsing the captured output into a typed value failed.
     | Parse of Program: string * Detail: string
 
+    /// The retry predicate threw while classifying a failed attempt. `Original` is the typed failure
+    /// from that attempt; this error is terminal and is never itself eligible for another retry.
+    | RetryPredicate of Program: string * Original: ProcessError * Detail: string
+
     /// A JSON-RPC peer (`JsonRpcSession`) answered a request with an `error` object instead of a
     /// `result` — the protocol's own way of saying "I understood you and I refuse", so it is a failure
     /// of that call, never a successful result. `Method` is the request it answers, `Code` and `Detail`
@@ -117,6 +121,8 @@ type ProcessError =
         | ProcessError.Cancelled program -> $"'{program}' was cancelled"
         | ProcessError.NotReady(program, timeout) -> $"'{program}' was not ready within {timeout.TotalSeconds}s"
         | ProcessError.Parse(program, detail) -> $"failed to parse output of '{program}': {detail}"
+        | ProcessError.RetryPredicate(program, original, detail) ->
+            $"retry predicate for '{program}' threw: {detail}; original attempt: {original.Message}"
         | ProcessError.JsonRpc(program, methodName, code, detail, _) ->
             if System.String.IsNullOrEmpty detail then
                 $"'{program}' answered '{methodName}' with JSON-RPC error {code}"
@@ -165,6 +171,7 @@ type ProcessError =
         | ProcessError.Cancelled program
         | ProcessError.NotReady(program, _)
         | ProcessError.Parse(program, _)
+        | ProcessError.RetryPredicate(program, _, _)
         | ProcessError.JsonRpc(program, _, _, _, _)
         | ProcessError.OutputTooLarge(program, _, _, _, _)
         | ProcessError.Stdin(program, _)
@@ -174,41 +181,51 @@ type ProcessError =
         | ProcessError.Io _
         | ProcessError.Unsupported _ -> None
 
-    /// The captured stdout when the error carries it (`Exit` / `Signalled` / `Timeout`); `None` otherwise.
+    /// The captured stdout when the error carries it (`Exit` / `Signalled` / `Timeout`, or the original
+    /// attempt inside `RetryPredicate`); `None` otherwise.
     member this.Stdout: string option =
         match this with
         | ProcessError.Exit(_, _, stdout, _)
         | ProcessError.Signalled(_, _, stdout, _)
         | ProcessError.Timeout(_, _, stdout, _) -> Some stdout
+        | ProcessError.RetryPredicate(_, original, _) -> original.Stdout
         | _ -> None
 
-    /// The captured stderr when the error carries it (`Exit` / `Signalled` / `Timeout`); `None` otherwise.
+    /// The captured stderr when the error carries it (`Exit` / `Signalled` / `Timeout`, or the original
+    /// attempt inside `RetryPredicate`); `None` otherwise.
     member this.Stderr: string option =
         match this with
         | ProcessError.Exit(_, _, _, stderr)
         | ProcessError.Signalled(_, _, _, stderr)
         | ProcessError.Timeout(_, _, _, stderr) -> Some stderr
+        | ProcessError.RetryPredicate(_, original, _) -> original.Stderr
         | _ -> None
 
     /// The captured stdout and stderr joined (stdout, then stderr on a new line when both are non-empty)
-    /// for the stream-carrying cases (`Exit` / `Signalled` / `Timeout`); `None` otherwise.
+    /// for the stream-carrying cases (`Exit` / `Signalled` / `Timeout`, or the original attempt inside
+    /// `RetryPredicate`); `None` otherwise.
     member this.Combined: string option =
         match this with
         | ProcessError.Exit(_, _, stdout, stderr)
         | ProcessError.Signalled(_, _, stdout, stderr)
         | ProcessError.Timeout(_, _, stdout, stderr) -> Some(ProcessError.CombineStreams(stdout, stderr))
+        | ProcessError.RetryPredicate(_, original, _) -> original.Combined
         | _ -> None
 
-    /// The exit code when the error is an `Exit`; `None` otherwise (a signal kill or timeout has none).
+    /// The exit code when the error is an `Exit`, or when its `RetryPredicate` original is an `Exit`;
+    /// `None` otherwise (a signal kill or timeout has none).
     member this.Code: int option =
         match this with
         | ProcessError.Exit(_, code, _, _) -> Some code
+        | ProcessError.RetryPredicate(_, original, _) -> original.Code
         | _ -> None
 
-    /// The terminating signal number when the error is a `Signalled` with a known number; `None` otherwise.
+    /// The terminating signal number when the error is a `Signalled` with a known number, or when its
+    /// `RetryPredicate` original is one; `None` otherwise.
     member this.Signal: int option =
         match this with
         | ProcessError.Signalled(_, signal, _, _) -> signal
+        | ProcessError.RetryPredicate(_, original, _) -> original.Signal
         | _ -> None
 
     /// The shared combined-output join: both streams non-empty → `stdout` + newline + `stderr`; else the

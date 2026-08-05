@@ -210,6 +210,44 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
             use reader = new ContentLengthReader(stream, tee, invalid)
             let mutable fault: exn option = None
 
+            let writeFrame (payload: byte[]) : Task =
+                let pending =
+                    StreamChannel.writeItem
+                        running.Config.StreamBuffer
+                        running.BackpressureToken
+                        frames
+                        (fun _policy ->
+                            // A frame is a whole protocol message, never a line, so `LineLimit`/
+                            // `TotalLines` would claim a unit this channel never had (T-297) —
+                            // both stay `None`/`0`. `ByteLimit` stays `None` too: the channel's
+                            // capacity bounds queued FRAMES, not bytes, so there is no honest byte
+                            // cap to report either. `TotalBytes` is the one field that genuinely
+                            // fits — the cumulative payload bytes of every frame parsed so far —
+                            // so it carries `writtenFrameBytes` instead of a hardcoded `0`.
+                            ProcessError.OutputTooLarge(program, None, None, 0, writtenFrameBytes))
+                        (fun () ->
+                            // Unreachable by construction: `writeItem` calls `onDrop` only from
+                            // its two DROP full modes, and both are refused for this session above.
+                            // Kept fail-loud rather than `ignore` so a frame can never vanish silently
+                            // if that guard is ever weakened — the parse loop turns this into the
+                            // frame stream's fault.
+                            invalidOp
+                                "ContentLengthSession must never drop a protocol frame; the lossy StreamBuffer full modes are refused at construction")
+                        payload
+
+                if pending.IsCompletedSuccessfully then
+                    Task.CompletedTask
+                else
+                    task {
+                        try
+                            do! pending
+                        with :? OperationCanceledException when running.BackpressureToken.IsCancellationRequested ->
+                            // Only the bounded writer's own terminal cancellation is routine; an OCE
+                            // from the parser itself remains visible to the outer fault handling.
+                            ()
+                    }
+                    :> Task
+
             try
                 let mutable reading = true
 
@@ -262,41 +300,10 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                                 else
                                     writtenFrameBytes + payload.Length
 
-                            do!
-                                StreamChannel.writeItem
-                                    running.Config.StreamBuffer
-                                    running.DisposalToken
-                                    frames
-                                    (fun _policy ->
-                                        // A frame is a whole protocol message, never a line, so `LineLimit`/
-                                        // `TotalLines` would claim a unit this channel never had (T-297) —
-                                        // both stay `None`/`0`. `ByteLimit` stays `None` too: the channel's
-                                        // capacity bounds queued FRAMES, not bytes, so there is no honest
-                                        // byte cap to report either. `TotalBytes` is the one field that
-                                        // genuinely fits — the cumulative payload bytes of every frame
-                                        // parsed so far — so it carries `writtenFrameBytes` instead of a
-                                        // hardcoded `0`.
-                                        ProcessError.OutputTooLarge(program, None, None, 0, writtenFrameBytes))
-                                    (fun () ->
-                                        // Unreachable by construction: `writeItem` calls `onDrop` only from
-                                        // its two DROP full modes, and both are refused for this session
-                                        // above. Kept fail-loud rather than `ignore` so a frame can never
-                                        // vanish silently if that guard is ever weakened — the parse loop
-                                        // below turns this into the frame stream's fault.
-                                        invalidOp
-                                            "ContentLengthSession must never drop a protocol frame; the lossy StreamBuffer full modes are refused at construction")
-                                    payload
+                            do! writeFrame payload
             with
             | (:? ObjectDisposedException | :? IOException) when isTearingDown () ->
                 // The owning handle closed stdout during teardown; end the frame stream normally.
-                ()
-            | :? OperationCanceledException when isTearingDown () ->
-                // The other way that same teardown reaches this loop: a bounded backlog's `Backpressure`
-                // write was parked waiting for the consumer to make room when the handle cancelled
-                // `DisposalToken`, the token that wait is deliberately bounded to (`StreamChannel.writeItem`,
-                // so an abandoned bounded stream's writer cannot outlive its handle). Disposal is not a
-                // parser fault, so end the frame stream normally here too — a consumer that disposes while
-                // behind must see a clean end, never a spurious cancellation out of its enumerator.
                 ()
             | ex -> fault <- Some(reportedFault ex)
 

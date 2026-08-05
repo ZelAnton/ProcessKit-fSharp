@@ -603,6 +603,7 @@ class ProcessKit.ProcessError
   member get_IsOutputTooLarge() : System.Boolean
   member get_IsParse() : System.Boolean
   member get_IsResourceLimit() : System.Boolean
+  member get_IsRetryPredicate() : System.Boolean
   member get_IsSignalled() : System.Boolean
   member get_IsSpawn() : System.Boolean
   member get_IsStdin() : System.Boolean
@@ -623,6 +624,7 @@ class ProcessKit.ProcessError
   property IsOutputTooLarge : System.Boolean { get }
   property IsParse : System.Boolean { get }
   property IsResourceLimit : System.Boolean { get }
+  property IsRetryPredicate : System.Boolean { get }
   property IsSignalled : System.Boolean { get }
   property IsSpawn : System.Boolean { get }
   property IsStdin : System.Boolean { get }
@@ -647,6 +649,7 @@ class ProcessKit.ProcessError
   static member NewOutputTooLarge(System.String, Microsoft.FSharp.Core.FSharpOption<System.Int32>, Microsoft.FSharp.Core.FSharpOption<System.Int32>, System.Int32, System.Int32) : ProcessKit.ProcessError
   static member NewParse(System.String, System.String) : ProcessKit.ProcessError
   static member NewResourceLimit(System.String) : ProcessKit.ProcessError
+  static member NewRetryPredicate(System.String, ProcessKit.ProcessError, System.String) : ProcessKit.ProcessError
   static member NewSignalled(System.String, Microsoft.FSharp.Core.FSharpOption<System.Int32>, System.String, System.String) : ProcessKit.ProcessError
   static member NewSpawn(System.String, System.String) : ProcessKit.ProcessError
   static member NewStdin(System.String, System.String) : ProcessKit.ProcessError
@@ -750,6 +753,16 @@ class ProcessKit.ProcessError+ResourceLimit : ProcessKit.ProcessError
   member get_Detail() : System.String
   property Detail : System.String { get }
 
+class ProcessKit.ProcessError+RetryPredicate : ProcessKit.ProcessError
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_Detail() : System.String
+  member get_Original() : ProcessKit.ProcessError
+  member get_Program() : System.String
+  property Detail : System.String { get }
+  property Original : ProcessKit.ProcessError { get }
+  property Program : System.String { get }
+
 class ProcessKit.ProcessError+Signalled : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.ProcessError>
@@ -790,6 +803,7 @@ module ProcessKit.ProcessError+Tags
   field literal OutputTooLarge : System.Int32
   field literal Parse : System.Int32
   field literal ResourceLimit : System.Int32
+  field literal RetryPredicate : System.Int32
   field literal Signalled : System.Int32
   field literal Spawn : System.Int32
   field literal Stdin : System.Int32

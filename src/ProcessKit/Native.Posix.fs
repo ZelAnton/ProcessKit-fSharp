@@ -3392,9 +3392,11 @@ module internal Posix =
     //    conflict; `POSIX_SPAWN_SETPGROUP` is not set (it and `SETSID` are mutually exclusive — see
     //    `spawnPosixViaSpawn`'s note).
     //  * The pid is added to NO reap ledger (`pendingWaits`), because nothing here ever waits on it —
-    //    the same deliberate stance `ProcessGroup.Adopt` takes for an external pid (K-016/K-072). Nor is
-    //    there any teardown path: no `killProcessGroup`, no kill-on-dispose, nothing for a `Dispose` or a
-    //    finalizer to reach.
+    //    the same deliberate stance `ProcessGroup.Adopt` takes for an external pid (K-016/K-072). The
+    //    normal detached lifetime has no teardown path: no `killProcessGroup`, no kill-on-dispose, nothing
+    //    for a `Dispose` or a finalizer to reach. The one exception is a post-spawn setup failure: before
+    //    returning an error, the priority fault path kills this fresh session's whole process group and
+    //    reaps its direct leader.
     //
     // Honest divergence (documented, not silently swallowed): `posix_spawn` cannot reparent, so the
     // detached child is still this process's DIRECT child in the kernel's table. It genuinely survives
@@ -3408,7 +3410,9 @@ module internal Posix =
     /// no reap ledger entry, no teardown. Returns the child's pid and OS-reported start time — read while
     /// the pid is still pinned by the unreaped child, so the identity pair can never describe a recycled
     /// pid. Structurally a much smaller `spawnPosixViaSpawn`: no socketpairs, no parent-kept ends, and
-    /// therefore no stream wrapping and no post-spawn teardown other than the priority fault path.
+    /// therefore no stream wrapping and no post-spawn teardown during the normal lifetime. If the
+    /// post-spawn priority setup fails, the fresh session is killed as a whole and its direct leader is
+    /// reaped before the original spawn error is returned.
     let private spawnDetachedPosixCore (command: Command) : Result<DetachedSpawn, ProcessError> =
         let config = command.Config
         // The verb layer has already refused every feeder stdin source (there is no parent left to pump
@@ -3659,7 +3663,12 @@ module internal Posix =
 
                             if priorityRc <> 0 then
                                 let errno = Marshal.GetLastWin32Error()
-                                killProcess pid
+                                // POSIX_SPAWN_SETSID makes the fresh leader both the session leader and
+                                // process-group leader, so kill the whole detached session rather than
+                                // only the leader. The leader is still our unreaped direct child here;
+                                // reapLeader's waitpid therefore remains identity-safe and can never reap
+                                // a recycled or unrelated process.
+                                killProcessGroup pid
                                 reapLeader pid
 
                                 Error(

@@ -858,7 +858,11 @@ Console.WriteLine(await cmd.RunAsync() switch
   covers spawn races and I/O blips). The classifier sees the typed `ProcessError`; a
   cancelled token stops the loop. The delay must be zero or positive; negative
   values are rejected when the command is built, while values beyond the runtime
-  timer maximum (about 24.8 days) are clamped when armed.
+  timer maximum (about 24.8 days) are clamped when armed. If the classifier throws,
+  the current attempt is terminal: the verb returns `ProcessError.RetryPredicate`,
+  whose `Original` field is the failed attempt's original `ProcessError` and whose
+  `Detail` contains the callback exception message. The callback exception never
+  escapes as a raw task fault, and no additional attempt is started.
 - **`RetryBackoff`** uses the same attempt/classifier contract with a growing
   `baseDelay × factor^n` pause, capped by `maxDelay` before optional `[0.5, 1.5)`
   jitter. Base/cap delays must be non-negative and `factor` must be finite and at
@@ -1252,7 +1256,9 @@ that ignore them today. Everything the OS can honour on its own **is** honoured:
   but if it exits *first*, while we are still running, its **zombie entry lingers until we
   exit** — ProcessKit never reaps what it does not contain. A long-lived host that
   launches many short-lived children should use the contained verbs; that is what
-  containment is for.
+  containment is for. If the post-spawn `Priority` setup is refused, ProcessKit instead
+  kills the entire new session/process group and reaps the direct leader before returning
+  the typed `ProcessError.Spawn`; a descendant cannot survive that failed launch.
 - **Windows.** The child is created running and assigned to no Job, and no handle to it is
   kept. It still shares the caller's **console** unless you add `CreateNoWindow()` (or
   `WindowsCtrlSignals()`, which makes it the root of its own console process group), so in
@@ -1457,6 +1463,7 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 | `ProcessError.Timeout` | `program, timeout, stdout, stderr` | The run's own deadline killed it; whatever it captured before the kill is attached. |
 | `ProcessError.NotReady` | `program, timeout` | A [readiness probe](streaming.md) gave up — distinct from a timeout. |
 | `ProcessError.Parse` | `program, detail` | A `ParseAsync` / `TryParseAsync` parser rejected the output, or `OutputJsonAsync<'T>` couldn't deserialize it as valid JSON. |
+| `ProcessError.RetryPredicate` | `program, original, detail` | A `Retry` / `RetryBackoff` classifier threw. `original` preserves the failed attempt's typed error; this is terminal and never retried. |
 | `ProcessError.JsonRpc` | `program, method, code, detail, data: string option` | A [JSON-RPC session](streaming.md) peer answered a request with an `error` object instead of a `result`; `code`/`detail` are the peer's own, `data` its optional payload as raw JSON. |
 | `ProcessError.OutputTooLarge` | `program, lineLimit, byteLimit, totalLines, totalBytes` | A `FailLoud` (`OverflowMode.Error`) buffer ceiling was exceeded. |
 | `ProcessError.Stdin` | `program, detail` | The child's stdin source could not be read — a missing/unreadable `FromFile` path, say — on an otherwise-successful run. A routine broken pipe (the child closed stdin early, as `head` does) is never reported, and a louder exit/signal/timeout failure wins instead. Also surfaces for a pipeline's first stage. |

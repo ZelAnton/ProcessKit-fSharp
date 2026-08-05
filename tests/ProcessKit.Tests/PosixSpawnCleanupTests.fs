@@ -73,6 +73,18 @@ type PosixSpawnCleanupTests() =
 
         count
 
+    /// Poll a marker until it appears or the bounded deadline expires. The priority fault seam uses this
+    /// to let a detached leader create a descendant before cleanup starts.
+    let waitForFile (path: string) (timeout: TimeSpan) =
+        let deadline = DateTime.UtcNow + timeout
+        let mutable found = File.Exists path
+
+        while not found && DateTime.UtcNow < deadline do
+            Thread.Sleep 10
+            found <- File.Exists path
+
+        found
+
     // Run `command` through `Native.Posix.spawnPosix` with a fault seam installed (always reset in a
     // `finally`) and assert it comes back as an honest `ProcessError.Spawn` — never a raw exception, and
     // never `Ok` (which would mean the fault did not fire and a child may have leaked). Cross-platform:
@@ -258,6 +270,77 @@ type PosixSpawnCleanupTests() =
             shell "sleep 10" |> Command.priority Priority.Normal |> Command.keepStdinOpen
 
         assertFaultedSpawnIsClean install reset command
+
+    [<Test>]
+    member _.``a detached priority fault kills the whole new session including descendants``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: exercises detached session process-group cleanup"
+
+            let ready =
+                Path.Combine(Path.GetTempPath(), $"pk-detached-priority-ready-{Guid.NewGuid():N}.marker")
+
+            let leaked =
+                Path.Combine(Path.GetTempPath(), $"pk-detached-priority-leaked-{Guid.NewGuid():N}.marker")
+
+            let quoteShellPath (path: string) =
+                let escaped = path.Replace("'", "'\\''", StringComparison.Ordinal)
+                "'" + escaped + "'"
+
+            let script =
+                $"(sleep 2; echo leaked > {quoteShellPath leaked}) & "
+                + $"echo ready > {quoteShellPath ready}; wait"
+
+            let command =
+                Command.create "/bin/sh"
+                |> Command.args [ "-c"; script ]
+                |> Command.priority Priority.Normal
+
+            let install () =
+                Native.Posix.setpriorityForTests <-
+                    Some(fun _ _ _ ->
+                        // Do not let the parent-side fault race the child-side fork: cleanup must be tested
+                        // after a descendant is already in the detached session's process group.
+                        waitForFile ready (TimeSpan.FromSeconds 10.0) |> ignore
+                        -1)
+
+            let reset () =
+                Native.Posix.setpriorityForTests <- None
+
+            try
+                install ()
+
+                match Native.Posix.spawnDetachedPosix command with
+                | Error(ProcessError.Spawn _) ->
+                    // The descendant would write this marker after two seconds if killing only the
+                    // session leader left it alive. Allow that window to pass before asserting cleanup.
+                    do! Task.Delay 3000
+
+                    let readyMessage: string =
+                        "the priority fault did not wait for the detached leader to create its descendant"
+
+                    let leakedMessage: string =
+                        "a detached descendant survived the priority-failure session cleanup"
+
+                    Assert.That(File.Exists ready, Is.True, readyMessage)
+
+                    Assert.That(File.Exists leaked, Is.False, leakedMessage)
+                | Error other -> Assert.Fail $"expected ProcessError.Spawn from the injected fault, got {other}"
+                | Ok spawned ->
+                    Native.Posix.killProcessGroup spawned.Pid
+                    Native.Posix.reapLeader spawned.Pid
+                    Assert.Fail "the priority fault seam did not fail the detached spawn"
+            finally
+                reset ()
+
+                for path in [ ready; leaked ] do
+                    try
+                        File.Delete path
+                    with _ ->
+                        // Best-effort test cleanup: a marker may still be held by a failed child, and a
+                        // leftover temporary file must not mask the process-group assertion.
+                        ()
+        }
 
     [<TestCase("stdout")>]
     [<TestCase("stderr")>]

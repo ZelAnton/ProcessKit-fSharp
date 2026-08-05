@@ -25,9 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Exec.outputAll`/`Exec.outputAllBytes` now reject `concurrency < 1` with `ArgumentOutOfRangeException` before running any command, instead of silently coercing it to sequential execution.
 
 ### Fixed
-- Supervisor callback exceptions from StopWhen, GiveUpWhen, OnRestart, and OnStormPause now terminate
-  supervision with a typed ProcessError.Io that preserves the available result/error context and
-  performs normal teardown instead of escaping from RunAsync or SupervisionSession.Completion.
+- Supervisor callback exceptions from StopWhen, GiveUpWhen, OnRestart, and OnStormPause now terminate supervision with a typed ProcessError.Io that preserves the available result/error context and performs normal teardown instead of escaping from RunAsync or SupervisionSession.Completion.
+- Throwing `Retry`/`RetryBackoff` classifiers now terminate with typed `ProcessError.RetryPredicate`, preserving the original attempt error instead of leaking a raw callback exception or starting another attempt.
+- POSIX `LaunchDetached` now kills the entire fresh session/process group when post-spawn `Priority` setup fails, then reaps its direct leader exactly once; descendants can no longer survive a detached launch that correctly returns `ProcessError.Spawn`.
+- `JsonRpcSession` now rejects incoming frames unless `jsonrpc` is the exact string `"2.0"`, returning a typed `ProcessError.Parse` before malformed requests, notifications, or responses can be routed.
 - Pipeline construction now rejects `KeepStdinOpen` on every stage with `ArgumentException`. Previously, `KeepStdinOpen` on stage 0 without a stdin source left the pipe open and could hang the chain forever; every other placement — `Stdin(source)` combined with `KeepStdinOpen()` on stage 0, and `KeepStdinOpen` on any later stage — was silently ignored, since the pipeline exposes no handle for further writes and the pipe was still closed once its source drained. Both cases are now rejected at build time instead of accepted, a breaking change for previously-accepted `.Pipe`/`Pipeline.create`/`Pipeline.pipe` calls; run the command separately when interactive stdin is required.
 - `RunningProcess.OutputEventsAsync()` now rejects a second call on the same handle with `InvalidOperationException`, matching `StdoutLinesAsync`/`StdoutChunksAsync`, instead of silently handing out a second enumerator over the shared single-reader event channel.
 - Windows graceful stops and `Signal.Int`/`Signal.Term` now confirm that a window is still owned by the expected child immediately before posting `WM_CLOSE`, so a child window that closed and had its window handle reused by another application can no longer be closed on the child's behalf; a window the child still owns is closed exactly as before.
@@ -49,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Output line handlers and tees now reject `Null` or `Inherit` destinations instead of silently receiving no output.
 - `FakeProcess.Build()` now hands each built handle its own stdin `MemoryStream` instead of sharing one across every `Build()` call on the same fake, so closing one handle's stdin no longer breaks writes on another already-built handle; `StdinBytes` still aggregates every built handle's writes.
 - Fixed incorrect cumulative totals (`TotalLines`, `TotalBytes`, `OutputTooLarge` message) reported for bounded-channel overflow in stdout streaming, event streaming, and content-length frame parsing.
+- Fixed terminal and shared-exit waits hanging behind abandoned bounded backpressure writers in stdout line/event streaming and Content-Length frame sessions; teardown cancellation now ends those pumps cleanly while preserving genuine pump errors.
 
 ## [2.10.0] - 2026-07-29
 
