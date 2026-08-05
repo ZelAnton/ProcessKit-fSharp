@@ -98,6 +98,25 @@ The defaults, if you set nothing, are: `RestartPolicy.OnCrash`, **unlimited** re
 `200ms × 2.0` capped at 30 s, jitter **on**, and the failure-storm guard **off** (its own
 defaults — half-life 30 s, threshold 5.0 — apply only once `StormPause` enables it).
 
+## Callback failures
+
+Supervisor callbacks are synchronous decision hooks, and an exception from any of the four
+callback APIs is converted to a typed ProcessError.Io terminal result. The raw exception never
+escapes RunAsync or a SupervisionSession.Completion task, and normal session teardown still runs;
+the error detail names the callback and retains the source context that was available when it ran.
+
+- StopWhen receives the completed ProcessResult. If it throws, the result context is retained and
+  supervision ends with Error(ProcessError.Io ...).
+- GiveUpWhen receives the ProcessError being classified. If it throws, the classified error context
+  is retained and supervision ends with Error(ProcessError.Io ...).
+- OnRestart runs before a restart backoff. If it throws, the restart is abandoned and supervision ends
+  with Error(ProcessError.Io ...); no later incarnation is launched.
+- OnStormPause runs before a configured storm pause. If it throws, the pause is abandoned and
+  supervision ends with Error(ProcessError.Io ...); no later incarnation is launched.
+
+Keep all four callbacks quick and non-blocking. A callback fault is terminal for that supervision
+instance, not a reason to retry the callback or silently continue with a different decision.
+
 ## Policies: what counts as a crash
 
 A **crash** is any run that is not a *success*: `ProcessResult.IsSuccess` is false. That honors

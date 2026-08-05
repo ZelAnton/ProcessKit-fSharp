@@ -549,6 +549,11 @@ The optional `LivenessMemory` probe intentionally samples attributable **peak** 
 incarnation. A transient peak remains a violation after current usage falls, so choose a threshold above
 expected startup spikes when they should not cause a restart; unsupported backends return a typed error.
 
+Exceptions from Supervisor's StopWhen, GiveUpWhen, OnRestart, and OnStormPause callbacks are returned
+as a typed ProcessError.Io from RunAsync or SupervisionSession.Completion. The error names the callback
+and keeps the available result/error context; the raw exception does not escape, no later incarnation
+is launched, and normal supervision teardown still runs.
+
 *Deeper: [Supervision](docs/supervision.md).*
 
 ## Waiting for a child to be ready

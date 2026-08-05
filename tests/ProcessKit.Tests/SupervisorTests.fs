@@ -632,6 +632,24 @@ type SupervisorTests() =
     let totalMs (clock: FakeClock) =
         clock.Delays |> Seq.sumBy (fun d -> d.TotalMilliseconds)
 
+    let assertCallbackFault (callbackName: string) (supervisor: Supervisor) : Task =
+        task {
+            let! session = supervisor.StartAsync()
+            let! completed = session.Completion.WaitAsync(TimeSpan.FromSeconds 5.0)
+
+            match completed with
+            | Error(ProcessError.Io detail) ->
+                Assert.That(detail, Does.Contain $"Supervisor callback '{callbackName}' failed")
+                Assert.That(detail, Does.Contain "scripted callback fault")
+                Assert.That(detail, Does.Contain "fake")
+            | Error error -> Assert.Fail $"expected ProcessError.Io for {callbackName}, got {error}"
+            | Ok outcome -> Assert.Fail $"expected callback failure for {callbackName}, got {outcome}"
+
+            Assert.That(session.Status.IsActive, Is.False, $"{callbackName} fault must end the session")
+            Assert.That(session.Status.Pid, Is.EqualTo None, $"{callbackName} fault must clear the current child")
+        }
+        :> Task
+
     // ----- restart policy & stop semantics -----
 
     [<Test>]
@@ -1373,6 +1391,55 @@ type SupervisorTests() =
                 Assert.That(events[0].Program, Is.EqualTo "worker")
                 Assert.That(events[0].Delay, Is.EqualTo(TimeSpan.FromSeconds 1.0))
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.StopWhen_exceptions_become_a_typed_Completion_error_with_result_context_and_cleanup() : Task =
+        task {
+            let supervisor =
+                supervise([ ok () ]).StopWhen(fun _ -> raise (InvalidOperationException "scripted callback fault"))
+
+            do! assertCallbackFault "StopWhen" supervisor
+        }
+        :> Task
+
+    [<Test>]
+    member _.GiveUpWhen_exceptions_become_a_typed_Completion_error_with_error_context_and_cleanup() : Task =
+        task {
+            let supervisor =
+                supervise([ failWith 1; ok () ])
+                    .GiveUpWhen(fun _ -> raise (InvalidOperationException "scripted callback fault"))
+
+            do! assertCallbackFault "GiveUpWhen" supervisor
+        }
+        :> Task
+
+    [<Test>]
+    member _.OnRestart_exceptions_become_a_typed_Completion_error_without_another_restart() : Task =
+        task {
+            let supervisor =
+                supervise([ failWith 1; ok () ])
+                    .OnRestart(fun _ -> raise (InvalidOperationException "scripted callback fault"))
+
+            do! assertCallbackFault "OnRestart" supervisor
+        }
+        :> Task
+
+    [<Test>]
+    member _.OnStormPause_exceptions_become_a_typed_Completion_error_without_a_hanging_pause() : Task =
+        task {
+            let clock = FakeClock()
+
+            let supervisor =
+                supervise([ failWith 1; failWith 1; failWith 1; ok () ])
+                    .StormPause(TimeSpan.Zero)
+                    .FailureThreshold(2.5)
+                    .FailureDecay(TimeSpan.FromSeconds 1000.0)
+                    .OnStormPause(fun _ -> raise (InvalidOperationException "scripted callback fault"))
+                |> withClock clock
+
+            do! assertCallbackFault "OnStormPause" supervisor
         }
         :> Task
 

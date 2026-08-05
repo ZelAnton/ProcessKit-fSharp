@@ -750,6 +750,57 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
         let command = config.Command.OutputBuffer config.Capture
         let program = config.Command.Program
 
+        // User callbacks are part of the supervision decision path, but they are not allowed to
+        // escape the Result-returning supervision contract. Keep the source context in the typed
+        // error: a callback fault may happen after a result/error has already been produced, and
+        // losing that context makes the terminal failure needlessly opaque.
+        let callbackFailure (callbackName: string) (context: string) (error: exn) : ProcessError =
+            let exceptionDetail =
+                if String.IsNullOrWhiteSpace error.Message then
+                    error.GetType().Name
+                else
+                    $"{error.GetType().Name}: {error.Message}"
+
+            ProcessError.Io $"Supervisor callback '{callbackName}' failed: {exceptionDetail}; {context}"
+
+        let resultContext (result: ProcessResult<string>) =
+            let verdict =
+                if result.IsSuccess then
+                    let code = result.Code |> Option.map string |> Option.defaultValue "unknown"
+                    $"completed successfully (code {code})"
+                else
+                    $"failed with {result.FailureError.Message}"
+
+            $"result context for '{result.Program}': {verdict}"
+
+        let errorContext (error: ProcessError) =
+            $"error context for '{program}': {error.Message}"
+
+        let invokeCallback (callbackName: string) (context: string) (callback: unit -> unit) =
+            try
+                callback ()
+                Ok()
+            with error ->
+                Error(callbackFailure callbackName context error)
+
+        let stopWhenMatches (result: ProcessResult<string>) : Result<bool, ProcessError> =
+            match config.StopWhen with
+            | None -> Ok false
+            | Some predicate ->
+                try
+                    Ok(predicate result)
+                with error ->
+                    Error(callbackFailure "StopWhen" (resultContext result) error)
+
+        let giveUpMatches (error: ProcessError) : Result<bool, ProcessError> =
+            match config.GiveUpWhen with
+            | None -> Ok false
+            | Some classify ->
+                try
+                    Ok(classify error)
+                with callbackError ->
+                    Error(callbackFailure "GiveUpWhen" (errorContext error) callbackError)
+
         let restartCapable =
             match config.Policy with
             | RestartPolicy.Never -> false
@@ -793,10 +844,10 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 else
                     None
 
-            let stormGate () : Task =
+            let stormGate (context: string) : Task<Result<unit, ProcessError>> =
                 task {
                     match config.StormPause with
-                    | None -> ()
+                    | None -> return Ok()
                     | Some pause ->
                         let now = config.Now()
 
@@ -812,26 +863,43 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             let jittered = Supervision.applyJitter pause config.Jitter
                             Log.stormPause config.Command.Config.Logger program jittered
                             Diag.stormPaused program
+                            let mutable callbackError: ProcessError option = None
 
-                            match config.OnStormPause with
-                            | Some handler -> handler (SupervisorStormPauseEvent(program, stormPauses + 1, jittered))
-                            | None -> ()
+                            let callbackResult =
+                                match config.OnStormPause with
+                                | Some handler ->
+                                    invokeCallback "OnStormPause" context (fun () ->
+                                        handler (SupervisorStormPauseEvent(program, stormPauses + 1, jittered)))
+                                | None -> Ok()
 
-                            // Bracket exactly the pause window in the live status: paused while the jittered
-                            // sleep runs, cleared the instant it returns (or is cut short by a stop).
-                            setStormPaused true
+                            match callbackResult with
+                            | Error error -> callbackError <- Some error
+                            | Ok() ->
+                                // Bracket exactly the pause window in the live status: paused while the jittered
+                                // sleep runs, cleared the instant it returns (or is cut short by a stop).
+                                setStormPaused true
 
-                            if jittered > TimeSpan.Zero then
-                                do! config.Sleep jittered sleepToken
+                                if jittered > TimeSpan.Zero then
+                                    do! config.Sleep jittered sleepToken
 
-                            setStormPaused false
-                            stormScore <- 0.0
-                            lastFailureAt <- None
-                            stormPauses <- stormPauses + 1
+                                setStormPaused false
+                                stormScore <- 0.0
+                                lastFailureAt <- None
+                                stormPauses <- stormPauses + 1
+
+                            match callbackError with
+                            | Some error -> return Error error
+                            | None -> return Ok()
+                        else
+                            return Ok()
                 }
-                :> Task
 
-            let sleepBackoff (exponent: int) (restartNumber: int) (cause: RestartCause) : Task =
+            let sleepBackoff
+                (exponent: int)
+                (restartNumber: int)
+                (cause: RestartCause)
+                (context: string)
+                : Task<Result<unit, ProcessError>> =
                 task {
                     let delay =
                         Supervision.backoffDelay config.BackoffBase factor exponent config.MaxBackoff
@@ -851,20 +919,28 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                         Diag.supervisorLivenessRestarted program
                     | RestartCause.Exit -> ()
 
-                    match config.OnRestart with
-                    | Some handler -> handler (SupervisorRestartEvent(program, restartNumber, delay, cause))
-                    | None -> ()
+                    let callbackResult =
+                        match config.OnRestart with
+                        | Some handler ->
+                            invokeCallback "OnRestart" context (fun () ->
+                                handler (SupervisorRestartEvent(program, restartNumber, delay, cause)))
+                        | None -> Ok()
 
-                    if delay > TimeSpan.Zero then
-                        do! config.Sleep delay sleepToken
+                    let mutable callbackError: ProcessError option = None
+
+                    match callbackResult with
+                    | Error error -> callbackError <- Some error
+                    | Ok() ->
+                        if delay > TimeSpan.Zero then
+                            do! config.Sleep delay sleepToken
+
+                    match callbackError with
+                    | Some error -> return Error error
+                    | None -> return Ok()
                 }
-                :> Task
 
             let budgetExhausted () =
                 config.MaxRestarts |> Option.exists (fun limit -> restarts >= limit)
-
-            let giveUpMatches (error: ProcessError) =
-                config.GiveUpWhen |> Option.exists (fun classify -> classify error)
 
             try
                 while final.IsNone do
@@ -913,70 +989,119 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                 // policy/predicate — the caller explicitly asked to stop.
                                 final <- Some(Ok(SupervisionOutcome(result, restarts, StopReason.Stopped, stormPauses)))
                             else
-                                let predicateMatched =
-                                    match config.StopWhen with
-                                    | Some predicate -> predicate result
-                                    | None -> false
-
-                                if predicateMatched then
-                                    final <-
-                                        Some(
-                                            Ok(SupervisionOutcome(result, restarts, StopReason.Predicate, stormPauses))
-                                        )
-                                else
-                                    let crashed = not result.IsSuccess
-
-                                    let wantsRestart =
-                                        match config.Policy with
-                                        | RestartPolicy.Always -> true
-                                        | RestartPolicy.OnCrash -> crashed
-                                        | RestartPolicy.Never -> false
-
-                                    if not wantsRestart then
+                                match stopWhenMatches result with
+                                | Error error -> final <- Some(Error error)
+                                | Ok predicateMatched ->
+                                    if predicateMatched then
                                         final <-
                                             Some(
                                                 Ok(
                                                     SupervisionOutcome(
                                                         result,
                                                         restarts,
-                                                        StopReason.PolicySatisfied,
-                                                        stormPauses
-                                                    )
-                                                )
-                                            )
-                                    elif crashed && giveUpMatches result.FailureError then
-                                        final <-
-                                            Some(
-                                                Ok(SupervisionOutcome(result, restarts, StopReason.GaveUp, stormPauses))
-                                            )
-                                    elif budgetExhausted () then
-                                        final <-
-                                            Some(
-                                                Ok(
-                                                    SupervisionOutcome(
-                                                        result,
-                                                        restarts,
-                                                        StopReason.RestartsExhausted,
+                                                        StopReason.Predicate,
                                                         stormPauses
                                                     )
                                                 )
                                             )
                                     else
-                                        if crashed then
-                                            do! stormGate ()
+                                        let crashed = not result.IsSuccess
 
-                                        if result.Duration >= config.MaxBackoff && not result.IsTimedOut then
-                                            escalation <- 0
+                                        let wantsRestart =
+                                            match config.Policy with
+                                            | RestartPolicy.Always -> true
+                                            | RestartPolicy.OnCrash -> crashed
+                                            | RestartPolicy.Never -> false
 
-                                        let cause =
-                                            if livenessCausedExit then
-                                                RestartCause.Liveness
-                                            else
-                                                RestartCause.Exit
+                                        if not wantsRestart then
+                                            final <-
+                                                Some(
+                                                    Ok(
+                                                        SupervisionOutcome(
+                                                            result,
+                                                            restarts,
+                                                            StopReason.PolicySatisfied,
+                                                            stormPauses
+                                                        )
+                                                    )
+                                                )
+                                        elif crashed then
+                                            match giveUpMatches result.FailureError with
+                                            | Error error -> final <- Some(Error error)
+                                            | Ok true ->
+                                                final <-
+                                                    Some(
+                                                        Ok(
+                                                            SupervisionOutcome(
+                                                                result,
+                                                                restarts,
+                                                                StopReason.GaveUp,
+                                                                stormPauses
+                                                            )
+                                                        )
+                                                    )
+                                            | Ok false when budgetExhausted () ->
+                                                final <-
+                                                    Some(
+                                                        Ok(
+                                                            SupervisionOutcome(
+                                                                result,
+                                                                restarts,
+                                                                StopReason.RestartsExhausted,
+                                                                stormPauses
+                                                            )
+                                                        )
+                                                    )
+                                            | Ok false ->
+                                                match! stormGate (resultContext result) with
+                                                | Error error -> final <- Some(Error error)
+                                                | Ok() ->
+                                                    if
+                                                        result.Duration >= config.MaxBackoff && not result.IsTimedOut
+                                                    then
+                                                        escalation <- 0
 
-                                        do! sleepBackoff escalation (restarts + 1) cause
-                                        escalation <- escalation + 1
-                                        bumpRestarts ()
+                                                    let cause =
+                                                        if livenessCausedExit then
+                                                            RestartCause.Liveness
+                                                        else
+                                                            RestartCause.Exit
+
+                                                    match!
+                                                        sleepBackoff
+                                                            escalation
+                                                            (restarts + 1)
+                                                            cause
+                                                            (resultContext result)
+                                                    with
+                                                    | Error error -> final <- Some(Error error)
+                                                    | Ok() ->
+                                                        escalation <- escalation + 1
+                                                        bumpRestarts ()
+                                        elif budgetExhausted () then
+                                            final <-
+                                                Some(
+                                                    Ok(
+                                                        SupervisionOutcome(
+                                                            result,
+                                                            restarts,
+                                                            StopReason.RestartsExhausted,
+                                                            stormPauses
+                                                        )
+                                                    )
+                                                )
+                                        else
+                                            match!
+                                                sleepBackoff
+                                                    escalation
+                                                    (restarts + 1)
+                                                    RestartCause.Exit
+                                                    (resultContext result)
+                                            with
+                                            | Error error -> final <- Some(Error error)
+                                            | Ok() ->
+                                                escalation <- escalation + 1
+                                                bumpRestarts ()
                         | Error error ->
                             // Consume the per-incarnation verdict even when capture itself failed: a
                             // live child can fault its pump after the monitor has stopped it.
@@ -995,26 +1120,36 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                     // that never produced a result has none to report, so surface the
                                     // honest terminal error (same shape as an exhausted budget here).
                                     final <- Some(Error error)
-                                elif not wantsRestart || giveUpMatches error || budgetExhausted () then
+                                elif not wantsRestart then
                                     final <- Some(Error error)
                                 else
-                                    // Remember the reason this incarnation produced no result before
-                                    // sleeping on it: a graceful stop can cut the backoff / storm pause
-                                    // short, and the pre-spawn branch above then reports this error rather
-                                    // than a synthetic one.
-                                    lastError <- Some error
+                                    match giveUpMatches error with
+                                    | Error callbackError -> final <- Some(Error callbackError)
+                                    | Ok true -> final <- Some(Error error)
+                                    | Ok false when budgetExhausted () -> final <- Some(Error error)
+                                    | Ok false ->
+                                        // Remember the reason this incarnation produced no result before
+                                        // sleeping on it: a graceful stop can cut the backoff / storm pause
+                                        // short, and the pre-spawn branch above then reports this error rather
+                                        // than a synthetic one.
+                                        lastError <- Some error
 
-                                    do! stormGate ()
+                                        match! stormGate (errorContext error) with
+                                        | Error callbackError -> final <- Some(Error callbackError)
+                                        | Ok() ->
+                                            let cause =
+                                                if livenessCausedError then
+                                                    RestartCause.Liveness
+                                                else
+                                                    RestartCause.Exit
 
-                                    let cause =
-                                        if livenessCausedError then
-                                            RestartCause.Liveness
-                                        else
-                                            RestartCause.Exit
-
-                                    do! sleepBackoff escalation (restarts + 1) cause
-                                    escalation <- escalation + 1
-                                    bumpRestarts ()
+                                            match!
+                                                sleepBackoff escalation (restarts + 1) cause (errorContext error)
+                                            with
+                                            | Error callbackError -> final <- Some(Error callbackError)
+                                            | Ok() ->
+                                                escalation <- escalation + 1
+                                                bumpRestarts ()
 
                 match final with
                 | Some result -> return result
@@ -1252,6 +1387,10 @@ type Supervisor internal (config: SupervisorConfig) =
     /// End supervision when `predicate` matches a completed run — checked before the
     /// `RestartPolicy` on every exit, clean or not. (It never sees a run that failed to *start*;
     /// spawn errors are classified by the policy alone.)
+    ///
+    /// If `predicate` throws, supervision ends with `Error(ProcessError.Io ...)`. The callback
+    /// exception never escapes `RunAsync` or `SupervisionSession.Completion`; the error detail names
+    /// `StopWhen` and retains the completed result context. The session still performs normal teardown.
     member _.StopWhen(predicate: Func<ProcessResult<string>, bool>) =
         ArgumentNullException.ThrowIfNull predicate
 
@@ -1279,6 +1418,10 @@ type Supervisor internal (config: SupervisorConfig) =
     ///
     /// Default: unset — a permanent failure restarts forever (throttled only by
     /// backoff/`MaxRestarts`/the storm guard), matching the prior behavior.
+    ///
+    /// If `classifier` throws, supervision ends with `Error(ProcessError.Io ...)`. The callback
+    /// exception never escapes `RunAsync` or `SupervisionSession.Completion`; the error detail names
+    /// `GiveUpWhen` and retains the classified error context. The session still performs normal teardown.
     member _.GiveUpWhen(classifier: Func<ProcessError, bool>) =
         ArgumentNullException.ThrowIfNull classifier
 
@@ -1294,7 +1437,11 @@ type Supervisor internal (config: SupervisorConfig) =
     /// `SupervisorRestartEvent.Cause` distinguishes an ordinary `Exit` restart from a `Liveness` one
     /// (a live-but-unresponsive child the probe stopped). `handler` runs on the same async context
     /// driving `RunAsync`, so keep it quick and non-blocking — a slow handler delays every restart.
-    /// Purely additive: does not change `SupervisionOutcome.Restarts` or any other final semantics.
+    /// If it throws, supervision ends with `Error(ProcessError.Io ...)`; the raw exception never
+    /// escapes `RunAsync` or `SupervisionSession.Completion`, the error detail names `OnRestart` and
+    /// retains the result/error context that led to the restart. Normal session teardown still runs.
+    /// Otherwise this callback is purely additive: it does not change `SupervisionOutcome.Restarts` or
+    /// any other final semantics.
     /// Default: unset.
     member _.OnRestart(handler: Action<SupervisorRestartEvent>) =
         ArgumentNullException.ThrowIfNull handler
@@ -1308,6 +1455,9 @@ type Supervisor internal (config: SupervisorConfig) =
     /// right before each pause is slept out — see `StormPause`. Same synchronous,
     /// keep-it-quick contract as `OnRestart`. No effect unless `StormPause` is set. Purely
     /// additive: does not change `SupervisionOutcome.StormPauses` or any other final semantics.
+    /// If it throws, supervision ends with `Error(ProcessError.Io ...)`; the raw exception never
+    /// escapes `RunAsync` or `SupervisionSession.Completion`, the error detail names `OnStormPause`
+    /// and retains the result/error context that led to the pause. Normal session teardown still runs.
     /// Default: unset.
     member _.OnStormPause(handler: Action<SupervisorStormPauseEvent>) =
         ArgumentNullException.ThrowIfNull handler
