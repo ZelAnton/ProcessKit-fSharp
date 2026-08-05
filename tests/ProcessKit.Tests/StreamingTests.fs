@@ -544,6 +544,61 @@ type StreamingTests() =
         :> Task
 
     [<Test>]
+    member _.``FinishAsync releases an unread bounded line stream and preserves the exit outcome``() : Task =
+        task {
+            let capacity = 1
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded capacity))
+                    .Config
+
+            use running = syntheticStdoutProcess config (linesPayload 32)
+            running.StdoutLinesAsync() |> ignore
+
+            do! Task.Delay 100
+            Assert.That(running.StdoutLineCount, Is.GreaterThanOrEqualTo(capacity + 1))
+
+            let finish = running.FinishAsync()
+            let! winner = Task.WhenAny(finish :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, finish), Is.True, "FinishAsync hung on abandoned backpressure")
+
+            match! finish with
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+            | Error error -> Assert.Fail $"expected FinishAsync to preserve the process outcome, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ExitTask releases an unread bounded event stream and preserves the exit outcome``() : Task =
+        task {
+            let capacity = 1
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded capacity))
+                    .Config
+
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes(linesPayload 16))
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes(linesPayload 16))
+
+            use running =
+                syntheticProcessOverStreams config (Some(stdout :> Stream)) (Some(stderr :> Stream))
+
+            running.OutputEventsAsync() |> ignore
+
+            do! Task.Delay 100
+            Assert.That(running.StdoutLineCount + running.StderrLineCount, Is.GreaterThan capacity)
+
+            let exit = running.ExitTask
+            let! winner = Task.WhenAny(exit :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, exit), Is.True, "ExitTask hung on abandoned backpressure")
+            let! outcome = exit
+            Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+        }
+        :> Task
+
+    [<Test>]
     member _.``StdoutChunks surfaces a genuine read fault as ProcessError.Io``() : Task =
         task {
             let fault = IOException "disk read error"

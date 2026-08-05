@@ -47,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Output line handlers and tees now reject `Null` or `Inherit` destinations instead of silently receiving no output.
 - `FakeProcess.Build()` now hands each built handle its own stdin `MemoryStream` instead of sharing one across every `Build()` call on the same fake, so closing one handle's stdin no longer breaks writes on another already-built handle; `StdinBytes` still aggregates every built handle's writes.
 - Fixed incorrect cumulative totals (`TotalLines`, `TotalBytes`, `OutputTooLarge` message) reported for bounded-channel overflow in stdout streaming, event streaming, and content-length frame parsing.
+- Fixed terminal and shared-exit waits hanging behind abandoned bounded backpressure writers in stdout line/event streaming and Content-Length frame sessions; teardown cancellation now ends those pumps cleanly while preserving genuine pump errors.
 
 ## [2.10.0] - 2026-07-29
 

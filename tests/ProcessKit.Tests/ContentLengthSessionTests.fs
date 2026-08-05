@@ -248,23 +248,31 @@ type ContentLengthSessionTests() =
             let command =
                 (Command.create "language-server").StreamBuffer(StreamBufferPolicy.Bounded(2))
 
-            let fake = FakeProcess.OfCommand(command).WithContentLengthFrames(payloads)
+            let stdout = new ChunkedFrameStream(payloads |> Array.map encoded)
 
-            use running = fake.Build()
+            use running =
+                new RunningProcess(hostForCommand command (stdout :> Stream) None ignore (fun () -> ValueTask()))
+
             let session = ContentLengthSession running
 
             // Nobody is reading `FramesAsync()` yet, and the in-memory producer has no real I/O delay of
-            // its own — with an honestly bounded channel (capacity 2) the parser can enqueue at most 2 of
-            // the 5 scripted frames before its `WriteAsync` on the 3rd genuinely blocks, so the session's
-            // combined outcome (which that parse loop's completion resolves) cannot have finished yet. An
-            // unbounded backlog (today's bug) would instead let the parser race ahead and finish
-            // instantly, with nobody ever having paced it.
-            let! stillPending = Task.WhenAny(running.ExitTask, Task.Delay 300)
+            // its own — with an honestly bounded channel (capacity 2) the parser reads the 3rd frame and
+            // then parks on its write, so it cannot request the 4th/5th chunk yet. An unbounded backlog
+            // (today's bug) would instead let the parser race ahead and serve every chunk immediately.
+            let! thirdServed = Task.WhenAny(stdout.ServedAsync 3 :> Task, Task.Delay 5000)
 
             Assert.That(
-                obj.ReferenceEquals(stillPending, running.ExitTask),
+                obj.ReferenceEquals(thirdServed, stdout.ServedAsync 3),
+                Is.True,
+                "the framed parser did not reach the first blocked write"
+            )
+
+            let! allServed = Task.WhenAny(stdout.ServedAsync payloads.Length :> Task, Task.Delay 300)
+
+            Assert.That(
+                obj.ReferenceEquals(allServed, stdout.ServedAsync payloads.Length),
                 Is.False,
-                "an unbounded channel would already have let the parser finish without any consumer"
+                "an unbounded channel would already have let the parser serve every frame"
             )
 
             let! actual = collect (session.FramesAsync())
@@ -420,9 +428,9 @@ type ContentLengthSessionTests() =
 
             do! (running :> IAsyncDisposable).DisposeAsync().AsTask()
 
-            // Teardown cancels `DisposalToken` — the very token that parked frame write is bounded to. That
-            // is graceful disposal, not a parser fault: the consumer must still receive what was queued and
-            // then see a clean end of stream, never a spurious cancellation out of `MoveNextAsync`.
+            // Teardown cancels the frame writer's backpressure token before closing stdout. That is graceful
+            // disposal, not a parser fault: the consumer must still receive what was queued and then see a
+            // clean end of stream, never a spurious cancellation out of `MoveNextAsync`.
             let delivered = "the frame queued before the disposal must still be delivered"
             let! first = frames.MoveNextAsync()
             Assert.That(first, Is.True, delivered)
@@ -434,6 +442,36 @@ type ContentLengthSessionTests() =
             let! ended = frames.MoveNextAsync()
             Assert.That(ended, Is.False, clean)
             do! frames.DisposeAsync().AsTask()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync releases an unread bounded frame backlog and preserves the exit outcome``() : Task =
+        task {
+            let payloads = [| for value in 1uy .. 8uy -> Array.create 4 value |]
+            let stdout = new ChunkedFrameStream(payloads |> Array.map encoded)
+
+            let command =
+                (Command.create "language-server").StreamBuffer(StreamBufferPolicy.Bounded 1)
+
+            use running =
+                new RunningProcess(hostForCommand command (stdout :> Stream) None ignore (fun () -> ValueTask()))
+
+            let _session = ContentLengthSession running
+            let! served = Task.WhenAny(stdout.ServedAsync 2 :> Task, Task.Delay 5000)
+
+            Assert.That(
+                obj.ReferenceEquals(served, stdout.ServedAsync 2),
+                Is.True,
+                "the framed parser never parked on its full backlog"
+            )
+
+            let stop = running.StopAsync(TimeSpan.Zero)
+            let! winner = Task.WhenAny(stop :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, stop), Is.True, "StopAsync hung on an abandoned frame backlog")
+
+            let! outcome = stop
+            Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
         }
         :> Task
 
