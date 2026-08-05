@@ -52,6 +52,9 @@ signal to one pid:
   grandchildren included. Where a mechanism has a genuine weakness (a `setsid` child escapes a
   POSIX process group), the active `Mechanism` is reported instead of pretending — never a silent
   downgrade.
+- **Detached failures are cleaned up.** The explicit `Command.LaunchDetached()` opt-out still
+  tears down the whole fresh POSIX session and reaps its leader if post-spawn priority setup fails,
+  before returning the typed `ProcessError.Spawn`.
 - **Async-first.** Run-and-capture, line/Content-Length streaming, interactive stdin, readiness
   probes, shell-free pipelines, supervision — all return `Task<…>` and stream as
   `IAsyncEnumerable<…>`.
@@ -822,8 +825,14 @@ var finished = (await proc.FinishAsync()).GetValueOrThrow();
 ```
 
 `StreamBuffer` bounds queued chunks; `Backpressure` preserves every byte while slowing the child
-when the consumer falls behind. See [Streaming & interactive I/O](docs/streaming.md) for the full
-streaming and lifecycle contract.
+when the consumer falls behind. If a consumer is abandoned, `FinishAsync`, `StopAsync`, shared exit
+waits, and disposal release the parked writer before waiting for the process outcome. See
+[Streaming & interactive I/O](docs/streaming.md) for the full streaming and lifecycle contract.
+
+For conversational language-server, build-server, or MCP-style children, use the
+[JSON-RPC 2.0 session layer](docs/streaming.md#json-rpc-sessions-lsp--bsp--mcp). It rejects every
+incoming frame whose `jsonrpc` member is missing, non-string, or not exactly `"2.0"` with a typed
+`ProcessError.Parse` before request, notification, or response routing.
 
 ### Interactive stdin — write requests, read responses
 

@@ -1256,7 +1256,9 @@ that ignore them today. Everything the OS can honour on its own **is** honoured:
   but if it exits *first*, while we are still running, its **zombie entry lingers until we
   exit** — ProcessKit never reaps what it does not contain. A long-lived host that
   launches many short-lived children should use the contained verbs; that is what
-  containment is for.
+  containment is for. If the post-spawn `Priority` setup is refused, ProcessKit instead
+  kills the entire new session/process group and reaps the direct leader before returning
+  the typed `ProcessError.Spawn`; a descendant cannot survive that failed launch.
 - **Windows.** The child is created running and assigned to no Job, and no handle to it is
   kept. It still shares the caller's **console** unless you add `CreateNoWindow()` (or
   `WindowsCtrlSignals()`, which makes it the root of its own console process group), so in

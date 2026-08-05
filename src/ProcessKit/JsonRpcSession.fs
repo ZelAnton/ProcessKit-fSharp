@@ -369,6 +369,15 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
             | true, value -> Some value
             | _ -> None
 
+        match property "jsonrpc" with
+        | None -> raise (protocolFault "the peer sent a message without the required 'jsonrpc' version")
+        | Some value when value.ValueKind <> JsonValueKind.String ->
+            raise (protocolFault "the peer sent a message whose 'jsonrpc' member is not a string")
+        | Some value ->
+            match value.GetString() with
+            | "2.0" -> ()
+            | _ -> raise (protocolFault "the peer sent a message whose 'jsonrpc' member is not exactly '2.0'")
+
         let id =
             match property "id" with
             | Some value when value.ValueKind <> JsonValueKind.Null -> Some value

@@ -559,10 +559,20 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // it, so it owns no timer — there is nothing to release, and skipping `Dispose` is safe.
     let disposalCts = new CancellationTokenSource()
 
+    // Bounded line/event/frame writers use a token separate from `disposalCts`: terminal verbs cancel
+    // this token BEFORE awaiting their shared outcome, while `disposalCts` remains the marker that host
+    // teardown has actually started for genuine-vs-teardown I/O classification. This distinction lets an
+    // abandoned Backpressure writer wake without turning a real pump fault into a routine cancellation.
+    let backpressureCts = new CancellationTokenSource()
+
     // Only the stdout chunk channel's bounded writer uses this token. StopAsync must be able to
     // release an abandoned chunk consumer before awaiting `chunkOutcome`, without cancelling the
     // general lifecycle token that line/event pumps use for teardown-fault classification.
     let chunkBackpressureCts = new CancellationTokenSource()
+
+    let cancelBackpressureWriters () =
+        backpressureCts.Cancel()
+        chunkBackpressureCts.Cancel()
 
     // The streaming channels and their policy-aware writer live in `StreamChannel`: the stdout channel
     // is written by exactly one pump, the event channel by two (stdout + stderr), and either is bounded
@@ -580,15 +590,31 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
 
     // Write one item to a line/event streaming channel per `config.StreamBuffer` (see
     // `StreamChannel.writeItem`): unbounded `TryWrite` when unset, else backpressure / drop / fail-loud.
-    // Bound `Backpressure` to `disposalCts.Token` so these writers preserve the existing lifecycle
-    // behavior and can't outlive this handle.
+    // Bound `Backpressure` to `backpressureCts.Token` so terminal/shared-exit paths can release an
+    // abandoned writer before they await its outcome; the separate `disposalCts` remains the teardown
+    // marker used by the pump fault classifier.
     let writeStreamItem
         (channel: StreamChannel.Channel<'T>)
         (buildOverflowError: StreamBufferPolicy -> ProcessError)
         (onDrop: unit -> unit)
         (item: 'T)
         : ValueTask =
-        StreamChannel.writeItem config.StreamBuffer disposalCts.Token channel buildOverflowError onDrop item
+        let pending =
+            StreamChannel.writeItem config.StreamBuffer backpressureCts.Token channel buildOverflowError onDrop item
+
+        if pending.IsCompletedSuccessfully then
+            pending
+        else
+            ValueTask(
+                task {
+                    try
+                        do! pending
+                    with :? OperationCanceledException when backpressureCts.Token.IsCancellationRequested ->
+                        // Only the bounded writer's own terminal cancellation is routine; an OCE from
+                        // the surrounding pump or a user callback remains visible to the outer handler.
+                        ()
+                }
+            )
 
     // Raw stdout byte chunks (`Pump.readBytesUntilDone`'s items) have no line structure — one item is
     // whatever the OS handed back on a single read — so neither `LineLimit` nor `TotalLines` means
@@ -1174,9 +1200,9 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     let reapGuard () =
         { new IAsyncDisposable with
             member _.DisposeAsync() =
-                // Unblock the dedicated chunk writer before/while tearing down, so it can't outlive this
-                // scope. The general lifecycle token below remains the teardown marker for other pumps.
-                chunkBackpressureCts.Cancel()
+                // Unblock bounded writers before/while tearing down, so they can't outlive this scope.
+                // The general lifecycle token below remains the teardown marker for other pumps.
+                cancelBackpressureWriters ()
                 disposalCts.Cancel()
                 // Clear `runs.active` for a verb that faults before reaching its own `conclude outcome`
                 // (e.g. a throwing `OnStdoutLine`/`OnStderrLine` handler, or a faulted exit wait) — a
@@ -1498,10 +1524,10 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
 
         task {
             use _reap = reapGuard ()
-            // Only the chunk writer has a dedicated cancellation path before the shared exit outcome.
-            // Keep the general lifecycle token untouched so line/event pumps preserve their normal
-            // teardown classification until the reap guard actually tears the host down.
-            chunkBackpressureCts.Cancel()
+            // Release any bounded writer before asking the shared exit task to settle. This is the
+            // terminal operation's explicit signal that an unread streaming backlog may be abandoned;
+            // keep `disposalCts` untouched so the pump's normal I/O classification remains intact.
+            cancelBackpressureWriters ()
             // Begin (or reuse) the exit wait BEFORE signalling, so the pipes are drained while the
             // child shuts down. `ExitTask` reuses whichever consumption already owns the pipes (a
             // streaming session, or an in-flight buffered verb) rather than racing a second reader,
@@ -2078,6 +2104,11 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         match outcomeTask with
         | None -> Task.FromResult(Error(alreadyConsumedError ()))
         | Some outcome ->
+            // `FinishAsync` is the explicit terminal hand-off after a streaming consumer has stopped.
+            // Wake any bounded writer before awaiting the shared session outcome; otherwise an unread
+            // full channel would keep this very task waiting for the pump that is waiting for a reader.
+            cancelBackpressureWriters ()
+
             task {
                 use _reap = reapGuard ()
                 let! settled = outcome
@@ -2423,11 +2454,14 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// and the terminal encoding from it.
     member internal _.Config: CommandConfig = config
 
-    /// Cancelled once this handle's own teardown begins. Internal: `ContentLengthSession` bounds its
-    /// framed channel's `StreamFullMode.Backpressure` wait (`StreamChannel.writeItem`'s
-    /// `disposalToken`) to this token, the same way `writeStreamItem` above bounds the stdout/event
-    /// channels — so a writer parked on a bounded frame backlog can't outlive an abandoned handle.
+    /// Cancelled once this handle's own teardown begins. Internal: buffered pumps use this marker to
+    /// distinguish a routine broken-pipe/close race caused by teardown from a genuine I/O failure.
     member internal _.DisposalToken: CancellationToken = disposalCts.Token
+
+    /// Cancelled when a terminal/shared-exit path takes ownership of ending a streaming session. It is
+    /// separate from `DisposalToken`, because a bounded Backpressure writer must wake before the shared
+    /// outcome is awaited while the pump's I/O fault classification still needs the actual teardown bit.
+    member internal _.BackpressureToken: CancellationToken = backpressureCts.Token
 
     /// Whether this run actually has a live pseudo-terminal behind it — what `PtySession` asks before
     /// choosing the carriage return a terminal expects for Enter over a plain pipe's line feed. Read
@@ -2659,6 +2693,10 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     ///   reuses that wait when it exists, or starts the sole wait itself when this genuinely is the
     ///   first consumer, either way guaranteeing exactly one `host.Wait()`/reap per handle.
     member internal _.ExitTask: Task<Outcome> =
+        // WaitAny/WaitAll are shared terminal waits. Release a bounded streaming/frame writer before
+        // returning the memoized outcome task, while leaving `disposalCts` as the actual teardown marker.
+        cancelBackpressureWriters ()
+
         lock stateLock (fun () ->
             if not exitStarted then
                 exitStarted <- true
@@ -2765,7 +2803,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
 
     interface IAsyncDisposable with
         member _.DisposeAsync() =
-            chunkBackpressureCts.Cancel()
+            cancelBackpressureWriters ()
             disposalCts.Cancel()
             // Stop and release the idle-timeout watchdog (if any); a pump still resetting it races this
             // harmlessly (`Reset` after disposal is a no-op).
