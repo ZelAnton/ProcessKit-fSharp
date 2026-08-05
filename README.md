@@ -816,8 +816,9 @@ var finished = (await proc.FinishAsync()).GetValueOrThrow();
 ```
 
 `StreamBuffer` bounds queued chunks; `Backpressure` preserves every byte while slowing the child
-when the consumer falls behind. See [Streaming & interactive I/O](docs/streaming.md) for the full
-streaming and lifecycle contract.
+when the consumer falls behind. If a consumer is abandoned, `FinishAsync`, `StopAsync`, shared exit
+waits, and disposal release the parked writer before waiting for the process outcome. See
+[Streaming & interactive I/O](docs/streaming.md) for the full streaming and lifecycle contract.
 
 ### Interactive stdin — write requests, read responses
 

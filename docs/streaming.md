@@ -533,9 +533,11 @@ side. Two things to know before opting in:
   `Backpressure` with `Command.Timeout` bounds the *child's* lifetime, not necessarily your consumer's.
 - Give your **own** consumption loop a deadline (a `CancellationToken` passed to
   `GetAsyncEnumerator(token)`, or a read-side timeout around each `MoveNextAsync()`), and make sure you
-  `Dispose`/`DisposeAsync` the `RunningProcess` promptly if you give up on it — disposal always
-  unblocks a writer parked on backpressure, so the pump can wind down instead of leaking forever as an
-  abandoned background task.
+  `Dispose`/`DisposeAsync` the `RunningProcess` promptly if you give up on it. If you deliberately hand
+  the run to a terminal operation after abandoning the stream, `FinishAsync()`, `StopAsync()`,
+  `WaitAnyAsync`/`WaitAllAsync`, and `DisposeAsync` cancel a writer parked on backpressure before
+  waiting for the shared outcome; the pump winds down and queued items remain readable until the
+  channel ends. Real pump/I/O faults still surface unchanged.
 
 If you can't reason about your consumer always resuming, prefer `DropOldest`/`DropNewest` (never
 blocks the child) or `Error` (fails loud instead of stalling) over `Backpressure`.
@@ -854,6 +856,11 @@ constructor itself never waits on the child: on a `Stdin(source)` + `KeepStdinOp
 feeder is awaited by the first `SendAsync`/`FinishInputAsync` instead, so you always get the session
 back and can start draining frames (the interactive writer still never shares the pipe with the
 feeder).
+
+If a frame consumer is abandoned, `StopAsync`, `WaitAnyAsync`/`WaitAllAsync`, and `DisposeAsync`
+release a parser parked on a full backpressure channel before waiting for the process outcome. The
+frames already queued are still delivered and the frame stream ends cleanly; genuine parser or I/O
+faults remain errors.
 
 ## JSON-RPC sessions (LSP / BSP / MCP)
 
