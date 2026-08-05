@@ -1621,11 +1621,17 @@ type Supervisor internal (config: SupervisorConfig) =
     /// `SupervisionOutcome`. A thin wrapper over `StartAsync` + awaiting the session's `Completion`, so
     /// its behaviour is identical to driving a `SupervisionSession` to its natural end.
     ///
-    /// Returns `Error` only when the *terminating* attempt failed to produce a result at all (a
-    /// spawn/IO failure with no further restart allowed) — there is no final result to report. A
-    /// spawn failure with restarts remaining counts as a crash and is retried. An incarnation
-    /// cancelled via its token is terminal: supervision returns that `Cancelled` immediately,
-    /// regardless of policy or budget.
+    /// Returns `Error` when the *terminating* attempt failed to produce a result at all (a spawn/IO
+    /// failure with no further restart allowed), or when one of the `StopWhen`, `GiveUpWhen`,
+    /// `OnRestart`, or `OnStormPause` callbacks throws. A callback exception is converted to a
+    /// terminal `Error(ProcessError.Io ...)`; it never escapes `RunAsync` or the session's
+    /// `Completion` task, and normal teardown still runs. The error detail names the callback and
+    /// retains the source context available at the failure: the completed `ProcessResult` for
+    /// `StopWhen`, the classified `ProcessError` for `GiveUpWhen`, and the result/error context that
+    /// led to the restart or storm pause for `OnRestart`/`OnStormPause`. A callback fault is terminal
+    /// and is not retried. A spawn failure with restarts remaining counts as a crash and is retried.
+    /// An incarnation cancelled via its token is terminal: supervision returns that `Cancelled`
+    /// immediately, regardless of policy or budget.
     member this.RunAsync
         ([<Optional>] cancellationToken: CancellationToken)
         : Task<Result<SupervisionOutcome, ProcessError>> =
