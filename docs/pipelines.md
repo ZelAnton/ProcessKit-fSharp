@@ -221,8 +221,10 @@ The two ends of the chain behave like a single `Command`:
   whole pipeline from a string, bytes, a file, or a stream. A `Stdin` source on any **later**
   stage is a configuration error — that stage's stdin is always rewired to the previous stage's
   stdout — so `.Pipe` rejects it with an `ArgumentException` naming the offending stage.
-- A `KeepStdinOpen` on a stage has no effect inside a chain: a pipeline exposes no live stdin
-  handle to write into, and the relay wires each later stage's stdin itself.
+- A `KeepStdinOpen` on **any** stage is a configuration error: a pipeline exposes no per-stage
+  `RunningProcess.TakeStdin` handle, so the caller cannot write to a kept-open stdin pipe. `.Pipe`
+  rejects it with an `ArgumentException` naming the offending stage; run the command separately
+  if interactive stdin is needed.
 - Every stage's **stdout** is wired into a pipe — feeding the next stage's stdin, or captured
   at the end — so a `Stdout` mode of `Null` / `Inherit` set on a stage is overridden to keep the
   chain connected.
