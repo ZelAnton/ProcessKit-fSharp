@@ -316,17 +316,15 @@ type PosixSpawnCleanupTests() =
                     // session leader left it alive. Allow that window to pass before asserting cleanup.
                     do! Task.Delay 3000
 
-                    Assert.That(
-                        File.Exists ready,
-                        Is.True,
+                    let readyMessage: string =
                         "the priority fault did not wait for the detached leader to create its descendant"
-                    )
 
-                    Assert.That(
-                        File.Exists leaked,
-                        Is.False,
+                    let leakedMessage: string =
                         "a detached descendant survived the priority-failure session cleanup"
-                    )
+
+                    Assert.That(File.Exists ready, Is.True, readyMessage)
+
+                    Assert.That(File.Exists leaked, Is.False, leakedMessage)
                 | Error other -> Assert.Fail $"expected ProcessError.Spawn from the injected fault, got {other}"
                 | Ok spawned ->
                     Native.Posix.killProcessGroup spawned.Pid
