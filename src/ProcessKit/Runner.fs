@@ -250,35 +250,52 @@ module Runner =
                             | ProcessError.Cancelled _ -> true
                             | _ -> false
 
-                        if
-                            attempt < maxRetries
-                            && shouldRetry.Invoke error
-                            && not retryToken.IsCancellationRequested
-                            && not isCancelled
-                        then
-                            attempt <- attempt + 1
+                        // Invoke the user predicate under the same typed-result boundary as parsers. A
+                        // predicate fault ends this run immediately, preserving the failed attempt as
+                        // `RetryPredicate.Original` instead of leaking the callback exception or starting
+                        // another attempt. Keep the existing short-circuit order: when the retry budget
+                        // is available, the predicate is still observed before cancellation is checked.
+                        let retryDecision =
+                            if attempt < maxRetries then
+                                match error with
+                                | ProcessError.RetryPredicate _ -> Ok false
+                                | _ ->
+                                    try
+                                        Ok(shouldRetry.Invoke error)
+                                    with ex ->
+                                        // A callback fault is part of the typed retry-result contract, not a raw runner exception.
+                                        Error ex
+                            else
+                                Ok false
 
-                            let delay =
-                                RetryDelayPolicy.delay attempt command.Config.RetryJitterSource delayPolicy
+                        match retryDecision with
+                        | Error ex ->
+                            final <- Some(Error(ProcessError.RetryPredicate(command.Program, error, ex.Message)))
+                        | Ok shouldRetry ->
+                            if shouldRetry && not retryToken.IsCancellationRequested && not isCancelled then
+                                attempt <- attempt + 1
 
-                            let runId = command.Config.RunId |> Option.defaultValue ""
-                            Log.retry command.Config.Logger command.Program attempt delay runId
-                            Diag.retried command.Program
+                                let delay =
+                                    RetryDelayPolicy.delay attempt command.Config.RetryJitterSource delayPolicy
 
-                            try
-                                // Clamp the backoff into the armable timer range so a misconfigured delay
-                                // (negative / `InfiniteTimeSpan` / over-long) can't throw synchronously out
-                                // of `Task.Delay` — which would break the honest-result contract — the same
-                                // guard `Timeouts` applies to `Command.Timeout`.
-                                do! Task.Delay(Timeouts.clampArmable delay, command.Config.TimeProvider, retryToken)
-                            with :? System.OperationCanceledException ->
-                                // Cancelled mid-backoff: don't sleep out the rest of the delay. Report it
-                                // as `Cancelled` (not the prior attempt's error), consistent with every
-                                // other cancellation path, so a caller matching on `Cancelled` is not
-                                // misrouted into its generic-failure branch.
-                                final <- Some(Error(ProcessError.Cancelled command.Program))
-                        else
-                            final <- Some(Error error)
+                                let runId = command.Config.RunId |> Option.defaultValue ""
+                                Log.retry command.Config.Logger command.Program attempt delay runId
+                                Diag.retried command.Program
+
+                                try
+                                    // Clamp the backoff into the armable timer range so a misconfigured delay
+                                    // (negative / `InfiniteTimeSpan` / over-long) can't throw synchronously out
+                                    // of `Task.Delay` — which would break the honest-result contract — the same
+                                    // guard `Timeouts` applies to `Command.Timeout`.
+                                    do! Task.Delay(Timeouts.clampArmable delay, command.Config.TimeProvider, retryToken)
+                                with :? System.OperationCanceledException ->
+                                    // Cancelled mid-backoff: don't sleep out the rest of the delay. Report it
+                                    // as `Cancelled` (not the prior attempt's error), consistent with every
+                                    // other cancellation path, so a caller matching on `Cancelled` is not
+                                    // misrouted into its generic-failure branch.
+                                    final <- Some(Error(ProcessError.Cancelled command.Program))
+                            else
+                                final <- Some(Error error)
 
                 match final with
                 | Some result -> return result

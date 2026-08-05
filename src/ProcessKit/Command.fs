@@ -1210,7 +1210,9 @@ type Command internal (config: CommandConfig) =
     /// `maxAttempts - 1` retries), waiting `delay` between attempts, while `shouldRetry` returns true
     /// for the error. `maxAttempts` of `0` or `1` both mean a single run — a command always runs at
     /// least once. A negative `delay` is rejected; delays beyond the maximum armable timer interval
-    /// are clamped when the retry runs.
+    /// are clamped when the retry runs. If `shouldRetry` throws, the current attempt is terminal and
+    /// the consuming verb returns `ProcessError.RetryPredicate` with the original `ProcessError` in
+    /// `Original`; the callback exception never escapes as a raw task fault and no further attempt runs.
     member _.Retry(maxAttempts: int, delay: TimeSpan, shouldRetry: Func<ProcessError, bool>) =
         ArgumentNullException.ThrowIfNull shouldRetry
         ArgumentOutOfRangeException.ThrowIfLessThan(delay, TimeSpan.Zero)
@@ -1226,6 +1228,9 @@ type Command internal (config: CommandConfig) =
     /// retry: `baseDelay × factor^n` (starting at `n = 0`), capped at `maxDelay` before optional
     /// jitter multiplies it by a random factor in `[0.5, 1.5)`. All delays must be non-negative;
     /// `factor` must be finite and at least `1.0`. Retry timers use the command's `TimeProvider`.
+    /// If `shouldRetry` throws, the current attempt is terminal and the consuming verb returns
+    /// `ProcessError.RetryPredicate` with the original `ProcessError` in `Original`; the callback
+    /// exception never escapes as a raw task fault and no further attempt runs.
     member _.RetryBackoff
         (
             maxAttempts: int,
@@ -1703,12 +1708,16 @@ module Command =
 
     /// Run the command up to `maxAttempts` times in total (initial run plus retries), waiting `delay`
     /// between attempts (`0`/`1` both mean a single run). A negative `delay` is rejected; delays
-    /// beyond the maximum armable timer interval are clamped when the retry runs.
+    /// beyond the maximum armable timer interval are clamped when the retry runs. If the predicate
+    /// throws, the consuming verb returns `ProcessError.RetryPredicate` with the original attempt
+    /// error in `Original`, and no further attempt runs.
     let retry (maxAttempts: int) (delay: TimeSpan) (shouldRetry: ProcessError -> bool) (command: Command) =
         command.Retry(maxAttempts, delay, Func<ProcessError, bool> shouldRetry)
 
     /// Run the command with exponential retry backoff: `baseDelay × factor^n`, capped at `maxDelay`
-    /// before optional jitter. Retry timers use the command's `TimeProvider`.
+    /// before optional jitter. Retry timers use the command's `TimeProvider`. If the predicate throws,
+    /// the consuming verb returns `ProcessError.RetryPredicate` with the original attempt error in
+    /// `Original`, and no further attempt runs.
     let retryBackoff
         (maxAttempts: int)
         (baseDelay: TimeSpan)

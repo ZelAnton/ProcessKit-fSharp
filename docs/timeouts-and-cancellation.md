@@ -307,6 +307,12 @@ backoff vocabulary as `Supervisor`, applied to a finite one-operation retry loop
 `maxAttempts - 1` retries), so `Retry 3` runs the command at most three times, and
 `0`/`1` both mean a single run — a command always runs at least once.
 
+The classifier is part of the typed result boundary. If it throws, ProcessKit stops
+the retry loop and returns `Error (ProcessError.RetryPredicate(program, original, detail))`:
+`original` is the failed attempt's complete typed `ProcessError`, while `detail` is
+the callback exception message. No raw callback exception escapes, and no additional
+attempt is started. A `RetryPredicate` error is terminal and is not itself retried.
+
 `delay` must be zero or positive; negative values, including
 `Timeout.InfiniteTimeSpan`, are rejected when the command is built. Delays beyond
 the maximum interval supported by the runtime timer (about 24.8 days) are clamped

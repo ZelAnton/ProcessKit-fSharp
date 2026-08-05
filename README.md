@@ -505,6 +505,12 @@ finite operation. A `Supervisor` instead keeps a child **alive**:
 it restarts the command per policy whenever it exits, with bounded restarts and exponential
 backoff (jittered by default so a restarted fleet doesn't stampede):
 
+Both retry classifiers receive typed `ProcessError` values. If a classifier throws, the consuming
+verb returns the terminal `ProcessError.RetryPredicate`, preserving the failed attempt in its
+`Original` field and the callback exception message in `Detail`; the raw exception does not escape
+and no further attempt starts. See [timeouts, retries & cancellation](docs/timeouts-and-cancellation.md)
+for the full contract.
+
 **F#**
 
 ```fsharp
