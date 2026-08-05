@@ -854,6 +854,64 @@ type JsonRpcSessionTests() =
         :> Task
 
     [<Test>]
+    member _.``malformed JSON-RPC versions are rejected before message routing``() : Task =
+        task {
+            let malformedFrames =
+                [| "missing", """{"method":"invalid/version"}"""
+                   "non-string", """{"jsonrpc":2,"method":"invalid/version"}"""
+                   "old-version", """{"jsonrpc":"1.0","method":"invalid/version"}"""
+                   "other-version", """{"jsonrpc":"2.0-preview","method":"invalid/version"}""" |]
+
+            for caseName, json in malformedFrames do
+                let peer = peerHandle ()
+                use running = peer.Running
+                let session = JsonRpcSession(running)
+                let messages = session.MessagesAsync().GetAsyncEnumerator()
+
+                peer.Stdout.Emit(framed json)
+
+                let faulted =
+                    Assert.ThrowsAsync<ProcessException>(Func<Task>(fun () -> messages.MoveNextAsync().AsTask()))
+
+                match faulted with
+                | null -> Assert.Fail $"expected the {caseName} JSON-RPC version to fault the message stream"
+                | error ->
+                    match error.Error with
+                    | ProcessError.Parse(program, _) -> Assert.That(program, Is.EqualTo "language-server")
+                    | other -> Assert.Fail $"expected Parse for the {caseName} JSON-RPC version, got {other}"
+
+                do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``malformed JSON-RPC versions cannot complete a pending request``() : Task =
+        task {
+            let malformedResponses =
+                [| "missing", fun id -> String.Concat("""{"id":""", id, ""","result":null}""")
+                   "non-string", fun id -> String.Concat("""{"jsonrpc":2,"id":""", id, ""","result":null}""")
+                   "old-version", fun id -> String.Concat("""{"jsonrpc":"1.0","id":""", id, ""","result":null}""")
+                   "other-version",
+                   fun id -> String.Concat("""{"jsonrpc":"2.0-preview","id":""", id, ""","result":null}""") |]
+
+            for caseName, createResponse in malformedResponses do
+                let peer = peerHandle ()
+                use running = peer.Running
+                let session = JsonRpcSession(running)
+                let call = session.RequestRawAsync("initialize", null)
+
+                use! request = nextFrame peer.Stdin
+                peer.Stdout.Emit(framed (createResponse (rawId request)))
+
+                match! call with
+                | Error(ProcessError.Parse(program, _)) -> Assert.That(program, Is.EqualTo "language-server")
+                | Ok result ->
+                    Assert.Fail $"the {caseName} JSON-RPC version incorrectly completed the request with {result}"
+                | Error other -> Assert.Fail $"expected Parse for the {caseName} JSON-RPC version, got {other}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``a notification is sent without an id and never waits for an answer``() : Task =
         task {
             let peer = peerHandle ()

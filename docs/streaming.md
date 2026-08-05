@@ -862,6 +862,9 @@ frames carry: JSON-RPC 2.0, where every request needs a unique `id`, every answe
 back to the call that is waiting for it, and the peer sends notifications and its own requests down
 the same stream at any time. `JsonRpcSession` is that layer — it owns one `ContentLengthSession`
 over the handle and turns it into `RequestAsync` / `NotifyAsync` / a stream of incoming messages.
+Every inbound frame must carry a string `jsonrpc` member whose value is exactly `"2.0"`; a missing,
+non-string, or different value is rejected before the frame can be routed as a request, notification,
+or response, ending the session with a typed `ProcessError.Parse`.
 
 **Debug adapters are not JSON-RPC peers.** DAP borrows LSP's `Content-Length` framing but not its
 envelope — its messages are `{"seq":1,"type":"request","command":"next","arguments":{}}` and
@@ -955,7 +958,7 @@ Every failure is a typed `ProcessError`, never a raw exception and never a silen
 | A `StreamBuffer` cap with `StreamFullMode.Error` filled up | `ProcessError.OutputTooLarge`, ending the session like a protocol failure (see the backlog note below) |
 | The peer's framed output ended before answering | `ProcessError.Io` — and every later verb fails the same way instead of waiting forever |
 | The `result` does not fit the requested type | `ProcessError.Parse` (a JSON `null` result included — read it with `RequestRawAsync`) |
-| The peer sent something that is not a JSON-RPC message | `ProcessError.Parse`, ending the session: pending requests all fail with it and `MessagesAsync` faults with `ProcessException` |
+| The peer sent something that is not a JSON-RPC 2.0 message, including a missing, non-string, or non-`"2.0"` `jsonrpc` member | `ProcessError.Parse`, ending the session before routing: pending requests all fail with it and `MessagesAsync` faults with `ProcessException` |
 
 Requests may be issued concurrently — each gets its own `id`, and answers are routed by `id`, never
 by arrival order. Without a timeout a request waits until the peer answers, its output ends, or the

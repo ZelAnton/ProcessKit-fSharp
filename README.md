@@ -819,6 +819,11 @@ var finished = (await proc.FinishAsync()).GetValueOrThrow();
 when the consumer falls behind. See [Streaming & interactive I/O](docs/streaming.md) for the full
 streaming and lifecycle contract.
 
+For conversational language-server, build-server, or MCP-style children, use the
+[JSON-RPC 2.0 session layer](docs/streaming.md#json-rpc-sessions-lsp--bsp--mcp). It rejects every
+incoming frame whose `jsonrpc` member is missing, non-string, or not exactly `"2.0"` with a typed
+`ProcessError.Parse` before request, notification, or response routing.
+
 ### Interactive stdin — write requests, read responses
 
 Keep stdin open with `KeepStdinOpen`, take the writer with `TakeStdin()`, then interleave writes
