@@ -240,6 +240,8 @@ module internal Common =
     /// backing `Exec.which`/`CliClient.EnsureAvailableAsync` and the POSIX `setsid` probe) or from a
     /// command's EFFECTIVE child environment + prefer-local (`commandContext`, backing
     /// `Command.ResolveProgram`/`CliClient.ResolveProgram` and the spawn's own `NotFound` diagnostic).
+    /// Neither context ever resolves the POSIX security helpers (`setpriv`/`setsid`): those are pinned to
+    /// a fixed trusted directory list by `Native.Posix.trustedHelperPath`, which reuses `probeDir` alone.
     /// Threading this one value through the SAME resolver (`resolveWith`) is what lets preflight, the real
     /// launch substitution (`resolveWindowsLaunch`/`resolvePreferLocal`), and the not-found diagnostic all
     /// agree without a second copy of the PATH/PATHEXT/exec-bit rules. `Path`/`PathExt` are `""` when
@@ -389,8 +391,9 @@ module internal Common =
 
     /// Resolve `program` against the CURRENT PROCESS's `PATH`/`PATHEXT` (and no prefer-local) — a
     /// program-name preflight against the parent's own environment. Backs `Exec.which`/
-    /// `CliClient.EnsureAvailableAsync` and the POSIX `setsid` helper probe, unchanged from before this
-    /// became one case of `resolveWith`.
+    /// `CliClient.EnsureAvailableAsync`, unchanged from before this became one case of `resolveWith`.
+    /// Deliberately NOT used for the POSIX `setpriv`/`setsid` security helpers: a `PATH` lookup is what
+    /// `Native.Posix.trustedHelperPath` exists to avoid for those.
     let resolveProgram (program: string) : Result<string, ProcessError> = resolveWith (processContext ()) program
 
     /// Resolve `command`'s program against its EFFECTIVE CHILD environment (`commandContext`): the child's

@@ -170,7 +170,12 @@ support.
 controlling terminal while preserving process containment. `Unsupported` is
 returned on Windows before ConPTY support, on macOS or BSD without the required
 controlling terminal helper, or when Linux lacks a usable PTY device or its
-`setsid --ctty` helper. `ResizeAsync` also returns `Unsupported` for a non-PTY or
+`setsid --ctty` helper. That helper is deliberately loaded only from a trusted
+system directory (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and never from
+`PATH`, so a host that keeps util-linux elsewhere reports `Unsupported` even
+though `setsid` is on its `PATH` — see
+[Hardening → Where the Unix helper binaries come from](hardening.md#where-the-unix-helper-binaries-come-from).
+`ResizeAsync` also returns `Unsupported` for a non-PTY or
 already torn down run, and session sends return it when stdin was not kept open.
 In contrast, `Pty` with `Setsid`, separate stderr observation, or a nonfinal
 pipeline stage is an invalid builder combination and throws `ArgumentException`.

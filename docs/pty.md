@@ -288,7 +288,7 @@ Calling it on a non-PTY `RunningProcess` returns `Error (ProcessError.Unsupporte
 
 ## Platform support
 
-PTY support is available on Windows through ConPTY (Windows 10 1809+) and on Linux through `openpty` plus `setsid --ctty`; unsupported hosts return `ProcessError.Unsupported` rather than falling back to pipes. See the full [platform capability matrix](platform-support.md#pseudo-terminal-pty-capabilities), including macOS/BSD helper requirements and containment caveats.
+PTY support is available on Windows through ConPTY (Windows 10 1809+) and on Linux through `openpty` plus `setsid --ctty` — the latter loaded from a trusted system directory (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) rather than `PATH`, so it cannot be replaced by a planted binary ([why](hardening.md#where-the-unix-helper-binaries-come-from)); unsupported hosts return `ProcessError.Unsupported` rather than falling back to pipes. See the full [platform capability matrix](platform-support.md#pseudo-terminal-pty-capabilities), including macOS/BSD helper requirements and containment caveats.
 
 ---
 

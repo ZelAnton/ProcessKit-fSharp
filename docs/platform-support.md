@@ -384,6 +384,9 @@ pipes.
 | Containment under PTY | ✅ Job Object | ✅ cgroup v2 or pgid | ✅ pgid |
 
 Windows older than 10 version 1809 returns `Unsupported`. Linux needs the `setsid --ctty` helper
+in one of the trusted system directories (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, where util-linux
+installs it — the helper is never taken from `PATH`, see
+[Hardening → Where the Unix helper binaries come from](hardening.md#where-the-unix-helper-binaries-come-from))
 as well as a usable PTY device. `openpty` exists on macOS/BSD, but their standard `setsid` does not
 provide `--ctty`; until a helper is supplied, a PTY spawn there is `Unsupported` rather than a
 controlling-terminal-less half implementation.
@@ -449,9 +452,13 @@ group memberships (`docker`, `video`, `adm`, …). Pass `Command.Groups(gids)` t
 supplementary groups explicitly (mapped to `setpriv --groups`); it is honoured only alongside a
 `Uid`/`Gid` drop, so requesting it without one fails with `ProcessError.Spawn` rather than being
 silently ignored. The whole family is **Unix-only**: on Windows `Uid`/`Gid`/`Groups`/`Setsid`/`Umask`
-each fail the spawn with `ProcessError.Unsupported`, never a silent no-op. `setpriv` ships on mainstream
-Linux; where it is absent (macOS/BSD) a `Uid`/`Gid`/`Groups` drop fails with a typed `ProcessError.Spawn`
-naming the missing helper.
+each fail the spawn with `ProcessError.Unsupported`, never a silent no-op. The helper is loaded only from
+a trusted system directory (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and launched by absolute path,
+never resolved on `PATH`, so it cannot be hijacked by a planted binary — see
+[Hardening → Where the Unix helper binaries come from](hardening.md#where-the-unix-helper-binaries-come-from).
+`setpriv` ships there on mainstream Linux; where no trusted directory holds it (macOS/BSD, and non-FHS
+layouts such as NixOS) a `Uid`/`Gid`/`Groups` drop fails with a typed `ProcessError.Spawn` naming the
+missing helper.
 
 **A Windows-hardened child keeps the caller's identity.** `WindowsRestrictedToken` and
 `WindowsIntegrityLevel` reduce *privilege* and *write* access; they do not change **who** the child is.
@@ -466,8 +473,9 @@ as that child's own non-zero exit rather than as a ProcessKit error.
 **`KillOnParentDeath` reaps only the direct child on Linux, and only up to a set-uid `exec`.** The
 opt-in `Command.KillOnParentDeath()` reaps a child when its parent dies *suddenly*, but the guarantee is
 platform-specific — `Command.KillOnParentDeathScope()` reports the honest scope. On **Linux** it is
-armed as `PR_SET_PDEATHSIG(SIGKILL)` via the `setpriv --pdeathsig` helper (util-linux; a missing helper
-is a typed `ProcessError.Spawn`, like the privilege drop) and reaches the **direct child only**: the
+armed as `PR_SET_PDEATHSIG(SIGKILL)` via the `setpriv --pdeathsig` helper (util-linux, loaded from a
+trusted system directory rather than `PATH` exactly as the privilege drop is; a helper absent from all of
+them is a typed `ProcessError.Spawn`, like the privilege drop) and reaches the **direct child only**: the
 parent-death signal is **not inherited** across a `fork`, so a **grandchild** the child spawns is not
 covered — with the child's parent gone, nothing reaps its cgroup/pgroup. The kernel also **resets** the
 signal when the child `execve`s a **set-uid/set-gid** image, so for a `sudo`-like child it holds only up

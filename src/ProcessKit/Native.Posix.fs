@@ -329,7 +329,7 @@ module internal Posix =
     /// deterministically ON a host that DOES carry `setsid` — exercising the honest typed
     /// `ProcessError.Unsupported` a PTY returns where a controlling terminal cannot be established (D9),
     /// without a socketpair ever pretending to be a tty. Production leaves it `None` and runs the real
-    /// `resolveProgram "setsid"` PATH probe.
+    /// trusted-directory probe for `setsid` (never a `PATH` lookup — see `trustedHelperPath`).
     let mutable ptyCttyHelperAvailableForTests: (unit -> bool) option = None
 
     /// Test seams (internal, not public API): replace the raw pty reads/writes so `PtyStream` can be
@@ -2114,9 +2114,11 @@ module internal Posix =
     // calls out, chosen over `fork` because it is the only mechanism that is reliable on .NET.
     //
     // Availability & honesty. `setpriv` ships in util-linux, a required package on mainstream Linux
-    // (Debian/Ubuntu — the CI image and GitHub runners), so the drop is real and tested there; where it
-    // is absent (macOS/BSD, a minimal musl image) the spawn fails with a typed `ProcessError.Spawn` that
-    // names the missing helper, never a silently un-dropped child. A drop the OS *refuses* surfaces as
+    // (Debian/Ubuntu — the CI image and GitHub runners), so the drop is real and tested there; where no
+    // TRUSTED directory holds it (macOS/BSD, a minimal musl image, a non-FHS layout — see the
+    // trusted-helper section below, which is the ONLY place either helper is looked up) the spawn fails
+    // with a typed `ProcessError.Spawn` that names the missing helper, never a silently un-dropped child
+    // and never one dropped by a `setpriv` picked up from `PATH`. A drop the OS *refuses* surfaces as
     // `setpriv` exiting non-zero (carrying its own stderr); the common "not privileged" case is caught
     // up-front as `ProcessError.Spawn` by `privilegeDropPrecheck` (a non-root caller cannot change to a
     // different uid/gid).
@@ -2135,6 +2137,87 @@ module internal Posix =
     // `POSIX_SPAWN_SETSID` differs per libc: 0x0400 on macOS, 0x80 on Linux glibc/musl. Not a `[<Literal>]`
     // because it is resolved from `isMacOs` at load. Used by `spawnPosixViaSpawn`'s flag block above.
     let private posixSpawnSetsid = if isMacOs then 0x0400s else 0x80s
+
+    // ----------------------------------------------------------------------------------
+    // Trusted resolution of the POSIX security helpers (`setpriv` / `setsid`)
+    // ----------------------------------------------------------------------------------
+    //
+    // `setpriv` and `setsid --ctty` are SECURITY helpers, not ordinary tools. `setpriv` performs the
+    // uid/gid drop and arms `PR_SET_PDEATHSIG`, so on the path that matters most it runs as ROOT, before
+    // the credentials it is there to lower have been lowered; `setsid --ctty` establishes the child's
+    // controlling terminal. Launching either by BARE NAME would hand their lookup to libc's `exec*p`,
+    // which walks the CURRENT PROCESS's `PATH` — so a `setpriv` planted in any directory that precedes
+    // `/usr/bin` there would be executed with the parent's full (often root) privileges, before any drop.
+    // That is precisely the hijack the Windows side already refuses: `Native.Windows.systemCmdExe` takes
+    // the batch wrapper's shell from `Environment.SystemDirectory` rather than `PATH`/`%ComSpec%` because
+    // "the shell itself must not be hijackable" — and this POSIX case is the MORE privileged of the two,
+    // so it gets the same treatment rather than a weaker one.
+    //
+    // Neither helper is therefore ever resolved on `PATH`. Both are looked up only in a fixed list of
+    // trusted system directories, in order, and the ABSOLUTE path of the match is what actually runs:
+    // as `argv[0]` of the `posix_spawnp` itself (the plain and detached drop paths, `setprivCommand`), or
+    // as the first word of the argv another pinned helper `exec`s (the `setsid --ctty` pty shim and the
+    // `/bin/sh` cgroup launcher, `setprivWrappedArgv`). `exec*p` performs NO `PATH` search for a
+    // path-form program, so no `PATH` entry can interpose anywhere along the chain — matching how the
+    // cgroup launcher and the `RLIMIT_CPU` shim already pin `/bin/sh` by absolute path.
+    // `Command.PreferLocal` deliberately does not participate either: it substitutes the caller's own
+    // TARGET program (`applyPreferLocal`) and never the security helper that launches it.
+    //
+    // The list is `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` — the FHS locations of util-linux, with the
+    // user-command directories first because both helpers are `bin` (not `sbin`) tools; on a
+    // merged-`/usr` host the first two are the same directory. `/usr/local/bin` and friends are
+    // deliberately absent: they are the conventional home of locally-installed, more widely writable
+    // software, which is the very thing this pinning exists to exclude. This is a resolution boundary,
+    // not a filesystem-integrity check: it assumes the trusted directories themselves are only writable
+    // by root, exactly as every other program on the host already assumes.
+    //
+    // Honest failure, never a downgrade. A host that holds neither helper in a trusted directory — a
+    // non-FHS layout (NixOS/Guix), a minimal image, or macOS/BSD, which have no util-linux at all — gets
+    // the SAME typed error class it already got when the helper was missing outright: a
+    // `ProcessError.Spawn` naming whichever knob needed `setpriv`, and a `ProcessError.Unsupported` for a
+    // PTY. What never happens is running the target with the requested hardening silently un-applied, or
+    // through a helper picked up from somewhere untrusted.
+
+    /// The util-linux privilege-drop / parent-death-signal helper (`Command.Uid`/`Gid`/`Groups`,
+    /// `Command.KillOnParentDeath`), resolved only from a trusted directory (see the section comment).
+    [<Literal>]
+    let private setprivHelper = "setpriv"
+
+    /// The util-linux controlling-terminal helper (`Command.Pty`, invoked as `setsid --ctty`), resolved
+    /// only from a trusted directory (see the section comment).
+    [<Literal>]
+    let private cttyHelper = "setsid"
+
+    /// The only directories either POSIX security helper may be loaded from, searched in this order (see
+    /// the section comment). Deliberately a fixed list rather than `PATH`.
+    let private trustedHelperDirectories = [ "/usr/bin"; "/bin"; "/usr/sbin"; "/sbin" ]
+
+    /// Test seam (internal, not public API): replaces the trusted directory list, so the
+    /// helper-absent-from-every-trusted-directory path can be exercised deterministically ON a host that
+    /// DOES carry `setpriv`/`setsid` in `/usr/bin` — including proving that a same-named helper sitting
+    /// on `PATH` is never used as a fallback. Production leaves it `None` and uses the fixed list.
+    let mutable trustedHelperDirectoriesForTests: string list option = None
+
+    /// The trusted directory list actually in force — the fixed one, or a test seam override. Read once
+    /// per resolution AND once per diagnostic, so an error message never names a list other than the one
+    /// that was really searched.
+    let private trustedHelperDirectoriesInUse () =
+        match trustedHelperDirectoriesForTests with
+        | Some directories -> directories
+        | None -> trustedHelperDirectories
+
+    /// The trusted directories as they appear inside an error message.
+    let private trustedHelperDirectoriesText () =
+        String.concat ", " (trustedHelperDirectoriesInUse ())
+
+    /// Resolve a security helper (`setpriv`/`setsid`) to the absolute path of the first match among the
+    /// trusted directories, reusing the shared `Common.probeDir` — so the "present and directly
+    /// executable" rule is the one the rest of the library already uses, not a second copy (the empty
+    /// `PATHEXT` argument is a POSIX no-op; this whole module is POSIX-only). `None` when no trusted
+    /// directory holds it: the caller then fails honestly and never falls back to a `PATH` lookup.
+    let private trustedHelperPath (helper: string) : string option =
+        trustedHelperDirectoriesInUse ()
+        |> List.tryPick (fun directory -> probeDir "" directory helper)
 
     [<DllImport("libc", SetLastError = true)>]
     extern int private geteuid()
@@ -2252,26 +2335,77 @@ module internal Posix =
         else
             None
 
-    /// Rewrite `command` to run through the `setpriv` helper: `setpriv <flags> <program> <args...>`. The
-    /// flags carry the uid/gid/groups drop and/or `--pdeathsig=SIGKILL` (`Command.KillOnParentDeath`); those
-    /// knobs are cleared on the rewritten command (so the `spawnPosix` dispatcher does not recurse), and
-    /// every other knob — stdio, env, CurrentDir, Priority, Umask, Setsid — is preserved and applied by
-    /// `posix_spawn` to the `setpriv` process, which inherits them across its `exec` of the real program.
-    let private setprivCommand (command: Command) : Command =
+    /// The honest typed failure for a `setpriv` that no trusted directory holds (see the trusted-helper
+    /// section comment): `ProcessError.Spawn` against the ORIGINAL program, with a reason tailored to
+    /// whichever knob(s) routed through the helper — so a caller who never mentioned `setpriv` still
+    /// learns what their own request needed. The one message for this condition, shared by the up-front
+    /// resolution on all three drop paths (plain / pty shim / cgroup launcher) and by
+    /// `remapSetprivNotFound`, so they cannot drift apart.
+    let private setprivHelperMissing (command: Command) : ProcessError =
         let config = command.Config
-        let prefix = setprivFlags config @ [ config.Program ]
 
-        Command(
-            { config with
-                Program = "setpriv"
-                Args = config.Args.InsertRange(0, prefix)
-                Uid = None
-                Gid = None
-                Groups = None
-                // Cleared with the drop knobs: the `--pdeathsig=SIGKILL` is already baked into `prefix`, so
-                // the rewritten command must not re-trigger `needsSetpriv` and wrap a second `setpriv` layer.
-                KillOnParentDeath = false }
+        let reason =
+            match (config.Uid.IsSome || config.Gid.IsSome), config.KillOnParentDeath with
+            | true, true -> "a Uid/Gid privilege drop and KillOnParentDeath both need"
+            | true, false -> "a Uid/Gid privilege drop needs"
+            | false, true -> "KillOnParentDeath needs"
+            // Unreachable: this error is only built for a command that routed through `setpriv`.
+            | false, false -> "this command needs"
+
+        ProcessError.Spawn(
+            command.Program,
+            $"{reason} the '{setprivHelper}' helper (util-linux), which is loaded only from a trusted system directory ({trustedHelperDirectoriesText ()}) and never from PATH so it cannot be hijacked; it was not found in any of them (present on mainstream Linux; absent on macOS/BSD)"
         )
+
+    /// Rewrite `command` to run through the `setpriv` helper: `<trusted setpriv> <flags> <program>
+    /// <args...>`. The flags carry the uid/gid/groups drop and/or `--pdeathsig=SIGKILL`
+    /// (`Command.KillOnParentDeath`); those knobs are cleared on the rewritten command (so the
+    /// `spawnPosix` dispatcher does not recurse), and every other knob — stdio, env, CurrentDir,
+    /// Priority, Umask, Setsid — is preserved and applied by `posix_spawn` to the `setpriv` process,
+    /// which inherits them across its `exec` of the real program.
+    ///
+    /// The helper is the ABSOLUTE path of a trusted-directory match, pinned as `argv[0]` of the spawn, so
+    /// `posix_spawnp` runs exactly that image with no `PATH` search; a helper no trusted directory holds
+    /// is an honest typed `Error` here, BEFORE any child exists (see `setprivHelperMissing`).
+    let private setprivCommand (command: Command) : Result<Command, ProcessError> =
+        match trustedHelperPath setprivHelper with
+        | None -> Error(setprivHelperMissing command)
+        | Some helperPath ->
+            let config = command.Config
+            let prefix = setprivFlags config @ [ config.Program ]
+
+            Ok(
+                Command(
+                    { config with
+                        Program = helperPath
+                        Args = config.Args.InsertRange(0, prefix)
+                        Uid = None
+                        Gid = None
+                        Groups = None
+                        // Cleared with the drop knobs: the `--pdeathsig=SIGKILL` is already baked into `prefix`,
+                        // so the rewritten command must not re-trigger `needsSetpriv` and wrap a second
+                        // `setpriv` layer.
+                        KillOnParentDeath = false }
+                )
+            )
+
+    /// The argv that actually runs the target once any privilege drop / parent-death arming is applied:
+    /// the trusted, absolute-path `setpriv` helper wrapping `<program> <args...>` when `needsSetpriv`,
+    /// else the target alone. This is the NESTED shape — the drop rides inside another helper's argv (the
+    /// `setsid --ctty` pty shim, the `/bin/sh` cgroup launcher) rather than becoming `Command.Program`,
+    /// which is `setprivCommand`'s shape. Both go through the one `trustedHelperPath`, so every path that
+    /// can reach `setpriv` pins it identically and fails identically (`setprivHelperMissing`) when no
+    /// trusted directory holds it.
+    let private setprivWrappedArgv (command: Command) : Result<string list, ProcessError> =
+        let config = command.Config
+        let target = config.Program :: List.ofSeq config.Args
+
+        if needsSetpriv config then
+            match trustedHelperPath setprivHelper with
+            | None -> Error(setprivHelperMissing command)
+            | Some helperPath -> Ok(helperPath :: (setprivFlags config @ target))
+        else
+            Ok target
 
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
     /// child's pid) and capture its stdout/stderr. The whole group can later be reaped with
@@ -2998,73 +3132,89 @@ module internal Posix =
     // helper-launcher pattern: `setsid --ctty <program> <args…>` (util-linux) does the `setsid()` +
     // `TIOCSCTTY` and `exec`s the target IN PLACE (same pid — so `Spawned.Handle`, the pgid, and
     // kill-on-drop are unchanged). The pty stdio (master/slave) is wired by `spawnPosixViaSpawn` above
-    // when `config.Pty` is set. A host lacking that helper (macOS/BSD, an old util-linux) — or the pty
-    // devfs — gets a typed `ProcessError.Unsupported`, never a socketpair pretending to be a tty (D9).
+    // when `config.Pty` is set. Like `setpriv`, this helper is resolved ONLY from the trusted directories
+    // and pinned by absolute path, never taken from `PATH` (see the trusted-helper section above). A host
+    // with no such helper (macOS/BSD, an old util-linux, a non-FHS layout) — or no pty devfs — gets a
+    // typed `ProcessError.Unsupported`, never a socketpair pretending to be a tty (D9).
+
+    /// The typed `ProcessError.Unsupported` for a host with no `setsid --ctty` controlling-terminal
+    /// helper in any trusted directory (see the trusted-helper section comment) — the honest capability
+    /// answer a PTY gets there, in place of a socketpair pretending to be a tty (D9). Shared by the
+    /// up-front host gate and the shim construction so the two cannot report the gap differently.
+    let private cttyHelperUnsupported () : ProcessError =
+        ProcessError.Unsupported
+            $"Pty (needs the '{cttyHelper} --ctty' controlling-terminal helper from util-linux, loaded only from a trusted system directory ({trustedHelperDirectoriesText ()}) and never from PATH so it cannot be hijacked; not found in any of them — as on macOS/BSD and old util-linux)"
 
     /// Whether the `setsid --ctty` controlling-terminal helper is available on this host (util-linux
-    /// `setsid`, resolved on PATH). The test seam forces the verdict so the honest-`Unsupported` path can
-    /// be exercised on a host that DOES carry `setsid`.
+    /// `setsid`, resolved from the trusted directories — never `PATH`, since this helper establishes the
+    /// child's controlling terminal). The test seam forces the verdict so the honest-`Unsupported` path
+    /// can be exercised on a host that DOES carry `setsid`.
     let private cttyHelperAvailable () : bool =
         match ptyCttyHelperAvailableForTests with
         | Some hook -> hook ()
-        | None ->
-            match resolveProgram "setsid" with
-            | Ok _ -> true
-            | Error _ -> false
+        | None -> (trustedHelperPath cttyHelper).IsSome
 
     /// The typed `ProcessError.Unsupported` for a host that cannot honor a PTY, or `None` when it can: the
-    /// `setsid --ctty` ctty helper must be present (absent on macOS/BSD, an old util-linux), and the pty
-    /// devfs (`/dev/ptmx`) must exist. Checked at dispatch, BEFORE any spawn, so a PTY on an unsupported
-    /// host is an honest up-front failure rather than a socketpair silently standing in for a tty (D9). A
-    /// transient runtime pty-open failure (EMFILE, a devfs race) surfaces later as `ProcessError.Spawn`
-    /// from `openPtyPair`, which is correct — that is a per-invocation failure, not a capability gap.
+    /// `setsid --ctty` ctty helper must be present in a trusted directory (absent on macOS/BSD, an old
+    /// util-linux), and the pty devfs (`/dev/ptmx`) must exist. Checked at dispatch, BEFORE any spawn, so
+    /// a PTY on an unsupported host is an honest up-front failure rather than a socketpair silently
+    /// standing in for a tty (D9). A transient runtime pty-open failure (EMFILE, a devfs race) surfaces
+    /// later as `ProcessError.Spawn` from `openPtyPair`, which is correct — that is a per-invocation
+    /// failure, not a capability gap.
     let private ptyHostUnsupported () : ProcessError option =
         if not (cttyHelperAvailable ()) then
-            Some(
-                ProcessError.Unsupported
-                    "Pty (needs the 'setsid --ctty' controlling-terminal helper from util-linux on PATH; not found here — absent on macOS/BSD and old util-linux)"
-            )
+            Some(cttyHelperUnsupported ())
         elif not (File.Exists "/dev/ptmx") then
             Some(ProcessError.Unsupported "Pty (host has no /dev/ptmx pseudo-terminal support)")
         else
             None
 
     /// Rewrite `command` to run under the `setsid --ctty` controlling-terminal helper:
-    /// `setsid --ctty <program> <args…>`. `setsid` performs `setsid()` + `TIOCSCTTY` on its stdin — which
-    /// the pty stdio wiring points at the slave — making the pty the child's controlling terminal, then
-    /// `exec`s the real program IN PLACE. A requested `Uid`/`Gid` drop is nested INSIDE
+    /// `<trusted setsid> --ctty <program> <args…>`. `setsid` performs `setsid()` + `TIOCSCTTY` on its
+    /// stdin — which the pty stdio wiring points at the slave — making the pty the child's controlling
+    /// terminal, then `exec`s the real program IN PLACE. A requested `Uid`/`Gid` drop is nested INSIDE
     /// (`setsid --ctty setpriv <flags> <program> …`), so the (privilege-free) controlling-tty setup runs
     /// before the drop, mirroring how the cgroup launcher nests `setpriv`. `Pty` is KEPT so
     /// `spawnPosixViaSpawn` wires the pty stdio; `Uid`/`Gid`/`Groups` are cleared so it does not ALSO wrap
     /// this in a second `setpriv` layer. Every other knob rides `posix_spawn` and is inherited across the
     /// `exec`s.
-    let private cttyShimCommand (command: Command) : Command =
-        let config = command.Config
+    ///
+    /// BOTH helpers are pinned to the absolute path of a trusted-directory match (`setsid` as `argv[0]`
+    /// of the spawn, the nested `setpriv` as the first word of the argv `setsid` `exec`s), so neither
+    /// link of the chain is resolved on `PATH`; a helper no trusted directory holds is an honest typed
+    /// `Error` before any child exists — `Unsupported` for the ctty helper (the same capability answer
+    /// `ptyHostUnsupported` gives), `Spawn` for `setpriv` (the same answer the non-pty drop gives).
+    let private cttyShimCommand (command: Command) : Result<Command, ProcessError> =
+        match trustedHelperPath cttyHelper with
+        | None -> Error(cttyHelperUnsupported ())
+        | Some cttyPath ->
+            match setprivWrappedArgv command with
+            | Error error -> Error error
+            | Ok target ->
+                let config = command.Config
 
-        let target =
-            if needsSetpriv config then
-                "setpriv" :: (setprivFlags config @ (config.Program :: List.ofSeq config.Args))
-            else
-                config.Program :: List.ofSeq config.Args
-
-        Command(
-            { config with
-                Program = "setsid"
-                Args = System.Collections.Immutable.ImmutableList.CreateRange("--ctty" :: target)
-                Uid = None
-                Gid = None
-                Groups = None
-                // Baked into `target` when set (nested inside `setsid --ctty`, after the in-place `setsid()`
-                // and before the final program `exec` — no `fork` clears the parent-death signal); cleared
-                // here so the rewritten `setsid` command does not re-trigger `needsSetpriv`.
-                KillOnParentDeath = false }
-        )
+                Ok(
+                    Command(
+                        { config with
+                            Program = cttyPath
+                            Args = System.Collections.Immutable.ImmutableList.CreateRange("--ctty" :: target)
+                            Uid = None
+                            Gid = None
+                            Groups = None
+                            // Baked into `target` when set (nested inside `setsid --ctty`, after the in-place
+                            // `setsid()` and before the final program `exec` — no `fork` clears the
+                            // parent-death signal); cleared here so the rewritten `setsid` command does not
+                            // re-trigger `needsSetpriv`.
+                            KillOnParentDeath = false }
+                    )
+                )
 
     /// Spawn `command` (which requests `Command.Pty`) as a contained POSIX child with a real controlling
     /// pseudo-terminal. Gates an unsupported host up front (`ptyHostUnsupported`), refuses a supplementary
     /// `Groups` without a drop and a non-root uid/gid drop exactly as the plain path does, then spawns the
-    /// `setsid --ctty` shim (with any drop nested inside). A `NotFound` for the just-checked `setsid`
-    /// (a PATH race between the availability check and the spawn) maps back to a typed `Unsupported`.
+    /// `setsid --ctty` shim (with any drop nested inside). A `NotFound` for the just-resolved `setsid`
+    /// (the pinned trusted-directory match vanished between the availability check and the spawn) maps
+    /// back to a typed `Unsupported`.
     let private spawnPosixPty (command: Command) : Result<Spawned, ProcessError> =
         let config = command.Config
 
@@ -3075,13 +3225,16 @@ module internal Posix =
             | Some error -> Error error
             | None ->
                 let proceed () =
-                    match spawnPosixViaSpawn (cttyShimCommand command) with
-                    | Error(ProcessError.NotFound _) ->
-                        Error(
-                            ProcessError.Unsupported
-                                "Pty (the 'setsid' controlling-terminal helper was not found by the spawn; util-linux setsid must be on PATH)"
-                        )
-                    | other -> other
+                    match cttyShimCommand command with
+                    | Error error -> Error error
+                    | Ok shim ->
+                        match spawnPosixViaSpawn shim with
+                        | Error(ProcessError.NotFound _) ->
+                            Error(
+                                ProcessError.Unsupported
+                                    "Pty (the 'setsid' controlling-terminal helper was not found by the spawn: the trusted-directory match vanished between the availability check and the launch)"
+                            )
+                        | other -> other
 
                 if config.Uid.IsSome || config.Gid.IsSome then
                     match privilegeDropPrecheck command with
@@ -3144,31 +3297,17 @@ module internal Posix =
                 )
             )
 
-    /// Rewrite a `setpriv`-helper `NotFound` (the helper is off PATH) into a typed `ProcessError.Spawn`
-    /// against the ORIGINAL program, so a caller who never mentioned `setpriv` gets a message naming what
-    /// their request actually needs. The reason is tailored to whichever knob(s) routed through `setpriv` —
-    /// a `Uid`/`Gid` drop, `Command.KillOnParentDeath`, or both. Generic in the success payload: the same
-    /// remap serves the contained spawn (`Spawned`) and the detached launch (`DetachedSpawn`), which route
-    /// a drop through the very same helper.
+    /// Rewrite a `setpriv`-helper `NotFound` into the same typed `ProcessError.Spawn` against the ORIGINAL
+    /// program that an up-front trusted-resolution miss produces (`setprivHelperMissing`), so a caller who
+    /// never mentioned `setpriv` gets a message naming what their request actually needs. Since the helper
+    /// is now pinned to a resolved absolute path before the spawn, the only way the spawn itself can still
+    /// report `NotFound` is the narrow race where that exact file was removed in between — the same
+    /// condition, reported the same way, rather than a second wording for it. Generic in the success
+    /// payload: one remap serves the contained spawn (`Spawned`) and the detached launch (`DetachedSpawn`),
+    /// which route a drop through the very same helper.
     let private remapSetprivNotFound (command: Command) (result: Result<'spawn, ProcessError>) =
         match result with
-        | Error(ProcessError.NotFound _) ->
-            let config = command.Config
-
-            let reason =
-                match (config.Uid.IsSome || config.Gid.IsSome), config.KillOnParentDeath with
-                | true, true -> "a Uid/Gid privilege drop and KillOnParentDeath both need"
-                | true, false -> "a Uid/Gid privilege drop needs"
-                | false, true -> "KillOnParentDeath needs"
-                // Unreachable: `remapSetprivNotFound` only wraps a spawn that routed through `setpriv`.
-                | false, false -> "this command needs"
-
-            Error(
-                ProcessError.Spawn(
-                    command.Program,
-                    $"{reason} the 'setpriv' helper (util-linux) on PATH; it was not found (available on mainstream Linux; absent on macOS/BSD)"
-                )
-            )
+        | Error(ProcessError.NotFound _) -> Error(setprivHelperMissing command)
         | other -> other
 
     /// The honest typed refusal for the Windows-only token-hardening knobs
@@ -3250,7 +3389,10 @@ module internal Posix =
 
                         match precheck with
                         | Some error -> Error error
-                        | None -> spawnPosixViaSpawn (setprivCommand command) |> remapSetprivNotFound command
+                        | None ->
+                            match setprivCommand command with
+                            | Error error -> Error error
+                            | Ok dropping -> spawnPosixViaSpawn dropping |> remapSetprivNotFound command
                     else
                         spawnPosixViaSpawn command
 
@@ -3304,28 +3446,9 @@ module internal Posix =
         let command = applyPreferLocal command
         let config = command.Config
 
-        let launch () =
-            // The argv the launcher `exec`s after migrating: the real program (and its args), or — when a
-            // uid/gid drop and/or `Command.KillOnParentDeath` is requested — the `setpriv` helper wrapping
-            // it, so the drop (and the in-place `--pdeathsig` arming) happens AFTER the privileged cgroup
-            // join. Mirrors `setprivCommand`'s `setpriv <flags> <program> <args...>`.
-            let dropOrPlain =
-                if needsSetpriv config then
-                    "setpriv" :: (setprivFlags config @ (config.Program :: List.ofSeq config.Args))
-                else
-                    config.Program :: List.ofSeq config.Args
-
-            let innerArgv =
-                if config.Pty.IsSome then
-                    // PTY under a cgroup: the launcher joins `cgroup.procs`, then `exec`s the
-                    // `setsid --ctty` controlling-terminal shim (with any privilege drop nested inside it,
-                    // after the privileged join). The cgroup membership is by the launcher's `$$` — which is
-                    // still the target's pid after the whole exec chain and after the helper's `setsid()` —
-                    // so limits and the controlling pty compose; `Mechanism.CgroupV2` is reported unchanged.
-                    "setsid" :: "--ctty" :: dropOrPlain
-                else
-                    dropOrPlain
-
+        // Build and spawn the `/bin/sh` migration launcher around an already-resolved inner argv (the
+        // target, with any trusted-path `setpriv`/`setsid --ctty` helper already pinned into it).
+        let launchWith (innerArgv: string list) =
             let launcherArgs = "-c" :: cgroupLauncherScript :: "sh" :: cgroupProcs :: innerArgv
 
             // Every other knob (stdio, cwd, env, Priority, Umask, Setsid) is preserved and applied by
@@ -3354,6 +3477,35 @@ module internal Posix =
                         "placing the process into its cgroup atomically needs /bin/sh (the migration launcher), which was not found on this host"
                 )
             | other -> other
+
+        let launch () =
+            // The argv the launcher `exec`s after migrating: the real program (and its args), or — when a
+            // uid/gid drop and/or `Command.KillOnParentDeath` is requested — the trusted, absolute-path
+            // `setpriv` helper wrapping it, so the drop (and the in-place `--pdeathsig` arming) happens
+            // AFTER the privileged cgroup join. Shares `setprivWrappedArgv` with the `setsid --ctty` pty
+            // shim, so this path pins (and refuses) the helper exactly as the other two do — the `exec` of
+            // an absolute path performs no `PATH` search, so nothing on `PATH` can interpose here either.
+            let innerArgv =
+                match setprivWrappedArgv command with
+                | Error error -> Error error
+                | Ok dropOrPlain ->
+                    if config.Pty.IsSome then
+                        // PTY under a cgroup: the launcher joins `cgroup.procs`, then `exec`s the
+                        // `setsid --ctty` controlling-terminal shim (with any privilege drop nested inside it,
+                        // after the privileged join). The cgroup membership is by the launcher's `$$` — which is
+                        // still the target's pid after the whole exec chain and after the helper's `setsid()` —
+                        // so limits and the controlling pty compose; `Mechanism.CgroupV2` is reported unchanged.
+                        // `ptyHostUnsupported` already resolved this helper below; re-resolving here keeps the
+                        // pinned path and the capability answer from drifting apart if it vanishes in between.
+                        match trustedHelperPath cttyHelper with
+                        | None -> Error(cttyHelperUnsupported ())
+                        | Some cttyPath -> Ok(cttyPath :: "--ctty" :: dropOrPlain)
+                    else
+                        Ok dropOrPlain
+
+            match innerArgv with
+            | Error error -> Error error
+            | Ok innerArgv -> launchWith innerArgv
 
         // The Windows-only token knobs have no POSIX equivalent and are refused first (the same gate
         // `spawnPosix` applies); a PTY then gates the same unsupported-host check as `spawnPosixPty` before
@@ -3729,6 +3881,9 @@ module internal Posix =
                 if config.Uid.IsSome || config.Gid.IsSome then
                     match privilegeDropPrecheck command with
                     | Some error -> Error error
-                    | None -> spawnDetachedPosixCore (setprivCommand command) |> remapSetprivNotFound command
+                    | None ->
+                        match setprivCommand command with
+                        | Error error -> Error error
+                        | Ok dropping -> spawnDetachedPosixCore dropping |> remapSetprivNotFound command
                 else
                     spawnDetachedPosixCore command

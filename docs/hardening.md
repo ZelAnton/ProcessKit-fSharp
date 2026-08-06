@@ -20,6 +20,7 @@ the source of truth.
 - [Capping the output flood](#capping-the-output-flood)
 - [Timeouts: total, idle, and graceful](#timeouts-total-idle-and-graceful)
 - [Dropping privileges and detaching the session](#dropping-privileges-and-detaching-the-session)
+- [Where the Unix helper binaries come from](#where-the-unix-helper-binaries-come-from)
 - [Dropping privileges on Windows](#dropping-privileges-on-windows)
 - [PTY echo and captured secrets](#pty-echo-and-captured-secrets)
 - [Clearing the inherited environment](#clearing-the-inherited-environment)
@@ -41,6 +42,7 @@ the source of truth.
 | Leaked inherited secrets in `env` | `Command.EnvClear` | [Running commands](commands.md) |
 | Secrets leaking into logs/traces/fixtures | The observability + record/replay secret invariants | [Observability](observability.md), [Testing your code](testing.md#record-and-replay) |
 | Command-line injection through a Windows legacy parser | Keep data in ordinary `Arg`/`Args`; never interpolate untrusted input into `WindowsRawArg` | [Running commands](commands.md#windows-raw-command-line-fragments) |
+| A hijacked helper binary implementing the hardening itself | Automatic: `setpriv` / `setsid` / `cmd.exe` are pinned to trusted system directories, never taken from `PATH` | [Where the Unix helper binaries come from](#where-the-unix-helper-binaries-come-from) |
 
 > **Windows raw arguments bypass the safe boundary.** `Command.WindowsRawArg`
 > appends text directly to the child's Windows command line without quoting. It
@@ -170,8 +172,53 @@ worth having at hand specifically for a hardening review:
 This whole family is **Unix-only**: on Windows, any of `Uid`/`Gid`/`Groups`/
 `Setsid`/`Umask` fails the spawn with `ProcessError.Unsupported` — never a silent
 no-op — so a cross-platform hardening path must handle that error rather than
-assume the drop happened. Windows drops privilege a different way; see the next
-section.
+assume the drop happened. Windows drops privilege a different way; see
+[Dropping privileges on Windows](#dropping-privileges-on-windows).
+
+## Where the Unix helper binaries come from
+
+Three Unix features are implemented by **executing a small helper binary** that
+does the pre-`exec` work and then `exec`s your program in place (no managed code
+may run in a forked .NET child, so this is the only safe mechanism):
+
+| Feature | Helper | What it does before your program runs |
+|---|---|---|
+| `Uid` / `Gid` / `Groups` | `setpriv` (util-linux) | sets gid, uid, and the supplementary groups |
+| `KillOnParentDeath` | `setpriv --pdeathsig` (util-linux) | arms `PR_SET_PDEATHSIG(SIGKILL)` |
+| `Pty` | `setsid --ctty` (util-linux) | new session + acquires the pty as controlling terminal |
+
+The helper is the thing that **performs** the hardening, so it is exactly the
+thing an attacker would want to replace — and on the privilege-drop path it runs
+**as root**, before the credentials it exists to lower have been lowered. A
+`setpriv` found through the calling process's `PATH` would therefore be an
+attacker-chosen program executed with the parent's full privileges.
+
+**So neither helper is ever resolved on `PATH`.** ProcessKit looks each one up
+only in a fixed list of trusted system directories — `/usr/bin`, `/bin`,
+`/usr/sbin`, `/sbin`, in that order — and launches the **absolute path** of the
+match, which means no `PATH` entry participates anywhere along the chain (`exec`
+of a path-form program performs no search). This is the same stance Windows
+already takes for the `.cmd`/`.bat` wrapper's shell, which comes from the system
+directory rather than `PATH`/`%ComSpec%`. `Command.PreferLocal` does not apply
+either: it substitutes *your* target program, never the helper that launches it.
+
+Three consequences worth knowing:
+
+- **A host with no helper in a trusted directory fails honestly**, exactly as a
+  host missing the tool outright always did: `ProcessError.Spawn` naming the knob
+  that needed `setpriv`, `ProcessError.Unsupported` for `Pty`. It never falls back
+  to a `PATH` copy, and it never runs your program with the hardening quietly
+  skipped. The typed error is the signal — handle it as "this host cannot apply
+  this measure".
+- **Non-FHS layouts are affected.** Distributions that do not install util-linux
+  into those directories (NixOS, Guix, some minimal images) get that typed failure
+  even though `setpriv` is on their `PATH`. Mainstream Linux — Debian/Ubuntu,
+  Fedora, Alpine with `util-linux` — installs both helpers under `/usr/bin`.
+- **This is a resolution boundary, not a filesystem-integrity check.** It assumes
+  the trusted directories themselves are writable only by root, which is the
+  assumption every other program on the host already makes. ProcessKit does not
+  verify their ownership or mode, and it cannot help a host where `/usr/bin` is
+  already compromised.
 
 ## Dropping privileges on Windows
 

@@ -229,7 +229,12 @@ specific external helper:
   image needs `Uid`/`Gid` dropping or `KillOnParentDeath`, install `util-linux` (`apk add util-linux`
   on Alpine) — or, for privilege dropping, drop another way (a distroless multi-stage image copying
   only the published output as a non-root `USER`, so the *container* never runs as root in the first
-  place and `Uid`/`Gid` is unnecessary).
+  place and `Uid`/`Gid` is unnecessary). Note that "present" here means present in one of the trusted
+  system directories `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`: the helper performs the hardening and
+  runs as root, so it is deliberately never resolved through `PATH` (see
+  [Hardening → Where the Unix helper binaries come from](hardening.md#where-the-unix-helper-binaries-come-from)).
+  Distribution packages install it there; a helper copied somewhere else and put on `PATH` is not
+  used, and reports the same typed failure as one that is absent.
 - **`ProcessGroupOptions` resource limits on Linux** are enforced through a private cgroup v2 whose
   self-migrating launcher is [a tiny `/bin/sh` script](platform-support.md#containment-mechanisms)
   that joins the cgroup and then `exec`s the real target in place. A shell-less image (no

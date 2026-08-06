@@ -972,10 +972,15 @@ to drop privileges in the child is unsafe), a command requesting `Uid`/`Gid` is
 rewritten to run through the **`setpriv`** helper (util-linux): it sets the gid/uid
 and either clears the supplementary groups (`--clear-groups`, the default) or sets the
 `Groups(gids)` you asked for (`--groups`), then `exec`s the real program *in place*
-(same pid, so containment is unchanged). `setpriv` ships on mainstream Linux; where it
-is absent (macOS/BSD) a `Uid`/`Gid`/`Groups` drop fails with a typed
-`ProcessError.Spawn` naming the missing helper. `Setsid` alone needs no helper (it is a
-native `posix_spawn` attribute).
+(same pid, so containment is unchanged). The helper is loaded **only** from a trusted
+system directory (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and launched by absolute
+path, never looked up on `PATH` — a `setpriv` the caller's `PATH` could point at would
+otherwise run with the caller's (often root) privileges *before* the drop; see
+[Hardening → Where the Unix helper binaries come from](hardening.md#where-the-unix-helper-binaries-come-from).
+`setpriv` ships there on mainstream Linux; where no trusted directory holds it
+(macOS/BSD, and non-FHS layouts such as NixOS) a `Uid`/`Gid`/`Groups` drop fails with a
+typed `ProcessError.Spawn` naming the missing helper. `Setsid` alone needs no helper (it
+is a native `posix_spawn` attribute).
 
 ProcessKit wires **pipes**, not a pseudo-terminal, so a tool that *demands* a tty
 — an `ssh` / `sudo` **password** prompt, some credential helpers — won't get one.

@@ -1035,3 +1035,236 @@ type WhichResolutionTests() =
             | _ -> Assert.Fail $"expected both to resolve, got command={viaCommand}, client={viaClient}"
         finally
             Directory.Delete(dir, true)
+
+/// The POSIX **security** helpers are deliberately the one thing in this library that is NOT resolved
+/// like every other program (T-317): `setpriv` (the `Command.Uid`/`Gid`/`Groups` drop and
+/// `Command.KillOnParentDeath`'s `--pdeathsig` arming) and `setsid --ctty` (`Command.Pty`'s controlling
+/// terminal) are looked up ONLY in a fixed list of trusted system directories and pinned by absolute
+/// path, never searched for on the calling process's `PATH`. The reason is the same one that makes
+/// `Native.Windows` take `cmd.exe` from `Environment.SystemDirectory` instead of `PATH`/`%ComSpec%` — a
+/// helper that can be hijacked defeats the hardening it implements — except that the POSIX case is the
+/// more privileged of the two: `setpriv` runs as root, before the credentials it exists to drop.
+///
+/// These tests pin BOTH halves of that contract: a helper reachable on `PATH` but absent from every
+/// trusted directory produces an honest typed refusal and is never executed, and a helper present in a
+/// trusted directory is run by its absolute path from there. The `setpriv` paths are driven through
+/// `Command.KillOnParentDeath`, the one knob that reaches the helper without needing root.
+///
+/// Sequential (no `[<Parallelizable>]`, as for `WhichResolutionTests` above): these tests mutate the
+/// process `PATH` (managed and native) and a process-wide test seam, both restored in a `finally`.
+[<TestFixture>]
+type TrustedHelperResolutionTests() =
+
+    let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
+
+    let freshDir (tag: string) =
+        let dir =
+            Path.Combine(Path.GetTempPath(), "processkit-helper-" + tag + "-" + Guid.NewGuid().ToString "N")
+
+        Directory.CreateDirectory dir |> ignore
+        dir
+
+    /// Write an executable POSIX stand-in for a util-linux security helper into `dir`. It records the
+    /// path it was actually invoked as (`$0`) into `markerPath`, skips its own option flags, and `exec`s
+    /// whatever target follows — a faithful enough impostor that a resolution which DID pick it up would
+    /// succeed loudly (leaving the marker behind) instead of failing in some ambiguous way. Returns the
+    /// shim's full path.
+    let writeHelperShim (dir: string) (helper: string) (markerPath: string) =
+        let path = Path.Combine(dir, helper)
+
+        let script =
+            String.concat
+                "\n"
+                [ "#!/bin/sh"
+                  "printf '%s' \"$0\" > \"" + markerPath + "\""
+                  "while [ $# -gt 0 ]; do"
+                  "  case \"$1\" in"
+                  "    --*) shift ;;"
+                  "    *) break ;;"
+                  "  esac"
+                  "done"
+                  "exec \"$@\""
+                  "" ]
+
+        File.WriteAllText(path, script)
+
+        File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+
+        path
+
+    /// The process `PATH`, never null — the native `setenv` restore takes a non-nullable string, unlike
+    /// managed `SetEnvironmentVariable`.
+    let currentPath () =
+        match Environment.GetEnvironmentVariable "PATH" with
+        | null -> ""
+        | value -> value
+
+    /// Set the process `PATH` in BOTH the managed view (which `Exec.which` reads) and the native
+    /// `environ` that the real `posix_spawnp` `PATH` search reads — the managed/native split documented
+    /// on `NativeEnv` at the top of this file. POSIX-only, as these tests are.
+    let setPath (value: string) =
+        Environment.SetEnvironmentVariable("PATH", value)
+        NativeEnv.setenv ("PATH", value, 1) |> ignore
+
+    [<Test>]
+    member _.``setpriv is loaded only from a trusted system directory, never from PATH (T-317)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore
+                    "Linux-only: KillOnParentDeath is the setpriv path reachable without root, and macOS/BSD refuse it before any helper resolution."
+
+            let pathDir = freshDir "setpriv-on-path"
+            let trustedDir = freshDir "setpriv-trusted-empty"
+            let marker = Path.Combine(pathDir, "ran.marker")
+            let shimPath = writeHelperShim pathDir "setpriv" marker
+            let originalPath = currentPath ()
+            let callerProgram: string = "/bin/sh"
+
+            try
+                setPath (pathDir + string Path.PathSeparator + originalPath)
+
+                // Premise of the test: a `setpriv` really IS reachable on the PATH the OS itself would
+                // search — this is exactly the planted-helper situation the pinning exists to defeat, not
+                // a host that simply lacks the tool.
+                let plantedFirst: string =
+                    "the planted setpriv must be the first PATH match, or this test proves nothing"
+
+                match Exec.which "setpriv" with
+                | Ok resolved -> Assert.That(resolved, Is.EqualTo shimPath, plantedFirst)
+                | Error error -> Assert.Fail $"expected the planted setpriv to be on PATH, got {error}"
+
+                // ... and no TRUSTED directory holds one.
+                Native.Posix.trustedHelperDirectoriesForTests <- Some [ trustedDir ]
+
+                let command =
+                    Command.create callerProgram
+                    |> Command.args [ "-c"; "exit 0" ]
+                    |> Command.killOnParentDeath
+
+                match! command.OutputStringAsync() with
+                | Ok result ->
+                    Assert.Fail
+                        $"the spawn must refuse when no trusted directory holds setpriv, but it ran (outcome {result.Outcome})"
+                | Error(ProcessError.Spawn(program, reason)) ->
+                    // The refusal names the CALLER's program and the knob that needed the helper — the
+                    // same honest diagnostic a host genuinely missing util-linux already produced.
+                    let namesCaller: string =
+                        "the refusal must name the caller's own program, not the helper"
+
+                    Assert.That(program, Is.EqualTo callerProgram, namesCaller)
+                    Assert.That(reason, Does.Contain "setpriv")
+                    Assert.That(reason, Does.Contain "KillOnParentDeath")
+
+                    let namesSearched: string =
+                        "the refusal must name the trusted directories actually searched"
+
+                    Assert.That(reason, Does.Contain trustedDir, namesSearched)
+                | Error other ->
+                    Assert.Fail $"expected a typed ProcessError.Spawn naming the missing setpriv, got {other}"
+
+                let neverRan: string =
+                    "a setpriv sitting on PATH must never be executed - that is the hijack this pinning prevents"
+
+                Assert.That(File.Exists marker, Is.False, neverRan)
+            finally
+                Native.Posix.trustedHelperDirectoriesForTests <- None
+                setPath originalPath
+                Directory.Delete(pathDir, true)
+                Directory.Delete(trustedDir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``setpriv found in a trusted directory runs from there, by absolute path (T-317)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore
+                    "Linux-only: KillOnParentDeath is the setpriv path reachable without root, and macOS/BSD refuse it before any helper resolution."
+
+            let trustedDir = freshDir "setpriv-trusted-hit"
+            let marker = Path.Combine(trustedDir, "ran.marker")
+            let shimPath = writeHelperShim trustedDir "setpriv" marker
+            let expectedStdout: string = "RAN"
+
+            // The PATH is deliberately left ALONE here: it still holds the host's real
+            // `/usr/bin/setpriv`, so a resolution that fell back to `PATH` would run that one and never
+            // touch this shim. The marker is therefore positive proof that the trusted list — not
+            // `PATH` — decided, and its contents prove the helper was invoked by its absolute path.
+            try
+                Native.Posix.trustedHelperDirectoriesForTests <- Some [ trustedDir ]
+
+                let command =
+                    Command.create "/bin/sh"
+                    |> Command.args [ "-c"; "printf RAN" ]
+                    |> Command.killOnParentDeath
+
+                match! command.OutputStringAsync() with
+                | Error error -> Assert.Fail $"the trusted-directory setpriv must be used, got {error}"
+                | Ok result ->
+                    // The shim `exec`s the target in place, so the target's own output and exit code are
+                    // what the run reports — the same in-place composition the real helper provides.
+                    Assert.That(result.Stdout, Is.EqualTo expectedStdout)
+                    Assert.That(result.Code, Is.EqualTo(Some 0))
+
+                    let ranFromTrusted: string =
+                        "the helper in the trusted directory must be the one that ran"
+
+                    Assert.That(File.Exists marker, Is.True, ranFromTrusted)
+
+                    let pinnedAbsolute: string =
+                        "the helper must be launched by the absolute path resolved from the trusted directory"
+
+                    Assert.That(File.ReadAllText marker, Is.EqualTo shimPath, pinnedAbsolute)
+            finally
+                Native.Posix.trustedHelperDirectoriesForTests <- None
+                Directory.Delete(trustedDir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the setsid ctty helper is loaded only from a trusted directory, never from PATH (T-317)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore
+                    "Linux-only: the pty ctty helper path needs a Linux host with /dev/ptmx; macOS/BSD have no such helper at all."
+
+            let pathDir = freshDir "setsid-on-path"
+            let trustedDir = freshDir "setsid-trusted-empty"
+            let marker = Path.Combine(pathDir, "ran.marker")
+            writeHelperShim pathDir "setsid" marker |> ignore
+            let originalPath = currentPath ()
+
+            try
+                setPath (pathDir + string Path.PathSeparator + originalPath)
+                Native.Posix.trustedHelperDirectoriesForTests <- Some [ trustedDir ]
+
+                let command =
+                    Command.create "/bin/sh" |> Command.args [ "-c"; "exit 0" ] |> Command.pty
+
+                match! command.OutputStringAsync() with
+                | Ok result ->
+                    Assert.Fail
+                        $"a PTY must be Unsupported when no trusted directory holds setsid, but it ran (outcome {result.Outcome})"
+                | Error(ProcessError.Unsupported reason) ->
+                    // The same honest capability answer a host genuinely without the helper gets — never a
+                    // socketpair pretending to be a tty, and never a `setsid` picked up off PATH.
+                    Assert.That(reason, Does.Contain "Pty")
+                    Assert.That(reason, Does.Contain "setsid")
+
+                    let namesSearched: string =
+                        "the refusal must name the trusted directories actually searched"
+
+                    Assert.That(reason, Does.Contain trustedDir, namesSearched)
+                | Error other -> Assert.Fail $"expected a typed ProcessError.Unsupported for the PTY, got {other}"
+
+                let neverRan: string =
+                    "a setsid sitting on PATH must never become the controlling-terminal helper"
+
+                Assert.That(File.Exists marker, Is.False, neverRan)
+            finally
+                Native.Posix.trustedHelperDirectoriesForTests <- None
+                setPath originalPath
+                Directory.Delete(pathDir, true)
+                Directory.Delete(trustedDir, true)
+        }
+        :> Task
