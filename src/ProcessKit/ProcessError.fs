@@ -134,7 +134,7 @@ type ProcessError =
             | None, Some _, _ -> $"'{program}' produced too much byte output ({totalBytes} bytes)"
             | None, None, events when events > 0 ->
                 $"'{program}' produced too many events ({events} events / {totalBytes} bytes)"
-            | None, None, _ -> $"'{program}' produced too much protocol output ({totalBytes} bytes)"
+            | None, None, _ -> $"'{program}' produced too much output ({totalBytes} bytes)"
         | ProcessError.Stdin(program, detail) -> $"could not read the stdin source for '{program}': {detail}"
         | ProcessError.ResourceLimit detail -> $"resource limit could not be enforced: {detail}"
         | ProcessError.Adopt(pid, detail) -> $"could not adopt process {pid} into the group: {detail}"
