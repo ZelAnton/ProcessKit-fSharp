@@ -212,8 +212,16 @@ Three consequences worth knowing:
   this measure".
 - **Non-FHS layouts are affected.** Distributions that do not install util-linux
   into those directories (NixOS, Guix, some minimal images) get that typed failure
-  even though `setpriv` is on their `PATH`. Mainstream Linux — Debian/Ubuntu,
-  Fedora, Alpine with `util-linux` — installs both helpers under `/usr/bin`.
+  even though `setpriv` is on their `PATH`. Mainstream Linux does install both
+  helpers into a trusted directory — but not always the *same* one, which is why
+  the list carries `/usr/bin` **and** `/bin`. Debian/Ubuntu and Fedora put both
+  under `/usr/bin`; Alpine's `util-linux` package puts `setsid` under `/usr/bin`
+  and **`setpriv` under `/bin`** (verified in
+  `mcr.microsoft.com/dotnet/sdk:10.0-alpine`, the image this project's own Alpine
+  CI leg uses). On a merged-`/usr` host the two paths resolve to one directory, so
+  `/bin` can look redundant there — it is not: dropping it would break privilege
+  dropping and `KillOnParentDeath` on Alpine/musl. When validating your own image,
+  check for the helper in **any** of the four directories, not just `/usr/bin`.
 - **This is a resolution boundary, not a filesystem-integrity check.** It assumes
   the trusted directories themselves are writable only by root, which is the
   assumption every other program on the host already makes. ProcessKit does not

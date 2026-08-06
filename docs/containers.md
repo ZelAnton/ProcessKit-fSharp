@@ -234,7 +234,10 @@ specific external helper:
   runs as root, so it is deliberately never resolved through `PATH` (see
   [Hardening → Where the Unix helper binaries come from](hardening.md#where-the-unix-helper-binaries-come-from)).
   Distribution packages install it there; a helper copied somewhere else and put on `PATH` is not
-  used, and reports the same typed failure as one that is absent.
+  used, and reports the same typed failure as one that is absent. Which of the four directories it
+  lands in varies by distribution, so check for it in all of them rather than in `/usr/bin` alone:
+  `apk add util-linux` on Alpine installs `setsid` as `/usr/bin/setsid` but `setpriv` as
+  `/bin/setpriv` (both trusted), while Debian/Ubuntu and Fedora put both under `/usr/bin`.
 - **`ProcessGroupOptions` resource limits on Linux** are enforced through a private cgroup v2 whose
   self-migrating launcher is [a tiny `/bin/sh` script](platform-support.md#containment-mechanisms)
   that joins the cgroup and then `exec`s the real target in place. A shell-less image (no

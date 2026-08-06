@@ -2164,10 +2164,15 @@ module internal Posix =
     // TARGET program (`applyPreferLocal`) and never the security helper that launches it.
     //
     // The list is `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` — the FHS locations of util-linux, with the
-    // user-command directories first because both helpers are `bin` (not `sbin`) tools; on a
-    // merged-`/usr` host the first two are the same directory. `/usr/local/bin` and friends are
-    // deliberately absent: they are the conventional home of locally-installed, more widely writable
-    // software, which is the very thing this pinning exists to exclude. This is a resolution boundary,
+    // user-command directories first because both helpers are `bin` (not `sbin`) tools. `/bin` is NOT a
+    // redundant duplicate of `/usr/bin` and must not be dropped as one: on a merged-`/usr` host
+    // (Debian/Ubuntu, Fedora) the two do resolve to the same directory, but on Alpine/musl they do not —
+    // its `util-linux` package installs `setsid` into `/usr/bin` and `setpriv` into `/bin` (verified in
+    // `mcr.microsoft.com/dotnet/sdk:10.0-alpine`, the image this repository's own Alpine CI leg and
+    // `scripts/test-linux.ps1 -Alpine` use), so removing `/bin` would break every uid/gid drop and every
+    // `--pdeathsig` arming there. `/usr/local/bin` and friends are deliberately absent: they are the
+    // conventional home of locally-installed, more widely writable software, which is the very thing
+    // this pinning exists to exclude. This is a resolution boundary,
     // not a filesystem-integrity check: it assumes the trusted directories themselves are only writable
     // by root, exactly as every other program on the host already assumes.
     //
@@ -2218,6 +2223,13 @@ module internal Posix =
     let private trustedHelperPath (helper: string) : string option =
         trustedHelperDirectoriesInUse ()
         |> List.tryPick (fun directory -> probeDir "" directory helper)
+
+    /// Test seam (internal, not public API): the very resolution the spawn paths use, exposed read-only so
+    /// a test can gate on the REAL precondition — "this host can actually load the helper" — instead of an
+    /// `Exec.which` lookup, which since the pinning no longer implies usable (a host carrying `setpriv`
+    /// only on its `PATH` is REFUSED by design, and a `PATH`-gated test would turn that correct refusal
+    /// into a red run). Returns the absolute path that would be launched, or `None`.
+    let trustedHelperPathForTests (helper: string) : string option = trustedHelperPath helper
 
     [<DllImport("libc", SetLastError = true)>]
     extern int private geteuid()

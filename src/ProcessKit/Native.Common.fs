@@ -237,8 +237,8 @@ module internal Common =
     /// `PATH` to walk for a bare name, the `PATHEXT` governing Windows extension probing, and the
     /// prefer-local directories to search first (each already anchored — a relative one against the
     /// command's working directory). Built either from the current process environment (`processContext`,
-    /// backing `Exec.which`/`CliClient.EnsureAvailableAsync` and the POSIX `setsid` probe) or from a
-    /// command's EFFECTIVE child environment + prefer-local (`commandContext`, backing
+    /// backing `Exec.which`/`CliClient.EnsureAvailableAsync`) or from a command's EFFECTIVE child
+    /// environment + prefer-local (`commandContext`, backing
     /// `Command.ResolveProgram`/`CliClient.ResolveProgram` and the spawn's own `NotFound` diagnostic).
     /// Neither context ever resolves the POSIX security helpers (`setpriv`/`setsid`): those are pinned to
     /// a fixed trusted directory list by `Native.Posix.trustedHelperPath`, which reuses `probeDir` alone.

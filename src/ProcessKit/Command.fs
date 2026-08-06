@@ -203,8 +203,9 @@ type internal CommandConfig =
       // requests either is rewritten to run through the `setpriv` helper (util-linux) on the ordinary
       // `posix_spawn` path (see `Native.Posix.setprivCommand`): `setpriv` sets the gid before the uid and
       // clears the parent's supplementary groups, then `exec`s the real program. A non-root caller asking
-      // for a different id is rejected up front with `ProcessError.Spawn`; a missing `setpriv` is a typed
-      // `ProcessError.Spawn`.
+      // for a different id is rejected up front with `ProcessError.Spawn`; so is a `setpriv` that no
+      // trusted system directory (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) holds — the helper is never
+      // resolved on `PATH`, so being reachable there is not enough (see `Native.Posix.trustedHelperPath`).
       Uid: int option
       Gid: int option
       // Unix privilege drop: the child's supplementary groups, REPLACING the inherited set — the third
@@ -260,8 +261,10 @@ type internal CommandConfig =
       // tty, contradicting a PTY's controlling tty), and only as a standalone run or the last stage of a
       // pipeline. Windows: ConPTY (`CreatePseudoConsole`, Windows 10 1809+; older hosts fail the spawn
       // with a typed `ProcessError.Unsupported`, never a silent pipe downgrade). POSIX: `openpty` +
-      // `setsid --ctty` (util-linux); a host without the ctty helper or the pty devfs (macOS/BSD) is a
-      // typed `ProcessError.Unsupported`, never a socketpair pretending to be a tty. See `Command.Pty`.
+      // `setsid --ctty` (util-linux, loaded only from a trusted system directory and never from `PATH`,
+      // as for the `setpriv` helper above); a host with the ctty helper in no trusted directory, or
+      // without the pty devfs (macOS/BSD), is a typed `ProcessError.Unsupported`, never a socketpair
+      // pretending to be a tty. See `Command.Pty`.
       Pty: PtyConfig option
       Logger: ILogger option
       // A per-run correlation id, stamped once at the verb layer so a run's log/trace events (and its
@@ -1355,10 +1358,21 @@ type Command internal (config: CommandConfig) =
     /// supplementary groups before `exec`ing the real program in place. Dropping to another user is
     /// **root-only** (`euid == 0`): a non-root caller asking for a different uid fails the spawn with
     /// `ProcessError.Spawn` (never a child that kept the parent's uid) — including one holding
-    /// `CAP_SETUID`/`CAP_SETGID`, which the up-front check conservatively refuses rather than probes — as
-    /// does a host with no `setpriv`
-    /// (mainstream Linux has it; macOS/BSD do not). `uid` must be non-negative (rejected with
-    /// `ArgumentOutOfRangeException` at the builder boundary). Pair with `Gid` (or `User`) for a full drop.
+    /// `CAP_SETUID`/`CAP_SETGID`, which the up-front check conservatively refuses rather than probes.
+    ///
+    /// **Where the helper comes from.** `setpriv` performs the drop while still running with the parent's
+    /// (usually root) credentials, so it is never resolved on `PATH`: it is loaded only from a fixed list
+    /// of trusted system directories — `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, in that order — and
+    /// launched by the absolute path of the match. A host that holds `setpriv` in **none** of them fails
+    /// the spawn with the same typed `ProcessError.Spawn`, *even when `setpriv` is present on the `PATH`*:
+    /// mainstream Linux installs it in a trusted directory (Debian/Ubuntu and Fedora in `/usr/bin`,
+    /// Alpine's `util-linux` in `/bin`), a non-FHS layout such as NixOS or Guix does not, and macOS/BSD
+    /// have no util-linux at all. `Command.PreferLocal` never applies to the helper either — it
+    /// substitutes your own target program. See `docs/hardening.md`, "Where the Unix helper binaries come
+    /// from".
+    ///
+    /// `uid` must be non-negative (rejected with `ArgumentOutOfRangeException` at the builder boundary).
+    /// Pair with `Gid` (or `User`) for a full drop.
     member _.Uid(uid: int) =
         ArgumentOutOfRangeException.ThrowIfNegative uid
         CommandConfig.ensureNoWindowsTokenHardening config "Uid"
@@ -1395,8 +1409,10 @@ type Command internal (config: CommandConfig) =
     /// need not name existing `/etc/group` entries. Because it rides the same `setpriv` helper as the
     /// uid/gid drop (mapped to `setpriv --groups`), it is meaningful only **alongside a `Uid` or `Gid`
     /// drop**: `Groups` set without either is refused at spawn with `ProcessError.Spawn` rather than
-    /// silently ignored (never a silent no-op). **Unix-only:** on Windows (no equivalent) a set value
-    /// fails the spawn with `ProcessError.Unsupported`, exactly like `Uid`/`Gid`. Every gid must be
+    /// silently ignored (never a silent no-op) — and it inherits that helper's trusted-directory
+    /// resolution, so a host carrying `setpriv` only on its `PATH` refuses this drop too (see `Uid`).
+    /// **Unix-only:** on Windows (no equivalent) a set value fails the spawn with
+    /// `ProcessError.Unsupported`, exactly like `Uid`/`Gid`. Every gid must be
     /// non-negative — rejected with `ArgumentOutOfRangeException` at the builder boundary, naming the
     /// offending element by index (`Groups[2]`).
     member _.Groups(gids: seq<int>) =
@@ -1501,9 +1517,12 @@ type Command internal (config: CommandConfig) =
     ///   `execve`s a **set-uid/set-gid** image, so for a `sudo`-like child the signal only holds up to that
     ///   `exec`. And because the signal is delivered when the **spawning thread** (not merely the process)
     ///   exits, and ProcessKit spawns on a thread-pool thread that .NET may retire while the process lives,
-    ///   the reap is best-effort: it can fire early if that thread is reclaimed. Where `setpriv` is absent
-    ///   (a minimal image) the spawn fails with a typed `ProcessError.Spawn` naming the helper, never a
-    ///   silently un-armed child.
+    ///   the reap is best-effort: it can fire early if that thread is reclaimed. The helper is loaded only
+    ///   from a trusted system directory (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and launched by
+    ///   absolute path, never resolved on `PATH` — see `Uid` for why. Where no trusted directory holds
+    ///   `setpriv` — a minimal image, or a non-FHS layout such as NixOS/Guix that keeps it only on the
+    ///   `PATH` — the spawn fails with a typed `ProcessError.Spawn` naming the helper, never a silently
+    ///   un-armed child.
     /// - **macOS/BSD — unsupported.** There is no `PR_SET_PDEATHSIG` analog, so a set value fails the spawn
     ///   with `ProcessError.Unsupported` rather than pretending the cleanup will happen.
     member _.KillOnParentDeath() =
@@ -1534,9 +1553,12 @@ type Command internal (config: CommandConfig) =
     ///
     /// **Platform support (typed, never a silent downgrade).** Windows: ConPTY, needing Windows 10 1809+;
     /// an older host fails the spawn with `ProcessError.Unsupported "Pty (needs Windows 10 1809+ /
-    /// ConPTY)"`. POSIX: a real controlling pty via `openpty` + the `setsid --ctty` helper (util-linux);
-    /// a host missing that ctty helper or the pty devfs (macOS/BSD) fails with `ProcessError.Unsupported`,
-    /// never a socketpair silently pretending to be a tty.
+    /// ConPTY)"`. POSIX: a real controlling pty via `openpty` + the `setsid --ctty` helper (util-linux),
+    /// which — like the `setpriv` helper behind `Uid` — is loaded only from a trusted system directory
+    /// (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and launched by absolute path, never resolved on `PATH`.
+    /// A host with `setsid` in none of those directories (a non-FHS layout such as NixOS/Guix, *even with
+    /// `setsid` on its `PATH`*) or without the pty devfs (macOS/BSD) fails with
+    /// `ProcessError.Unsupported`, never a socketpair silently pretending to be a tty.
     ///
     /// **Secret-safety.** A terminal echoes typed input into its captured output by default — see
     /// `PtyConfig` for the echo footgun and the `Echo` flag. argv/env values and any PTY credentials are

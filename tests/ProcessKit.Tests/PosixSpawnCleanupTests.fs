@@ -380,10 +380,21 @@ type PosixSpawnCleanupTests() =
             if not isLinux then
                 Assert.Ignore "Linux-only: PR_SET_PDEATHSIG is armed via the util-linux 'setpriv --pdeathsig' helper"
 
-            match Exec.which "setpriv", Exec.which "python3" with
-            | Error _, _ -> Assert.Ignore "requires the util-linux 'setpriv' helper on PATH"
+            // The `setpriv` precondition is the library's OWN resolution rule, not an `Exec.which` PATH
+            // lookup: since T-317 the helper is loaded only from a trusted system directory (`/usr/bin`,
+            // `/bin`, `/usr/sbin`, `/sbin`) and never from `PATH`, so "on PATH" no longer implies usable.
+            // A non-FHS host (NixOS/Guix, a custom image with util-linux under /usr/local/bin) resolves
+            // `Exec.which "setpriv"` fine and is then refused with a typed `ProcessError.Spawn` — exactly
+            // the intended behaviour — which a PATH-based gate would report as a failed test instead of an
+            // ignored one. Asking the resolver itself keeps the gate and the contract in lockstep, and
+            // keeps the assertion strict wherever the helper really is loadable. `python3` stays a plain
+            // `which`: it is the ordinary target program, resolved on PATH like any other.
+            match Native.Posix.trustedHelperPathForTests "setpriv", Exec.which "python3" with
+            | None, _ ->
+                Assert.Ignore
+                    "requires the util-linux 'setpriv' helper in a trusted system directory (/usr/bin, /bin, /usr/sbin, /sbin) - a PATH copy is deliberately not used"
             | _, Error _ -> Assert.Ignore "requires 'python3' on PATH to read PR_GET_PDEATHSIG"
-            | Ok _, Ok _ ->
+            | Some _, Ok _ ->
                 // The child reads its OWN parent-death signal (PR_GET_PDEATHSIG = 2) and prints it. If
                 // ProcessKit wired KillOnParentDeath correctly it must be SIGKILL (9): setpriv armed it and
                 // the signal survived setpriv's execve of (non-set-uid) python3.
@@ -400,7 +411,9 @@ type PosixSpawnCleanupTests() =
 
                 match! cmd.OutputStringAsync() with
                 | Ok result -> Assert.That(result.Stdout.Trim(), Is.EqualTo expected)
-                | Error err -> Assert.Fail $"KillOnParentDeath spawn failed on Linux: {err.Message}"
+                | Error err ->
+                    Assert.Fail
+                        $"KillOnParentDeath spawn failed on Linux although setpriv resolved from a trusted directory: {err.Message}"
         }
 
     [<Test>]

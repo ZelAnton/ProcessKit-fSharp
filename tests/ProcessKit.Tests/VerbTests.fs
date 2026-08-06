@@ -384,6 +384,13 @@ type VerbTests() =
                 // Dropping to another uid/gid needs privilege; without root setuid/setgid would EPERM, so
                 // the drop is not exercisable here. Skipped explicitly (never a silent always-pass).
                 Assert.Ignore "Dropping to another uid/gid requires root; skipping as an unprivileged user."
+            elif (Native.Posix.trustedHelperPathForTests "setpriv").IsNone then
+                // The drop runs through `setpriv`, which is loaded ONLY from a trusted system directory and
+                // never from `PATH` (T-317). A host that keeps util-linux elsewhere is refused by design, so
+                // gate on the library's own resolution — an `Exec.which` gate would turn that deliberate,
+                // correct refusal into a failing test.
+                Assert.Ignore
+                    "The privilege drop needs the util-linux 'setpriv' helper in a trusted system directory (/usr/bin, /bin, /usr/sbin, /sbin)."
             else
                 // As root, drop to uid/gid 1 and have the child report its own euid via `id -u`. A correct
                 // fork + setgid + setuid before exec makes it print "1". Uid 1 exists on every POSIX system,
@@ -451,6 +458,11 @@ type VerbTests() =
                 // EPERM, so the real membership change is not exercisable here. Skipped explicitly.
                 Assert.Ignore
                     "Setting supplementary groups requires root (CAP_SETGID); skipping as an unprivileged user."
+            elif (Native.Posix.trustedHelperPathForTests "setpriv").IsNone then
+                // Same trusted-directory precondition as the uid/gid drop above: the helper is never taken
+                // from `PATH`, so "reachable on PATH" is not the rule this test may gate on.
+                Assert.Ignore
+                    "Setting supplementary groups needs the util-linux 'setpriv' helper in a trusted system directory (/usr/bin, /bin, /usr/sbin, /sbin)."
             else
                 // As root, drop to uid/gid 1 AND set two supplementary groups, then have the child report
                 // its full group set via `id -G`. setpriv applies the numeric gids verbatim (no /etc/group
