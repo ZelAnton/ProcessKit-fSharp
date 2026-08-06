@@ -646,7 +646,7 @@ type StreamingTests() =
             let! error = processError drain
 
             match error with
-            | Some(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes)) ->
+            | Some((ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes) as overflow)) ->
                 Assert.That(lineLimit, Is.EqualTo None, "a raw stdout byte chunk is not a line")
                 Assert.That(byteLimit, Is.EqualTo None, "the channel's capacity bounds queued chunks, not bytes")
                 Assert.That(totalLines, Is.EqualTo 0)
@@ -656,6 +656,9 @@ type StreamingTests() =
                     Is.GreaterThan 0,
                     "TotalBytes must report the real cumulative chunk bytes, not the hardcoded 0"
                 )
+
+                Assert.That(overflow.Message, Does.Contain("produced too much output"))
+                Assert.That(overflow.Message, Does.Not.Contain("protocol"))
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
         }
         :> Task

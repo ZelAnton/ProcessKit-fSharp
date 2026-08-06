@@ -389,10 +389,7 @@ type ContentLengthSessionTests() =
 
                 Assert.That(totalBytes, Is.EqualTo expectedBytes)
 
-                Assert.That(
-                    overflow.Message,
-                    Is.EqualTo("'language-server' produced too much protocol output (12 bytes)")
-                )
+                Assert.That(overflow.Message, Is.EqualTo("'language-server' produced too much output (12 bytes)"))
 
                 Assert.That(overflow.Message, Does.Not.Contain("line"))
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
