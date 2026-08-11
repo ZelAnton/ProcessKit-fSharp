@@ -1218,8 +1218,10 @@ pinned, so it can never describe an already-recycled process.
   session** (`setsid`, POSIX). Nothing this process does — `Dispose`, GC, or dying —
   reaches it. `ProcessGroup`-level knobs (`ResourceLimits`, `ProcessGroupOptions`) are not
   merely ignored: they live on the container this verb refuses to create.
-- **No exit.** Nobody waits on it, so there is no `Outcome`, no exit code, no duration,
-  and no `ProcessResult`. Its exit is invisible to this process by construction.
+- **No public exit.** `DetachedProcess` has no wait operation or `Outcome`, exit code, duration,
+  or `ProcessResult`. On POSIX, a private reaper consumes the direct leader's wait status while this
+  process lives solely to prevent zombies; that internal ownership is not exposed as lifecycle control.
+  Windows does not observe the detached child's exit.
 - **No output.** There is no parent left to drain a pipe, so `StdioMode.Piped` — the
   builder default — is wired to the **null device** here. Keep output with
   `StdoutToFile`/`StderrToFile` (the child writes the file itself, with no pump), or share

@@ -46,10 +46,11 @@ module internal Common =
 
     /// A freshly spawned **detached** child (`Command.LaunchDetached`) — the deliberate opt-out from
     /// containment. Deliberately unlike `Spawned`: there is no handle to hold, no stream to pump and no
-    /// PTY control, because nothing in the library waits on, signals, or kills this process. Only the two
-    /// identity facts the platform layer can capture while the pid is still pinned (Windows: our own open
-    /// process handle; POSIX: the unreaped child) survive the launch, and the verb layer turns them into
-    /// the public `DetachedProcess`.
+    /// PTY control. The public detached descriptor owns no wait, signal, kill, or other lifetime control;
+    /// on POSIX, a private reaper owns the exit-status wait after the identity snapshot is captured. Only
+    /// the two identity facts the platform layer can capture while the pid is still pinned (Windows: our
+    /// own open process handle; POSIX: the direct child before handoff) survive the launch, and the verb
+    /// layer turns them into the public `DetachedProcess`.
     type DetachedSpawn =
         {
             /// The OS process id of the detached child.

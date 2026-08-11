@@ -89,7 +89,9 @@ type DetachedLaunchTests() =
                 let closeParen = stat.LastIndexOf ')'
 
                 if closeParen >= 0 then
-                    let fields = stat.Substring(closeParen + 1).Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)
+                    let fields =
+                        stat.Substring(closeParen + 1).Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)
+
                     if fields.Length > 0 then Some fields[0] else Some "?"
                 else
                     Some "?"
@@ -251,18 +253,20 @@ type DetachedLaunchTests() =
 
             try
                 for index in 1..32 do
-                    let command =
-                        Command.create "/bin/sh"
-                        |> Command.args [ "-c"; "exit 0" ]
+                    let command = Command.create "/bin/sh" |> Command.args [ "-c"; "exit 0" ]
 
                     let pid =
                         match command.LaunchDetached() with
                         | Ok detached ->
                             Assert.That(seen.Add detached.Pid, Is.True, $"detached pid was reused at iteration {index}")
                             detached.Pid
-                        | Error error -> Assert.Fail $"short-lived detached spawn {index} failed: {error}"; 0
+                        | Error error ->
+                            Assert.Fail $"short-lived detached spawn {index} failed: {error}"
+                            0
 
-                    let reaped = waitUntil (TimeSpan.FromSeconds 2.0) (fun () -> procState pid |> Option.isNone)
+                    let reaped =
+                        waitUntil (TimeSpan.FromSeconds 2.0) (fun () -> procState pid |> Option.isNone)
+
                     let state = procState pid |> Option.defaultValue "gone"
 
                     Assert.That(

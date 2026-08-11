@@ -317,8 +317,11 @@ module internal Posix =
     /// Test seam (internal, not public API): can force detached-reaper preparation or handoff to fail
     /// after the test has arranged the child state. Returning `Ok ()` delegates to the real private reaper;
     /// returning `Error` exercises the typed pre-spawn or post-spawn unwind without bypassing ownership.
-    let mutable detachedReaperPrepareForTests: (unit -> Result<unit, string>) option = None
-    let mutable detachedReaperHandoffForTests: (int -> Result<unit, string>) option = None
+    let mutable detachedReaperPrepareForTests: (unit -> Result<unit, string>) option =
+        None
+
+    let mutable detachedReaperHandoffForTests: (int -> Result<unit, string>) option =
+        None
 
     /// Test seam (internal, not public API): overrides the by-number process-group liveness probe
     /// (`killpg(pgid, 0)`), so a pid/pgid-reuse scenario — a recycled number that still probes alive —
@@ -360,11 +363,12 @@ module internal Posix =
         None
 
     [<NoComparison; NoEquality>]
-    type private DetachedReaperState =
-        { Queue: BlockingCollection<int> }
+    type private DetachedReaperState = { Queue: BlockingCollection<int> }
 
     let private detachedReaperInitLock = obj ()
-    let mutable private detachedReaperState: Result<DetachedReaperState, string> option = None
+
+    let mutable private detachedReaperState: Result<DetachedReaperState, string> option =
+        None
 
     // Polling is deliberately bounded: a live child is revisited at this interval, and a transient waitpid
     // error leaves the pid in `owned` for the same next pass. The owner is never dropped just because one
@@ -460,7 +464,7 @@ module internal Posix =
             try
                 match hook () with
                 | Error message -> Error message
-                | Ok () -> prepareDetachedReaperCore ()
+                | Ok() -> prepareDetachedReaperCore ()
             with ex ->
                 Error $"detached reaper preparation hook failed: {ex.Message}"
         | None -> prepareDetachedReaperCore ()
@@ -485,7 +489,7 @@ module internal Posix =
             try
                 match hook pid with
                 | Error message -> Error message
-                | Ok () -> handoffDetachedReaperCore pid
+                | Ok() -> handoffDetachedReaperCore pid
             with ex ->
                 Error $"detached reaper handoff hook failed: {ex.Message}"
         | None -> handoffDetachedReaperCore pid
@@ -3950,18 +3954,25 @@ module internal Posix =
                         // uses a sentinel pair only to keep the existing unwind below single-shaped; the
                         // preparation error is selected before the spawn result is inspected.
                         let reaperPreparation = prepareDetachedReaper ()
+
                         let reaperPreparationError =
                             match reaperPreparation with
-                            | Error message -> Some(ProcessError.Spawn(command.Program, $"could not prepare detached POSIX reaper: {message}"))
-                            | Ok () -> None
+                            | Error message ->
+                                Some(
+                                    ProcessError.Spawn(
+                                        command.Program,
+                                        $"could not prepare detached POSIX reaper: {message}"
+                                    )
+                                )
+                            | Ok() -> None
 
                         // `umask(2)` is a whole-process attribute with no posix_spawn attribute, so it is
                         // set on the parent around the spawn under the SAME lock every other spawn takes —
                         // a concurrent no-mask spawn must never observe this one's temporary umask.
                         let rc, pid =
-                            if reaperPreparationError.IsSome then
-                                0, 0
-                            else
+                            match reaperPreparationError with
+                            | Some _ -> 0, 0
+                            | None ->
                                 lock umaskSpawnLock (fun () ->
                                     match config.Umask with
                                     | None -> spawnUnderLock ()
@@ -3975,64 +3986,63 @@ module internal Posix =
 
                         closeChildSideFds ()
 
-                        if reaperPreparationError.IsSome then
-                            Error(Option.get reaperPreparationError)
-                        elif rc <> 0 then
-                            if rc = ENOENT then
-                                Error(notFoundFromSpawnFailure command)
+                        match reaperPreparationError with
+                        | Some error -> Error error
+                        | None ->
+                            if rc <> 0 then
+                                if rc = ENOENT then
+                                    Error(notFoundFromSpawnFailure command)
+                                else
+                                    Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
                             else
-                                Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
-                        else
-                            // The child is running and detached. The ONLY thing that can still fail is the
-                            // post-spawn priority nudge; a refused one must not leave a detached child
-                            // running at an unintended priority (there would be no handle to fix it with
-                            // afterwards), so it is killed and reaped — the one teardown on this path, and
-                            // a fault path only, never part of the normal lifetime.
-                            let priorityRc =
-                                match config.Priority with
-                                | None -> 0
-                                | Some priority ->
-                                    match setpriorityForTests with
-                                    | Some hook -> hook PRIO_PROCESS pid (PriorityMapping.niceValue priority)
-                                    | None -> setpriority (PRIO_PROCESS, pid, PriorityMapping.niceValue priority)
+                                // The child is running and detached. The ONLY thing that can still fail is the
+                                // post-spawn priority nudge; a refused one must not leave a detached child
+                                // running at an unintended priority (there would be no handle to fix it with
+                                // afterwards), so it is killed and reaped — the one teardown on this path, and
+                                // a fault path only, never part of the normal lifetime.
+                                let priorityRc =
+                                    match config.Priority with
+                                    | None -> 0
+                                    | Some priority ->
+                                        match setpriorityForTests with
+                                        | Some hook -> hook PRIO_PROCESS pid (PriorityMapping.niceValue priority)
+                                        | None -> setpriority (PRIO_PROCESS, pid, PriorityMapping.niceValue priority)
 
-                            if priorityRc <> 0 then
-                                let errno = Marshal.GetLastWin32Error()
-                                // POSIX_SPAWN_SETSID makes the fresh leader both the session leader and
-                                // process-group leader, so kill the whole detached session rather than
-                                // only the leader. The leader is still our unreaped direct child here;
-                                // reapLeader's waitpid therefore remains identity-safe and can never reap
-                                // a recycled or unrelated process.
-                                killProcessGroup pid
-                                reapLeader pid
+                                if priorityRc <> 0 then
+                                    let errno = Marshal.GetLastWin32Error()
+                                    // POSIX_SPAWN_SETSID makes the fresh leader both the session leader and
+                                    // process-group leader, so kill the whole detached session rather than
+                                    // only the leader. The leader is still our unreaped direct child here;
+                                    // reapLeader's waitpid therefore remains identity-safe and can never reap
+                                    // a recycled or unrelated process.
+                                    killProcessGroup pid
+                                    reapLeader pid
 
-                                Error(
-                                    ProcessError.Spawn(
-                                        command.Program,
-                                        $"could not set process priority via setpriority (errno {errno}); raising priority may require privilege (CAP_SYS_NICE)"
-                                    )
-                                )
-                            else
-                                // Capture the identity pair before handoff: the child is still pinned by its
-                                // unreaped direct-child status, so the pair cannot describe a recycled pid.
-                                let startTime = readProcessStartTime pid
-
-                                match handoffDetachedReaper pid with
-                                | Ok () ->
-                                    Ok
-                                        { Pid = pid
-                                          StartTime = startTime }
-                                | Error message ->
-                                    // The queue did not accept ownership, so this caller is still the sole
-                                    // waiter. Do not return an error until the fresh session is gone and the
-                                    // direct leader has been synchronously reaped.
-                                    terminateAndReapDetached pid
                                     Error(
                                         ProcessError.Spawn(
                                             command.Program,
-                                            $"could not hand off detached child to POSIX reaper: {message}"
+                                            $"could not set process priority via setpriority (errno {errno}); raising priority may require privilege (CAP_SYS_NICE)"
                                         )
                                     )
+                                else
+                                    // Capture the identity pair before handoff: the child is still pinned by its
+                                    // unreaped direct-child status, so the pair cannot describe a recycled pid.
+                                    let startTime = readProcessStartTime pid
+
+                                    match handoffDetachedReaper pid with
+                                    | Ok() -> Ok { Pid = pid; StartTime = startTime }
+                                    | Error message ->
+                                        // The queue did not accept ownership, so this caller is still the sole
+                                        // waiter. Do not return an error until the fresh session is gone and the
+                                        // direct leader has been synchronously reaped.
+                                        terminateAndReapDetached pid
+
+                                        Error(
+                                            ProcessError.Spawn(
+                                                command.Program,
+                                                $"could not hand off detached child to POSIX reaper: {message}"
+                                            )
+                                        )
                 finally
                     if fileActionsReady then
                         posix_spawn_file_actions_destroy fileActions |> ignore

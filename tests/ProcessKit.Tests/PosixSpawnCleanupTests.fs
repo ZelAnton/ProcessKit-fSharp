@@ -199,7 +199,9 @@ type PosixSpawnCleanupTests() =
             if isWindows then
                 Assert.Ignore "POSIX-only: exercises the pre-spawn detached reaper preparation gate"
 
-            let marker = Path.Combine(Path.GetTempPath(), $"pk-detached-prepare-{Guid.NewGuid():N}.marker")
+            let marker =
+                Path.Combine(Path.GetTempPath(), $"pk-detached-prepare-{Guid.NewGuid():N}.marker")
+
             let command =
                 Command.create "/bin/sh"
                 |> Command.args [ "-c"; $"echo launched > {quoteShellPath marker}" ]
@@ -234,8 +236,12 @@ type PosixSpawnCleanupTests() =
             if isWindows then
                 Assert.Ignore "POSIX-only: exercises the post-spawn detached reaper handoff unwind"
 
-            let ready = Path.Combine(Path.GetTempPath(), $"pk-detached-handoff-{Guid.NewGuid():N}.ready")
-            let pidFile = Path.Combine(Path.GetTempPath(), $"pk-detached-handoff-{Guid.NewGuid():N}.pid")
+            let ready =
+                Path.Combine(Path.GetTempPath(), $"pk-detached-handoff-{Guid.NewGuid():N}.ready")
+
+            let pidFile =
+                Path.Combine(Path.GetTempPath(), $"pk-detached-handoff-{Guid.NewGuid():N}.pid")
+
             let command =
                 Command.create "/bin/sh"
                 |> Command.args
@@ -275,6 +281,7 @@ type PosixSpawnCleanupTests() =
 
                 if isLinux then
                     do! Task.Delay 100
+
                     Assert.That(
                         ourChildCount (),
                         Is.LessThanOrEqualTo(childBefore),

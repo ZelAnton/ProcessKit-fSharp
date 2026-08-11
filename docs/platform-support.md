@@ -201,12 +201,14 @@ refusals; the platform divergences are:
 |---|:---:|:---:|
 | Detachment mechanism | ✅ created running, assigned to **no** Job Object, no handle retained | ✅ `POSIX_SPAWN_SETSID` — its own session, no controlling terminal |
 | Survives a terminal/console close | 🟡 only with `CreateNoWindow()` (or `WindowsCtrlSignals()`) — it otherwise shares the caller's console | ✅ a new session cannot be reached by the terminal's hangup |
-| Leaves no entry behind when it exits first | ✅ nothing references the process | 🟡 it stays our direct child (`posix_spawn` cannot reparent), so its zombie lingers until this process exits |
+| Leaves no entry behind when it exits first | ✅ nothing references the process | ✅ a private reaper consumes the direct leader's wait status while this process lives |
 
-Both platforms return the same `DetachedProcess` (pid + start-time identity) and neither observes the
-child's exit — that is what "detached" means here. The POSIX zombie window is the honest cost of
-returning the *real* target pid rather than double-forking through a helper: the child genuinely
-outlives us (init adopts it then), and ProcessKit never reaps a process it does not contain.
+Both platforms return the same `DetachedProcess` (pid + start-time identity) and neither exposes the
+child's exit through that descriptor — that is what "detached" means here. On POSIX, the private reaper
+consumes the direct leader's wait status while this process lives; if the parent exits first, the OS
+reparents the child and its new supervisor owns reaping. Returning the *real* target pid therefore does
+not require double-forking through a helper, and ProcessKit never claims arbitrary processes outside its
+own child ownership.
 
 The opt-out covers the containment **ProcessKit** creates, not one your own process was placed in by
 someone else: a child of a job-bound Windows process joins that job by kernel rule (breakaway is not
