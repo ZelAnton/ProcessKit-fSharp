@@ -302,9 +302,10 @@ module internal Common =
           WorkingDirectory = baseDir }
 
     /// Walk `ctx.Path` for `program` (a bare name — see `isBareName`), reusing `probeDir` (with the
-    /// context's `PathExt`) for each directory in order. Returns `(found, searched)`: `found` is the first
-    /// matching directory's resolved path; `searched` is the raw `PATH` value, for the `NotFound`
-    /// diagnostic (`""` when the `PATH` is unset/empty).
+    /// context's `PathExt`) for each directory in order. Relative entries are anchored to the effective
+    /// working directory before probing, and every hit is normalized to a full path. Returns `(found,
+    /// searched)`: `found` is the first matching directory's resolved path; `searched` is the raw `PATH`
+    /// value, for the `NotFound` diagnostic (`""` when the `PATH` is unset/empty).
     ///
     /// `PATH` is split on the raw `Path.PathSeparator` with NO quote handling, on Windows as on POSIX —
     /// deliberate and verified. The real bare-name launch is `CreateProcessW` with
@@ -320,8 +321,24 @@ module internal Common =
         match ctx.Path with
         | "" -> None, ""
         | pathValue ->
+            let effectiveWorkingDirectory =
+                match ctx.WorkingDirectory with
+                | Some directory -> Path.GetFullPath directory
+                | None -> Directory.GetCurrentDirectory()
+
+            let resolvePathEntry (directory: string) =
+                if Path.IsPathRooted directory then
+                    directory
+                else
+                    Path.Combine(effectiveWorkingDirectory, directory)
+
             let dirs = pathValue.Split Path.PathSeparator |> Array.filter (fun d -> d <> "")
-            (dirs |> Array.tryPick (fun dir -> probeDir ctx.PathExt dir program)), pathValue
+
+            (dirs
+             |> Array.tryPick (fun dir ->
+                 probeDir ctx.PathExt (resolvePathEntry dir) program
+                 |> Option.map Path.GetFullPath)),
+            pathValue
 
     /// Resolve `program` (a bare name) against `ctx.PreferLocal` — the prefer-local directories, already
     /// anchored — searched in the order they were added, BEFORE any `PATH` lookup (T-182). Each directory
