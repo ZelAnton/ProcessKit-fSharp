@@ -441,6 +441,72 @@ type JsonRpcSessionTests() =
         :> Task
 
     [<Test>]
+    member _.``an answer claimed before cancellation publication keeps its success``() : Task =
+        task {
+            use cancellation = new CancellationTokenSource()
+
+            let cancellationObserved =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let cancellationFinished =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use _ =
+                cancellation.Token.Register(Action(fun () -> cancellationObserved.TrySetResult() |> ignore))
+
+            let mutable hookCalls = 0
+
+            // The internal hook runs while the router owns the pending entry. Cancelling from another
+            // thread makes the deadline path contend for that same ownership, while the waits below make
+            // the interleaving deterministic instead of relying on a timing-sensitive sleep.
+            let beforePendingCompletion =
+                Action<int64>(fun _ ->
+                    if Interlocked.Exchange(&hookCalls, 1) = 0 then
+                        Task.Run(
+                            Action(fun () ->
+                                cancellation.Cancel()
+                                cancellationFinished.TrySetResult() |> ignore)
+                        )
+                        |> ignore
+
+                        cancellationObserved.Task.GetAwaiter().GetResult()
+                        cancellationFinished.Task.GetAwaiter().GetResult())
+
+            let peer = peerHandle ()
+            use running = peer.Running
+
+            let session =
+                JsonRpcSession(running, 16 * 1024 * 1024, 1024, beforePendingCompletion)
+
+            let call =
+                session.RequestRawAsync(
+                    "race/answer-before-cancellation",
+                    null,
+                    TimeSpan.FromSeconds 30.0,
+                    cancellation.Token
+                )
+
+            use! request = nextFrame peer.Stdin
+            peer.Stdout.Emit(framed (responseJson (rawId request) "\"answer wins\""))
+
+            let! answer = call
+            assertRaw "\"answer wins\"" answer
+            Assert.That(cancellation.IsCancellationRequested, Is.True)
+
+            // The response claimed exactly one pending entry; the session must still be able to allocate,
+            // send, and complete a later request after the losing cancellation continuation has run.
+            let next =
+                session.RequestRawAsync("after/answer-race", null, TimeSpan.FromSeconds 30.0)
+
+            use! nextRequest = nextFrame peer.Stdin
+            peer.Stdout.Emit(framed (responseJson (rawId nextRequest) "\"next answer\""))
+
+            let! nextAnswer = next
+            assertRaw "\"next answer\"" nextAnswer
+        }
+        :> Task
+
+    [<Test>]
     member _.``the timeout also bounds writing the frame to a peer that stopped reading its stdin``() : Task =
         task {
             let peer = peerHandle ()
@@ -692,12 +758,25 @@ type JsonRpcSessionTests() =
             use cancellation = new CancellationTokenSource()
 
             let call = session.RequestRawAsync("slow/call", null, cancellation.Token)
-            use! _sent = nextFrame peer.Stdin
+            use! sent = nextFrame peer.Stdin
             cancellation.Cancel()
 
             match! call with
             | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
             | other -> Assert.Fail $"expected a cancellation, got {other}"
+
+            // The answer that arrives after cancellation is discarded, and the same session can still
+            // correlate a later request instead of letting the old id consume its waiter.
+            peer.Stdout.Emit(framed (responseJson (rawId sent) "\"too late after cancellation\""))
+
+            let next =
+                session.RequestRawAsync("after/cancellation", null, TimeSpan.FromSeconds 30.0)
+
+            use! nextRequest = nextFrame peer.Stdin
+            peer.Stdout.Emit(framed (responseJson (rawId nextRequest) "\"still works\""))
+
+            let! nextAnswer = next
+            assertRaw "\"still works\"" nextAnswer
         }
         :> Task
 
