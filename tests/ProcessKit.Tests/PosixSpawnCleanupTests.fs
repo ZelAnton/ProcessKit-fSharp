@@ -85,6 +85,10 @@ type PosixSpawnCleanupTests() =
 
         found
 
+    let quoteShellPath (path: string) =
+        let escaped = path.Replace("'", "'\\''", StringComparison.Ordinal)
+        "'" + escaped + "'"
+
     // Run `command` through `Native.Posix.spawnPosix` with a fault seam installed (always reset in a
     // `finally`) and assert it comes back as an honest `ProcessError.Spawn` — never a raw exception, and
     // never `Ok` (which would mean the fault did not fire and a child may have leaked). Cross-platform:
@@ -187,6 +191,105 @@ type PosixSpawnCleanupTests() =
             match! cmd.OutputStringAsync() with
             | Error _ -> ()
             | Ok _ -> Assert.Fail "expected an error spawning an unknown program"
+        }
+
+    [<Test>]
+    member _.``detached reaper preparation failure prevents the child from being spawned``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: exercises the pre-spawn detached reaper preparation gate"
+
+            let marker = Path.Combine(Path.GetTempPath(), $"pk-detached-prepare-{Guid.NewGuid():N}.marker")
+            let command =
+                Command.create "/bin/sh"
+                |> Command.args [ "-c"; $"echo launched > {quoteShellPath marker}" ]
+
+            try
+                Native.Posix.detachedReaperPrepareForTests <- Some(fun () -> Error "injected preparation failure")
+
+                match Native.Posix.spawnDetachedPosix command with
+                | Error(ProcessError.Spawn(_, detail)) ->
+                    Assert.That(detail.Contains("injected preparation failure"), Is.True, detail)
+                | Error other -> Assert.Fail $"expected ProcessError.Spawn, got {other}"
+                | Ok spawned ->
+                    Native.Posix.killProcessGroup spawned.Pid
+                    Native.Posix.reapLeader spawned.Pid
+                    Assert.Fail "detached spawn succeeded despite a failed reaper preparation"
+
+                do! Task.Delay 100
+                Assert.That(File.Exists marker, Is.False, "the child ran even though reaper preparation failed")
+            finally
+                Native.Posix.detachedReaperPrepareForTests <- None
+
+                try
+                    File.Delete marker
+                with _ ->
+                    // Best-effort cleanup: the marker is only a launch proof and must not mask the assertion.
+                    ()
+        }
+
+    [<Test>]
+    member _.``detached reaper handoff failure synchronously kills and reaps the child``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: exercises the post-spawn detached reaper handoff unwind"
+
+            let ready = Path.Combine(Path.GetTempPath(), $"pk-detached-handoff-{Guid.NewGuid():N}.ready")
+            let pidFile = Path.Combine(Path.GetTempPath(), $"pk-detached-handoff-{Guid.NewGuid():N}.pid")
+            let command =
+                Command.create "/bin/sh"
+                |> Command.args
+                    [ "-c"
+                      $"echo $$ > {quoteShellPath pidFile}; echo ready > {quoteShellPath ready}; sleep 10" ]
+
+            let childBefore = if isLinux then ourChildCount () else 0
+
+            let cleanupLeakedChild () =
+                match Int32.TryParse(if File.Exists pidFile then File.ReadAllText pidFile else "") with
+                | true, pid ->
+                    try
+                        Native.Posix.killProcess pid
+                        Native.Posix.reapLeader pid
+                    with _ ->
+                        // Best-effort cleanup for a deliberately failing path; a correct implementation has
+                        // already killed and reaped this pid before returning.
+                        ()
+                | false, _ -> ()
+
+            try
+                Native.Posix.detachedReaperHandoffForTests <-
+                    Some(fun _ ->
+                        waitForFile ready (TimeSpan.FromSeconds 10.0) |> ignore
+                        Error "injected handoff failure")
+
+                match Native.Posix.spawnDetachedPosix command with
+                | Error(ProcessError.Spawn(_, detail)) ->
+                    Assert.That(detail.Contains("injected handoff failure"), Is.True, detail)
+                | Error other -> Assert.Fail $"expected ProcessError.Spawn, got {other}"
+                | Ok spawned ->
+                    Native.Posix.killProcessGroup spawned.Pid
+                    Native.Posix.reapLeader spawned.Pid
+                    Assert.Fail "detached spawn succeeded despite a failed reaper handoff"
+
+                Assert.That(File.Exists ready, Is.True, "handoff failure was reported before the child ran")
+
+                if isLinux then
+                    do! Task.Delay 100
+                    Assert.That(
+                        ourChildCount (),
+                        Is.LessThanOrEqualTo(childBefore),
+                        "handoff failure returned with a live or zombie direct child"
+                    )
+            finally
+                cleanupLeakedChild ()
+                Native.Posix.detachedReaperHandoffForTests <- None
+
+                for path in [ ready; pidFile ] do
+                    try
+                        File.Delete path
+                    with _ ->
+                        // Best-effort test cleanup: marker files do not belong to the lifecycle under test.
+                        ()
         }
 
     [<Test>]

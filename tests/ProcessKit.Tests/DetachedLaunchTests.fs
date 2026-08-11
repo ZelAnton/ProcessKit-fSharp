@@ -23,6 +23,7 @@ open ProcessKit
 type DetachedLaunchTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
 
     // A single-process sleeper that spawns NO grandchildren (K-069/F-05: a `cmd.exe /c` wrapper would add
     // a transient child to the group membership this test asserts on). Windows `ping` sends its first
@@ -74,6 +75,27 @@ type DetachedLaunchTests() =
             ok <- predicate ()
 
         ok
+
+    // A reaped Linux child has no /proc entry; a zombie still has one. The state is included only in the
+    // failure message so a regression distinguishes a live child from an unreaped zombie.
+    let procState (pid: int) : string option =
+        let path = $"/proc/{pid}/stat"
+
+        if not (File.Exists path) then
+            None
+        else
+            try
+                let stat = File.ReadAllText path
+                let closeParen = stat.LastIndexOf ')'
+
+                if closeParen >= 0 then
+                    let fields = stat.Substring(closeParen + 1).Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)
+                    if fields.Length > 0 then Some fields[0] else Some "?"
+                else
+                    Some "?"
+            with _ ->
+                // The process can disappear between the existence check and the read; treat that as reaped.
+                None
 
     let tempFile () =
         Path.Combine(Path.GetTempPath(), $"pk-detached-{Guid.NewGuid():N}.log")
@@ -218,6 +240,42 @@ type DetachedLaunchTests() =
                     Assert.That(names.Contains forbidden, Is.False, leaked)
             finally
                 killQuietly detached.Pid
+
+    [<Test>]
+    member _.``repeated short-lived detached children are reaped while the owner remains alive``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: confirms detached leaders leave no zombie /proc entries"
+
+            let seen = System.Collections.Generic.HashSet<int>()
+
+            try
+                for index in 1..32 do
+                    let command =
+                        Command.create "/bin/sh"
+                        |> Command.args [ "-c"; "exit 0" ]
+
+                    let pid =
+                        match command.LaunchDetached() with
+                        | Ok detached ->
+                            Assert.That(seen.Add detached.Pid, Is.True, $"detached pid was reused at iteration {index}")
+                            detached.Pid
+                        | Error error -> Assert.Fail $"short-lived detached spawn {index} failed: {error}"; 0
+
+                    let reaped = waitUntil (TimeSpan.FromSeconds 2.0) (fun () -> procState pid |> Option.isNone)
+                    let state = procState pid |> Option.defaultValue "gone"
+
+                    Assert.That(
+                        reaped,
+                        Is.True,
+                        $"detached child {pid} remained in /proc after exit (state {state}); the live parent did not reap it"
+                    )
+            finally
+                // A failure must not leave a live child behind while still giving the reaper the normal chance
+                // to consume successful exits. `killQuietly` is a no-op for an already-reaped child.
+                for pid in seen do
+                    killQuietly pid
+        }
 
     [<Test>]
     member _.``a detached child runs and writes its redirected output with no parent involvement``() =

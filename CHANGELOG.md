@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Exec.outputAll`/`Exec.outputAllBytes` now reject `concurrency < 1` with `ArgumentOutOfRangeException` before running any command, instead of silently coercing it to sequential execution.
 
 ### Fixed
+- POSIX `LaunchDetached` now transfers each direct child to a private background reaper, preventing zombies in long-lived parents while preserving the pid-and-start-time-only detached API.
 - POSIX `Uid`/`Gid`/`Groups`, `KillOnParentDeath`, and `Pty` now load their `setpriv`/`setsid --ctty` helper binaries only from the trusted system directories `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` and launch them by absolute path instead of searching the calling process's `PATH`, so a `setpriv` planted earlier on `PATH` can no longer run with the parent's (often root) privileges before the drop; a host carrying neither helper in those directories now returns the same typed `ProcessError.Spawn`/`ProcessError.Unsupported` it already returned when the helper was missing entirely, never a silent fallback.
 - Bounded chunk and protocol-frame overflow diagnostics now use neutral output wording instead of describing raw stdout chunks as protocol output.
 - Supervisor callback exceptions from StopWhen, GiveUpWhen, OnRestart, and OnStormPause now terminate supervision with a typed ProcessError.Io that preserves the available result/error context and performs normal teardown instead of escaping from RunAsync or SupervisionSession.Completion.

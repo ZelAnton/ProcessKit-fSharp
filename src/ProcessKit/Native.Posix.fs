@@ -76,6 +76,19 @@ module internal Posix =
     [<Literal>]
     let private ENOENT = 2
 
+    // `waitpid` returns ECHILD when another owner has already consumed the status. EAGAIN is retained
+    // with the other temporary wait failures by the detached reaper rather than dropping ownership.
+    [<Literal>]
+    let private detachedReaperEchild = 10
+
+    [<Literal>]
+    let private EAGAIN = 11
+
+    // Detached reaping uses its own early non-blocking probe so it cannot accidentally depend on the
+    // event-driven wait registry used by contained processes (which intentionally has a different owner).
+    [<Literal>]
+    let private detachedReaperWnohang = 1
+
     // `killpg(pgid, 0)` reports this only when the target process group no longer exists. A failed
     // probe with EPERM instead proves that the group exists but the caller may not signal it.
     [<Literal>]
@@ -301,6 +314,12 @@ module internal Posix =
     /// when a stream ctor fails.
     let mutable streamWrapFaultForTests: (string -> unit) option = None
 
+    /// Test seam (internal, not public API): can force detached-reaper preparation or handoff to fail
+    /// after the test has arranged the child state. Returning `Ok ()` delegates to the real private reaper;
+    /// returning `Error` exercises the typed pre-spawn or post-spawn unwind without bypassing ownership.
+    let mutable detachedReaperPrepareForTests: (unit -> Result<unit, string>) option = None
+    let mutable detachedReaperHandoffForTests: (int -> Result<unit, string>) option = None
+
     /// Test seam (internal, not public API): overrides the by-number process-group liveness probe
     /// (`killpg(pgid, 0)`), so a pid/pgid-reuse scenario — a recycled number that still probes alive —
     /// can be driven deterministically without racing a real OS pid recycle. Production leaves it `None`
@@ -339,6 +358,137 @@ module internal Posix =
 
     let mutable ptyWriteForTests: (int -> nativeint -> nativeint -> nativeint) option =
         None
+
+    [<NoComparison; NoEquality>]
+    type private DetachedReaperState =
+        { Queue: BlockingCollection<int> }
+
+    let private detachedReaperInitLock = obj ()
+    let mutable private detachedReaperState: Result<DetachedReaperState, string> option = None
+
+    // Polling is deliberately bounded: a live child is revisited at this interval, and a transient waitpid
+    // error leaves the pid in `owned` for the same next pass. The owner is never dropped just because one
+    // probe was interrupted or temporarily unavailable.
+    [<Literal>]
+    let private detachedReaperPollMs = 10
+
+    let private detachedWaitCompleted (pid: int) : bool =
+        let mutable status = 0
+
+        try
+            let result = waitpid (pid, &status, detachedReaperWnohang)
+
+            if result = pid then
+                true
+            elif result < 0 then
+                let errno = Marshal.GetLastWin32Error()
+                // ECHILD means another path already consumed this child; retaining the numeric pid cannot
+                // restore its status, but there is no zombie left for this owner to clear.
+                if errno = detachedReaperEchild then
+                    true
+                elif errno = EAGAIN then
+                    // EAGAIN is a temporary wait failure; keep the owner for the next bounded poll.
+                    false
+                else
+                    // Unknown wait failures are also retained. Losing the owner here is the unsafe choice:
+                    // the child may still be a zombie that only this reaper can consume.
+                    false
+            else
+                // 0 means the child is still running. Any other non-negative result is unexpected, so keep
+                // the owner and let the next bounded poll try again rather than dropping the pid.
+                false
+        with _ ->
+            // A native wait failure is transient for this owner; retaining the pid is safer than allowing a
+            // detached child to become an unreaped zombie when the probe itself faults.
+            false
+
+    // One process-wide manager owns every detached POSIX leader after handoff. It stores only pids because
+    // `posix_spawn` exposes no managed Child handle, but the queue boundary is still the ownership boundary:
+    // before `TryAdd` the caller may synchronously kill/reap; after it succeeds only this thread calls waitpid.
+    let private detachedReaperLoop (state: DetachedReaperState) =
+        let owned = ResizeArray<int>()
+
+        try
+            while true do
+                if owned.Count = 0 then
+                    owned.Add(state.Queue.Take())
+                else
+                    let mutable pid = 0
+
+                    if state.Queue.TryTake(&pid, detachedReaperPollMs) then
+                        owned.Add pid
+
+                let mutable index = 0
+
+                while index < owned.Count do
+                    if detachedWaitCompleted owned[index] then
+                        owned.RemoveAt index
+                    else
+                        index <- index + 1
+        with _ ->
+            // The queue is process-global and never intentionally completes. If an infrastructure failure
+            // nevertheless ends this loop, closing it makes future handoffs fail synchronously instead of
+            // silently accepting pids into a manager that no longer exists.
+            try
+                state.Queue.CompleteAdding()
+            with _ ->
+                // Teardown of a failed manager must not mask the original startup/handoff error.
+                ()
+
+    let private prepareDetachedReaperCore () : Result<unit, string> =
+        lock detachedReaperInitLock (fun () ->
+            match detachedReaperState with
+            | Some(Ok _) -> Ok()
+            | Some(Error message) -> Error message
+            | None ->
+                try
+                    let state = { Queue = new BlockingCollection<int>() }
+                    let thread = Thread(ThreadStart(fun () -> detachedReaperLoop state))
+                    thread.IsBackground <- true
+                    thread.Name <- "ProcessKit-detached-reaper"
+                    thread.Start()
+                    detachedReaperState <- Some(Ok state)
+                    Ok()
+                with ex ->
+                    let message = $"could not start detached reaper: {ex.Message}"
+                    detachedReaperState <- Some(Error message)
+                    Error message)
+
+    let private prepareDetachedReaper () : Result<unit, string> =
+        match detachedReaperPrepareForTests with
+        | Some hook ->
+            try
+                match hook () with
+                | Error message -> Error message
+                | Ok () -> prepareDetachedReaperCore ()
+            with ex ->
+                Error $"detached reaper preparation hook failed: {ex.Message}"
+        | None -> prepareDetachedReaperCore ()
+
+    let private handoffDetachedReaperCore (pid: int) : Result<unit, string> =
+        lock detachedReaperInitLock (fun () ->
+            match detachedReaperState with
+            | Some(Ok state) ->
+                try
+                    if state.Queue.TryAdd pid then
+                        Ok()
+                    else
+                        Error "detached reaper stopped unexpectedly"
+                with ex ->
+                    Error $"detached reaper handoff failed: {ex.Message}"
+            | Some(Error message) -> Error message
+            | None -> Error "detached reaper was not prepared before spawn")
+
+    let private handoffDetachedReaper (pid: int) : Result<unit, string> =
+        match detachedReaperHandoffForTests with
+        | Some hook ->
+            try
+                match hook pid with
+                | Error message -> Error message
+                | Ok () -> handoffDetachedReaperCore pid
+            with ex ->
+                Error $"detached reaper handoff hook failed: {ex.Message}"
+        | None -> handoffDetachedReaperCore pid
 
     // Fire the group-delivery test observer (if installed) with the target pgid BEFORE the syscall, so a
     // test can record exactly which pgids a signal/kill path delivered to — and so it can never perturb
@@ -2087,6 +2237,15 @@ module internal Posix =
                 if result = pid then
                     completePending pid (decodeWaitStatus status)
 
+    // The detached handoff has not succeeded until this returns. Kill both the fresh session and the
+    // leader directly (the latter closes the tiny pre-session race defensively), then use the existing
+    // bounded synchronous owner-side reap. The caller must not return a Spawn error while still owning an
+    // unreaped child.
+    let private terminateAndReapDetached (pid: int) =
+        killProcessGroup pid
+        kill (pid, SIGKILL) |> ignore
+        reapLeader pid
+
     // ----------------------------------------------------------------------------------
     // POSIX privilege drop / session detach / parent-death signal
     // (Command.Uid / Gid / Setsid / KillOnParentDeath)
@@ -3547,7 +3706,7 @@ module internal Posix =
     //
     // Every other spawn here puts the child in a process group (or cgroup) the owning `ProcessGroup`
     // tears down with `killpg`, and registers its pid with the event-driven reap machinery. The detached
-    // launch deliberately does neither:
+    // launch deliberately skips containment, but it still hands its direct leader to the private reaper:
     //
     //  * `POSIX_SPAWN_SETSID` unconditionally — the child becomes a session leader (sid == pgid == pid)
     //    with NO controlling terminal, so it is immune to the terminal hangup that would otherwise reach
@@ -3555,28 +3714,26 @@ module internal Posix =
     //    exactly what `Command.Setsid` asks for, so setting that knob alongside is redundant, never a
     //    conflict; `POSIX_SPAWN_SETPGROUP` is not set (it and `SETSID` are mutually exclusive — see
     //    `spawnPosixViaSpawn`'s note).
-    //  * The pid is added to NO reap ledger (`pendingWaits`), because nothing here ever waits on it —
-    //    the same deliberate stance `ProcessGroup.Adopt` takes for an external pid (K-016/K-072). The
-    //    normal detached lifetime has no teardown path: no `killProcessGroup`, no kill-on-dispose, nothing
-    //    for a `Dispose` or a finalizer to reach. The one exception is a post-spawn setup failure: before
-    //    returning an error, the priority fault path kills this fresh session's whole process group and
-    //    reaps its direct leader.
+    //  * The pid is handed to one process-wide private reaper after the start-time snapshot. That owner
+    //    performs the only normal `waitpid` for the detached leader, retries bounded non-blocking probes,
+    //    and retains the pid after temporary wait errors. The normal detached lifetime still has no public
+    //    teardown path: no `killProcessGroup`, no kill-on-dispose, nothing for a `Dispose` or finalizer to
+    //    reach. The exceptions are pre-handoff setup failures, whose fresh session is killed and reaped
+    //    synchronously before the typed spawn error is returned.
     //
-    // Honest divergence (documented, not silently swallowed): `posix_spawn` cannot reparent, so the
-    // detached child is still this process's DIRECT child in the kernel's table. It genuinely survives
-    // the parent's exit (nothing kills it, and init adopts it then), but if it exits FIRST, while the
-    // parent is still alive, its zombie entry lingers until the parent exits, because ProcessKit
-    // deliberately never reaps a process it does not contain. Long-lived hosts that launch many
-    // short-lived detached children should use the ordinary contained verbs instead — which is what
-    // containment is for.
+    // Honest divergence (documented, not silently broadened): `posix_spawn` cannot reparent, so the
+    // detached child is still this process's DIRECT child while it runs and genuinely survives the
+    // parent's exit. Its exit status is nevertheless consumed by the private reaper while this parent is
+    // alive, so a long-lived host does not accumulate detached zombies; the public descriptor remains a
+    // pid + start-time snapshot with no lifetime/control API.
 
     /// Launch `command` detached from all containment (see the section comment above): its own session,
-    /// no reap ledger entry, no teardown. Returns the child's pid and OS-reported start time — read while
-    /// the pid is still pinned by the unreaped child, so the identity pair can never describe a recycled
-    /// pid. Structurally a much smaller `spawnPosixViaSpawn`: no socketpairs, no parent-kept ends, and
-    /// therefore no stream wrapping and no post-spawn teardown during the normal lifetime. If the
-    /// post-spawn priority setup fails, the fresh session is killed as a whole and its direct leader is
-    /// reaped before the original spawn error is returned.
+    /// then a private reaper handoff after the start-time snapshot; no public teardown. Returns the child's
+    /// pid and OS-reported start time — read while the pid is still pinned by the unreaped child, so the
+    /// identity pair can never describe a recycled pid. Structurally a much smaller `spawnPosixViaSpawn`:
+    /// no socketpairs, no parent-kept ends, and therefore no stream wrapping. If preparation, post-spawn
+    /// priority setup, or the reaper handoff fails, the fresh session is killed and its direct leader is
+    /// synchronously reaped before the typed spawn error is returned.
     let private spawnDetachedPosixCore (command: Command) : Result<DetachedSpawn, ProcessError> =
         let config = command.Config
         // The verb layer has already refused every feeder stdin source (there is no parent left to pump
@@ -3789,24 +3946,38 @@ module internal Posix =
 
                             rc, localPid
 
+                        // The reaper must be ready before this call can create a child. A failed preparation
+                        // uses a sentinel pair only to keep the existing unwind below single-shaped; the
+                        // preparation error is selected before the spawn result is inspected.
+                        let reaperPreparation = prepareDetachedReaper ()
+                        let reaperPreparationError =
+                            match reaperPreparation with
+                            | Error message -> Some(ProcessError.Spawn(command.Program, $"could not prepare detached POSIX reaper: {message}"))
+                            | Ok () -> None
+
                         // `umask(2)` is a whole-process attribute with no posix_spawn attribute, so it is
                         // set on the parent around the spawn under the SAME lock every other spawn takes —
                         // a concurrent no-mask spawn must never observe this one's temporary umask.
                         let rc, pid =
-                            lock umaskSpawnLock (fun () ->
-                                match config.Umask with
-                                | None -> spawnUnderLock ()
-                                | Some mask ->
-                                    let previous = umask mask
+                            if reaperPreparationError.IsSome then
+                                0, 0
+                            else
+                                lock umaskSpawnLock (fun () ->
+                                    match config.Umask with
+                                    | None -> spawnUnderLock ()
+                                    | Some mask ->
+                                        let previous = umask mask
 
-                                    try
-                                        spawnUnderLock ()
-                                    finally
-                                        umask previous |> ignore)
+                                        try
+                                            spawnUnderLock ()
+                                        finally
+                                            umask previous |> ignore)
 
                         closeChildSideFds ()
 
-                        if rc <> 0 then
+                        if reaperPreparationError.IsSome then
+                            Error(Option.get reaperPreparationError)
+                        elif rc <> 0 then
                             if rc = ENOENT then
                                 Error(notFoundFromSpawnFailure command)
                             else
@@ -3842,11 +4013,26 @@ module internal Posix =
                                     )
                                 )
                             else
-                                // Read the identity pair now: the child has not been reaped (and never will
-                                // be by us), so the kernel cannot recycle this pid underneath the read.
-                                Ok
-                                    { Pid = pid
-                                      StartTime = readProcessStartTime pid }
+                                // Capture the identity pair before handoff: the child is still pinned by its
+                                // unreaped direct-child status, so the pair cannot describe a recycled pid.
+                                let startTime = readProcessStartTime pid
+
+                                match handoffDetachedReaper pid with
+                                | Ok () ->
+                                    Ok
+                                        { Pid = pid
+                                          StartTime = startTime }
+                                | Error message ->
+                                    // The queue did not accept ownership, so this caller is still the sole
+                                    // waiter. Do not return an error until the fresh session is gone and the
+                                    // direct leader has been synchronously reaped.
+                                    terminateAndReapDetached pid
+                                    Error(
+                                        ProcessError.Spawn(
+                                            command.Program,
+                                            $"could not hand off detached child to POSIX reaper: {message}"
+                                        )
+                                    )
                 finally
                     if fileActionsReady then
                         posix_spawn_file_actions_destroy fileActions |> ignore
