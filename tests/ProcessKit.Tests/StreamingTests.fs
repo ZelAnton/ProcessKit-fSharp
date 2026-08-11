@@ -1704,9 +1704,9 @@ type StreamingTests() =
             // consumer-paced whole-line contract, unaffected by this fix) — this test only exercises
             // the stderr side, through `StdoutLinesAsync()` + `FinishAsync()` exactly as a real consumer
             // would use them.
-            let cap = 64
+            let cap = 65
             let stdoutPayload = "out-line\n"
-            let stderrPayload = String('x', 100_000)
+            let stderrPayload = String('é', 100_000)
 
             let config =
                 (Command.create "test"
@@ -1722,11 +1722,34 @@ type StreamingTests() =
 
             match! running.FinishAsync() with
             | Ok finished ->
+                Assert.That(finished.Stderr, Is.EqualTo(String('é', 32)))
+
                 Assert.That(
                     Encoding.UTF8.GetByteCount finished.Stderr,
                     Is.LessThanOrEqualTo cap,
                     "the in-flight cap must bound the reassembled stderr, not just the streamed stdout"
                 )
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``OutputStringAsync applies the byte cap while force-flushing newline-free Unicode stdout``() : Task =
+        task {
+            let cap = 5
+
+            let config =
+                (Command.create "test"
+                 |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes cap))
+                    .Config
+
+            use running = syntheticStdoutProcess config "ééé"
+
+            match! running.OutputStringAsync() with
+            | Ok result ->
+                Assert.That(result.Stdout, Is.EqualTo "é")
+                Assert.That(result.Truncated, Is.True)
+                Assert.That(Encoding.UTF8.GetByteCount result.Stdout, Is.LessThanOrEqualTo cap)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task

@@ -232,14 +232,14 @@ module internal Pump =
             result
 
     /// Append the run `buffer[start .. stop-1]` to `line`, force-flushing it to `onLine` whenever it
-    /// reaches `cap` characters. Batched: append up to the remaining budget (`cap - line.Length`) in
-    /// one `StringBuilder.Append(char[], int, int)` call; if the run isn't fully consumed yet, flush
-    /// the now-full line, append exactly the one character that tripped the cap (an unconditional
-    /// post-check append, so even a cap of 0 still makes progress), and repeat for the remainder of
-    /// the run. The one definition of the force-flush-at-cap algorithm, shared by `readLines`'s `Lf`
-    /// hot path and its CR-aware path's `appendRun` (a multi-character run) and `appendChar` (a
-    /// single character passed as a one-element range, so a deferred '\r'/'\n' that no longer lives
-    /// at its original `charBuffer` position still goes through the same logic).
+    /// reaches `cap` UTF-8 bytes. A Unicode scalar value is kept intact even when it is larger than
+    /// the cap, because splitting a surrogate pair would corrupt the decoded text; the caller's
+    /// `LineBuffer` policy then decides whether that one over-cap segment is retained. The
+    /// `lineBytes` cell carries the exact UTF-8 size across decoded chunks and is reset whenever the
+    /// line is emitted. The same algorithm is shared by `readLines`'s `Lf` hot path and its CR-aware
+    /// path's `appendRun` (a multi-character run) and `appendChar` (a single character passed as a
+    /// one-element range, so a deferred '\r'/'\n' that no longer lives at its original `charBuffer`
+    /// position still goes through the same logic).
     let private appendCapped
         (line: StringBuilder)
         (buffer: char[])
@@ -247,21 +247,68 @@ module internal Pump =
         (stop: int)
         (cap: int)
         (onLine: string -> ValueTask)
+        (lineBytes: int64 ref)
         : Task =
         task {
+            let capBytes = int64 cap
+            let utf8 = Encoding.UTF8
+
+            let scalarLength p =
+                if
+                    Char.IsHighSurrogate buffer[p]
+                    && p + 1 < stop
+                    && Char.IsLowSurrogate buffer[p + 1]
+                then
+                    2
+                else
+                    1
+
+            let flush () =
+                task {
+                    do! onLine (line.ToString())
+                    line.Clear() |> ignore
+                    lineBytes.Value <- 0L
+                }
+
             let mutable p = start
 
             while p < stop do
-                if line.Length > 0 && line.Length >= cap then
-                    do! onLine (line.ToString())
-                    line.Clear() |> ignore
-                    line.Append buffer[p] |> ignore
+                // A decoder may place the two UTF-16 code units of one scalar in adjacent output
+                // chunks. The high surrogate was counted as its replacement fallback in the previous
+                // call, so join it here before deciding whether the cap forces a flush. Otherwise a
+                // cap boundary could emit the pair as two invalid strings.
+                if
+                    Char.IsLowSurrogate buffer[p]
+                    && line.Length > 0
+                    && Char.IsHighSurrogate line[line.Length - 1]
+                then
+                    let prefixBytes = lineBytes.Value - 3L
+
+                    if line.Length > 1 && prefixBytes + 4L > capBytes then
+                        let high = line[line.Length - 1]
+                        line.Length <- line.Length - 1
+                        lineBytes.Value <- prefixBytes
+                        do! flush ()
+                        line.Append high |> ignore
+                        line.Append buffer[p] |> ignore
+                        lineBytes.Value <- 4L
+                    else
+                        line.Append buffer[p] |> ignore
+                        lineBytes.Value <- prefixBytes + 4L
+
                     p <- p + 1
                 else
-                    let budget = max 1 (cap - line.Length)
-                    let take = min budget (stop - p)
-                    line.Append(buffer, p, take) |> ignore
-                    p <- p + take
+                    let scalarWidth = scalarLength p
+                    let scalarBytes = int64 (utf8.GetByteCount(buffer, p, scalarWidth))
+
+                    if line.Length > 0 && lineBytes.Value >= capBytes then
+                        do! flush ()
+                    elif line.Length > 0 && lineBytes.Value + scalarBytes > capBytes then
+                        do! flush ()
+
+                    line.Append(buffer, p, scalarWidth) |> ignore
+                    lineBytes.Value <- lineBytes.Value + scalarBytes
+                    p <- p + scalarWidth
         }
         :> Task
 
@@ -296,10 +343,10 @@ module internal Pump =
     /// `onLine`. `terminator` decides where a line ends: `Lf` (the default) splits on `\n` only,
     /// stripping a preceding `\r`; `Cr`/`CrLf`/`Any` also (or instead) split on a bare `\r`, so
     /// carriage-return progress output streams as per-frame lines (see `LineTerminator`). A `\r\n` pair
-    /// is a single terminator in every mode. When `maxLineLength` is set, an unterminated line that
-    /// reaches that many characters is force-flushed to `onLine` as a segment, so a newline-free flood
+    /// is a single terminator in every mode. When `maxLineBytes` is set, an unterminated line that
+    /// reaches that many UTF-8 bytes is force-flushed to `onLine` as a segment, so a newline-free flood
     /// can't grow the in-flight buffer without bound (the segment then goes through the caller's buffer
-    /// policy).
+    /// policy). A single Unicode scalar larger than the cap is emitted intact rather than split.
     ///
     /// `onLine` returns a `ValueTask` (not `unit`) so a streaming consumer's sink can genuinely await —
     /// e.g. a bounded channel's backpressured `WriteAsync`, which must stop this very read loop from
@@ -315,7 +362,7 @@ module internal Pump =
         (terminator: LineTerminator)
         (tee: Stream option)
         (onLine: string -> ValueTask)
-        (maxLineLength: int option)
+        (maxLineBytes: int option)
         (cancellationToken: CancellationToken)
         : Task =
         task {
@@ -323,6 +370,7 @@ module internal Pump =
             let byteBuffer = Array.zeroCreate<byte> 8192
             let charBuffer = Array.zeroCreate<char> (encoding.GetMaxCharCount byteBuffer.Length)
             let line = StringBuilder()
+            let lineBytes = ref 0L
             let mutable reading = true
             // A leading byte-order mark of the chosen encoding is stripped from the decoded text
             // (GetDecoder, unlike StreamReader, leaves it in). The raw `tee` and OutputBytes stay
@@ -365,29 +413,38 @@ module internal Pump =
                         let newlineIndex = Array.IndexOf(charBuffer, '\n', pos, chars - pos)
                         let runEnd = if newlineIndex >= 0 then newlineIndex else chars
 
-                        match maxLineLength with
+                        match maxLineBytes with
                         | None ->
                             if runEnd > pos then
                                 line.Append(charBuffer, pos, runEnd - pos) |> ignore
 
                             pos <- runEnd
                         | Some cap ->
-                            // `appendCapped` batches the per-character force-flush at the cap (see its
-                            // doc comment); it always advances through the whole run.
-                            do! appendCapped line charBuffer pos runEnd cap onLine
+                            // `appendCapped` advances by Unicode scalar values and enforces the UTF-8
+                            // byte cap (see its doc comment), including across decoder chunks.
+                            do! appendCapped line charBuffer pos runEnd cap onLine lineBytes
                             pos <- runEnd
 
                         if newlineIndex >= 0 then
                             if line.Length > 0 && line[line.Length - 1] = '\r' then
                                 line.Length <- line.Length - 1
 
+                                match maxLineBytes with
+                                | Some _ -> lineBytes.Value <- lineBytes.Value - 1L
+                                | None -> ()
+
                             do! onLine (line.ToString())
                             line.Clear() |> ignore
+                            lineBytes.Value <- 0L
                             pos <- newlineIndex + 1
 
                 if line.Length > 0 then
                     if line[line.Length - 1] = '\r' then
                         line.Length <- line.Length - 1
+
+                        match maxLineBytes with
+                        | Some _ -> lineBytes.Value <- lineBytes.Value - 1L
+                        | None -> ()
 
                     do! onLine (line.ToString())
             | _ ->
@@ -405,6 +462,7 @@ module internal Pump =
                     task {
                         do! onLine (line.ToString())
                         line.Clear() |> ignore
+                        lineBytes.Value <- 0L
                     }
 
                 // A single deferred content character (a lone '\r' or '\n') never lives at a stable
@@ -414,25 +472,25 @@ module internal Pump =
                 // `appendCapped` helper the runs below use.
                 let oneChar = Array.zeroCreate<char> 1
 
-                // Append one content character, honouring the `maxLineLength` force-flush.
+                // Append one content character, honouring the `maxLineBytes` UTF-8 byte cap.
                 let appendChar (c: char) =
                     task {
-                        match maxLineLength with
+                        match maxLineBytes with
                         | None -> line.Append c |> ignore
                         | Some cap ->
                             oneChar[0] <- c
-                            do! appendCapped line oneChar 0 1 cap onLine
+                            do! appendCapped line oneChar 0 1 cap onLine lineBytes
                     }
 
-                // Append the content run `charBuffer[start .. stop-1]`, honouring the force-flush (the
-                // same batched logic as the `Lf` path above).
+                // Append the content run `charBuffer[start .. stop-1]`, honouring the UTF-8 byte cap
+                // (the same logic as the `Lf` path above).
                 let appendRun (start: int) (stop: int) =
                     task {
-                        match maxLineLength with
+                        match maxLineBytes with
                         | None ->
                             if stop > start then
                                 line.Append(charBuffer, start, stop - start) |> ignore
-                        | Some cap -> do! appendCapped line charBuffer start stop cap onLine
+                        | Some cap -> do! appendCapped line charBuffer start stop cap onLine lineBytes
                     }
 
                 while reading do
@@ -525,7 +583,7 @@ module internal Pump =
         (terminator: LineTerminator)
         (tee: Stream option)
         (onLine: string -> ValueTask)
-        (maxLineLength: int option)
+        (maxLineBytes: int option)
         (cancellationToken: CancellationToken)
         : Task =
         task {
@@ -536,7 +594,7 @@ module internal Pump =
             let mutable fault: exn option = None
 
             try
-                do! readLinesBody stream encoding terminator tee onLine maxLineLength cancellationToken
+                do! readLinesBody stream encoding terminator tee onLine maxLineBytes cancellationToken
             with ex ->
                 fault <- Some ex
 
@@ -580,13 +638,13 @@ module internal Pump =
         (terminator: LineTerminator)
         (tee: Stream option)
         (onLine: string -> ValueTask)
-        (maxLineLength: int option)
+        (maxLineBytes: int option)
         (isTearingDown: unit -> bool)
         (cancellationToken: CancellationToken)
         : Task =
         task {
             try
-                do! readLines stream encoding terminator tee onLine maxLineLength cancellationToken
+                do! readLines stream encoding terminator tee onLine maxLineBytes cancellationToken
             with
             | :? ObjectDisposedException as ex ->
                 match genuineReadFault isTearingDown ex with
