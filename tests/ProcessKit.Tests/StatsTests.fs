@@ -27,7 +27,7 @@ type internal MemberStatsSeamBackend(memberStats: unit -> Result<MemberStats lis
         member _.Wait(_handle) = Task.FromResult(Outcome.Exited 0)
         member _.PidOf(spawned) = Some(int spawned.Handle)
         member _.KillChild(_spawned) = ()
-        member _.KillTree() = ()
+        member _.KillTree() = Ok()
         member _.GracefulKillTree (_signal) (_grace) = Task.CompletedTask
         member _.SignalChild(_spawned, _signal) = Ok()
         member _.Members() = Ok []

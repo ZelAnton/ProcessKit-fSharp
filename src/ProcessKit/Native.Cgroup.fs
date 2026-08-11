@@ -507,6 +507,62 @@ module internal Cgroup =
         | Ok members -> not (List.isEmpty members)
         | Error _ -> true
 
+    [<Literal>]
+    let private MaxThawAttempts = 3
+
+    [<Literal>]
+    let private ThawRetryDelayMilliseconds = 2
+
+    /// Test-only seam for the legacy kill fallback's cgroup file writes. Production leaves it unset;
+    /// fault-injection tests use it to model a kernel/delegation write refusal without depending on
+    /// the test runner's effective uid or a real delegated cgroup hierarchy.
+    let mutable internal killCgroupWriteTestHook: (string -> string -> unit) option =
+        None
+
+    let private writeKillCgroupFile (file: string) (content: string) =
+        killCgroupWriteTestHook |> Option.iter (fun hook -> hook file content)
+        File.WriteAllText(file, content)
+
+    /// Thaw the legacy fallback's reusable cgroup and verify the kernel-visible state. A successful
+    /// write is not enough: cgroup.freeze is asynchronous, and a refused write can leave a previously
+    /// frozen cgroup unchanged. A missing freezer means the cgroup was removed or the filesystem no
+    /// longer exposes the control, so there is no reusable frozen group left to protect. Any other
+    /// unreadable or unexpected state remains an error rather than a false success.
+    let private thawCgroupAfterKill (cgroupPath: string) : Result<unit, string> =
+        let freezeFile = Path.Combine(cgroupPath, "cgroup.freeze")
+        let mutable attempt = 0
+        let mutable thawed = false
+        let mutable lastFailure = "cgroup.freeze did not report an unfrozen state"
+
+        while attempt < MaxThawAttempts && not thawed do
+            try
+                writeKillCgroupFile freezeFile "0"
+            with ex ->
+                lastFailure <- $"could not write {freezeFile} to thaw the cgroup: {ex.Message}"
+
+            try
+                let state = File.ReadAllText freezeFile |> fun value -> value.Trim()
+
+                if state = "0" then
+                    thawed <- true
+                elif state = "1" then
+                    lastFailure <- $"{freezeFile} still reports frozen state (1) after thaw attempt"
+                else
+                    lastFailure <- $"{freezeFile} returned unexpected state '{state}' while verifying thaw"
+            with
+            | :? FileNotFoundException
+            | :? DirectoryNotFoundException ->
+                // A removed cgroup cannot remain as a frozen reusable group; teardown may continue.
+                thawed <- true
+            | ex -> lastFailure <- $"could not read {freezeFile} while verifying thaw: {ex.Message}"
+
+            attempt <- attempt + 1
+
+            if not thawed && attempt < MaxThawAttempts then
+                System.Threading.Thread.Sleep ThawRetryDelayMilliseconds
+
+        if thawed then Ok() else Error lastFailure
+
     /// Hard-kill the whole subtree via `cgroup.kill` (kernel >= 5.14) — the atomic, race-free whole-subtree
     /// SIGKILL that also catches a process forked after any membership snapshot. On older kernels (< 5.14,
     /// no `cgroup.kill`) fall back to freezing the tree and running a bounded per-pid `kill(pid, SIGKILL)`
@@ -521,17 +577,17 @@ module internal Cgroup =
     /// SIGKILL is the least-harmful signal to misdirect, and a kernel without `cgroup.kill` (< 5.14) is old
     /// enough that pinning is not the point of this legacy path. The atomic `cgroup.kill` above is the
     /// race-free path used on every current kernel.
-    let killCgroup (cgroupPath: string) =
+    let killCgroup (cgroupPath: string) : Result<unit, string> =
         let viaKillFile =
             try
-                File.WriteAllText(Path.Combine(cgroupPath, "cgroup.kill"), "1")
+                writeKillCgroupFile (Path.Combine(cgroupPath, "cgroup.kill")) "1"
                 true
             with _ ->
                 false
 
         if not viaKillFile then
             (try
-                File.WriteAllText(Path.Combine(cgroupPath, "cgroup.freeze"), "1")
+                writeKillCgroupFile (Path.Combine(cgroupPath, "cgroup.freeze")) "1"
              with _ ->
                  // Best-effort freeze to stop members forking faster than the sweep can kill them; if
                  // the freeze controller is unavailable we still SIGKILL the members below.
@@ -562,12 +618,9 @@ module internal Cgroup =
                 System.Threading.Thread.Sleep 2
                 sweep <- sweep + 1
 
-            (try
-                File.WriteAllText(Path.Combine(cgroupPath, "cgroup.freeze"), "0")
-             with _ ->
-                 // Best-effort thaw so a survivor of the sweep isn't left frozen; the cgroup is being
-                 // torn down regardless, so a failure here is not actionable.
-                 ())
+            thawCgroupAfterKill cgroupPath
+        else
+            Ok()
 
     // errno: the kernel does not implement the syscall — a pre-5.3 kernel lacking `pidfd_open`, a pre-5.1
     // kernel lacking `pidfd_send_signal`, or a seccomp filter blocking either. Turned into an honest

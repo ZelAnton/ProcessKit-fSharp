@@ -361,6 +361,10 @@ CTRL+BREAK/WM_CLOSE paths and other signals return `ProcessError.Unsupported`. S
 container exists — `cgroup.freeze` on Linux, `SIGSTOP`/`SIGCONT` on macOS/BSD and the
 process-group fallback, per-thread suspension on Windows.
 
+`ProcessGroup.KillAll()` is reusable: on Linux kernels without `cgroup.kill`, it reports
+`ProcessError.Io` if the fallback cannot verify that `cgroup.freeze` returned to `0`; an already-unfrozen or
+removed freezer remains a best-effort success, and final disposal still removes the cgroup.
+
 *Deeper: [Process groups → signals, suspend/resume](docs/process-groups.md#signals-and-suspendresume).*
 
 ## Inspecting the tree and racing children

@@ -125,6 +125,7 @@ type internal SyntheticBackend() =
         member _.KillTree() =
             requireLive "KillTree"
             lock gate (fun () -> killTreeCount <- killTreeCount + 1)
+            Ok()
 
         member _.GracefulKillTree (_signal) (_grace) =
             requireLive "GracefulKillTree"
@@ -241,7 +242,7 @@ type internal CtrlSignalRaceBackend() =
         member _.Wait(_handle) = task { return Outcome.Exited 0 }
         member _.PidOf(spawned) = Some(int spawned.Handle)
         member _.KillChild(_spawned) = ()
-        member _.KillTree() = ()
+        member _.KillTree() = Ok()
         member _.GracefulKillTree (_signal) (_grace) = Task.CompletedTask
         member _.SignalChild(_spawned, _signal) = Ok()
 

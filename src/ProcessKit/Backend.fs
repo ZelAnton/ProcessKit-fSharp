@@ -118,8 +118,10 @@ type internal IContainmentBackend =
     /// Hard-kill a single contained child (not the whole tree).
     abstract KillChild: Native.Common.Spawned -> unit
 
-    /// Hard-kill the whole contained tree now (no grace) without releasing the container.
-    abstract KillTree: unit -> unit
+    /// Hard-kill the whole contained tree now (no grace) without releasing the container. A reusable
+    /// backend may report a failure that leaves the container unsafe to reuse; final teardown remains
+    /// best-effort through `HardRelease`.
+    abstract KillTree: unit -> Result<unit, ProcessError>
 
     /// Gracefully kill the tree (configured soft signal → grace → hard kill) without releasing it.
     abstract GracefulKillTree: Signal -> TimeSpan -> Task
@@ -234,6 +236,7 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
 
         member _.KillTree() =
             Native.Windows.terminateWindowsJob jobHandle
+            Ok()
 
         member _.GracefulKillTree (_signal) (grace) =
             // A best-effort SOFT phase before the atomic Job kill. Windows has no per-job graceful
@@ -598,7 +601,9 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                 identities.TryRemove pid |> ignore
                 children.Remove pid |> ignore
 
-        member _.KillTree() = Native.Cgroup.killCgroup cgroupPath
+        member _.KillTree() =
+            Native.Cgroup.killCgroup cgroupPath
+            |> Result.mapError (fun message -> ProcessError.Io $"failed to kill cgroup: {message}")
 
         member _.GracefulKillTree (signal) (grace) =
             let signalNum = Native.Posix.signalNumber signal
@@ -606,7 +611,7 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             GracefulTeardown.poll
                 (fun () -> Native.Cgroup.signalCgroup cgroupPath signalNum |> ignore)
                 (fun () -> Native.Cgroup.cgroupAlive cgroupPath)
-                (fun () -> Native.Cgroup.killCgroup cgroupPath)
+                (fun () -> Native.Cgroup.killCgroup cgroupPath |> ignore)
                 grace
 
         member _.SignalChild(spawned, signal) =
@@ -636,8 +641,8 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
         member _.Signal(signal) =
             match signal with
             | Signal.Kill ->
-                Native.Cgroup.killCgroup cgroupPath // atomic whole-subtree SIGKILL
-                Ok()
+                Native.Cgroup.killCgroup cgroupPath
+                |> Result.mapError (fun message -> ProcessError.Io $"failed to kill cgroup: {message}")
             | _ ->
                 let signalNum = Native.Posix.signalNumber signal
 
@@ -749,7 +754,9 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                     | Error message -> Error(ProcessError.ResourceLimit message)
 
         member _.HardRelease() =
-            Native.Cgroup.killCgroup cgroupPath
+            // Final disposal must remain bounded and best-effort: it removes the cgroup even when a
+            // reusable kill could not prove that the legacy freezer was thawed.
+            Native.Cgroup.killCgroup cgroupPath |> ignore
 
             // cgroup.kill SIGKILLs everything in the cgroup but does not reap our own children, and a
             // child that failed to migrate runs outside the cgroup entirely. Every child is also its own
@@ -891,6 +898,8 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                     Native.Posix.killProcessGroup pgid
                 else
                     untrack pgid |> ignore
+
+            Ok()
 
         member _.GracefulKillTree (signal) (grace) =
             // Snapshot the pgids and their identity tokens together. The poll runs off the lifecycle lock,

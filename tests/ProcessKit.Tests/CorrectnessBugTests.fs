@@ -181,6 +181,35 @@ type CorrectnessBugTests() =
     let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
     let runner: IProcessRunner = JobRunner()
 
+    let withSyntheticCgroup (freezeState: string option) (writeHook: string -> string -> unit) action =
+        // The cgroup path is exercised through plain file I/O with an empty cgroup.procs, so no Linux
+        // syscall is reached. This keeps the fault-injection contract executable on every test runner.
+        let dir =
+            Path.Combine(Path.GetTempPath(), $"processkit-cgroup-kill-{Guid.NewGuid():N}")
+
+        Directory.CreateDirectory dir |> ignore
+        File.WriteAllText(Path.Combine(dir, "cgroup.procs"), "")
+
+        freezeState
+        |> Option.iter (fun state -> File.WriteAllText(Path.Combine(dir, "cgroup.freeze"), state))
+
+        let originalHook = Native.Cgroup.killCgroupWriteTestHook
+        Native.Cgroup.killCgroupWriteTestHook <- Some writeHook
+
+        try
+            action dir
+        finally
+            Native.Cgroup.killCgroupWriteTestHook <- originalHook
+
+            try
+                Directory.Delete(dir, true)
+            with
+            | :? DirectoryNotFoundException
+            | :? IOException
+            | :? UnauthorizedAccessException ->
+                // Best-effort cleanup; the synthetic cgroup is not a production resource.
+                ()
+
     // A minimal synthetic `RunningHost` over the given config with no pipes and an immediate clean
     // exit — the T-066 concurrency/fault tests below override just the fields they need (`Stdout`,
     // `Wait`, `StartKill`, `Teardown`) with `{ baseHost cfg with ... }`.
@@ -1224,7 +1253,7 @@ type CorrectnessBugTests() =
 
                 try
                     let stopwatch = Stopwatch.StartNew()
-                    Native.Cgroup.killCgroup dir
+                    Native.Cgroup.killCgroup dir |> ignore
                     stopwatch.Stop()
 
                     Assert.That(
@@ -1270,6 +1299,101 @@ type CorrectnessBugTests() =
 
         assertIo "Suspend" (backend.Suspend())
         assertIo "Resume" (backend.Resume())
+
+    [<Test>]
+    member _.``legacy cgroup kill retries a refused first thaw and verifies the resulting state``() =
+        let mutable thawAttempts = 0
+
+        let writeHook (file: string) (content: string) =
+            if file.EndsWith("cgroup.kill", StringComparison.Ordinal) then
+                raise (IOException "cgroup.kill is unavailable")
+            elif content = "0" then
+                thawAttempts <- thawAttempts + 1
+
+                if thawAttempts = 1 then
+                    raise (UnauthorizedAccessException "first thaw is refused")
+
+        withSyntheticCgroup (Some "1\n") writeHook (fun dir ->
+            match Native.Cgroup.killCgroup dir with
+            | Error detail -> Assert.Fail $"expected the retry to thaw the cgroup, got {detail}"
+            | Ok() -> ()
+
+            Assert.That(thawAttempts, Is.EqualTo 2, "a refused first thaw must be retried")
+            Assert.That(File.ReadAllText(Path.Combine(dir, "cgroup.freeze")).Trim(), Is.EqualTo "0"))
+
+    [<Test>]
+    member _.``legacy cgroup kill failure reaches Signal Kill and KillAll, then a later KillAll can recover``() =
+        let mutable allowThaw = false
+
+        let writeHook (file: string) (content: string) =
+            if file.EndsWith("cgroup.kill", StringComparison.Ordinal) then
+                raise (IOException "cgroup.kill is unavailable")
+            elif content = "0" && not allowThaw then
+                raise (UnauthorizedAccessException "thaw remains refused")
+
+        withSyntheticCgroup (Some "1\n") writeHook (fun dir ->
+            let backend: IContainmentBackend = CgroupBackend dir
+
+            let assertKillFailure operation result =
+                match result with
+                | Error(ProcessError.Io message) ->
+                    Assert.That(message, Does.Contain "freeze", $"{operation} must identify the thaw failure")
+                | Error other -> Assert.Fail $"expected ProcessError.Io from {operation}, got {other}"
+                | Ok() -> Assert.Fail $"{operation} falsely reported success for a frozen reusable cgroup"
+
+            assertKillFailure "backend KillTree" (backend.KillTree())
+            Assert.That(File.ReadAllText(Path.Combine(dir, "cgroup.freeze")).Trim(), Is.EqualTo "1")
+
+            let group = ProcessGroup.FromBackend(CgroupBackend dir, ProcessGroupOptions())
+
+            try
+                assertKillFailure "ProcessGroup.Signal Kill" (group.Signal Signal.Kill)
+                assertKillFailure "ProcessGroup.KillAll" (group.KillAll())
+
+                allowThaw <- true
+
+                match group.KillAll() with
+                | Error error -> Assert.Fail $"expected a later KillAll to recover, got {error}"
+                | Ok() -> ()
+
+                Assert.That(File.ReadAllText(Path.Combine(dir, "cgroup.freeze")).Trim(), Is.EqualTo "0")
+            finally
+                (group :> IDisposable).Dispose())
+
+    [<Test>]
+    member _.``legacy cgroup kill does not fail for a fully write-restricted already-unfrozen cgroup``() =
+        let writeHook _file _content =
+            raise (UnauthorizedAccessException "all cgroup writes are refused")
+
+        withSyntheticCgroup (Some "0\n") writeHook (fun dir ->
+            let group = ProcessGroup.FromBackend(CgroupBackend dir, ProcessGroupOptions())
+
+            try
+                match group.KillAll() with
+                | Error error -> Assert.Fail $"an already-unfrozen cgroup should remain reusable, got {error}"
+                | Ok() -> ()
+
+                match group.Signal Signal.Kill with
+                | Error error -> Assert.Fail $"Signal Kill should preserve best-effort success, got {error}"
+                | Ok() -> ()
+            finally
+                (group :> IDisposable).Dispose())
+
+    [<Test>]
+    member _.``legacy cgroup kill treats a freezer that disappears during thaw as successful``() =
+        let writeHook (file: string) (content: string) =
+            if file.EndsWith("cgroup.kill", StringComparison.Ordinal) then
+                raise (IOException "cgroup.kill is unavailable")
+            elif content = "0" then
+                File.Delete file
+                raise (IOException "freezer disappeared during thaw")
+
+        withSyntheticCgroup (Some "1\n") writeHook (fun dir ->
+            match Native.Cgroup.killCgroup dir with
+            | Error detail -> Assert.Fail $"a removed freezer cannot leave a reusable group frozen: {detail}"
+            | Ok() -> ()
+
+            Assert.That(File.Exists(Path.Combine(dir, "cgroup.freeze")), Is.False))
 
     // --- T-197: a concurrent StopAsync teardown during an in-flight buffered verb must not fault the
     // verb with a false ProcessError.Io (the supervision path drives exactly this: `monitorLiveness`
