@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
+- `Stdin.FromBytes` now takes a defensive copy of the caller's byte array at the API boundary, so mutating it after building a `Command` (or across retry attempts) no longer changes what is written to the child's stdin.
 - Newline-free captured text now applies `OutputBuffer.MaxBytes` to UTF-8 byte size during force-flush, including multibyte Unicode output.
 - Relative entries in `PATH` now resolve to canonical absolute executable paths, anchored to the effective working directory for `Exec.which`, `Command.ResolveProgram`, and `CliClient.ResolveProgram`.
 - `FirstLineAsync` now preserves cancellation that arrives after a matching line, including while the child is being reaped, and no longer masks a `FinishAsync` error.
