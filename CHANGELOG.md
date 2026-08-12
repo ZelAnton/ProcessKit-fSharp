@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
+- `Stdin.FromBytes` now takes a defensive copy of the caller's byte array at the API boundary, so mutating it after building a `Command` (or across retry attempts) no longer changes what is written to the child's stdin.
 - Newline-free captured text now applies `OutputBuffer.MaxBytes` to UTF-8 byte size during force-flush, including multibyte Unicode output.
+- Windows bare-name executable resolution now matches `CreateProcessW` by checking the current directory and other pre-`PATH` search locations.
 - Relative entries in `PATH` now resolve to canonical absolute executable paths, anchored to the effective working directory for `Exec.which`, `Command.ResolveProgram`, and `CliClient.ResolveProgram`.
 - `FirstLineAsync` now preserves cancellation that arrives after a matching line, including while the child is being reaped, and no longer masks a `FinishAsync` error.
 - Linux cgroup legacy hard kills now verify that the reusable cgroup thawed and surface a typed `ProcessError.Io` through `ProcessGroup.KillAll()` and `Signal.Kill` instead of reporting success for a group still frozen; final disposal remains best-effort.

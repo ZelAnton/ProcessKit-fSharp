@@ -306,7 +306,7 @@ type CorrectnessBugTests() =
 
     [<Test>]
     member _.``a negative pipeline timeout is rejected at configuration time``() =
-        let pipeline = (shell "echo a").Pipe(shell "cat")
+        let pipeline = (shell "echo a").Pipe(shell (if isWindows then "more" else "cat"))
 
         Assert.Throws<ArgumentOutOfRangeException>(
             Action(fun () -> pipeline.Timeout(TimeSpan.FromSeconds -1.0) |> ignore)
@@ -739,6 +739,61 @@ type CorrectnessBugTests() =
                 Assert.Fail "a pipefail failure must win over the stdin failure, not surface ProcessError.Stdin"
             | Error other -> Assert.Fail $"unexpected error: {other.Message}"
         }
+
+    // --- T-322: Stdin.FromBytes must take a defensive copy at the API boundary --------------------
+
+    [<Test>]
+    member _.``mutating the source array after Stdin.FromBytes does not change what the child receives``() : Task =
+        task {
+            let bytes = [| 65uy; 66uy; 67uy |]
+
+            let cmd =
+                (shell (if isWindows then "more" else "cat"))
+                |> Command.stdin (Stdin.FromBytes bytes)
+
+            // Mutate the caller's array AFTER the command was built (and before it runs) — the already
+            // built `Command`/`Stdin` must not alias it, so the child must still see the original bytes.
+            bytes[0] <- 90uy
+
+            match! cmd.OutputBytesAsync() with
+            | Error e -> Assert.Fail $"expected the run to complete, got {e.Message}"
+            | Ok result ->
+                // Windows `more` may append a trailing CRLF to its output, so compare only the leading
+                // bytes the child actually echoed back from the fed content.
+                Assert.That(
+                    result.Stdout |> Array.truncate 3,
+                    Is.EqualTo<byte>([| 65uy; 66uy; 67uy |]),
+                    "the child observed the caller's post-construction mutation of the source array"
+                )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``two sequential Stdin.FromBytes attempts read the identical unmutated byte snapshot``() : Task =
+        task {
+            let original = [| 1uy; 2uy; 3uy; 4uy |]
+            let stdin = Stdin.FromBytes original
+
+            // Mutate the caller's array after building `stdin`, then run it twice (simulating two retry
+            // attempts sharing the same `Stdin` value) — both attempts must read the same, original
+            // snapshot taken at `FromBytes`, not the caller's mutated array and not each other's copy.
+            original[0] <- 99uy
+
+            let cmd = (shell (if isWindows then "more" else "cat")) |> Command.stdin stdin
+
+            match! cmd.OutputBytesAsync() with
+            | Error e -> Assert.Fail $"expected attempt 1 to complete, got {e.Message}"
+            | Ok first ->
+                match! cmd.OutputBytesAsync() with
+                | Error e -> Assert.Fail $"expected attempt 2 to complete, got {e.Message}"
+                | Ok second ->
+                    // Windows `more` may append a trailing CRLF to its output, so compare only the
+                    // leading bytes the child actually echoed back from the fed content.
+                    Assert.That(first.Stdout |> Array.truncate 4, Is.EqualTo<byte>([| 1uy; 2uy; 3uy; 4uy |]))
+                    Assert.That(second.Stdout |> Array.truncate 4, Is.EqualTo<byte>([| 1uy; 2uy; 3uy; 4uy |]))
+                    Assert.That(second.Stdout, Is.EqualTo<byte>(first.Stdout))
+        }
+        :> Task
 
     // --- T-066: atomic claim/transition state machine, and fault-aware terminal teardown ---
 
