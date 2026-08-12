@@ -138,6 +138,144 @@ type WhichResolutionTests() =
         :> Task
 
     [<Test>]
+    member _.``Windows: which and StartAsync agree for a bare name found only in the current directory``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "CreateProcessW's current-directory bare-name search is Windows-only."
+            else
+                let dir =
+                    Path.Combine(Path.GetTempPath(), "processkit-cwd-resolution-" + Guid.NewGuid().ToString "N")
+
+                Directory.CreateDirectory dir |> ignore
+                let toolName = "pk320-cwd-tool"
+                let toolPath = Path.Combine(dir, toolName + ".exe")
+                let originalDirectory = Directory.GetCurrentDirectory()
+                let originalPath = Environment.GetEnvironmentVariable "PATH"
+
+                let originalCurrentDirectoryPolicy =
+                    Environment.GetEnvironmentVariable "NoDefaultCurrentDirectoryInExePath"
+
+                try
+                    File.Copy(Path.Combine(Environment.SystemDirectory, "cmd.exe"), toolPath)
+                    Environment.SetEnvironmentVariable("PATH", Environment.SystemDirectory)
+                    Environment.SetEnvironmentVariable("NoDefaultCurrentDirectoryInExePath", null)
+                    Directory.SetCurrentDirectory dir
+
+                    match Exec.which toolName with
+                    | Error error -> Assert.Fail $"expected cwd-only program to resolve, got {error}"
+                    | Ok resolved -> Assert.That(resolved, Is.EqualTo(Path.GetFullPath toolPath).IgnoreCase)
+
+                    match! (Command.create toolName |> Command.args [ "/c"; "exit 0" ]).StartAsync() with
+                    | Error error -> Assert.Fail $"expected cwd-only program to start, got {error}"
+                    | Ok running ->
+                        let! outcome = running.WaitAsync()
+                        Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+                finally
+                    Directory.SetCurrentDirectory originalDirectory
+                    Environment.SetEnvironmentVariable("PATH", originalPath)
+
+                    Environment.SetEnvironmentVariable(
+                        "NoDefaultCurrentDirectoryInExePath",
+                        originalCurrentDirectoryPolicy
+                    )
+
+                    Directory.Delete(dir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: which and StartAsync agree when NoDefaultCurrentDirectoryInExePath excludes the current directory``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "NeedCurrentDirectoryForExePathW is Windows-only."
+            else
+                let dir =
+                    Path.Combine(Path.GetTempPath(), "processkit-cwd-policy-" + Guid.NewGuid().ToString "N")
+
+                Directory.CreateDirectory dir |> ignore
+                let toolName = "pk320-cwd-policy"
+                let toolPath = Path.Combine(dir, toolName + ".exe")
+                let originalDirectory = Directory.GetCurrentDirectory()
+                let originalPath = Environment.GetEnvironmentVariable "PATH"
+
+                let originalCurrentDirectoryPolicy =
+                    Environment.GetEnvironmentVariable "NoDefaultCurrentDirectoryInExePath"
+
+                try
+                    File.Copy(Path.Combine(Environment.SystemDirectory, "cmd.exe"), toolPath)
+                    Environment.SetEnvironmentVariable("PATH", Environment.SystemDirectory)
+                    Environment.SetEnvironmentVariable("NoDefaultCurrentDirectoryInExePath", "1")
+                    Directory.SetCurrentDirectory dir
+
+                    let whichResult = Exec.which toolName
+
+                    match! (Command.create toolName |> Command.args [ "/c"; "exit 0" ]).StartAsync() with
+                    | Ok running ->
+                        do! (running :> IAsyncDisposable).DisposeAsync()
+                        Assert.Fail "expected the current-directory policy to exclude the cwd-only program"
+                    | Error spawnError ->
+                        Assert.That(spawnError.IsNotFound, Is.True, $"expected NotFound, got {spawnError}")
+
+                        match whichResult with
+                        | Error whichError ->
+                            Assert.That(whichError.IsNotFound, Is.True, $"expected which NotFound, got {whichError}")
+                        | Ok resolved -> Assert.Fail $"which unexpectedly resolved '{resolved}'"
+                finally
+                    Directory.SetCurrentDirectory originalDirectory
+                    Environment.SetEnvironmentVariable("PATH", originalPath)
+
+                    Environment.SetEnvironmentVariable(
+                        "NoDefaultCurrentDirectoryInExePath",
+                        originalCurrentDirectoryPolicy
+                    )
+
+                    Directory.Delete(dir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: which and StartAsync agree when a bare name is absent from the current directory and PATH``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "CreateProcessW's current-directory bare-name search is Windows-only."
+            else
+                let dir =
+                    Path.Combine(Path.GetTempPath(), "processkit-cwd-missing-" + Guid.NewGuid().ToString "N")
+
+                Directory.CreateDirectory dir |> ignore
+                let toolName = "pk320-cwd-missing"
+                let originalDirectory = Directory.GetCurrentDirectory()
+                let originalPath = Environment.GetEnvironmentVariable "PATH"
+
+                try
+                    Environment.SetEnvironmentVariable("PATH", Environment.SystemDirectory)
+                    Directory.SetCurrentDirectory dir
+
+                    let whichResult = Exec.which toolName
+
+                    match! (Command.create toolName).StartAsync() with
+                    | Ok running ->
+                        do! (running :> IAsyncDisposable).DisposeAsync()
+                        Assert.Fail "expected a cwd/PATH miss, but StartAsync launched the program"
+                    | Error spawnError ->
+                        Assert.That(spawnError.IsNotFound, Is.True, $"expected NotFound, got {spawnError}")
+
+                        match whichResult with
+                        | Error whichError ->
+                            Assert.That(whichError.IsNotFound, Is.True, $"expected which NotFound, got {whichError}")
+                        | Ok resolved -> Assert.Fail $"which unexpectedly resolved '{resolved}'"
+                finally
+                    Directory.SetCurrentDirectory originalDirectory
+                    Environment.SetEnvironmentVariable("PATH", originalPath)
+                    Directory.Delete(dir, true)
+        }
+        :> Task
+
+    [<Test>]
     member _.``which resolves a path-form program directly, with no PATH search, and no Searched on a miss``() =
         let dir =
             Path.Combine(Path.GetTempPath(), "processkit-which-" + Guid.NewGuid().ToString "N")
