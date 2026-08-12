@@ -513,7 +513,7 @@ type PumpTests() =
 
     [<Test>]
     member _.``Cr mode force-flushes an over-long frame at the byte cap``() =
-        // The '\r'-aware path honours `maxLineLength` too: a newline-free (here, CR-free) frame is
+        // The '\r'-aware path honours the UTF-8 byte cap too: a newline-free (here, CR-free) frame is
         // flushed in <=cap segments, so a runaway frame can't outgrow the in-flight buffer.
         use stream = new MemoryStream(Encoding.UTF8.GetBytes "aaabbbc\rtail")
         let segments = ResizeArray<string>()
@@ -746,8 +746,8 @@ type PumpTests() =
 
     [<Test>]
     member _.``readLines force-flushes an over-long unterminated line at the cap``() =
-        // A 7-char newline-free blob with a cap of 3 is flushed as <=3-char segments, so the in-flight
-        // buffer never grows past the cap — a newline-free flood can't outgrow it.
+        // A 7-byte ASCII newline-free blob with a cap of 3 is flushed as <=3-byte segments, so the
+        // in-flight buffer never grows past the cap — a newline-free flood can't outgrow it.
         use stream = new MemoryStream(Encoding.UTF8.GetBytes "aaabbbc")
         let segments = ResizeArray<string>()
 
@@ -764,6 +764,73 @@ type PumpTests() =
             .Wait()
 
         CollectionAssert.AreEqual([ "aaa"; "bbb"; "c" ], segments)
+
+    [<Test>]
+    member _.``readLines force-flushes by UTF-8 bytes without splitting a surrogate pair``() =
+        // U+1F600 is four UTF-8 bytes but two UTF-16 code units. A character-count cap of 3 would
+        // incorrectly keep it together with the following ASCII character; the byte cap must emit
+        // the complete scalar first and never split its surrogate pair.
+        use stream = new MemoryStream(Encoding.UTF8.GetBytes "😀x")
+        let segments = ResizeArray<string>()
+
+        (Pump.readLines
+            stream
+            Encoding.UTF8
+            LineTerminator.Lf
+            None
+            (fun l ->
+                segments.Add l
+                ValueTask.CompletedTask)
+            (Some 3)
+            CancellationToken.None)
+            .Wait()
+
+        CollectionAssert.AreEqual([ "😀"; "x" ], segments)
+
+    [<Test>]
+    member _.``readLines keeps an over-cap multibyte scalar intact when cap is smaller than one character``() =
+        use stream = new MemoryStream(Encoding.UTF8.GetBytes "éé")
+        let segments = ResizeArray<string>()
+
+        (Pump.readLines
+            stream
+            Encoding.UTF8
+            LineTerminator.Lf
+            None
+            (fun l ->
+                segments.Add l
+                ValueTask.CompletedTask)
+            (Some 1)
+            CancellationToken.None)
+            .Wait()
+
+        CollectionAssert.AreEqual([ "é"; "é" ], segments)
+
+    [<Test>]
+    member _.``readLines byte force-flushes feed the LineBuffer's UTF-8 byte policy``() =
+        // With a cap of 5, two 'é' characters (4 bytes plus the retained-line separator surcharge)
+        // fit exactly, so the byte-aware path retains the final one after DropOldest evicts the first
+        // segment. The old character-count path emitted all three as one 7-byte line and retained
+        // nothing.
+        let cap = 5
+        let buf = Pump.LineBuffer(OutputBufferPolicy.Unbounded.WithMaxBytes cap)
+        use stream = new MemoryStream(Encoding.UTF8.GetBytes "ééé")
+
+        (Pump.readLines
+            stream
+            Encoding.UTF8
+            LineTerminator.Lf
+            None
+            (fun l ->
+                buf.Add l
+                ValueTask.CompletedTask)
+            (Some cap)
+            CancellationToken.None)
+            .Wait()
+
+        Assert.That(buf.Text, Is.EqualTo "é")
+        Assert.That(buf.Truncated, Is.True)
+        Assert.That(Encoding.UTF8.GetByteCount buf.Text, Is.LessThanOrEqualTo cap)
 
     [<Test>]
     member _.``readLines with a zero cap emits only real content segments``() =
