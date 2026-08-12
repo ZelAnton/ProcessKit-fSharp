@@ -485,7 +485,6 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     let readStdoutLineCount () =
         readStdoutLineCount64 () |> saturateInt64ToInt
 
-    let readStdoutChunkCount () = Volatile.Read(&stdoutChunkCount)
     let readStderrLineCount64 () = Volatile.Read(&stderrLineCount)
 
     let readStderrLineCount () =
