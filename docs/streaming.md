@@ -1130,7 +1130,13 @@ Probe semantics are deliberately uniform:
   distinct from `ProcessError.Timeout`, which is the run's own deadline.
 - A probe also fails *fast* once readiness can no longer happen: the child exits, or
   (for `WaitForLineAsync`) its stdout closes — no waiting out a 10s deadline on a dead
-  server.
+  server. Observing the exit does not by itself discard readiness, though: the four
+  external-condition probes (`WaitForPortAsync` / `WaitForSocketAsync` / `WaitForHttpAsync` /
+  `WaitForAsync`) check the condition exactly one more time first — bounded by what is left of the
+  deadline and by a brief grace — so a port, socket, endpoint, or sentinel published immediately
+  before the child terminated still reports `Ok` instead of being lost to that exit. Expect that one
+  extra invocation of a `WaitForAsync` predicate; an already-cancelled token or a spent deadline
+  skips it.
 - A failed probe **never kills the child.** You decide what happens next: retry, log
   and continue, or tear down.
 - All five probes background-drain the child's piped stdout/stderr while polling, so a chatty

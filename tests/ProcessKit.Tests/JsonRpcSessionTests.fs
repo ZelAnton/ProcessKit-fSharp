@@ -1241,3 +1241,85 @@ type JsonRpcSessionTests() =
             | other -> Assert.Fail $"expected a typed parse failure, got {other}"
         }
         :> Task
+
+    [<Test>]
+    member _.``a request id that is not a string, number, or null ends the session with a typed parse failure``
+        ()
+        : Task =
+        task {
+            let malformedFrames =
+                [| "boolean", """{"jsonrpc":"2.0","id":true,"method":"invalid/id"}"""
+                   "object", """{"jsonrpc":"2.0","id":{"a":1},"method":"invalid/id"}"""
+                   "array", """{"jsonrpc":"2.0","id":[1],"method":"invalid/id"}""" |]
+
+            for caseName, json in malformedFrames do
+                let peer = peerHandle ()
+                use running = peer.Running
+                let session = JsonRpcSession(running)
+                let messages = session.MessagesAsync().GetAsyncEnumerator()
+
+                peer.Stdout.Emit(framed json)
+
+                let faulted =
+                    Assert.ThrowsAsync<ProcessException>(Func<Task>(fun () -> messages.MoveNextAsync().AsTask()))
+
+                match faulted with
+                | null -> Assert.Fail $"expected the {caseName} id to fault the message stream"
+                | error ->
+                    match error.Error with
+                    | ProcessError.Parse(program, _) -> Assert.That(program, Is.EqualTo "language-server")
+                    | other -> Assert.Fail $"expected Parse for the {caseName} id, got {other}"
+
+                do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an explicit null id is delivered as a request, not folded into a notification``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"window/showMessageRequest\"}")
+
+            let! received = messages.MoveNextAsync()
+            Assert.That(received, Is.True)
+            let request = messages.Current
+            Assert.That(request.IsRequest, Is.True, "an explicit null id must still be a request")
+            Assert.That(request.Id, Is.EqualTo(Some "null"))
+
+            match! session.RespondRawAsync(request, "null") with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"expected the null-id request to be answerable, got {error}"
+
+            use! sent = nextFrame peer.Stdin
+            Assert.That(rawId sent, Is.EqualTo "null")
+
+            do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a peer response id string must round-trip exactly, not just parse as the numeric id``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+
+            let call = session.RequestRawAsync("initialize", null)
+            use! request = nextFrame peer.Stdin
+            let realId = rawId request
+
+            // Both decoys are strings `Int64.TryParse` would still accept — a leading sign, surrounding
+            // whitespace — but neither is the id's own canonical decimal text, so neither may complete
+            // the pending call. Only the genuine numeric-id answer, sent last, may.
+            peer.Stdout.Emit(framed (responseJson ("\"+" + realId + "\"") "\"decoy-signed\""))
+            peer.Stdout.Emit(framed (responseJson ("\" " + realId + " \"") "\"decoy-padded\""))
+            peer.Stdout.Emit(framed (responseJson realId "\"genuine\""))
+
+            let! answer = call
+            assertRaw "\"genuine\"" answer
+        }
+        :> Task

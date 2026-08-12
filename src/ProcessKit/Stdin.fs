@@ -42,10 +42,12 @@ type Stdin internal (source: StdinSource) =
         ArgumentNullException.ThrowIfNull text
         Stdin(StdinSource.Text text)
 
-    /// Raw bytes. `bytes` must not be null (`ArgumentNullException`).
+    /// Raw bytes. `bytes` must not be null (`ArgumentNullException`). A defensive copy is taken at this
+    /// boundary — the built `Command`/`Stdin` never aliases the caller's array, so mutating it afterward
+    /// (including between retries) has no effect on what is written to the child.
     static member FromBytes(bytes: byte[]) =
         ArgumentNullException.ThrowIfNull bytes
-        Stdin(StdinSource.Bytes bytes)
+        Stdin(StdinSource.Bytes(Array.copy bytes))
 
     /// The contents of a file, streamed to the child. `path` must not be null (`ArgumentNullException`).
     static member FromFile(path: string) =

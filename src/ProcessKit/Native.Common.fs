@@ -328,11 +328,19 @@ module internal Common =
           PreferLocal = preferLocal
           WorkingDirectory = baseDir }
 
-    /// Walk `ctx.Path` for `program` (a bare name — see `isBareName`), reusing `probeDir` (with the
-    /// context's `PathExt`) for each directory in order. Relative entries are anchored to the effective
-    /// working directory before probing, and every hit is normalized to a full path. Returns `(found,
-    /// searched)`: `found` is the first matching directory's resolved path; `searched` is the raw `PATH`
-    /// value, for the `NotFound` diagnostic (`""` when the `PATH` is unset/empty).
+    [<DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "NeedCurrentDirectoryForExePathW")>]
+    extern bool private needCurrentDirectoryForExePath(string fileName)
+
+    /// Walk the directories that `CreateProcessW` with `lpApplicationName = NULL` searches for `program`
+    /// (a bare name — see `isBareName`), followed by `ctx.Path`, reusing `probeDir` (with the context's
+    /// `PathExt`) for each directory in order. On Windows this includes the loaded application's directory,
+    /// the parent process's current directory when `NeedCurrentDirectoryForExePathW` includes it, the system
+    /// directories, and the Windows directory before `PATH`; the process's current directory is deliberately
+    /// used rather than `ctx.WorkingDirectory`, because `lpCurrentDirectory` only sets the child's directory
+    /// after executable resolution. Relative `PATH` entries are anchored to the effective working directory
+    /// before probing, and every hit is normalized to a full path. Returns `(found, searched)`: `found` is the
+    /// first matching directory's resolved path; `searched` is the raw `PATH` value, for the `NotFound`
+    /// diagnostic (`""` when the `PATH` is unset/empty).
     ///
     /// `PATH` is split on the raw `Path.PathSeparator` with NO quote handling, on Windows as on POSIX —
     /// deliberate and verified. The real bare-name launch is `CreateProcessW` with
@@ -345,27 +353,66 @@ module internal Common =
     /// OS: a quoted entry is treated as the (invalid) directory name it literally is and simply matches
     /// nothing, exactly as the spawn finds nothing.
     let private findInContextPath (ctx: ResolveContext) (program: string) : string option * string =
-        match ctx.Path with
-        | "" -> None, ""
-        | pathValue ->
-            let effectiveWorkingDirectory =
-                match ctx.WorkingDirectory with
-                | Some directory -> Path.GetFullPath directory
-                | None -> Directory.GetCurrentDirectory()
+        let effectiveWorkingDirectory =
+            match ctx.WorkingDirectory with
+            | Some directory -> Path.GetFullPath directory
+            | None -> Directory.GetCurrentDirectory()
 
-            let resolvePathEntry (directory: string) =
-                if Path.IsPathRooted directory then
-                    directory
-                else
-                    Path.Combine(effectiveWorkingDirectory, directory)
+        let resolvePathEntry (directory: string) =
+            if Path.IsPathRooted directory then
+                directory
+            else
+                Path.Combine(effectiveWorkingDirectory, directory)
 
-            let dirs = pathValue.Split Path.PathSeparator |> Array.filter (fun d -> d <> "")
+        let pathDirs =
+            if String.IsNullOrEmpty ctx.Path then
+                [||]
+            else
+                ctx.Path.Split Path.PathSeparator
+                |> Array.filter (fun d -> d <> "")
+                |> Array.map resolvePathEntry
 
-            (dirs
-             |> Array.tryPick (fun dir ->
-                 probeDir ctx.PathExt (resolvePathEntry dir) program
-                 |> Option.map Path.GetFullPath)),
-            pathValue
+        let dirs =
+            if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                let applicationDirectory =
+                    match Environment.ProcessPath with
+                    | null
+                    | "" -> []
+                    | processPath ->
+                        match Path.GetDirectoryName processPath with
+                        | null
+                        | "" -> []
+                        | directory -> [ directory ]
+
+                let windowsDirectory = Environment.GetFolderPath Environment.SpecialFolder.Windows
+                let systemDirectory = Environment.SystemDirectory
+
+                let legacySystemDirectory =
+                    if String.IsNullOrEmpty windowsDirectory then
+                        []
+                    else
+                        [ Path.Combine(windowsDirectory, "System") ]
+
+                let currentDirectory =
+                    if needCurrentDirectoryForExePath program then
+                        [ Directory.GetCurrentDirectory() ]
+                    else
+                        []
+
+                applicationDirectory
+                @ currentDirectory
+                @ [ systemDirectory ]
+                @ legacySystemDirectory
+                @ [ windowsDirectory ]
+                @ Array.toList pathDirs
+                |> List.filter (fun directory -> not (String.IsNullOrEmpty directory))
+                |> List.toArray
+            else
+                pathDirs
+
+        (dirs
+         |> Array.tryPick (fun dir -> probeDir ctx.PathExt dir program |> Option.map Path.GetFullPath)),
+        ctx.Path
 
     /// Resolve `program` (a bare name) against `ctx.PreferLocal` — the prefer-local directories, already
     /// anchored — searched in the order they were added, BEFORE any `PATH` lookup (T-182). Each directory

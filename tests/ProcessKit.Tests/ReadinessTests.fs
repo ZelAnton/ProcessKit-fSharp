@@ -43,6 +43,73 @@ type private ReadinessHttpHandler() =
 
         base.Dispose disposing
 
+/// An `HttpMessageHandler` whose FIRST request parks until the test releases it and whose every later
+/// request answers 200 — the HTTP shape of "the stale health check is still in flight when the child
+/// publishes readiness and exits". Parking the first request is what makes the post-exit re-check tests
+/// deterministic rather than timing-dependent: the polling loop provably cannot reach a second request
+/// on its own while that first one is unanswered, so a second request can only come from the single
+/// re-check `RunningProcess.raceReadinessAgainstExit` performs after observing the exit.
+type private LateReadyHttpHandler() =
+    inherit HttpMessageHandler()
+
+    let mutable requests = 0
+
+    let firstRequestStarted =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let firstRequestReleased =
+        TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    /// How many requests the client has sent through this handler.
+    member _.Requests = Volatile.Read(&requests)
+
+    /// Completes once the first (parked) request has been sent.
+    member _.FirstRequestStarted = firstRequestStarted.Task
+
+    /// Unpark the first request with a "not ready" answer, so the abandoned probe attempt behind it can
+    /// finish instead of being left pending for the rest of the test run.
+    member _.ReleaseFirstRequest() =
+        firstRequestReleased.TrySetResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable))
+        |> ignore
+
+    override _.SendAsync(_request: HttpRequestMessage, _cancellationToken: CancellationToken) =
+        if Interlocked.Increment(&requests) = 1 then
+            firstRequestStarted.TrySetResult() |> ignore
+            firstRequestReleased.Task
+        else
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK))
+
+/// A timer that never fires — see `ManualReadinessClock` for why the readiness tests want one.
+type private InertTimer() =
+    interface ITimer with
+        member _.Change(_dueTime, _period) = true
+
+        member _.Dispose() = ()
+
+        member _.DisposeAsync() = ValueTask()
+
+/// A `TimeProvider` whose clock only moves when the test moves it and whose timers never fire at all.
+/// Readiness code observes the deadline two independent ways: the poll core arms a
+/// `CancellationTokenSource` on a provider timer, while `RunningProcess.raceReadinessAgainstExit`
+/// measures the spent budget with `GetElapsedTime`. Advancing the clock WITHOUT firing timers isolates
+/// the second, which is exactly what the "a spent deadline suppresses the post-exit re-check" test needs:
+/// the budget is observably gone, yet nothing has ended the run on the test's behalf.
+///
+/// `TimestampFrequency` is fixed at `TimeSpan.TicksPerSecond` so an `Advance` maps one-to-one onto
+/// elapsed time; the tests using it advance by far more than the budget under test, so they stay correct
+/// even where the base class converts through a different timestamp frequency.
+type private ManualReadinessClock() =
+    inherit TimeProvider()
+
+    let mutable timestamp = 0L
+
+    override _.TimestampFrequency = TimeSpan.TicksPerSecond
+    override _.GetTimestamp() = Volatile.Read(&timestamp)
+    override _.CreateTimer(_callback, _state, _dueTime, _period) = new InertTimer() :> ITimer
+
+    member _.Advance(amount: TimeSpan) =
+        Interlocked.Add(&timestamp, amount.Ticks) |> ignore
+
 [<TestFixture>]
 type ReadinessTests() =
 
@@ -211,13 +278,10 @@ type ReadinessTests() =
             // Best-effort cleanup only; leaving a stray temp file behind is not a test failure.
             ()
 
-    // A synthetic `RunningProcess` with no piped streams whose exit is fully driven by `exitTask`:
-    // pass a never-completing task to model a child that stays running, or `Task.FromResult(Outcome...)`
-    // to model one that has already exited. Used to drive the readiness probes' exit-race path
-    // (HTTP/port/custom) deterministically, without a real subprocess.
-    let syntheticProcess (exitTask: Task<Outcome>) : RunningProcess =
-        let config = (Command.create "test").Config
-
+    // `syntheticProcess` over a caller-supplied `CommandConfig` — the only reason to reach for this
+    // overload is to hand the handle a non-default `TimeProvider` (see `ManualReadinessClock`), since the
+    // readiness deadline arithmetic reads the clock through the command's config.
+    let syntheticProcessWith (config: CommandConfig) (exitTask: Task<Outcome>) : RunningProcess =
         let host: RunningHost =
             { Config = config
               Pid = None
@@ -238,6 +302,13 @@ type ReadinessTests() =
               Teardown = fun () -> ValueTask() }
 
         new RunningProcess(host)
+
+    // A synthetic `RunningProcess` with no piped streams whose exit is fully driven by `exitTask`:
+    // pass a never-completing task to model a child that stays running, or `Task.FromResult(Outcome...)`
+    // to model one that has already exited. Used to drive the readiness probes' exit-race path
+    // (HTTP/port/custom) deterministically, without a real subprocess.
+    let syntheticProcess (exitTask: Task<Outcome>) : RunningProcess =
+        syntheticProcessWith (Command.create "test").Config exitTask
 
     // A `Wait` delegate for `syntheticProcess` that faults ~300ms after being invoked — asynchronously,
     // through `task { }`, never synchronously from the call to `exitFaultsLate()` itself (KB K-058/
@@ -963,6 +1034,7 @@ type ReadinessTests() =
                     neverConnects
                     "test"
                     endpoint
+                    ReadinessAttempts.PollUntilDeadline
                     (TimeSpan.FromMilliseconds 200.0)
                     CancellationToken.None
             with
@@ -1023,6 +1095,7 @@ type ReadinessTests() =
                     lateConnect
                     "test"
                     endpoint
+                    ReadinessAttempts.PollUntilDeadline
                     (TimeSpan.FromMilliseconds 100.0)
                     CancellationToken.None
             with
@@ -1067,6 +1140,7 @@ type ReadinessTests() =
                     faultsLate
                     "test"
                     endpoint
+                    ReadinessAttempts.PollUntilDeadline
                     (TimeSpan.FromMilliseconds 100.0)
                     CancellationToken.None
             with
@@ -1216,7 +1290,10 @@ type ReadinessTests() =
 
     // Early-exit contract, custom probe: a predicate that never flips true against an already-exited
     // child must resolve to `NotReady` promptly, not poll out the full timeout — the `WaitForAsync`
-    // sibling of the port test above.
+    // sibling of the port test above. Also the guard on the ceiling over the post-exit re-check
+    // (`postExitRecheckGrace`, T-331): this predicate never answers at all, so without that ceiling the
+    // one final observation would run until the 5s deadline and turn prompt early-exit detection back
+    // into waiting the budget out.
     [<Test>]
     member _.``WaitFor returns NotReady promptly when the child has already exited``() : Task =
         task {
@@ -1227,6 +1304,272 @@ type ReadinessTests() =
             match! running.WaitForAsync(neverReady, TimeSpan.FromSeconds 5.0) with
             | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
             | other -> Assert.Fail $"expected early NotReady, got {other}"
+        }
+        :> Task
+
+    // --- T-331: the single post-exit re-check ------------------------------------------------------
+    // Observing the child's exit is not proof that the condition never came true. The polling probe's
+    // in-flight attempt can observe a stale `false` and then yield long enough for the child to publish
+    // readiness (a sentinel, an open port/socket, a health endpoint) and terminate; reporting `NotReady`
+    // at that point erases a state that genuinely exists. `raceReadinessAgainstExit`'s exit branch
+    // therefore takes exactly ONE more bounded look before answering. The five tests below pin every
+    // part of that contract — a late success is kept (through two different probe kinds, custom and
+    // HTTP, to show the behaviour comes from the shared choke point rather than one verb), a genuine
+    // terminal false still ends as `NotReady` after exactly one extra look, and cancellation and a
+    // spent deadline each still outrank the re-check.
+    //
+    // Each drives the ordering with a PARKED first attempt rather than a sleep: while the first
+    // observation is unanswered the polling loop provably cannot start a second one, so a second
+    // invocation can only be the post-exit re-check. That makes the attempt counts below exact rather
+    // than timing-dependent. The synthetic host models "still running" with a never-completing `Wait`
+    // (KB K-044), driven by the test's own `TaskCompletionSource` so the exit happens exactly when the
+    // scenario calls for it.
+    [<Test>]
+    member _.``WaitFor observes readiness published immediately before the child exits``() : Task =
+        task {
+            let exitSignal =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use running = syntheticProcess exitSignal.Task
+
+            let firstAttemptStarted =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let firstAttemptAnswer =
+                TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let attempts = ref 0
+            let published = ref 0
+
+            let probe () : Task<bool> =
+                if Interlocked.Increment(&attempts.contents) = 1 then
+                    // The stale observation: started before the sentinel existed and still in flight when
+                    // the child publishes it and dies.
+                    firstAttemptStarted.TrySetResult() |> ignore
+                    firstAttemptAnswer.Task
+                else
+                    Task.FromResult(Volatile.Read(&published.contents) = 1)
+
+            let waitTask = running.WaitForAsync(probe, TimeSpan.FromSeconds 5.0)
+            do! firstAttemptStarted.Task
+
+            // The child becomes ready and then immediately exits — the race this fix exists for.
+            Volatile.Write(&published.contents, 1)
+            exitSignal.SetResult(Outcome.Exited 0)
+
+            match! waitTask with
+            | Ok() ->
+                Assert.That(
+                    Volatile.Read(&attempts.contents),
+                    Is.EqualTo 2,
+                    "the exit branch must re-check the condition exactly once, not poll on"
+                )
+            | other -> Assert.Fail $"expected Ok from the post-exit re-check, got {other}"
+
+            // Let the abandoned first attempt conclude instead of leaving it pending for the whole run.
+            firstAttemptAnswer.TrySetResult false |> ignore
+        }
+        :> Task
+
+    // The same race through a different probe kind, proving the fix lives in the shared choke point
+    // rather than in one verb: the health endpoint starts answering while the first request is still
+    // unanswered, and the child exits before that answer arrives.
+    [<Test>]
+    member _.``WaitForHttp observes an endpoint that starts answering immediately before the child exits``() : Task =
+        task {
+            let exitSignal =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use running = syntheticProcess exitSignal.Task
+            use handler = new LateReadyHttpHandler()
+            use client = new HttpClient(handler, Timeout = Timeout.InfiniteTimeSpan)
+            let uri = Uri "http://127.0.0.1:1/health"
+
+            let waitTask = running.WaitForHttpAsync(uri, client, TimeSpan.FromSeconds 5.0)
+            do! handler.FirstRequestStarted
+            exitSignal.SetResult(Outcome.Exited 0)
+
+            match! waitTask with
+            | Ok() ->
+                Assert.That(
+                    handler.Requests,
+                    Is.EqualTo 2,
+                    "the exit branch must send exactly one more request, not resume polling"
+                )
+            | other -> Assert.Fail $"expected Ok from the post-exit re-check, got {other}"
+
+            handler.ReleaseFirstRequest()
+        }
+        :> Task
+
+    // A genuine terminal false: the condition never became true, so the one re-check confirms it and the
+    // result stays `NotReady` — reached with exactly one extra observation (never a resumed poll loop)
+    // and without waiting out the deadline.
+    [<Test>]
+    member _.``WaitFor reports NotReady after a single post-exit re-check when the condition never holds``() : Task =
+        task {
+            let exitSignal =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use running = syntheticProcess exitSignal.Task
+
+            let firstAttemptStarted =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let firstAttemptAnswer =
+                TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let attempts = ref 0
+
+            let probe () : Task<bool> =
+                if Interlocked.Increment(&attempts.contents) = 1 then
+                    firstAttemptStarted.TrySetResult() |> ignore
+                    firstAttemptAnswer.Task
+                else
+                    Task.FromResult false
+
+            let elapsed = Stopwatch.StartNew()
+            let waitTask = running.WaitForAsync(probe, TimeSpan.FromSeconds 30.0)
+            do! firstAttemptStarted.Task
+            exitSignal.SetResult(Outcome.Exited 1)
+
+            match! waitTask with
+            | Error(ProcessError.NotReady(_, reported)) ->
+                Assert.That(
+                    Volatile.Read(&attempts.contents),
+                    Is.EqualTo 2,
+                    "a terminal false must cost exactly one extra observation"
+                )
+
+                Assert.That(reported, Is.EqualTo(TimeSpan.FromSeconds 30.0), "NotReady reports the whole budget")
+                Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 5.0), "the re-check is not a new poll")
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+
+            firstAttemptAnswer.TrySetResult false |> ignore
+        }
+        :> Task
+
+    // Cancellation still outranks readiness, including the re-check's own verdict: the caller's token
+    // fires while that final observation is parked, and the parked observation would answer `true` if it
+    // were ever allowed to finish — so `Cancelled` here proves the re-check is bounded by the caller's
+    // token rather than awaited to completion.
+    //
+    // The exit is signalled only after the first attempt has provably STARTED, which is what makes the
+    // attempt numbering trustworthy: a poll attempt abandoned at cancellation still runs its queued body
+    // afterwards, so a probe that branches on an attempt counter without that gate can see the re-check
+    // and the abandoned poll attempt arrive in either order.
+    [<Test>]
+    member _.``WaitFor reports Cancelled when the caller's token fires during the post-exit re-check``() : Task =
+        task {
+            let exitSignal =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use running = syntheticProcess exitSignal.Task
+            use cts = new CancellationTokenSource()
+
+            let firstAttemptStarted =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let parkedAnswer =
+                TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let attempts = ref 0
+
+            let probe () : Task<bool> =
+                if Interlocked.Increment(&attempts.contents) = 1 then
+                    firstAttemptStarted.TrySetResult() |> ignore
+                else
+                    // The caller cancels from inside the one post-exit observation, so the cancellation
+                    // is guaranteed to land while that observation is in flight — no window for the grace
+                    // ceiling to decide the result first, and no dependence on scheduling latency.
+                    cts.Cancel()
+
+                // Both the stale observation and the re-check park; only the cancellation above can end
+                // this wait, and it would answer `true` (below) if it were ever awaited to completion.
+                parkedAnswer.Task
+
+            let waitTask = running.WaitForAsync(probe, TimeSpan.FromSeconds 30.0, cts.Token)
+            do! firstAttemptStarted.Task
+            exitSignal.SetResult(Outcome.Exited 1)
+
+            match! waitTask with
+            | Error(ProcessError.Cancelled _) ->
+                Assert.That(
+                    Volatile.Read(&attempts.contents),
+                    Is.EqualTo 2,
+                    "the cancelled result must come from the re-check itself, not from skipping it"
+                )
+            | other -> Assert.Fail $"expected Cancelled, got %A{other}"
+
+            parkedAnswer.TrySetResult true |> ignore
+        }
+        :> Task
+
+    // Regression for R-01: once the shared exit race has obtained Ok, a caller cancellation observed before
+    // the final return must still win over that success.
+    [<Test>]
+    member _.``WaitFor reports Cancelled when caller cancellation follows a raced readiness success``() : Task =
+        task {
+            use cts = new CancellationTokenSource()
+            let raced = Ok()
+            cts.Cancel()
+
+            match ReadinessRace.preferCancellation "test" cts.Token raced with
+            | Error(ProcessError.Cancelled "test") -> ()
+            | other -> Assert.Fail $"expected Cancelled after raced Ok, got {other}"
+        }
+        :> Task
+
+    // The other half of the priority rule: a deadline that is already spent when the exit is observed
+    // must not buy one more observation. The clock is advanced far past the budget while the first
+    // attempt is still parked, and the manual provider's timers never fire (see `ManualReadinessClock`),
+    // so the spent budget is the only thing left that can decide the result — and it must decide it
+    // without calling the probe again, even though a second call would answer `true`. This pins the
+    // contract, not one line of it: the re-check is bounded by what remains of the caller's `timeout`,
+    // so handing it a fresh window instead would show up here as a second invocation and an `Ok`.
+    [<Test>]
+    member _.``WaitFor skips the post-exit re-check once the deadline is already spent``() : Task =
+        task {
+            let clock = ManualReadinessClock()
+            let config = (Command.create "test" |> Command.timeProvider clock).Config
+
+            let exitSignal =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use running = syntheticProcessWith config exitSignal.Task
+
+            let firstAttemptStarted =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let firstAttemptAnswer =
+                TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let attempts = ref 0
+
+            let probe () : Task<bool> =
+                if Interlocked.Increment(&attempts.contents) = 1 then
+                    firstAttemptStarted.TrySetResult() |> ignore
+                    firstAttemptAnswer.Task
+                else
+                    Task.FromResult true
+
+            let waitTask = running.WaitForAsync(probe, TimeSpan.FromSeconds 5.0)
+            do! firstAttemptStarted.Task
+            clock.Advance(TimeSpan.FromHours 1.0)
+            exitSignal.SetResult(Outcome.Exited 0)
+
+            match! waitTask with
+            | Error(ProcessError.NotReady(_, reported)) ->
+                Assert.That(
+                    Volatile.Read(&attempts.contents),
+                    Is.EqualTo 1,
+                    "a spent deadline must not start another observation"
+                )
+
+                Assert.That(reported, Is.EqualTo(TimeSpan.FromSeconds 5.0))
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+
+            firstAttemptAnswer.TrySetResult false |> ignore
         }
         :> Task
 
