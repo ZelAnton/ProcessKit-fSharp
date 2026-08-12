@@ -51,6 +51,12 @@ type WhichResolutionTests() =
         Directory.CreateDirectory dir |> ignore
         dir
 
+    let setProcessPath (value: string) =
+        Environment.SetEnvironmentVariable("PATH", value)
+
+        if not isWindows then
+            NativeEnv.setenv ("PATH", value, 1) |> ignore
+
     [<Test>]
     member _.``which reports NotFound with Searched for a bare name absent from PATH``() =
         match Exec.which missingProgram with
@@ -539,6 +545,86 @@ type WhichResolutionTests() =
             File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
 
         baseName
+
+    [<Test>]
+    member this.``relative PATH entries resolve to absolute paths across public preflight APIs``() : Task =
+        task {
+            let dir = freshDir "relative-path"
+            let toolName = "pk319-relative-path-tool"
+            let originalPath = Environment.GetEnvironmentVariable "PATH"
+
+            let restorePath =
+                match originalPath with
+                | null -> ""
+                | value -> value
+
+            try
+                this.WriteMarkerTool(dir, toolName, "RELATIVE-PATH-HIT") |> ignore
+
+                // The PATH entry is relative to the process cwd. On POSIX, update libc's environ too so
+                // the real posix_spawnp bare-name search sees the same value as the managed resolver.
+                let relativeDir = Path.GetRelativePath(Directory.GetCurrentDirectory(), dir)
+                setProcessPath relativeDir
+
+                let expectedPath =
+                    Path.GetFullPath(Path.Combine(dir, if isWindows then toolName + ".cmd" else toolName))
+
+                let assertResolved (label: string) (result: Result<string, ProcessError>) =
+                    match result with
+                    | Ok resolved -> Assert.That(resolved, Is.EqualTo(expectedPath).IgnoreCase, label)
+                    | Error error -> Assert.Fail $"{label}: expected a resolution, got {error}"
+
+                assertResolved "Exec.which" (Exec.which toolName)
+
+                let command = Command.create toolName |> Command.env "PATH" relativeDir
+                assertResolved "Command.ResolveProgram" (command.ResolveProgram())
+
+                let client =
+                    (CliClient.create toolName).WithDefaults(fun template -> template.Env("PATH", relativeDir))
+
+                assertResolved "CliClient.ResolveProgram" (client.ResolveProgram())
+
+                let! spawnResult = command.OutputStringAsync()
+
+                match spawnResult with
+                | Ok output -> Assert.That(output.Stdout, Does.Contain "RELATIVE-PATH-HIT")
+                | Error error -> Assert.Fail $"relative PATH bare-name spawn failed: {error}"
+            finally
+                setProcessPath restorePath
+                Directory.Delete(dir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member this.``relative PATH entries anchor to the command's effective CurrentDir``() =
+        let baseDir = freshDir "relative-path-current-dir"
+        let toolsDir = Path.Combine(baseDir, "tools")
+        let toolName = "pk319-current-dir-path-tool"
+
+        try
+            this.WriteMarkerTool(toolsDir, toolName, "CURRENT-DIR-PATH-HIT") |> ignore
+
+            let command =
+                Command.create toolName
+                |> Command.currentDir baseDir
+                |> Command.env "PATH" "tools"
+
+            let expectedPath =
+                Path.GetFullPath(Path.Combine(toolsDir, if isWindows then toolName + ".cmd" else toolName))
+
+            match command.ResolveProgram() with
+            | Ok resolved -> Assert.That(resolved, Is.EqualTo(expectedPath).IgnoreCase)
+            | Error error -> Assert.Fail $"relative PATH did not use CurrentDir: {error}"
+
+            let client =
+                (CliClient.create toolName)
+                    .WithDefaults(fun template -> template.CurrentDir(baseDir).Env("PATH", "tools"))
+
+            match client.ResolveProgram() with
+            | Ok resolved -> Assert.That(resolved, Is.EqualTo(expectedPath).IgnoreCase)
+            | Error error -> Assert.Fail $"CliClient relative PATH did not use CurrentDir: {error}"
+        finally
+            Directory.Delete(baseDir, true)
 
     [<Test>]
     member this.``PreferLocal resolves a bare name absent from PATH and launches it (T-182)``() : Task =

@@ -174,7 +174,7 @@ module internal StreamChannel =
     // Pump one stream's lines through `onLine` until the stream ends — the streaming-verb analogue
     // of `Pump`'s buffered capture (which captures to a `LineBuffer` instead). No-op when the stream
     // isn't piped. The caller owns the sink (a channel writer, a buffer) and any completion signal.
-    // `maxLineLength` is the in-flight byte cap for a NEWLINE-FREE flood, threaded straight through to
+    // `maxLineBytes` is the in-flight byte cap for a NEWLINE-FREE flood, threaded straight through to
     // `Pump.readLinesUntilDone` — pass `None` for a genuinely consumer-paced channel (a consumer
     // receives whole lines, e.g. the stdout streaming channel and the event channels), or
     // `config.OutputBuffer.MaxBytes` for a call site that captures into a `Pump.LineBuffer` under that
@@ -188,7 +188,7 @@ module internal StreamChannel =
         terminator
         tee
         (onLine: string -> ValueTask)
-        (maxLineLength: int option)
+        (maxLineBytes: int option)
         (isTearingDown: unit -> bool)
         =
         task {
@@ -201,7 +201,7 @@ module internal StreamChannel =
                         terminator
                         tee
                         onLine
-                        maxLineLength
+                        maxLineBytes
                         isTearingDown
                         CancellationToken.None
             | None -> ()

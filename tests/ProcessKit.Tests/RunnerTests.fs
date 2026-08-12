@@ -61,6 +61,55 @@ type private RetryTimeProvider() =
         let timer = lock gate (fun () -> fst timers[index])
         timer.Fire()
 
+type private FirstLineFinishGate(stdinError: exn option) =
+    let finishStarted =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let finishOutcome =
+        TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable killCount = 0
+    let mutable tornDown = 0
+
+    member _.FinishStarted = finishStarted.Task
+
+    member _.KillCount = Volatile.Read(&killCount)
+
+    member _.IsTornDown = Volatile.Read(&tornDown) = 1
+
+    member _.Release(outcome: Outcome) =
+        finishOutcome.TrySetResult(outcome) |> ignore
+
+    member _.Build(command: Command) : RunningProcess =
+        let stdout = new MemoryStream(Encoding.UTF8.GetBytes "ready\n") :> Stream
+
+        let host: RunningHost =
+            { Config = command.Config
+              Pid = None
+              Stdout = Some stdout
+              Stderr = None
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = 0L
+              StartTimeIdentity = None
+              Wait =
+                fun () ->
+                    finishStarted.TrySetResult() |> ignore
+                    finishOutcome.Task
+              StdinError = fun () -> stdinError
+              StdinFeedComplete = ignore
+              StartKill = fun () -> Interlocked.Increment(&killCount) |> ignore
+              Signal = fun _ -> Ok()
+              GracefulKill = fun _ -> Task.CompletedTask
+              ResizePty = None
+              TreeStats = None
+              Teardown =
+                fun () ->
+                    Interlocked.Exchange(&tornDown, 1) |> ignore
+                    ValueTask() }
+
+        new RunningProcess(host)
+
 [<TestFixture>]
 type RunnerTests() =
 
@@ -847,5 +896,103 @@ type RunnerTests() =
             match result with
             | Error(ProcessError.Cancelled _) -> ()
             | other -> Assert.Fail $"expected Cancelled, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``firstLine reports cancellation raised inside the matching predicate``() : Task =
+        task {
+            use cts = new CancellationTokenSource()
+            let scripted = ScriptedRunner().Fallback(Reply.Ok "ready\n") :> IProcessRunner
+            let command = Command.create "first-line"
+
+            let! result =
+                Runner.firstLine
+                    scripted
+                    cts.Token
+                    (fun _ ->
+                        cts.Cancel()
+                        true)
+                    command
+
+            match result with
+            | Error(ProcessError.Cancelled "first-line") -> ()
+            | other -> Assert.Fail $"expected predicate cancellation, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``firstLine gives cancellation priority after FinishAsync reaps the match``() : Task =
+        task {
+            use cts = new CancellationTokenSource()
+            let gate = FirstLineFinishGate(None)
+            let command = Command.create "first-line"
+
+            let runner =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program))
+
+                    member _.CaptureBytesAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program))
+
+                    member _.SpawnAsync(_, _) = Task.FromResult(Ok(gate.Build command)) }
+
+            let pending = Runner.firstLine runner cts.Token (fun line -> line = "ready") command
+            do! gate.FinishStarted.WaitAsync(TimeSpan.FromSeconds 2.0)
+            Assert.That(pending.IsCompleted, Is.False, "FinishAsync should still be waiting for the gated reap")
+
+            cts.Cancel()
+            Assert.That(gate.KillCount, Is.GreaterThanOrEqualTo 2, "cancellation must kill the live handle")
+            gate.Release(Outcome.Exited 0)
+
+            match! pending with
+            | Error(ProcessError.Cancelled "first-line") -> ()
+            | other -> Assert.Fail $"expected cancellation after FinishAsync, got {other}"
+
+            Assert.That(gate.IsTornDown, Is.True, "the matched child must be reaped after cancellation")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``firstLine returns None when stdout closes without a match``() : Task =
+        task {
+            let scripted = ScriptedRunner().Fallback(Reply.Ok "ready\n") :> IProcessRunner
+
+            let! result =
+                Runner.firstLine scripted CancellationToken.None (fun _ -> false) (Command.create "first-line")
+
+            Assert.That(result, Is.EqualTo(Ok None: Result<string option, ProcessError>))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``firstLine preserves a finish error after a matching line``() : Task =
+        task {
+            let gate =
+                FirstLineFinishGate(Some(InvalidOperationException "synthetic stdin failure" :> exn))
+
+            let command = Command.create "first-line"
+
+            let runner =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program))
+
+                    member _.CaptureBytesAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program))
+
+                    member _.SpawnAsync(_, _) = Task.FromResult(Ok(gate.Build command)) }
+
+            let pending =
+                Runner.firstLine runner CancellationToken.None (fun line -> line = "ready") command
+
+            do! gate.FinishStarted.WaitAsync(TimeSpan.FromSeconds 2.0)
+            gate.Release(Outcome.Exited 0)
+
+            match! pending with
+            | Error(ProcessError.Stdin("first-line", detail)) ->
+                Assert.That(detail, Does.Contain "synthetic stdin failure")
+            | other -> Assert.Fail $"expected the finish error, got {other}"
         }
         :> Task
