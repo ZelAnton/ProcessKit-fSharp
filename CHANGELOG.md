@@ -14,13 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
+- `Stdin.FromBytes` now takes a defensive copy of the caller's byte array at the API boundary, so mutating it after building a `Command` (or across retry attempts) no longer changes what is written to the child's stdin.
 - Newline-free captured text now applies `OutputBuffer.MaxBytes` to UTF-8 byte size during force-flush, including multibyte Unicode output.
+- Windows bare-name executable resolution now matches `CreateProcessW` by checking the current directory and other pre-`PATH` search locations.
 - Relative entries in `PATH` now resolve to canonical absolute executable paths, anchored to the effective working directory for `Exec.which`, `Command.ResolveProgram`, and `CliClient.ResolveProgram`.
 - `FirstLineAsync` now preserves cancellation that arrives after a matching line, including while the child is being reaped, and no longer masks a `FinishAsync` error.
 - Linux cgroup legacy hard kills now verify that the reusable cgroup thawed and surface a typed `ProcessError.Io` through `ProcessGroup.KillAll()` and `Signal.Kill` instead of reporting success for a group still frozen; final disposal remains best-effort.
 - `JsonRpcSession` now gives an already-claimed response priority over a concurrent timeout or cancellation, so a successful answer cannot be replaced by a typed deadline error during pending-request completion.
 - POSIX `LaunchDetached` now transfers each direct child to a private background reaper, preventing zombies in long-lived parents while preserving the pid-and-start-time-only detached API.
 - `WaitForPortAsync`, `WaitForSocketAsync`, `WaitForHttpAsync`, and `WaitForAsync` now check their condition exactly one more time — bounded by the remaining timeout, a brief grace, and the caller's token — after observing the child's exit, so readiness published immediately before that exit reports `Ok` instead of being lost as `NotReady`; a `WaitForAsync` predicate is therefore invoked once more after the child exits, unless the token is already cancelled or the deadline already spent.
+- `JsonRpcSession` now rejects a peer request/notification whose `id` is not a string, number, or null instead of publishing an object/array/boolean id as `JsonRpcMessage.Id`; preserves an explicit `id: null` as a request instead of folding it into a notification; and correlates a string response id against the exact canonical decimal text of its numeric id, so a signed or whitespace-padded variant (`"+1"`, `" 1 "`) no longer completes an unrelated pending request.
 
 ## [2.11.0] - 2026-08-06
 
