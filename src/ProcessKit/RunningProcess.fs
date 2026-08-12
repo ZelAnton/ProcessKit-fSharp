@@ -68,6 +68,38 @@ type internal RunningHost =
         Teardown: unit -> ValueTask
     }
 
+module internal ReadinessRace =
+
+    let preferCancellation
+        (program: string)
+        (cancellationToken: CancellationToken)
+        (result: Result<unit, ProcessError>)
+        : Result<unit, ProcessError> =
+        match result with
+        | Ok() when cancellationToken.IsCancellationRequested -> Error(ProcessError.Cancelled program)
+        | other -> other
+
+    let preferCancellationAndDeadline
+        (program: string)
+        (cancellationToken: CancellationToken)
+        (deadlineHasElapsed: unit -> bool)
+        (notReady: ProcessError)
+        (result: Result<unit, ProcessError>)
+        : Result<unit, ProcessError> =
+        match result with
+        | Ok() ->
+            if cancellationToken.IsCancellationRequested then
+                Error(ProcessError.Cancelled program)
+            elif deadlineHasElapsed () then
+                Error notReady
+            elif cancellationToken.IsCancellationRequested then
+                // A caller cancellation can race the elapsed-time read; check again so the deadline gate
+                // cannot let a success through after cancellation has taken effect.
+                Error(ProcessError.Cancelled program)
+            else
+                result
+        | other -> other
+
 /// The result of `RunningProcess.WaitAnyAsync`: which started process finished first and how it
 /// concluded. A named type (rather than a tuple) so the fields read clearly from C#.
 [<Sealed; NoComparison>]
@@ -988,6 +1020,17 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
 
             bufferedOutcome)
 
+    // The ceiling on the single post-exit readiness re-check in `raceReadinessAgainstExit` below.
+    // Deliberately much shorter than a typical readiness `timeout`: the re-check exists to observe a
+    // condition the child published a moment ago — a local file, an open port/socket, a health endpoint
+    // — all of which answer in milliseconds even on a loaded CI runner, so this window is generous for
+    // an honest answer while keeping the guarantee that mattered before it existed. Without a ceiling, a
+    // caller-owned predicate that answers slowly (or, like `TaskCompletionSource<bool>().Task`, never)
+    // would turn "an exited child resolves promptly" back into "waits out the whole timeout". Reaching
+    // the ceiling costs nothing beyond the delay: the verdict is then the same `NotReady` the exit
+    // branch reported before this re-check was added.
+    let postExitRecheckGrace = TimeSpan.FromMilliseconds 500.0
+
     // Race a readiness probe against the child's own exit so a probe on a child that has already
     // exited — or that dies early on startup — resolves to `NotReady` promptly instead of burning the
     // whole `timeout` polling a condition that can never come true. Shared by all readiness probes
@@ -1009,35 +1052,114 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // stays `Fresh` and a subsequent buffered verb can still claim the pipes and reuse this exact same
     // memoized wait — one `host.Wait()`, one reap, shared by the probe and by whatever verb runs
     // afterward.
+    //
+    // Observing the exit is NOT by itself proof that the condition never came true. The polling probe's
+    // in-flight attempt may have observed a stale `false` and then yielded long enough for the child to
+    // publish readiness (a sentinel file, an open port/socket, a health endpoint served by a surviving
+    // grandchild) and exit: cancelling that run and reporting `NotReady` at once would erase a state
+    // that genuinely exists. So the exit branch below gives the condition exactly ONE more observation
+    // before concluding, and only when there is budget left for it — see the numbered contract there.
     let raceReadinessAgainstExit
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
-        (startProbe: Stream option -> Stream option -> CancellationToken -> Task<Result<unit, ProcessError>>)
+        (startProbe:
+            ReadinessAttempts
+                -> Stream option
+                -> Stream option
+                -> TimeSpan
+                -> CancellationToken
+                -> Task<Result<unit, ProcessError>>)
         : Task<Result<unit, ProcessError>> =
         task {
             if cancellationToken.IsCancellationRequested then
                 return Error(ProcessError.Cancelled config.Program)
             else
+                // The whole probe's budget, clamped exactly as the readiness core clamps it, measured
+                // from here — the post-exit re-check below spends what is left of THIS budget, never a
+                // fresh copy of it, and a `NotReady` still reports this same clamped total (not the
+                // shorter slice the re-check was given) so the reported budget matches what was enforced.
+                let armedTimeout = Timeouts.clampArmable timeout
+                let startedTimestamp = config.TimeProvider.GetTimestamp()
                 let stdout, stderr = probeDrainStreams ()
 
                 use readinessCts =
                     CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
 
-                let readinessTask = startProbe stdout stderr readinessCts.Token
+                let readinessTask =
+                    startProbe ReadinessAttempts.PollUntilDeadline stdout stderr timeout readinessCts.Token
 
                 let childExitTask = ensureBufferedWait ()
                 let! winner = Task.WhenAny(readinessTask :> Task, childExitTask :> Task)
 
+                let classifyCompletedResult result =
+                    ReadinessRace.preferCancellationAndDeadline
+                        config.Program
+                        cancellationToken
+                        (fun () -> config.TimeProvider.GetElapsedTime startedTimestamp >= armedTimeout)
+                        (ProcessError.NotReady(config.Program, armedTimeout))
+                        result
+
                 if obj.ReferenceEquals(winner, readinessTask) || readinessTask.IsCompleted then
-                    return! readinessTask
+                    let! completed = readinessTask
+                    return classifyCompletedResult completed
                 else
                     readinessCts.Cancel()
-                    let! _ = readinessTask
+                    let! raced = readinessTask
 
-                    if cancellationToken.IsCancellationRequested then
-                        return Error(ProcessError.Cancelled config.Program)
-                    else
-                        return Error(ProcessError.NotReady(config.Program, Timeouts.clampArmable timeout))
+                    match raced with
+                    | Ok() ->
+                        // (1) The polling run DID see the condition hold — it just finished in the window
+                        // between the race above picking the exit and the cancel here. Its `Ok` was
+                        // computed with the caller's token and the shared deadline both still clear, so it
+                        // is an honest success; discarding it in favour of `NotReady` would lose exactly
+                        // the readiness this branch exists to preserve.
+                        return classifyCompletedResult (Ok())
+                    | Error _ ->
+                        if cancellationToken.IsCancellationRequested then
+                            // (2) The caller cancelled: cancellation outranks readiness, and no further
+                            // observation may be started on a token that has already fired.
+                            return Error(ProcessError.Cancelled config.Program)
+                        else
+                            let remaining = armedTimeout - config.TimeProvider.GetElapsedTime startedTimestamp
+
+                            if remaining <= TimeSpan.Zero then
+                                // (3) The overall deadline is spent, so there is no budget to observe
+                                // anything else with — `NotReady`, exactly as before this re-check existed.
+                                // Stated here rather than left to the readiness core (which does refuse a
+                                // non-positive budget without invoking the probe): the rule that a spent
+                                // deadline buys no further observation belongs with the decision to make
+                                // one, and it keeps the spent-budget path from starting a probe run at all.
+                                return Error(ProcessError.NotReady(config.Program, armedTimeout))
+                            else
+                                // (4) One final observation of a state that can no longer change, bounded
+                                // by `min(remaining budget, postExitRecheckGrace)` and by the caller's own
+                                // token. `Once` (never a second poll loop) is what keeps this cheap: a
+                                // "still not ready" answer returns at the first attempt, so the ordinary
+                                // "child died on startup" path costs one probe invocation, not the rest of
+                                // the timeout. The grace caps the OTHER direction — a probe that answers
+                                // slowly (or never) must not turn prompt early-exit detection back into
+                                // waiting out the deadline. No drain streams are handed over: an exited
+                                // child cannot block on a full pipe, so there is nothing left to unblock.
+                                let! recheck =
+                                    startProbe
+                                        ReadinessAttempts.Once
+                                        None
+                                        None
+                                        (min remaining postExitRecheckGrace)
+                                        cancellationToken
+
+                                match recheck with
+                                | Ok() ->
+                                    // The caller can cancel, or the original absolute deadline can elapse,
+                                    // after the bounded re-check reports success but before this branch
+                                    // returns. Both checks must use the original budget, not the re-check's
+                                    // relative slice.
+                                    return classifyCompletedResult recheck
+                                | Error(ProcessError.Cancelled _) ->
+                                    // The caller's token fired while the one re-check was in flight; it
+                                    // outranks the re-check's own verdict, as in (2).
+                                    return Error(ProcessError.Cancelled config.Program)
+                                | Error _ -> return Error(ProcessError.NotReady(config.Program, armedTimeout))
         }
 
     let waitForHttp
@@ -1046,7 +1168,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
+        raceReadinessAgainstExit timeout cancellationToken (fun attempts stdout stderr budget readinessToken ->
             ReadinessProbe.waitForHttp
                 config.TimeProvider
                 config.Program
@@ -1054,7 +1176,8 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 stderr
                 uri
                 isSatisfactory
-                timeout
+                attempts
+                budget
                 readinessToken)
 
     let waitForHttpWithClient
@@ -1064,7 +1187,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
+        raceReadinessAgainstExit timeout cancellationToken (fun attempts stdout stderr budget readinessToken ->
             ReadinessProbe.waitForHttpWithClient
                 config.TimeProvider
                 config.Program
@@ -1073,7 +1196,8 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 client
                 uri
                 isSatisfactory
-                timeout
+                attempts
+                budget
                 readinessToken)
 
     let httpStatusPredicate (acceptableStatusCodes: seq<int>) =
@@ -1092,22 +1216,31 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
-            ReadinessProbe.waitForPort config.TimeProvider config.Program stdout stderr endpoint timeout readinessToken)
+        raceReadinessAgainstExit timeout cancellationToken (fun attempts stdout stderr budget readinessToken ->
+            ReadinessProbe.waitForPort
+                config.TimeProvider
+                config.Program
+                stdout
+                stderr
+                endpoint
+                attempts
+                budget
+                readinessToken)
 
     let waitForSocket
         (endpoint: EndPoint)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
+        raceReadinessAgainstExit timeout cancellationToken (fun attempts stdout stderr budget readinessToken ->
             ReadinessProbe.waitForSocket
                 config.TimeProvider
                 config.Program
                 stdout
                 stderr
                 endpoint
-                timeout
+                attempts
+                budget
                 readinessToken)
 
     let waitForCustom
@@ -1115,8 +1248,16 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        raceReadinessAgainstExit timeout cancellationToken (fun stdout stderr readinessToken ->
-            ReadinessProbe.waitFor config.TimeProvider config.Program stdout stderr probe timeout readinessToken)
+        raceReadinessAgainstExit timeout cancellationToken (fun attempts stdout stderr budget readinessToken ->
+            ReadinessProbe.waitFor
+                config.TimeProvider
+                config.Program
+                stdout
+                stderr
+                probe
+                attempts
+                budget
+                readinessToken)
 
     // Kill the tree the moment an output pump faults, so a still-producing child can't wedge the exit
     // wait — and the pump's siblings — by blocking on a full pipe that nobody drains once the pump
@@ -2532,10 +2673,13 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// attempt and polling backoff shares that one deadline, so a slow or non-cooperative connect can
     /// never overrun a short `timeout` — see `ReadinessProbe.waitForCoreUsing` for the full contract,
     /// including the ratified scheduler-bounded window at the deadline. If the child exits before the
-    /// port opens, this returns `NotReady` immediately rather than polling out the full `timeout` — the
-    /// same early-exit contract `WaitForHttpAsync`/`WaitForSocketAsync`/`WaitForAsync` honour, and via the
-    /// one reap-once exit wait the rest of the handle shares (so a later `WaitAsync`/`ProfileAsync` still
-    /// reports the real exit). Background-drains (and discards) the child's piped stdout/stderr for the
+    /// port opens, the endpoint is dialled exactly once more — bounded by what is left of `timeout` and
+    /// by a brief internal grace, so a port opened immediately before the child terminated is reported
+    /// as `Ok` instead of being lost — and this then returns `NotReady` rather than polling out the full
+    /// `timeout`; a cancelled token or an already-spent deadline still wins over that last dial. That is
+    /// the same early-exit contract `WaitForHttpAsync`/`WaitForSocketAsync`/`WaitForAsync` honour, and it
+    /// runs via the one reap-once exit wait the rest of the handle shares (so a later
+    /// `WaitAsync`/`ProfileAsync` still reports the real exit). Background-drains (and discards) the child's piped stdout/stderr for the
     /// duration of the poll — like `WaitForLineAsync`, so a child that writes more than one OS pipe buffer
     /// of startup output (~64 KiB on Linux) before becoming ready can't block in `write()` and spuriously
     /// time out this probe — but unlike `WaitForLineAsync`, the drained bytes are discarded rather than
@@ -2576,7 +2720,9 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// Poll `uri` with HTTP GET until a response passes the default 2xx check, or fail with `NotReady`
     /// once `timeout` expires (or `Cancelled` if `cancellationToken` fires first). Connection failures,
     /// DNS failures, and request cancellations caused by the shared deadline are retried every 50ms.
-    /// If the child exits before a satisfactory response arrives, this returns `NotReady` immediately.
+    /// If the child exits before a satisfactory response arrives, exactly one more request is sent —
+    /// bounded by what is left of `timeout` and by a brief internal grace — and this returns `NotReady`
+    /// unless that last response is satisfactory, exactly as `WaitForPortAsync` describes.
     /// While polling, the child's piped stdout/stderr are background-drained and discarded exactly like
     /// `WaitForPortAsync`, so startup output cannot block a chatty child before it becomes ready. `uri`
     /// must be absolute; a relative URI throws `ArgumentException` before polling begins.
@@ -2662,10 +2808,14 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// an abandoned invocation keeps running in the background, but its late outcome is safely observed
     /// (a late fault never becomes an unobserved task exception). See `ReadinessProbe.waitForCoreUsing` for
     /// the full contract, including the ratified scheduler-bounded window at the deadline. If the child
-    /// exits before `probe` returns true, this returns `NotReady` immediately rather than polling out the
-    /// full `timeout` — the same early-exit contract `WaitForHttpAsync`/`WaitForPortAsync` honour, and via
-    /// the one reap-once exit wait the rest of the handle shares (so a later `WaitAsync`/`ProfileAsync`
-    /// still reports the real exit). Background-drains (and discards) the child's piped stdout/stderr for
+    /// exits before `probe` returns true, `probe` is invoked exactly once more — bounded by what is left
+    /// of `timeout` and by a brief internal grace, so readiness published immediately before the child
+    /// terminated is reported as `Ok` instead of being lost — and this then returns `NotReady` rather
+    /// than polling out the full `timeout`. Callers therefore must expect one extra `probe` invocation
+    /// after the child exits; a cancelled token or an already-spent deadline suppresses it. That is the
+    /// same early-exit contract `WaitForHttpAsync`/`WaitForPortAsync` honour, and it runs via the one
+    /// reap-once exit wait the rest of the handle shares (so a later `WaitAsync`/`ProfileAsync` still
+    /// reports the real exit). Background-drains (and discards) the child's piped stdout/stderr for
     /// the duration of the poll, exactly like `WaitForPortAsync` — see its doc for what that does and
     /// doesn't compose with afterward.
     member _.WaitForAsync

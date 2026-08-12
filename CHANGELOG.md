@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux cgroup legacy hard kills now verify that the reusable cgroup thawed and surface a typed `ProcessError.Io` through `ProcessGroup.KillAll()` and `Signal.Kill` instead of reporting success for a group still frozen; final disposal remains best-effort.
 - `JsonRpcSession` now gives an already-claimed response priority over a concurrent timeout or cancellation, so a successful answer cannot be replaced by a typed deadline error during pending-request completion.
 - POSIX `LaunchDetached` now transfers each direct child to a private background reaper, preventing zombies in long-lived parents while preserving the pid-and-start-time-only detached API.
+- `WaitForPortAsync`, `WaitForSocketAsync`, `WaitForHttpAsync`, and `WaitForAsync` now check their condition exactly one more time — bounded by the remaining timeout, a brief grace, and the caller's token — after observing the child's exit, so readiness published immediately before that exit reports `Ok` instead of being lost as `NotReady`; a `WaitForAsync` predicate is therefore invoked once more after the child exits, unless the token is already cancelled or the deadline already spent.
 
 ## [2.11.0] - 2026-08-06
 

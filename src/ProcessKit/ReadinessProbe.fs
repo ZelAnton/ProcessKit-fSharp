@@ -9,6 +9,21 @@ open System.Net.Sockets
 open System.Threading
 open System.Threading.Tasks
 
+/// How many times one readiness run may invoke the condition it was handed. Every readiness verb polls
+/// (`PollUntilDeadline`) while the child is still running. The one exception is the re-check
+/// `RunningProcess.raceReadinessAgainstExit` runs after the child's exit has won that race: it asks for
+/// `Once`, because a child that has exited can publish nothing further, so re-observing an unchanged
+/// terminal state would only burn the budget that remains.
+[<RequireQualifiedAccess>]
+type internal ReadinessAttempts =
+    /// Invoke the condition repeatedly, backing off between attempts, until it holds or the deadline
+    /// (or the caller's token) ends the run.
+    | PollUntilDeadline
+    /// Invoke the condition at most once and report that single answer: a `false` ends the run
+    /// immediately instead of backing off for another attempt. The deadline and cancellation still
+    /// bound that one attempt exactly as they bound a polling one.
+    | Once
+
 /// Readiness probes for a started process that never touch its state: they poll an external
 /// condition (a reachable TCP endpoint, an arbitrary async predicate) and report through a `Result`,
 /// using only the program name for the `NotReady`/`Cancelled` error. Factored out of `RunningProcess`
@@ -134,10 +149,19 @@ module internal ReadinessProbe =
     /// probe cannot delay this loop's return past the deadline; the blocked call keeps running on a pool
     /// thread but is abandoned (and its eventual fault observed) exactly like a returned-but-never-
     /// completing task. The API does not claim it can force a caller-owned probe to stop.
+    ///
+    /// `attempts` chooses between the polling contract above (`PollUntilDeadline`) and a single
+    /// observation (`Once`): with `Once` a `false` result ends the run at that first answer instead of
+    /// backing off for another attempt, so the caller pays one probe invocation, never the whole
+    /// remaining budget. Everything else — the deadline guard, the shared `deadlineSignal` race, the
+    /// abandoned-attempt fault observation, and the final `Cancelled`/`NotReady`/`Ok` classification —
+    /// is identical for both, which is what keeps the post-exit re-check honest about cancellation and
+    /// the deadline rather than being a second, hand-rolled probe path.
     let private waitForCoreUsing
         (timeProvider: TimeProvider)
         (program: string)
         (probe: CancellationToken -> Task<bool>)
+        (attempts: ReadinessAttempts)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -208,6 +232,12 @@ module internal ReadinessProbe =
 
                             if result then
                                 ready <- true
+                            elif attempts = ReadinessAttempts.Once then
+                                // A single-observation run: the one attempt answered "not ready", and
+                                // that answer is the result. Stopping here (rather than backing off for
+                                // another attempt) is what keeps the post-exit re-check as cheap as one
+                                // probe invocation instead of the whole remaining budget.
+                                stopped <- true
                             else
                                 // Cap the backoff to whatever budget remains so a fixed 50ms poll can't
                                 // overrun a very short overall timeout on its own.
@@ -264,6 +294,7 @@ module internal ReadinessProbe =
         (connect: IPEndPoint -> CancellationToken -> Task)
         (program: string)
         (endpoint: IPEndPoint)
+        (attempts: ReadinessAttempts)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -283,7 +314,7 @@ module internal ReadinessProbe =
                     return false
             }
 
-        waitForCoreUsing timeProvider program probe timeout cancellationToken
+        waitForCoreUsing timeProvider program probe attempts timeout cancellationToken
 
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` once the shared
     /// `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). See
@@ -300,6 +331,7 @@ module internal ReadinessProbe =
         (stdout: Stream option)
         (stderr: Stream option)
         (endpoint: IPEndPoint)
+        (attempts: ReadinessAttempts)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -310,7 +342,7 @@ module internal ReadinessProbe =
             }
 
         withBackgroundDrain stdout stderr (fun () ->
-            waitForPortUsing timeProvider tcpConnect program endpoint timeout cancellationToken)
+            waitForPortUsing timeProvider tcpConnect program endpoint attempts timeout cancellationToken)
 
     /// Whether this host can dial a Unix domain socket at all. Factored out as a predicate — rather than
     /// inlined as `Socket.OSSupportsUnixDomainSockets` — so a test can force both branches deterministically
@@ -337,6 +369,7 @@ module internal ReadinessProbe =
         (connect: EndPoint -> CancellationToken -> Task)
         (program: string)
         (endpoint: EndPoint)
+        (attempts: ReadinessAttempts)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -352,7 +385,7 @@ module internal ReadinessProbe =
                     return false
             }
 
-        waitForCoreUsing timeProvider program probe timeout cancellationToken
+        waitForCoreUsing timeProvider program probe attempts timeout cancellationToken
 
     /// Wait until a connection to the Unix domain socket at `path` succeeds, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). See
@@ -371,6 +404,7 @@ module internal ReadinessProbe =
         (stdout: Stream option)
         (stderr: Stream option)
         (endpoint: EndPoint)
+        (attempts: ReadinessAttempts)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -383,7 +417,7 @@ module internal ReadinessProbe =
             }
 
         withBackgroundDrain stdout stderr (fun () ->
-            waitForSocketUsing timeProvider unixConnect program endpoint timeout cancellationToken)
+            waitForSocketUsing timeProvider unixConnect program endpoint attempts timeout cancellationToken)
 
     /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).
@@ -396,6 +430,7 @@ module internal ReadinessProbe =
         (isSatisfactory: Func<HttpResponseMessage, bool>)
         (program: string)
         (uri: Uri)
+        (attempts: ReadinessAttempts)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -414,7 +449,7 @@ module internal ReadinessProbe =
                     return false
             }
 
-        waitForCoreUsing timeProvider program probe timeout cancellationToken
+        waitForCoreUsing timeProvider program probe attempts timeout cancellationToken
 
     /// Poll an HTTP endpoint through caller-owned `client`. The client is reused for every attempt and is
     /// never disposed or mutated by ProcessKit; each request still receives the shared readiness token.
@@ -426,6 +461,7 @@ module internal ReadinessProbe =
         (client: HttpClient)
         (uri: Uri)
         (isSatisfactory: Func<HttpResponseMessage, bool>)
+        (attempts: ReadinessAttempts)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -436,6 +472,7 @@ module internal ReadinessProbe =
                 isSatisfactory
                 program
                 uri
+                attempts
                 timeout
                 cancellationToken)
 
@@ -450,6 +487,7 @@ module internal ReadinessProbe =
         (stderr: Stream option)
         (uri: Uri)
         (isSatisfactory: Func<HttpResponseMessage, bool>)
+        (attempts: ReadinessAttempts)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -465,6 +503,7 @@ module internal ReadinessProbe =
                     client
                     uri
                     isSatisfactory
+                    attempts
                     timeout
                     cancellationToken
         }
@@ -485,8 +524,9 @@ module internal ReadinessProbe =
         (stdout: Stream option)
         (stderr: Stream option)
         (probe: Func<Task<bool>>)
+        (attempts: ReadinessAttempts)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
         withBackgroundDrain stdout stderr (fun () ->
-            waitForCoreUsing timeProvider program (fun _ -> probe.Invoke()) timeout cancellationToken)
+            waitForCoreUsing timeProvider program (fun _ -> probe.Invoke()) attempts timeout cancellationToken)

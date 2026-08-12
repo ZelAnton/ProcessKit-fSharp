@@ -535,6 +535,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             isSatisfactory
                             program
                             uri
+                            ReadinessAttempts.PollUntilDeadline
                             probeTimeout
                             probeToken
 
@@ -547,6 +548,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             None
                             None
                             (Func<Task<bool>> userProbe)
+                            ReadinessAttempts.PollUntilDeadline
                             probeTimeout
                             probeToken
 
