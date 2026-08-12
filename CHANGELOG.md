@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux cgroup legacy hard kills now verify that the reusable cgroup thawed and surface a typed `ProcessError.Io` through `ProcessGroup.KillAll()` and `Signal.Kill` instead of reporting success for a group still frozen; final disposal remains best-effort.
 - `JsonRpcSession` now gives an already-claimed response priority over a concurrent timeout or cancellation, so a successful answer cannot be replaced by a typed deadline error during pending-request completion.
 - POSIX `LaunchDetached` now transfers each direct child to a private background reaper, preventing zombies in long-lived parents while preserving the pid-and-start-time-only detached API.
+- Ending a POSIX `Pty` run's stdin now actually reaches the child: a drained `Command.Stdin` source, `ProcessStdin.FinishAsync`, and `PtySession.CloseStdinAsync` deliver the terminal's configured end-of-input character (`termios.c_cc[VEOF]`, read from the pty rather than assumed to be Ctrl-D) twice — terminating an unterminated line and then ending input — so a child reading to EOF such as `cat` or a shell `read` loop finishes instead of hanging; the shared pty master stays open and owned by the merged output stream, writes through a finished stdin handle are refused, and a delivery that genuinely fails is now reported (`IOException`, or a typed `ProcessError.Io`/`ProcessError.Stdin`) instead of silently dropped.
 
 ## [2.11.0] - 2026-08-06
 

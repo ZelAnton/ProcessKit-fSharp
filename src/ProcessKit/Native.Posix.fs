@@ -240,6 +240,25 @@ module internal Posix =
     [<Literal>]
     let private TERMIOS_LFLAG_OFFSET = 12
 
+    // Byte offset of the control-character array `c_cc[NCCS]` inside `struct termios`: the four 4-byte
+    // `tcflag_t` words (16) plus the 1-byte `c_line` line discipline that follows them on Linux. Together
+    // with `VEOF_INDEX` — the index of the end-of-input character in that array (Linux orders it VINTR,
+    // VQUIT, VERASE, VKILL, VEOF) — this addresses the single byte `readEofChar` reads. Same glibc layout
+    // assumption as `TERMIOS_LFLAG_OFFSET` above, and correct for the same reason: the POSIX pty path is
+    // Linux-only (macOS/BSD take the honest Unsupported path before a pty is ever opened).
+    [<Literal>]
+    let private TERMIOS_CC_OFFSET = 17
+
+    [<Literal>]
+    let private VEOF_INDEX = 4
+
+    // `_POSIX_VDISABLE` on Linux: the value a `c_cc` slot carries when that control character is switched
+    // OFF entirely. A pty whose VEOF is disabled has NO end-of-input character, so writing this byte would
+    // send a NUL through as ordinary input while looking like a delivered EOF — the pty stdin's finish
+    // reports that honestly instead (see `PtyStdinStream`).
+    [<Literal>]
+    let private POSIX_VDISABLE = 0uy
+
     // tcsetattr optional_actions: apply the change immediately (POSIX `TCSANOW` = 0 on Linux).
     [<Literal>]
     let private TCSANOW = 0
@@ -361,6 +380,15 @@ module internal Posix =
 
     let mutable ptyWriteForTests: (int -> nativeint -> nativeint -> nativeint) option =
         None
+
+    /// Test seam (internal, not public API): observes the final close of a shared pty master lifetime. This
+    /// makes owner-dispose versus a retained stdin-view lease deterministic without relying on fd reuse timing.
+    let mutable ptyMasterCloseForTests: (unit -> unit) option = None
+
+    /// Test seam (internal, not public API): changes the slave's actual termios before `openPtyPair` reads
+    /// `c_cc[VEOF]`. The production path leaves this unset; Linux integration tests use it to prove the
+    /// discovery path, rather than merely passing a byte directly to `PtyStdinStream`.
+    let mutable ptyConfigureTermiosForTests: (int -> Result<unit, string>) option = None
 
     [<NoComparison; NoEquality>]
     type private DetachedReaperState = { Queue: BlockingCollection<int> }
@@ -1161,28 +1189,99 @@ module internal Posix =
     // POSIX pty (pseudo-terminal) master: fd allocation + an async Stream wrapper (Command.Pty)
     // ----------------------------------------------------------------------------------
 
+    /// The write-side pty HANGUP: the child has closed the last slave fd (it exited, or dropped its
+    /// terminal), so a `write` on the master returns EIO/EPIPE and no byte can reach the line discipline
+    /// any more. A distinct `IOException` SUBTYPE, so the one caller that must tell this apart — the stdin
+    /// view's end-of-input delivery, for which a hung-up terminal means "moot", not "failed" — can match on
+    /// the type instead of on an errno-bearing message, while every other consumer keeps seeing exactly the
+    /// broken-pipe `IOException` the socketpair path raises.
+    type internal PtyHangupException(message: string) =
+        inherit IOException(message)
+
+    /// A short-lived operation lease over the shared pty master. The lease keeps the master fd from being
+    /// closed or recycled until the native call has returned.
+    type internal PtyLifetimeLease(fd: int, release: unit -> unit) =
+        let mutable released = 0
+
+        member _.Fd = fd
+
+        member _.Release() =
+            if Interlocked.Exchange(&released, 1) = 0 then
+                release ()
+
+        interface IDisposable with
+            member this.Dispose() = this.Release()
+
+    /// Shared ownership state for the one pty master fd. The stdout stream owns the master lease; the stdin
+    /// view retains a separate lease until its finish/dispose lifecycle is complete. All individual native
+    /// reads/writes also take an operation lease, so owner disposal cannot close/recycle the fd underneath a
+    /// call that already passed its lifecycle check.
+    type internal PtyMasterLifetime(handle: Microsoft.Win32.SafeHandles.SafeFileHandle) =
+        let gate = obj ()
+        let mutable ownerReleased = false
+        let mutable retainedLeases = 0
+        let mutable activeOperations = 0
+        let mutable closed = false
+
+        let closeIfReady () =
+            if ownerReleased && retainedLeases = 0 && activeOperations = 0 && not closed then
+                closed <- true
+                handle.Dispose()
+                ptyMasterCloseForTests |> Option.iter (fun observer -> observer ())
+
+        member this.Retain() : IDisposable =
+            lock gate (fun () ->
+                if closed || ownerReleased then
+                    raise (ObjectDisposedException(nameof PtyMasterLifetime))
+
+                retainedLeases <- retainedLeases + 1
+
+                let lease =
+                    new PtyLifetimeLease(
+                        int (handle.DangerousGetHandle()),
+                        fun () ->
+                            lock gate (fun () ->
+                                retainedLeases <- retainedLeases - 1
+                                closeIfReady ())
+                    )
+
+                lease :> IDisposable)
+
+        member this.AcquireOperation() : PtyLifetimeLease =
+            lock gate (fun () ->
+                if closed || (ownerReleased && retainedLeases = 0) then
+                    raise (ObjectDisposedException(nameof PtyMasterLifetime))
+
+                activeOperations <- activeOperations + 1
+
+                new PtyLifetimeLease(
+                    int (handle.DangerousGetHandle()),
+                    fun () ->
+                        lock gate (fun () ->
+                            activeOperations <- activeOperations - 1
+                            closeIfReady ())
+                ))
+
+        member this.ReleaseOwner() =
+            lock gate (fun () ->
+                if not ownerReleased then
+                    ownerReleased <- true
+                    closeIfReady ())
+
     /// A `Stream` over a POSIX pty MASTER fd — the single merged terminal output (D3). When an
-    /// interactive/fed stdin is also wanted, the SAME master is wrapped a second time as a NON-owning
-    /// `PtyStream` for the write side (a pty master is bidirectional; read and write on it are
-    /// independent), so there is one master fd, closed exactly once by the owning read stream — no `dup`,
-    /// hence no non-CLOEXEC duplicate to leak. Unlike a socketpair end (a `Socket`/`NetworkStream` driven
-    /// by the runtime's epoll/kqueue `SocketAsyncEngine`),
-    /// a pty master is a character device that engine cannot host, so I/O goes through libc `read`/`write`;
-    /// the base `Stream` offloads the synchronous `Read`/`Write` to the thread pool for its async verbs, so
-    /// the `Pump`'s `ReadAsync` still completes on data with no busy-poll (it parks a pool thread for the
-    /// read's duration — the pty analogue accepted here in place of the socketpair's epoll path). Two
-    /// pty-specific wrinkles it hides from the `Pump`:
+    /// interactive/fed stdin is also wanted, the SAME master is wrapped a second time as a non-owning
+    /// `PtyStdinStream` (the subclass below) for the write side (a pty master is bidirectional; read and
+    /// write on it are independent), so there is one master fd, closed exactly once by the shared lifetime
+    /// — no `dup`, hence no non-CLOEXEC duplicate to leak. Unlike a socketpair end (a `Socket`/`NetworkStream`
+    /// driven by the runtime's epoll/kqueue `SocketAsyncEngine`), a pty master is a character device that
+    /// engine cannot host, so I/O goes through libc `read`/`write`; the base `Stream` offloads the synchronous
+    /// `Read`/`Write` to the thread pool for its async verbs. Two pty-specific wrinkles it hides from `Pump`:
     ///   * **Hangup EIO → EOF.** On Linux, once the child closes the last slave fd, a master `read` returns
-    ///     EIO rather than a clean 0-length EOF; this maps it to EOF so the merged-capture path ends
-    ///     normally (macOS/BSD already give a real EOF). A write-side EIO/EPIPE becomes a broken-pipe
-    ///     `IOException`, matching the socketpair path's write-after-peer-close.
-    ///   * **Single-owner fd.** The fd is held by a `SafeFileHandle`; the merged-output (read) stream owns
-    ///     it (closed exactly once on `Dispose`, finalizer as the GC-time safety net) — the same contract
-    ///     the socketpair `SafeSocketHandle` gives — while the optional stdin (write) view over the same fd
-    ///     is constructed non-owning, so it never closes the fd. Reads/writes take a
-    ///     `DangerousAddRef`/`Release` around the syscall so a concurrent `Dispose` cannot close the fd
-    ///     mid-call.
-    type internal PtyStream(handle: Microsoft.Win32.SafeHandles.SafeFileHandle) =
+    ///     EIO rather than a clean 0-length EOF; this maps it to EOF so the merged-capture path ends normally.
+    ///     A write-side EIO/EPIPE becomes a broken-pipe `IOException` (`PtyHangupException`).
+    ///   * **Shared lifetime.** The stdout stream releases the owner lease on disposal, but the stdin view's
+    ///     retained lease and every active read/write keep the raw fd alive until their work releases it.
+    type internal PtyStream(lifetime: PtyMasterLifetime, ownsMaster: bool) =
         inherit Stream()
 
         // Match Stream.ValidateBufferArguments before pinning the caller's buffer or calculating a native
@@ -1204,23 +1303,20 @@ module internal Posix =
                     )
                 )
 
-        // Run one libc read/write (`op`) against the owned fd with the caller's buffer pinned at `offset`,
-        // holding a ref on the SafeHandle so `Dispose` cannot close the fd underneath the syscall.
+        // Run one libc read/write (`op`) against a leased fd with the caller's buffer pinned at `offset`.
+        // The shared lifetime keeps the owning handle open until this operation releases its lease.
         let withPinnedFd (buffer: byte[]) (offset: int) (op: int -> nativeint -> nativeint) : nativeint =
-            let mutable refAdded = false
+            use lease = lifetime.AcquireOperation()
+            let pin = GCHandle.Alloc(buffer, GCHandleType.Pinned)
 
             try
-                handle.DangerousAddRef &refAdded
-                let fd = int (handle.DangerousGetHandle())
-                let pin = GCHandle.Alloc(buffer, GCHandleType.Pinned)
-
-                try
-                    op fd (pin.AddrOfPinnedObject() + nativeint offset)
-                finally
-                    pin.Free()
+                op lease.Fd (pin.AddrOfPinnedObject() + nativeint offset)
             finally
-                if refAdded then
-                    handle.DangerousRelease()
+                pin.Free()
+
+        new(handle: Microsoft.Win32.SafeHandles.SafeFileHandle) = new PtyStream(new PtyMasterLifetime(handle), true)
+
+        member internal _.MasterLifetime = lifetime
 
         override _.CanRead = true
         override _.CanWrite = true
@@ -1265,9 +1361,12 @@ module internal Posix =
 
                 attempt ()
 
-        override _.Write(buffer, offset, count) =
-            validateBufferArguments buffer offset count
-
+        /// The raw write loop over the master fd — partial writes resumed, EINTR retried — and the ONE
+        /// place a write to a pty master is issued. `Write` calls it after validating the caller's buffer;
+        /// the stdin view's end-of-input delivery (`PtyStdinStream.FinishAsync`) calls it directly with its
+        /// own fixed two-byte payload, so those bytes ride exactly the same partial-write/EINTR handling as
+        /// ordinary input while bypassing the view's finished-gate (which by then already refuses writes).
+        member internal _.WriteRaw(buffer: byte[], offset: int, count: int) : unit =
             let mutable written = 0
 
             while written < count do
@@ -1295,16 +1394,166 @@ module internal Posix =
                         () // interrupted before any byte was written; retry the remaining bytes
                     elif errno = EIO || errno = EPIPE then
                         raise (
-                            IOException $"write to the pty master failed: the child closed the terminal (errno {errno})"
+                            PtyHangupException
+                                $"write to the pty master failed: the child closed the terminal (errno {errno})"
                         )
                     else
                         raise (IOException $"write to the pty master failed (errno {errno})")
 
+        override this.Write(buffer, offset, count) =
+            validateBufferArguments buffer offset count
+            this.WriteRaw(buffer, offset, count)
+
         override _.Dispose(disposing) =
-            if disposing then
-                handle.Dispose()
+            if ownsMaster then
+                lifetime.ReleaseOwner()
 
             base.Dispose disposing
+
+    /// The stdin (write) side of a POSIX pty run: a NON-owning second view over the SAME master fd the
+    /// merged-output stream owns (a pty master is bidirectional, and there is deliberately no `dup`), so
+    /// this view closes nothing and the child's terminal never hangs up when it is dropped.
+    ///
+    /// That is exactly why ending this stdin is not a close. A child reading to EOF (`cat`, a shell `read`
+    /// loop) sees end of input only when the terminal's LINE DISCIPLINE receives the pty's end-of-input
+    /// character, so `FinishAsync` delivers `eofChar` **twice** in one write:
+    ///   * the FIRST one terminates a canonical line the caller left unterminated — the line discipline
+    ///     hands those bytes to the child's pending `read` without a newline;
+    ///   * the SECOND then lands on an empty line, which is what makes the child's next `read` return 0
+    ///     bytes — the actual end of input.
+    /// A single character would only flush the pending line and leave the child waiting forever; sending
+    /// both in ONE `write` also keeps the second from racing a child that exits on the first.
+    ///
+    /// `eofChar` is the pty's ACTUAL configured `termios.c_cc[VEOF]`, read from the slave when the pair was
+    /// created (`openPtyPair`) rather than assumed to be Ctrl-D. `_POSIX_VDISABLE` means the terminal has no
+    /// end-of-input character at all, which is reported as an honest failure rather than sending a NUL byte
+    /// that would look like a delivered EOF. Note the character only reaches a child whose terminal is still
+    /// in canonical mode — a child that switched its own tty to raw mode reads VEOF as ordinary input, which
+    /// is the line discipline's contract, not something this can paper over.
+    ///
+    /// The finish is once-only and its outcome is honest: the first call claims it and every later call is a
+    /// no-op (`ProcessStdin.FinishAsync`/`PtySession.CloseStdinAsync` are documented idempotent), writes are
+    /// refused from the claim onwards, and a genuine delivery failure faults the returned task instead of
+    /// silently leaving the child hanging. A hung-up terminal or an already-torn-down run are not failures:
+    /// the child either cannot read any more or is being killed with the run.
+    type internal PtyStdinStream(lifetime: PtyMasterLifetime, eofChar: byte, retainedLease: IDisposable) =
+        inherit PtyStream(lifetime, false)
+
+        // Serializes the once-only finish claim against a concurrent/repeat finish and against the write
+        // gate below, so the flag is never observed torn or claimed twice. Not a hot path: one stdin view
+        // per pty run, and stdin writes are caller-paced.
+        let gate = obj ()
+        let mutable finished = false
+        let mutable finishTask: Task option = None
+
+        new(handle: Microsoft.Win32.SafeHandles.SafeFileHandle, eofChar: byte) =
+            let lifetime = new PtyMasterLifetime(handle)
+            new PtyStdinStream(lifetime, eofChar, lifetime.Retain())
+
+        new(lifetime: PtyMasterLifetime, eofChar: byte) = new PtyStdinStream(lifetime, eofChar, lifetime.Retain())
+
+        /// The pty's configured end-of-input character, for the caller that wants to see which byte this
+        /// view would deliver (the spawn reads it from the slave's `termios`; tests set it explicitly).
+        member _.EofChar = eofChar
+
+        /// Whether the logical end of input has been claimed — after which this view refuses writes.
+        member _.IsFinished = lock gate (fun () -> finished)
+
+        override this.Write(buffer, offset, count) =
+            Monitor.Enter gate
+
+            try
+                if finished then
+                    raise (
+                        ObjectDisposedException(
+                            nameof PtyStdinStream,
+                            "the child's stdin has been finished: the terminal's end-of-input character was already delivered, so further input would trail past the end of input the child has seen"
+                        )
+                    )
+
+                // Keep the gate across the complete partial-write/EINTR loop. Finish claims the same gate,
+                // so VEOF cannot overtake a payload write that was admitted before the claim.
+                base.Write(buffer, offset, count)
+            finally
+                Monitor.Exit gate
+
+        /// Deliver the two end-of-input characters, then release this non-owning view. Runs the claim's
+        /// delivery only; see the type doc for the contract. Prefer the `IStdinFinisher` interface at call
+        /// sites — this concrete member exists so the behaviour can be exercised directly in tests.
+        member this.FinishAsync() : Task =
+            lock gate (fun () ->
+                match finishTask with
+                | Some task ->
+                    // Every caller observes the one delivery task, including its eventual failure.
+                    task
+                | None ->
+                    finished <- true
+
+                    // On the thread pool: a pty write parks until the terminal's input queue has room, which
+                    // a child that has stopped reading can fill, and finish must not block the caller's thread.
+                    // The claim itself waited for any already-admitted Write to release `gate`; after the claim
+                    // no new Write can enter, so the delivery can run outside the gate while repeat callers
+                    // immediately retrieve this same pending task.
+                    let task = Task.Run(fun () -> this.DeliverEndOfInput())
+
+                    finishTask <- Some task
+                    task)
+
+        // The delivery itself, off the caller's thread. Failures propagate to the `FinishAsync` task except
+        // for the two cases where end of input is moot rather than undelivered (see the handlers).
+        member private this.DeliverEndOfInput() : unit =
+            try
+                try
+                    if eofChar = POSIX_VDISABLE then
+                        raise (
+                            IOException
+                                "cannot deliver end of input through this pty: its terminal end-of-input character (termios c_cc[VEOF]) is disabled (_POSIX_VDISABLE), so the child can only see EOF when the terminal itself is closed"
+                        )
+
+                    this.WriteRaw([| eofChar; eofChar |], 0, 2)
+                with
+                | :? PtyHangupException ->
+                    // The child already closed the last slave fd (it exited, or dropped its terminal): there
+                    // is no line discipline left to hand an end of input to, and the child can no longer read
+                    // one. Moot, not a failed delivery — exactly as closing a pipe whose peer is gone is not.
+                    ()
+                | :? ObjectDisposedException ->
+                    // The run's own teardown released this view first (`Pump.closeSpawned`), which is also
+                    // what closes the shared master and hangs the child's terminal up. `FinishAsync` promises
+                    // to stay safe after a torn-down run, so this is not a failed delivery either.
+                    ()
+            finally
+                // Release the retained stdin-view lease even when delivery failed. The shared master owner
+                // can close only after this lease and any native operation lease are both gone.
+                retainedLease.Dispose()
+
+        override _.Dispose(disposing) =
+            lock gate (fun () ->
+                match finishTask with
+                | Some task when not task.IsCompleted ->
+                    // A queued/in-flight FinishAsync still owns the retained lease; releasing it here would
+                    // let owner teardown close and recycle the master before that task reaches native write.
+                    ()
+                | _ -> retainedLease.Dispose())
+
+            base.Dispose(disposing)
+
+        interface IStdinFinisher with
+            member this.FinishAsync() : Task = this.FinishAsync()
+
+    /// How a retained parent-side fd is wrapped into a `Stream` by the spawn (`pipeStream`). Explicit rather
+    /// than a pair of booleans because the three wraps differ in BOTH the stream type and fd ownership, and
+    /// the pty stdin view additionally carries the terminal's end-of-input character.
+    [<RequireQualifiedAccess; NoComparison; NoEquality>]
+    type private ParentStreamKind =
+        /// A socketpair end: a sole-owning `Socket` + `NetworkStream` on the runtime's epoll/kqueue engine.
+        | Socketpair
+        /// The pty MASTER, owned by the merged-output (stdout) reader that closes it exactly once.
+        | PtyMaster
+        /// A NON-owning second view over that same master for stdin, carrying the pty's configured
+        /// `termios.c_cc[VEOF]` so its logical finish can deliver a terminal end of input without closing
+        /// the master the merged-output stream still owns.
+        | PtyStdinView of EofChar: byte
 
     /// Clear the pty's cooked-mode ECHO bit on `fd` (the slave, before the child adopts it) so typed input
     /// is NOT echoed into the terminal's output — the `PtyConfig.Echo = false` secret-safety mitigation.
@@ -1335,6 +1584,58 @@ module internal Posix =
         finally
             Marshal.FreeHGlobal buffer
 
+    /// Read the end-of-input character this pty's line discipline is ACTUALLY configured with —
+    /// `termios.c_cc[VEOF]` on the SLAVE (the side the child adopts), Ctrl-D on a default terminal but the
+    /// kernel's/host's business, not ours to assume. It is read once when the pair is created and carried
+    /// to the stdin view (`PtyStdinStream`), whose logical finish delivers it so a child reading to EOF
+    /// actually sees end of input (a stdin view over the shared master closes nothing).
+    ///
+    /// Reads the WHOLE `struct termios` into the same opaque, zeroed 128-byte buffer `disableEcho` uses and
+    /// takes one byte out of it — no field is written back, so the whole-struct-preserve rule that governs
+    /// `tcsetattr` (KB K-033) is not even in play here. A `tcgetattr` failure is a real per-invocation error
+    /// the caller turns into a failed spawn: with no known VEOF, the run could not honour its end-of-input
+    /// contract, and guessing Ctrl-D would be exactly the silent downgrade this reads the value to avoid.
+    let private readEofChar (fd: int) : Result<byte, string> =
+        let buffer = Marshal.AllocHGlobal 128
+
+        try
+            // Zeroed for the same reason as in `disableEcho`: a short `tcgetattr` write must never leave
+            // stack garbage where the control characters are read from.
+            for i in 0..127 do
+                Marshal.WriteByte(buffer, i, 0uy)
+
+            if tcgetattr (fd, buffer) <> 0 then
+                Error
+                    $"tcgetattr failed reading the terminal end-of-input character (errno {Marshal.GetLastWin32Error()})"
+            else
+                Ok(Marshal.ReadByte(buffer, TERMIOS_CC_OFFSET + VEOF_INDEX))
+        finally
+            Marshal.FreeHGlobal buffer
+
+    /// Test-only helper that edits the actual slave-side `termios.c_cc[VEOF]`, preserving every other
+    /// terminal field. It is used only by the open-pty test seam below; production callers cannot change the
+    /// configured control character through this internal helper.
+    let internal setPtyEofCharForTests (fd: int) (eofChar: byte) : Result<unit, string> =
+        let buffer = Marshal.AllocHGlobal 128
+
+        try
+            for i in 0..127 do
+                Marshal.WriteByte(buffer, i, 0uy)
+
+            if tcgetattr (fd, buffer) <> 0 then
+                Error
+                    $"tcgetattr failed configuring the terminal end-of-input character (errno {Marshal.GetLastWin32Error()})"
+            else
+                Marshal.WriteByte(buffer, TERMIOS_CC_OFFSET + VEOF_INDEX, eofChar)
+
+                if tcsetattr (fd, TCSANOW, buffer) <> 0 then
+                    Error
+                        $"tcsetattr(TCSANOW) failed configuring the terminal end-of-input character (errno {Marshal.GetLastWin32Error()})"
+                else
+                    Ok()
+        finally
+            Marshal.FreeHGlobal buffer
+
     /// Open a POSIX pty master/slave pair via the all-libc `posix_openpt` sequence (portable across glibc
     /// versions, and — unlike a bare `openpty` — able to set O_CLOEXEC without `fcntl`, per the PTY ADR).
     /// Both ends are opened O_CLOEXEC so a DIFFERENT concurrent spawn never inherits them (the pty analogue
@@ -1345,10 +1646,11 @@ module internal Posix =
     /// the Windows `CreatePseudoConsole` path (`bare openpty` would take a `winsize` argument directly; the
     /// `posix_openpt` sequence sets it explicitly after allocation). When `echo` is false the slave's
     /// cooked-mode ECHO is cleared via `termios` before the child adopts it (`PtyConfig.Echo` — the
-    /// secret-safety mitigation). Returns the master and slave fds (the caller owns and must close both),
+    /// secret-safety mitigation). Returns the master and slave fds (the caller owns and must close both)
+    /// plus the terminal's configured end-of-input character (`readEofChar`, for the stdin view's finish),
     /// or an errno-tagged message. Each `Marshal.GetLastWin32Error()` is read immediately after its failing
     /// P/Invoke, before any other one.
-    let private openPtyPair (cols: int) (rows: int) (echo: bool) : Result<int * int, string> =
+    let private openPtyPair (cols: int) (rows: int) (echo: bool) : Result<int * int * byte, string> =
         let master = posix_openpt (O_RDWR ||| O_NOCTTY ||| O_CLOEXEC)
 
         if master < 0 then
@@ -1395,24 +1697,46 @@ module internal Posix =
                                 ws.Row <- uint16 rows
                                 ws.Col <- uint16 cols
 
-                                if ioctl (master, unativeint TIOCSWINSZ, &ws) <> 0 then
-                                    let errno = Marshal.GetLastWin32Error()
+                                // Every failure past this point owns both ends of a fully allocated pair.
+                                let closeBoth () =
                                     close slave |> ignore
                                     close master |> ignore
+
+                                if ioctl (master, unativeint TIOCSWINSZ, &ws) <> 0 then
+                                    let errno = Marshal.GetLastWin32Error()
+                                    closeBoth ()
                                     Error $"ioctl(TIOCSWINSZ) failed (errno {errno})"
-                                elif not echo then
+                                else
                                     // `PtyConfig.Echo = false`: clear ECHO on the SLAVE (the child's side)
                                     // before it is dup'd onto the child's 0/1/2, so no typed credential is
                                     // echoed into the captured merged output. A failure fails the spawn
                                     // (both ends closed) — never a silent fallback to echo-on (the secret leak).
-                                    match disableEcho slave with
-                                    | Ok() -> Ok(master, slave)
+                                    let echoApplied = if echo then Ok() else disableEcho slave
+
+                                    match echoApplied with
                                     | Error message ->
-                                        close slave |> ignore
-                                        close master |> ignore
+                                        closeBoth ()
                                         Error message
-                                else
-                                    Ok(master, slave)
+                                    | Ok() ->
+                                        let termiosConfigured =
+                                            match ptyConfigureTermiosForTests with
+                                            | Some configure -> configure slave
+                                            | None -> Ok()
+
+                                        match termiosConfigured with
+                                        | Error message ->
+                                            closeBoth ()
+                                            Error message
+                                        | Ok() ->
+                                            // Capture the terminal's own end-of-input character while the slave is
+                                            // still ours and before the child can reconfigure its tty, so a logical
+                                            // stdin finish delivers the pty's REAL VEOF rather than an assumed
+                                            // Ctrl-D (see `PtyStdinStream`).
+                                            match readEofChar slave with
+                                            | Error message ->
+                                                closeBoth ()
+                                                Error message
+                                            | Ok eofChar -> Ok(master, slave, eofChar)
 
     /// Resize the pty behind `masterFd` (retained from spawn as `Spawned.PtyControl`) to `cols` x `rows`
     /// and notify the child `pid` — the POSIX arm of `RunningProcess.ResizeAsync` (Stage 4 / D6). Applies
@@ -2623,6 +2947,11 @@ module internal Posix =
         // master into a concurrent spawn, keeping the pty-child from ever seeing its stdin EOF (R-02).
         let mutable ptyMasterFd = -1
         let mutable ptyStdinOverMaster = false
+        // The pty's own end-of-input character (`termios.c_cc[VEOF]`), read from the slave when the pair is
+        // created. Carried to the stdin view, whose logical finish delivers it so a child reading to EOF
+        // actually sees end of input — closing a view over the shared master would deliver nothing. Only
+        // read on the pty branch below (where `openPtyPair` supplies it); the initial value is never used.
+        let mutable ptyEofChar = 0uy
 
         // A failed open("/dev/null") (fd < 0, e.g. EMFILE/ENFILE) must fail the spawn honestly,
         // exactly like a failed socketpair() below (`makeStdioChannel`) already does — NOT leave the slot's
@@ -2709,7 +3038,7 @@ module internal Posix =
             // socketpair on this path.
             match openPtyPair pty.Cols pty.Rows pty.Echo with
             | Error message -> failure <- Some message
-            | Ok(master, slave) ->
+            | Ok(master, slave, eofChar) ->
                 childSideFds.Add slave
                 stdinChildFd <- slave
                 stdoutChildFd <- slave
@@ -2717,6 +3046,7 @@ module internal Posix =
                 stdoutParentRead <- Some master
                 ptyMasterFd <- master
                 ptyStdinOverMaster <- stdinWanted
+                ptyEofChar <- eofChar
         | None ->
             if stdinInherit then
                 // `InheritStdin`: hand the child the PARENT's own standard input directly (no socketpair,
@@ -3172,30 +3502,53 @@ module internal Posix =
                                     // read/write, hangup-EIO → EOF) over a `SafeFileHandle` instead — the same
                                     // single-owner + finalizer contract, and the same `createdStreams` bookkeeping
                                     // so the teardown closes it exactly once. An interactive/fed stdin under a PTY
-                                    // wraps that SAME master a second time as a NON-owning view (`owns = false`):
-                                    // the one master is closed exactly once by the owning stdout stream, and there
-                                    // is no `dup` — hence no non-CLOEXEC duplicate to leak into a concurrent spawn
-                                    // (R-02). `owns` is ignored on the socketpair path (always sole-owning there).
-                                    let pipeStream (label: string) (owns: bool) (isPtyStream: bool) fd =
+                                    // wraps that SAME master a second time as a NON-owning `PtyStdinView`: the one
+                                    // master is closed exactly once by the owning stdout stream, and there is no
+                                    // `dup` — hence no non-CLOEXEC duplicate to leak into a concurrent spawn
+                                    // (R-02). Because that view closes nothing, ending it is not a close: it
+                                    // carries the pty's `termios.c_cc[VEOF]` and delivers the terminal's own end
+                                    // of input instead (`PtyStdinStream`).
+                                    let mutable ptyMasterLifetime: PtyMasterLifetime option = None
+
+                                    let pipeStream (label: string) (kind: ParentStreamKind) fd =
                                         streamWrapFaultForTests |> Option.iter (fun fault -> fault label)
 
                                         let stream =
-                                            if isPtyStream then
-                                                let owned =
-                                                    new Microsoft.Win32.SafeHandles.SafeFileHandle(
-                                                        nativeint fd,
-                                                        ownsHandle = owns
-                                                    )
-
-                                                new PtyStream(owned) :> Stream
-                                            else
+                                            match kind with
+                                            | ParentStreamKind.Socketpair ->
                                                 let socket =
                                                     new Socket(new SafeSocketHandle(nativeint fd, ownsHandle = true))
 
                                                 new NetworkStream(socket, ownsSocket = true) :> Stream
+                                            | ParentStreamKind.PtyMaster ->
+                                                let owned =
+                                                    new Microsoft.Win32.SafeHandles.SafeFileHandle(
+                                                        nativeint fd,
+                                                        ownsHandle = true
+                                                    )
+
+                                                let lifetime = new PtyMasterLifetime(owned)
+                                                ptyMasterLifetime <- Some lifetime
+                                                new PtyStream(lifetime, true) :> Stream
+                                            | ParentStreamKind.PtyStdinView eofChar ->
+                                                match ptyMasterLifetime with
+                                                | Some lifetime -> new PtyStdinStream(lifetime, eofChar) :> Stream
+                                                | None ->
+                                                    raise (
+                                                        InvalidOperationException
+                                                            "pty stdin was created before its master lifetime"
+                                                    )
 
                                         createdStreams.Add stream
                                         stream
+
+                                    // The parent-side wrap for a captured stdout/stderr end: the pty master under
+                                    // a PTY run, an ordinary socketpair end otherwise.
+                                    let capturedKind =
+                                        if config.Pty.IsSome then
+                                            ParentStreamKind.PtyMaster
+                                        else
+                                            ParentStreamKind.Socketpair
 
                                     // Wrap each retained parent end into an owning stream, clearing its fd
                                     // tracker as ownership transfers so that if a later step (or the teardown)
@@ -3203,7 +3556,7 @@ module internal Posix =
                                     let stdoutStream =
                                         match stdoutParentRead with
                                         | Some fd ->
-                                            let stream = pipeStream "stdout" true config.Pty.IsSome fd
+                                            let stream = pipeStream "stdout" capturedKind fd
                                             stdoutParentRead <- None
                                             Some stream
                                         | None -> None
@@ -3211,7 +3564,7 @@ module internal Posix =
                                     let stderrStream =
                                         match stderrParentRead with
                                         | Some fd ->
-                                            let stream = pipeStream "stderr" true config.Pty.IsSome fd
+                                            let stream = pipeStream "stderr" capturedKind fd
                                             stderrParentRead <- None
                                             Some stream
                                         | None -> None
@@ -3219,22 +3572,33 @@ module internal Posix =
                                     let stdinStream =
                                         match stdinParentWrite with
                                         | Some fd ->
-                                            // Socketpair path: the parent-write end is its own owning stream.
-                                            let stream = pipeStream "stdin" true config.Pty.IsSome fd
+                                            // Socketpair path: the parent-write end is its own owning stream. A
+                                            // PTY never gets here — its stdin rides the master, below.
+                                            let stream = pipeStream "stdin" ParentStreamKind.Socketpair fd
                                             stdinParentWrite <- None
                                             Some stream
                                         | None when ptyStdinOverMaster && stdoutStream.IsSome ->
                                             // PTY interactive/fed stdin: a NON-owning second view over the SAME
                                             // master fd the stdout stream already owns (no `dup`, so nothing extra
                                             // to close and nothing to leak — R-02). The stdout owner closes the one
-                                            // master exactly once; disposing this view is a no-op on the fd.
-                                            Some(pipeStream "stdin" false true ptyMasterFd)
+                                            // master exactly once; disposing this view is a no-op on the fd, which
+                                            // is why the view ends by DELIVERING the pty's end-of-input character
+                                            // (`ptyEofChar`, read from the slave's termios at creation) instead.
+                                            Some(
+                                                pipeStream
+                                                    "stdin"
+                                                    (ParentStreamKind.PtyStdinView ptyEofChar)
+                                                    ptyMasterFd
+                                            )
                                         | None -> None
 
                                     let extraStreams =
                                         [ for targetFd in config.ExtraFds do
                                               let fd = extraParentEnds[targetFd]
-                                              let stream = pipeStream $"extra fd {targetFd}" true false fd
+
+                                              let stream =
+                                                  pipeStream $"extra fd {targetFd}" ParentStreamKind.Socketpair fd
+
                                               extraParentEnds.Remove targetFd |> ignore
                                               yield targetFd, stream ]
 

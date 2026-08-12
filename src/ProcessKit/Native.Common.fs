@@ -5,6 +5,7 @@ open System
 open System.ComponentModel
 open System.IO
 open System.Runtime.InteropServices
+open System.Threading.Tasks
 
 /// Shared, platform-neutral pieces of the low-level native layer.
 ///
@@ -59,6 +60,31 @@ module internal Common =
             /// `None` when the platform could not report one — never fabricated.
             StartTime: DateTime option
         }
+
+    /// A parent-side stdin stream whose LOGICAL end of input is more than closing the handle, so the
+    /// ordinary teardown-race-safe dispose would leave the child waiting for an EOF that never comes.
+    ///
+    /// The one implementation today is the POSIX pty stdin view (`Native.Posix.PtyStdinStream`): it is a
+    /// NON-owning second view over the pty master fd the merged-output stream owns, so closing it releases
+    /// nothing and the child's terminal never hangs up — the child sees end of input only once the line
+    /// discipline receives the terminal's own end-of-input character. Every stdin stream that is simply a
+    /// pipe end (the socketpair paths, Windows) does NOT implement this, and keeps being closed by dispose.
+    ///
+    /// Both reliable finish paths route through this when the stream implements it — `ProcessStdin.FinishAsync`
+    /// (the interactive handle) and the bulk stdin feeder (`Pump.feedStdin*`, when the source is the child's
+    /// complete input) — and fall back to `Pump.disposeQuietly`/`disposeQuietlyAsync` when it does not.
+    type IStdinFinisher =
+        /// Deliver end of input to the child, WITHOUT releasing a handle this stream does not own.
+        ///
+        /// Idempotent: the first call performs the delivery, later ones are no-ops (`ProcessStdin.FinishAsync`
+        /// and `PtySession.CloseStdinAsync` both promise that). Writes through the stream are refused once it
+        /// has been finished, rather than silently trailing input past the end of input the child has seen.
+        ///
+        /// A genuine delivery failure faults the returned task instead of being swallowed — a child reading to
+        /// EOF would otherwise hang forever on a silently dropped end of input. The two cases where end of
+        /// input is moot rather than failed — the child has already closed its terminal, or the run's own
+        /// teardown already released this stream — complete successfully.
+        abstract member FinishAsync: unit -> Task
 
     /// The OS-reported start time of `pid` (`System.Diagnostics.Process.StartTime`, local kind), or
     /// `None` when the process has exited between enumeration and this read, or its start time is

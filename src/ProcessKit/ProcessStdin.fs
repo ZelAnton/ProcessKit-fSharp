@@ -40,5 +40,18 @@ type ProcessStdin internal (stream: Stream, encoding: Text.Encoding) =
     /// or after the run's own teardown has closed stdin), mirroring `IAsyncDisposable.DisposeAsync`.
     /// Uncancellable by the same convention: closing flushes any buffered input, which a full pipe can
     /// block — to bound an interactive session, cancel the `WriteAsync`/`WriteLineAsync`/`FlushAsync`
-    /// calls above before closing rather than the close itself.
-    member _.FinishAsync() : Task = Pump.disposeQuietlyAsync stream
+    /// calls above before closing rather than the close itself. Writes through this handle are refused
+    /// once it has been finished.
+    ///
+    /// Under a POSIX **PTY** there is no stdin pipe to close — stdin is a view over the terminal the
+    /// child's output also comes from — so the end of input is delivered as the terminal's own
+    /// end-of-input character (`termios.c_cc[VEOF]`, Ctrl-D on a default terminal) instead. The child
+    /// therefore sees EOF only while its terminal is in canonical mode; one that switched its tty to raw
+    /// mode reads that character as ordinary input, which is the line discipline's contract. A genuine
+    /// failure to deliver it throws (an `IOException`) rather than leaving a child that reads to EOF
+    /// waiting forever — a child that has already closed its terminal, and a run whose own teardown has
+    /// been through here, both still complete quietly.
+    member _.FinishAsync() : Task =
+        match box stream with
+        | :? Native.Common.IStdinFinisher as finisher -> finisher.FinishAsync()
+        | _ -> Pump.disposeQuietlyAsync stream

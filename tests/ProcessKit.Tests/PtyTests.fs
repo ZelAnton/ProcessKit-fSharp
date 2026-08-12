@@ -39,6 +39,23 @@ type PtyTests() =
     let ptyStreamForTests () =
         new Native.Posix.PtyStream(new SafeFileHandle(IntPtr.Zero, ownsHandle = false))
 
+    // The stdin (write) view over a pty master, with an explicit end-of-input character standing in for the
+    // one a real spawn reads out of the slave's termios. Non-owning, over no real fd — every write goes
+    // through the `ptyWriteForTests` seam below.
+    let ptyStdinForTests (eofChar: byte) =
+        new Native.Posix.PtyStdinStream(new SafeFileHandle(IntPtr.Zero, ownsHandle = false), eofChar)
+
+    // Record every byte handed to the raw pty write, accepting at most `accept` of them per call so a
+    // partial write can be forced.
+    let recordPtyWrites (written: ResizeArray<byte>) (accept: int) =
+        Native.Posix.ptyWriteForTests <-
+            Some(fun _ ptr count ->
+                let take = min accept (int count)
+                let buffer = Array.zeroCreate<byte> take
+                Marshal.Copy(ptr, buffer, 0, take)
+                written.AddRange buffer
+                nativeint take)
+
     // Collect an async sequence (the streaming event/line verbs) into a list for assertions.
     let collect (items: IAsyncEnumerable<'T>) =
         task {
@@ -141,6 +158,317 @@ type PtyTests() =
             Native.Posix.ptyWriteForTests <- None
 
         Assert.That(writeCalls, Is.EqualTo 1, "a zero-byte write must fail instead of retrying indefinitely")
+
+    // ----------------------------------------------------------------------------------
+    // T-332: ending a POSIX pty stdin delivers a TERMINAL end of input. The view owns no fd to close (it
+    // shares the master with the merged-output stream), so a child reading to EOF only ever sees one if
+    // the pty's own end-of-input character reaches the line discipline.
+    // ----------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``finishing a pty stdin delivers the configured VEOF twice, then refuses further input``() : Task =
+        task {
+            // A deliberately non-default end-of-input character (Ctrl-Q, 0x11) instead of Ctrl-D: what is
+            // delivered must be the character the pty is CONFIGURED with, read from its slave termios when
+            // the pair was created, never an assumed default.
+            let written = ResizeArray<byte>()
+            recordPtyWrites written 64
+
+            try
+                let stdin = ptyStdinForTests 0x11uy
+                Assert.That(stdin.EofChar, Is.EqualTo 0x11uy)
+                do! stdin.FinishAsync()
+
+                // Twice: the first terminates the unterminated canonical line (handing it to the child's
+                // pending read), the second lands on the now-empty line and IS the child's end of input.
+                Assert.That(written.ToArray(), Is.EqualTo<byte[]>([| 0x11uy; 0x11uy |]))
+                Assert.That(stdin.IsFinished, Is.True)
+
+                // Input after the end of input is refused, never written silently past the EOF the child saw.
+                Assert.Throws<ObjectDisposedException>(Action(fun () -> stdin.Write([| 1uy |], 0, 1)))
+                |> ignore
+
+                // Idempotent, as `ProcessStdin.FinishAsync`/`PtySession.CloseStdinAsync` both promise.
+                do! stdin.FinishAsync()
+
+                Assert.That(written.Count, Is.EqualTo 2, "a repeated finish must not deliver a second end of input")
+            finally
+                Native.Posix.ptyWriteForTests <- None
+        }
+
+    [<Test>]
+    member _.``a real pty reads the configured slave VEOF and delivers it to cat``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only POSIX termios PTY integration"
+            else
+                // Configure the actual slave-side termios before openPtyPair reads c_cc[VEOF]. The child then
+                // proves both halves of the contract: the non-default byte is discovered and the canonical
+                // line discipline turns two of those bytes into payload delivery followed by EOF.
+                Native.Posix.ptyConfigureTermiosForTests <-
+                    Some(fun slave -> Native.Posix.setPtyEofCharForTests slave 0x11uy)
+
+                try
+                    let payload = "termios-configured-vEOF"
+
+                    let command =
+                        (Command.create "/bin/cat").Pty({ Cols = 80; Rows = 24; Echo = false })
+                        |> Command.stdin (Stdin.FromString payload)
+                        |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                    match! command.OutputStringAsync() with
+                    | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                    | Error other -> Assert.Fail $"unexpected configured-VEOF PTY failure: {other}"
+                    | Ok result ->
+                        Assert.That(result.Stdout, Does.Contain payload)
+
+                        match result.Outcome with
+                        | Outcome.Exited 0 -> ()
+                        | other -> Assert.Fail $"configured slave VEOF did not produce clean child EOF: {other}"
+                finally
+                    Native.Posix.ptyConfigureTermiosForTests <- None
+        }
+
+    [<Test>]
+    member _.``pty finish waits for an admitted payload write before delivering VEOF``() : Task =
+        task {
+            let written = ResizeArray<byte>()
+            use entered = new ManualResetEventSlim(false)
+            use release = new ManualResetEventSlim(false)
+
+            Native.Posix.ptyWriteForTests <-
+                Some(fun _ ptr count ->
+                    entered.Set()
+                    release.Wait()
+                    let buffer = Array.zeroCreate<byte> (int count)
+                    Marshal.Copy(ptr, buffer, 0, buffer.Length)
+                    written.AddRange buffer
+                    nativeint buffer.Length)
+
+            try
+                use stdin = ptyStdinForTests 4uy
+                let payload = [| 0x41uy; 0x42uy |]
+
+                let writeTask: Task =
+                    Task.Run(Action(fun () -> stdin.Write(payload, 0, payload.Length)))
+
+                Assert.That(
+                    entered.Wait(TimeSpan.FromSeconds 5.0),
+                    Is.True,
+                    "payload write did not enter the native seam"
+                )
+
+                // Finish is invoked concurrently while the payload write owns the gate. It must remain
+                // pending until that write releases the gate, rather than overtaking it with VEOF.
+                let finishTask: Task = Task.Run(Func<Task>(fun () -> stdin.FinishAsync()))
+                Assert.That(finishTask.Wait(TimeSpan.FromMilliseconds 100.0), Is.False)
+
+                release.Set()
+                do! writeTask
+                do! finishTask
+
+                Assert.That(written.ToArray(), Is.EqualTo<byte[]>([| 0x41uy; 0x42uy; 4uy; 4uy |]))
+
+                Assert.Throws<ObjectDisposedException>(Action(fun () -> stdin.Write([| 0x43uy |], 0, 1)))
+                |> ignore
+            finally
+                release.Set()
+                Native.Posix.ptyWriteForTests <- None
+        }
+
+    [<Test>]
+    member _.``a pending pty finish retains the shared master after owner teardown``() : Task =
+        task {
+            use entered = new ManualResetEventSlim(false)
+            use release = new ManualResetEventSlim(false)
+            use ownerClosed = new ManualResetEventSlim(false)
+
+            Native.Posix.ptyMasterCloseForTests <- Some(fun () -> ownerClosed.Set())
+
+            Native.Posix.ptyWriteForTests <-
+                Some(fun _ ptr count ->
+                    entered.Set()
+                    release.Wait()
+                    let buffer = Array.zeroCreate<byte> (int count)
+                    Marshal.Copy(ptr, buffer, 0, buffer.Length)
+                    nativeint buffer.Length)
+
+            try
+                use owner = ptyStreamForTests ()
+                use stdin = new Native.Posix.PtyStdinStream(owner.MasterLifetime, 4uy)
+                let finishTask = stdin.FinishAsync()
+
+                Assert.That(entered.Wait(TimeSpan.FromSeconds 5.0), Is.True, "finish did not enter the native seam")
+                owner.Dispose()
+
+                // The non-owning view's retained lease keeps the shared master alive even after stdout's
+                // owner is disposed. This is the deterministic form of the close/reuse race protection.
+                Assert.That(ownerClosed.IsSet, Is.False)
+
+                release.Set()
+                do! finishTask
+                Assert.That(ownerClosed.Wait(TimeSpan.FromSeconds 5.0), Is.True)
+            finally
+                release.Set()
+                Native.Posix.ptyWriteForTests <- None
+                Native.Posix.ptyMasterCloseForTests <- None
+        }
+
+    [<Test>]
+    member _.``T332_R04_concurrent FinishAsync callers share one successful delivery task``() =
+        use entered = new ManualResetEventSlim(false)
+        use release = new ManualResetEventSlim(false)
+        let written = ResizeArray<byte>()
+
+        Native.Posix.ptyWriteForTests <-
+            Some(fun _ ptr count ->
+                entered.Set()
+                release.Wait()
+                let buffer = Array.zeroCreate<byte> (int count)
+                Marshal.Copy(ptr, buffer, 0, buffer.Length)
+                written.AddRange buffer
+                nativeint buffer.Length)
+
+        try
+            use stdin = ptyStdinForTests 4uy
+            let first = stdin.FinishAsync()
+            Assert.That(entered.Wait(TimeSpan.FromSeconds 5.0), Is.True, "finish did not enter the delayed native seam")
+
+            let secondResult =
+                new TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let secondCaller =
+                Task.Run(Action(fun () -> secondResult.SetResult(stdin.FinishAsync())))
+
+            Assert.That(
+                secondCaller.Wait(TimeSpan.FromSeconds 5.0),
+                Is.True,
+                "a repeated FinishAsync caller must not wait for the first delivery to finish"
+            )
+
+            let second = secondResult.Task.Result
+
+            Assert.That(Object.ReferenceEquals(first, second), Is.True)
+            Assert.That(first.IsCompleted, Is.False)
+
+            release.Set()
+            Assert.That(first.Wait(TimeSpan.FromSeconds 5.0), Is.True, "the cached finish task did not complete")
+            Assert.That(second.Wait(TimeSpan.FromSeconds 5.0), Is.True, "the repeated finish task did not complete")
+            Assert.That(written.ToArray(), Is.EqualTo<byte[]>([| 4uy; 4uy |]))
+        finally
+            release.Set()
+            Native.Posix.ptyWriteForTests <- None
+
+    [<Test>]
+    member _.``a pty end-of-input delivery resumes a partial write and retries EINTR``() : Task =
+        task {
+            // The raw write takes ONE byte per call and is interrupted (EINTR) in between, so both
+            // characters only arrive if the delivery honours partial writes and retries an interrupted
+            // one — the same loop an ordinary stdin write goes through.
+            let written = ResizeArray<byte>()
+            let calls = ref 0
+
+            Native.Posix.ptyWriteForTests <-
+                Some(fun _ ptr count ->
+                    calls.Value <- calls.Value + 1
+
+                    if calls.Value = 2 then
+                        // Interrupted before any byte was written: the remainder must be retried, not lost.
+                        Marshal.SetLastPInvokeError 4 // EINTR
+                        -1n
+                    else
+                        let take = min 1 (int count)
+                        let buffer = Array.zeroCreate<byte> take
+                        Marshal.Copy(ptr, buffer, 0, take)
+                        written.AddRange buffer
+                        nativeint take)
+
+            try
+                let stdin = ptyStdinForTests 4uy
+                do! stdin.FinishAsync()
+
+                Assert.That(written.ToArray(), Is.EqualTo<byte[]>([| 4uy; 4uy |]))
+                Assert.That(calls.Value, Is.EqualTo 3, "one accepted byte, one EINTR retry, then the second byte")
+            finally
+                Native.Posix.ptyWriteForTests <- None
+        }
+
+    [<Test>]
+    member _.``a pty with its end-of-input character disabled reports an honest failure``() : Task =
+        task {
+            // `_POSIX_VDISABLE` means the terminal has NO end-of-input character. Sending the byte anyway
+            // would push a NUL through as ordinary input while looking like a delivered EOF.
+            let written = ResizeArray<byte>()
+            recordPtyWrites written 64
+
+            try
+                let stdin = ptyStdinForTests 0uy
+                let action = Func<Task>(fun () -> stdin.FinishAsync())
+
+                match Assert.ThrowsAsync<IOException>(action) with
+                | null -> Assert.Fail "a disabled end-of-input character must fail the delivery, not pretend"
+                | fault -> Assert.That(fault.Message, Does.Contain "_POSIX_VDISABLE")
+
+                Assert.That(written.Count, Is.Zero, "a disabled end-of-input character must not send a byte at all")
+            finally
+                Native.Posix.ptyWriteForTests <- None
+        }
+
+    [<Test>]
+    member _.``a failed pty end-of-input delivery surfaces instead of being swallowed``() : Task =
+        task {
+            // A genuine write failure (EBADF here) must reach the caller: a child reading to EOF would
+            // otherwise wait forever on an end of input that was silently dropped.
+            Native.Posix.ptyWriteForTests <-
+                Some(fun _ _ _ ->
+                    Marshal.SetLastPInvokeError 9 // EBADF
+                    -1n)
+
+            try
+                let stdin = ptyStdinForTests 4uy
+                let first = stdin.FinishAsync()
+                let second = stdin.FinishAsync()
+                Assert.That(Object.ReferenceEquals(first, second), Is.True)
+
+                let observe (delivery: Task) =
+                    task {
+                        try
+                            do! delivery
+                            return None
+                        with :? IOException as ex ->
+                            return Some ex.Message
+                    }
+
+                let! firstError = observe first
+                let! secondError = observe second
+
+                match firstError, secondError with
+                | Some firstMessage, Some secondMessage ->
+                    Assert.That(firstMessage, Does.Contain "errno 9")
+                    Assert.That(secondMessage, Is.EqualTo firstMessage)
+                | _ -> Assert.Fail "every repeated FinishAsync caller must observe the delivery failure"
+            finally
+                Native.Posix.ptyWriteForTests <- None
+        }
+
+    [<Test>]
+    member _.``finishing a pty stdin whose child already closed the terminal completes quietly``() : Task =
+        task {
+            // EIO on the master write is the pty hangup: the child dropped its last slave fd, so there is no
+            // line discipline left to hand an end of input to — and no child left to read one. Moot, not a
+            // failed delivery, exactly as closing a pipe whose peer is gone is not an error.
+            Native.Posix.ptyWriteForTests <-
+                Some(fun _ _ _ ->
+                    Marshal.SetLastPInvokeError 5 // EIO
+                    -1n)
+
+            try
+                let stdin = ptyStdinForTests 4uy
+                do! stdin.FinishAsync()
+                Assert.That(stdin.IsFinished, Is.True)
+            finally
+                Native.Posix.ptyWriteForTests <- None
+        }
 
     [<Test>]
     member _.``Pty rejects a non-positive number of columns``() =
@@ -673,6 +1001,40 @@ type PtyTests() =
                         Does.Contain marker,
                         "with cooked-mode echo on (the default), fed input is echoed into the captured output"
                     )
+        }
+
+    [<Test>]
+    member _.``a PTY bulk stdin source with no trailing newline still ends the child's input (T-332)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                // `cat` reads until EOF and the payload carries NO trailing newline, so this run can only
+                // finish if draining the source delivers a real terminal end of input: the first
+                // end-of-input character hands the unterminated line to `cat`, the second ends its input.
+                // Without one the child waits forever and the run is killed by its timeout instead.
+                // Echo=false so the payload can only reach the captured output by way of `cat` itself,
+                // never the terminal's own echo of the input.
+                let payload = "unterminated"
+
+                let cmd =
+                    (Command.create "/bin/cat").Pty({ Cols = 80; Rows = 24; Echo = false })
+                    |> Command.stdin (Stdin.FromString payload)
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok result ->
+                    Assert.That(
+                        result.Stdout,
+                        Does.Contain payload,
+                        "the unterminated payload must have reached the child, which copies it back"
+                    )
+
+                    match result.Outcome with
+                    | Outcome.Exited 0 -> ()
+                    | other -> Assert.Fail $"the child should have seen EOF and exited cleanly, got {other}"
         }
 
     // ----------------------------------------------------------------------------------

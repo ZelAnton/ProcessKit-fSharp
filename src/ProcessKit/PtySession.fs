@@ -355,6 +355,12 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     /// Close the child's stdin, so it sees end-of-file — how a conversation that feeds input ends for a
     /// child that reads until EOF. Idempotent; returns the same typed `Unsupported` as the send verbs
     /// when the run has no interactive stdin.
+    ///
+    /// On a POSIX pty the end of input is the terminal's own end-of-input character (see
+    /// `ProcessStdin.FinishAsync`), delivered through the same terminal the conversation runs over. A
+    /// genuine failure to deliver it is a typed `Io` — never a silently dropped close that would leave the
+    /// child waiting — while a child that has already closed its terminal is reported as the `Ok` it is:
+    /// there is nothing left to tell it.
     member _.CloseStdinAsync() : Task<Result<unit, ProcessError>> =
         match stdin with
         | None ->
@@ -366,8 +372,15 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
             )
         | Some pipe ->
             task {
-                do! pipe.FinishAsync()
-                return Ok()
+                try
+                    do! pipe.FinishAsync()
+                    return Ok()
+                with
+                | :? IOException as ex ->
+                    // The end of input could not be delivered (the terminal refused the write) - the same
+                    // honest typed failure the send verbs report, never a close that silently did nothing.
+                    return Error(ProcessError.Io ex.Message)
+                | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
             }
 
     /// The output received but not yet consumed by a pattern — what the next `ExpectAsync` will match

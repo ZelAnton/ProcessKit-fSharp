@@ -1334,7 +1334,26 @@ module internal Pump =
                     | _ -> genuineStdinFault ex
 
             if closeWhenDone then
-                disposeQuietly stdinStream
+                // The source was the child's complete input, so the child must now see END OF INPUT. For a
+                // pipe end that is the ordinary close (the fallback branch below); a stdin stream that owns
+                // no handle to close (the POSIX pty view over the shared master) has to deliver the
+                // terminal's own end-of-input character instead, or a child reading to EOF waits forever
+                // for one that can never arrive.
+                match box stdinStream with
+                | :? Native.Common.IStdinFinisher as finisher ->
+                    try
+                        do! finisher.FinishAsync()
+                    with ex ->
+                        // Unlike the dispose above, a failed end-of-input delivery is NOT a teardown race to
+                        // swallow: the child is left waiting on input this feed promised to end. Stash it so
+                        // an otherwise-successful run surfaces it as `ProcessError.Stdin`, without displacing
+                        // a source fault already recorded above (that one is the earlier, primary cause).
+                        // `FinishAsync` itself already completes successfully for the two cases where end of
+                        // input is moot rather than lost (a hung-up terminal, an already-torn-down run).
+                        match fault with
+                        | None -> fault <- Some ex
+                        | Some _ -> ()
+                | _ -> disposeQuietly stdinStream
 
             return fault
         }

@@ -760,3 +760,52 @@ type PtySessionTests() =
                     | Outcome.Exited 0 -> ()
                     | other -> Assert.Fail $"expected a clean exit from the pty child, got {other}"
         }
+
+    [<Test>]
+    member _.``CloseStdinAsync ends a PTY child reading to EOF after an unterminated line (T-332)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                // `cat` reads until EOF and the sent line is deliberately UNTERMINATED, so the child can
+                // only finish if `CloseStdinAsync` delivers a real terminal end of input — its stdin is a
+                // view over the same terminal the output comes from, with no pipe of its own to close.
+                // Echo=false keeps the terminal's own echo out of it, so the text can only come back from
+                // `cat` having actually received it.
+                let payload = "unterminated-line"
+
+                let command =
+                    (Command.create "/bin/cat").Pty({ PtyConfig.Default with Echo = false })
+                    |> Command.keepStdinOpen
+                    |> Command.timeout (TimeSpan.FromSeconds 60.0)
+
+                match! runner.StartAsync(command, CancellationToken.None) with
+                | Error(ProcessError.Unsupported message) -> Assert.Ignore $"host lacks a PTY: {message}"
+                | Error other -> Assert.Fail $"unexpected error from a POSIX pty spawn: {other}"
+                | Ok running ->
+                    use running = running
+                    let session = PtySession running
+
+                    match! session.SendAsync payload with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"sending the unterminated line failed: {error}"
+
+                    match! session.CloseStdinAsync() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"closing the pty stdin failed: {error}"
+
+                    match! session.ExpectAsync(payload, TimeSpan.FromSeconds 30.0) with
+                    | Ok _ -> ()
+                    | Error error -> Assert.Fail $"the child should have received the unterminated line: {error}"
+
+                    // The child read to EOF and exited on its own — not killed by the run's timeout, which
+                    // is what a stdin close that delivered nothing would have left it waiting for.
+                    match! session.WaitForExitAsync() with
+                    | Outcome.Exited 0 -> ()
+                    | other -> Assert.Fail $"the child should have exited at EOF, got {other}"
+
+                    // Closing again is a no-op, not a second end of input or a failure.
+                    match! session.CloseStdinAsync() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"a repeated CloseStdinAsync must stay Ok: {error}"
+        }
