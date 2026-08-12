@@ -86,7 +86,7 @@ type internal LimitContractBackend(initial: ResourceLimits, shouldFail: Resource
         member _.Wait(_handle) = task { return Outcome.Exited 0 }
         member _.PidOf(_spawned) = None
         member _.KillChild(_spawned) = ()
-        member _.KillTree() = ()
+        member _.KillTree() = Ok()
         member _.GracefulKillTree (_signal) (_grace) = Task.CompletedTask
         member _.SignalChild(_spawned, _signal) = Ok()
         member _.Members() = Ok []

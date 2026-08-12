@@ -186,7 +186,9 @@ type private DropCounter() =
 /// silently deleting a queued frame would delete a message the peer is correlating with a request, and
 /// no consumer could tell. Leaving `StreamBuffer` unset keeps the default unbounded frame backlog.
 [<Sealed>]
-type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog: int) =
+type JsonRpcSession
+    internal
+    (running: RunningProcess, maxFrameBytes: int, messageBacklog: int, beforePendingCompletion: Action<int64> | null) =
     do ArgumentNullException.ThrowIfNull(running, nameof running)
     do ArgumentOutOfRangeException.ThrowIfLessThan(messageBacklog, 1, nameof messageBacklog)
 
@@ -210,6 +212,7 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
 
     let gate = obj ()
     let pending = Dictionary<int64, PendingRequest>()
+    let beforePendingCompletion = Option.ofObj beforePendingCompletion
     let dropped = DropCounter()
     let mutable nextId = 0L
     let mutable ended: ProcessError option = None
@@ -284,13 +287,26 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
 
         code, detail, data
 
-    let takePending (id: int64) : PendingRequest option =
+    // Claim and publish a terminal result while holding the same gate. The completion source uses
+    // RunContinuationsAsynchronously, so publishing here cannot run caller code or perform I/O under
+    // the lock. This is the one state transition out of `pending`: an answer, timeout/cancellation,
+    // send failure, or late-answer discard cannot observe a claimed entry before its result is visible.
+    let tryCompletePending (id: int64) (outcome: PendingRequest -> Result<string, ProcessError>) : bool =
         lock gate (fun () ->
             match pending.TryGetValue id with
             | true, entry ->
+                let result = outcome entry
                 pending.Remove id |> ignore
-                Some entry
-            | _ -> None)
+                // This callback is populated only by the internal fault-injection constructor used by
+                // deterministic race tests. Production constructors leave it absent; it is invoked while
+                // the gate is held so a competing timeout/cancellation can attempt the same transition.
+                try
+                    beforePendingCompletion |> Option.iter (fun callback -> callback.Invoke id)
+                finally
+                    entry.Completion.TrySetResult result |> ignore
+
+                true
+            | _ -> false)
 
     // Register a waiter, unless the conversation is already over — checked and stored under the same
     // lock the router ends the session with, so a request racing the peer's exit either joins the
@@ -312,17 +328,15 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
                 Ok())
 
     let endSession (error: ProcessError) =
-        let waiters =
-            lock gate (fun () ->
-                if ended.IsNone then
-                    ended <- Some error
+        lock gate (fun () ->
+            if ended.IsNone then
+                ended <- Some error
 
-                let waiters = pending.Values |> Seq.toArray
-                pending.Clear()
-                waiters)
+            let waiters = pending.Values |> Seq.toArray
+            pending.Clear()
 
-        for waiter in waiters do
-            waiter.Completion.TrySetResult(Error error) |> ignore
+            for waiter in waiters do
+                waiter.Completion.TrySetResult(Error error) |> ignore)
 
     let currentFault () = lock gate (fun () -> ended)
 
@@ -430,18 +444,17 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
                         | Some element -> Choice2Of2(element.GetRawText())
                         | None -> raise (protocolFault "the peer answered with neither a 'result' nor an 'error'")
 
-                match readId idElement |> Option.bind takePending with
+                match readId idElement with
                 // Nobody is waiting for this id: a late answer to a request that already timed out or
                 // was cancelled, or an id this session never issued. Discarded, not a session failure.
                 | None -> ()
-                | Some waiter ->
-                    let outcome =
+                | Some id ->
+                    tryCompletePending id (fun waiter ->
                         match answered with
                         | Choice1Of2(code, detail, data) ->
                             Error(ProcessError.JsonRpc(program, waiter.Method, code, detail, data))
-                        | Choice2Of2 text -> Ok text
-
-                    waiter.Completion.TrySetResult outcome |> ignore
+                        | Choice2Of2 text -> Ok text)
+                    |> ignore
 
     // The single reader of the framed transport. `backgroundTask` (KB K-009), not `task`: a caller may
     // block on a request from a single-threaded SynchronizationContext (a UI thread, classic ASP.NET),
@@ -496,11 +509,15 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
 
     /// A session over `running` with a custom maximum frame size, using the default 1024-message
     /// inbound backlog.
-    new(running: RunningProcess, maxFrameBytes: int) = JsonRpcSession(running, maxFrameBytes, 1024)
+    new(running: RunningProcess, maxFrameBytes: int) = JsonRpcSession(running, maxFrameBytes, 1024, null)
+
+    /// A session over `running` with custom frame and decoded-message backlog limits.
+    new(running: RunningProcess, maxFrameBytes: int, messageBacklog: int) =
+        JsonRpcSession(running, maxFrameBytes, messageBacklog, null)
 
     /// A session over `running` using the framing layer's default 16 MiB maximum frame size and a
     /// 1024-message inbound backlog.
-    new(running: RunningProcess) = JsonRpcSession(running, 16 * 1024 * 1024, 1024)
+    new(running: RunningProcess) = JsonRpcSession(running, 16 * 1024 * 1024, 1024, null)
 
     // ---- message construction -------------------------------------------------------------------
 
@@ -572,18 +589,21 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
             try
                 return! completion.Task.WaitAsync linkedToken
             with :? OperationCanceledException ->
-                takePending id |> ignore
+                let error =
+                    if cancellationToken.IsCancellationRequested then
+                        ProcessError.Cancelled program
+                    else
+                        match armed with
+                        | Some span -> ProcessError.Timeout(program, span, "", "")
+                        | None -> ProcessError.Cancelled program
 
-                // The answer can land in the instant between the deadline firing and this handler
-                // running; reporting a timeout for an answer that did arrive would be a lie.
-                if completion.Task.IsCompletedSuccessfully then
-                    return completion.Task.Result
-                elif cancellationToken.IsCancellationRequested then
-                    return Error(ProcessError.Cancelled program)
+                // If this call still owns the entry, fail it under the same gate as the router's answer
+                // publication. Otherwise the router or session-end path already published the terminal
+                // result, which has priority even though this cancellation continuation ran first.
+                if tryCompletePending id (fun _ -> Error error) then
+                    return Error error
                 else
-                    match armed with
-                    | Some span -> return Error(ProcessError.Timeout(program, span, "", ""))
-                    | None -> return Error(ProcessError.Cancelled program)
+                    return! completion.Task
         }
 
     // The one request path: allocate an id, register the waiter, arm the call's deadline, send the frame,
@@ -649,8 +669,13 @@ type JsonRpcSession(running: RunningProcess, maxFrameBytes: int, messageBacklog:
 
                 match! this.SendFramed(payload, linked.Token, classifyInterrupt) with
                 | Error error ->
-                    takePending id |> ignore
-                    return Error error
+                    // A response can already have claimed the request while the send reports its own
+                    // interruption. Preserve whichever terminal result won the gate rather than
+                    // replacing an already-published answer with the send error.
+                    if tryCompletePending id (fun _ -> Error error) then
+                        return Error error
+                    else
+                        return! completion.Task
                 | Ok() -> return! this.AwaitAnswer(id, completion, armed, linked.Token, cancellationToken)
             }
 

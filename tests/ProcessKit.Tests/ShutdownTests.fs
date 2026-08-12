@@ -40,7 +40,7 @@ type private GracefulFaultBackend() =
         member _.Wait(_handle) = task { return Outcome.Exited 0 }
         member _.PidOf(_spawned) = None
         member _.KillChild(_spawned) = ()
-        member _.KillTree() = ()
+        member _.KillTree() = Ok()
 
         member _.GracefulKillTree (_signal) (_grace) : Task =
             // The fault this backend exists to inject: `ShutdownAsync`'s graceful stage must still

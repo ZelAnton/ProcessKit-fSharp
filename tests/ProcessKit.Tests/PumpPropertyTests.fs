@@ -105,7 +105,7 @@ type PumpPropertyTests() =
         (bytes: byte[])
         (encoding: Encoding)
         (terminator: LineTerminator)
-        (maxLineLength: int option)
+        (maxLineBytes: int option)
         (chunkSizes: int list)
         : ResizeArray<string> =
         use stream = new ChunkedStream(bytes, chunkSizes)
@@ -119,7 +119,7 @@ type PumpPropertyTests() =
             (fun l ->
                 lines.Add l
                 ValueTask.CompletedTask)
-            maxLineLength
+            maxLineBytes
             CancellationToken.None)
             .Wait()
 
@@ -315,10 +315,11 @@ type PumpPropertyTests() =
 
         Check.QuickThrowOnFailure property
 
-    // --- Property 4: force-flush at the `maxLineLength` cap — every emitted segment is bounded by
-    // the cap, and concatenating all emitted segments (across the whole stream) reconstructs the
-    // concatenation of the "true" (uncapped) line contents, regardless of where a chunk boundary —
-    // including one straddling a `\r\n` pair — falls. ---
+    // --- Property 4: force-flush at the `maxLineBytes` UTF-8 byte cap — every emitted segment is
+    // bounded by the cap unless it is one indivisible character larger than the cap, and concatenating
+    // all emitted segments (across the whole stream) reconstructs the concatenation of the "true"
+    // (uncapped) line contents, regardless of where a chunk boundary — including one straddling a
+    // `\r\n` pair — falls. ---
 
     [<Test>]
     member _.``readLines force-flushes at the cap without losing or duplicating content, across chunk and CRLF boundaries``
@@ -366,7 +367,12 @@ type PumpPropertyTests() =
                 let actual =
                     runReadLines bytes Encoding.UTF8 case.Terminator (Some case.Cap) case.ChunkSizes
 
-                let lengthsOk = actual |> Seq.forall (fun s -> s.Length <= case.Cap)
+                // `contentPool` contains only BMP scalars, so an over-cap segment can only be one
+                // UTF-16 character: the indivisible unit is larger than the configured byte cap.
+                let lengthsOk =
+                    actual
+                    |> Seq.forall (fun s -> Encoding.UTF8.GetByteCount s <= case.Cap || s.Length = 1)
+
                 let reconstructed = String.concat "" actual
                 let expected = String.concat "" case.Segments
                 lengthsOk && reconstructed = expected)

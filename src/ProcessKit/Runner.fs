@@ -432,6 +432,7 @@ module Runner =
                 // predicate / cancellation), so a streaming verb never downgrades the kill-on-drop
                 // guarantee to GC finalization.
                 use _ = running
+                use _registration = effectiveToken.Register(fun () -> running.Kill())
 
                 try
                     let mutable found = None
@@ -449,14 +450,16 @@ module Runner =
 
                     running.Kill()
 
-                    // `firstLine` force-kills the child at the first match, so it never runs to the
-                    // natural accepted-exit completion that a stdin-source failure surfaces through
-                    // (`ProcessError.Stdin` fires only on an otherwise-successful run). Reporting it here
-                    // would hinge on whether the child happened to exit 0 before `Kill` landed — i.e. be
-                    // non-deterministic — so `firstLine` deliberately does not surface it: the matched
-                    // line is the result. `FinishAsync` is still awaited to reap the tree.
-                    let! _ = running.FinishAsync()
-                    return Ok found
+                    // `FinishAsync` is still awaited to reap the tree. Cancellation is checked only
+                    // after that await so a cancellation in the match-to-finish window cannot be lost;
+                    // a genuine finish error remains visible instead of being replaced by a match.
+                    let! finished = running.FinishAsync()
+
+                    match finished with
+                    | Error error -> return Error error
+                    | Ok _ when effectiveToken.IsCancellationRequested ->
+                        return Error(ProcessError.Cancelled command.Program)
+                    | Ok _ -> return Ok found
                 with
                 | :? System.OperationCanceledException ->
                     // Faithful to the contract: a cancelled run is always an error, not a raised

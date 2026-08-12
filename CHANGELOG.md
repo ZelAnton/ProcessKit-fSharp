@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+- Newline-free captured text now applies `OutputBuffer.MaxBytes` to UTF-8 byte size during force-flush, including multibyte Unicode output.
+- Relative entries in `PATH` now resolve to canonical absolute executable paths, anchored to the effective working directory for `Exec.which`, `Command.ResolveProgram`, and `CliClient.ResolveProgram`.
+- `FirstLineAsync` now preserves cancellation that arrives after a matching line, including while the child is being reaped, and no longer masks a `FinishAsync` error.
+- Linux cgroup legacy hard kills now verify that the reusable cgroup thawed and surface a typed `ProcessError.Io` through `ProcessGroup.KillAll()` and `Signal.Kill` instead of reporting success for a group still frozen; final disposal remains best-effort.
+- `JsonRpcSession` now gives an already-claimed response priority over a concurrent timeout or cancellation, so a successful answer cannot be replaced by a typed deadline error during pending-request completion.
+- POSIX `LaunchDetached` now transfers each direct child to a private background reaper, preventing zombies in long-lived parents while preserving the pid-and-start-time-only detached API.
+
+## [2.11.0] - 2026-08-06
+
+### Added
 - `ProcessGroup.MemberStats()` exposes per-member PID, CPU time, resident memory, and optional I/O counters with native Windows and POSIX sampling; vanished members are omitted, and Windows retains unavailable metrics only for PIDs confirmed by a fresh Job membership query.
 - `ResourceLimits.WithIoMax` and `ProcessGroupOptions.WithIoMax` cap directional disk bandwidth and IOPS through Linux cgroup v2 `io.max` or Windows Job Object I/O rate control.
 - `RunningProcess.StdoutChunksAsync` streams stdout as byte-exact `ReadOnlyMemory<byte>` chunks with configurable channel backpressure.
@@ -25,7 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Exec.outputAll`/`Exec.outputAllBytes` now reject `concurrency < 1` with `ArgumentOutOfRangeException` before running any command, instead of silently coercing it to sequential execution.
 
 ### Fixed
-- POSIX `LaunchDetached` now transfers each direct child to a private background reaper, preventing zombies in long-lived parents while preserving the pid-and-start-time-only detached API.
 - POSIX `Uid`/`Gid`/`Groups`, `KillOnParentDeath`, and `Pty` now load their `setpriv`/`setsid --ctty` helper binaries only from the trusted system directories `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` and launch them by absolute path instead of searching the calling process's `PATH`, so a `setpriv` planted earlier on `PATH` can no longer run with the parent's (often root) privileges before the drop; a host carrying neither helper in those directories now returns the same typed `ProcessError.Spawn`/`ProcessError.Unsupported` it already returned when the helper was missing entirely, never a silent fallback.
 - Bounded chunk and protocol-frame overflow diagnostics now use neutral output wording instead of describing raw stdout chunks as protocol output.
 - Supervisor callback exceptions from StopWhen, GiveUpWhen, OnRestart, and OnStormPause now terminate supervision with a typed ProcessError.Io that preserves the available result/error context and performs normal teardown instead of escaping from RunAsync or SupervisionSession.Completion.
@@ -565,7 +580,8 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - POSIX: the SIGCHLD dispatch callback no longer blocks on a `Thread.Sleep` spin while resolving a reap race against a concurrent `reapLeader` (group teardown) — the same bounded grace period now runs on the thread pool instead of the shared signal-dispatch thread, so it can no longer delay reaping every other pending child. A race that genuinely can't be resolved within the grace period now reports `Outcome.Unobserved` rather than a fabricated clean exit; the far more common case — the concurrent reap actually landing the real status — is unaffected.
 - Linux cgroup v2: a child that cannot be migrated into the cgroup (the write to `cgroup.procs` fails) is now killed and reaped, and the spawn fails with `ProcessError.ResourceLimit`, instead of being silently left to run in the parent cgroup entirely outside the requested resource limits. The `Mechanism.CgroupV2` / `ProcessGroup.Create` docs now also state the spawn→migrate window honestly: the limits apply to the child and every descendant it forks *after* migration, while a grandchild forked in the brief window before the migration write completes stays in the parent cgroup — still reaped by kill-on-drop teardown, but outside the resource limits.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.10.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.11.0...HEAD
+[2.11.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.10.0...v2.11.0
 [2.10.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.9.1...v2.10.0
 [2.9.1]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.9.0...v2.9.1
 [2.9.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.8.0...v2.9.0

@@ -198,7 +198,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// Hard-kill the contained tree now (no grace) without releasing the group. Internal — used by
     /// pipeline cancellation/timeout.
-    member internal _.KillTree() = backend.KillTree()
+    member internal _.KillTree() = backend.KillTree() |> ignore
 
     // Tree-control / accounting verbs, spawn+track, and the release transition all serialize on `sync`.
     // A verb runs its live check AND its native backend call under the lock, so a concurrent
@@ -415,7 +415,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
               StdinFeedComplete = (fun () -> stdinFeeder.Task.GetAwaiter().GetResult() |> ignore)
               StartKill =
                 (if ownsGroup then
-                     (fun () -> killWhenLive backend.KillTree)
+                     (fun () -> killWhenLive (fun () -> backend.KillTree() |> ignore))
                  else
                      (fun () -> killWhenLive (fun () -> backend.KillChild spawned)))
               Signal = signalWhenLive
@@ -636,12 +636,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// Immediately hard-kill every process currently in the group (the honest name for the tree kill —
     /// no graceful signal). Idempotent; the group stays usable for further spawns. Returns `Result` for
-    /// parity with the other tree-control verbs (a future backend can report an undrained tree); the
-    /// current backends always succeed.
+    /// parity with the other tree-control verbs. Linux cgroup v2's legacy fallback reports an I/O error
+    /// when it cannot verify that the reusable cgroup was thawed; final disposal remains best-effort.
     member this.KillAll() : Result<unit, ProcessError> =
-        this.WhenLive(fun () ->
-            backend.KillTree()
-            Ok())
+        this.WhenLive(fun () -> backend.KillTree())
 
     /// The pids of the processes currently in the group — a point-in-time snapshot. On Windows the
     /// whole Job tree, on cgroup v2 the whole cgroup, on the POSIX fallback the tracked group leaders.

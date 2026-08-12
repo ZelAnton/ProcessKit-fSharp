@@ -57,10 +57,11 @@ type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, ov
     member _.MaxLines = maxLines
 
     /// Maximum retained bytes: `None` is unbounded. Also bounds the in-flight (not-yet-newline-
-    /// terminated) line for the buffered verbs: an unterminated line is force-flushed once it reaches
-    /// this many characters, so a child emitting a newline-free flood can't grow the assembly buffer
-    /// past the cap (the flushed segments are dropped/errored per `Overflow`, like any other over-cap
-    /// output).
+    /// terminated) line for the buffered verbs: an unterminated line is force-flushed once its UTF-8
+    /// size reaches this many bytes, so a child emitting a newline-free flood can't grow the assembly
+    /// buffer past the cap (the flushed segments are dropped/errored per `Overflow`, like any other
+    /// over-cap output). An indivisible decoded Unicode scalar can itself be larger than the cap; it is
+    /// emitted intact and the retention policy still refuses to retain it when it exceeds the limit.
     ///
     /// For the **line-capturing** paths (the text verbs' stdout/stderr, and a byte verb's line-pumped
     /// stderr — see `Pump.LineBuffer`), each retained line counts its own UTF-8 byte length **plus one
