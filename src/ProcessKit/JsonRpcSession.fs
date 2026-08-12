@@ -44,9 +44,10 @@ type JsonRpcMessage
     /// The `method` member — what the peer is notifying about or asking for.
     member _.Method = methodName
 
-    /// The peer's `id`, as the raw JSON text it sent (`7`, `"abc"`), or `None` for a notification.
-    /// `RespondAsync`/`RespondErrorAsync` echo it back byte-for-byte, which is what the peer correlates
-    /// its own pending call against.
+    /// The peer's `id`, as the raw JSON text it sent (`7`, `"abc"`, or the literal `null` — JSON-RPC 2.0
+    /// allows a null id on a request), or `None` when the message carried no `id` member at all (a
+    /// notification). `RespondAsync`/`RespondErrorAsync` echo it back byte-for-byte, which is what the
+    /// peer correlates its own pending call against.
     member _.Id = id
 
     /// True when the peer expects an answer (the message carried an `id`) — answer it with
@@ -248,13 +249,16 @@ type JsonRpcSession
             | true, value -> Some value
             | _ -> None
         // This session only ever sends numeric ids, but a peer echoing one back as a string is common
-        // enough in the wild to accept: a string that is exactly one of our ids still identifies it.
+        // enough in the wild to accept: a string that is EXACTLY the canonical decimal form of one of
+        // our ids still identifies it. `Int64.TryParse` alone is too permissive (it accepts a leading
+        // sign and surrounding whitespace), so the parsed value's own canonical text must round-trip
+        // back to the original string — "+1" and " 1 " parse to `1` but do not match its canonical "1".
         | JsonValueKind.String ->
             match element.GetString() with
             | null -> None
             | text ->
                 match Int64.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture) with
-                | true, value -> Some value
+                | true, value when value.ToString(CultureInfo.InvariantCulture) = text -> Some value
                 | _ -> None
         | _ -> None
 
@@ -392,10 +396,12 @@ type JsonRpcSession
             | "2.0" -> ()
             | _ -> raise (protocolFault "the peer sent a message whose 'jsonrpc' member is not exactly '2.0'")
 
-        let id =
-            match property "id" with
-            | Some value when value.ValueKind <> JsonValueKind.Null -> Some value
-            | _ -> None
+        // Presence, not value, decides notification vs. request: an explicit `"id": null` is a request
+        // with a null id (JSON-RPC 2.0 allows null as an id, even though this session never sends one),
+        // while an absent `id` member is a notification. Collapsing the two into the same `None` here —
+        // as the code used to — silently turns an explicit-null request into a notification the peer
+        // never gets an answer for.
+        let id = property "id"
 
         match property "method" with
         | Some methodElement ->
@@ -407,6 +413,19 @@ type JsonRpcSession
                     match methodElement.GetString() with
                     | null -> raise (protocolFault "the peer sent a message whose 'method' is not a string")
                     | text -> text
+
+            // JSON-RPC 2.0 restricts `id` to a string, a number, or null. Anything else (object, array,
+            // boolean) cannot be echoed back as a valid response id, so a request/notification carrying
+            // one is not a well-formed message — it is rejected through the same protocol-error contract
+            // as any other malformed frame, not silently accepted and later echoed by `SendResponse`.
+            match id with
+            | Some idElement when
+                idElement.ValueKind <> JsonValueKind.String
+                && idElement.ValueKind <> JsonValueKind.Number
+                && idElement.ValueKind <> JsonValueKind.Null
+                ->
+                raise (protocolFault "the peer sent a message whose 'id' is not a string, a number, or null")
+            | _ -> ()
 
             let message =
                 JsonRpcMessage(

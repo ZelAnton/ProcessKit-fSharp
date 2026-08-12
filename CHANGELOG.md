@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux cgroup legacy hard kills now verify that the reusable cgroup thawed and surface a typed `ProcessError.Io` through `ProcessGroup.KillAll()` and `Signal.Kill` instead of reporting success for a group still frozen; final disposal remains best-effort.
 - `JsonRpcSession` now gives an already-claimed response priority over a concurrent timeout or cancellation, so a successful answer cannot be replaced by a typed deadline error during pending-request completion.
 - POSIX `LaunchDetached` now transfers each direct child to a private background reaper, preventing zombies in long-lived parents while preserving the pid-and-start-time-only detached API.
+- `JsonRpcSession` now rejects a peer request/notification whose `id` is not a string, number, or null instead of publishing an object/array/boolean id as `JsonRpcMessage.Id`; preserves an explicit `id: null` as a request instead of folding it into a notification; and correlates a string response id against the exact canonical decimal text of its numeric id, so a signed or whitespace-padded variant (`"+1"`, `" 1 "`) no longer completes an unrelated pending request.
 
 ## [2.11.0] - 2026-08-06
 
