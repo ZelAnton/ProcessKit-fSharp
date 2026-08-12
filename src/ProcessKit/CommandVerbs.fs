@@ -309,8 +309,9 @@ type CommandVerbs =
     ///
     /// **Platform notes.** POSIX: the child gets a new session (no controlling terminal), so a terminal
     /// hangup cannot reach it; because `posix_spawn` cannot reparent, it stays this process's direct
-    /// child in the kernel's table, so a child that exits *before* the parent leaves a zombie entry until
-    /// the parent exits (ProcessKit never reaps what it does not contain). Windows: the child shares the
+    /// child while the parent lives, so if it exits *first* a private reaper consumes that leader's wait
+    /// status and a long-lived host does not accumulate zombies (if the parent exits first, the OS
+    /// reparents the child and its new supervisor owns reaping). Windows: the child shares the
     /// caller's console unless you add `CreateNoWindow()` (or `WindowsCtrlSignals()`, which puts it in
     /// its own console process group), so a console-close event still reaches it in the default wiring.
     /// `WindowsRestrictedToken()` and `WindowsIntegrityLevel(...)` remain effective on Windows: detaching

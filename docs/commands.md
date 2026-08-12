@@ -1259,11 +1259,11 @@ that ignore them today. Everything the OS can honour on its own **is** honoured:
 - **POSIX.** The child gets a new session with no controlling terminal (`Setsid()` asks for
   exactly this, so setting it alongside is redundant, never a conflict), so a terminal
   hangup cannot reach it. Because `posix_spawn` cannot reparent, it remains this process's
-  direct child in the kernel's table: it genuinely survives our exit (init adopts it then),
-  but if it exits *first*, while we are still running, its **zombie entry lingers until we
-  exit** — ProcessKit never reaps what it does not contain. A long-lived host that
-  launches many short-lived children should use the contained verbs; that is what
-  containment is for. If the post-spawn `Priority` setup is refused, ProcessKit instead
+  direct child while the parent lives: if it exits *first*, a private reaper consumes the
+  direct leader's wait status, so a long-lived host does not accumulate zombies. If the
+  parent exits first, the OS reparents the child and its new supervisor owns reaping; the
+  public descriptor remains only a pid + start-time snapshot with no lifecycle-control API.
+  If the post-spawn `Priority` setup is refused, ProcessKit instead
   kills the entire new session/process group and reaps the direct leader before returning
   the typed `ProcessError.Spawn`; a descendant cannot survive that failed launch.
 - **Windows.** The child is created running and assigned to no Job, and no handle to it is
