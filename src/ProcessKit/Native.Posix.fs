@@ -2615,11 +2615,15 @@ module internal Posix =
     // unsafe forked child), and `setpriv --pdeathsig=SIGKILL` does exactly that — it sets the signal and
     // survives its own `execve` of a non-set-uid/set-gid target. It composes with (or, requested alone,
     // stands in for) the uid/gid drop through `needsSetpriv`/`setprivFlags`; because every POSIX helper
-    // chain here `exec`s in place with NO intervening `fork` (setpriv, setsid --ctty, and the /bin/sh
-    // cgroup launcher all keep the same pid), the target stays the parent's DIRECT child, which is what
-    // `PR_SET_PDEATHSIG` tracks — hence `KillOnParentDeathScope.DirectChildOnly` (grandchildren, forked
-    // AFTER the signal is set, do not inherit it). macOS/BSD have no analog, so `spawnPosix` refuses the
-    // request there with `ProcessError.Unsupported` before any helper rewrite (`KillOnParentDeathScope.Nothing`).
+    // chain here `exec`s in place with NO intervening `fork` (setpriv, setsid --ctty, the /bin/sh cgroup
+    // launcher, and the /bin/sh parent-death guard below all keep the same pid), the target stays the
+    // parent's DIRECT child, which is what `PR_SET_PDEATHSIG` tracks — hence
+    // `KillOnParentDeathScope.DirectChildOnly` (grandchildren, forked AFTER the signal is set, do not
+    // inherit it). Because the arming happens inside that child rather than in the parent, a parent that
+    // dies before it lands would leave the signal bound to the reaper that adopted the orphan — the
+    // pre-arm window closed by the guard immediately after `setprivFlags` below. macOS/BSD have no analog,
+    // so `spawnPosix` refuses the request there with `ProcessError.Unsupported` before any helper rewrite
+    // (`KillOnParentDeathScope.Nothing`).
 
     // `POSIX_SPAWN_SETSID` differs per libc: 0x0400 on macOS, 0x80 on Linux glibc/musl. Not a `[<Literal>]`
     // because it is resolved from `isMacOs` at load. Used by `spawnPosixViaSpawn`'s flag block above.
@@ -2809,6 +2813,117 @@ module internal Posix =
 
         dropFlags @ pdeathsig
 
+    // ----------------------------------------------------------------------------------
+    // `Command.KillOnParentDeath`: closing the window between the spawn and the arming
+    // ----------------------------------------------------------------------------------
+    //
+    // `setpriv --pdeathsig=SIGKILL` arms `PR_SET_PDEATHSIG` INSIDE the freshly spawned child, so there is
+    // a window — from `posix_spawn` creating that child to `setpriv` reaching its `prctl` — during which
+    // the signal is not armed yet. A parent that dies inside that window is not covered by the arming at
+    // all: the kernel first reparents the orphan to the nearest `PR_SET_CHILD_SUBREAPER` ancestor (or to
+    // init), and the later `prctl` then binds the parent-death signal to THAT new parent — which normally
+    // outlives everything. The child therefore runs on after the process that asked for
+    // `KillOnParentDeathScope.DirectChildOnly` is gone: narrow, but a real breach of the documented
+    // guarantee, and precisely the case the knob exists for (the owner being killed outright).
+    //
+    // No managed code may run between the fork and the exec (see the `setpriv` note above), so the check
+    // rides the same in-place helper chain instead: `setpriv` arms the signal and `exec`s a tiny POSIX-sh
+    // guard, which compares its own parent — `$PPID`, which the shell reads at startup, i.e. AFTER the
+    // arming — against the spawner pid CAPTURED IN THE PARENT before the spawn and passed to it as an
+    // argument. Equal: the process the signal is now bound to is still the one that asked for the child,
+    // so the guard `exec`s the target IN PLACE (same pid, so the pgid, cgroup membership, stdio, and
+    // controlling terminal the rest of the chain set up are all unchanged). Unequal: the parent already
+    // died in the pre-arm window, so the guard kills ITSELF with `SIGKILL` and the target never runs at
+    // all — leaving the same observable outcome (`Outcome.Signalled(Some SIGKILL)`, no orphan) a working
+    // parent-death signal would have produced.
+    //
+    // The comparison is against the CAPTURED pid, never the literal `1`. "getppid() == 1 means orphaned"
+    // is wrong in both directions: it kills every child of a spawner that legitimately IS pid 1 (a
+    // container entrypoint — exactly where this hardening matters most), and it misses a reparent to a
+    // subreaper, which has an ordinary pid of its own. An equality test against the pid captured before
+    // the spawn is correct in both cases, and pid recycling cannot fool it either — the new parent is an
+    // already-running reaper, not a process that could have just been assigned the dead spawner's number.
+    //
+    // The guard covers only the pre-arm window. Once the signal IS armed the kernel owns the guarantee,
+    // including its documented limits (not inherited across the child's own `fork`, reset by an `execve`
+    // of a set-uid/set-gid image, and fired by the death of the spawning THREAD rather than the process —
+    // see `Command.KillOnParentDeath`).
+
+    /// The `$0` the guard shell runs under, and the file name probed for it in `/bin` — a name, never a
+    /// `PATH` lookup.
+    [<Literal>]
+    let private parentDeathGuardShellName = "sh"
+
+    /// The POSIX-sh guard `setpriv` `exec`s once `PR_SET_PDEATHSIG` is armed (see the section comment
+    /// above). `$1` is the spawner pid captured before the spawn; `$2...` is the target argv, `exec`ed
+    /// verbatim through `"$@"` (separate positional parameters — no user value is ever reparsed as shell
+    /// text, exactly as in `cgroupLauncherScript`). `$PPID` is POSIX (dash, BusyBox `ash`, bash all set it
+    /// at startup); an unequal value means the parent died before the arming, and the guard then kills
+    /// itself with the very signal the arming would have delivered. The `exit 137` (128 + SIGKILL) behind
+    /// it is the belt-and-braces path for a `kill` that somehow failed: never fall through to `exec`.
+    [<Literal>]
+    let private parentDeathGuardScript =
+        "[ \"$PPID\" = \"$1\" ] || { kill -s KILL $$; exit 137; }; shift; exec \"$@\""
+
+    /// Test seam (internal, not public API): the exact guard script the rewrite runs, so a test can
+    /// exercise its semantics — a matching pid, a stale one, a genuinely reparented shell whose parent is
+    /// the host's reaper — against the one script production uses, instead of a copy that can drift.
+    let parentDeathGuardScriptForTests: string = parentDeathGuardScript
+
+    /// Test seam (internal, not public API): replaces the spawner pid captured for the guard, so the
+    /// "the parent already changed" branch — otherwise reachable only by winning a nanosecond-wide race
+    /// against a dying process — can be driven deterministically through the REAL helper chain.
+    /// Production leaves it `None` and captures this process's own pid.
+    let mutable parentDeathSpawnerPidForTests: int option = None
+
+    /// The pid the guard compares `$PPID` against: this process — the direct parent of every child
+    /// `posix_spawn` creates here — captured BEFORE the spawn, which is what makes the comparison able to
+    /// detect a parent that has already been replaced by the time the guard runs.
+    let private capturedSpawnerPid () : int =
+        match parentDeathSpawnerPidForTests with
+        | Some pid -> pid
+        | None -> Environment.ProcessId
+
+    /// The absolute `/bin/sh` the guard runs, probed with the shared `Common.probeDir` so "present and
+    /// directly executable" is the rule the rest of the library already uses. Pinned by absolute path for
+    /// the same reason the cgroup launcher and the `RLIMIT_CPU` shim pin it: an `exec` of a path-form
+    /// program performs no `PATH` search, so nothing on `PATH` can interpose. `None` only on a host with
+    /// no `/bin/sh` at all (pathological on Linux).
+    let private parentDeathGuardShell () : string option =
+        probeDir "" "/bin" parentDeathGuardShellName
+
+    /// The honest typed failure for a host that holds no `/bin/sh` to run the guard with. Refusing is the
+    /// only answer that keeps the contract: arming without the guard would leave the pre-arm window open
+    /// while still reporting `KillOnParentDeathScope.DirectChildOnly` — the silent downgrade this library
+    /// does not ship.
+    let private parentDeathGuardMissing (command: Command) : ProcessError =
+        ProcessError.Spawn(
+            command.Program,
+            $"KillOnParentDeath needs '/bin/{parentDeathGuardShellName}' to run the guard that detects a parent which died before PR_SET_PDEATHSIG could be armed; it was not found there (present on every mainstream Linux)"
+        )
+
+    /// Wrap `target` (the program and its args, as the argv a helper `exec`s) in the parent-death guard
+    /// when `Command.KillOnParentDeath` is set, else return it untouched — a plain `Uid`/`Gid` drop gains
+    /// no extra layer. Shared by every chain that can arm the signal (the plain `setpriv` rewrite, the
+    /// `setsid --ctty` pty shim, the `/bin/sh` cgroup launcher), so the guard sits in the same place in
+    /// all of them: immediately after the `setpriv` flags that arm the signal, immediately before the
+    /// target, with nothing in between that could fork.
+    let private parentDeathGuardedTarget (command: Command) (target: string list) : Result<string list, ProcessError> =
+        if command.Config.KillOnParentDeath then
+            match parentDeathGuardShell () with
+            | None -> Error(parentDeathGuardMissing command)
+            | Some shellPath ->
+                Ok(
+                    shellPath
+                    :: "-c"
+                    :: parentDeathGuardScript
+                    :: parentDeathGuardShellName
+                    :: string (capturedSpawnerPid ())
+                    :: target
+                )
+        else
+            Ok target
+
     // A command routes through the `setpriv` helper when it requests a uid/gid privilege drop OR (Linux
     // only) `Command.KillOnParentDeath` — the latter uses `setpriv --pdeathsig` to arm the parent-death
     // signal. Consulted only on the POSIX spawn path; `spawnPosix` refuses `KillOnParentDeath` off Linux
@@ -2861,7 +2976,9 @@ module internal Posix =
     /// (`Command.KillOnParentDeath`); those knobs are cleared on the rewritten command (so the
     /// `spawnPosix` dispatcher does not recurse), and every other knob — stdio, env, CurrentDir,
     /// Priority, Umask, Setsid — is preserved and applied by `posix_spawn` to the `setpriv` process,
-    /// which inherits them across its `exec` of the real program.
+    /// which inherits them across its `exec` of the real program. A `KillOnParentDeath` request also
+    /// nests the parent-death guard between the flags and the target (`parentDeathGuardedTarget`), so the
+    /// pre-arm window is closed on this path exactly as it is on the pty and cgroup ones.
     ///
     /// The helper is the ABSOLUTE path of a trusted-directory match, pinned as `argv[0]` of the spawn, so
     /// `posix_spawnp` runs exactly that image with no `PATH` search; a helper no trusted directory holds
@@ -2871,22 +2988,26 @@ module internal Posix =
         | None -> Error(setprivHelperMissing command)
         | Some helperPath ->
             let config = command.Config
-            let prefix = setprivFlags config @ [ config.Program ]
 
-            Ok(
-                Command(
-                    { config with
-                        Program = helperPath
-                        Args = config.Args.InsertRange(0, prefix)
-                        Uid = None
-                        Gid = None
-                        Groups = None
-                        // Cleared with the drop knobs: the `--pdeathsig=SIGKILL` is already baked into `prefix`,
-                        // so the rewritten command must not re-trigger `needsSetpriv` and wrap a second
-                        // `setpriv` layer.
-                        KillOnParentDeath = false }
+            match parentDeathGuardedTarget command (config.Program :: List.ofSeq config.Args) with
+            | Error error -> Error error
+            | Ok target ->
+                let argv = setprivFlags config @ target
+
+                Ok(
+                    Command(
+                        { config with
+                            Program = helperPath
+                            Args = ImmutableList.CreateRange argv
+                            Uid = None
+                            Gid = None
+                            Groups = None
+                            // Cleared with the drop knobs: the `--pdeathsig=SIGKILL` (and the guard that
+                            // follows it) is already baked into `argv`, so the rewritten command must not
+                            // re-trigger `needsSetpriv` and wrap a second `setpriv` layer.
+                            KillOnParentDeath = false }
+                    )
                 )
-            )
 
     /// The argv that actually runs the target once any privilege drop / parent-death arming is applied:
     /// the trusted, absolute-path `setpriv` helper wrapping `<program> <args...>` when `needsSetpriv`,
@@ -2894,7 +3015,8 @@ module internal Posix =
     /// `setsid --ctty` pty shim, the `/bin/sh` cgroup launcher) rather than becoming `Command.Program`,
     /// which is `setprivCommand`'s shape. Both go through the one `trustedHelperPath`, so every path that
     /// can reach `setpriv` pins it identically and fails identically (`setprivHelperMissing`) when no
-    /// trusted directory holds it.
+    /// trusted directory holds it — and both nest the same parent-death guard (`parentDeathGuardedTarget`)
+    /// directly around the target when `Command.KillOnParentDeath` is set.
     let private setprivWrappedArgv (command: Command) : Result<string list, ProcessError> =
         let config = command.Config
         let target = config.Program :: List.ofSeq config.Args
@@ -2902,9 +3024,18 @@ module internal Posix =
         if needsSetpriv config then
             match trustedHelperPath setprivHelper with
             | None -> Error(setprivHelperMissing command)
-            | Some helperPath -> Ok(helperPath :: (setprivFlags config @ target))
+            | Some helperPath ->
+                match parentDeathGuardedTarget command target with
+                | Error error -> Error error
+                | Ok guarded -> Ok(helperPath :: (setprivFlags config @ guarded))
         else
             Ok target
+
+    /// Test seam (internal, not public API): the exact argv the `setsid --ctty` pty shim and the
+    /// `/bin/sh` cgroup launcher `exec` for a command — the `setpriv` flags, the parent-death guard, and
+    /// the target. Exposed so a test can pin the guard's position in every helper chain (and its absence
+    /// from a plain drop) without needing root, a pty, or a delegated cgroup.
+    let setprivWrappedArgvForTests (command: Command) : Result<string list, ProcessError> = setprivWrappedArgv command
 
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
     /// child's pid) and capture its stdout/stderr. The whole group can later be reaped with

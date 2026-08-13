@@ -53,6 +53,25 @@ module private WindowsMemberControlInterop =
         else
             Ok handle
 
+    /// Make a hard-kill seam (`Windows.terminateProcessHook` / `Windows.terminateJobObjectHook`) refuse the
+    /// way Windows refuses, last-error included — production reads it back with `Marshal.GetLastWin32Error`.
+    let refuseTermination () =
+        Marshal.SetLastPInvokeError ERROR_ACCESS_DENIED
+        false
+
+    /// Start a process, let it exit with `exitCode`, and hand back the (still open, still queryable)
+    /// handle to the corpse — the idempotent "the target beat us to it" case every kill verb must accept.
+    let startAndAwaitExit (exitCode: int) : Process =
+        let psi = ProcessStartInfo("cmd.exe", $"/c exit {exitCode}")
+        psi.UseShellExecute <- false
+        psi.CreateNoWindow <- true
+
+        match Process.Start psi with
+        | null -> failwith "failed to start the test process"
+        | p ->
+            p.WaitForExit()
+            p
+
     /// Fill a `JOBOBJECT_BASIC_PROCESS_ID_LIST` buffer with `pids` — the shape
     /// `Windows.queryInformationJobObjectHook` must produce for `membersWindows`.
     let writeMemberList (buffer: nativeint) (pids: int list) =
@@ -668,6 +687,186 @@ type ProcessControlTests() =
         finally
             Windows.queryInformationJobObjectHook <- originalMembers
             Windows.openControlHandleForTests <- originalOpen
+
+    // --- T-333: Windows hard termination must report a REFUSAL instead of fabricating success. Neither
+    // native kill can be made to fail on demand against a handle we own with full access, so the two seams
+    // replace exactly the `TerminateProcess`/`TerminateJobObject` calls and nothing else — everything that
+    // follows a refusal (the "is the target actually dead?" classification, and the verbs that carry its
+    // verdict out to the caller) runs for real, against real process and Job handles. The injected failure
+    // is ERROR_ACCESS_DENIED because that is the code Windows returns BOTH for a kill it will not perform
+    // AND for a process that has already terminated: the number alone can never decide between them, which
+    // is the whole reason the classification asks the handle instead. ---
+
+    [<Test>]
+    member _.``Windows: a refused TerminateProcess on a still-running process is an honest failure``() =
+        if not isWindows then
+            Assert.Ignore "Windows-only: the TerminateProcess kill path."
+
+        // A REAL, live process: only the terminate call is replaced, so the classification that follows
+        // interrogates a genuine handle and can only answer "still running" honestly.
+        use external = startExternalSleeper ()
+        let original = Windows.terminateProcessHook
+
+        try
+            Windows.terminateProcessHook <- fun _ _ -> WindowsMemberControlInterop.refuseTermination ()
+
+            match Windows.terminateWindowsProcess external.Handle with
+            | Error(ProcessError.Io message) ->
+                Assert.That(
+                    message,
+                    Does.Contain "still running",
+                    "the error must say the target survived, not merely that a call failed"
+                )
+            | other -> Assert.Fail $"a refused kill of a live process must not be reported as success, got {other}"
+        finally
+            Windows.terminateProcessHook <- original
+
+        // The seam replaced the whole native call, so nothing was killed and the real kill still works.
+        external.Kill()
+        external.WaitForExit()
+
+    [<Test>]
+    member _.``Windows: a refused TerminateProcess on an already-exited process stays a successful no-op``() =
+        if not isWindows then
+            Assert.Ignore "Windows-only: the TerminateProcess kill path."
+
+        let original = Windows.terminateProcessHook
+
+        try
+            Windows.terminateProcessHook <- fun _ _ -> WindowsMemberControlInterop.refuseTermination ()
+
+            // 7 is an ordinary exit code; 259 is `STILL_ACTIVE`, a legal exit code whose collision with
+            // `GetExitCodeProcess`'s "not exited" sentinel is resolved by the process object's signalled
+            // state. Both are corpses, so both must be accepted — a kill cannot fail for lack of a target.
+            for exitCode in [ 7; 259 ] do
+                use exited = WindowsMemberControlInterop.startAndAwaitExit exitCode
+
+                match Windows.terminateWindowsProcess exited.Handle with
+                | Ok() -> ()
+                | other ->
+                    Assert.Fail
+                        $"a refused kill of a process that had already exited with {exitCode} must stay Ok, got {other}"
+        finally
+            Windows.terminateProcessHook <- original
+
+    [<Test>]
+    member _.``Windows: a refused TerminateJobObject fails KillAll and Signal Kill on a live tree``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: the TerminateJobObject tree-kill path."
+
+            use group = create ()
+
+            // A 30-ping child outlasts the whole test, so "the Job still holds live members" is a fact
+            // rather than a race with the child's own exit.
+            let longSleeper =
+                (Command.create "ping" |> Command.args [ "-n"; "30"; "127.0.0.1" ])
+                    .Stdout(StdioMode.Null)
+                    .Timeout(TimeSpan.FromSeconds 25.0)
+
+            match! group.StartAsync longSleeper with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let original = Windows.terminateJobObjectHook
+
+                try
+                    Windows.terminateJobObjectHook <- fun _ _ -> WindowsMemberControlInterop.refuseTermination ()
+
+                    match group.KillAll() with
+                    | Error(ProcessError.Io message) ->
+                        Assert.That(
+                            message,
+                            Does.Contain "still live",
+                            "the error must say the tree survived the refused terminate"
+                        )
+                    | other -> Assert.Fail $"a refused job terminate must fail KillAll, got {other}"
+
+                    match group.Signal Signal.Kill with
+                    | Error(ProcessError.Io _) -> ()
+                    | other -> Assert.Fail $"a refused job terminate must fail Signal Kill, got {other}"
+                finally
+                    Windows.terminateJobObjectHook <- original
+
+                // The refusal was pure reporting — the tree was never touched, so the real kill still
+                // succeeds and the child concludes.
+                match group.KillAll() with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the real kill must succeed once the seam is restored, got {error}"
+
+                let! outcome = running.WaitAsync()
+
+                match outcome with
+                | Outcome.TimedOut -> Assert.Fail "the child outlived a successful KillAll"
+                | _ -> ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: a refused TerminateJobObject on a drained tree stays a successful no-op``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: the TerminateJobObject tree-kill path."
+
+            use group = create ()
+
+            match! group.StartAsync(shell "echo drained") with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                // Run it to completion first: the Job is real and open, but holds no live member, so a
+                // refused terminate had nothing left to kill.
+                let! _ = running.WaitAsync()
+                let original = Windows.terminateJobObjectHook
+
+                try
+                    Windows.terminateJobObjectHook <- fun _ _ -> WindowsMemberControlInterop.refuseTermination ()
+
+                    match group.KillAll() with
+                    | Ok() -> ()
+                    | other -> Assert.Fail $"a refused terminate of an already-drained tree must stay Ok, got {other}"
+                finally
+                    Windows.terminateJobObjectHook <- original
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: killing the same child twice reports success both times``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: the TerminateProcess kill path."
+
+            use group = create ()
+
+            let longSleeper =
+                (Command.create "ping" |> Command.args [ "-n"; "30"; "127.0.0.1" ])
+                    .Stdout(StdioMode.Null)
+                    .Timeout(TimeSpan.FromSeconds 25.0)
+
+            // No seam at all here: this is the REAL `TerminateProcess`, whose second call lands on a
+            // process that has already exited — the case Windows itself answers with ERROR_ACCESS_DENIED,
+            // and the exact regression an error-number-based classification would introduce.
+            match! group.StartAsync longSleeper with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match running.Signal Signal.Kill with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the first kill must succeed, got {error}"
+
+                // Awaiting the shared exit observation does not tear the run down, so the repeat kill below
+                // still reaches the backend — with the child provably concluded by then. (It does claim the
+                // handle's one consumption, so the teardown here is a dispose rather than `WaitAsync`.)
+                let! outcome = running.ExitTask
+
+                match outcome with
+                | Outcome.TimedOut -> Assert.Fail "the child outlived the first kill"
+                | _ -> ()
+
+                match running.Signal Signal.Kill with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"killing an already-dead child must stay idempotent, got {error}"
+
+                do! (running :> IAsyncDisposable).DisposeAsync()
+        }
+        :> Task
 
     [<Test>]
     member _.``a ProcessGroup is an IProcessRunner that runs into the shared group``() : Task =

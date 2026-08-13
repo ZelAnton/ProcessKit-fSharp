@@ -23,8 +23,10 @@ type KillOnParentDeathScope =
     /// `setpriv --pdeathsig` helper — delivers `SIGKILL` to the immediate child when its parent dies,
     /// but the parent-death signal is **not inherited** across a `fork`: a grandchild the child forks
     /// has its own (unset) parent-death signal, so once the child's parent is gone nothing reaps the
-    /// grandchildren's cgroup/pgroup. See `Command.KillOnParentDeath` for the further caveats (the
-    /// set-uid/set-gid `execve` reset, and the spawning-thread lifetime note).
+    /// grandchildren's cgroup/pgroup. A parent that dies before the signal is armed is covered by the
+    /// child's own captured-spawner check instead, which terminates it rather than letting it run. See
+    /// `Command.KillOnParentDeath` for the further caveats (the set-uid/set-gid `execve` reset, and the
+    /// spawning-thread lifetime note).
     | DirectChildOnly
 
     /// **Nothing** is reaped on sudden parent death (macOS/BSD). There is no `PR_SET_PDEATHSIG` analog,

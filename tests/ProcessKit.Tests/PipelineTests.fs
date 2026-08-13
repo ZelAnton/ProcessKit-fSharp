@@ -75,11 +75,13 @@ type private BlockingTee() =
 
 /// A relay-source double that yields one complete payload and then raises a real upstream read error.
 /// The pipeline test seam installs it only for the inter-stage source, while the downstream stage and
-/// both public completion paths remain real process plumbing.
+/// both public completion paths remain real process plumbing. An EMPTY payload fails the very first
+/// read instead (an empty read would otherwise be an ordinary EOF, not a fault), which is what the
+/// relay-fault liveness tests need: the failure must land while the upstream stage is still alive.
 type private RelayReadFaultStream(payload: byte[], message: string) =
     inherit Stream()
 
-    let mutable payloadPending = true
+    let mutable payloadPending = payload.Length > 0
 
     override _.CanRead = true
     override _.CanSeek = false
@@ -103,6 +105,46 @@ type private RelayReadFaultStream(payload: byte[], message: string) =
             ValueTask<int>(payload.Length)
         else
             raise (IOException message)
+
+/// A relay-source double that PARKS its first read until the test releases it, and only then raises a
+/// real upstream read error. It lets a test place the fault deterministically after the whole chain has
+/// already begun tearing down (an external cancellation, or the chain deadline), which is where the
+/// relay must classify it as a routine teardown race rather than a genuine failure — so the run keeps
+/// reporting `Cancelled`/`TimedOut` instead of the relay's `ProcessError.Io`.
+type private GatedRelayFaultStream(release: Task, message: string) =
+    inherit Stream()
+
+    let parked =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    /// Completes once the relay's read has entered — and parked in — this source.
+    member _.Parked: Task = parked.Task
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_, _) = raise (NotSupportedException())
+    override _.SetLength _ = raise (NotSupportedException())
+    override _.Write(_, _, _) = raise (NotSupportedException())
+    override _.Read(_, _, _) = raise (NotSupportedException())
+
+    override _.ReadAsync(_: Memory<byte>, _: CancellationToken) : ValueTask<int> =
+        parked.TrySetResult() |> ignore
+
+        let faulted: Task<int> =
+            task {
+                do! release
+                return raise (IOException message)
+            }
+
+        ValueTask<int>(faulted)
 
 // --- T-069 stdin-feeder test doubles, shared across PipelineTests / ProcessControlTests / PumpTests.
 // Defined here (non-private) because PipelineTests is the earliest of the three in the .fsproj compile
@@ -364,6 +406,16 @@ type PipelineTests() =
                 Is.SameAs run,
                 "the pipeline must tear the chain down proactively, not wait for the slow/silent stage"
             )
+        }
+        :> Task
+
+    // Await a control signal raised by the code under test (a teardown callback firing, a verdict being
+    // settled) with a hard bound: a regression that never raises it then fails this test with the given
+    // reason instead of parking the whole suite on a task that can no longer complete.
+    let awaitSignal (reason: string) (signal: Task) : Task =
+        task {
+            let! finished = Task.WhenAny(signal, Task.Delay(TimeSpan.FromSeconds 15.0))
+            Assert.That(finished, Is.SameAs signal, reason)
         }
         :> Task
 
@@ -758,7 +810,15 @@ type PipelineTests() =
                         |> Seq.filter (fun line -> line.Length > 0)
                         |> Seq.toList
 
-                    Assert.That(got, Is.EqualTo(box [ "relay-payload" ]))
+                    // The streamed prefix is best-effort by design: the relay fault hard-kills the whole
+                    // chain the moment it is seen (T-343), so the downstream stage may be torn down before
+                    // it flushes the payload it did receive. Whatever arrives must still be that payload
+                    // and nothing else — a truncated stream, never a different or extra one.
+                    Assert.That(
+                        got,
+                        Is.EqualTo(box List.empty<string>).Or.EqualTo(box [ "relay-payload" ]),
+                        "the streamed output is a (possibly empty) prefix of the relayed payload"
+                    )
 
                     match! session.FinishAsync() with
                     | Error(ProcessError.Io detail) ->
@@ -774,6 +834,177 @@ type PipelineTests() =
             match! (emit [ "cherry"; "apple" ]).Pipe(sortStage).OutputStringAsync() with
             | Ok output -> Assert.That(lines output.Stdout, Is.EqualTo(box [ "apple"; "cherry" ]))
             | Error error -> Assert.Fail $"a later normal pipeline failed after streaming cleanup: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a relay read fault tears down a silent upstream instead of waiting for its natural exit``() : Task =
+        // Regression (T-343). Stage 0 never writes and would run ~30s, so it can never die of a broken pipe
+        // when the relay closes the pipe ends after its read fails. The old phase order — wait for every
+        // stage's terminal `Outcome`, THEN read the relay verdicts — therefore sat on stage 0's natural exit
+        // while holding an already-diagnosed `ProcessError.Io`, and with no chain deadline set it would have
+        // sat there forever. The completion-order choke must instead tear the chain down at once.
+        task {
+            let faultMessage = "injected relay read failure with a live silent upstream"
+
+            PipelineRunner.relaySourceTestHook <-
+                Some(fun _ _ -> new RelayReadFaultStream(Array.empty, faultMessage) :> Stream)
+
+            try
+                let pipeline = slowSilentStage.Pipe sortStage
+                let run = pipeline.OutputStringAsync()
+                do! assertFinishesPromptly run
+
+                match! run with
+                | Error(ProcessError.Io detail) ->
+                    Assert.That(detail, Does.Contain faultMessage)
+                    Assert.That(detail, Does.Contain slowSilentStage.Program)
+                | Error error -> Assert.Fail $"expected ProcessError.Io, got {error}"
+                | Ok result -> Assert.Fail $"a relay read fault must not become a successful run: {result.Outcome}"
+            finally
+                PipelineRunner.relaySourceTestHook <- None
+
+            // The torn-down chain must also have been reaped and its pipes closed: a fresh real pipeline
+            // still transfers data and completes normally afterwards.
+            match! (emit [ "banana"; "apple" ]).Pipe(sortStage).OutputStringAsync() with
+            | Ok output -> Assert.That(lines output.Stdout, Is.EqualTo(box [ "apple"; "banana" ]))
+            | Error error -> Assert.Fail $"a later normal pipeline failed after the relay teardown: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a streaming pipeline tears down a silent upstream when the relay read faults``() : Task =
+        // The streaming session must not have its own, slower answer to the same race: `FinishAsync` goes
+        // through the SAME completion-order choke, so it completes promptly with the relay's own
+        // `ProcessError.Io` instead of waiting out the silent stage-0 producer.
+        task {
+            let faultMessage =
+                "injected streaming relay read failure with a live silent upstream"
+
+            PipelineRunner.relaySourceTestHook <-
+                Some(fun _ _ -> new RelayReadFaultStream(Array.empty, faultMessage) :> Stream)
+
+            try
+                match! (slowSilentStage.Pipe sortStage).StartAsync() with
+                | Error error -> Assert.Fail $"streaming pipeline failed to start: {error}"
+                | Ok session ->
+                    use session = session
+                    let finish = session.FinishAsync()
+                    do! assertFinishesPromptly finish
+
+                    match! finish with
+                    | Error(ProcessError.Io detail) ->
+                        Assert.That(detail, Does.Contain faultMessage)
+                        Assert.That(detail, Does.Contain slowSilentStage.Program)
+                    | Error error -> Assert.Fail $"expected ProcessError.Io from FinishAsync, got {error}"
+                    | Ok finished -> Assert.Fail $"a relay read fault must not become a successful session: {finished}"
+            finally
+                PipelineRunner.relaySourceTestHook <- None
+
+            match! (emit [ "cherry"; "apple" ]).Pipe(sortStage).OutputStringAsync() with
+            | Ok output -> Assert.That(lines output.Stdout, Is.EqualTo(box [ "apple"; "cherry" ]))
+            | Error error -> Assert.Fail $"a later normal pipeline failed after the streaming relay teardown: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a later relay fault is not held up by an earlier stage that is still running``() : Task =
+        // Three stages, the first two silent ~30s producers. The relay between stages 1 and 2 fails while
+        // BOTH earlier stages are still pending, so nothing about this fault can be reached by draining the
+        // stage exits first — the choke has to see it among them. The earlier relay (stage 0 -> 1) is left
+        // as real plumbing and simply ends at EOF once the teardown kills its producer.
+        task {
+            let faultMessage = "injected relay read failure on the later relay"
+
+            PipelineRunner.relaySourceTestHook <-
+                Some(fun upstreamIndex upstream ->
+                    if upstreamIndex = 1 then
+                        new RelayReadFaultStream(Array.empty, faultMessage) :> Stream
+                    else
+                        upstream)
+
+            try
+                let pipeline = slowSilentStage.Pipe(slowSilentStage).Pipe(sortStage)
+                let run = pipeline.OutputStringAsync()
+                do! assertFinishesPromptly run
+
+                match! run with
+                | Error(ProcessError.Io detail) -> Assert.That(detail, Does.Contain faultMessage)
+                | Error error -> Assert.Fail $"expected ProcessError.Io, got {error}"
+                | Ok result -> Assert.Fail $"a relay read fault must not become a successful run: {result.Outcome}"
+            finally
+                PipelineRunner.relaySourceTestHook <- None
+        }
+        :> Task
+
+    [<Test>]
+    member _.``cancellation keeps priority over a relay fault raised during the teardown``() : Task =
+        // A relay exception raised into a teardown that has ALREADY begun is a routine race, not a genuine
+        // failure — so the whole-chain cancellation still decides the result. Deterministic: cancelling the
+        // token runs the chain's registration synchronously, so the teardown is in flight before the test
+        // releases the parked read.
+        task {
+            let release =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let source =
+                new GatedRelayFaultStream(release.Task, "relay fault raised into an in-flight teardown")
+
+            PipelineRunner.relaySourceTestHook <- Some(fun _ _ -> source :> Stream)
+
+            try
+                use cts = new CancellationTokenSource()
+                let run = (slowSilentStage.Pipe sortStage).OutputStringAsync(cts.Token)
+
+                // The relay is parked in the injected source; nothing has faulted yet.
+                do! awaitSignal "the relay must reach the injected source" source.Parked
+                cts.Cancel() // ... and the chain's teardown has begun by the time this returns
+                release.SetResult() // only NOW let the read fail
+
+                do! assertFinishesPromptly run
+
+                match! run with
+                | Error(ProcessError.Cancelled _) -> Assert.Pass()
+                | Error error -> Assert.Fail $"expected Cancelled to outrank the teardown-race relay fault, got {error}"
+                | Ok result -> Assert.Fail $"expected Cancelled, got {result.Outcome}"
+            finally
+                PipelineRunner.relaySourceTestHook <- None
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the chain deadline keeps priority over a relay fault raised during its teardown``() : Task =
+        // The timeout counterpart of the test above, and the end-to-end form of "the verdict is fixed at the
+        // last stage exit": the 300ms deadline tears the chain down and settles the verdict while the relay
+        // is still parked, and the fault released a full 2s later (a ~7x margin over the deadline) is a
+        // teardown race that neither reports `Io` nor hangs the run past the relay's own completion.
+        task {
+            let release =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let source =
+                new GatedRelayFaultStream(release.Task, "relay fault raised into the deadline teardown")
+
+            PipelineRunner.relaySourceTestHook <- Some(fun _ _ -> source :> Stream)
+
+            try
+                let pipeline =
+                    (slowSilentStage.Pipe sortStage).Timeout(TimeSpan.FromMilliseconds 300.0)
+
+                let run = pipeline.OutputStringAsync()
+
+                do! awaitSignal "the relay must reach the injected source" source.Parked
+                do! Task.Delay(TimeSpan.FromSeconds 2.0)
+                release.SetResult()
+
+                do! assertFinishesPromptly run
+
+                match! run with
+                | Ok result -> Assert.That(result.Outcome, Is.EqualTo Outcome.TimedOut)
+                | Error error ->
+                    Assert.Fail $"expected the deadline to outrank the teardown-race relay fault, got {error}"
+            finally
+                PipelineRunner.relaySourceTestHook <- None
         }
         :> Task
 
@@ -1612,11 +1843,14 @@ type PipelineTests() =
 
     // --- Causally-stable terminal classification: the timeout verdict and the teardown-victim labelling
     //     are decided by the stages' real completion order at the deadline, not by the order stray wait
-    //     continuations happen to run in (T-071). These drive `PipelineRunner.observeStages` directly with
-    //     controllable wait-tasks, so both races reproduce deterministically with no wall-clock timing. ---
+    //     continuations happen to run in (T-071) — and the inter-stage relays are raced in that SAME
+    //     completion-order choke, so a genuine relay fault tears the chain down the moment it is seen
+    //     rather than sitting behind a still-pending stage (T-343). These drive
+    //     `PipelineRunner.observeChain` directly with controllable wait/relay tasks, so every race
+    //     reproduces deterministically with no wall-clock timing. ---
 
     [<Test>]
-    member _.``observeStages does not flip a settled success when the deadline fires after all stages exit``() : Task =
+    member _.``observeChain does not flip a settled success when the deadline fires after all stages exit``() : Task =
         // The core of the timeout-after-success race: every stage exits cleanly BEFORE the deadline, so the
         // verdict is fixed as "not timed out" and the timer is disarmed — a deadline that only fires during
         // the later slow tee/drain (modelled by flipping `timerFired` afterwards) can no longer time it out.
@@ -1628,8 +1862,9 @@ type PipelineTests() =
             let mutable kills = 0
 
             let observation =
-                PipelineRunner.observeStages
+                PipelineRunner.observeChain
                     [| w0.Task; w1.Task |]
+                    Array.empty
                     checkedFailure
                     (fun () -> kills <- kills + 1)
                     (fun () -> false)
@@ -1652,7 +1887,7 @@ type PipelineTests() =
         :> Task
 
     [<Test>]
-    member _.``observeStages reports TimedOut when the deadline had already fired at terminal``() : Task =
+    member _.``observeChain reports TimedOut when the deadline had already fired at terminal``() : Task =
         // The contrasting genuine timeout: the deadline caught the stages still running, so the whole chain
         // is being torn down and the verdict sampled at terminal is TimedOut.
         task {
@@ -1661,8 +1896,9 @@ type PipelineTests() =
             let mutable disarmed = 0
 
             let observation =
-                PipelineRunner.observeStages
+                PipelineRunner.observeChain
                     [| w0.Task; w1.Task |]
+                    Array.empty
                     checkedFailure
                     (fun () -> ())
                     (fun () -> true) // the whole chain is already being torn down by the timeout
@@ -1685,7 +1921,7 @@ type PipelineTests() =
         :> Task
 
     [<Test>]
-    member _.``observeStages blames the checked failure seen first and torns down the later sibling``() : Task =
+    member _.``observeChain blames the checked failure seen first and torns down the later sibling``() : Task =
         task {
             let w0 = TaskCompletionSource<Outcome>()
             let w1 = TaskCompletionSource<Outcome>()
@@ -1693,8 +1929,9 @@ type PipelineTests() =
             let mutable kills = 0
 
             let observation =
-                PipelineRunner.observeStages
+                PipelineRunner.observeChain
                     [| w0.Task; w1.Task |]
+                    Array.empty
                     checkedFailure
                     (fun () ->
                         kills <- kills + 1
@@ -1718,7 +1955,7 @@ type PipelineTests() =
         :> Task
 
     [<Test>]
-    member _.``observeStages fixes the victim by real completion order, not by stage position``() : Task =
+    member _.``observeChain fixes the victim by real completion order, not by stage position``() : Task =
         // Regression (T-071): the torn-down victim was decided by reading a shared teardown token AFTER each
         // stage's wait continuation, so a stage that actually finished BEFORE a sibling's failure could be
         // mislabelled a victim purely because its continuation ran later — and pipefail would then blame the
@@ -1731,8 +1968,9 @@ type PipelineTests() =
             let mutable kills = 0
 
             let observation =
-                PipelineRunner.observeStages
+                PipelineRunner.observeChain
                     [| w0.Task; w1.Task |]
+                    Array.empty
                     checkedFailure
                     (fun () ->
                         kills <- kills + 1
@@ -1757,6 +1995,171 @@ type PipelineTests() =
 
             Assert.That(result.TornDown[0], Is.True, "the stage seen only after the teardown fired is the victim")
             Assert.That(kills, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``observeChain tears the chain down as soon as a relay fault is seen``() : Task =
+        // Regression (T-343): the relay verdicts used to be read only AFTER every stage's exit had been
+        // awaited, so a genuine relay failure could not tear anything down while a stage was still running —
+        // and a silent upstream that stops writing never earns a broken pipe, so the chain hung on a failure
+        // it had already diagnosed. Here NEITHER stage has exited when the relay fails: the fault must fire
+        // the whole-chain teardown by itself, which is the only thing that lets the stages become terminal.
+        task {
+            let w0 = TaskCompletionSource<Outcome>()
+            let w1 = TaskCompletionSource<Outcome>()
+            let relay = TaskCompletionSource<ProcessError option>()
+            let teardown = TaskCompletionSource<unit>()
+            let mutable kills = 0
+
+            let observation =
+                PipelineRunner.observeChain
+                    [| w0.Task; w1.Task |]
+                    [| relay.Task |]
+                    checkedFailure
+                    (fun () ->
+                        kills <- kills + 1
+                        teardown.TrySetResult() |> ignore)
+                    (fun () -> false)
+                    (fun () -> false)
+                    (fun () -> ())
+
+            relay.SetResult(Some(ProcessError.Io "upstream stdout read failed"))
+
+            // The relay fault alone must fire the whole-chain kill — nothing else can, since no stage has
+            // reached a terminal state yet.
+            do! awaitSignal "a genuine relay fault must fire the whole-chain teardown by itself" teardown.Task
+
+            // The kill it fired is what ends the stages; both are seen only afterwards, so both are victims.
+            w0.SetResult(Outcome.Signalled None)
+            w1.SetResult(Outcome.Exited 0)
+
+            let! result = observation
+
+            match result.RelayFault with
+            | Some(ProcessError.Io detail) -> Assert.That(detail, Is.EqualTo "upstream stdout read failed")
+            | other -> Assert.Fail $"expected the relay's own Io fault, got {other}"
+
+            Assert.That(kills, Is.EqualTo 1, "the relay fault fires the idempotent whole-chain teardown once")
+
+            Assert.That(
+                result.TornDown,
+                Is.EqualTo(box [| true; true |]),
+                "a stage seen only after the relay teardown fired is a victim, never the culprit"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``observeChain keeps the relay fault seen first, not the leftmost relay``() : Task =
+        // Several relays can fail while the chain unwinds; the reported `ProcessError.Io` is the one the
+        // choke actually saw first (which is also the one that fired the teardown), not whichever happens to
+        // sit furthest left in the chain — a positional pick would report a fault caused by the teardown the
+        // first one triggered.
+        task {
+            let w0 = TaskCompletionSource<Outcome>()
+            let relay0 = TaskCompletionSource<ProcessError option>()
+            let relay1 = TaskCompletionSource<ProcessError option>()
+            let teardown = TaskCompletionSource<unit>()
+            let mutable kills = 0
+
+            let observation =
+                PipelineRunner.observeChain
+                    [| w0.Task |]
+                    [| relay0.Task; relay1.Task |]
+                    checkedFailure
+                    (fun () ->
+                        kills <- kills + 1
+                        teardown.TrySetResult() |> ignore)
+                    (fun () -> false)
+                    (fun () -> false)
+                    (fun () -> ())
+
+            // The RIGHT relay fails first and fires the teardown; the left one only fails afterwards.
+            relay1.SetResult(Some(ProcessError.Io "right relay failed first"))
+            do! awaitSignal "the first relay fault seen must fire the teardown" teardown.Task
+            relay0.SetResult(Some(ProcessError.Io "left relay failed later"))
+            w0.SetResult(Outcome.Signalled None)
+
+            let! result = observation
+
+            match result.RelayFault with
+            | Some(ProcessError.Io detail) -> Assert.That(detail, Is.EqualTo "right relay failed first")
+            | other -> Assert.Fail $"expected the first fault seen, got {other}"
+
+            Assert.That(kills, Is.EqualTo 1, "the second fault does not fire a second teardown")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``observeChain lets a cancel or timeout teardown keep priority over a relay fault``() : Task =
+        // The whole chain is already being torn down by its own deadline / an external cancellation, so a
+        // relay fault raised into that teardown must not fire a second, redundant kill, and must not
+        // re-label the stages it catches as proactive-teardown victims — that louder verdict still decides
+        // the run's result.
+        task {
+            let w0 = TaskCompletionSource<Outcome>()
+            let relay = TaskCompletionSource<ProcessError option>()
+            let mutable kills = 0
+
+            let observation =
+                PipelineRunner.observeChain
+                    [| w0.Task |]
+                    [| relay.Task |]
+                    checkedFailure
+                    (fun () -> kills <- kills + 1)
+                    (fun () -> true) // the chain is already being torn down by the timeout/cancellation
+                    (fun () -> true)
+                    (fun () -> ())
+
+            relay.SetResult(Some(ProcessError.Io "fault raised into an in-flight teardown"))
+            w0.SetResult(Outcome.Signalled None)
+
+            let! result = observation
+
+            Assert.That(kills, Is.EqualTo 0, "a chain already being torn down must not be killed a second time")
+            Assert.That(result.TimedOut, Is.True)
+            Assert.That(result.TornDown, Is.EqualTo(box [| false |]), "a cancel/timeout kill is not a pipefail victim")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``observeChain fixes the timeout verdict at the last stage exit while a relay still drains``() : Task =
+        // The T-071 verdict rule survives racing the relays in the same choke: the deadline is sampled and
+        // disarmed the instant the last STAGE is terminal, even though the relays are still draining, so a
+        // slow relay can no longer let a late timer turn an already-settled success into a timeout. The
+        // disarm callback is the test's own signal that the stages have settled, so no wall clock is needed.
+        task {
+            let w0 = TaskCompletionSource<Outcome>()
+            let relay = TaskCompletionSource<ProcessError option>()
+            let settled = TaskCompletionSource<unit>()
+            let mutable timerFired = false
+            let mutable disarmed = 0
+
+            let observation =
+                PipelineRunner.observeChain
+                    [| w0.Task |]
+                    [| relay.Task |]
+                    checkedFailure
+                    (fun () -> ())
+                    (fun () -> false)
+                    (fun () -> timerFired)
+                    (fun () ->
+                        disarmed <- disarmed + 1
+                        settled.TrySetResult() |> ignore)
+
+            w0.SetResult(Outcome.Exited 0)
+            do! awaitSignal "the deadline must be disarmed as soon as the last stage exits" settled.Task
+
+            // The deadline fires only now: the stages are settled, but the relay is still in flight.
+            timerFired <- true
+            relay.SetResult None
+
+            let! result = observation
+
+            Assert.That(result.TimedOut, Is.False, "a deadline firing during the relay drain must not time the run out")
+            Assert.That(disarmed, Is.EqualTo 1, "the timer is disarmed exactly once, at the last stage exit")
+            Assert.That(result.RelayFault.IsNone, Is.True, "a clean relay verdict is observed and is not a fault")
         }
         :> Task
 

@@ -897,6 +897,9 @@ if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and w
 // …then read proc.StdoutLinesAsync() for the answers.
 ```
 
+`WriteLineAsync` appends LF for an ordinary stdin pipe or POSIX PTY, and CR for Windows ConPTY so
+console line readers receive Enter. `WriteAsync` always sends exactly the supplied bytes.
+
 > For a **large** interactive stdin, write from one task and read `StdoutLinesAsync()` from another —
 > otherwise the child can block writing stdout while you block writing stdin, a full-duplex
 > deadlock. The non-interactive `Stdin.From*` sources are written on a background task and never
