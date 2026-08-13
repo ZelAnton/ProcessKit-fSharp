@@ -204,7 +204,11 @@ verb was set):
   when the kernel closes the dead parent's last Job handle during process rundown).
 - **Linux** — the **direct child only**, via `PR_SET_PDEATHSIG(SIGKILL)` armed through the
   `setpriv --pdeathsig` helper. A **grandchild** is not covered (the signal is not inherited across a
-  `fork`), and the kernel resets it across an `execve` of a **set-uid/set-gid** image.
+  `fork`), and the kernel resets it across an `execve` of a **set-uid/set-gid** image. A parent that
+  dies in the instant *before* the signal is armed is covered too, but by termination rather than by
+  the signal: the child checks that its parent is still the process that spawned it and `SIGKILL`s
+  itself instead of running your program if it is not. That check compares the pid of the spawner, so
+  it stays correct when your entrypoint **is** `PID 1` — the usual case in a container.
 - **macOS/BSD** — no `PR_SET_PDEATHSIG` analog; a set value fails the spawn with
   `ProcessError.Unsupported`, never a silent no-op.
 
@@ -222,6 +226,9 @@ specific external helper:
   (util-linux): a `Uid`/`Gid` drop because `posix_spawn` has no uid/gid attribute of its own, and
   `KillOnParentDeath` because `PR_SET_PDEATHSIG` must be armed by a process that then `exec`s the
   target in place (`setpriv --pdeathsig`) rather than by managed .NET code in an unsafe forked child.
+  `KillOnParentDeath` additionally runs `/bin/sh` between that arming and your program, to check the
+  parent has not already changed; `/bin/sh` is present in every image that has a shell at all,
+  including a bare Alpine base.
   `setpriv` ships on mainstream glibc-based Linux (Debian/Ubuntu, the distributions ProcessKit's own
   CI runs on) but is **commonly absent from a minimal musl image** (a bare Alpine base, or
   `FROM scratch` / distroless-style images) — where it's missing, the spawn fails with a typed

@@ -245,7 +245,8 @@ type internal CommandConfig =
       // `TerminateProcess`) — a case the deterministic `Dispose`/`DisposeAsync` kill-on-drop cannot
       // cover because no managed teardown runs. `false` (the default) leaves the behaviour unchanged.
       // Linux: armed as `PR_SET_PDEATHSIG(SIGKILL)` through the `setpriv --pdeathsig` helper on the
-      // ordinary `posix_spawn` path (see `Native.Posix`) — reaches the direct child only, and is reset
+      // ordinary `posix_spawn` path, with a `/bin/sh` guard right behind it for a parent that died
+      // before the arming (see `Native.Posix`) — reaches the direct child only, and is reset
       // by the kernel across an `execve` of a set-uid/set-gid image. Windows: no extra action — every
       // child already lives in a Job Object with `KILL_ON_JOB_CLOSE`, whose sole handle the parent owns,
       // so the kernel's handle rundown on parent death terminates the whole Job tree. macOS/BSD: a set
@@ -1511,7 +1512,12 @@ type Command internal (config: CommandConfig) =
     ///   tree-wide and unconditionally — this method is a documented no-op on Windows, not a silent one.
     /// - **Linux — the direct child only.** The child is armed with `PR_SET_PDEATHSIG(SIGKILL)` via the
     ///   `setpriv --pdeathsig` helper (util-linux) on the ordinary `posix_spawn` path, so it is killed when
-    ///   its parent dies. **Known limits (not silent):** the parent-death signal is **not inherited** across
+    ///   its parent dies. A parent that dies in the instant *before* that arming — where the signal would
+    ///   otherwise bind to the reaper that adopted the orphan, and the child would run on — is covered too:
+    ///   immediately after arming, and before the target program runs, the child checks (through `/bin/sh`,
+    ///   pinned by absolute path) that its parent is still the exact process that spawned it, and
+    ///   `SIGKILL`s itself instead of running the program when it is not. **Known limits (not silent):**
+    ///   the parent-death signal is **not inherited** across
     ///   a `fork`, so a **grandchild** the child spawns is *not* covered — with the child's parent gone
     ///   nothing reaps its cgroup/pgroup. The kernel also **resets** `PR_SET_PDEATHSIG` when the child
     ///   `execve`s a **set-uid/set-gid** image, so for a `sudo`-like child the signal only holds up to that
