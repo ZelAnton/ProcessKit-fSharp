@@ -367,6 +367,33 @@ module internal PipelineRunner =
         // chain's output, captured by `run` / streamed by the session.
         sp.Stdout
 
+    /// The FINAL observation of stage 0's stdin feed, for the `Stdin0Error` a finished chain hands to
+    /// `PipelineClassify.stdinErrorOnSuccess` — shared by the buffered `run` and the streaming session's
+    /// `waitWhole` so the single-command fix cannot be present on one pipeline path and missing on the
+    /// other. `capture` is this chain's observation with `Stdin0Error` not yet filled in; nothing read
+    /// here depends on that field.
+    ///
+    /// Only a pipeline that would actually SURFACE a stage-0 stdin failure pays for the bounded window:
+    /// a relay read fault (`CopyError`) and a pipefail failure/timeout (a non-accepted representative)
+    /// both outrank `ProcessError.Stdin` in `Pipeline`'s classification, so on those paths this keeps the
+    /// old non-blocking peek and adds no wait at all. On the success path it gives a source still reading
+    /// when the chain exited a bounded window to conclude — the same fix, and the same budget, as a
+    /// single command's `RunningHost.StdinError` — instead of dropping a genuine failure that merely lost
+    /// the race with a fast stage 0. The caller stops the feeder immediately afterwards either way.
+    let internal observeStage0Fault (feed: Pump.StdinFeeder option) (capture: PipelineCapture) : Task<exn option> =
+        match feed with
+        | None -> Task.FromResult<exn option> None
+        | Some feeder ->
+            let representative = PipelineClassify.representative capture
+
+            if
+                capture.CopyError.IsNone
+                && representative.Outcome.IsAcceptedBy representative.OkCodes
+            then
+                feeder.ObserveFaultAsync()
+            else
+                Task.FromResult feeder.Fault
+
     /// Spawn every stage into one fresh shared group, wire each stage's stdout to the next stage's
     /// stdin (no shell involved), capture the last stage's stdout, and reap the whole tree on exit.
     /// Cancellation or the optional `timeout` hard-kill the tree.
@@ -804,25 +831,30 @@ module internal PipelineRunner =
                                         StderrTotalBytes = stderrCaptures[i].TotalBytes
                                         TornDown = observation.TornDown[i] } ]
 
-                            // Observe the stage-0 stdin fault without blocking: only a feed that has
-                            // finished (a missing `FromFile` faults synchronously at spawn) yields its
-                            // stashed source failure — matching the single-command observer. Stop the
-                            // feeder afterwards so a still-parked source feed (a hung `FromAsyncLines`)
-                            // is cancelled and its enumerator disposed rather than leaked past the run.
-                            let stdin0Error = stage0Feed |> Option.bind (fun feeder -> feeder.Fault)
+                            let observed =
+                                { LastStdout = lastCapture.Bytes
+                                  LastStdoutTruncated = lastCapture.Truncated
+                                  LastStdoutTooLarge = lastCapture.TooLarge
+                                  LastStdoutTotalBytes = lastCapture.TotalBytes
+                                  Stages = stageResults
+                                  Duration = duration
+                                  TimedOut = timedOut
+                                  Stdin0Error = None
+                                  CopyError = copyError }
+
+                            // The chain is fully observed, so this is the point that decides whether a
+                            // stage-0 source failure can still be the pipeline's result — the bounded final
+                            // observation (see `observeStage0Fault`; the single-command analogue is
+                            // `RunningHost.StdinError`). Stop the feeder immediately afterwards so a
+                            // still-parked source feed (a hung `FromAsyncLines`) is cancelled and its
+                            // enumerator disposed rather than leaked past the run.
+                            let! stdin0Error = observeStage0Fault stage0Feed observed
                             stopStage0Feed ()
 
                             return
                                 Ok
-                                    { LastStdout = lastCapture.Bytes
-                                      LastStdoutTruncated = lastCapture.Truncated
-                                      LastStdoutTooLarge = lastCapture.TooLarge
-                                      LastStdoutTotalBytes = lastCapture.TotalBytes
-                                      Stages = stageResults
-                                      Duration = duration
-                                      TimedOut = timedOut
-                                      Stdin0Error = stdin0Error
-                                      CopyError = copyError }
+                                    { observed with
+                                        Stdin0Error = stdin0Error }
         }
 
     /// The live materials a streaming pipeline session (`Pipeline.StartAsync`) is built from. `Host` is a
@@ -1095,10 +1127,7 @@ module internal PipelineRunner =
                                             StderrTotalBytes = stderrCaptures[i].TotalBytes
                                             TornDown = observation.TornDown[i] } ]
 
-                                let stdin0Error = stage0Feed |> Option.bind (fun feeder -> feeder.Fault)
-                                stopStage0Feed ()
-
-                                let capture =
+                                let observed =
                                     { LastStdout = Array.empty
                                       LastStdoutTruncated = false
                                       LastStdoutTooLarge = false
@@ -1106,8 +1135,19 @@ module internal PipelineRunner =
                                       Stages = stageResults
                                       Duration = duration
                                       TimedOut = observation.TimedOut
-                                      Stdin0Error = stdin0Error
+                                      Stdin0Error = None
                                       CopyError = copyError }
+
+                                // The same bounded final observation the buffered `run` makes, through the
+                                // same helper — the streaming session classifies from this stashed capture,
+                                // so a stage-0 source that failed only after the chain exited must reach it
+                                // here or be lost. The feeder is stopped immediately afterwards.
+                                let! stdin0Error = observeStage0Fault stage0Feed observed
+                                stopStage0Feed ()
+
+                                let capture =
+                                    { observed with
+                                        Stdin0Error = stdin0Error }
 
                                 captureTcs.TrySetResult capture |> ignore
 
@@ -1204,7 +1244,7 @@ module internal PipelineRunner =
                               Wait = waitWhole
                               // Stage-0 stdin faults are surfaced through the stashed capture's `Stdin0Error`
                               // by the session, not the inner handle, so it never errors on stdin itself.
-                              StdinError = (fun () -> None)
+                              StdinError = RunningHost.NoStdinError
                               StdinFeedComplete = (fun () -> ())
                               StartKill = killTreeGated
                               Signal = signalGated
