@@ -26,7 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `WaitForPortAsync`, `WaitForSocketAsync`, `WaitForHttpAsync`, and `WaitForAsync` now check their condition exactly one more time — bounded by the remaining timeout, a brief grace, and the caller's token — after observing the child's exit, so readiness published immediately before that exit reports `Ok` instead of being lost as `NotReady`; a `WaitForAsync` predicate is therefore invoked once more after the child exits, unless the token is already cancelled or the deadline already spent.
 - `JsonRpcSession` now rejects a peer request/notification whose `id` is not a string, number, or null instead of publishing an object/array/boolean id as `JsonRpcMessage.Id`; preserves an explicit `id: null` as a request instead of folding it into a notification; and correlates a string response id against the exact canonical decimal text of its numeric id, so a signed or whitespace-padded variant (`"+1"`, `" 1 "`) no longer completes an unrelated pending request.
 - `JsonRpcSession` now rejects responses sent through a session other than the one that received the peer request, permits a retry after a response fails before writing, and prevents another response once one starts writing.
-- `JsonRpcSession` construction no longer races an immediately available peer frame, which could previously end the session with an initialization error.
 
 ## [2.11.0] - 2026-08-06
 
