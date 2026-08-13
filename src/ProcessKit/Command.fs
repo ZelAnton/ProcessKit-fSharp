@@ -1528,7 +1528,10 @@ type Command internal (config: CommandConfig) =
     ///   absolute path, never resolved on `PATH` — see `Uid` for why. Where no trusted directory holds
     ///   `setpriv` — a minimal image, or a non-FHS layout such as NixOS/Guix that keeps it only on the
     ///   `PATH` — the spawn fails with a typed `ProcessError.Spawn` naming the helper, never a silently
-    ///   un-armed child.
+    ///   un-armed child. The `/bin/sh` that runs the parent check is a host requirement in the same way:
+    ///   it is taken from that absolute path rather than `PATH`, and a host that has no shell there also
+    ///   fails the spawn with a typed `ProcessError.Spawn` — never a child armed but left running with
+    ///   the pre-arm window open.
     /// - **macOS/BSD — unsupported.** There is no `PR_SET_PDEATHSIG` analog, so a set value fails the spawn
     ///   with `ProcessError.Unsupported` rather than pretending the cleanup will happen.
     member _.KillOnParentDeath() =
