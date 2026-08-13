@@ -60,8 +60,10 @@ type private ManualTimerProvider() =
 ///
 /// The double-backed tests run everywhere (`FakeProcess.WithPty` models the merged-stream shape, and
 /// `WithStdinOpen` gives the session a stdin to record). The genuine expect/send round trip is
-/// Linux-gated exactly like the rest of `PtyTests`: the POSIX ctty helper (util-linux `setsid --ctty`)
-/// is absent on macOS/BSD, and a real ConPTY round trip needs a console-less parent.
+/// Linux-gated exactly like the rest of `PtyTests`, because it drives `/bin/sh` conversations through
+/// the POSIX ctty helper (util-linux `setsid --ctty`, absent on macOS/BSD). It is no longer gated on the
+/// launcher's console: since T-338 a ConPTY child's stdio is bound to the pseudoconsole from a
+/// console-attached and a headless launcher alike (see the T-338 tests in `PtyTests`).
 [<TestFixture>]
 type PtySessionTests() =
 
