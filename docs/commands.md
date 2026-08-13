@@ -870,14 +870,29 @@ Console.WriteLine(await cmd.RunAsync() switch
   have reached a child (`Exit`, `Timeout`, `Signalled`, `Stdin`, `OutputTooLarge`,
   `Cancelled`, or the ambiguous `Io`) the run ends with that first error, without
   consulting your classifier, rather than feeding a second child an exhausted
-  source. Such a run also reserves the source while it holds it: a concurrent run
-  over the same stream or sequence — or a later one, once a child has read it — is
-  refused with `ProcessError.Unsupported` instead of being handed the remains. The
-  reservation is released again whenever the run ends without any attempt reaching a
-  child — an already-cancelled token, a cancellation during the backoff, a throwing
-  classifier, or an attempt that threw before launching all hand the source back to
-  the next run — while a run that may have reached one (a success, a post-child
-  failure, or a cancellation that arrived mid-attempt) keeps it.
+  source. Such a run also reserves the source while it holds it: another
+  **retrying** run over the same stream or sequence — one that starts while this
+  one still holds it, or a later one, once a capture verb (`run` /
+  `outputString` / `outputBytes` / `exitCode` / `probe`) has launched a child
+  over it — is refused with `ProcessError.Unsupported` instead of being handed
+  the remains. The reservation is released again whenever the run ends without
+  any attempt reaching a child — an already-cancelled token, a cancellation
+  during the backoff, a throwing classifier, or an attempt that threw before
+  launching all hand the source back to the next run — while a run that may have
+  reached one (a success, a post-child failure, or a cancellation that arrived
+  mid-attempt) keeps it.
+  That guard is scoped to retry; it is **not** a general cross-runner
+  reservation. Only a run with a retry budget takes the reservation, so a run
+  without one is never refused: it feeds its child from the same source whoever
+  else holds it (though its capture verb's child does mark the source spent for
+  later retrying runs). And only a capture verb's launch marks a source spent: a
+  child started outside those verbs — a streaming [`StartAsync`](streaming.md)
+  handle, a [`Pipeline`](pipelines.md) stage, a [supervised](supervision.md)
+  incarnation's own spawn, or a custom `IProcessRunner` — drains the source
+  without recording it, so a later retrying run can still reserve what is
+  already empty and hand its child nothing. Sequencing a one-shot source shared
+  across those paths is yours: give each run its own source, or a repeatable one
+  (`Stdin.FromString` / `FromBytes` / `FromFile`).
 - **`RetryBackoff`** uses the same attempt/classifier contract with a growing
   `baseDelay × factor^n` pause, capped by `maxDelay` before optional `[0.5, 1.5)`
   jitter. Base/cap delays must be non-negative and `factor` must be finite and at
