@@ -754,8 +754,10 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                     | Error message -> Error(ProcessError.ResourceLimit message)
 
         member _.HardRelease() =
-            // Final disposal must remain bounded and best-effort: it removes the cgroup even when a
-            // reusable kill could not prove that the legacy freezer was thawed.
+            // Final disposal must remain bounded and best-effort: it removes the cgroup even when the
+            // reusable kill reported an error — an unverified thaw of the legacy freezer, or a sweep
+            // that left the cgroup populated (including a kernel without pidfd, which kills nothing
+            // rather than downgrading to a racy raw kill).
             Native.Cgroup.killCgroup cgroupPath |> ignore
 
             // cgroup.kill SIGKILLs everything in the cgroup but does not reap our own children, and a

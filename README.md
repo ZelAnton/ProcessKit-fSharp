@@ -362,8 +362,11 @@ container exists — `cgroup.freeze` on Linux, `SIGSTOP`/`SIGCONT` on macOS/BSD 
 process-group fallback, per-thread suspension on Windows.
 
 `ProcessGroup.KillAll()` is reusable: on Linux kernels without `cgroup.kill`, it reports
-`ProcessError.Io` if the fallback cannot verify that `cgroup.freeze` returned to `0`; an already-unfrozen or
-removed freezer remains a best-effort success, and final disposal still removes the cgroup.
+`ProcessError.Io` if the fallback cannot verify that `cgroup.freeze` returned to `0`, or if a member could
+not be signalled and the group is still populated afterwards; an already-unfrozen or
+removed freezer remains a best-effort success, and final disposal still removes the cgroup. That fallback
+pins each member and reconfirms its cgroup membership before delivering SIGKILL, so a recycled pid is
+skipped rather than killed.
 
 *Deeper: [Process groups → signals, suspend/resume](docs/process-groups.md#signals-and-suspendresume).*
 
@@ -557,6 +560,12 @@ supervision stopped. The opt-in **failure-storm guard** distinguishes "fails rar
 of hammering restarts at backoff speed. Supervision runs through the `IProcessRunner` seam: pass
 `.WithRunner(group)` to keep every incarnation in one shared kill-on-dispose group, or a
 `ScriptedRunner` to test supervision logic hermetically.
+
+`Supervisor.StartAsync()` exposes a live `SupervisionSession`. Its `StopAsync` gracefully stops a
+spawned process, while a capture-only runner is interrupted immediately through the capture token;
+if at least one incarnation produced a result, the session completes with `StopReason.Stopped`.
+Otherwise it returns the last error, or `ProcessError.Cancelled` when there is no error to report.
+External token cancellation also remains `ProcessError.Cancelled`.
 
 The optional `LivenessMemory` probe intentionally samples attributable **peak** tree memory for each
 incarnation. A transient peak remains a violation after current usage falls, so choose a threshold above

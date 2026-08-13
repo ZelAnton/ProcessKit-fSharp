@@ -62,7 +62,7 @@ type private BlockingRunner() =
                             // is an active-child barrier rather than the earlier SpawnAsync-return race.
                             started.TrySetResult() |> ignore
                             finished.Task
-                      StdinError = fun () -> None
+                      StdinError = RunningHost.NoStdinError
                       StdinFeedComplete = ignore
                       StartKill =
                         fun () ->
@@ -127,7 +127,7 @@ type private LateFaultingStopRunner() =
                             // Signal after the session has published this handle as its active child.
                             started.TrySetResult() |> ignore
                             finished.Task
-                      StdinError = fun () -> None
+                      StdinError = RunningHost.NoStdinError
                       StdinFeedComplete = ignore
                       StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
                       Signal = fun _ -> Ok()
@@ -224,7 +224,7 @@ type private SlowSpawnRunner() =
                       StartedTimestamp = Stopwatch.GetTimestamp()
                       StartTimeIdentity = None
                       Wait = fun () -> finished.Task
-                      StdinError = fun () -> None
+                      StdinError = RunningHost.NoStdinError
                       StdinFeedComplete = ignore
                       StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
                       Signal = fun _ -> Ok()
@@ -288,7 +288,7 @@ type private CrashThenBackoffRunner() =
                       StartedTimestamp = Stopwatch.GetTimestamp()
                       StartTimeIdentity = None
                       Wait = fun () -> finished.Task
-                      StdinError = fun () -> None
+                      StdinError = RunningHost.NoStdinError
                       StdinFeedComplete = ignore
                       StartKill = fun () -> finished.TrySetResult(Outcome.Signalled None) |> ignore
                       Signal = fun _ -> Ok()

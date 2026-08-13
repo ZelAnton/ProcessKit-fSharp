@@ -34,6 +34,14 @@ type VerbTests() =
         else
             shell "echo line1; echo line2; echo line3"
 
+    // A child that comfortably outlives the short deadline/cancellation the T-329 precedence tests below
+    // fire at it, so the run really is decided by the timeout/cancellation rather than by its own exit.
+    let sleeper () =
+        if isWindows then
+            shell "ping 127.0.0.1 -n 10 >NUL"
+        else
+            shell "sleep 8"
+
     [<Test>]
     member _.``public verb extensions reject null command and runner arguments eagerly``() =
         let nullCommand = Unchecked.defaultof<Command>
@@ -657,5 +665,201 @@ type VerbTests() =
                 match! runner.RunAsync lowered with
                 | Error(ProcessError.Unsupported _) -> Assert.Pass()
                 | other -> Assert.Fail $"expected Unsupported for WindowsIntegrityLevel on POSIX, got {other}"
+        }
+        :> Task
+
+    // --- T-329: a stdin source that fails only AFTER the child exits ------------------------------
+    //
+    // The background feeder stashes a genuine source failure when its feed finishes. A Result-producing
+    // verb used to PEEK at that stash exactly once, the instant the child's exit and the output drains
+    // were observed: a slow `FromStream`/`FromLines`/`FromAsyncLines` source that had not concluded yet
+    // read as "no failure", the verb returned a spurious success, and teardown then stopped the feeder
+    // and destroyed the evidence. These tests pin the bounded final observation that closes the race —
+    // and, just as importantly, what it must NOT change: a louder failure still wins (and pays nothing
+    // for the window), a stopped feed is still not an error, and a hung source can never hold a verb open.
+
+    [<Test>]
+    member _.``a stdin source that fails only after the child exits surfaces as ProcessError.Stdin``() : Task =
+        task {
+            // The source is released at the exact instant the verb opens its observation window — i.e.
+            // strictly after the child exited and the pumps drained, which is precisely where the old
+            // single peek saw nothing. The failure is genuine (the child was fed truncated input), so it
+            // must become the run's result instead of a silent success.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use _observation =
+                new StdinFinalObservationScope((fun () -> source.Release()), None)
+
+            let command = shell "exit 0" |> Command.stdin (Stdin.FromAsyncLines source)
+
+            match! command.OutputStringAsync() with
+            | Error(ProcessError.Stdin _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Stdin, got {other.Message}"
+            | Ok _ -> Assert.Fail "a source failing after the child exited must not pass through as a success"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a stdin source that ends cleanly after the child exits is not turned into a failure``() : Task =
+        task {
+            // The mirror image: the window opens on a still-running source, but that source concludes
+            // WITHOUT failing. Waiting for it must invent no error — and the routine broken pipe from a
+            // child that never read its input must stay the non-failure it has always been.
+            let source = DelayedStdinAsyncLines EndWhenReleased
+
+            use observation = new StdinFinalObservationScope((fun () -> source.Release()), None)
+
+            let command = shell "exit 0" |> Command.stdin (Stdin.FromAsyncLines source)
+
+            match! command.OutputStringAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"a clean delayed source must not fail the run, got {error.Message}"
+
+            // Proves the assertion above is about a source observed through the window, not about a feed
+            // that had already finished by the time the verb first looked at it.
+            Assert.That(observation.Windows, Is.EqualTo 1, "the verb never opened a bounded observation window")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the bounded observation stops a hung stdin source instead of waiting for it``() : Task =
+        task {
+            // At the seam itself, with no verb or teardown around it to muddy the picture: a source still
+            // parked in its own read when the budget runs out is STOPPED — its lifecycle token cancels, it
+            // unwinds, and the user's enumerator is disposed rather than leaked — and reported as no
+            // failure, because a cancelled feed is not the caller's error.
+            let source = DelayedStdinAsyncLines FailWhenReleased // never released: it stays parked
+
+            use _observation =
+                new StdinFinalObservationScope(ignore, Some(TimeSpan.FromMilliseconds 200.0))
+
+            use pipe = new MemoryStream()
+
+            let feeder =
+                Pump.feedStdinSource (Some(pipe :> Stream)) (Some(Stdin.FromAsyncLines source)) true
+
+            do! source.Parked.WaitAsync(TimeSpan.FromSeconds 30.0)
+            let! fault = feeder.ObserveFaultAsync()
+
+            Assert.That(fault.IsNone, Is.True, "a source stopped at the budget must not be reported as a failure")
+            do! source.Cancelled.WaitAsync(TimeSpan.FromSeconds 30.0)
+            do! source.Disposed.WaitAsync(TimeSpan.FromSeconds 30.0)
+            let! _ = feeder.Task.WaitAsync(TimeSpan.FromSeconds 30.0)
+            ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a hung stdin source cannot hold a verb open past the bounded budget``() : Task =
+        task {
+            // End to end: the source parks forever, so without a bound the verb could never return. The
+            // window closes on the budget, the run reports its honest success, and the source is stopped.
+            let source = DelayedStdinAsyncLines FailWhenReleased // never released
+
+            use _observation =
+                new StdinFinalObservationScope(ignore, Some(TimeSpan.FromMilliseconds 200.0))
+
+            let command = shell "exit 0" |> Command.stdin (Stdin.FromAsyncLines source)
+            let run = command.OutputStringAsync()
+            let! completed = Task.WhenAny(run :> Task, Task.Delay(TimeSpan.FromSeconds 30.0))
+
+            Assert.That(
+                obj.ReferenceEquals(completed, (run :> Task)),
+                Is.True,
+                "the verb waited on a hung stdin source instead of bounding the observation"
+            )
+
+            match! run with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"a stopped hung source must not fail the run, got {error.Message}"
+
+            do! source.Cancelled.WaitAsync(TimeSpan.FromSeconds 30.0)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a non-zero exit still wins over a stdin source that fails after exit``() : Task =
+        task {
+            // Precedence is unchanged, and is decided BEFORE the window: an unaccepted exit is the realer
+            // failure, so the outcome passes through as data and no observation window opens at all.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use observation = new StdinFinalObservationScope((fun () -> source.Release()), None)
+
+            let command = shell "exit 7" |> Command.stdin (Stdin.FromAsyncLines source)
+
+            match! command.OutputStringAsync() with
+            | Ok result ->
+                match result.Outcome with
+                | Outcome.Exited 7 -> ()
+                | other -> Assert.Fail $"expected exit 7 to pass through, got {other}"
+            | Error(ProcessError.Stdin _) ->
+                Assert.Fail "a non-zero exit must win over the delayed stdin failure, not surface ProcessError.Stdin"
+            | Error other -> Assert.Fail $"unexpected error: {other.Message}"
+
+            Assert.That(
+                observation.Windows,
+                Is.EqualTo 0,
+                "a failing run must not pay for the bounded observation window at all"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a timeout still wins over a stdin source that fails after exit``() : Task =
+        task {
+            // The same precedence rule for the deadline: `TimedOut` is not an accepted outcome, so the
+            // stdin failure is neither surfaced nor waited for.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use observation = new StdinFinalObservationScope((fun () -> source.Release()), None)
+
+            let command =
+                sleeper ()
+                |> Command.stdin (Stdin.FromAsyncLines source)
+                |> Command.timeout (TimeSpan.FromMilliseconds 400.0)
+
+            match! command.OutputStringAsync() with
+            | Ok result ->
+                match result.Outcome with
+                | Outcome.TimedOut -> ()
+                | other -> Assert.Fail $"expected TimedOut to pass through, got {other}"
+            | Error(ProcessError.Stdin _) ->
+                Assert.Fail "a timeout must win over the delayed stdin failure, not surface ProcessError.Stdin"
+            | Error other -> Assert.Fail $"unexpected error: {other.Message}"
+
+            Assert.That(
+                observation.Windows,
+                Is.EqualTo 0,
+                "a timed-out run must not pay for the bounded observation window at all"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``cancellation still wins over a stdin source that fails after exit``() : Task =
+        task {
+            // And for cancellation, decided outside the outcome classification entirely: the killed run is
+            // not an accepted outcome, so no window opens and the verb reports `Cancelled`.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use observation = new StdinFinalObservationScope((fun () -> source.Release()), None)
+
+            use cts = new CancellationTokenSource()
+            let command = sleeper () |> Command.stdin (Stdin.FromAsyncLines source)
+            cts.CancelAfter(TimeSpan.FromMilliseconds 400.0)
+
+            match! runner.OutputStringAsync(command, cts.Token) with
+            | Error(ProcessError.Cancelled _) -> ()
+            | Error(ProcessError.Stdin _) ->
+                Assert.Fail "cancellation must win over the delayed stdin failure, not surface ProcessError.Stdin"
+            | Error other -> Assert.Fail $"expected Cancelled, got {other.Message}"
+            | Ok result -> Assert.Fail $"expected Cancelled, got a result with outcome {result.Outcome}"
+
+            Assert.That(
+                observation.Windows,
+                Is.EqualTo 0,
+                "a cancelled run must not pay for the bounded observation window at all"
+            )
         }
         :> Task

@@ -39,10 +39,15 @@ type internal RunningHost =
         StartTimeIdentity: DateTime option
         /// Wait for the process to exit and report how it concluded.
         Wait: unit -> Task<Outcome>
-        /// Observe a genuine stdin-source failure stashed by the background feeder, but only once the
-        /// feed has finished — a still-running feed yields `None` and never blocks. A Result-producing
-        /// verb surfaces it as `ProcessError.Stdin`, but only on an otherwise-successful run.
-        StdinError: unit -> exn option
+        /// The BOUNDED FINAL observation of the background stdin feeder's genuine source failure, made at
+        /// the one moment a Result-producing verb decides an otherwise-successful run's result (the child
+        /// exited with an accepted code and the output drains have finished). A feed that already finished
+        /// answers immediately; a feed still reading its source gets a bounded window to conclude — so a
+        /// slow source that only fails AFTER a fast child exited is reported as the real cause instead of
+        /// being torn down unread — and is stopped, not awaited, once that window runs out. Never blocks
+        /// past the budget, and never faults. A synthetic host with no feed to observe uses
+        /// `RunningHost.NoStdinError`.
+        StdinError: unit -> Task<exn option>
         /// Block until the background stdin feeder has finished draining the source, so `TakeStdin` never
         /// hands the caller a stream the feeder is still writing to (two concurrent writers on one pipe is
         /// forbidden). A no-op — returns immediately — when the command kept stdin open with **no** source
@@ -67,6 +72,12 @@ type internal RunningHost =
         /// Reap the tree and release the container.
         Teardown: unit -> ValueTask
     }
+
+    /// The `StdinError` observer for a host with NO background stdin feed behind it: there is nothing to
+    /// observe, so it answers "no fault" immediately and can never delay a verb. Used by the pipeline
+    /// session's inner handle (stage 0's feed is observed by the chain itself, and reaches the session
+    /// through the stashed capture's `Stdin0Error`) and by every synthetic host in the fakes and tests.
+    static member NoStdinError() : Task<exn option> = Task.FromResult<exn option> None
 
 module internal ReadinessRace =
 
@@ -960,15 +971,24 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         )
 
     // A genuine stdin-source failure surfaces as `ProcessError.Stdin` only on an otherwise-successful
-    // run — an accepted exit code. A non-zero/unaccepted exit or a signal is the "realer" failure and
-    // wins: the outcome passes through unchanged so the caller's own classifier sees it. (A cancelled
-    // run is already turned into `ProcessError.Cancelled` upstream, before this is reached.)
-    let stdinErrorOnSuccess (outcome: Outcome) : ProcessError option =
+    // run — an accepted exit code. A non-zero/unaccepted exit, a signal, or a timeout is the "realer"
+    // failure and wins: the outcome passes through unchanged so the caller's own classifier sees it. (A
+    // cancelled run is already turned into `ProcessError.Cancelled` upstream, before this is reached.)
+    //
+    // Called by each Result-producing verb at its ONE classification point, after the exit outcome AND
+    // the output drains have been awaited. Only then is the feeder observed, and only on the success
+    // branch — which is both the correct precedence and why a failing/timed-out run pays nothing for the
+    // bounded window: `host.StdinError` waits (bounded) for a source still reading when the child exited,
+    // instead of peeking once and calling a lost race a success. A feed that already finished — every
+    // synchronous source failure, e.g. a missing `FromFile` — answers with no wait at all.
+    let stdinErrorOnSuccess (outcome: Outcome) : Task<ProcessError option> =
         if outcome.IsAcceptedBy config.OkCodes then
-            host.StdinError()
-            |> Option.map (fun ex -> ProcessError.Stdin(config.Program, ex.Message))
+            task {
+                let! fault = host.StdinError()
+                return fault |> Option.map (fun ex -> ProcessError.Stdin(config.Program, ex.Message))
+            }
         else
-            None
+            Task.FromResult<ProcessError option> None
 
     // Observe any fault on an otherwise fire-and-forget outcome task, so it can never surface as an
     // unobserved task exception at finalization when nothing awaits it (a streaming-only consumer that
@@ -1727,7 +1747,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                 (int (min (int64 outBuf.TotalBytes + int64 errBuf.TotalBytes) (int64 Int32.MaxValue)))
                         )
                 else
-                    match stdinErrorOnSuccess outcome with
+                    match! stdinErrorOnSuccess outcome with
                     | Some err -> return Error err
                     | None ->
                         return
@@ -1801,7 +1821,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                 ))
                         )
                 else
-                    match stdinErrorOnSuccess outcome with
+                    match! stdinErrorOnSuccess outcome with
                     | Some err -> return Error err
                     | None ->
                         return
@@ -2257,7 +2277,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 if stderrStreamBuffer.TooLarge then
                     return Error(tooLargeError stderrStreamBuffer.TotalLines stderrStreamBuffer.TotalBytes)
                 else
-                    match stdinErrorOnSuccess settled with
+                    match! stdinErrorOnSuccess settled with
                     | Some err -> return Error err
                     | None -> return Ok(Finished(settled, stderrStreamBuffer.Text))
             }

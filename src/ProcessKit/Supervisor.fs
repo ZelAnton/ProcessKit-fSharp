@@ -318,9 +318,23 @@ type SupervisionStatus
     /// runner exposes no live handle (a scripted test double).
     member _.Pid = pid
 
-    /// When the current live incarnation started, or `None` when no child is alive right now (see
-    /// `Pid`).
+    /// When the current live incarnation started, including a capture-only incarnation whose `Pid` is
+    /// unavailable, or `None` when no incarnation is active right now.
     member _.StartTime = startTime
+
+[<Sealed>]
+type private CaptureOnlyStopLever(source: CancellationTokenSource, startTime: DateTime, startedTimestamp: int64) =
+    let identity = obj ()
+    let mutable stopRequested = false
+
+    member _.Identity = identity
+    member _.Source = source
+    member _.StartTime = startTime
+    member _.StartedTimestamp = startedTimestamp
+
+    member _.StopRequested
+        with get () = stopRequested
+        and set value = stopRequested <- value
 
 /// A live handle to a running supervision, returned by `Supervisor.StartAsync`. Unlike `RunAsync` —
 /// which only reports its `SupervisionOutcome` at the very end — a session lets a caller watch
@@ -353,6 +367,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     let mutable stormPaused = false
     let mutable active = true
     let mutable current: RunningProcess option = None
+    let mutable captureOnlyCurrent: CaptureOnlyStopLever option = None
 
     // The graceful-stop request, set by `StopAsync`, read by the loop and by `captureIncarnation`.
     let mutable stopping = false
@@ -381,7 +396,13 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     // Rebuild the published snapshot from the mirror fields. Caller must hold `gate`.
     let refresh () =
         let pid = current |> Option.bind (fun running -> running.Pid)
-        let startTime = current |> Option.map (fun running -> running.StartTime)
+
+        let startTime =
+            match current, captureOnlyCurrent with
+            | Some running, _ -> Some running.StartTime
+            | None, Some lever -> Some lever.StartTime
+            | None, None -> None
+
         status <- SupervisionStatus(active, restarts, stormPaused, pid, startTime)
 
     // Publish a freshly-spawned child as the current incarnation AND, atomically under `gate`, learn
@@ -402,6 +423,51 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
 
             refresh ())
 
+    let cancelCaptureOnly (lever: CaptureOnlyStopLever) =
+        try
+            lever.Source.Cancel()
+        with
+        | :? ObjectDisposedException ->
+            // The same incarnation completed and disposed its lever after it was snapshotted; there is
+            // no active capture left to interrupt.
+            ()
+        | :? AggregateException ->
+            // Cancellation callbacks belong to the injected runner. A faulty callback must not prevent
+            // the supervisor from completing its own deliberate-stop protocol.
+            ()
+
+    // Publish the capture token and its observable start time as one state transition. If a stop won the
+    // gate first, mark the lever under the gate and cancel it after releasing the gate; otherwise
+    // `requestGracefulStop` does the same. Thus the capability-probe gap cannot leave an uninterruptible
+    // capture behind without invoking runner-owned cancellation callbacks while holding `gate`.
+    let publishCaptureOnly (lever: CaptureOnlyStopLever) =
+        let shouldCancel =
+            lock gate (fun () ->
+                captureOnlyCurrent <- Some lever
+                refresh ()
+
+                if stopping then
+                    lever.StopRequested <- true
+                    true
+                else
+                    false)
+
+        if shouldCancel then
+            cancelCaptureOnly lever
+
+    let captureStopWasRequested (lever: CaptureOnlyStopLever) =
+        lock gate (fun () -> lever.StopRequested)
+
+    let clearCaptureOnly (lever: CaptureOnlyStopLever) =
+        lock gate (fun () ->
+            match captureOnlyCurrent with
+            | Some existing when Object.ReferenceEquals(existing.Identity, lever.Identity) ->
+                captureOnlyCurrent <- None
+                refresh ()
+            | _ -> ()
+
+            lever.Source.Dispose())
+
     let bumpRestarts () =
         lock gate (fun () ->
             restarts <- restarts + 1
@@ -416,36 +482,45 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
         lock gate (fun () ->
             active <- false
             current <- None
+            captureOnlyCurrent <- None
             refresh ())
 
     let isStopping () = lock gate (fun () -> stopping)
 
     // Record a graceful-stop request and snapshot the current live child atomically under `gate` (closing
-    // the `StopAsync`-vs-spawn race, see `publishCurrent`), then interrupt any in-flight backoff / storm
-    // sleep so a stop taken *between* incarnations ends the loop promptly instead of waiting the delay out.
-    // Shared by the public `StopAsync` and the internal `StopActiveAsync` hosting seam.
+    // the `StopAsync`-vs-spawn race, see `publishCurrent`). A capture-only incarnation has no graceful
+    // process handle, so cancel its identity-scoped lever immediately. Then interrupt any in-flight
+    // backoff / storm sleep so a stop taken *between* incarnations ends the loop promptly instead of
+    // waiting the delay out. Shared by the public `StopAsync` and the internal `StopActiveAsync` seam.
     let requestGracefulStop (gracePeriod: TimeSpan) : RunningProcess option =
-        let child =
+        let child, captureOnly =
             lock gate (fun () ->
                 stopGrace <- gracePeriod
                 stopping <- true
-                current)
 
-        // `Cancel()` is serialized against `runLoop`'s teardown `Dispose()` under this same `gate` (see
-        // its `finally`), so the two can never interleave: whichever call takes `gate` first either runs
-        // `Cancel()` to completion while `stopCts` is still fully live (the linked `sleepCts` it notifies
-        // is guaranteed not to be disposing concurrently), or finds `stopCts` already disposed and hits
-        // the guard below cleanly. Without this lock, a `Cancel()` that starts just before a racing
-        // `Dispose()` could have its linked-token callback throw `ObjectDisposedException` against the
-        // already-torn-down `sleepCts`, which surfaces from `Cancel()` as an unhandled `AggregateException`
-        // that this handler — written only for a direct `ObjectDisposedException` — would not catch.
-        lock gate (fun () ->
-            try
-                stopCts.Cancel()
-            with :? ObjectDisposedException ->
-                // Already disposed by a concurrent `runLoop` teardown; the loop has already ended and
-                // there is nothing further to cancel.
-                ())
+                captureOnlyCurrent |> Option.iter (fun lever -> lever.StopRequested <- true)
+
+                current, captureOnlyCurrent)
+
+        try
+            captureOnly |> Option.iter cancelCaptureOnly
+        finally
+            // `stopCts.Cancel()` is serialized against `runLoop`'s teardown `Dispose()` under `gate` (see
+            // its `finally`), so the two can never interleave. Keep this in `finally` so a runner-owned
+            // capture cancellation callback cannot prevent an in-flight backoff / storm pause from being
+            // interrupted.
+            lock gate (fun () ->
+                try
+                    stopCts.Cancel()
+                with
+                | :? ObjectDisposedException ->
+                    // Already disposed by a concurrent `runLoop` teardown; the loop has already ended and
+                    // there is nothing further to cancel.
+                    ()
+                | :? AggregateException ->
+                    // Linked sleep callbacks have already been notified. A faulty callback must not turn
+                    // a deliberate stop into an exception after the stop signal has been delivered.
+                    ())
 
         child
 
@@ -636,9 +711,63 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     // The tracked path is a faithful inline of `CaptureVerbs.runToCompletion` (kept in step with it) —
     // same `CancelOn` linking, same up-front and post-consume cancellation checks — plus the live-handle
     // publication and the capture-only fallback.
+    let captureOnlyIncarnation (command: Command) : Task<Result<ProcessResult<string>, ProcessError>> =
+        task {
+            let captureCts = CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+
+            let lever =
+                CaptureOnlyStopLever(
+                    captureCts,
+                    command.Config.TimeProvider.GetUtcNow().UtcDateTime,
+                    Stopwatch.GetTimestamp()
+                )
+
+            publishCaptureOnly lever
+
+            try
+                try
+                    let! captured = config.Runner.CaptureStringAsync(command, captureCts.Token)
+
+                    match captured with
+                    | Error(ProcessError.Cancelled _) when captureStopWasRequested lever ->
+                        return
+                            Ok(
+                                ProcessResult<string>(
+                                    command.Program,
+                                    "",
+                                    "",
+                                    Outcome.Unobserved
+                                        "Capture-only incarnation stopped before its exit status was observed.",
+                                    Stopwatch.GetElapsedTime lever.StartedTimestamp,
+                                    false,
+                                    command.Config.OkCodes
+                                )
+                            )
+                    | result -> return result
+                with :? OperationCanceledException when captureCts.IsCancellationRequested ->
+                    if captureStopWasRequested lever then
+                        return
+                            Ok(
+                                ProcessResult<string>(
+                                    command.Program,
+                                    "",
+                                    "",
+                                    Outcome.Unobserved
+                                        "Capture-only incarnation stopped before its exit status was observed.",
+                                    Stopwatch.GetElapsedTime lever.StartedTimestamp,
+                                    false,
+                                    command.Config.OkCodes
+                                )
+                            )
+                    else
+                        return Error(ProcessError.Cancelled command.Program)
+            finally
+                clearCaptureOnly lever
+        }
+
     let captureIncarnation (command: Command) : Task<Result<ProcessResult<string>, ProcessError>> =
         if not spawnCapable then
-            config.Runner.CaptureStringAsync(command, cancellationToken)
+            captureOnlyIncarnation command
         else
             task {
                 use linkedCts =
@@ -663,7 +792,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             None
 
                     match spawned with
-                    | None -> return! config.Runner.CaptureStringAsync(command, cancellationToken)
+                    | None -> return! captureOnlyIncarnation command
                     | Some spawnTask ->
                         match! spawnTask with
                         | Error error -> return Error error
@@ -814,9 +943,9 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
             do! Task.Yield()
 
             // Sleeps observe both the caller's cancellation and a session stop, so a graceful stop (which
-            // cancels `stopCts`) promptly interrupts an in-flight backoff / storm pause. The incarnation
-            // capture, by contrast, keeps the *caller's* token only — a stop must gracefully stop the
-            // child (`RunningProcess.StopAsync`), never hard-cancel it as an error.
+            // cancels `stopCts`) promptly interrupts an in-flight backoff / storm pause. A live-handle
+            // incarnation keeps the caller's token only and is stopped through `RunningProcess.StopAsync`;
+            // a capture-only incarnation gets its own separately published cancellation lever.
             use sleepCts =
                 CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, stopCts.Token)
 
@@ -1189,11 +1318,12 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     /// supervision concludes on its own, via `StopAsync`, or via the `StartAsync` token's cancellation.
     member _.Completion: Task<Result<SupervisionOutcome, ProcessError>> = completion
 
-    /// Request a graceful stop with `gracePeriod`: stop the current live incarnation through its own
-    /// graceful path (`RunningProcess.StopAsync`, honouring the grace window) and end the supervision
-    /// loop with `StopReason.Stopped` — reported as a normal `SupervisionOutcome` whose `FinalResult` is
-    /// that incarnation's honest result, never a crash. Interrupts an in-flight backoff / storm pause so
-    /// a stop taken between incarnations also ends promptly, and never launches a further incarnation. A
+    /// Request a graceful stop with `gracePeriod`: stop a live-handle incarnation through its own
+    /// graceful path (`RunningProcess.StopAsync`, honouring the grace window), or immediately cancel a
+    /// capture-only incarnation (which has no process handle to stop gracefully), and end the supervision
+    /// loop with `StopReason.Stopped`. A stopped capture-only run whose exit status is unavailable reports
+    /// `Outcome.Unobserved` in its final result. Interrupts an in-flight backoff / storm pause so a stop
+    /// taken between incarnations also ends promptly, and never launches a further incarnation. A
     /// stop that lands before *any* incarnation has produced a result has no result to report and no
     /// child of its own to stop, so supervision ends with `RunAsync`'s `Error` rather than starting one
     /// more child just to manufacture a `SupervisionOutcome`: the last failure that kept the child from
@@ -1221,12 +1351,10 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 return! completion
             | None ->
                 // No live child to stop right now: a stop taken before the first spawn, between
-                // incarnations, or against a capture-only runner. The `stopCts` cancellation above cuts
-                // any in-flight backoff / storm sleep short, and it is the loop's own pre-spawn
-                // `isStopping ()` check that then ends supervision — without starting another
-                // incarnation. (A capture-only incarnation already in flight has no graceful stop path,
-                // so the loop ends through its ordinary post-capture stop branch once that capture
-                // returns.)
+                // incarnations, or against a capture-only runner. `requestGracefulStop` has already
+                // cancelled any published capture-only lever immediately; otherwise `stopCts` cuts an
+                // in-flight backoff / storm sleep short. The loop's pre-spawn `isStopping ()` check then
+                // prevents another incarnation.
                 return! completion
         }
 
@@ -1237,7 +1365,8 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     /// graceful stop as `StopAsync` — set the `stopping` flag and interrupt the backoff / storm sleep so
     /// the loop ends promptly, launching no further incarnation — but additionally report the honest
     /// `Outcome` of the *live* child this call actually stopped (`Some outcome`), or `None` when there was
-    /// no live child to stop (a between-incarnations / storm-pause stop, or a capture-only runner). This
+    /// no live child to stop (a between-incarnations / storm-pause stop, or a capture-only runner, whose
+    /// cancellation lever is still triggered immediately). This
     /// lets a wrapper honour a "publish a last-stop outcome only for a real child stop" contract without
     /// racing the loop for the current child: the snapshot is taken atomically under `gate`, exactly as
     /// the loop publishes each incarnation. Unlike `StopAsync`, this does **not** await `Completion` — the

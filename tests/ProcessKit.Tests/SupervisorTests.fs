@@ -111,7 +111,7 @@ module private SessionTestHelpers =
               StartedTimestamp = Stopwatch.GetTimestamp()
               StartTimeIdentity = None
               Wait = wait
-              StdinError = fun () -> None
+              StdinError = RunningHost.NoStdinError
               StdinFeedComplete = ignore
               StartKill = startKill
               Signal = fun _ -> Ok()
@@ -147,7 +147,7 @@ module private SessionTestHelpers =
               StartedTimestamp = Stopwatch.GetTimestamp()
               StartTimeIdentity = None
               Wait = wait
-              StdinError = fun () -> None
+              StdinError = RunningHost.NoStdinError
               StdinFeedComplete = ignore
               StartKill = startKill
               Signal = fun _ -> Ok()
@@ -299,6 +299,149 @@ type private GatedCaptureRunner() =
 
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             failwith "GatedCaptureRunner only scripts CaptureString"
+
+type private PendingCaptureRunner() =
+    let started =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let cancelled =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable captures = 0
+    let mutable spawns = 0
+
+    member _.Started = started.Task
+    member _.Cancelled = cancelled.Task
+    member _.Captures = Volatile.Read(&captures)
+    member _.Spawns = Volatile.Read(&spawns)
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(command, cancellationToken) =
+            task {
+                Interlocked.Increment(&captures) |> ignore
+                started.TrySetResult() |> ignore
+
+                try
+                    do! Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
+                    return Error(ProcessError.Io "the pending capture delay completed unexpectedly")
+                with :? OperationCanceledException ->
+                    cancelled.TrySetResult() |> ignore
+                    return Error(ProcessError.Cancelled command.Program)
+            }
+
+        member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
+            Interlocked.Increment(&spawns) |> ignore
+            raise (NotSupportedException "PendingCaptureRunner only scripts CaptureString")
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "PendingCaptureRunner only scripts CaptureString"
+
+/// A capture-only runner whose cancellation callback is defective. The pending delay still observes
+/// cancellation, proving that a foreign callback exception cannot escape `StopAsync` or strand the loop.
+type private ThrowingCancellationCaptureRunner() =
+    let started =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    member _.Started = started.Task
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(command, cancellationToken) =
+            task {
+                use _registration =
+                    cancellationToken.Register(Action(fun () -> raise (InvalidOperationException "callback defect")))
+
+                started.TrySetResult() |> ignore
+
+                try
+                    do! Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
+                    return Error(ProcessError.Io "the pending capture delay completed unexpectedly")
+                with
+                | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                    return Error(ProcessError.Cancelled command.Program)
+                | error -> return raise error
+            }
+
+        member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
+            raise (NotSupportedException "ThrowingCancellationCaptureRunner only scripts CaptureString")
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "ThrowingCancellationCaptureRunner only scripts CaptureString"
+
+type private LatchedPendingCaptureRunner() =
+    let secondStarted =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable captures = 0
+    let mutable spawns = 0
+
+    member _.SecondStarted = secondStarted.Task
+    member _.Captures = Volatile.Read(&captures)
+    member _.Spawns = Volatile.Read(&spawns)
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(command, cancellationToken) =
+            task {
+                let capture = Interlocked.Increment(&captures)
+
+                if capture = 1 then
+                    return
+                        Ok(
+                            ProcessResult<string>(
+                                command.Program,
+                                "",
+                                "",
+                                Outcome.Exited 1,
+                                TimeSpan.Zero,
+                                false,
+                                [ 0 ]
+                            )
+                        )
+                else
+                    secondStarted.TrySetResult() |> ignore
+
+                    try
+                        do! Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
+                        return Error(ProcessError.Io "the pending capture delay completed unexpectedly")
+                    with :? OperationCanceledException ->
+                        return Error(ProcessError.Cancelled command.Program)
+            }
+
+        member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
+            Interlocked.Increment(&spawns) |> ignore
+            raise (NotSupportedException "LatchedPendingCaptureRunner only scripts CaptureString")
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "LatchedPendingCaptureRunner only scripts CaptureString"
+
+type private GatedCapabilityProbeRunner() =
+    let probeEntered =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let releaseProbe =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable captures = 0
+
+    member _.ProbeEntered = probeEntered.Task
+    member _.ReleaseProbe() = releaseProbe.TrySetResult() |> ignore
+    member _.Captures = Volatile.Read(&captures)
+
+    interface IProcessRunner with
+        member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
+            probeEntered.TrySetResult() |> ignore
+            releaseProbe.Task.GetAwaiter().GetResult()
+            raise (NotSupportedException "GatedCapabilityProbeRunner only scripts CaptureString")
+
+        member _.CaptureStringAsync(command, cancellationToken) =
+            Interlocked.Increment(&captures) |> ignore
+
+            if cancellationToken.IsCancellationRequested then
+                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+            else
+                Task.FromResult(Error(ProcessError.Io "capture started without the pending stop cancellation"))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "GatedCapabilityProbeRunner only scripts CaptureString"
 
 /// A spawn-capable runner whose every `SpawnAsync` fails with a *transient* error, so an incarnation
 /// ends without ever producing a `ProcessResult` — the state in which the supervision loop backs off
@@ -1530,6 +1673,156 @@ type SupervisorTests() =
             | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
 
             Assert.That(session.Status.IsActive, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync immediately cancels a pending capture-only incarnation without waiting for grace``() : Task =
+        task {
+            let runner = PendingCaptureRunner()
+
+            let supervisor =
+                Supervisor(Command.create "worker").WithRunner(runner).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+            let! session = supervisor.StartAsync()
+            do! runner.Started
+
+            Assert.That(
+                session.Status.StartTime.IsSome,
+                Is.True,
+                "the capture-only incarnation is published as current"
+            )
+
+            Assert.That(session.Status.Pid, Is.EqualTo None)
+
+            let stopTask = session.StopAsync(TimeSpan.FromSeconds 60.0)
+            let! winner = Task.WhenAny(stopTask :> Task, Task.Delay(TimeSpan.FromSeconds 2.0))
+
+            Assert.That(winner, Is.SameAs(stopTask), "capture-only stop incorrectly waited for the grace period")
+
+            let! outcome = stopTask
+
+            match outcome with
+            | Ok result ->
+                Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+                Assert.That(result.FinalResult.Outcome.IsUnobserved, Is.True)
+            | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
+
+            Assert.That(runner.Cancelled.IsCompleted, Is.True, "the active capture token was not cancelled")
+            Assert.That(runner.Captures, Is.EqualTo 1)
+            Assert.That(runner.Spawns, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync tolerates a throwing capture cancellation callback``() : Task =
+        task {
+            let runner = ThrowingCancellationCaptureRunner()
+
+            let supervisor =
+                Supervisor(Command.create "worker")
+                    .WithRunner(runner)
+                    .Restart(RestartPolicy.Always)
+                    .Backoff(TimeSpan.FromSeconds 60.0, 1.0)
+                    .Jitter(false)
+
+            let! session = supervisor.StartAsync()
+            do! runner.Started
+
+            let stopTask = session.StopAsync(TimeSpan.FromSeconds 60.0)
+            let! winner = Task.WhenAny(stopTask :> Task, Task.Delay(TimeSpan.FromSeconds 2.0))
+
+            Assert.That(winner, Is.SameAs(stopTask), "a throwing callback stranded the stop or its backoff")
+
+            match! stopTask with
+            | Ok result ->
+                Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+                Assert.That(result.FinalResult.Outcome.IsUnobserved, Is.True)
+            | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync cancels a latched capture-only incarnation after restart``() : Task =
+        task {
+            let runner = LatchedPendingCaptureRunner()
+
+            let supervisor =
+                Supervisor(Command.create "worker")
+                    .WithRunner(runner)
+                    .Restart(RestartPolicy.Always)
+                    .MaxRestarts(3)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+
+            let! session = supervisor.StartAsync()
+            do! runner.SecondStarted
+
+            let stopTask = session.StopAsync(TimeSpan.FromSeconds 60.0)
+            let! winner = Task.WhenAny(stopTask :> Task, Task.Delay(TimeSpan.FromSeconds 2.0))
+
+            Assert.That(winner, Is.SameAs(stopTask), "latched capture-only stop waited for the grace period")
+
+            match! stopTask with
+            | Ok result ->
+                Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+                Assert.That(result.Restarts, Is.EqualTo 1)
+            | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
+
+            Assert.That(runner.Captures, Is.EqualTo 2)
+            Assert.That(runner.Spawns, Is.EqualTo 1, "the capture-only capability marker must remain latched")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync racing the first capability probe cancels fallback before capture starts``() : Task =
+        task {
+            let runner = GatedCapabilityProbeRunner()
+
+            let supervisor =
+                Supervisor(Command.create "worker")
+                    .WithRunner(runner)
+                    .Restart(RestartPolicy.Always)
+                    .MaxRestarts(3)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+
+            let! session = supervisor.StartAsync()
+            do! runner.ProbeEntered
+
+            let stopTask = session.StopAsync(TimeSpan.FromSeconds 60.0)
+            runner.ReleaseProbe()
+
+            let! winner = Task.WhenAny(stopTask :> Task, Task.Delay(TimeSpan.FromSeconds 2.0))
+            Assert.That(winner, Is.SameAs(stopTask), "the capability-probe race left capture running")
+
+            match! stopTask with
+            | Ok result -> Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+            | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
+
+            Assert.That(runner.Captures, Is.EqualTo 1, "a stopped session must not launch another incarnation")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``external cancellation of a capture-only incarnation remains Cancelled``() : Task =
+        task {
+            let runner = PendingCaptureRunner()
+            use cts = new CancellationTokenSource()
+
+            let supervisor =
+                Supervisor(Command.create "worker").WithRunner(runner).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+            let! session = supervisor.StartAsync(cts.Token)
+            do! runner.Started
+            cts.Cancel()
+
+            match! session.Completion with
+            | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "worker")
+            | other -> Assert.Fail $"expected external ProcessError.Cancelled, got {other}"
+
+            Assert.That(runner.Cancelled.IsCompleted, Is.True)
+            Assert.That(runner.Captures, Is.EqualTo 1)
         }
         :> Task
 

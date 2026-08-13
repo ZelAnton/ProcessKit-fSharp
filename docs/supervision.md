@@ -735,14 +735,18 @@ if (await supervised is { IsOk: false, ErrorValue: { IsCancelled: true } })
 
 A **graceful stop** of a live supervision session (`Supervisor.StartAsync`, then
 `SupervisionSession.StopAsync`) normally ends supervision as `Ok` with `StopReason.Stopped`,
-reporting the honest result of the incarnation it stopped. A stop that lands before *any*
-incarnation has produced a result falls under the no-result rule above instead: it has nothing to
-report and the supervisor will not start one more child just to manufacture an outcome, so
-supervision ends as an `Error` carrying the last failure that kept the child from starting — or
-`ProcessError.Cancelled`, when the stop arrived before the very first incarnation was started at
-all and there is no failure to report either. That last shape is the one `Cancelled` ProcessKit
-produces without a cancelled token, so code that must tell "my token fired" apart from "I asked for
-a graceful stop" should consult the token rather than the error case.
+reporting the honest result of a live-handle incarnation. A capture-only incarnation has no process
+handle or graceful-stop mechanism, so the session publishes a per-incarnation cancellation lever
+and `StopAsync` cancels it immediately without applying the grace period. If cancellation prevents
+the runner from reporting an exit status, the final result uses `Outcome.Unobserved`; the session
+still completes normally with `StopReason.Stopped`. Cancellation through the token passed to
+`StartAsync`, without a `StopAsync` request, remains `ProcessError.Cancelled`.
+
+A stop that lands before any incarnation has produced a result falls under the no-result rule above.
+The supervisor will not start a child just to manufacture an outcome: it returns the last failure
+from an incarnation that produced no result, or `ProcessError.Cancelled` when there is no such
+failure. That `Cancelled` is produced when the token did **not** fire. To distinguish external
+cancellation from a deliberate stop, consult the token, not the error shape.
 
 For the full model of captured-versus-raised deadlines and how cancellation differs from a
 timeout, see [timeouts-and-cancellation.md](timeouts-and-cancellation.md).
