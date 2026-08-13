@@ -336,6 +336,37 @@ type private PendingCaptureRunner() =
         member _.CaptureBytesAsync(_command, _cancellationToken) =
             failwith "PendingCaptureRunner only scripts CaptureString"
 
+/// A capture-only runner whose cancellation callback is defective. The pending delay still observes
+/// cancellation, proving that a foreign callback exception cannot escape `StopAsync` or strand the loop.
+type private ThrowingCancellationCaptureRunner() =
+    let started =
+        new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    member _.Started = started.Task
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(command, cancellationToken) =
+            task {
+                use _registration =
+                    cancellationToken.Register(Action(fun () -> raise (InvalidOperationException "callback defect")))
+
+                started.TrySetResult() |> ignore
+
+                try
+                    do! Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
+                    return Error(ProcessError.Io "the pending capture delay completed unexpectedly")
+                with
+                | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                    return Error(ProcessError.Cancelled command.Program)
+                | error -> return raise error
+            }
+
+        member _.SpawnAsync(_command, _cancellationToken) : Task<Result<RunningProcess, ProcessError>> =
+            raise (NotSupportedException "ThrowingCancellationCaptureRunner only scripts CaptureString")
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "ThrowingCancellationCaptureRunner only scripts CaptureString"
+
 type private LatchedPendingCaptureRunner() =
     let secondStarted =
         new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -1680,6 +1711,34 @@ type SupervisorTests() =
             Assert.That(runner.Cancelled.IsCompleted, Is.True, "the active capture token was not cancelled")
             Assert.That(runner.Captures, Is.EqualTo 1)
             Assert.That(runner.Spawns, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync tolerates a throwing capture cancellation callback``() : Task =
+        task {
+            let runner = ThrowingCancellationCaptureRunner()
+
+            let supervisor =
+                Supervisor(Command.create "worker")
+                    .WithRunner(runner)
+                    .Restart(RestartPolicy.Always)
+                    .Backoff(TimeSpan.FromSeconds 60.0, 1.0)
+                    .Jitter(false)
+
+            let! session = supervisor.StartAsync()
+            do! runner.Started
+
+            let stopTask = session.StopAsync(TimeSpan.FromSeconds 60.0)
+            let! winner = Task.WhenAny(stopTask :> Task, Task.Delay(TimeSpan.FromSeconds 2.0))
+
+            Assert.That(winner, Is.SameAs(stopTask), "a throwing callback stranded the stop or its backoff")
+
+            match! stopTask with
+            | Ok result ->
+                Assert.That(result.Stopped, Is.EqualTo StopReason.Stopped)
+                Assert.That(result.FinalResult.Outcome.IsUnobserved, Is.True)
+            | Error error -> Assert.Fail $"expected Ok Stopped, got {error}"
         }
         :> Task
 

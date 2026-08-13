@@ -424,25 +424,36 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
             refresh ())
 
     let cancelCaptureOnly (lever: CaptureOnlyStopLever) =
-        lever.StopRequested <- true
-
         try
             lever.Source.Cancel()
-        with :? ObjectDisposedException ->
+        with
+        | :? ObjectDisposedException ->
             // The same incarnation completed and disposed its lever after it was snapshotted; there is
             // no active capture left to interrupt.
             ()
+        | :? AggregateException ->
+            // Cancellation callbacks belong to the injected runner. A faulty callback must not prevent
+            // the supervisor from completing its own deliberate-stop protocol.
+            ()
 
     // Publish the capture token and its observable start time as one state transition. If a stop won the
-    // gate first, cancel before entering the capture; otherwise `requestGracefulStop` sees this lever and
-    // cancels it. Thus the capability-probe gap cannot leave an uninterruptible capture behind.
+    // gate first, mark the lever under the gate and cancel it after releasing the gate; otherwise
+    // `requestGracefulStop` does the same. Thus the capability-probe gap cannot leave an uninterruptible
+    // capture behind without invoking runner-owned cancellation callbacks while holding `gate`.
     let publishCaptureOnly (lever: CaptureOnlyStopLever) =
-        lock gate (fun () ->
-            captureOnlyCurrent <- Some lever
-            refresh ()
+        let shouldCancel =
+            lock gate (fun () ->
+                captureOnlyCurrent <- Some lever
+                refresh ()
 
-            if stopping then
-                cancelCaptureOnly lever)
+                if stopping then
+                    lever.StopRequested <- true
+                    true
+                else
+                    false)
+
+        if shouldCancel then
+            cancelCaptureOnly lever
 
     let captureStopWasRequested (lever: CaptureOnlyStopLever) =
         lock gate (fun () -> lever.StopRequested)
@@ -482,29 +493,34 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     // backoff / storm sleep so a stop taken *between* incarnations ends the loop promptly instead of
     // waiting the delay out. Shared by the public `StopAsync` and the internal `StopActiveAsync` seam.
     let requestGracefulStop (gracePeriod: TimeSpan) : RunningProcess option =
-        let child =
+        let child, captureOnly =
             lock gate (fun () ->
                 stopGrace <- gracePeriod
                 stopping <- true
 
-                captureOnlyCurrent |> Option.iter cancelCaptureOnly
-                current)
+                captureOnlyCurrent |> Option.iter (fun lever -> lever.StopRequested <- true)
 
-        // `Cancel()` is serialized against `runLoop`'s teardown `Dispose()` under this same `gate` (see
-        // its `finally`), so the two can never interleave: whichever call takes `gate` first either runs
-        // `Cancel()` to completion while `stopCts` is still fully live (the linked `sleepCts` it notifies
-        // is guaranteed not to be disposing concurrently), or finds `stopCts` already disposed and hits
-        // the guard below cleanly. Without this lock, a `Cancel()` that starts just before a racing
-        // `Dispose()` could have its linked-token callback throw `ObjectDisposedException` against the
-        // already-torn-down `sleepCts`, which surfaces from `Cancel()` as an unhandled `AggregateException`
-        // that this handler — written only for a direct `ObjectDisposedException` — would not catch.
-        lock gate (fun () ->
-            try
-                stopCts.Cancel()
-            with :? ObjectDisposedException ->
-                // Already disposed by a concurrent `runLoop` teardown; the loop has already ended and
-                // there is nothing further to cancel.
-                ())
+                current, captureOnlyCurrent)
+
+        try
+            captureOnly |> Option.iter cancelCaptureOnly
+        finally
+            // `stopCts.Cancel()` is serialized against `runLoop`'s teardown `Dispose()` under `gate` (see
+            // its `finally`), so the two can never interleave. Keep this in `finally` so a runner-owned
+            // capture cancellation callback cannot prevent an in-flight backoff / storm pause from being
+            // interrupted.
+            lock gate (fun () ->
+                try
+                    stopCts.Cancel()
+                with
+                | :? ObjectDisposedException ->
+                    // Already disposed by a concurrent `runLoop` teardown; the loop has already ended and
+                    // there is nothing further to cancel.
+                    ()
+                | :? AggregateException ->
+                    // Linked sleep callbacks have already been notified. A faulty callback must not turn
+                    // a deliberate stop into an exception after the stop signal has been delivered.
+                    ())
 
         child
 

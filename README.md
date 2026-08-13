@@ -560,8 +560,9 @@ of hammering restarts at backoff speed. Supervision runs through the `IProcessRu
 
 `Supervisor.StartAsync()` exposes a live `SupervisionSession`. Its `StopAsync` gracefully stops a
 spawned process, while a capture-only runner is interrupted immediately through the capture token;
-in both cases the session completes with `StopReason.Stopped`. External token cancellation remains
-`ProcessError.Cancelled`.
+if at least one incarnation produced a result, the session completes with `StopReason.Stopped`.
+Otherwise it returns the last error, or `ProcessError.Cancelled` when there is no error to report.
+External token cancellation also remains `ProcessError.Cancelled`.
 
 The optional `LivenessMemory` probe intentionally samples attributable **peak** tree memory for each
 incarnation. A transient peak remains a violation after current usage falls, so choose a threshold above

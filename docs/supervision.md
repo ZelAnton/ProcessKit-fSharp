@@ -742,9 +742,11 @@ the runner from reporting an exit status, the final result uses `Outcome.Unobser
 still completes normally with `StopReason.Stopped`. Cancellation through the token passed to
 `StartAsync`, without a `StopAsync` request, remains `ProcessError.Cancelled`.
 
-A stop that lands before any incarnation has started falls under the no-result rule above: the
-supervisor will not start a child just to manufacture an outcome, so it returns the last failure
-that kept a child from starting, or `ProcessError.Cancelled` when there is no such failure.
+A stop that lands before any incarnation has produced a result falls under the no-result rule above.
+The supervisor will not start a child just to manufacture an outcome: it returns the last failure
+from an incarnation that produced no result, or `ProcessError.Cancelled` when there is no such
+failure. That `Cancelled` is produced when the token did **not** fire. To distinguish external
+cancellation from a deliberate stop, consult the token, not the error shape.
 
 For the full model of captured-versus-raised deadlines and how cancellation differs from a
 timeout, see [timeouts-and-cancellation.md](timeouts-and-cancellation.md).
