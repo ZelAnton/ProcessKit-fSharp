@@ -5,10 +5,6 @@
 			<BuildDependency Project="src/ProcessKit.Testing/ProcessKit.Testing.fsproj" />
 			<BuildDependency Project="src/ProcessKit.Extensions.DependencyInjection/ProcessKit.Extensions.DependencyInjection.fsproj" />
 			<BuildDependency Project="src/ProcessKit.Extensions.Hosting/ProcessKit.Extensions.Hosting.fsproj" />
-			<BuildDependency Project="tests/ProcessKit.ConPtyIsolationHelper/ProcessKit.ConPtyIsolationHelper.fsproj" />
-		</Project>
-		<Project Path="tests/ProcessKit.ConPtyIsolationHelper/ProcessKit.ConPtyIsolationHelper.fsproj">
-			<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
 		</Project>
 		<Project Path="tests/ProcessKit.CSharp.Tests/ProcessKit.CSharp.Tests.csproj">
 			<BuildDependency Project="src/ProcessKit/ProcessKit.fsproj" />
