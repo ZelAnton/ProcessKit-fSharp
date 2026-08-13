@@ -61,6 +61,35 @@ type internal ConPtyHostInputDouble(failWrites: exn option) =
         disposeCount <- disposeCount + 1
         base.Dispose disposing
 
+module private WindowsConsoleBroadcast =
+
+    [<Literal>]
+    let private CTRL_C_EVENT = 0u
+
+    [<UnmanagedFunctionPointer(CallingConvention.Winapi)>]
+    type Handler = delegate of uint32 -> bool
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private SetConsoleCtrlHandler(Handler handlerRoutine, bool add)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private GenerateConsoleCtrlEvent(uint32 ctrlEvent, uint32 processGroupId)
+
+    let tryInstallHostHandler () : Handler option =
+        let handler = Handler(fun _ -> true)
+
+        if SetConsoleCtrlHandler(handler, true) then
+            Some handler
+        else
+            None
+
+    let removeHostHandler (handler: Handler) =
+        SetConsoleCtrlHandler(handler, false) |> ignore
+        GC.KeepAlive handler
+
+    let broadcastCtrlC () =
+        GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0u)
+
 /// Tests for the opt-in PTY (pseudo-terminal) mode: Stage 1 (T-137) — `PtyConfig`, the `Command.Pty` /
 /// `Command.pty` builders, the build-time guards (D4/D8 + the pipeline guard), the Windows ConPTY spawn;
 /// and Stage 2 (T-138) — the real POSIX `openpty` (`posix_openpt`) + `setsid --ctty` spawn: a merged
@@ -786,6 +815,122 @@ type PtyTests() =
                         Assert.Fail "a PTY without the ctty helper must fail Unsupported, not succeed with a fake tty"
                 finally
                     Native.Posix.ptyCttyHelperAvailableForTests <- None
+        }
+
+    [<Test>]
+    member _.``Windows creation flags always isolate ConPTY while regular spawn stays opt-in``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only creation flags"
+            else
+                let observed = ResizeArray<bool * uint32>()
+                let ctrlGroups = ResizeArray<bool * bool>()
+                let originalObserver = Native.Windows.windowsCreationFlagsObserverForTests
+                let originalCtrlGroupObserver = Native.Windows.windowsCtrlGroupObserverForTests
+
+                let run (command: Command) =
+                    task {
+                        match! command.OutputStringAsync() with
+                        | Ok _ -> ()
+                        | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
+                            Assert.Ignore $"host lacks ConPTY: {message}"
+                        | Error error -> Assert.Fail $"spawn failed while observing creation flags: {error}"
+                    }
+
+                let command () =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/d"; "/c"; "exit /b 0" ]
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                try
+                    Native.Windows.windowsCreationFlagsObserverForTests <-
+                        Some(fun observation -> observed.Add observation)
+
+                    Native.Windows.windowsCtrlGroupObserverForTests <-
+                        Some(fun observation -> ctrlGroups.Add observation)
+
+                    do! run ((command ()).Pty())
+                    do! run (((command ()).Pty()).WindowsCtrlSignals())
+                    do! run (command ())
+                    do! run ((command ()).WindowsCtrlSignals())
+
+                    Assert.That(observed.Count, Is.EqualTo 4)
+
+                    let hasNewProcessGroup (_, flags) = flags &&& 0x00000200u <> 0u
+
+                    Assert.That(fst observed[0], Is.True, "the first observation must be the default ConPTY path")
+                    Assert.That(hasNewProcessGroup observed[0], Is.True, "default ConPTY must be isolated")
+                    Assert.That(fst observed[1], Is.True, "the second observation must be opt-in ConPTY")
+                    Assert.That(hasNewProcessGroup observed[1], Is.True, "opt-in ConPTY must remain isolated")
+                    Assert.That(fst observed[2], Is.False, "the third observation must be regular spawn")
+                    Assert.That(hasNewProcessGroup observed[2], Is.False, "regular spawn must remain opt-in")
+                    Assert.That(fst observed[3], Is.False, "the fourth observation must be opt-in regular spawn")
+                    Assert.That(hasNewProcessGroup observed[3], Is.True, "opt-in regular spawn must keep its flag")
+
+                    Assert.That(
+                        ctrlGroups.ToArray(),
+                        Is.EqualTo<bool * bool>([| (true, false); (true, true); (false, false); (false, true) |]),
+                        "only WindowsCtrlSignals may register either spawn path for directed CTRL+BREAK"
+                    )
+                finally
+                    Native.Windows.windowsCreationFlagsObserverForTests <- originalObserver
+                    Native.Windows.windowsCtrlGroupObserverForTests <- originalCtrlGroupObserver
+        }
+
+    [<Test>]
+    member _.``stray shared-console CTRL+C does not terminate a default ConPTY child``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only ConPTY console isolation"
+            else
+                match WindowsConsoleBroadcast.tryInstallHostHandler () with
+                | None -> Assert.Ignore "the test host has no console on which to broadcast CTRL+C"
+                | Some handler ->
+                    let completionMarker = Path.GetFullPath $"pk-conpty-complete-{Guid.NewGuid():N}.txt"
+
+                    try
+                        let script =
+                            "Start-Sleep -Seconds 2; "
+                            + "[System.IO.File]::WriteAllText($env:PK_CONPTY_COMPLETE, 'complete'); exit 23"
+
+                        let command =
+                            Command.create "powershell.exe"
+                            |> Command.args [ "-NoLogo"; "-NoProfile"; "-NonInteractive"; "-Command"; script ]
+                            |> Command.env "PK_CONPTY_COMPLETE" completionMarker
+                            |> Command.pty
+                            |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                        match! runner.StartAsync(command, CancellationToken.None) with
+                        | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
+                            Assert.Ignore $"host lacks ConPTY: {message}"
+                        | Error error -> Assert.Fail $"unexpected error from a ConPTY spawn: {error}"
+                        | Ok running ->
+                            use _running = running
+                            // Give cmd.exe time to enter the ping window before broadcasting. The completion
+                            // marker below, not this delay, is the proof that the child survived the event.
+                            do! Task.Delay 500
+
+                            if not (WindowsConsoleBroadcast.broadcastCtrlC ()) then
+                                running.Kill()
+                                let! _ = running.WaitAsync()
+                                Assert.Ignore "the test host lost its console before CTRL+C could be broadcast"
+
+                            let! outcome = running.WaitAsync()
+
+                            match outcome with
+                            | Outcome.Exited 23 -> ()
+                            | other ->
+                                Assert.Fail
+                                    $"the default ConPTY child did not survive shared-console CTRL+C to its completion exit, got {other}"
+
+                            Assert.That(
+                                File.Exists completionMarker,
+                                Is.True,
+                                "the default ConPTY child did not reach its completion marker after shared-console CTRL+C"
+                            )
+                    finally
+                        WindowsConsoleBroadcast.removeHostHandler handler
+                        File.Delete completionMarker
         }
 
     [<Test>]

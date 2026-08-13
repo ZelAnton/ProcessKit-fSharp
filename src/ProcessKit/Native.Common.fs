@@ -32,10 +32,12 @@ module internal Common =
             /// Parent sides of POSIX-only full-duplex channels, keyed by the child fd each peer was
             /// dup2'd onto. Empty on Windows and when no Command.ExtraFd was configured.
             ExtraFds: (int * Stream) list
-            /// Windows only: `true` when the child was spawned as its own console process group
-            /// (`CREATE_NEW_PROCESS_GROUP`), so `ProcessGroup.Signal(Signal.Int/Term)` can deliver a
-            /// best-effort `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to it. Always `false` on
-            /// POSIX, which delivers signals through `killpg` regardless of this flag.
+            /// Windows only: `true` when the child opted into registration as a targetable console process
+            /// group, so `ProcessGroup.Signal(Signal.Int/Term)` can deliver a best-effort
+            /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` to it. This is distinct from merely being
+            /// created with `CREATE_NEW_PROCESS_GROUP`: every ConPTY child is isolated that way, while a
+            /// default ConPTY child remains unregistered here. Always `false` on POSIX, which delivers
+            /// signals through `killpg` regardless of this flag.
             WindowsCtrlGroup: bool
             /// The retained PTY control handle/fd for a `Command.Pty` run, kept for the child's whole
             /// lifetime so `RunningProcess.ResizeAsync` can reach it — the Windows pseudoconsole handle

@@ -183,10 +183,10 @@ type internal CommandConfig =
       UncheckedInPipe: bool
       OkCodes: int list
       CreateNoWindow: bool
-      // Windows: spawn the child as its own console process group (`CREATE_NEW_PROCESS_GROUP`) so
-      // `ProcessGroup.Signal(Signal.Int/Term)` can deliver a best-effort console CTRL+BREAK to it
-      // instead of the hard Job kill. Default `false`; no effect on Unix (which signals the child's
-      // process group through `killpg` regardless).
+      // Windows: opt the child into registration for targeted CTRL+BREAK through
+      // `ProcessGroup.Signal(Signal.Int/Term)`. Regular children are also spawned in their own console
+      // process group; ConPTY children already have one unconditionally for isolation. Default `false`;
+      // no effect on Unix (which signals the child's process group through `killpg` regardless).
       WindowsCtrlSignals: bool
       // The child's CPU-scheduling priority, applied at spawn (Windows priority class / Unix nice).
       // `None` (the default) leaves the OS default untouched.
@@ -1311,7 +1311,7 @@ type Command internal (config: CommandConfig) =
     member _.CreateNoWindow() =
         Command({ config with CreateNoWindow = true })
 
-    /// Windows: spawn the child as its own console process group (`CREATE_NEW_PROCESS_GROUP`), so that
+    /// Windows: opt the child into targeted console signalling, so that
     /// `ProcessGroup.Signal(Signal.Int)` / `Signal.Term` can deliver it a best-effort console
     /// **CTRL+BREAK** — the closest Windows analogue to a graceful `SIGINT`/`SIGTERM` — instead of the
     /// hard atomic Job-Object kill, giving a console child a chance to clean up. **Best-effort and
@@ -1320,9 +1320,9 @@ type Command internal (config: CommandConfig) =
     /// cannot receive it — the send then fails honestly with `ProcessError.Unsupported` rather than a
     /// silent downgrade — and even on a successful send delivery is not guaranteed (the child may
     /// install its own console handler). `Signal.Kill` is unaffected (always the atomic Job kill), and
-    /// this has no effect on Unix, where signals reach the child's process group regardless. Note that
-    /// `CREATE_NEW_PROCESS_GROUP` also disables the child's default CTRL+C handling, which is why the
-    /// soft signal is delivered as CTRL+BREAK rather than CTRL+C.
+    /// this has no effect on Unix, where signals reach the child's process group regardless. Regular children
+    /// get a new group through this option; ConPTY children always have one for isolation, while the option
+    /// only registers their leader for directed CTRL+BREAK. The flag disables default CTRL+C handling.
     member _.WindowsCtrlSignals() =
         Command(
             { config with
