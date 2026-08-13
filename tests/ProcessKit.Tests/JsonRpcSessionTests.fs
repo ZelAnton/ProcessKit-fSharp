@@ -968,6 +968,140 @@ type JsonRpcSessionTests() =
         :> Task
 
     [<Test>]
+    member _.``a peer request cannot be answered through a different session``() : Task =
+        task {
+            let peerA = peerHandle ()
+            let peerB = peerHandle ()
+            use runningA = peerA.Running
+            use runningB = peerB.Running
+            let sessionA = JsonRpcSession(runningA)
+            let sessionB = JsonRpcSession(runningB)
+            let messages = sessionA.MessagesAsync().GetAsyncEnumerator()
+
+            peerA.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"workspace/configuration\"}")
+
+            let! received = messages.MoveNextAsync()
+            Assert.That(received, Is.True)
+            let request = messages.Current
+
+            match! sessionB.RespondRawAsync(request, "null") with
+            | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Does.Contain "different JsonRpcSession")
+            | other -> Assert.Fail $"expected a cross-session response to be unsupported, got {other}"
+
+            // A foreign session's rejected attempt must not consume the originating session's one reply.
+            match! sessionA.RespondRawAsync(request, "null") with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"expected the originating session to answer, got {error}"
+
+            use! sent = nextFrame peerA.Stdin
+            Assert.That(rawId sent, Is.EqualTo "17")
+
+            do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a response cancelled before writing can be retried``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"workspace/configuration\"}")
+
+            let! received = messages.MoveNextAsync()
+            Assert.That(received, Is.True)
+            let request = messages.Current
+            use cancellation = new CancellationTokenSource()
+            cancellation.Cancel()
+
+            match!
+                session.RespondAsync(
+                    request,
+                    { Contents = "cancelled attempt" },
+                    hoverResultTypeInfo,
+                    cancellation.Token
+                )
+            with
+            | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
+            | other -> Assert.Fail $"expected the first response attempt to be cancelled, got {other}"
+
+            match! session.RespondAsync(request, { Contents = "settings" }, hoverResultTypeInfo) with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"expected the response retry to be sent, got {error}"
+
+            use! sent = nextFrame peer.Stdin
+            Assert.That(rawId sent, Is.EqualTo "18")
+
+            Assert.That(
+                sent.RootElement.GetProperty("result").GetProperty("Contents").GetString(),
+                Is.EqualTo "settings"
+            )
+
+            do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a peer request cannot be answered twice``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"workspace/configuration\"}")
+
+            let! received = messages.MoveNextAsync()
+            Assert.That(received, Is.True)
+            let request = messages.Current
+
+            match! session.RespondRawAsync(request, "{\"items\":[]}") with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"expected the first response to be sent, got {error}"
+
+            use! first = nextFrame peer.Stdin
+            Assert.That(rawId first, Is.EqualTo "18")
+
+            match! session.RespondErrorAsync(request, -32601, "Method not found") with
+            | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Does.Contain "more than once")
+            | other -> Assert.Fail $"expected the duplicate response to be unsupported, got {other}"
+
+            do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a peer request can be answered once through its originating session``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"workspace/configuration\"}")
+
+            let! received = messages.MoveNextAsync()
+            Assert.That(received, Is.True)
+
+            match! session.RespondAsync(messages.Current, { Contents = "settings" }, hoverResultTypeInfo) with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"expected the response to be sent, got {error}"
+
+            use! sent = nextFrame peer.Stdin
+            Assert.That(rawId sent, Is.EqualTo "19")
+
+            Assert.That(
+                sent.RootElement.GetProperty("result").GetProperty("Contents").GetString(),
+                Is.EqualTo "settings"
+            )
+
+            do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
     member _.``an error answer to a peer request carries its code and message``() : Task =
         task {
             let peer = peerHandle ()
