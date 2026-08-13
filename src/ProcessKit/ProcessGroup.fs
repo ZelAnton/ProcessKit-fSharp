@@ -636,8 +636,18 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// Immediately hard-kill every process currently in the group (the honest name for the tree kill —
     /// no graceful signal). Idempotent; the group stays usable for further spawns. Returns `Result` for
-    /// parity with the other tree-control verbs. Linux cgroup v2's legacy fallback reports an I/O error
-    /// when it cannot verify that the reusable cgroup was thawed; final disposal remains best-effort.
+    /// parity with the other tree-control verbs.
+    ///
+    /// Linux cgroup v2's legacy fallback — a kernel without `cgroup.kill` (< 5.14) — reports
+    /// `ProcessError.Io` in two independent cases. **Thaw**: it cannot verify that the reusable cgroup
+    /// was thawed (`cgroup.freeze` still reports frozen, or cannot be read); an already-unfrozen or
+    /// removed freezer stays a best-effort success. **Delivery**: a member could not be signalled AND
+    /// the cgroup is still populated — or its membership unreadable — once the sweep ends; a cgroup that
+    /// did drain is not reported as a kill failure, because the drain check is the authority on whether
+    /// the tree died. That second case includes a kernel without pidfd (< 5.3), where the identity-safe
+    /// sweep kills nothing at all rather than downgrading to a raw `kill(pid, ...)` that a recycled pid
+    /// could land on an unrelated process. Final disposal remains best-effort — it removes the cgroup
+    /// regardless of either error.
     member this.KillAll() : Result<unit, ProcessError> =
         this.WhenLive(fun () -> backend.KillTree())
 
