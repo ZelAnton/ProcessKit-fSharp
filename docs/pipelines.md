@@ -306,7 +306,9 @@ Under `OverflowMode.Error` a cap is **fail-loud**: once the stream exceeds it, t
 exactly like a single command's byte capture, and consistently whether the overflow is on the final
 stdout or on any stage's stderr (an intermediate stage's stderr fail-loud overflow is no longer
 silently dropped). Under `DropOldest` / `DropNewest` the same overflow stays **lossy but
-non-erroring** (a bounded tail/head with `Truncated` set), for stderr just as for stdout.
+non-erroring**. The result's `Truncated` combines final-stage stdout truncation with truncation of
+the representative stage's published stderr; truncation of an unselected stage's stderr remains
+local to diagnostics the result does not publish.
 
 When more than one stream overflows at once — several stages, and/or a stage's stderr together with
 the final stdout — one deterministic error is chosen by
@@ -501,7 +503,7 @@ The session mirrors `RunningProcess`:
 | `StdoutJsonLinesAsync<'T>()` | the same, each non-empty line deserialized as NDJSON / JSON Lines |
 | `OutputEventsAsync()` | the final stage's stdout as `OutputEvent.Stdout` line events (a pipeline captures only the final stdout, so — unlike a single command — there are no `Stderr` events) |
 | `WaitForLineAsync(pred, timeout)` | wait until a final-stage stdout line matches — a readiness probe over the running chain |
-| `FinishAsync()` | wait for the WHOLE chain, then return `Finished` (the pipefail representative's `Outcome` + that stage's stderr); pairs with `StdoutLinesAsync` |
+| `FinishAsync()` | wait for the WHOLE chain, then return `Finished` (the pipefail representative's `Outcome` + that stage's stderr and the matching truncation signal); pairs with `StdoutLinesAsync` |
 | `StopAsync()` / `StopAsync(grace)` | gracefully stop and reap **every** stage, returning the pipefail outcome |
 | `Kill()` | fire-and-forget kill of the whole chain |
 | `DisposeAsync()` | reap the whole chain's tree (kill-on-drop) |
@@ -517,7 +519,9 @@ session `StdoutLinesAsync` started — call it *after* streaming lines; after
 [pipefail](#pipefail-the-result-and-the-ends) representative (the rightmost checked stage
 that did not exit with an accepted code, or a `TimedOut`/`Cancelled` for the whole chain),
 and `Finished.Stderr` is that stage's stderr — identical to what `RunAsync` reports, never
-a final-stage-only view. A non-zero pipefail exit is *data* in `Finished.Outcome`; a
+a final-stage-only view. `Finished.Truncated` combines drops from the final stdout stream with
+truncation of that representative stderr only; truncation on another stage does not mark diagnostics
+that were not published. A non-zero pipefail exit is *data* in `Finished.Outcome`; a
 genuine upstream relay read failure is returned as `ProcessError.Io`, while a downstream
 broken pipe and teardown race remain quiet. A fail-loud [output overflow](#fail-loud-output-overflow)
 on any stage or a stage-0

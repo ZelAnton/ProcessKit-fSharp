@@ -2282,7 +2282,15 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 else
                     match! stdinErrorOnSuccess settled with
                     | Some err -> return Error err
-                    | None -> return Ok(Finished(settled, stderrStreamBuffer.Text))
+                    | None ->
+                        return
+                            Ok(
+                                Finished(
+                                    settled,
+                                    stderrStreamBuffer.Text,
+                                    Volatile.Read(&droppedStreamLineCount) > 0 || stderrStreamBuffer.Truncated
+                                )
+                            )
             }
 
     // Returns false when a different consumption (a buffered verb, or stdout streaming) already owns the

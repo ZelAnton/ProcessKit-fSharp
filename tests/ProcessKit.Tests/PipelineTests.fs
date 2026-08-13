@@ -574,6 +574,95 @@ type PipelineTests() =
     // --- Every stage's stderr is bounded by that stage's own OutputBuffer byte cap (T-034) ---
 
     [<Test>]
+    member _.``representative pipefail stderr truncation is reported by buffered text and bytes``() : Task =
+        task {
+            let cap = 16
+
+            for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest ] do
+                let policy = (OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow overflow
+
+                let noisy = noisyFailingStage 50 None |> Command.outputBuffer policy
+
+                match! (noisy.Pipe sortStage).OutputBytesAsync() with
+                | Ok result ->
+                    Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 3))
+                    Assert.That(result.Stderr, Is.Not.Empty)
+                    Assert.That(Encoding.UTF8.GetByteCount result.Stderr, Is.LessThanOrEqualTo cap)
+                    Assert.That(result.Truncated, Is.True)
+                | Error error -> Assert.Fail $"buffered bytes failed for {overflow}: {error}"
+
+                match! (noisy.Pipe sortStage).OutputStringAsync() with
+                | Ok result ->
+                    Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 3))
+                    Assert.That(result.Stderr, Is.Not.Empty)
+                    Assert.That(Encoding.UTF8.GetByteCount result.Stderr, Is.LessThanOrEqualTo cap)
+                    Assert.That(result.Truncated, Is.True)
+                | Error error -> Assert.Fail $"buffered text failed for {overflow}: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``non-representative stderr truncation does not mark the pipeline result``() : Task =
+        task {
+            let policy =
+                (OutputBufferPolicy.Unbounded.WithMaxBytes 16).WithOverflow OverflowMode.DropNewest
+
+            let noisySuccessful = stderrStage 50 policy
+
+            match! (noisySuccessful.Pipe sortStage).OutputStringAsync() with
+            | Ok result ->
+                Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 0))
+                Assert.That(result.Stderr, Is.Empty, "the representative last stage owns the published stderr")
+                Assert.That(result.Truncated, Is.False)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``last-stage stderr truncation marks the pipeline result``() : Task =
+        task {
+            let cap = 16
+
+            let noisyLast =
+                stderrStage 50 ((OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow OverflowMode.DropOldest)
+
+            match! ((shell "exit 0").Pipe noisyLast).OutputBytesAsync() with
+            | Ok result ->
+                Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 0))
+                Assert.That(result.Stderr, Is.Not.Empty)
+                Assert.That(Encoding.UTF8.GetByteCount result.Stderr, Is.LessThanOrEqualTo cap)
+                Assert.That(result.Truncated, Is.True)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``streaming Finish reports representative pipefail stderr truncation``() : Task =
+        task {
+            let cap = 16
+
+            for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest ] do
+                let policy = (OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow overflow
+
+                let noisy = noisyFailingStage 50 None |> Command.outputBuffer policy
+
+                match! (noisy.Pipe sortStage).StartAsync() with
+                | Error error -> Assert.Fail $"streaming start failed for {overflow}: {error}"
+                | Ok session ->
+                    use session = session
+                    let! _ = collect (session.StdoutLinesAsync())
+
+                    match! session.FinishAsync() with
+                    | Ok finished ->
+                        Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 3))
+                        Assert.That(finished.Stderr, Is.Not.Empty)
+                        Assert.That(Encoding.UTF8.GetByteCount finished.Stderr, Is.LessThanOrEqualTo cap)
+                        Assert.That(finished.Truncated, Is.True)
+                    | Error error -> Assert.Fail $"streaming finish failed for {overflow}: {error}"
+        }
+        :> Task
+
+    [<Test>]
     member _.``a chatty stage's stderr is bounded by its own OutputBuffer byte cap``() : Task =
         task {
             let cap = 64

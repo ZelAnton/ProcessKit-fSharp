@@ -519,7 +519,7 @@ type StreamingTests() =
                 Assert.That(lines.Count, Is.GreaterThanOrEqualTo 3)
 
                 match finished with
-                | Ok _ -> ()
+                | Ok finished -> Assert.That(finished.Truncated, Is.False)
                 | Error error -> Assert.Fail $"{error}"
         }
         :> Task
@@ -544,7 +544,7 @@ type StreamingTests() =
             CollectionAssert.AreEqual(expected, actual)
 
             match! running.FinishAsync() with
-            | Ok _ -> ()
+            | Ok finished -> Assert.That(finished.Truncated, Is.False)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
@@ -610,7 +610,7 @@ type StreamingTests() =
             CollectionAssert.AreEqual(chunks |> Seq.collect id |> Seq.toArray, actual)
 
             match! running.FinishAsync() with
-            | Ok _ -> ()
+            | Ok finished -> Assert.That(finished.Truncated, Is.False)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
@@ -819,7 +819,7 @@ type StreamingTests() =
             )
 
             match! running.FinishAsync() with
-            | Ok _ -> ()
+            | Ok finished -> Assert.That(finished.Truncated, Is.False)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
@@ -1896,6 +1896,7 @@ type StreamingTests() =
             match! running.FinishAsync() with
             | Ok finished ->
                 Assert.That(finished.Stderr, Is.EqualTo(String('é', 32)))
+                Assert.That(finished.Truncated, Is.True)
 
                 Assert.That(
                     Encoding.UTF8.GetByteCount finished.Stderr,
@@ -2056,7 +2057,7 @@ type StreamingTests() =
                 Assert.That(running.DroppedStreamLineCount, Is.EqualTo 0)
 
                 match finished with
-                | Ok _ -> ()
+                | Ok finished -> Assert.That(finished.Truncated, Is.False)
                 | Error error -> Assert.Fail $"{error}"
         }
         :> Task
@@ -2096,7 +2097,7 @@ type StreamingTests() =
             Assert.That(running.DroppedStreamLineCount, Is.EqualTo 0)
 
             match! running.FinishAsync() with
-            | Ok _ -> ()
+            | Ok finished -> Assert.That(finished.Truncated, Is.False)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
@@ -2128,7 +2129,7 @@ type StreamingTests() =
             Assert.That(running.StdoutLineCount, Is.EqualTo total)
 
             match! running.FinishAsync() with
-            | Ok _ -> ()
+            | Ok finished -> Assert.That(finished.Truncated, Is.True)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
@@ -2158,7 +2159,7 @@ type StreamingTests() =
             Assert.That(running.StdoutLineCount, Is.EqualTo total)
 
             match! running.FinishAsync() with
-            | Ok _ -> ()
+            | Ok finished -> Assert.That(finished.Truncated, Is.True)
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task

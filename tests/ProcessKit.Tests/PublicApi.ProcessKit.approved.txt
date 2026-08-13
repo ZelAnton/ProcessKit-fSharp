@@ -236,6 +236,7 @@ class ProcessKit.ExpectMatch
 class ProcessKit.Finished
   property Outcome : ProcessKit.Outcome { get }
   property Stderr : System.String { get }
+  property Truncated : System.Boolean { get }
 
 interface ProcessKit.IProcessRunner
   member CaptureBytesAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
@@ -1537,4 +1538,3 @@ enum ProcessKit.WindowsUiRestrictions
   field literal SystemParameters : ProcessKit.WindowsUiRestrictions
   field literal WriteClipboard : ProcessKit.WindowsUiRestrictions
   field value__ : System.Int32
-
