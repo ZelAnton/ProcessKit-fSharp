@@ -1001,6 +1001,49 @@ type JsonRpcSessionTests() =
         :> Task
 
     [<Test>]
+    member _.``a response cancelled before writing can be retried``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"workspace/configuration\"}")
+
+            let! received = messages.MoveNextAsync()
+            Assert.That(received, Is.True)
+            let request = messages.Current
+            use cancellation = new CancellationTokenSource()
+            cancellation.Cancel()
+
+            match!
+                session.RespondAsync(
+                    request,
+                    { Contents = "cancelled attempt" },
+                    hoverResultTypeInfo,
+                    cancellation.Token
+                )
+            with
+            | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
+            | other -> Assert.Fail $"expected the first response attempt to be cancelled, got {other}"
+
+            match! session.RespondAsync(request, { Contents = "settings" }, hoverResultTypeInfo) with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"expected the response retry to be sent, got {error}"
+
+            use! sent = nextFrame peer.Stdin
+            Assert.That(rawId sent, Is.EqualTo "18")
+
+            Assert.That(
+                sent.RootElement.GetProperty("result").GetProperty("Contents").GetString(),
+                Is.EqualTo "settings"
+            )
+
+            do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
     member _.``a peer request cannot be answered twice``() : Task =
         task {
             let peer = peerHandle ()

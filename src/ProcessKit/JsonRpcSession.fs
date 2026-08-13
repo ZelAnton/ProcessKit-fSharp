@@ -76,6 +76,9 @@ type JsonRpcMessage
     member internal _.TryClaimResponse() =
         Interlocked.CompareExchange(&responseClaimed, 1, 0) = 0
 
+    member internal _.ReleaseResponseClaim() =
+        Interlocked.Exchange(&responseClaimed, 0) |> ignore
+
     /// Deserialize `params` into a `'T` using source-generated `JsonTypeInfo&lt;'T&gt;` metadata, so this
     /// overload is safe for trimmed and NativeAOT applications. A message with no `params`, or one whose
     /// `params` do not fit `'T`, is `ProcessError.Parse` — never a raw exception.
@@ -204,11 +207,11 @@ type private DropCounter() =
 [<Sealed>]
 type JsonRpcSession
     internal
-    (running: RunningProcess, maxFrameBytes: int, messageBacklog: int, beforePendingCompletion: Action<int64> | null) as this
-    =
+    (running: RunningProcess, maxFrameBytes: int, messageBacklog: int, beforePendingCompletion: Action<int64> | null) =
     do ArgumentNullException.ThrowIfNull(running, nameof running)
     do ArgumentOutOfRangeException.ThrowIfLessThan(messageBacklog, 1, nameof messageBacklog)
 
+    let identity = obj ()
     let config = running.Config
     let program = config.Program
 
@@ -450,7 +453,7 @@ type JsonRpcSession
                     id |> Option.map (fun value -> value.GetRawText()),
                     property "params" |> Option.map (fun value -> value.GetRawText()),
                     payload,
-                    this
+                    identity
                 )
 
             // Never blocks (see the channel's drop policy), so a consumer that is not reading its
@@ -575,9 +578,9 @@ type JsonRpcSession
     // only that call, while one the framing layer reports from mid-write may have torn a frame and ends
     // the session (see `endTornSend`). `classifyInterrupt` names which token ended it — a request's own
     // deadline reports a timeout, anything else a cancellation.
-    member private _.SendFramed
+    member private _.SendFramedStaged
         (payload: byte[], cancellationToken: CancellationToken, classifyInterrupt: ProcessError -> ProcessError)
-        : Task<Result<unit, ProcessError>> =
+        : Task<Result<unit, ProcessError * FramedSendStage>> =
         task {
             let mutable entered = false
 
@@ -591,22 +594,31 @@ type JsonRpcSession
                 ()
 
             if not entered then
-                return Error(classifyInterrupt (ProcessError.Cancelled program))
+                return Error(classifyInterrupt (ProcessError.Cancelled program), FramedSendStage.BeforeWrite)
             else
                 try
                     // The same check once more, for a token that fired in the instant the gate was being
                     // handed over: still nothing written, so still not the session's failure.
                     if cancellationToken.IsCancellationRequested then
-                        return Error(classifyInterrupt (ProcessError.Cancelled program))
+                        return Error(classifyInterrupt (ProcessError.Cancelled program), FramedSendStage.BeforeWrite)
                     else
                         match! transport.SendStagedAsync(payload, cancellationToken) with
                         | Ok() -> return Ok()
                         | Error(error, stage) ->
                             let reported = classifyInterrupt error
                             endTornSend stage reported
-                            return Error reported
+                            return Error(reported, stage)
                 finally
                     sendGate.Release() |> ignore
+        }
+
+    member private this.SendFramed
+        (payload: byte[], cancellationToken: CancellationToken, classifyInterrupt: ProcessError -> ProcessError)
+        : Task<Result<unit, ProcessError>> =
+        task {
+            match! this.SendFramedStaged(payload, cancellationToken, classifyInterrupt) with
+            | Ok() -> return Ok()
+            | Error(error, _) -> return Error error
         }
 
     // Wait for the answer to an already-sent request under the call's own deadline (`armed`, ticking
@@ -769,7 +781,7 @@ type JsonRpcSession
                         "answering a JSON-RPC notification (a message with no id, so the peer is not waiting for a reply)"
                 )
             )
-        | Some _ when not (request.OriginatesFrom this) ->
+        | Some _ when not (request.OriginatesFrom this.Identity) ->
             Task.FromResult(
                 Error(
                     ProcessError.Unsupported
@@ -795,12 +807,21 @@ type JsonRpcSession
                         writer.WriteRawValue(id, true)
                         writeBody writer)
 
-                this.SendFramed(payload, cancellationToken, noDeadline)
+                task {
+                    match! this.SendFramedStaged(payload, cancellationToken, noDeadline) with
+                    | Ok() -> return Ok()
+                    | Error(error, FramedSendStage.BeforeWrite) ->
+                        request.ReleaseResponseClaim()
+                        return Error error
+                    | Error(error, FramedSendStage.Writing) -> return Error error
+                }
 
     // ---- session state --------------------------------------------------------------------------
 
     /// The maximum framed payload size in either direction, in bytes.
     member _.MaxFrameBytes = transport.MaxFrameBytes
+
+    member internal _.Identity = identity
 
     /// How many incoming notifications/peer requests were dropped because the inbound backlog was full
     /// — a consumer that is not enumerating `MessagesAsync`, or is falling behind the peer. Always `0`
@@ -1011,9 +1032,10 @@ type JsonRpcSession
     // ---- answering the peer ---------------------------------------------------------------------
 
     /// Answer a peer request (`JsonRpcMessage.IsRequest`) with a `result` that is already JSON text —
-    /// serializer-free, so always trim-/NativeAOT-safe. Only the first response attempt is accepted by the
-    /// session that received the request. A later attempt, an attempt through another session, or answering
-    /// a notification is a typed `ProcessError.Unsupported`.
+    /// serializer-free, so always trim-/NativeAOT-safe. Only the first response that starts writing is
+    /// accepted by the session that received the request; an attempt that fails before writing may be
+    /// retried. A later attempt, an attempt through another session, or answering a notification is a typed
+    /// `ProcessError.Unsupported`.
     member this.RespondRawAsync
         (request: JsonRpcMessage, resultJson: string, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
@@ -1029,8 +1051,9 @@ type JsonRpcSession
         )
 
     /// Answer a peer request with a `result` serialized through source-generated `JsonTypeInfo` metadata
-    /// (the trim-/NativeAOT-safe path). Only the first response attempt is accepted by the session that
-    /// received the request; a later or cross-session attempt is a typed
+    /// (the trim-/NativeAOT-safe path). Only the first response that starts writing is accepted by the
+    /// session that received the request; an attempt that fails before writing may be retried, while a
+    /// later or cross-session attempt is a typed
     /// `ProcessError.Unsupported`.
     member this.RespondAsync<'R>
         (
@@ -1051,8 +1074,9 @@ type JsonRpcSession
         )
 
     /// Answer a peer request with a `result` serialized via reflection-based `System.Text.Json`
-    /// (`options` omitted uses the BCL defaults). Only the first response attempt is accepted by the
-    /// session that received the request; a later or cross-session attempt is a typed
+    /// (`options` omitted uses the BCL defaults). Only the first response that starts writing is accepted
+    /// by the session that received the request; an attempt that fails before writing may be retried,
+    /// while a later or cross-session attempt is a typed
     /// `ProcessError.Unsupported`.
     ///
     /// **Trimming / AOT:** not trim-/AOT-safe — use the `JsonTypeInfo` overload (or `RespondRawAsync`)
@@ -1079,8 +1103,9 @@ type JsonRpcSession
 
     /// Answer a peer request with a JSON-RPC `error` object — the honest reply when the peer asks for
     /// something this client cannot do (`-32601` "method not found", `-32602` "invalid params", and the
-    /// rest of the reserved range are the conventional codes). Only the first response attempt is accepted
-    /// by the session that received the request; a later or cross-session attempt is a typed
+    /// rest of the reserved range are the conventional codes). Only the first response that starts writing
+    /// is accepted by the session that received the request; an attempt that fails before writing may be
+    /// retried, while a later or cross-session attempt is a typed
     /// `ProcessError.Unsupported`.
     member this.RespondErrorAsync
         (request: JsonRpcMessage, code: int, message: string, [<Optional>] cancellationToken: CancellationToken)
