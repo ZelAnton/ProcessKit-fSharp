@@ -9,13 +9,14 @@ class ProcessKit.Testing.CassetteEntry
   member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
   member ToString() : System.String
   new()
-  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double, System.Boolean, System.Nullable<System.Int32>, System.Nullable<System.Int32>)
+  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double, System.Boolean, System.Nullable<System.Int32>, System.Nullable<System.Int32>, ProcessKit.Testing.CassetteFailure)
   property Args : System.String[] { get; set }
   property Code : System.Nullable<System.Int32> { get; set }
   property Cwd : System.String { get; set }
   property DurationMs : System.Double { get; set }
   property EnvFingerprint : System.String { get; set }
   property EnvNames : System.String[] { get; set }
+  property Failure : ProcessKit.Testing.CassetteFailure { get; set }
   property HasStdin : System.Boolean { get; set }
   property Program : System.String { get; set }
   property Pty : System.Boolean { get; set }
@@ -29,6 +30,33 @@ class ProcessKit.Testing.CassetteEntry
   property StdoutBase64 : System.String { get; set }
   property TimedOut : System.Boolean { get; set }
   property Truncated : System.Boolean { get; set }
+
+class ProcessKit.Testing.CassetteFailure
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.Testing.CassetteFailure>
+  member Equals(ProcessKit.Testing.CassetteFailure) : System.Boolean
+  member Equals(ProcessKit.Testing.CassetteFailure, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  new()
+  new(System.String, System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Double>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.String, System.String)
+  property ByteLimit : System.Nullable<System.Int32> { get; set }
+  property Code : System.Nullable<System.Int32> { get; set }
+  property Data : System.String { get; set }
+  property Detail : System.String { get; set }
+  property Kind : System.String { get; set }
+  property LineLimit : System.Nullable<System.Int32> { get; set }
+  property Method : System.String { get; set }
+  property Searched : System.String { get; set }
+  property Signal : System.Nullable<System.Int32> { get; set }
+  property Stderr : System.String { get; set }
+  property Stdout : System.String { get; set }
+  property TimeoutMs : System.Nullable<System.Double> { get; set }
+  property TotalBytes : System.Nullable<System.Int32> { get; set }
+  property TotalLines : System.Nullable<System.Int32> { get; set }
 
 class ProcessKit.Testing.CassetteFile
   :> System.Collections.IStructuralEquatable

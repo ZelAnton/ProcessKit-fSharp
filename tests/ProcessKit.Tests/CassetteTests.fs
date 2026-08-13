@@ -78,6 +78,50 @@ type private FixedRunner(stdout: string, code: int) =
         member _.SpawnAsync(_command, _cancellationToken) =
             Task.FromResult(Error(ProcessError.Unsupported "FixedRunner has no Spawn"))
 
+/// A deterministic inner `IProcessRunner` whose every verb FAILS with a scripted typed error: the
+/// errors in order, then the last one again for every later call (so a fixed failure needs a
+/// one-element script). `Calls` counts every call it served, which is how a test proves a replay never
+/// reached the inner runner at all.
+type private ErrorRunner(errors: ProcessError list) =
+    let scripted = List.toArray errors
+    let mutable calls = 0
+
+    let next () =
+        let index = min calls (scripted.Length - 1)
+        calls <- calls + 1
+        scripted[index]
+
+    /// How many capture/spawn calls this runner has served.
+    member _.Calls = calls
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult<Result<ProcessResult<string>, ProcessError>>(Error(next ()))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult<Result<ProcessResult<byte[]>, ProcessError>>(Error(next ()))
+
+        member _.SpawnAsync(_command, _cancellationToken) =
+            Task.FromResult<Result<RunningProcess, ProcessError>>(Error(next ()))
+
+/// An inner runner that cancels `source` and only THEN returns its typed failure — the exact race the
+/// record path's cancellation gate is about: the call really has come back with a failure, but the
+/// effective token is already cancellation-requested by the time the recorder looks at it.
+type private CancelThenFailRunner(source: CancellationTokenSource, error: ProcessError) =
+    let fail () =
+        source.Cancel()
+        error
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(_command, _cancellationToken) =
+            Task.FromResult<Result<ProcessResult<string>, ProcessError>>(Error(fail ()))
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            Task.FromResult<Result<ProcessResult<byte[]>, ProcessError>>(Error(fail ()))
+
+        member _.SpawnAsync(_command, _cancellationToken) =
+            Task.FromResult<Result<RunningProcess, ProcessError>>(Error(fail ()))
+
 [<TestFixture>]
 type CassetteTests() =
 
@@ -1467,7 +1511,7 @@ type CassetteTests() =
     // --- PTY recordings and cassette schema migrations -----------------------------------------------
 
     [<Test>]
-    member _.``recording a Command.Pty run writes a v6 cassette with the Pty flag and geometry``() : Task =
+    member _.``recording a Command.Pty run writes a current-format cassette with the Pty flag and geometry``() : Task =
         withCassette (fun path ->
             task {
                 do!
@@ -1482,7 +1526,7 @@ type CassetteTests() =
                     }
 
                 let onDisk = File.ReadAllText path
-                Assert.That(onDisk, Does.Contain "\"Version\": 6", "a PTY recording writes the v6 format")
+                Assert.That(onDisk, Does.Contain "\"Version\": 7", "a PTY recording writes the current format")
                 Assert.That(onDisk, Does.Contain "\"Pty\": true")
                 // PtyConfig.Default geometry is 80x24.
                 Assert.That(onDisk, Does.Contain "\"PtyCols\": 80")
@@ -1490,12 +1534,13 @@ type CassetteTests() =
             })
 
     [<Test>]
-    member _.``pre-v6 cassettes v1 through v5 still load and replay as non-PTY under the v6 build``() : Task =
+    member _.``pre-v7 cassettes v1 through v6 still load and replay as recorded results under the v7 build``() : Task =
         task {
-            // One hand-crafted fixture per legacy version. Each must load under the v6 build (a missing
-            // Pty field defaults to false / non-PTY, and a missing Signalled field preserves legacy
-            // signal behavior) and replay its recorded stdout, proving the v1→v6
-            // back-compat load path, not just v1/v2.
+            // One hand-crafted fixture per legacy version. Each must load under the v7 build (a missing
+            // Pty field defaults to false / non-PTY, a missing Signalled field preserves legacy signal
+            // behavior, and a missing Failure keeps the entry the recorded RESULT it always was) and
+            // replay its recorded stdout, proving the whole v1→v7 back-compat load path, not just the
+            // newest predecessor.
             let fixtures =
                 [ 1,
                   "legacy1",
@@ -1516,7 +1561,11 @@ type CassetteTests() =
                   5,
                   "legacy5",
                   "five",
-                  """{ "Version": 5, "Entries": [ { "Program": "legacy5", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "five", "Stderr": "", "Pty": false } ] }""" ]
+                  """{ "Version": 5, "Entries": [ { "Program": "legacy5", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "five", "Stderr": "", "Pty": false } ] }"""
+                  6,
+                  "legacy6",
+                  "six",
+                  """{ "Version": 6, "Entries": [ { "Program": "legacy6", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "six", "Stderr": "", "Pty": false, "Signalled": false, "Code": 0 } ] }""" ]
 
             for version, program, expected, json in fixtures do
                 let path = Path.GetTempFileName()
@@ -1525,7 +1574,7 @@ type CassetteTests() =
                     File.WriteAllText(path, json)
 
                     match RecordReplayRunner.Replay path with
-                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v6 build: {error}"
+                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v7 build: {error}"
                     | Ok replayer ->
                         match! (runner replayer).OutputStringAsync(Command.create program, CancellationToken.None) with
                         | Ok result ->
@@ -1656,6 +1705,534 @@ type CassetteTests() =
                             [| "out1"; "out2" |],
                             events |> Seq.map (fun e -> e.Text) |> Seq.toArray
                         )
+            })
+
+    // --- Recorded typed failures (cassette format v7) ------------------------------------------------
+    //
+    // A recording is only as honest as the calls it keeps: before v7 a call that ended in a typed
+    // `ProcessError` was returned to the caller and written nowhere, so the very failures a test
+    // records a cassette FOR — a missing program, a refused spawn, an unreadable stdin source, a
+    // fail-loud output ceiling — replayed as `CassetteMiss`, and an Auto session re-ran the real tool
+    // on every pass. These tests pin the recorded-failure half of the format: which errors are
+    // recorded, that they come back as the same case and payload (never a generic `Io`/`CassetteMiss`),
+    // that replay reaches no inner runner, and where the boundary against a racing cancellation sits.
+
+    [<Test>]
+    member _.``every recordable typed failure round-trips as the same case and payload, on both capture verbs``
+        ()
+        : Task =
+        task {
+            // One case per recordable `ProcessError`, plus the payload variants that must survive
+            // DISTINCTLY: a `NotFound` whose search path is absent / empty / present (three different
+            // facts), a signal with and without a number, each `OutputTooLarge` unit, and a JSON-RPC
+            // `data` member both attached and absent.
+            let failures =
+                [ ProcessError.NotFound("not-found-searched", Some "/usr/bin:/bin")
+                  ProcessError.NotFound("not-found-unsearched", None)
+                  ProcessError.NotFound("not-found-empty-path", Some "")
+                  ProcessError.Spawn("spawn-tool", "EACCES: permission denied")
+                  ProcessError.Stdin("stdin-tool", "could not open /tmp/does-not-exist")
+                  ProcessError.Exit("exit-tool", 3, "partial stdout", "boom")
+                  ProcessError.Signalled("signalled-known", Some 9, "some stdout", "killed")
+                  ProcessError.Signalled("signalled-unknown", None, "some stdout", "killed")
+                  ProcessError.Timeout("timeout-tool", TimeSpan.FromMilliseconds 2500.0, "slow out", "slow err")
+                  ProcessError.OutputTooLarge("too-many-lines", Some 10, None, 11, 4096)
+                  ProcessError.OutputTooLarge("too-many-bytes", None, Some 1024, 0, 2048)
+                  ProcessError.Parse("parse-tool", "unexpected token at offset 3")
+                  ProcessError.JsonRpc(
+                      "rpc-with-data",
+                      "textDocument/hover",
+                      -32601,
+                      "method not found",
+                      Some """{"retryable":false}"""
+                  )
+                  ProcessError.JsonRpc("rpc-without-data", "shutdown", -32602, "invalid params", None) ]
+
+            for expected in failures do
+                let program =
+                    match expected.Program with
+                    | Some name -> name
+                    | None -> ""
+
+                let path = Path.GetTempFileName()
+
+                try
+                    do!
+                        task {
+                            use recorder = RecordReplayRunner.Record(path, ErrorRunner [ expected ])
+                            let recordLabel: string = $"{program}: record mode must return the live failure"
+
+                            match!
+                                (runner recorder).CaptureStringAsync(Command.create program, CancellationToken.None)
+                            with
+                            | Error error -> Assert.That(error, Is.EqualTo expected, recordLabel)
+                            | Ok result ->
+                                Assert.Fail
+                                    $"the inner runner failed, so the recorder must not report success: {result.Stdout}"
+
+                            match recorder.Save() with
+                            | Ok() -> ()
+                            | Error error -> Assert.Fail $"save ({program}): {error}"
+                        }
+
+                    // Replay mode holds NO inner runner at all, so whatever comes back here can only
+                    // have come from the cassette — never from a subprocess or a delegate.
+                    match RecordReplayRunner.Replay path with
+                    | Error error -> Assert.Fail $"replay load ({program}): {error}"
+                    | Ok replayer ->
+                        use replayer = replayer
+                        let stringLabel: string = $"{program} must replay as the same typed failure"
+
+                        match! (runner replayer).CaptureStringAsync(Command.create program, CancellationToken.None) with
+                        | Error error -> Assert.That(error, Is.EqualTo expected, stringLabel)
+                        | Ok result -> Assert.Fail $"a recorded failure must not replay as a result: {result.Stdout}"
+
+                        // A failure has no verb-specific payload, so the bytes verb replays the very
+                        // same error rather than the "recorded as text, re-record for bytes" refusal a
+                        // recorded RESULT would (correctly) give.
+                        let bytesLabel: string = $"{program} must replay identically through the bytes verb"
+
+                        match! (runner replayer).CaptureBytesAsync(Command.create program, CancellationToken.None) with
+                        | Error error -> Assert.That(error, Is.EqualTo expected, bytesLabel)
+                        | Ok result ->
+                            Assert.Fail $"a recorded failure must not replay as bytes: {result.Stdout.Length} bytes"
+                finally
+                    deleteCassette path
+        }
+
+    [<Test>]
+    member _.``recording a typed failure writes the v7 Failure form and no result half``() : Task =
+        withCassette (fun path ->
+            task {
+                do!
+                    task {
+                        use recorder =
+                            RecordReplayRunner.Record(
+                                path,
+                                ErrorRunner [ ProcessError.NotFound("git", Some "/usr/bin") ]
+                            )
+
+                        let! _ = (runner recorder).CaptureStringAsync(Command.create "git", CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                let onDisk = File.ReadAllText path
+                Assert.That(onDisk, Does.Contain "\"Version\": 7", "a recorded failure writes the v7 format")
+                Assert.That(onDisk, Does.Contain "\"Kind\": \"NotFound\"", "the discriminant names the error case")
+                Assert.That(onDisk, Does.Contain "\"Searched\": \"/usr/bin\"", "the payload keeps the searched path")
+
+                Assert.That(
+                    onDisk,
+                    Does.Not.Contain "\"Code\"",
+                    "a failure entry records no result half — every unused field stays omitted"
+                )
+            })
+
+    [<Test>]
+    member _.``an Auto session replays a recorded failure instead of calling the inner runner again``() : Task =
+        withCassette (fun path ->
+            task {
+                let expected = ProcessError.NotFound("git", Some "/usr/bin")
+                let inner = ErrorRunner [ expected ]
+
+                let command () =
+                    Command.create "git" |> Command.arg "status"
+
+                match RecordReplayRunner.Auto(path, inner) with
+                | Error error -> Assert.Fail $"auto load: {error}"
+                | Ok recorder ->
+                    use recorder = recorder
+
+                    match! (runner recorder).CaptureStringAsync(command (), CancellationToken.None) with
+                    | Error error -> Assert.That(error, Is.EqualTo expected, "the first call delegates and fails")
+                    | Ok _ -> Assert.Fail "the inner runner failed, so the first call must fail too"
+
+                    match! (runner recorder).CaptureStringAsync(command (), CancellationToken.None) with
+                    | Error error -> Assert.That(error, Is.EqualTo expected, "the repeat replays the recorded failure")
+                    | Ok _ -> Assert.Fail "the repeat must replay the recorded failure"
+
+                    Assert.That(
+                        inner.Calls,
+                        Is.EqualTo 1,
+                        "a recorded failure must replay without reaching the inner runner a second time"
+                    )
+
+                    match recorder.Save() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"save: {error}"
+
+                // ...and it was persisted, so a later hermetic session replays it too.
+                CollectionAssert.AreEqual([| "git" |], cassettePrograms path)
+            })
+
+    [<Test>]
+    member _.``duplicate recorded failures replay in capture order, then repeat the last``() : Task =
+        withCassette (fun path ->
+            task {
+                let first = ProcessError.Exit("tool", 1, "", "first failure")
+                let second = ProcessError.Exit("tool", 2, "", "second failure")
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, ErrorRunner [ first; second ])
+
+                        for _ in 1..2 do
+                            let! _ =
+                                (runner recorder).CaptureStringAsync(Command.create "tool", CancellationToken.None)
+
+                            ()
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+
+                    // The third call has no third recording: duplicates replay in capture order and then
+                    // repeat the last one, exactly as duplicate RESULTS do.
+                    for index, expected in List.indexed [ first; second; second ] do
+                        let label: string = $"replay {index} must be the recorded failure for that position"
+
+                        match! (runner replayer).CaptureStringAsync(Command.create "tool", CancellationToken.None) with
+                        | Error error -> Assert.That(error, Is.EqualTo expected, label)
+                        | Ok _ -> Assert.Fail $"replay {index} must be a failure"
+            })
+
+    [<Test>]
+    member _.``the redaction hook scrubs a recorded failure's streams, detail, data, and searched path``() : Task =
+        withCassette (fun path ->
+            task {
+                // The same hook that keeps a secret out of a recorded RESULT must keep it out of the
+                // error half: an echoed credential can land in a failure's captured streams, in a spawn
+                // detail built around a command line, in a JSON-RPC peer's `data`, or in the `PATH` a
+                // not-found lookup reports.
+                let options =
+                    RecordReplayOptions().WithRedaction(fun s -> s.Replace("hunter2", "[REDACTED]"))
+
+                let secrets =
+                    [ ProcessError.Exit("exit-tool", 1, "token=hunter2", "auth failed for hunter2")
+                      ProcessError.Spawn("spawn-tool", "could not run: --password=hunter2")
+                      ProcessError.JsonRpc(
+                          "rpc-tool",
+                          "login",
+                          -32000,
+                          "denied for hunter2",
+                          Some """{"pw":"hunter2"}"""
+                      )
+                      ProcessError.NotFound("which-tool", Some "/opt/hunter2/bin:/usr/bin") ]
+
+                let scrubbed =
+                    [ ProcessError.Exit("exit-tool", 1, "token=[REDACTED]", "auth failed for [REDACTED]")
+                      ProcessError.Spawn("spawn-tool", "could not run: --password=[REDACTED]")
+                      ProcessError.JsonRpc(
+                          "rpc-tool",
+                          "login",
+                          -32000,
+                          "denied for [REDACTED]",
+                          Some """{"pw":"[REDACTED]"}"""
+                      )
+                      ProcessError.NotFound("which-tool", Some "/opt/[REDACTED]/bin:/usr/bin") ]
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, ErrorRunner secrets, options)
+
+                        for error in secrets do
+                            let program =
+                                match error.Program with
+                                | Some name -> name
+                                | None -> ""
+
+                            let! _ =
+                                (runner recorder).CaptureStringAsync(Command.create program, CancellationToken.None)
+
+                            ()
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                let onDisk = File.ReadAllText path
+
+                Assert.That(
+                    onDisk,
+                    Does.Not.Contain "hunter2",
+                    "no failure field may carry the secret to disk — streams, detail, data, or searched path"
+                )
+
+                Assert.That(onDisk, Does.Contain "[REDACTED]")
+
+                // ...and the scrubbed payload is what replays.
+                match RecordReplayRunner.Replay(path, options) with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+
+                    for expected in scrubbed do
+                        let program =
+                            match expected.Program with
+                            | Some name -> name
+                            | None -> ""
+
+                        let label: string = $"{program} must replay its redacted payload"
+
+                        match!
+                            (runner replayer).CaptureStringAsync(Command.create program, CancellationToken.None)
+                        with
+                        | Error error -> Assert.That(error, Is.EqualTo expected, label)
+                        | Ok _ -> Assert.Fail $"{program} must replay as a failure"
+            })
+
+    [<Test>]
+    member _.``the record boundary is the token when the failure arrives, not the failure itself``() : Task =
+        task {
+            // The two halves of the boundary, differing ONLY in when the caller's token fires. Same
+            // command, same inner failure, same recorder configuration:
+            //   * live token when the failure arrives  -> the call completed, so it is recorded;
+            //   * token already cancellation-requested -> the call was being torn down, so nothing is
+            //     recorded (whether the cancellation caused the failure or merely raced it cannot be
+            //     known here), while the caller still gets the inner failure verbatim rather than a
+            //     relabelled `Cancelled`.
+            let failure = ProcessError.Spawn("tool", "resource temporarily unavailable")
+
+            let record (makeInner: unit -> IProcessRunner) (token: CancellationToken) : Task<string[]> =
+                task {
+                    let path = Path.GetTempFileName()
+
+                    try
+                        do!
+                            task {
+                                use recorder = RecordReplayRunner.Record(path, makeInner ())
+
+                                match! (runner recorder).CaptureStringAsync(Command.create "tool", token) with
+                                | Error error ->
+                                    Assert.That(
+                                        error,
+                                        Is.EqualTo failure,
+                                        "the caller sees the inner failure either way"
+                                    )
+                                | Ok _ -> Assert.Fail "the inner runner failed, so the call must fail"
+
+                                match recorder.Save() with
+                                | Ok() -> ()
+                                | Error error -> Assert.Fail $"save: {error}"
+                            }
+
+                        return cassettePrograms path
+                    finally
+                        deleteCassette path
+                }
+
+            let! completed = record (fun () -> ErrorRunner [ failure ]) CancellationToken.None
+
+            CollectionAssert.AreEqual(
+                [| "tool" |],
+                completed,
+                "a failure that arrived with a live token is a completed call and is recorded"
+            )
+
+            use cancelling = new CancellationTokenSource()
+            let! raced = record (fun () -> CancelThenFailRunner(cancelling, failure)) cancelling.Token
+
+            Assert.That(
+                raced,
+                Is.Empty,
+                "a failure that arrived with the token already cancelled must not reach the cassette"
+            )
+        }
+
+    [<Test>]
+    member _.``an error this format does not record is returned unrecorded and still misses on replay``() : Task =
+        task {
+            // Deliberately outside the recordable set: a cancellation (the caller's control flow), the
+            // machinery's own miss, a nested retry-predicate failure this flat payload cannot hold, and
+            // the transient/host-dependent kinds. Each must behave exactly as it did before failures
+            // were recorded at all — returned to the caller, written nowhere.
+            let unrecorded =
+                [ ProcessError.Cancelled "tool"
+                  ProcessError.CassetteMiss "tool"
+                  ProcessError.Io "the disk went away"
+                  ProcessError.Unsupported "not on this platform"
+                  ProcessError.Unobserved("tool", "the exit status could not be read")
+                  ProcessError.NotReady("tool", TimeSpan.FromSeconds 1.0)
+                  ProcessError.ResourceLimit "no whole-tree limit primitive here"
+                  ProcessError.Adopt(4321, "the target had already exited")
+                  ProcessError.RetryPredicate("tool", ProcessError.Exit("tool", 1, "", ""), "the predicate threw") ]
+
+            for expected in unrecorded do
+                let path = Path.GetTempFileName()
+
+                try
+                    do!
+                        task {
+                            use recorder = RecordReplayRunner.Record(path, ErrorRunner [ expected ])
+                            let label: string = $"the caller still sees {expected.Message}"
+
+                            match!
+                                (runner recorder).CaptureStringAsync(Command.create "tool", CancellationToken.None)
+                            with
+                            | Error error -> Assert.That(error, Is.EqualTo expected, label)
+                            | Ok _ -> Assert.Fail "the inner runner failed, so the call must fail"
+
+                            match recorder.Save() with
+                            | Ok() -> ()
+                            | Error error -> Assert.Fail $"save: {error}"
+                        }
+
+                    let emptyLabel: string = $"{expected.Message} must not be recorded"
+                    Assert.That(cassettePrograms path, Is.Empty, emptyLabel)
+
+                    match RecordReplayRunner.Replay path with
+                    | Error error -> Assert.Fail $"replay load: {error}"
+                    | Ok replayer ->
+                        use replayer = replayer
+
+                        match! (runner replayer).CaptureStringAsync(Command.create "tool", CancellationToken.None) with
+                        | Error(ProcessError.CassetteMiss "tool") -> ()
+                        | other -> Assert.Fail $"an unrecorded call must still miss on replay, got {other}"
+                finally
+                    deleteCassette path
+        }
+
+    [<Test>]
+    member _.``a recorded launch failure replays through SpawnAsync as that failure, not a fake handle``() : Task =
+        withCassette (fun path ->
+            task {
+                // `NotFound`/`Spawn` are launch failures: a real `SpawnAsync` of the same command
+                // reported exactly this, so the replayed handle-producing verb must report it too rather
+                // than starting a fake process from an entry that never held a result.
+                let expected = ProcessError.NotFound("git", Some "/usr/bin:/bin")
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, ErrorRunner [ expected ])
+                        let! _ = (runner recorder).CaptureStringAsync(Command.create "git", CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+
+                    match! (runner replayer).SpawnAsync(Command.create "git", CancellationToken.None) with
+                    | Error error -> Assert.That(error, Is.EqualTo expected, "the recorded failure replays as itself")
+                    | Ok proc ->
+                        use proc = proc
+                        Assert.Fail $"a recorded failure must not replay as a live handle (pid {proc.Pid})"
+            })
+
+    [<Test>]
+    member _.``a cassette mixing recorded results and recorded failures loads and replays both``() : Task =
+        withCassette (fun path ->
+            task {
+                // The realistic shape of a grown cassette: some calls succeeded, some failed. Both halves
+                // must load together and replay as what they are.
+                let failure = ProcessError.Stdin("feeder", "could not open /tmp/gone")
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("recorded-output", 0))
+                        let! _ = (runner recorder).CaptureStringAsync(Command.create "ok-tool", CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Auto(path, ErrorRunner [ failure ]) with
+                | Error error -> Assert.Fail $"auto load: {error}"
+                | Ok grower ->
+                    use grower = grower
+                    let! _ = (runner grower).CaptureStringAsync(Command.create "feeder", CancellationToken.None)
+
+                    match grower.Save() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"save: {error}"
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a mixed cassette must load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+
+                    match! (runner replayer).CaptureStringAsync(Command.create "ok-tool", CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded-output")
+                    | Error error -> Assert.Fail $"the recorded result must still replay: {error}"
+
+                    match! (runner replayer).CaptureStringAsync(Command.create "feeder", CancellationToken.None) with
+                    | Error error ->
+                        Assert.That(error, Is.EqualTo failure, "the recorded failure must replay as itself")
+                    | Ok _ -> Assert.Fail "the recorded failure must not replay as a result"
+            })
+
+    [<Test>]
+    member _.``a crafted or incomplete recorded failure is rejected at load, naming the offending entry``() : Task =
+        task {
+            // A cassette is untrusted input: a failure payload this build cannot rebuild EXACTLY is
+            // refused when the file loads (naming the row), never replayed as a different or generic
+            // error, and never silently dropped so the entry replays as an empty success.
+            let cases =
+                [ "an unrecognized kind",
+                  """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "Failure": { "Kind": "SomethingElse" } } ] }"""
+                  "a failure with no kind at all",
+                  """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "Failure": { "Detail": "boom" } } ] }"""
+                  "an Exit failure without its code",
+                  """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "Failure": { "Kind": "Exit", "Stderr": "boom" } } ] }"""
+                  "a Timeout failure without its timeout",
+                  """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "Failure": { "Kind": "Timeout" } } ] }"""
+                  "a JsonRpc failure without its code",
+                  """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "Failure": { "Kind": "JsonRpc", "Method": "m" } } ] }"""
+                  "a failure alongside a recorded terminal state",
+                  """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "Code": 0, "Failure": { "Kind": "Spawn", "Detail": "boom" } } ] }""" ]
+
+            for label, json in cases do
+                let path = Path.GetTempFileName()
+
+                try
+                    File.WriteAllText(path, json)
+
+                    let indexLabel: string =
+                        $"{label} must be rejected with the offending entry's index"
+
+                    match RecordReplayRunner.Replay path with
+                    | Error(ProcessError.Io message) -> Assert.That(message, Does.Contain "entry 0", indexLabel)
+                    | other -> Assert.Fail $"expected {label} to be rejected at load, got {other}"
+                finally
+                    deleteCassette path
+        }
+
+    [<Test>]
+    member _.``a crafted out-of-range failure timeout is clamped, not an overflow on replay``() : Task =
+        withCassette (fun path ->
+            task {
+                // The same guarantee `DurationMs` already has: a hand-edited millisecond count far
+                // beyond `TimeSpan`'s range must not turn a `Result`-returning verb into a throw.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "Stdout": "", "Stderr": "", "Failure": { "Kind": "Timeout", "TimeoutMs": 1e18, "Stderr": "slow" } } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a clampable timeout must still load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+
+                    match! (runner replayer).CaptureStringAsync(Command.create "tool", CancellationToken.None) with
+                    | Error(ProcessError.Timeout("tool", timeout, _, stderr)) ->
+                        Assert.That(timeout, Is.LessThanOrEqualTo TimeSpan.MaxValue)
+                        Assert.That(stderr, Is.EqualTo "slow")
+                    | other -> Assert.Fail $"expected a clamped Timeout failure, got {other}"
             })
 
     // --- Concurrent saves to one cassette path ---------------------------------------------------

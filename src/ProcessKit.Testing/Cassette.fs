@@ -33,11 +33,105 @@ module private NativeCassetteIo =
     [<DllImport("libc", EntryPoint = "flock", SetLastError = true)>]
     extern int flockFd(int fd, int operation)
 
+/// The on-disk vocabulary of `CassetteFailure.Kind`: which `ProcessError` a recorded failure replays
+/// as. Each name is spelled exactly like the union case it rebuilds, so a cassette reads the way the
+/// error does. These strings are part of the file format — a recorded cassette is read by whatever
+/// build opens it next, so an existing name is never respelled; a new kind is added alongside them.
+module private CassetteFailureKind =
+    [<Literal>]
+    let NotFound = "NotFound"
+
+    [<Literal>]
+    let Spawn = "Spawn"
+
+    [<Literal>]
+    let Stdin = "Stdin"
+
+    [<Literal>]
+    let Exit = "Exit"
+
+    [<Literal>]
+    let Signalled = "Signalled"
+
+    [<Literal>]
+    let Timeout = "Timeout"
+
+    [<Literal>]
+    let OutputTooLarge = "OutputTooLarge"
+
+    [<Literal>]
+    let Parse = "Parse"
+
+    [<Literal>]
+    let JsonRpc = "JsonRpc"
+
+/// The typed failure an invocation ended with — the *error* half of a `CassetteEntry`, present only
+/// when the call produced no result (public so `System.Text.Json` can serialize it; inspect a cassette
+/// file directly rather than depending on this shape). `Kind` names the `ProcessError` case the entry
+/// replays as and decides which payload fields below carry anything; the rest are omitted from the
+/// file. `Detail`, `Searched`, `Stdout`, `Stderr`, and `Data` are stored verbatim (after the
+/// record-time `RecordReplayOptions.WithRedaction` hook, which covers all five) and can carry secrets
+/// — review a cassette before committing it.
+[<CLIMutable>]
+type CassetteFailure =
+    {
+        /// Which `ProcessError` this entry replays as, spelled exactly like the union case: `NotFound`,
+        /// `Spawn`, `Stdin`, `Exit`, `Signalled`, `Timeout`, `OutputTooLarge`, `Parse`, or `JsonRpc`.
+        /// A kind this build cannot rebuild is rejected when the cassette loads (naming the offending
+        /// entry) rather than replayed as a different — or generic — error.
+        Kind: string
+        /// The failing error's own detail text: `Spawn`, `Stdin`, and `Parse` carry theirs here, and a
+        /// `JsonRpc` failure carries the peer's `message`. `null` for the kinds that carry none.
+        Detail: string | null
+        /// The search path a `NotFound` lookup probed (`ProcessError.NotFound.Searched`), or `null`
+        /// when no `PATH` search applied. This is an environment **value** kept verbatim — the one
+        /// exception to this format's names-only environment rule (see `CassetteEntry.EnvNames`) — so
+        /// that a not-found failure replays with the payload it was recorded with; the redaction hook
+        /// covers it.
+        Searched: string | null
+        /// The captured stdout a stream-carrying failure (`Exit`, `Signalled`, `Timeout`) held; `null`
+        /// for the kinds that carry none. Always text, because a `ProcessError`'s streams are text
+        /// whichever capture verb produced them — a failure entry has no base64 half.
+        Stdout: string | null
+        /// The captured stderr a stream-carrying failure (`Exit`, `Signalled`, `Timeout`) held; `null`
+        /// for the kinds that carry none.
+        Stderr: string | null
+        /// The exit code of an `Exit` failure, or the peer's own `code` for a `JsonRpc` one; `null`
+        /// otherwise. Both kinds require it — an entry missing it is rejected at load.
+        Code: Nullable<int>
+        /// The terminating signal number of a `Signalled` failure when it was known; `null` both for a
+        /// signal whose number was unavailable (`Kind` alone records that it was signalled) and for
+        /// every other kind.
+        Signal: Nullable<int>
+        /// The elapsed timeout of a `Timeout` failure, in milliseconds; `null` otherwise (a `Timeout`
+        /// entry missing it is rejected at load). Clamped into `TimeSpan`'s range when the cassette
+        /// loads, so a hand-edited value cannot fault replay.
+        TimeoutMs: Nullable<double>
+        /// The configured line ceiling an `OutputTooLarge` failure exceeded, when that unit applied to
+        /// the channel; `null` otherwise.
+        LineLimit: Nullable<int>
+        /// The configured byte ceiling an `OutputTooLarge` failure exceeded, when that unit applied to
+        /// the channel; `null` otherwise.
+        ByteLimit: Nullable<int>
+        /// The line (or merged-event / frame) total an `OutputTooLarge` failure reported; `null` reads
+        /// as `0`, the same value that metric carries when its unit does not apply.
+        TotalLines: Nullable<int>
+        /// The byte total an `OutputTooLarge` failure reported; `null` reads as `0`.
+        TotalBytes: Nullable<int>
+        /// The request a `JsonRpc` failure answers (`ProcessError.JsonRpc.Method`); `null` otherwise.
+        Method: string | null
+        /// The raw JSON text of the optional `data` member a JSON-RPC peer attached, or `null` when it
+        /// attached none (and for every other kind).
+        Data: string | null
+    }
+
 /// One captured `invocation → result` pair — a row inside the `CassetteFile` envelope (public so
 /// `System.Text.Json` can serialize it; inspect a cassette file directly rather than depending on
 /// this shape). Env values are never stored in clear text — only the variable *names* and a redacting
-/// `EnvFingerprint` of the effective environment; `program`, `args`, `cwd`, `stdout`, and `stderr`
-/// are verbatim and can carry secrets — review a cassette before committing it.
+/// `EnvFingerprint` of the effective environment (the lone exception is a recorded `NotFound`
+/// failure's searched `PATH`, see `CassetteFailure.Searched`); `program`, `args`, `cwd`, `stdout`,
+/// `stderr`, and a recorded `Failure`'s own text are verbatim and can carry secrets — review a
+/// cassette before committing it.
 [<CLIMutable>]
 type CassetteEntry =
     {
@@ -109,6 +203,13 @@ type CassetteEntry =
         /// The PTY's initial terminal height in rows when `Pty` is set; `null` otherwise (and in a
         /// pre-v4 cassette).
         PtyRows: Nullable<int>
+        /// The typed failure this invocation ended with, when it produced no result — `null` for an
+        /// ordinary recorded result (and in every pre-v7 cassette, which had no error half at all). An
+        /// entry records one or the other: where a failure is present the result fields above carry
+        /// nothing, and the entry replays as that error through every verb. Only a failure this format
+        /// can rebuild exactly is ever written (see `CassetteFailure.Kind`); any other error is
+        /// returned to the caller unrecorded, exactly as before this field existed.
+        Failure: CassetteFailure | null
     }
 
 /// The on-disk cassette envelope: a format `version` (so a format newer than this build understands is
@@ -168,7 +269,9 @@ type RecordReplayOptions
     /// Scrub captured **text** before it is written to the cassette, so a secret echoed to stdout/stderr
     /// (a token, a password) never reaches disk. Applied at record time to the stdout and stderr text of
     /// a string capture and to the stderr of a bytes capture; a `byte[]` stdout capture is stored opaquely
-    /// (base64) and is **not** passed through the redactor.
+    /// (base64) and is **not** passed through the redactor. It covers a recorded typed failure's text on
+    /// the same terms — its `Stdout`/`Stderr`, its `Detail`, a JSON-RPC peer's `Data`, and the `PATH` a
+    /// `NotFound` searched — so the error half of an entry is no less scrubbed than the result half.
     member _.WithRedaction(redact: Func<string, string>) =
         ArgumentNullException.ThrowIfNull redact
         RecordReplayOptions(hashFileStdinContents, argNormalizer, Some redact.Invoke, matchCwd)
@@ -222,10 +325,15 @@ type private SaveLockAttempt =
 /// A record/replay `IProcessRunner`.
 ///
 /// **Record** mode wraps a real inner runner, captures each completed call to a JSON cassette
-/// (written on `Save`, or best-effort on dispose), and returns the live result. Errors (a spawn
-/// failure) record nothing; non-zero exits and captured timeouts are results and are recorded.
+/// (written on `Save`, or best-effort on dispose), and returns the live result. A call that ends in a
+/// typed failure this format can rebuild exactly — `NotFound`, `Spawn`, `Stdin`, `Exit`, `Signalled`,
+/// `Timeout`, `OutputTooLarge`, `Parse`, `JsonRpc` — is recorded as that failure and replays as it,
+/// so an expected failure is as reproducible as an expected success. Any other error (a cancellation,
+/// or one whose payload this format cannot carry) is returned to the caller and records nothing.
+/// Non-zero exits and captured timeouts are results, not errors, and are recorded as results.
 ///
-/// **Replay** mode loads the cassette and serves results with **no subprocess**: a match is keyed on
+/// **Replay** mode loads the cassette and serves recorded results — and recorded typed failures, which
+/// come back as the very `ProcessError` case and payload that was recorded — with **no subprocess**: a match is keyed on
 /// program + args + stdin-source digest + an effective-environment fingerprint (so a call whose env
 /// values/names/removals or `EnvClear` differ no longer replays an unrelated recording — a pre-v3
 /// cassette with no fingerprint keys as the un-customized environment); the working directory does
@@ -259,7 +367,10 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // path-only file source. v1-v4 digests still replay through the legacy key fallback. A pre-v4 entry
     // with no `Pty` flag loads as a non-PTY recording (`Pty` defaults `false`, the geometry `null`). v6
     // adds `Signalled` so a signal with an unavailable number remains distinct from no terminal state.
-    static let currentFormatVersion = 6
+    // v7 adds `Failure`, the recorded typed-failure half of an entry, so a call that ended in a
+    // `ProcessError` replays as that error instead of missing; a pre-v7 entry has no `Failure` and
+    // loads as exactly the recorded-result entry it always was.
+    static let currentFormatVersion = 7
 
     static let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
@@ -367,23 +478,100 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             else
                 List.ofArray result
 
-    static let normalizeEntry (entry: CassetteEntry) : CassetteEntry =
-        // Clamp a crafted/corrupted `DurationMs` into `TimeSpan`'s range (and a NaN/∞ to 0), so replay's
-        // `TimeSpan.FromMilliseconds` can't overflow-throw on a hand-edited cassette — same "a partial /
-        // crafted entry can't trip replay" guarantee the null-coalescing below gives the string fields.
-        let durationMs =
-            if Double.IsFinite entry.DurationMs then
-                Math.Clamp(entry.DurationMs, 0.0, TimeSpan.MaxValue.TotalMilliseconds)
-            else
-                0.0
+    // Clamp a crafted/corrupted millisecond count into `TimeSpan`'s range (and a NaN/∞ to 0), so a
+    // later `TimeSpan.FromMilliseconds` can't overflow-throw on a hand-edited cassette. Shared by the
+    // recorded duration and a recorded `Timeout` failure's timeout, so the two cannot drift.
+    static let clampMilliseconds (milliseconds: double) : double =
+        if Double.IsFinite milliseconds then
+            Math.Clamp(milliseconds, 0.0, TimeSpan.MaxValue.TotalMilliseconds)
+        else
+            0.0
 
+    // An optional recorded metric as the plain `int` its `ProcessError` field is: an omitted value reads
+    // as 0, the same number that metric carries when its unit does not apply to the channel.
+    static let intOrZero (value: Nullable<int>) : int =
+        if value.HasValue then value.Value else 0
+
+    // The ONE mapping from a recorded failure payload back to the `ProcessError` it replays as, shared
+    // by load-time validation (which rejects a payload this build cannot rebuild, naming the entry) and
+    // by the replay verbs — so what loads and what replays can never disagree. `Error` carries the
+    // reason a payload is unusable, never a substitute error: a recorded failure this build cannot
+    // rebuild exactly is refused, not quietly downgraded to a generic `Io`/`CassetteMiss`.
+    static let failureToError (program: string) (failure: CassetteFailure) : Result<ProcessError, string> =
+        let detail = stringOrEmpty failure.Detail
+        let stdout = stringOrEmpty failure.Stdout
+        let stderr = stringOrEmpty failure.Stderr
+
+        // The kind is a schema discriminant rather than recorded output, so naming the unrecognized one
+        // is the whole value of the diagnostic — but it comes from the same untrusted file as everything
+        // else, so a crafted one is cut before it reaches the message.
+        let quoted (kind: string) =
+            if kind.Length <= 64 then
+                kind
+            else
+                kind.Substring(0, 64) + "…"
+
+        match stringOrEmpty failure.Kind with
+        | CassetteFailureKind.NotFound -> Ok(ProcessError.NotFound(program, Option.ofObj failure.Searched))
+        | CassetteFailureKind.Spawn -> Ok(ProcessError.Spawn(program, detail))
+        | CassetteFailureKind.Stdin -> Ok(ProcessError.Stdin(program, detail))
+        | CassetteFailureKind.Parse -> Ok(ProcessError.Parse(program, detail))
+        | CassetteFailureKind.Exit ->
+            match Option.ofNullable failure.Code with
+            | Some code -> Ok(ProcessError.Exit(program, code, stdout, stderr))
+            | None -> Error "an 'Exit' failure carries no exit code"
+        | CassetteFailureKind.Signalled ->
+            Ok(ProcessError.Signalled(program, Option.ofNullable failure.Signal, stdout, stderr))
+        | CassetteFailureKind.Timeout ->
+            match Option.ofNullable failure.TimeoutMs with
+            | Some milliseconds ->
+                Ok(ProcessError.Timeout(program, TimeSpan.FromMilliseconds milliseconds, stdout, stderr))
+            | None -> Error "a 'Timeout' failure carries no timeout"
+        | CassetteFailureKind.OutputTooLarge ->
+            Ok(
+                ProcessError.OutputTooLarge(
+                    program,
+                    Option.ofNullable failure.LineLimit,
+                    Option.ofNullable failure.ByteLimit,
+                    intOrZero failure.TotalLines,
+                    intOrZero failure.TotalBytes
+                )
+            )
+        | CassetteFailureKind.JsonRpc ->
+            match Option.ofNullable failure.Code with
+            | Some code ->
+                Ok(ProcessError.JsonRpc(program, stringOrEmpty failure.Method, code, detail, Option.ofObj failure.Data))
+            | None -> Error "a 'JsonRpc' failure carries no error code"
+        | "" -> Error "a recorded failure has no 'Kind'"
+        | unknown -> Error $"unrecognized recorded failure kind '{quoted unknown}'"
+
+    // Make a recorded failure safe to rebuild from: coalesce the discriminant's nulls and clamp the
+    // timeout the same way the recorded duration is clamped, so a hand-edited payload surfaces as a
+    // typed refusal (or a clamped value) rather than an exception out of a `Result`-returning verb.
+    static let normalizeFailure (failure: CassetteFailure | null) : CassetteFailure | null =
+        match failure with
+        | null -> null
+        | failure ->
+            { failure with
+                Kind = stringOrEmpty failure.Kind
+                TimeoutMs =
+                    if failure.TimeoutMs.HasValue then
+                        Nullable(clampMilliseconds failure.TimeoutMs.Value)
+                    else
+                        failure.TimeoutMs }
+
+    static let normalizeEntry (entry: CassetteEntry) : CassetteEntry =
         { entry with
             Program = stringOrEmpty entry.Program
             Args = arrayOrEmpty entry.Args
             EnvNames = arrayOrEmpty entry.EnvNames
             Stdout = stringOrEmpty entry.Stdout
             Stderr = stringOrEmpty entry.Stderr
-            DurationMs = durationMs }
+            // Clamped so replay's `TimeSpan.FromMilliseconds` can't overflow-throw on a hand-edited
+            // cassette — same "a partial / crafted entry can't trip replay" guarantee the
+            // null-coalescing above gives the string fields.
+            DurationMs = clampMilliseconds entry.DurationMs
+            Failure = normalizeFailure entry.Failure }
 
     // Build a replay index from cassette entries, grouping duplicates of a key in capture order and
     // freezing each group to an immutable array once (not `Array.append` per duplicate, which is O(n²)).
@@ -419,12 +607,13 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         slots
 
     // Reject an entry whose terminal-state fields are self-contradictory (more than one of
-    // TimedOut/(Signalled or Signal)/Code set) or that is missing its required `Program` — a corrupted
-    // or hand-edited cassette, not a value a real recording ever produces. Absence of every terminal
-    // state is deliberately NOT rejected here: it is a legitimate (if degenerate) partial cassette and
-    // replays honestly as `Outcome.Unobserved` (see `outcomeOf`) rather than being rejected or
-    // fabricating a clean exit. The index identifies the offending entry without echoing any of its
-    // (possibly secret) content — `Program`/`Args`/`Stdout`/`Stderr` never appear in this message.
+    // TimedOut/(Signalled or Signal)/Code set), that is missing its required `Program`, or whose
+    // recorded failure is not one this build can rebuild — a corrupted or hand-edited cassette, not a
+    // value a real recording ever produces. Absence of every terminal state is deliberately NOT
+    // rejected here: it is a legitimate (if degenerate) partial cassette and replays honestly as
+    // `Outcome.Unobserved` (see `outcomeOf`) rather than being rejected or fabricating a clean exit.
+    // The index identifies the offending entry without echoing any of its (possibly secret) content —
+    // `Program`/`Args`/`Stdout`/`Stderr`, and a failure's own text, never appear in this message.
     static let validateEntry (index: int) (entry: CassetteEntry) : Result<CassetteEntry, ProcessError> =
         let terminalStatesSet =
             [ entry.TimedOut
@@ -441,7 +630,25 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         elif String.IsNullOrWhiteSpace entry.Program then
             Error(ProcessError.Io $"cassette entry {index} is missing its required 'Program' field")
         else
-            Ok entry
+            match entry.Failure with
+            | null -> Ok entry
+            | failure ->
+                // An entry records a result OR a typed failure, never both: a recording that failed
+                // produced no terminal state to store, so a payload claiming both is as contradictory
+                // as two terminal states at once, and would leave replay to guess which half wins.
+                if terminalStatesSet > 0 then
+                    Error(
+                        ProcessError.Io
+                            $"cassette entry {index} records both a terminal state (TimedOut/Signalled/Signal/Code) and a typed failure"
+                    )
+                else
+                    // Rejected at LOAD, not at the call that happens to match it: a cassette carrying a
+                    // failure this build cannot rebuild is broken as a whole, and finding out at load
+                    // beats a test that passes until it reaches that one entry.
+                    match failureToError entry.Program failure with
+                    | Ok _ -> Ok entry
+                    | Error reason ->
+                        Error(ProcessError.Io $"cassette entry {index} has an unusable recorded failure: {reason}")
 
     // Validate every entry in capture order, failing on the FIRST invalid one (its index pinpoints the
     // offending row without scanning/reporting the rest).
@@ -839,39 +1046,12 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         | Some pty -> true, Nullable pty.Cols, Nullable pty.Rows
         | None -> false, Nullable(), Nullable()
 
-    // Record a text capture: stdout/stderr are the decoded strings (redacted); no base64. For a PTY run
-    // (D3) `Stdout` IS the single merged stream, so the redaction hook that scrubs it covers the whole
-    // captured PTY output (where an echoed credential could otherwise land) — there is no separate
-    // stderr to leak through.
-    let entryOfText (command: Command) (result: ProcessResult<string>) (digest: string option) : CassetteEntry =
+    // The INVOCATION half of an entry — every field that keys or describes the call — with the result
+    // half left at the "nothing recorded" defaults an omitted field loads as. The three builders below
+    // (text result, bytes result, typed failure) each fill only their own half on top of it, so the
+    // keying fields can never drift apart between them.
+    let entryOfInvocation (command: Command) (digest: string option) : CassetteEntry =
         let pty, ptyCols, ptyRows = ptyFieldsOf command
-        let signalled, signal = signalOf result.Outcome
-
-        { Program = command.Program
-          Args = Seq.toArray command.Arguments
-          Cwd = Option.toObj command.WorkingDirectory
-          StdinDigest = Option.toObj digest
-          HasStdin = command.Config.StdinSource.IsSome
-          EnvNames = envNamesOf command
-          EnvFingerprint = envFingerprint command.Config.ClearEnv command.Config.EnvOverrides
-          Stdout = redactText result.Stdout
-          Stderr = redactText result.Stderr
-          StdoutBase64 = null
-          Code = codeOf result.Code
-          TimedOut = result.IsTimedOut
-          Signalled = signalled
-          Signal = signal
-          Truncated = result.Truncated
-          DurationMs = result.Duration.TotalMilliseconds
-          Pty = pty
-          PtyCols = ptyCols
-          PtyRows = ptyRows }
-
-    // Record a bytes capture: exact stdout bytes go to base64 (Stdout text stays empty — a string-verb
-    // replay decodes the base64); stderr is text (redacted). The opaque bytes are not redacted.
-    let entryOfBytes (command: Command) (result: ProcessResult<byte[]>) (digest: string option) : CassetteEntry =
-        let pty, ptyCols, ptyRows = ptyFieldsOf command
-        let signalled, signal = signalOf result.Outcome
 
         { Program = command.Program
           Args = Seq.toArray command.Arguments
@@ -881,17 +1061,183 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           EnvNames = envNamesOf command
           EnvFingerprint = envFingerprint command.Config.ClearEnv command.Config.EnvOverrides
           Stdout = ""
-          Stderr = redactText result.Stderr
-          StdoutBase64 = Convert.ToBase64String result.Stdout
-          Code = codeOf result.Code
-          TimedOut = result.IsTimedOut
-          Signalled = signalled
-          Signal = signal
-          Truncated = result.Truncated
-          DurationMs = result.Duration.TotalMilliseconds
+          Stderr = ""
+          StdoutBase64 = null
+          Code = Nullable()
+          TimedOut = false
+          Signalled = false
+          Signal = Nullable()
+          Truncated = false
+          DurationMs = 0.0
           Pty = pty
           PtyCols = ptyCols
-          PtyRows = ptyRows }
+          PtyRows = ptyRows
+          Failure = null }
+
+    // Record a text capture: stdout/stderr are the decoded strings (redacted); no base64. For a PTY run
+    // (D3) `Stdout` IS the single merged stream, so the redaction hook that scrubs it covers the whole
+    // captured PTY output (where an echoed credential could otherwise land) — there is no separate
+    // stderr to leak through.
+    let entryOfText (command: Command) (result: ProcessResult<string>) (digest: string option) : CassetteEntry =
+        let signalled, signal = signalOf result.Outcome
+
+        { entryOfInvocation command digest with
+            Stdout = redactText result.Stdout
+            Stderr = redactText result.Stderr
+            Code = codeOf result.Code
+            TimedOut = result.IsTimedOut
+            Signalled = signalled
+            Signal = signal
+            Truncated = result.Truncated
+            DurationMs = result.Duration.TotalMilliseconds }
+
+    // Record a bytes capture: exact stdout bytes go to base64 (Stdout text stays empty — a string-verb
+    // replay decodes the base64); stderr is text (redacted). The opaque bytes are not redacted.
+    let entryOfBytes (command: Command) (result: ProcessResult<byte[]>) (digest: string option) : CassetteEntry =
+        let signalled, signal = signalOf result.Outcome
+
+        { entryOfInvocation command digest with
+            Stderr = redactText result.Stderr
+            StdoutBase64 = Convert.ToBase64String result.Stdout
+            Code = codeOf result.Code
+            TimedOut = result.IsTimedOut
+            Signalled = signalled
+            Signal = signal
+            Truncated = result.Truncated
+            DurationMs = result.Duration.TotalMilliseconds }
+
+    // The empty failure payload every recorded failure is built from, so each kind names only the fields
+    // it actually carries and every other one stays `null`/omitted in the file.
+    let noFailurePayload =
+        { Kind = ""
+          Detail = null
+          Searched = null
+          Stdout = null
+          Stderr = null
+          Code = Nullable()
+          Signal = Nullable()
+          TimeoutMs = Nullable()
+          LineLimit = Nullable()
+          ByteLimit = Nullable()
+          TotalLines = Nullable()
+          TotalBytes = Nullable()
+          Method = null
+          Data = null }
+
+    // The on-disk payload for a live typed failure, or `None` when this format deliberately does not
+    // record that error. A `None` keeps the call behaving exactly as it did before failures were
+    // recordable at all: the error is returned to the caller, nothing is written, and an Auto session
+    // delegates the same call again next time — never a downgraded or invented replay.
+    //
+    // What is recorded is what an INVOCATION produced and this schema can rebuild field for field.
+    // Deliberately outside that set:
+    //   * `Cancelled` — the caller's own control flow, not something the command produced. Recording it
+    //     would freeze one run's timing into a cassette that then fails every replay the same way.
+    //   * `CassetteMiss` — the record/replay machinery's own miss. Recording it would make the miss
+    //     permanent and stop Auto from ever growing that call.
+    //   * `RetryPredicate` — carries a nested `ProcessError` this flat payload cannot hold; storing it
+    //     without its `Original` would be exactly the downgrade this feature exists to avoid.
+    //   * `Io` / `Unsupported` / `ResourceLimit` / `Unobserved` / `NotReady` / `Adopt` — a transient,
+    //     host- or platform-dependent condition (or, for `Adopt`, one no capture verb produces). Each
+    //     says something about the machine that recorded, not about the invocation, so replaying it
+    //     elsewhere as a property of the call would be a lie.
+    // The redaction hook covers every free-text field here, so the error half of an entry is no less
+    // scrubbed than the result half (`Method` is an identifier, kept verbatim like `Program`/`Args`).
+    let failureOf (error: ProcessError) : CassetteFailure option =
+        let redactOptional (text: string option) =
+            text |> Option.map redactText |> Option.toObj
+
+        match error with
+        | ProcessError.NotFound(_, searched) ->
+            Some
+                { noFailurePayload with
+                    Kind = CassetteFailureKind.NotFound
+                    Searched = redactOptional searched }
+        | ProcessError.Spawn(_, detail) ->
+            Some
+                { noFailurePayload with
+                    Kind = CassetteFailureKind.Spawn
+                    Detail = redactText detail }
+        | ProcessError.Stdin(_, detail) ->
+            Some
+                { noFailurePayload with
+                    Kind = CassetteFailureKind.Stdin
+                    Detail = redactText detail }
+        | ProcessError.Parse(_, detail) ->
+            Some
+                { noFailurePayload with
+                    Kind = CassetteFailureKind.Parse
+                    Detail = redactText detail }
+        | ProcessError.Exit(_, code, stdout, stderr) ->
+            Some
+                { noFailurePayload with
+                    Kind = CassetteFailureKind.Exit
+                    Code = Nullable code
+                    Stdout = redactText stdout
+                    Stderr = redactText stderr }
+        | ProcessError.Signalled(_, signal, stdout, stderr) ->
+            Some
+                { noFailurePayload with
+                    Kind = CassetteFailureKind.Signalled
+                    Signal = Option.toNullable signal
+                    Stdout = redactText stdout
+                    Stderr = redactText stderr }
+        | ProcessError.Timeout(_, timeout, stdout, stderr) ->
+            Some
+                { noFailurePayload with
+                    Kind = CassetteFailureKind.Timeout
+                    TimeoutMs = Nullable timeout.TotalMilliseconds
+                    Stdout = redactText stdout
+                    Stderr = redactText stderr }
+        | ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes) ->
+            Some
+                { noFailurePayload with
+                    Kind = CassetteFailureKind.OutputTooLarge
+                    LineLimit = Option.toNullable lineLimit
+                    ByteLimit = Option.toNullable byteLimit
+                    TotalLines = Nullable totalLines
+                    TotalBytes = Nullable totalBytes }
+        | ProcessError.JsonRpc(_, methodName, code, detail, data) ->
+            Some
+                { noFailurePayload with
+                    Kind = CassetteFailureKind.JsonRpc
+                    Method = methodName
+                    Code = Nullable code
+                    Detail = redactText detail
+                    Data = redactOptional data }
+        | ProcessError.Cancelled _
+        | ProcessError.CassetteMiss _
+        | ProcessError.RetryPredicate _
+        | ProcessError.Unobserved _
+        | ProcessError.NotReady _
+        | ProcessError.ResourceLimit _
+        | ProcessError.Adopt _
+        | ProcessError.Io _
+        | ProcessError.Unsupported _ -> None
+
+    // Record a completed typed failure exactly the way a completed result is recorded: one entry,
+    // appended under this recorder's gate, marking the cassette dirty for the next save. `register` is
+    // what Auto uses to also fold the fresh entry into its live replay index (`ignore` in record mode,
+    // which has none). An error this format does not record leaves the cassette untouched.
+    let recordFailure
+        (recorded: List<CassetteEntry>)
+        (dirty: bool ref)
+        (register: CassetteEntry -> unit)
+        (command: Command)
+        (digest: string option)
+        (error: ProcessError)
+        : unit =
+        match failureOf error with
+        | None -> ()
+        | Some failure ->
+            let entry =
+                { entryOfInvocation command digest with
+                    Failure = failure }
+
+            lock gate (fun () ->
+                recorded.Add entry
+                register entry
+                dirty.Value <- true)
 
     // A v6 cassette explicitly records every signal through `Signalled`; `Signal` carries its optional
     // number. A pre-v6 cassette lacks that marker, so a non-null legacy `Signal` still means a known
@@ -914,6 +1260,26 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         else
             Outcome.Unobserved
                 "cassette entry has no recorded terminal state (TimedOut/Signalled/Signal/Code all absent)"
+
+    // The typed failure a matched entry recorded, when it recorded one instead of a result. Every
+    // replay path goes through this — both capture verbs and the reconstructed `SpawnAsync` handle — so
+    // a recorded failure comes back identically whichever verb asks for it: an error has no
+    // verb-specific payload (its streams are text for a bytes capture too), and the entry that recorded
+    // it holds no result to hand back instead.
+    let recordedFailure (command: Command) (entry: CassetteEntry) : ProcessError option =
+        match entry.Failure with
+        | null -> None
+        | failure ->
+            match failureToError command.Program failure with
+            | Ok error -> Some error
+            | Error reason ->
+                // Unreachable by construction — `validateEntry` refuses an unusable payload when the
+                // cassette loads, and a freshly recorded one is only ever written from a payload this
+                // build can rebuild — so this reports the contradiction honestly rather than letting a
+                // failure entry replay as an (empty) success.
+                Some(
+                    ProcessError.Io $"cassette entry for '{command.Program}' has an unusable recorded failure: {reason}"
+                )
 
     // Decode a cassette entry's base64 stdout, reporting corruption as the SAME `ProcessError.Io` shape
     // regardless of which verb (string capture, bytes capture, or replayed `SpawnAsync`) is asking — a
@@ -987,19 +1353,29 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // Reconstruct a live handle from a recorded entry, reusing the same in-memory `FakeProcess` the
     // scripted double builds — so a replayed stream agrees with a real run on line splitting, encoding,
     // OkCodes, and outcome. A corrupt base64 stdout errors here exactly as it does for the capture verbs,
-    // rather than silently starting the fake process with empty/placeholder stdout.
+    // rather than silently starting the fake process with empty/placeholder stdout. An entry that
+    // recorded a typed failure has no handle to reconstruct: it replays as that failure, which is also
+    // what a real `SpawnAsync` of the same command reported when the failure was a launch one
+    // (`NotFound`/`Spawn`).
     let spawnFromEntry (command: Command) (entry: CassetteEntry) : Result<RunningProcess, ProcessError> =
-        match stdoutText command entry with
-        | Error error -> Error error
-        | Ok stdout ->
-            let fake =
-                FakeProcess.OfCommand(command).WithStdout(stdout).WithStderr(entry.Stderr).WithOutcome(outcomeOf entry)
+        match recordedFailure command entry with
+        | Some error -> Error error
+        | None ->
+            match stdoutText command entry with
+            | Error error -> Error error
+            | Ok stdout ->
+                let fake =
+                    FakeProcess
+                        .OfCommand(command)
+                        .WithStdout(stdout)
+                        .WithStderr(entry.Stderr)
+                        .WithOutcome(outcomeOf entry)
 
-            // A PTY recording (D3) replays as a merged-stream handle: `OutputEventsAsync` yields only
-            // `OutputEvent.Stdout` and `ResizeAsync` is a recorded no-op success. The recorded `Stdout`
-            // is the merged stream; the entry flag is authoritative (independent of the live command).
-            let fake = if entry.Pty then fake.WithPty() else fake
-            Ok(fake.Build())
+                // A PTY recording (D3) replays as a merged-stream handle: `OutputEventsAsync` yields only
+                // `OutputEvent.Stdout` and `ResizeAsync` is a recorded no-op success. The recorded `Stdout`
+                // is the merged stream; the entry flag is authoritative (independent of the live command).
+                let fake = if entry.Pty then fake.WithPty() else fake
+                Ok(fake.Build())
 
     let play (slots: Dictionary<Key, ReplaySlot>) (key: Key) : CassetteEntry option =
         match slots.TryGetValue key with
@@ -1182,12 +1558,15 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     static member internal FsyncParentDirectoryForTests(path: string) : Result<unit, string> = fsyncParentDir path
 
     // The shared mode logic behind both capture verbs: Record delegates to `inner` and captures the
-    // live result; Replay serves strictly from the cassette (a miss is `CassetteMiss`, never a
-    // surprise subprocess); Auto replays a hit and delegates+records a miss (VCR "new episodes").
+    // live call — its result, or the typed failure it ended in; Replay serves strictly from the
+    // cassette (a miss is `CassetteMiss`, never a surprise subprocess); Auto replays a hit and
+    // delegates+records a miss (VCR "new episodes").
     // Parameterized over `captureInner` (which of `inner`'s two capture verbs to call),
     // `entryOf` (how to turn a live result into a `CassetteEntry`), and `resultOf` (how to turn a
     // replayed entry back into a result — `resultBytes` alone can fail, on a text/pre-v2 entry), so
-    // the text and bytes paths can never drift apart on the mode/lock/dirty discipline itself.
+    // the text and bytes paths can never drift apart on the mode/lock/dirty discipline itself. A
+    // recorded FAILURE needs no such parameter: it replays identically for both verbs (see
+    // `recordedFailure`).
     member private this.CaptureVia<'a>
         (
             command: Command,
@@ -1204,6 +1583,14 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 | None -> CancellationTokenSource.CreateLinkedTokenSource cancellationToken
 
             let effectiveToken = linkedCts.Token
+
+            // What a matched entry hands back: the typed failure it recorded, or its recorded result
+            // through the verb's own `resultOf`. One place, so the three replay call sites below
+            // (Replay, an Auto hit, and — via `spawnFromEntry` — a replayed handle) cannot disagree.
+            let replayed (entry: CassetteEntry) =
+                match recordedFailure command entry with
+                | Some error -> Error error
+                | None -> resultOf command entry
 
             if effectiveToken.IsCancellationRequested then
                 // Completion verbs honour both their own token and `Command.CancelOn`, including in
@@ -1222,7 +1609,25 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                     match mode with
                     | RecordMode(inner, recorded, dirty) ->
                         match! captureInner inner command effectiveToken with
-                        | Error error -> return Error error
+                        | Error error ->
+                            // The call came back with a typed failure, and it is recorded exactly like
+                            // a completed result — with one gate, which is where the boundary sits: if
+                            // the effective token (the caller's, linked with `Command.CancelOn`) is
+                            // already cancellation-requested by the time the failure arrives, nothing
+                            // is recorded. Whether that cancellation caused the failure or merely
+                            // raced it cannot be known here, and the success path below refuses to
+                            // record under the same condition, so a cassette never gains an entry from
+                            // a call the caller was already tearing down.
+                            //
+                            // The error itself is still returned verbatim — unchanged from before
+                            // failures were recorded at all. Only the success path turns into
+                            // `Cancelled`, and only because it must, to keep "a cancelled run is
+                            // always an error"; a failure is already an error, so relabelling it would
+                            // hide the diagnosis the inner runner just produced.
+                            if not effectiveToken.IsCancellationRequested then
+                                recordFailure recorded dirty ignore command digest error
+
+                            return Error error
                         | Ok result ->
                             if effectiveToken.IsCancellationRequested then
                                 return Error(ProcessError.Cancelled command.Program)
@@ -1239,7 +1644,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                             if effectiveToken.IsCancellationRequested then
                                 return Error(ProcessError.Cancelled command.Program)
                             else
-                                return resultOf command entry
+                                return replayed entry
                         | Ok None -> return Error(ProcessError.CassetteMiss command.Program)
                     | AutoMode(inner, slots, recorded, dirty) ->
                         let key = keyOf command digest
@@ -1250,10 +1655,18 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                             if effectiveToken.IsCancellationRequested then
                                 return Error(ProcessError.Cancelled command.Program)
                             else
-                                return resultOf command entry
+                                return replayed entry
                         | Ok None ->
                             match! captureInner inner command effectiveToken with
-                            | Error error -> return Error error
+                            | Error error ->
+                                // Same boundary as record mode above, plus the Auto-only half: a
+                                // recorded failure also joins the live replay index, so a repeat of
+                                // this call in the same session replays it instead of reaching the
+                                // inner runner again.
+                                if not effectiveToken.IsCancellationRequested then
+                                    recordFailure recorded dirty (remember slots key) command digest error
+
+                                return Error error
                             | Ok result ->
                                 if effectiveToken.IsCancellationRequested then
                                     return Error(ProcessError.Cancelled command.Program)

@@ -457,6 +457,107 @@ type CassetteRobustnessTests() =
 
         Check.QuickThrowOnFailure property
 
+    // --- Property 7: the recorded-failure half (format v7) with adversarial payloads — a `Failure`
+    // object whose `Kind` is known / unknown / empty / absurdly long, whose required members are missing
+    // or extreme (a NaN-ish timeout, `Int32` extremes for the codes and the output totals), and whose
+    // text members are null or long. The entry is keyed to match the replay command, so a payload that
+    // loads is actually rebuilt into a `ProcessError` by every verb. Every combination must resolve to
+    // Ok or a typed error across load AND replay — never an unhandled exception out of a
+    // `Result`-returning verb (a `TimeSpan.FromMilliseconds` overflow being the obvious trap). ---
+
+    [<Test>]
+    member _.``an adversarial recorded-failure payload never throws on load or replay``() =
+        let case =
+            gen {
+                let! kindChoice =
+                    Gen.elements
+                        [ "NotFound"
+                          "Spawn"
+                          "Stdin"
+                          "Exit"
+                          "Signalled"
+                          "Timeout"
+                          "OutputTooLarge"
+                          "Parse"
+                          "JsonRpc"
+                          "notfound" // right name, wrong case: an unknown kind
+                          ""
+                          String('k', 5000) ]
+
+                let! hasDetail = Gen.elements [ true; false ]
+                let! hasStreams = Gen.elements [ true; false ]
+                let! hasSearched = Gen.elements [ true; false ]
+                let! codeChoice = Gen.elements [ None; Some 0; Some -32601; Some Int32.MaxValue; Some Int32.MinValue ]
+                let! signalChoice = Gen.elements [ None; Some 9; Some Int32.MinValue ]
+
+                let! timeoutChoice = Gen.elements [ None; Some 0.0; Some 2500.0; Some 1e18; Some -5.0; Some 1.7e308 ]
+
+                let! limitChoice = Gen.elements [ None; Some 0; Some 10; Some Int32.MaxValue ]
+                let! totalChoice = Gen.elements [ None; Some 0; Some Int32.MaxValue; Some Int32.MinValue ]
+                let! hasMethod = Gen.elements [ true; false ]
+                let! hasData = Gen.elements [ true; false ]
+                let! terminalState = Gen.elements [ true; false ]
+
+                return
+                    {| Kind = kindChoice
+                       HasDetail = hasDetail
+                       HasStreams = hasStreams
+                       HasSearched = hasSearched
+                       Code = codeChoice
+                       Signal = signalChoice
+                       Timeout = timeoutChoice
+                       Limit = limitChoice
+                       Total = totalChoice
+                       HasMethod = hasMethod
+                       HasData = hasData
+                       TerminalState = terminalState |}
+            }
+
+        let property =
+            Prop.forAll (Arb.fromGen case) (fun c ->
+                let optionalInt (name: string) (value: int option) =
+                    value |> Option.map (fun v -> kv name (string v)) |> Option.toList
+
+                let failureMembers =
+                    [ yield kv "Kind" (jstr c.Kind)
+                      if c.HasDetail then
+                          yield kv "Detail" (jstr (String('d', 300)))
+                      if c.HasSearched then
+                          yield kv "Searched" (jstr "/usr/bin:/bin")
+                      if c.HasStreams then
+                          yield kv "Stdout" (jstr "out")
+                          yield kv "Stderr" (jstr "err")
+                      yield! optionalInt "Code" c.Code
+                      yield! optionalInt "Signal" c.Signal
+                      match c.Timeout with
+                      | Some milliseconds -> yield kv "TimeoutMs" (jnum milliseconds)
+                      | None -> ()
+                      yield! optionalInt "LineLimit" c.Limit
+                      yield! optionalInt "ByteLimit" c.Limit
+                      yield! optionalInt "TotalLines" c.Total
+                      yield! optionalInt "TotalBytes" c.Total
+                      if c.HasMethod then
+                          yield kv "Method" (jstr "textDocument/hover")
+                      if c.HasData then
+                          yield kv "Data" (jstr """{"retryable":true}""") ]
+
+                let members =
+                    [ yield kv "Program" (jstr "tool")
+                      yield kv "Args" "[]"
+                      yield kv "HasStdin" "false"
+                      yield kv "EnvNames" "[]"
+                      yield kv "Stdout" (jstr "")
+                      yield kv "Stderr" (jstr "")
+                      // A recorded result half alongside the failure: contradictory, and must be a typed
+                      // refusal rather than an ambiguous replay.
+                      if c.TerminalState then
+                          yield kv "Code" "0"
+                      yield "\"Failure\": { " + String.Join(", ", failureMembers) + " }" ]
+
+                loadIsRobust (utf8 (cassetteJson (string currentVersion) members)))
+
+        Check.QuickThrowOnFailure property
+
     // --- Explicit boundary cases (checked directly, not merely relied upon to appear at random). ---
 
     [<Test>]
