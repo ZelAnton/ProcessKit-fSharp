@@ -89,6 +89,125 @@ type PosixSpawnCleanupTests() =
         let escaped = path.Replace("'", "'\\''", StringComparison.Ordinal)
         "'" + escaped + "'"
 
+    // `/proc/<pid>/stat` past its `comm` field: the file is `pid (comm) state ppid ...` and `comm` may
+    // hold spaces/parens, so the remaining fields are read after the LAST ')' — `[0]` is the state and
+    // `[1]` the parent pid. Linux-only; the KillOnParentDeath guard tests below use it to know which pid
+    // the guard really compares against instead of assuming one.
+    let statFieldsAfterComm (pid: string) =
+        let stat = File.ReadAllText $"/proc/{pid}/stat"
+        let closeParen = stat.LastIndexOf ')'
+        stat.Substring(closeParen + 1).Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)
+
+    /// This test host's own parent pid.
+    let ourParentPid () =
+        match Int32.TryParse((statFieldsAfterComm "self")[1]) with
+        | true, ppid -> ppid
+        | false, _ -> -1
+
+    /// True while `pid` still names a live (not yet reaped, not zombie) process.
+    let processLive (pid: int) =
+        try
+            let fields = statFieldsAfterComm (string pid)
+            fields.Length > 0 && fields[0] <> "Z"
+        with _ ->
+            // No /proc entry (or it vanished mid-read): the process is gone, which is exactly the state
+            // the caller is polling for — not a failure to report.
+            false
+
+    /// Poll `condition` until it holds or the bounded deadline expires.
+    let waitUntil (condition: unit -> bool) (timeout: TimeSpan) =
+        let deadline = DateTime.UtcNow + timeout
+        let mutable ok = condition ()
+
+        while not ok && DateTime.UtcNow < deadline do
+            Thread.Sleep 25
+            ok <- condition ()
+
+        ok
+
+    /// The `setpriv` the library itself would load — a trusted-directory match, never a `PATH` copy (see
+    /// the pdeathsig test below for why the gate must ask the resolver rather than `Exec.which`).
+    let trustedSetpriv () =
+        Native.Posix.trustedHelperPathForTests "setpriv"
+
+    // The middle process of the parent-death race harness (see the section comment further down): fork the
+    // inner shell, handing it this shell's own pid, then die — immediately, or, in `armed` mode, once the
+    // target the inner shell launched is running.
+    // Positional: $1 = inner script, $2 = setpriv, $3 = guard script, $4 = reached marker, $5 = mode,
+    // $6 = wait marker, $7... = target argv.
+    let parentDeathMiddleScript =
+        """inner=$1
+shift
+/bin/sh -c "$inner" sh "$$" "$@" &
+if [ "$4" = armed ]; then
+    i=0
+    while [ ! -f "$5" ] && [ "$i" -lt 300 ]; do
+        i=$((i + 1))
+        sleep 0.1
+    done
+fi
+exit 0
+"""
+
+    // The inner process: in `armed` mode run the chain straight away (the parent is still alive, so the
+    // arming is what must protect the target); otherwise spin until the kernel has really reparented this
+    // shell away from the middle process, and only then run the chain — with either the dead spawner's pid
+    // (`stale`, the pre-arm race) or the pid of the parent it actually has now (`reaper`, the case that
+    // must still run, whether that parent is PID 1 or a subreaper). `/proc/$$/stat`'s fourth field is the
+    // CURRENT parent pid, unlike `$PPID`, which the shell snapshots once at startup. The pid the chain is
+    // given is written to the reached marker first, so a test can tell "the harness never got there" apart
+    // from "the guard stopped it".
+    // Positional: $1 = middle pid, $2 = setpriv, $3 = guard script, $4 = reached marker, $5 = mode,
+    // $6 = wait marker, $7... = target argv.
+    let parentDeathInnerScript =
+        """mid=$1
+sp=$2
+g=$3
+reached=$4
+mode=$5
+shift 6
+if [ "$mode" = armed ]; then
+    e=$mid
+else
+    i=0
+    while [ "$(cut -d' ' -f4 /proc/$$/stat)" = "$mid" ] && [ "$i" -lt 200 ]; do
+        i=$((i + 1))
+        sleep 0.05
+    done
+    if [ "$mode" = stale ]; then
+        e=$mid
+    else
+        e=$(cut -d' ' -f4 /proc/$$/stat)
+    fi
+fi
+echo "$e" > "$reached"
+exec "$sp" --pdeathsig=SIGKILL /bin/sh -c "$g" sh "$e" "$@"
+"""
+
+    /// Launch the parent-death race harness detached — its own session, no containment, no kill-on-drop —
+    /// so the inner chain really is orphaned by the middle process's death instead of being torn down with
+    /// the run. Returns as soon as the middle process is launched; the assertions poll the markers.
+    let startParentDeathHarness
+        (setpriv: string)
+        (mode: string)
+        (reached: string)
+        (waitMarker: string)
+        (target: string list)
+        =
+        let args =
+            [ "-c"
+              parentDeathMiddleScript
+              "sh"
+              parentDeathInnerScript
+              setpriv
+              Native.Posix.parentDeathGuardScriptForTests
+              reached
+              mode
+              waitMarker ]
+            @ target
+
+        Native.Posix.spawnDetachedPosix (Command.create "/bin/sh" |> Command.args args)
+
     // Run `command` through `Native.Posix.spawnPosix` with a fault seam installed (always reset in a
     // `finally`) and assert it comes back as an honest `ProcessError.Spawn` — never a raw exception, and
     // never `Ok` (which would mean the fault did not fire and a child may have leaked). Cross-platform:
@@ -553,4 +672,464 @@ type PosixSpawnCleanupTests() =
             match! cmd.OutputStringAsync() with
             | Ok result -> Assert.That(result.Stdout.Trim(), Is.EqualTo "hi")
             | Error err -> Assert.Fail $"KillOnParentDeath must not affect a Windows run: {err.Message}"
+        }
+
+    // ---- The pre-arm window (T-361) -----------------------------------------------------------
+    //
+    // `setpriv --pdeathsig=SIGKILL` arms `PR_SET_PDEATHSIG` INSIDE the child, so a parent that dies
+    // between the spawn and that `prctl` is never covered by the arming: the kernel reparents the orphan
+    // first, and the arming then binds the signal to the reaper that adopted it, leaving the child alive
+    // after the process that asked for `KillOnParentDeathScope.DirectChildOnly` is gone. `Native.Posix`
+    // closes that window with a POSIX-sh guard `setpriv` `exec`s immediately after arming: it compares its
+    // own `$PPID` (read at shell startup, i.e. after the arming) with the spawner pid captured BEFORE the
+    // spawn, and SIGKILLs itself instead of `exec`ing the target when the two differ.
+    //
+    // The window cannot be hit by a test that needs its own runner alive, so it is covered from two
+    // directions, both deterministic:
+    //
+    //  * the `parentDeathSpawnerPidForTests` seam substitutes the captured pid, driving the "the parent is
+    //    no longer the captured one" branch through the REAL production chain — plain, pty, and cgroup;
+    //  * a shell harness reproduces the race for real: a middle process forks a child and dies, the child
+    //    waits until the kernel has actually reparented it and only then runs the same
+    //    `setpriv --pdeathsig` + guard chain. The same harness also covers the two cases that must NOT
+    //    kill anything — a captured pid that matches the current (reaper, PID 1 or subreaper) parent, and
+    //    an ordinary armed child whose parent dies AFTER the arming, where the kernel is what kills it.
+    //
+    // The seam is a process-wide mutable set and reset in a `finally`; this fixture runs sequentially (no
+    // `[<Parallelizable>]`), so it never races a concurrent spawn.
+
+    // The three shapes a lost pre-arm race leaves behind, all of them "the child's parent is no longer the
+    // pid captured before the spawn": the spawner is simply gone; the orphan was adopted by a subreaper
+    // with an ordinary (non-init) pid; the spawner was pid 1 itself. Each is expressed as the captured pid
+    // the guard has to reject, since the child's actual parent is always this live test host.
+    [<TestCase("vanished-spawner")>]
+    [<TestCase("non-init-subreaper")>]
+    [<TestCase("captured-pid-1")>]
+    member _.``KillOnParentDeath stops the child instead of running the target when the spawner is no longer its parent``
+        (shape: string)
+        : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: the pre-arm guard rides the util-linux 'setpriv --pdeathsig' chain"
+            elif shape = "captured-pid-1" && Environment.ProcessId = 1 then
+                Assert.Ignore "this test host IS pid 1, so a captured 1 would legitimately match its child's parent"
+
+            match trustedSetpriv () with
+            | None ->
+                Assert.Ignore
+                    "requires the util-linux 'setpriv' helper in a trusted system directory (/usr/bin, /bin, /usr/sbin, /sbin)"
+            | Some _ ->
+                let captured =
+                    match shape with
+                    // A pid that is not this process and names no parent of the child at all — the plain
+                    // "the spawner died and its pid went with it" case.
+                    | "vanished-spawner" -> Environment.ProcessId + 1
+                    // This test host's OWN parent: a real, live, non-init process that simply is not the
+                    // child's parent — the shape a reparent to a `PR_SET_CHILD_SUBREAPER` ancestor leaves,
+                    // where the new parent keeps an ordinary pid and an "orphans have ppid 1" shortcut
+                    // would never fire. Falls back to another non-init pid on the exotic host where this
+                    // process is itself a direct child of init, so the case stays a non-init one.
+                    | "non-init-subreaper" ->
+                        let parent = ourParentPid ()
+
+                        if parent > 1 then parent else Environment.ProcessId + 2
+                    // Captured pid 1 while the child's parent is this (non-init) test host: 1 must be
+                    // compared like any other pid, not read as a sentinel meaning "fine".
+                    | _ -> 1
+
+                Assert.That(
+                    captured,
+                    Is.Not.EqualTo(Environment.ProcessId),
+                    "the captured pid must differ from the child's real parent for this to be the lost-race case"
+                )
+
+                let marker =
+                    Path.Combine(Path.GetTempPath(), $"pk-pdeath-{shape}-{Guid.NewGuid():N}.marker")
+
+                try
+                    Native.Posix.parentDeathSpawnerPidForTests <- Some captured
+
+                    let cmd =
+                        Command.create "/bin/sh"
+                        |> Command.args [ "-c"; $"echo ran > {quoteShellPath marker}" ]
+                        |> Command.killOnParentDeath
+                        |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                    match! cmd.OutputStringAsync() with
+                    | Ok result ->
+                        Assert.That(
+                            result.Outcome,
+                            Is.EqualTo(Outcome.Signalled(Some 9)),
+                            "a child whose captured spawner is not its parent must end exactly as the armed signal would have ended it"
+                        )
+
+                        Assert.That(
+                            File.Exists marker,
+                            Is.False,
+                            $"the target ran although the pid it captured ({captured}) is not its parent"
+                        )
+                    | Error err -> Assert.Fail $"the guarded KillOnParentDeath spawn failed outright: {err.Message}"
+                finally
+                    Native.Posix.parentDeathSpawnerPidForTests <- None
+
+                    try
+                        File.Delete marker
+                    with _ ->
+                        // Best-effort cleanup: the marker is only a launch proof and must not mask the
+                        // assertion that it was never written.
+                        ()
+        }
+
+    [<Test>]
+    member _.``KillOnParentDeath still runs the target when the spawner is unchanged``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: KillOnParentDeath is armed by the util-linux 'setpriv --pdeathsig' helper"
+
+            match trustedSetpriv () with
+            | None ->
+                Assert.Ignore
+                    "requires the util-linux 'setpriv' helper in a trusted system directory (/usr/bin, /bin, /usr/sbin, /sbin)"
+            | Some _ ->
+                // The ordinary case: this process really is the child's parent, so the guard must pass the
+                // target through untouched — same exit code, same output, argv intact across both `exec`s.
+                let cmd =
+                    Command.create "/bin/sh"
+                    |> Command.args [ "-c"; "printf '%s' \"$1\""; "sh"; "guarded-ok" ]
+                    |> Command.killOnParentDeath
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Ok result ->
+                    Assert.That(result.Stdout, Is.EqualTo "guarded-ok")
+                    Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 0))
+                | Error err -> Assert.Fail $"a KillOnParentDeath run with a live spawner must succeed: {err.Message}"
+        }
+
+    [<Test>]
+    member _.``the parent-death guard is nested between the setpriv arming and the target, and only when asked``() =
+        if not isLinux then
+            Assert.Ignore "Linux-only: the helper chain is built only where setpriv can be resolved"
+
+        match trustedSetpriv () with
+        | None ->
+            Assert.Ignore
+                "requires the util-linux 'setpriv' helper in a trusted system directory (/usr/bin, /bin, /usr/sbin, /sbin)"
+        | Some setpriv ->
+            // This is the exact argv the `setsid --ctty` pty shim and the `/bin/sh` cgroup launcher `exec`,
+            // so pinning it here pins the guard's position in BOTH of those chains — no root, pty, or
+            // delegated cgroup needed to prove the composition.
+            let guard = Native.Posix.parentDeathGuardScriptForTests
+            let self = string Environment.ProcessId
+
+            let armed =
+                Command.create "/bin/echo" |> Command.args [ "hi" ] |> Command.killOnParentDeath
+
+            match Native.Posix.setprivWrappedArgvForTests armed with
+            | Ok argv ->
+                Assert.That(
+                    List.toArray argv,
+                    Is.EqualTo<string[]>(
+                        [| setpriv
+                           "--pdeathsig=SIGKILL"
+                           "/bin/sh"
+                           "-c"
+                           guard
+                           "sh"
+                           self
+                           "/bin/echo"
+                           "hi" |]
+                    )
+                )
+            | Error err -> Assert.Fail $"a lone KillOnParentDeath must build a chain: {err.Message}"
+
+            // Composed with a uid/gid drop: setpriv still applies the drop flags first and arms the signal
+            // after them, and the guard still sits immediately before the target — so the check runs with
+            // nothing between it and the program's `exec`, and the drop is not weakened by it.
+            match Native.Posix.setprivWrappedArgvForTests (armed |> Command.uid 12345 |> Command.gid 12345) with
+            | Ok argv ->
+                Assert.That(
+                    List.toArray argv,
+                    Is.EqualTo<string[]>(
+                        [| setpriv
+                           "--regid=12345"
+                           "--reuid=12345"
+                           "--clear-groups"
+                           "--pdeathsig=SIGKILL"
+                           "/bin/sh"
+                           "-c"
+                           guard
+                           "sh"
+                           self
+                           "/bin/echo"
+                           "hi" |]
+                    )
+                )
+            | Error err -> Assert.Fail $"KillOnParentDeath composed with a drop must build a chain: {err.Message}"
+
+            // A plain privilege drop gains no guard layer at all: nothing is armed, so there is nothing to
+            // race, and the extra `exec` would be pure cost.
+            match
+                Native.Posix.setprivWrappedArgvForTests (
+                    Command.create "/bin/echo" |> Command.args [ "hi" ] |> Command.uid 12345
+                )
+            with
+            | Ok argv ->
+                Assert.That(
+                    List.toArray argv,
+                    Is.EqualTo<string[]>([| setpriv; "--reuid=12345"; "--clear-groups"; "/bin/echo"; "hi" |])
+                )
+            | Error err -> Assert.Fail $"a plain uid drop must build a chain: {err.Message}"
+
+    [<TestCase(true)>]
+    [<TestCase(false)>]
+    member _.``a cgroup-launched KillOnParentDeath child joins its cgroup first and only then meets the guard``
+        (spawnerGone: bool)
+        : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: the cgroup launcher path is Linux-only"
+
+            match trustedSetpriv () with
+            | None ->
+                Assert.Ignore
+                    "requires the util-linux 'setpriv' helper in a trusted system directory (/usr/bin, /bin, /usr/sbin, /sbin)"
+            | Some _ ->
+                // A plain file stands in for `cgroup.procs`: the launcher's `echo $$ > "$1"` writes to it
+                // exactly as it writes to a real one, so the whole launcher -> setpriv -> guard -> target
+                // chain is exercised on any host, with the written pid proving the (privileged) join
+                // happened BEFORE the guard had its say.
+                let procs = Path.Combine(Path.GetTempPath(), $"pk-pdeath-procs-{Guid.NewGuid():N}")
+
+                let marker =
+                    Path.Combine(Path.GetTempPath(), $"pk-pdeath-cgroup-{Guid.NewGuid():N}.marker")
+
+                let command =
+                    Command.create "/bin/sh"
+                    |> Command.args [ "-c"; $"echo ran > {quoteShellPath marker}" ]
+                    |> Command.killOnParentDeath
+                    |> Command.stdout StdioMode.Null
+                    |> Command.stderr StdioMode.Null
+
+                try
+                    if spawnerGone then
+                        Native.Posix.parentDeathSpawnerPidForTests <- Some(Environment.ProcessId + 1)
+
+                    match Native.Posix.spawnPosixIntoCgroup command procs with
+                    | Error err -> Assert.Fail $"the cgroup launcher spawn failed: {err.Message}"
+                    | Ok spawned ->
+                        let! outcome = Native.Posix.waitPosix spawned.Handle
+
+                        Assert.That(
+                            File.Exists procs && File.ReadAllText(procs).Trim() <> "",
+                            Is.True,
+                            "the launcher must join the cgroup before the guard runs, in both cases"
+                        )
+
+                        if spawnerGone then
+                            Assert.That(outcome, Is.EqualTo(Outcome.Signalled(Some 9)))
+
+                            Assert.That(
+                                File.Exists marker,
+                                Is.False,
+                                "the cgroup-launched target ran although its spawner was gone"
+                            )
+                        else
+                            Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+
+                            Assert.That(
+                                waitUntil (fun () -> File.Exists marker) (TimeSpan.FromSeconds 10.0),
+                                Is.True,
+                                "the guard must pass the cgroup-launched target through when the spawner is unchanged"
+                            )
+                finally
+                    Native.Posix.parentDeathSpawnerPidForTests <- None
+
+                    for path in [ procs; marker ] do
+                        try
+                            File.Delete path
+                        with _ ->
+                            // Best-effort cleanup of the stand-in cgroup.procs file and the launch marker.
+                            ()
+        }
+
+    [<TestCase(true)>]
+    [<TestCase(false)>]
+    member _.``a Pty KillOnParentDeath child meets the guard inside the ctty chain``(spawnerGone: bool) : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: the pty ctty helper is util-linux 'setsid --ctty'"
+
+            match trustedSetpriv () with
+            | None ->
+                Assert.Ignore
+                    "requires the util-linux 'setpriv' helper in a trusted system directory (/usr/bin, /bin, /usr/sbin, /sbin)"
+            | Some _ ->
+                let marker =
+                    Path.Combine(Path.GetTempPath(), $"pk-pdeath-pty-{Guid.NewGuid():N}.marker")
+
+                try
+                    if spawnerGone then
+                        Native.Posix.parentDeathSpawnerPidForTests <- Some(Environment.ProcessId + 1)
+
+                    // `setsid --ctty` establishes the controlling terminal and then `exec`s the nested
+                    // `setpriv` + guard, so the guard is the last link before the target here too.
+                    let cmd =
+                        Command.create "/bin/sh"
+                        |> Command.args [ "-c"; $"echo ran > {quoteShellPath marker}; printf pty-ran" ]
+                        |> Command.killOnParentDeath
+                        |> Command.pty
+                        |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                    match! cmd.OutputStringAsync() with
+                    | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                    | Error err -> Assert.Fail $"the guarded pty KillOnParentDeath spawn failed: {err.Message}"
+                    | Ok result ->
+                        if spawnerGone then
+                            Assert.That(
+                                File.Exists marker,
+                                Is.False,
+                                "the pty target ran although its spawner was gone"
+                            )
+
+                            Assert.That(result.Stdout, Does.Not.Contain "pty-ran")
+                        else
+                            Assert.That(
+                                waitUntil (fun () -> File.Exists marker) (TimeSpan.FromSeconds 10.0),
+                                Is.True,
+                                "the guard must pass the pty target through when the spawner is unchanged"
+                            )
+                finally
+                    Native.Posix.parentDeathSpawnerPidForTests <- None
+
+                    try
+                        File.Delete marker
+                    with _ ->
+                        // Best-effort cleanup, as above.
+                        ()
+        }
+
+    [<TestCase("stale")>]
+    [<TestCase("reaper")>]
+    member _.``a child orphaned before the arming is stopped, while one whose captured pid is its real parent runs``
+        (mode: string)
+        : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: reproduces the PR_SET_PDEATHSIG pre-arm race"
+
+            match trustedSetpriv () with
+            | None ->
+                Assert.Ignore
+                    "requires the util-linux 'setpriv' helper in a trusted system directory (/usr/bin, /bin, /usr/sbin, /sbin)"
+            | Some setpriv ->
+                let directory = Directory.CreateTempSubdirectory($"pk-pdeath-{mode}-").FullName
+
+                let reached = Path.Combine(directory, "reached")
+                let ran = Path.Combine(directory, "ran")
+
+                try
+                    let target = [ "/bin/sh"; "-c"; $"echo ran > {quoteShellPath ran}" ]
+
+                    match startParentDeathHarness setpriv mode reached ran target with
+                    | Error err -> Assert.Fail $"could not launch the parent-death race harness: {err.Message}"
+                    | Ok _ ->
+                        Assert.That(
+                            waitForFile reached (TimeSpan.FromSeconds 30.0),
+                            Is.True,
+                            "the harness never reached the setpriv chain (the child was not reparented in time)"
+                        )
+
+                        let captured = File.ReadAllText(reached).Trim()
+
+                        if mode = "stale" then
+                            // The captured spawner really is gone by now, so the arming would bind the
+                            // signal to the reaper: the guard must stop the chain instead of running it.
+                            Assert.That(
+                                waitUntil (fun () -> File.Exists ran) (TimeSpan.FromSeconds 3.0),
+                                Is.False,
+                                $"the target ran although the spawner it captured ({captured}) had already died"
+                            )
+                        else
+                            // The captured pid IS the process that is now the parent — PID 1 on a container
+                            // host, an ordinary subreaper pid elsewhere. Either way nothing may be killed.
+                            Assert.That(
+                                waitUntil (fun () -> File.Exists ran) (TimeSpan.FromSeconds 30.0),
+                                Is.True,
+                                $"the guard killed a child whose captured spawner pid ({captured}) is its real parent"
+                            )
+                finally
+                    try
+                        Directory.Delete(directory, true)
+                    with _ ->
+                        // Best-effort cleanup of the harness markers; a leftover temp directory must not
+                        // mask the assertions above.
+                        ()
+        }
+
+    [<Test>]
+    member _.``an armed child is killed by the kernel when its parent dies after the arming``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: PR_SET_PDEATHSIG"
+
+            match trustedSetpriv () with
+            | None ->
+                Assert.Ignore
+                    "requires the util-linux 'setpriv' helper in a trusted system directory (/usr/bin, /bin, /usr/sbin, /sbin)"
+            | Some setpriv ->
+                let directory = Directory.CreateTempSubdirectory("pk-pdeath-armed-").FullName
+                let reached = Path.Combine(directory, "reached")
+                let pidFile = Path.Combine(directory, "pid")
+                let mutable targetPid = 0
+
+                try
+                    // The guard passes (the captured pid IS the live middle process), the signal is armed,
+                    // and only THEN does the parent die — the case the guard must not interfere with and
+                    // the kernel must handle: the target is SIGKILLed with its long sleep unfinished.
+                    let target = [ "/bin/sh"; "-c"; $"echo $$ > {quoteShellPath pidFile}; sleep 30" ]
+
+                    match startParentDeathHarness setpriv "armed" reached pidFile target with
+                    | Error err -> Assert.Fail $"could not launch the parent-death race harness: {err.Message}"
+                    | Ok _ ->
+                        Assert.That(
+                            waitForFile pidFile (TimeSpan.FromSeconds 30.0),
+                            Is.True,
+                            "the armed target never started"
+                        )
+
+                        // The file can be observed between create and write, so read the pid itself with a
+                        // bounded poll rather than assuming the first read sees it.
+                        Assert.That(
+                            waitUntil
+                                (fun () ->
+                                    match Int32.TryParse(File.ReadAllText(pidFile).Trim()) with
+                                    | true, pid ->
+                                        targetPid <- pid
+                                        true
+                                    | false, _ -> false)
+                                (TimeSpan.FromSeconds 10.0),
+                            Is.True,
+                            "the armed target never reported its pid"
+                        )
+
+                        Assert.That(
+                            waitUntil (fun () -> not (processLive targetPid)) (TimeSpan.FromSeconds 20.0),
+                            Is.True,
+                            $"the armed target ({targetPid}) survived its parent's death"
+                        )
+                finally
+                    if targetPid > 0 && processLive targetPid then
+                        try
+                            Native.Posix.killProcess targetPid
+                        with _ ->
+                            // Best-effort cleanup of a target that outlived its parent (the very failure
+                            // asserted above): it must not be left behind for the rest of the suite.
+                            ()
+
+                    try
+                        Directory.Delete(directory, true)
+                    with _ ->
+                        // Best-effort cleanup of the harness markers.
+                        ()
         }

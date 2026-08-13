@@ -6,6 +6,7 @@ open System.IO
 open System.Runtime.InteropServices
 open System.Security.Cryptography
 open System.Text
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
@@ -80,6 +81,14 @@ type private FixedRunner(stdout: string, code: int) =
 [<TestFixture>]
 type CassetteTests() =
 
+    /// Remove a cassette and the sibling advisory-lock file a save creates next to it (`Save` never
+    /// deletes that file itself — see `RecordReplayRunner.Save` — so a test cleans it up like the
+    /// cassette it belongs to).
+    let deleteCassette (path: string) : unit =
+        for file in [ path; path + ".lock" ] do
+            if File.Exists file then
+                File.Delete file
+
     let withCassette (body: string -> Task) : Task =
         task {
             let path = Path.GetTempFileName()
@@ -87,11 +96,54 @@ type CassetteTests() =
             try
                 do! body path
             finally
-                if File.Exists path then
-                    File.Delete path
+                deleteCassette path
         }
 
     let runner (r: RecordReplayRunner) : IProcessRunner = r
+
+    /// The cassette on disk, read through a share mode that tolerates the atomic replace a concurrent
+    /// save performs (on Windows a plain read would otherwise make that save's rename fail).
+    let readCassetteText (path: string) : string =
+        use stream =
+            new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite ||| FileShare.Delete)
+
+        use reader = new StreamReader(stream)
+        reader.ReadToEnd()
+
+    /// The `Program` of every entry in the cassette on disk, in capture order — enough to tell WHICH
+    /// writer's snapshot a file holds, and how much of it.
+    let cassettePrograms (path: string) : string[] =
+        use document = JsonDocument.Parse(readCassetteText path)
+
+        document.RootElement.GetProperty("Entries").EnumerateArray()
+        |> Seq.map (fun entry ->
+            match entry.GetProperty("Program").GetString() with
+            | null -> ""
+            | program -> program)
+        |> Seq.toArray
+
+    /// The directory holding a cassette (a temp-file path always has one).
+    let cassetteDirectory (path: string) : string =
+        match Path.GetDirectoryName path with
+        | null
+        | "" -> "."
+        | directory -> directory
+
+    /// The file name a cassette's sibling temp files are derived from.
+    let cassetteFileName (path: string) : string =
+        match Path.GetFileName path with
+        | null -> ""
+        | fileName -> fileName
+
+    /// Record `count` distinct invocations of `program` through a recorder, so its snapshot is
+    /// recognisable on disk (every entry carries that program name).
+    let recordEntries (recorder: RecordReplayRunner) (program: string) (count: int) : Task =
+        task {
+            for index in 1..count do
+                let command = Command.create program |> Command.arg (string index)
+                let! _ = (recorder :> IProcessRunner).OutputStringAsync(command, CancellationToken.None)
+                ()
+        }
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
@@ -278,8 +330,7 @@ type CassetteTests() =
                             Is.EqualTo(UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
                         )
             finally
-                if File.Exists path then
-                    File.Delete path
+                deleteCassette path
         }
 
     [<Test>]
@@ -1605,4 +1656,284 @@ type CassetteTests() =
                             [| "out1"; "out2" |],
                             events |> Seq.map (fun e -> e.Text) |> Seq.toArray
                         )
+            })
+
+    // --- Concurrent saves to one cassette path ---------------------------------------------------
+    //
+    // A cassette write is a full-file replacement, so two writers that overlap can silently lose a
+    // recording: the older snapshot lands last and the newer one is gone, with both callers told `Ok`.
+    // `Save` therefore runs its whole snapshot → write → rename → fsync section under this recorder's
+    // save gate AND an advisory lock on a sibling `<path>.lock` shared with every other recorder and
+    // process. The tests below pin the four promises that follow: a recorder never conflicts with
+    // itself, a writer that loses the lock is refused with a typed retryable error instead of
+    // clobbering, the file always holds one writer's whole snapshot, and an ordinary save neither
+    // removes the lock file nor touches a temp it did not create.
+
+    [<Test>]
+    member _.``concurrent Save calls on one recorder all succeed and leave a whole cassette``() : Task =
+        withCassette (fun path ->
+            task {
+                use recorder = RecordReplayRunner.Record(path, FixedRunner("out", 0))
+                do! recordEntries recorder "tool" 20
+
+                // A recorder is serialized against itself: overlapping saves queue up rather than
+                // conflict, so none of them may be refused.
+                let! results = Task.WhenAll [| for _ in 1..8 -> Task.Run(fun () -> recorder.Save()) |]
+
+                for result in results do
+                    match result with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"a recorder must never conflict with its own save: {error}"
+
+                // ...and the file holds one complete snapshot, not a mixture of several writes.
+                CollectionAssert.AreEqual(Array.create 20 "tool", cassettePrograms path)
+            })
+
+    [<Test>]
+    member _.``a save that loses the sibling lock is refused and leaves the last cassette untouched``() : Task =
+        withCassette (fun path ->
+            task {
+                use first = RecordReplayRunner.Record(path, FixedRunner("first", 0))
+                do! recordEntries first "winner" 2
+
+                match first.Save() with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the first save must succeed: {error}"
+
+                let before = File.ReadAllBytes path
+
+                // A second recorder stands in for another process saving the same path.
+                use second = RecordReplayRunner.Record(path, FixedRunner("second", 0))
+                do! recordEntries second "loser" 1
+
+                // Hold the lock through the very primitive `Save` acquires, so this is the real
+                // contention path and not a re-implementation of it.
+                match RecordReplayRunner.HoldSaveLockForTests path with
+                | Error error -> Assert.Fail $"the test could not take the save lock: {error}"
+                | Ok holder ->
+                    let refused =
+                        use _holder = holder
+                        second.Save()
+
+                    match refused with
+                    | Error(ProcessError.Io _ as error) ->
+                        Assert.That(error.IsTransient, Is.True, "a losing save must be retryable")
+                    | other -> Assert.Fail $"a losing save must be a typed I/O conflict, got {other}"
+
+                    CollectionAssert.AreEqual(
+                        before,
+                        File.ReadAllBytes path,
+                        "a refused save must leave the last saved cassette byte for byte"
+                    )
+
+                // The lock is released now — as it is when a crashed writer's process dies, since the OS
+                // drops it — so the next save goes through and publishes its own whole snapshot.
+                match second.Save() with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"a save after the lock is released must succeed: {error}"
+
+                CollectionAssert.AreEqual([| "loser" |], cassettePrograms path)
+            })
+
+    [<Test>]
+    member _.``concurrent saves from several recorders leave one writer's whole snapshot, never a mix``() : Task =
+        withCassette (fun path ->
+            task {
+                // Three recorders on one path, each with a recognisable program name and a different
+                // number of entries — the stand-in for three processes sharing a cassette.
+                let plan = [| "alpha", 3; "beta", 5; "gamma", 7 |]
+
+                let recorders =
+                    [| for program, _ in plan -> RecordReplayRunner.Record(path, FixedRunner(program, 0)) |]
+
+                try
+                    for index, (program, count) in Array.indexed plan do
+                        do! recordEntries recorders[index] program count
+
+                    let! results =
+                        Task.WhenAll
+                            [| for recorder in recorders -> Task.Run(fun () -> [| for _ in 1..5 -> recorder.Save() |]) |]
+
+                    // Every save either wrote its whole snapshot or was told, in a typed and retryable
+                    // way, that someone else was writing — never a silent partial success.
+                    for result in Array.concat results do
+                        match result with
+                        | Ok() -> ()
+                        | Error(ProcessError.Io _ as error) ->
+                            Assert.That(error.IsTransient, Is.True, "a losing save must be retryable")
+                        | Error other -> Assert.Fail $"a concurrent save must not fail as {other}"
+                finally
+                    for recorder in recorders do
+                        (recorder :> IDisposable).Dispose()
+
+                // Whatever the interleaving, the file is exactly one recorder's complete recording.
+                let programs = cassettePrograms path
+                let winner = Array.head programs
+                let expected = plan |> Array.find (fun (program, _) -> program = winner) |> snd
+
+                CollectionAssert.AreEqual(
+                    Array.create expected winner,
+                    programs,
+                    "the cassette must hold one writer's whole snapshot, not a mixture"
+                )
+            })
+
+    [<Test>]
+    member _.``a later Save is never undone by an older one of the same recorder``() : Task =
+        withCassette (fun path ->
+            task {
+                use recorder = RecordReplayRunner.Record(path, FixedRunner("out", 0))
+                use stop = new CancellationTokenSource()
+
+                // An observer of the cassette: because each save snapshots only once it already holds the
+                // write lock, and the recording only grows, the entry count on disk can never go
+                // backwards. A slower older save overwriting a newer one is exactly what that would look
+                // like. Reads that lose a race with the rename are skipped, not failed.
+                let highest = ref 0
+                let wentBackwards = ref false
+
+                let observer =
+                    Task.Run(fun () ->
+                        while not stop.IsCancellationRequested do
+                            try
+                                let seen = (cassettePrograms path).Length
+
+                                if seen < highest.Value then
+                                    wentBackwards.Value <- true
+                                else
+                                    highest.Value <- seen
+                            with _ ->
+                                // A read that lands mid-replacement (or before the first save) proves
+                                // nothing either way; only the counts actually observed are asserted on.
+                                ()
+
+                            Thread.Sleep 1)
+
+                for round in 1..30 do
+                    let command = Command.create "tool" |> Command.arg (string round)
+                    let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+                    // Four saves race each other while the recording keeps growing underneath them.
+                    let! _ = Task.WhenAll [| for _ in 1..4 -> Task.Run(fun () -> recorder.Save()) |]
+                    ()
+
+                stop.Cancel()
+                do! observer
+
+                Assert.That(wentBackwards.Value, Is.False, "a completed save must never be replaced by an older one")
+
+                match recorder.Save() with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the final save must succeed: {error}"
+
+                Assert.That((cassettePrograms path).Length, Is.EqualTo 30)
+            })
+
+    [<Test>]
+    member _.``an ordinary save keeps the lock file and never touches a foreign temp``() : Task =
+        withCassette (fun path ->
+            task {
+                let lockPath = path + ".lock"
+                let directory = cassetteDirectory path
+                let fileName = cassetteFileName path
+                let tempPattern = fileName + ".tmp-*"
+
+                // A leftover temp from a writer that crashed mid-save (or a live writer's in-flight temp,
+                // which looks identical from here): a save must neither open nor remove it.
+                let strayTemp = Path.Combine(directory, fileName + ".tmp-crashed-writer")
+
+                File.WriteAllText(strayTemp, "a crashed writer's leftover")
+
+                try
+                    use recorder = RecordReplayRunner.Record(path, FixedRunner("out", 0))
+                    do! recordEntries recorder "tool" 1
+
+                    for _ in 1..2 do
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+
+                    Assert.That(
+                        File.Exists lockPath,
+                        Is.True,
+                        "the lock file is a rendezvous, so an ordinary save must not delete and recreate it"
+                    )
+
+                    Assert.That(File.ReadAllText strayTemp, Is.EqualTo "a crashed writer's leftover")
+
+                    CollectionAssert.AreEqual(
+                        [| strayTemp |],
+                        Directory.GetFiles(directory, tempPattern),
+                        "a save must clean up its own temp and leave every other one alone"
+                    )
+                finally
+                    if File.Exists strayTemp then
+                        File.Delete strayTemp
+            })
+
+    [<Test>]
+    member _.``disposing a recorder while another writer holds the lock neither throws nor clobbers``() : Task =
+        withCassette (fun path ->
+            task {
+                use first = RecordReplayRunner.Record(path, FixedRunner("first", 0))
+                do! recordEntries first "winner" 1
+
+                match first.Save() with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the first save must succeed: {error}"
+
+                let before = File.ReadAllBytes path
+
+                match RecordReplayRunner.HoldSaveLockForTests path with
+                | Error error -> Assert.Fail $"the test could not take the save lock: {error}"
+                | Ok holder ->
+                    use _holder = holder
+                    let second = RecordReplayRunner.Record(path, FixedRunner("second", 0))
+                    do! recordEntries second "loser" 1
+
+                    // The drop-time flush is best-effort in both directions: a lock it cannot get within
+                    // its short wait is given up on rather than thrown out of `Dispose`, and the cassette
+                    // the lock holder is protecting stays exactly as it was.
+                    Assert.DoesNotThrow(Action(fun () -> (second :> IDisposable).Dispose()))
+
+                    CollectionAssert.AreEqual(
+                        before,
+                        File.ReadAllBytes path,
+                        "a flush that lost the lock must not touch the saved cassette"
+                    )
+            })
+
+    [<Test>]
+    member _.``a save to an unusable path fails as itself, not as a concurrency conflict``() : Task =
+        task {
+            // A cassette under a directory that does not exist can never be written, however long the
+            // caller waits — so it must report that, not the retryable "another writer has the lock"
+            // conflict a save uses for real contention.
+            let missing =
+                Path.Combine(Path.GetTempPath(), $"pk-missing-{Guid.NewGuid():N}", "cassette.json")
+
+            use recorder = RecordReplayRunner.Record(missing, FixedRunner("out", 0))
+            do! recordEntries recorder "tool" 1
+
+            match recorder.Save() with
+            | Ok() -> Assert.Fail "a save into a missing directory must not report success"
+            | Error(ProcessError.Io detail) ->
+                Assert.That(
+                    detail,
+                    Does.Not.Contain "another writer",
+                    "a broken path must not be reported as a retryable conflict"
+                )
+            | Error other -> Assert.Fail $"expected a typed I/O error, got {other}"
+        }
+
+    [<Test>]
+    member _.``the parent-directory fsync a save performs reaches the platform``() : Task =
+        withCassette (fun path ->
+            task {
+                // The rename that publishes a cassette is a directory-metadata write of its own, so a
+                // save fsyncs the parent directory on Unix (a documented no-op on Windows). That call is
+                // best-effort inside `Save`, which means a binding that never resolves would look exactly
+                // like success — this asserts it actually runs.
+                match RecordReplayRunner.FsyncParentDirectoryForTests path with
+                | Ok() -> ()
+                | Error detail -> Assert.Fail $"the parent-directory fsync must reach the platform: {detail}"
             })

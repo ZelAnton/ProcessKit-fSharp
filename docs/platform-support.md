@@ -246,7 +246,9 @@ the verb was set):
   parent death closes that last handle and terminates the Job. `KillOnParentDeath()` is a documented
   no-op there, not a silent one.
 - **Linux** arms `PR_SET_PDEATHSIG(SIGKILL)` on the child through the `setpriv --pdeathsig` helper,
-  reaching the **direct child only** (see the caveat below for what that excludes).
+  reaching the **direct child only** (see the caveat below for what that excludes). A parent that dies
+  before the arming lands is handled by the child itself: it verifies its parent is still the process
+  that spawned it and terminates instead of running your program if it is not.
 - **macOS/BSD** have no `PR_SET_PDEATHSIG` analog, so a set value fails the spawn with
   `ProcessError.Unsupported` — never a silent no-op.
 
@@ -483,7 +485,11 @@ covered — with the child's parent gone, nothing reaps its cgroup/pgroup. The k
 signal when the child `execve`s a **set-uid/set-gid** image, so for a `sudo`-like child it holds only up
 to that `exec`. And because the parent-death signal fires when the **spawning thread** (not merely the
 process) exits — and ProcessKit spawns on a thread-pool thread .NET may retire while the process lives —
-the reap is best-effort and can, in principle, fire early if that thread is reclaimed. On **Windows**
+the reap is best-effort and can, in principle, fire early if that thread is reclaimed. The one window the
+signal cannot cover — the parent dying *before* it is armed, which would leave it bound to the reaper
+that adopted the orphan — is closed separately: the child compares its parent against the pid captured
+before the spawn and `SIGKILL`s itself rather than running your program when they differ, so it needs
+`/bin/sh` alongside `setpriv` (absent, the spawn fails with a typed `ProcessError.Spawn`). On **Windows**
 the whole tree is reaped with no opt-in (the Job Object's `KILL_ON_JOB_CLOSE` fires when the kernel
 closes the dead parent's last Job handle during process rundown). On **macOS/BSD** there is no analog,
 so a request fails the spawn with `ProcessError.Unsupported` rather than pretending the cleanup happens.

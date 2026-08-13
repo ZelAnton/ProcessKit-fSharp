@@ -37,9 +37,11 @@ type internal PipelineStage =
 /// `OverflowMode.Error` stderr overflow on any stage — not just the final stdout — is surfaced), the
 /// wall-clock duration, whether the pipeline timed out, and a genuine stage-0 stdin source-acquisition
 /// failure observed by the feeder (surfaced by `Pipeline` as `ProcessError.Stdin` on an
-/// otherwise-successful run, like a single command). An inter-stage upstream read failure is retained
+/// otherwise-successful run, like a single command). An inter-stage relay failure is retained
 /// separately from the process outcomes so both the buffering and streaming paths surface it as a typed
-/// `ProcessError.Io` instead of accepting a downstream stage's truncated EOF as success.
+/// `ProcessError.Io` instead of accepting a downstream stage's truncated EOF as success — and it is the
+/// first such failure in real completion order, the one that also hard-killed the rest of the chain
+/// (see `PipelineRunner.observeChain`) rather than letting the run wait out a now-useless silent stage.
 type internal PipelineCapture =
     { LastStdout: byte[]
       LastStdoutTruncated: bool
@@ -61,7 +63,10 @@ module internal PipelineClassify =
 
     /// A genuine upstream relay-read failure is a pipeline I/O error even when the downstream stage
     /// observed the relay's resulting EOF and exited successfully. The relay records it in the capture
-    /// so buffering and streaming completion use the same error channel and precedence.
+    /// so buffering and streaming completion use the same error channel and precedence. Because that
+    /// failure also tore the chain down (`PipelineRunner.observeChain`), the stages around it may carry
+    /// signal-kill outcomes; this rule outranking the pipefail fold is what keeps the reported cause the
+    /// relay fault itself rather than a stage the resulting kill happened to catch.
     let copyError (capture: PipelineCapture) : ProcessError option = capture.CopyError
 
     /// The representative stage carrying the program/outcome/stderr for the verb result: pipefail's
@@ -192,100 +197,184 @@ module internal PipelineRunner =
     /// the zero-based upstream stage index.
     let mutable relaySourceTestHook: (int -> Stream -> Stream) option = None
 
-    /// The terminal observation of every pipeline stage, as seen when the whole chain has finished:
-    /// each stage's final `Outcome` (left-to-right), whether the chain's own proactive teardown caught
-    /// it (`TornDown` victim — de-prioritized by the pipefail fold so a killed sibling never steals the
-    /// blame), and whether the whole-chain deadline had fired by the moment the LAST stage reached a
-    /// terminal state (`TimedOut`). The timeout verdict is fixed here — the instant every stage is done,
-    /// *before* any slow relay/tee/stderr drain — so a lingering user tee or a slow drain can never
-    /// retroactively turn an already-decided success into a timeout (T-071).
-    type internal StageObservation =
-        { Outcomes: Outcome[]
-          TornDown: bool[]
-          TimedOut: bool }
+    /// The terminal observation of a whole pipeline chain — every stage's exit AND every inter-stage
+    /// relay — as seen once the chain has finished: each stage's final `Outcome` (left-to-right), whether
+    /// the chain's own proactive teardown caught it (`TornDown` victim — de-prioritized by the pipefail
+    /// fold so a killed sibling never steals the blame), whether the whole-chain deadline had fired by the
+    /// moment the LAST stage reached a terminal state (`TimedOut`), and the first genuine relay failure
+    /// seen (`RelayFault`). The timeout verdict is fixed the instant every stage is done — *before* any
+    /// slow relay/tee/stderr drain — so a lingering user tee or a slow drain can never retroactively turn
+    /// an already-decided success into a timeout (T-071).
+    type internal ChainObservation =
+        {
+            Outcomes: Outcome[]
+            TornDown: bool[]
+            TimedOut: bool
+            /// The FIRST genuine inter-stage relay failure, in real completion order across every relay —
+            /// the error the pipeline reports as `ProcessError.Io`, and the one that fired the chain's
+            /// teardown. `None` when every relay ended cleanly: `Pump.copyToAsync` already classifies the
+            /// routine cases (a downstream broken pipe, a teardown race) as no error at all, so anything
+            /// surfacing here is a real upstream read / downstream write failure.
+            RelayFault: ProcessError option
+        }
 
-    /// Observe every stage's exit in the order the exits are actually *seen* — one sequential `WhenAny`
-    /// drain of the per-stage wait tasks rather than N parallel continuations each reading a shared
-    /// teardown token after its own `await`. That is the crux of T-071: the "finished before vs. after
-    /// the proactive teardown fired" classification must follow real completion order, not the
-    /// scheduler's order of running continuations. With N independent continuations, a stage whose
-    /// process exited *before* a sibling's failure could still be mislabelled a teardown victim purely
-    /// because its continuation happened to run *after* the sibling's fired the teardown — and the
-    /// pipefail fold would then blame the wrong stage. A single sequential drain removes that slop: each
-    /// exit is classified atomically with the kill decision at the point it is observed.
+    /// Observe the whole chain — every stage's exit AND every inter-stage relay — through ONE
+    /// completion-order choke: a single sequential `WhenAny` drain over both task sets, in the order
+    /// things are actually *seen*, rather than N parallel continuations each reading a shared teardown
+    /// token after its own `await` (and rather than waiting out every stage exit first and only then
+    /// reading the relays' verdicts). Two distinct races make this one choke instead of two phases:
+    ///
+    /// - **Exit-order classification (T-071).** The "finished before vs. after the proactive teardown
+    ///   fired" labelling must follow real completion order, not the scheduler's order of running
+    ///   continuations. With N independent continuations, a stage whose process exited *before* a
+    ///   sibling's failure could still be mislabelled a teardown victim purely because its continuation
+    ///   happened to run *after* the sibling's fired the teardown — and the pipefail fold would then
+    ///   blame the wrong stage. A single sequential drain removes that slop: each exit is classified
+    ///   atomically with the kill decision at the point it is observed.
+    /// - **Relay-fault liveness (T-343).** A genuine relay read/write failure must tear the chain down
+    ///   the moment it is *seen*. The relay does close both pipe ends, but that alone is not enough: an
+    ///   upstream stage that simply stops writing and keeps running never earns a broken pipe, so a
+    ///   phase order that waits for every stage's natural exit *before* looking at the relay results
+    ///   would hang the whole pipeline on a failure it has already diagnosed — and hang it forever when
+    ///   no chain-level deadline is set. Racing the relay tasks in the SAME choke as the exits turns
+    ///   that hang into a prompt `ProcessError.Io`.
     ///
     /// For each stage, in completion order: record its outcome; mark it a teardown **victim**
     /// (`TornDown`) iff the teardown had already fired when this exit was seen; and, if this stage is
     /// itself the first genuine *checked* failure (not already a victim, and not under a whole-chain
     /// cancel/timeout teardown), fire the proactive teardown that hard-kills the still-running rest of
-    /// the chain. Once every stage is terminal, sample the timeout verdict and disarm the deadline timer
-    /// before returning, so the caller's subsequent (possibly slow) drain/tee runs with no armed timer.
+    /// the chain. For each relay, in the same order: a genuine failure is kept as the chain's
+    /// `RelayFault` (the first one only) and fires that very same idempotent teardown. Once every stage
+    /// is terminal — relays may still be draining — sample the timeout verdict and disarm the deadline
+    /// timer, so the caller's subsequent (possibly slow) drain/tee runs with no armed timer.
     ///
+    /// This choke never reaps anything itself: the stage waits handed to it are already the chain's ONE
+    /// `group.WaitHandle` per stage, and the teardown it fires only kills (K-016).
+    ///
+    /// - `waits` — each stage's single exit wait, by stage index.
+    /// - `relays` — the inter-stage relay tasks (`Pump.copyToAsync`, already classified: `None` is a
+    ///   clean relay, a routine downstream broken pipe, or a teardown race). Order is irrelevant — only
+    ///   the first genuine failure *seen* is kept — and an empty array is the single-stage chain.
     /// - `isCheckedFailure i outcome` — stage `i`'s outcome is a blame-worthy *checked* failure (its own
     ///   `UncheckedInPipe`/`OkCodes` already applied).
     /// - `killTree` — the proactive teardown kill (idempotent; a no-op once the tree is already down).
     /// - `externallyCancelled` — the whole chain is already being torn down by its timeout or an external
-    ///   cancellation, so a stage failing under it must NOT fire a second, redundant teardown.
+    ///   cancellation, so a stage failing (or a relay faulting) under it must NOT fire a second,
+    ///   redundant teardown; that path keeps its own priority over a relay fault.
     /// - `timeoutFired` — the whole-chain deadline (`timeoutCts`) has fired; sampled exactly once, the
     ///   moment every stage is terminal, to fix the timeout verdict before the optional slow drain/tee.
     /// - `disarmTimeout` — disarm the deadline timer once all stages are terminal, so it can neither fire
     ///   during the slow drain/tee nor leave an armed timer able to convert a settled success into a timeout.
-    let internal observeStages
+    let internal observeChain
         (waits: Task<Outcome>[])
+        (relays: Task<ProcessError option>[])
         (isCheckedFailure: int -> Outcome -> bool)
         (killTree: unit -> unit)
         (externallyCancelled: unit -> bool)
         (timeoutFired: unit -> bool)
         (disarmTimeout: unit -> unit)
-        : Task<StageObservation> =
+        : Task<ChainObservation> =
         task {
             let count = waits.Length
             let outcomes = Array.zeroCreate<Outcome> count
             let tornDown = Array.zeroCreate<bool> count
             let mutable teardownFired = false
-            // The stage indices not yet observed, drained in real completion order by `WhenAny` below.
-            let remaining = ResizeArray<int>(seq { 0 .. count - 1 })
+            let mutable relayFault: ProcessError option = None
+            let mutable timedOut = false
+            let mutable stagesSettled = false
 
-            while remaining.Count > 0 do
-                let pending = [| for i in remaining -> waits[i] |]
-                let! completed = Task.WhenAny pending
+            // The stage / relay slots not yet observed, drained TOGETHER in real completion order by the
+            // `WhenAny` below. `pending` lists the remaining stages first, so a winning position below
+            // `remainingStages.Count` is a stage exit and anything at or above it is a relay verdict.
+            let remainingStages = ResizeArray<int>(seq { 0 .. count - 1 })
+            let remainingRelays = ResizeArray<int>(seq { 0 .. relays.Length - 1 })
 
-                // `completed` is reference-equal to whichever `pending` element finished first; map it
-                // back to its original stage index before draining it from the remaining set.
-                let slot =
-                    pending
-                    |> Array.findIndex (fun (t: Task<Outcome>) -> obj.ReferenceEquals(t, completed))
-
-                let index = remaining[slot]
-                remaining.RemoveAt slot
-
-                // Await the finished wait to unwrap its outcome (and propagate a genuine wait fault
-                // exactly as the previous `Task.WhenAll` over the per-stage waits would have).
-                let! outcome = completed
-                outcomes[index] <- outcome
-
-                // Victim iff the teardown had already fired when THIS exit was seen. Because the drain is
-                // sequential, this snapshot is atomic against the kill decision below: a stage seen before
-                // the teardown is never mislabelled a victim by a later-running sibling continuation.
-                let victim = teardownFired
-                tornDown[index] <- victim
-
-                if not victim && not (externallyCancelled ()) && isCheckedFailure index outcome then
-                    // The first genuine checked failure fires the proactive teardown once (idempotent),
-                    // hard-killing the still-running rest of the chain instead of waiting on a pipe EOF a
-                    // quiet sibling may never deliver. It stays the (non-torn) culprit.
+            // The chain's proactive teardown, fired at most once by whichever comes first: a stage's own
+            // checked failure or a genuine relay fault. Suppressed while the whole chain is ALREADY being
+            // torn down by its timeout or an external cancellation — that path is killing the tree itself,
+            // and its verdict outranks a relay fault that merely raced it.
+            let fireProactiveTeardown () =
+                if not teardownFired && not (externallyCancelled ()) then
                     teardownFired <- true
                     killTree ()
 
-            // Every stage is terminal: fix the timeout verdict now — before the caller's slow relay/tee/
-            // stderr drain — and disarm the deadline timer so it cannot fire during that tail.
-            let timedOut = timeoutFired ()
-            disarmTimeout ()
+            // Fix the timeout verdict and disarm the deadline the instant every STAGE is terminal — before
+            // the (possibly slow) relay/tee/stderr tail, so nothing running afterwards can re-fire the
+            // timer and convert an already-settled success into a spurious timeout (T-071). Exactly once.
+            let settleStages () =
+                if not stagesSettled && remainingStages.Count = 0 then
+                    stagesSettled <- true
+                    timedOut <- timeoutFired ()
+                    disarmTimeout ()
+
+            // A chain with no stages at all never reaches the drain below; keep the verdict total.
+            settleStages ()
+
+            while remainingStages.Count > 0 || remainingRelays.Count > 0 do
+                let stageSlots = remainingStages.Count
+
+                let pending =
+                    [| for i in remainingStages -> waits[i] :> Task
+                       for j in remainingRelays -> relays[j] :> Task |]
+
+                let! completed = Task.WhenAny pending
+
+                // `completed` is reference-equal to whichever `pending` element finished first; map it
+                // back to its slot before draining it from the matching remaining set.
+                let slot =
+                    pending |> Array.findIndex (fun (t: Task) -> obj.ReferenceEquals(t, completed))
+
+                if slot < stageSlots then
+                    let index = remainingStages[slot]
+                    remainingStages.RemoveAt slot
+
+                    // Await the finished wait to unwrap its outcome (and propagate a genuine wait fault
+                    // exactly as a `Task.WhenAll` over the per-stage waits would have).
+                    let! outcome = waits[index]
+                    outcomes[index] <- outcome
+
+                    // Victim iff the teardown had already fired when THIS exit was seen. Because the drain
+                    // is sequential, this snapshot is atomic against the kill decision below: a stage seen
+                    // before the teardown is never mislabelled a victim by a later-running sibling.
+                    let victim = teardownFired
+                    tornDown[index] <- victim
+
+                    if not victim && isCheckedFailure index outcome then
+                        // The first genuine checked failure fires the proactive teardown once (idempotent),
+                        // hard-killing the still-running rest of the chain instead of waiting on a pipe EOF
+                        // a quiet sibling may never deliver. It stays the (non-torn) culprit.
+                        fireProactiveTeardown ()
+
+                    settleStages ()
+                else
+                    let relaySlot = slot - stageSlots
+                    let index = remainingRelays[relaySlot]
+                    remainingRelays.RemoveAt relaySlot
+
+                    // The relay task never faults — `Pump.copyToAsync` returns its classification — so this
+                    // only unwraps the verdict it already reached.
+                    let! fault = relays[index]
+
+                    match fault with
+                    | Some error ->
+                        // A genuine relay failure. Keep the FIRST one seen as the chain's I/O error and
+                        // tear the whole chain down at once: the relay has already closed both pipe ends,
+                        // but a silent upstream stage never dies of a broken pipe, so without this kill the
+                        // chain would sit waiting on a process whose output it can no longer use.
+                        if relayFault.IsNone then
+                            relayFault <- Some error
+
+                        fireProactiveTeardown ()
+                    | None ->
+                        // A clean relay, a routine downstream broken pipe, or a teardown race — by
+                        // `Pump.copyToAsync`'s own classification, not an error and not a teardown trigger.
+                        ()
 
             return
                 { Outcomes = outcomes
                   TornDown = tornDown
-                  TimedOut = timedOut }
+                  TimedOut = timedOut
+                  RelayFault = relayFault }
         }
 
     /// Wire ONE freshly spawned stage into the chain — stage 0's stdin feed, the inter-stage
@@ -592,20 +681,24 @@ module internal PipelineRunner =
                     // `killFirst = true` on the two ABORT exits (a stage spawn failure; a cancel/timeout that
                     // halted staging): hard-kill the whole partial chain, stop stage 0's feed, and reap every
                     // started stage here, returning those reap outcomes. `killFirst = false` on the normal
-                    // completion path: it has already reaped every stage through `observeStages` (whose lazy
-                    // per-checked-failure kill and timeout verdict are its own concern, and whose reap must not
-                    // be duplicated — a second `WaitHandle` on an already-reaped pid observes the wrong status)
-                    // and stops stage 0's feed later, only after observing that feed's fault — so this runs
-                    // just the shared tail and returns an empty outcome array (the caller uses `observeStages`'
-                    // outcomes instead).
+                    // completion path: it has already reaped every stage through `observeChain` (whose lazy
+                    // per-checked-failure kill, relay-fault teardown and timeout verdict are its own concern,
+                    // and whose reap must not be duplicated — a second `WaitHandle` on an already-reaped pid
+                    // observes the wrong status) and stops stage 0's feed later, only after observing that
+                    // feed's fault — so this runs just the shared tail and returns an empty outcome array (the
+                    // caller uses `observeChain`'s outcomes instead).
                     //
                     // The shared tail is identical for all three: drain the inter-stage relays, await every
                     // stage's stderr capture, then close every spawned pipe (the group's `use` dispose alone
                     // hard-kills but neither waitpids POSIX leaders nor closes these parent-side streams, so
                     // without this they would leak). The last stage's stdout capture is NOT closed here: the
                     // normal path awaits it just before calling this, so it is fully drained before these
-                    // `closeSpawned` calls dispose that stream.
-                    let drainChain (killFirst: bool) : Task<Outcome[] * Pump.RawCapture[] * ProcessError option> =
+                    // `closeSpawned` calls dispose that stream. The relay await is what keeps the tail total on
+                    // the two ABORT paths, which run no completion-order choke at all; on the normal path
+                    // `observeChain` has already observed AND classified every relay, so it completes at once
+                    // there and the chain's `ProcessError.Io` comes from that choke — never from a positional
+                    // pick here, which would report a left-of-chain relay over the fault actually seen first.
+                    let drainChain (killFirst: bool) : Task<Outcome[] * Pump.RawCapture[]> =
                         task {
                             if killFirst then
                                 beginTeardown ()
@@ -620,15 +713,13 @@ module internal PipelineRunner =
                                 else
                                     Task.FromResult(Array.empty<Outcome>)
 
-                            let! copyErrors = Task.WhenAll(copyTasks.ToArray())
+                            let! _ = Task.WhenAll(copyTasks.ToArray())
                             let! captures = Task.WhenAll(stderrTasks.ToArray())
-
-                            let copyError = copyErrors |> Array.tryPick id
 
                             for sp in spawned do
                                 Pump.closeSpawned sp
 
-                            return outcomes, captures, copyError
+                            return outcomes, captures
                         }
 
                     match spawnError with
@@ -662,7 +753,7 @@ module internal PipelineRunner =
                         // happen-before the waits, so the reap can never block on a raced stage the callback
                         // had not reached yet; this path keeps the reap outcomes and stderr captures to build
                         // its stage list.
-                        let! killedOutcomes, stderrCaptures, _ = drainChain true
+                        let! killedOutcomes, stderrCaptures = drainChain true
 
                         let duration = Stopwatch.GetElapsedTime startedAt
                         let timedOut = timeoutCts.IsCancellationRequested
@@ -770,8 +861,10 @@ module internal PipelineRunner =
                         // already being torn down by the whole-chain timeout or cancellation (`linkedCts`)
                         // suppresses it — that path is killing the tree itself. The whole before/after-
                         // teardown classification, plus the timeout verdict, is decided in one sequential
-                        // drain (`observeStages`, T-071) so it follows real exit order rather than the
-                        // order stray continuations happen to run in.
+                        // drain (`observeChain`, T-071) so it follows real exit order rather than the
+                        // order stray continuations happen to run in — and that same drain races the
+                        // inter-stage relays, so a genuine relay fault fires this identical teardown the
+                        // moment it is seen instead of waiting out a silent upstream (T-343).
                         let isCheckedFailure (index: int) (outcome: Outcome) =
                             not stages[index].Config.UncheckedInPipe
                             && not (outcome.IsAcceptedBy stages[index].Config.OkCodes)
@@ -790,26 +883,37 @@ module internal PipelineRunner =
                         let waits =
                             [| for index in 0 .. spawned.Count - 1 -> group.WaitHandle spawned[index].Handle |]
 
+                        // ONE completion-order choke over the stage exits AND the inter-stage relays: a
+                        // genuine relay fault tears the chain down the moment it is seen (it cannot sit
+                        // behind a still-pending, silently living upstream), while the exit-order victim
+                        // labelling and the timeout verdict keep their T-071 semantics.
                         let! observation =
-                            observeStages
+                            observeChain
                                 waits
+                                (copyTasks.ToArray())
                                 isCheckedFailure
                                 beginTeardown
                                 (fun () -> linkedCts.IsCancellationRequested)
                                 (fun () -> timeoutCts.IsCancellationRequested)
                                 disarmTimeout
 
-                        // Only NOW, with every stage terminal and the deadline disarmed, drain the
-                        // (possibly slow) relay/tee/stderr tail. A timer firing here can no longer flip
-                        // the verdict — it was fixed by `observeStages` above. Await the last stage's stdout
-                        // capture FIRST, so it is fully drained before `drainChain`'s `closeSpawned` disposes
-                        // that stream out from under it (the last stage has already exited, so its stdout is
-                        // at EOF and this cannot block on the relays). The shared tail then drains the relays
-                        // and stderr and closes every pipe: `killFirst = false` because the tree was killed
-                        // only lazily inside `observeStages`, the reap is already done there (never re-reap),
-                        // and stage 0's feed is stopped later once its fault has been observed below.
+                        // The chain's I/O verdict is the FIRST genuine relay fault the choke saw, in real
+                        // completion order — a routine downstream broken pipe and a teardown race were
+                        // already classified as no error by `Pump.copyToAsync` itself.
+                        let copyError = observation.RelayFault
+
+                        // Only NOW, with every stage terminal, every relay observed and the deadline
+                        // disarmed, drain the (possibly slow) tee/stderr tail. A timer firing here can no
+                        // longer flip the verdict — it was fixed by `observeChain` above. Await the last
+                        // stage's stdout capture FIRST, so it is fully drained before `drainChain`'s
+                        // `closeSpawned` disposes that stream out from under it (the last stage has already
+                        // exited, so its stdout is at EOF and this cannot block). The shared tail then awaits
+                        // the (already finished) relays and the stderr captures and closes every pipe:
+                        // `killFirst = false` because the tree was killed only lazily inside `observeChain`,
+                        // the reap is already done there (never re-reap), and stage 0's feed is stopped later
+                        // once its fault has been observed below.
                         let! lastCapture = captureTask
-                        let! _, stderrCaptures, copyError = drainChain false
+                        let! _, stderrCaptures = drainChain false
 
                         let duration = Stopwatch.GetElapsedTime startedAt
                         let timedOut = observation.TimedOut
@@ -908,7 +1012,7 @@ module internal PipelineRunner =
     /// Spawn every stage of a *streaming* pipeline into one fresh shared group, wire the chain, and return
     /// a `PipelineStart`. The last stage's stdout is left for the session's `RunningProcess` to stream
     /// (rather than captured like `run` does); the returned `RunningHost.Wait` observes the WHOLE chain
-    /// through the same reap-once choke point the buffered `run` uses — `observeStages` + `group.WaitHandle`
+    /// through the same reap-once choke point the buffered `run` uses — `observeChain` + `group.WaitHandle`
     /// (K-016/K-043) — so there is no fifth independent copy of the wait/reap logic. Cancellation
     /// (`cancellationToken`/`cancelOn`) or the chain `timeout` hard-kill the tree.
     ///
@@ -1150,18 +1254,25 @@ module internal PipelineRunner =
                                         // Disposed by a concurrent teardown; a disarmed timer no longer matters.
                                         ()
 
+                                // The SAME completion-order choke the buffered `run` uses (one implementation,
+                                // two callers): the stage exits and the inter-stage relays are raced together,
+                                // so a genuine relay fault tears the whole chain down the moment it is seen —
+                                // it can never sit behind a still-pending, silently living upstream — and the
+                                // fault it reports is the first one in real completion order.
                                 let! observation =
-                                    observeStages
+                                    observeChain
                                         waits
+                                        (copyTasks.ToArray())
                                         isCheckedFailure
                                         killTreeGated
                                         (fun () -> linkedCts.IsCancellationRequested)
                                         (fun () -> timeoutCts.IsCancellationRequested)
                                         disarmTimeout
 
-                                let! copyErrors = Task.WhenAll(copyTasks.ToArray())
+                                // Every relay was already awaited (and classified) inside the choke, so only
+                                // the stderr captures remain to be drained here.
                                 let! stderrCaptures = Task.WhenAll(stderrTasks.ToArray())
-                                let copyError = copyErrors |> Array.tryPick id
+                                let copyError = observation.RelayFault
                                 let duration = Stopwatch.GetElapsedTime startedAt
                                 let outcomes = observation.Outcomes
 
@@ -1219,11 +1330,11 @@ module internal PipelineRunner =
                             task {
                                 // Hard-kill, then reap EVERY started stage through `group.WaitHandle` — the
                                 // reap-once choke point (K-016/K-151). This is self-contained: it does not
-                                // depend on whether `Wait` (`observeStages`) ever ran, and because concurrent
+                                // depend on whether `Wait` (`observeChain`) ever ran, and because concurrent
                                 // waiters on one pid share the single OS reap, running it alongside an
-                                // in-flight `observeStages` (a session disposed mid-stream) neither
+                                // in-flight `observeChain` (a session disposed mid-stream) neither
                                 // double-reaps nor leaks a zombie. On the normal path (a terminal verb reaped
-                                // through `observeStages` already) these waits hit the warm linger cache and
+                                // through `observeChain` already) these waits hit the warm linger cache and
                                 // return promptly; their discarded outcomes don't matter here.
                                 teardownCts.Cancel()
                                 group.KillTree()

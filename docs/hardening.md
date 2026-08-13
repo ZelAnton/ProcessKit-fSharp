@@ -184,8 +184,19 @@ may run in a forked .NET child, so this is the only safe mechanism):
 | Feature | Helper | What it does before your program runs |
 |---|---|---|
 | `Uid` / `Gid` / `Groups` | `setpriv` (util-linux) | sets gid, uid, and the supplementary groups |
-| `KillOnParentDeath` | `setpriv --pdeathsig` (util-linux) | arms `PR_SET_PDEATHSIG(SIGKILL)` |
+| `KillOnParentDeath` | `setpriv --pdeathsig` (util-linux), then `/bin/sh` | arms `PR_SET_PDEATHSIG(SIGKILL)`, then checks the parent is still the process that spawned it |
 | `Pty` | `setsid --ctty` (util-linux) | new session + acquires the pty as controlling terminal |
+
+`KillOnParentDeath` needs the second step because `setpriv` can only arm the
+signal *inside* the child, after the spawn: a parent that dies in that moment is
+never covered by the arming (the kernel reparents the orphan first, and the
+signal then binds to whatever adopted it). The `/bin/sh` step runs immediately
+after the arming and before your program, and compares the child's current parent
+with the pid captured before the spawn — equal, it `exec`s your program in place;
+different, it `SIGKILL`s itself and your program never runs. It is pinned to the
+absolute `/bin/sh` for the same reason the two util-linux helpers are pinned; a
+host without it fails the spawn with a typed `ProcessError.Spawn` rather than
+arming with that window left open.
 
 The helper is the thing that **performs** the hardening, so it is exactly the
 thing an attacker would want to replace — and on the privilege-drop path it runs

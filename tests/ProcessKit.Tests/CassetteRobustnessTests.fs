@@ -103,8 +103,11 @@ type CassetteRobustnessTests() =
             bytes, version
         finally
             try
-                if File.Exists path then
-                    File.Delete path
+                // The cassette and the sibling advisory-lock file the save created next to it (a save
+                // deliberately never deletes that one itself — see `RecordReplayRunner.Save`).
+                for file in [ path; path + ".lock" ] do
+                    if File.Exists file then
+                        File.Delete file
             with _ ->
                 // Best-effort cleanup of the one-off seed fixture; a locked temp file must not fail
                 // static initialization.

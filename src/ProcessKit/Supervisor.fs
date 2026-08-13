@@ -885,6 +885,15 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
         // escape the Result-returning supervision contract. Keep the source context in the typed
         // error: a callback fault may happen after a result/error has already been produced, and
         // losing that context makes the terminal failure needlessly opaque.
+        //
+        // That context is kept in full on the typed error - `ProcessError.Io`'s `Detail` field carries
+        // this whole composite string, however long it grows. Only the one-line RENDER of it
+        // (`ProcessError.Message`, which previews each fragment up to `MessageText.MaxFragmentChars`)
+        // is bounded, and it is bounded from the END - hence the order below: which callback failed,
+        // then what it threw, then the run it failed around, whose own tail is already a bounded
+        // preview of the child's output. A detail long enough to be cut therefore shortens that
+        // trailing context first, and a callback whose own exception message fills the budget can
+        // crowd the context out of the render entirely; `Detail` still has all of it.
         let callbackFailure (callbackName: string) (context: string) (error: exn) : ProcessError =
             let exceptionDetail =
                 if String.IsNullOrWhiteSpace error.Message then
