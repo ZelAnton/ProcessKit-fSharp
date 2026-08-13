@@ -1,6 +1,239 @@
 namespace ProcessKit
 
 open System
+open System.Text
+
+/// The one sanitize-and-bound rule every caller-, child-, or peer-controlled fragment goes through
+/// before it reaches `ProcessError.Message` (and from there `ProcessError.ToString()`,
+/// `ProcessException.Message`, and whatever log line or terminal the consumer prints them to).
+///
+/// A failure's text routinely carries bytes ProcessKit did not author: a hostile child's stderr, a
+/// JSON-RPC peer's own error text, a caller's parser message, an OS error string built around a
+/// caller-supplied path. Printed verbatim, those can repaint an operator's terminal with ANSI escapes,
+/// ring the bell, split one log record into several with `CR`/`LF`/`U+2028`, or visually reorder the
+/// surrounding text with bidirectional-formatting controls (the "Trojan Source" class, CVE-2021-42574)
+/// — and an unbounded stream or unparsed dump can flood the log with a single message. This module is
+/// the single choke point that neutralizes all of that, so the rule cannot drift between error cases.
+///
+/// It bounds only the human-readable render. The structured fields (`Detail`, `Stdout`, `Stderr`,
+/// `Data`, `Original`) and their accessors keep the caller's bytes exactly as captured — a consumer
+/// that wants the full text still has it.
+module internal MessageText =
+
+    /// The character budget for ONE embedded fragment of a message. Chosen to clear the longest text
+    /// this library writes *by hand* — its wordiest literal diagnostic runs to roughly 400 characters —
+    /// while turning a 100 KB stderr line or unparsed dump into a small, stable preview. A message
+    /// embeds at most a handful of fragments, so the whole render stays bounded too.
+    ///
+    /// It is deliberately **not** a promise that every fragment survives whole. A fragment carrying text
+    /// this library did not author is cut whenever it exceeds the budget — that is the point — and so is
+    /// a *composite* detail the library builds around such text (an OS or exception message, a nested
+    /// error's own render; `Supervisor`'s callback failures compose one). A fragment is previewed from
+    /// its start, so compose such a detail with its short, actionable part first and the foreign text
+    /// last, and the cut falls on the least useful end. Nothing is lost either way: the untruncated text
+    /// stays on the structured field the fragment came from. Raising this budget to keep some particular
+    /// fragment whole is therefore the wrong lever — order or bound that fragment where it is composed.
+    [<Literal>]
+    let MaxFragmentChars = 512
+
+    /// Appended when a fragment is cut at `MaxFragmentChars`, so a truncated preview is never mistaken
+    /// for the whole text. It is the only character a preview can carry beyond the budget.
+    [<Literal>]
+    let private Ellipsis = '…'
+
+    /// What an unsafe character becomes: U+FFFD REPLACEMENT CHARACTER — visible, inert, and the
+    /// conventional "something was here that could not be represented" marker.
+    [<Literal>]
+    let private Replacement = '\uFFFD'
+
+    /// Whether `c` must never be emitted verbatim into a one-line log or terminal.
+    ///
+    /// Control characters (`ESC` and its ANSI sequences, `BEL`, `NUL`, `CR`, cursor moves, …), the
+    /// Unicode line/paragraph separators a terminal or log viewer renders as a newline, and the
+    /// bidirectional-formatting controls that can visually reorder the text around them.
+    ///
+    /// **TAB is deliberately exempt**: it is a legitimate column separator in ordinary tool output
+    /// (TSV, `git diff`, `ls -l`), it cannot start an escape sequence or reorder text, and mangling it
+    /// would corrupt normal output for no security gain.
+    let isDisplayUnsafe (c: char) : bool =
+        (Char.IsControl c && c <> '\t')
+        || c = '\u2028' // LINE SEPARATOR      — not a control character, still breaks the line
+        || c = '\u2029' // PARAGRAPH SEPARATOR — likewise
+        || c = '\u061C' // ARABIC LETTER MARK
+        || c = '\u200E' // LEFT-TO-RIGHT MARK
+        || c = '\u200F' // RIGHT-TO-LEFT MARK
+        || (c >= '\u202A' && c <= '\u202E') // LRE RLE PDF LRO RLO (embeddings/overrides)
+        || (c >= '\u2066' && c <= '\u2069') // LRI RLI FSI PDI (isolates)
+
+    /// The line terminators `String.ReplaceLineEndings` recognizes: `LF`, `CR`, `FF`, `NEL`, `LS`, `PS`.
+    /// Used to split a captured stream into lines; every one of them is also display-unsafe, so any that
+    /// survives inside a line (a lone `CR` between progress redraws, say) is neutralized by the preview.
+    let private isLineBreak (c: char) =
+        c = '\n'
+        || c = '\r'
+        || c = '\u000C'
+        || c = '\u0085'
+        || c = '\u2028'
+        || c = '\u2029'
+
+    /// Sanitize `text[first..last - 1]` (`last` exclusive) into a bounded single-line preview.
+    ///
+    /// Text that is already display-safe and inside the budget is returned unchanged — the common case
+    /// of an ordinary program name or a short OS error string pays nothing and reads exactly as before.
+    /// Otherwise each unsafe character becomes `Replacement`, and the copy stops at `MaxFragmentChars`
+    /// with an `Ellipsis`. A surrogate pair is copied whole or not at all, so the cap can never split
+    /// one (a lone surrogate is not a character and becomes `Replacement`, keeping the preview
+    /// well-formed text).
+    let private previewRange (text: string) (first: int) (last: int) : string =
+        let length = last - first
+        let mutable index = first
+        let mutable verbatim = length <= MaxFragmentChars
+
+        while verbatim && index < last do
+            if isDisplayUnsafe text[index] || Char.IsSurrogate text[index] then
+                verbatim <- false
+            else
+                index <- index + 1
+
+        if verbatim then
+            text.Substring(first, length)
+        else
+            let builder = StringBuilder(min length MaxFragmentChars + 1)
+            let mutable index = first
+            let mutable truncated = false
+
+            while not truncated && index < last do
+                let isPair =
+                    Char.IsHighSurrogate text[index]
+                    && index + 1 < last
+                    && Char.IsLowSurrogate text[index + 1]
+
+                let width = if isPair then 2 else 1
+
+                if builder.Length + width > MaxFragmentChars then
+                    truncated <- true
+                elif isPair then
+                    builder.Append(text[index]).Append(text[index + 1]) |> ignore
+                    index <- index + 2
+                else
+                    let c = text[index]
+
+                    builder.Append(
+                        if isDisplayUnsafe c || Char.IsSurrogate c then
+                            Replacement
+                        else
+                            c
+                    )
+                    |> ignore
+
+                    index <- index + 1
+
+            if truncated then
+                builder.Append Ellipsis |> ignore
+
+            builder.ToString()
+
+    /// A whole fragment (a program name, a detail, a searched path, a method name) as a bounded,
+    /// display-safe preview. `null`/empty renders as the empty string rather than throwing — every
+    /// `ProcessError` case is constructible from C#, where any of these fields can arrive `null`.
+    let fragment (text: string) : string =
+        if String.IsNullOrEmpty text then
+            ""
+        else
+            previewRange text 0 text.Length
+
+    /// How a probed search path is *reported* in a message: **how many entries it held**, never the
+    /// entries themselves — `"84 PATH entries"`, `"1 PATH entry"`, `"an empty PATH"`.
+    ///
+    /// `NotFound`'s `Searched` is a whole `PATH` value (`Native.Common.resolveWith`, the one resolution
+    /// every lookup goes through, passes the effective `PATH` verbatim). Quoting it would put an
+    /// environment value — several
+    /// thousand characters of it on an ordinary developer machine — into every "not found" log line;
+    /// quoting a 512-character prefix of it would be worse, an arbitrary slice that still reads like the
+    /// search path. The count is the part of it a one-line message can honestly carry: it separates "the
+    /// `PATH` I gave this command was empty/short" from "it had 84 entries and none of them had the
+    /// program", which is the question a not-found failure actually raises. The value itself stays on
+    /// the `Searched` field, in full, for a caller that wants to print or diff it.
+    ///
+    /// Entries are counted the way the resolver splits that value — on `Path.PathSeparator`, empty
+    /// entries dropped — so the number is how many `PATH` entries the lookup walked. It is not the total
+    /// number of directories probed, and `Searched` never was either: a bare name is tried against
+    /// `Command.PreferLocal` first, and on Windows against the pre-`PATH` locations `CreateProcessW`
+    /// searches. Counted by index rather than by `Split`, so a pathologically long value is never
+    /// materialized into an array.
+    let searchedPath (searched: string) : string =
+        let mutable entries = 0
+
+        if not (String.IsNullOrEmpty searched) then
+            let mutable index = 0
+            let mutable insideEntry = false
+
+            while index < searched.Length do
+                if searched[index] = IO.Path.PathSeparator then
+                    insideEntry <- false
+                elif not insideEntry then
+                    insideEntry <- true
+                    entries <- entries + 1
+
+                index <- index + 1
+
+        match entries with
+        | 0 -> "an empty PATH"
+        | 1 -> "1 PATH entry"
+        | count -> $"{count} PATH entries"
+
+    /// The **last non-blank line** of a captured stream, trimmed and previewed — the actionable one
+    /// (`git push` ends with `remote: permission denied`, it does not start with it) — or `None` when
+    /// the stream holds nothing worth quoting. The line is located and trimmed by index, so a
+    /// single-line 100 KB stream is never materialized just to be capped.
+    let lastLine (text: string) : string option =
+        if String.IsNullOrEmpty text then
+            None
+        else
+            let mutable remaining = text.Length
+            let mutable result = None
+
+            while result.IsNone && remaining > 0 do
+                // Walk back over the separators that ended the previous segment, then to this one's start.
+                let mutable segmentEnd = remaining
+
+                while segmentEnd > 0 && isLineBreak text[segmentEnd - 1] do
+                    segmentEnd <- segmentEnd - 1
+
+                let mutable segmentStart = segmentEnd
+
+                while segmentStart > 0 && not (isLineBreak text[segmentStart - 1]) do
+                    segmentStart <- segmentStart - 1
+
+                if segmentEnd = 0 then
+                    remaining <- 0 // nothing but separators left
+                else
+                    let mutable trimStart = segmentStart
+                    let mutable trimEnd = segmentEnd
+
+                    while trimStart < trimEnd && Char.IsWhiteSpace text[trimStart] do
+                        trimStart <- trimStart + 1
+
+                    while trimEnd > trimStart && Char.IsWhiteSpace text[trimEnd - 1] do
+                        trimEnd <- trimEnd - 1
+
+                    if trimEnd > trimStart then
+                        result <- Some(previewRange text trimStart trimEnd)
+                    else
+                        remaining <- segmentStart // a blank line: keep looking further back
+
+            result
+
+    /// The `: <last non-blank line>` a stream-carrying failure (`Exit`/`Signalled`/`Timeout`) appends to
+    /// its one-line message, or `""` when the stream has nothing to quote. One rule for all three, so
+    /// none of them can grow back into a full multi-line dump.
+    ///
+    /// The quoted stream is `Stderr` — the same stream `Exit` has always quoted; `Stdout` deliberately
+    /// stays out of the human-readable render (it is on the `Stdout` accessor in full).
+    let diagnosticTail (stderr: string) : string =
+        match lastLine stderr with
+        | Some line -> ": " + line
+        | None -> ""
 
 /// Structured failure type for ProcessKit operations.
 ///
@@ -13,7 +246,13 @@ type ProcessError =
     /// The process could not be spawned (a failure before or during launch).
     | Spawn of Program: string * Detail: string
 
-    /// The program could not be found. `Searched` is the search path that was probed, when known.
+    /// The program could not be found. `Searched` is the search path that was probed, when known — the
+    /// whole `PATH` value the lookup walked, `None` when no `PATH` search applied (a path-form program
+    /// is resolved against its own directory instead).
+    ///
+    /// `Message` reports only **how many entries** that path held, not the entries: a `PATH` is an
+    /// environment value, and a several-thousand-character one has no place in a log line. Read this
+    /// field when you want to name the directories that were searched.
     | NotFound of Program: string * Searched: string option
 
     /// A success-requiring verb (`run`) observed a non-zero exit code.
@@ -99,48 +338,79 @@ type ProcessError =
     /// The requested operation is unsupported on this platform or in this configuration.
     | Unsupported of Operation: string
 
-    /// A short, human-readable description for logs and diagnostics.
+    /// A short, human-readable description for logs and diagnostics — always **one line**, and always
+    /// bounded.
+    ///
+    /// Every fragment this render embeds that ProcessKit did not author — the program name, a captured
+    /// stream, a detail, a peer's method name — goes through `MessageText`: terminal and
+    /// bidirectional-formatting controls, `CR`/`LF`, and the Unicode line/paragraph separators
+    /// become `U+FFFD` (an ordinary TAB is kept), and anything past 512 characters per fragment is cut
+    /// with a trailing `…`. So a hostile child, a JSON-RPC peer, or a caller's own parser cannot repaint
+    /// an operator's terminal, forge extra log lines, or flood the log through this string — and a
+    /// message stays the same small size whether the child wrote 20 bytes of stderr or 100 KB.
+    ///
+    /// A stream-carrying failure (`Exit`/`Signalled`/`Timeout`) quotes at most the **last non-blank line
+    /// of `Stderr`**, never the whole stream. A `NotFound` reports how many entries the `PATH` it
+    /// searched held, never the `PATH` itself — an environment value stays out of the message (read
+    /// `Searched` for it).
+    ///
+    /// This is the *render* only. `Detail`, `Stdout`, `Stderr`, `Data`, `Original` and their accessors
+    /// still carry the full, unmodified text — read them when you need the whole thing.
     member this.Message =
         match this with
-        | ProcessError.Spawn(program, detail) -> $"failed to spawn '{program}': {detail}"
+        | ProcessError.Spawn(program, detail) ->
+            $"failed to spawn '{MessageText.fragment program}': {MessageText.fragment detail}"
         | ProcessError.NotFound(program, searched) ->
             match searched with
-            | Some path -> $"program '{program}' was not found (searched {path})"
-            | None -> $"program '{program}' was not found"
+            | Some path ->
+                $"program '{MessageText.fragment program}' was not found (searched {MessageText.searchedPath path})"
+            | None -> $"program '{MessageText.fragment program}' was not found"
         | ProcessError.Exit(program, code, _, stderr) ->
-            if System.String.IsNullOrEmpty stderr then
-                $"'{program}' exited with code {code}"
-            else
-                $"'{program}' exited with code {code}: {stderr.Trim()}"
-        | ProcessError.Signalled(program, signal, _, _) ->
+            $"'{MessageText.fragment program}' exited with code {code}{MessageText.diagnosticTail stderr}"
+        | ProcessError.Signalled(program, signal, _, stderr) ->
+            let tail = MessageText.diagnosticTail stderr
+
             match signal with
-            | Some s -> $"'{program}' was terminated by signal {s}"
-            | None -> $"'{program}' was killed"
-        | ProcessError.Timeout(program, timeout, _, _) -> $"'{program}' timed out after {timeout.TotalSeconds}s"
-        | ProcessError.Unobserved(program, detail) -> $"'{program}' concluded, but its exit status is unknown: {detail}"
-        | ProcessError.Cancelled program -> $"'{program}' was cancelled"
-        | ProcessError.NotReady(program, timeout) -> $"'{program}' was not ready within {timeout.TotalSeconds}s"
-        | ProcessError.Parse(program, detail) -> $"failed to parse output of '{program}': {detail}"
+            | Some s -> $"'{MessageText.fragment program}' was terminated by signal {s}{tail}"
+            | None -> $"'{MessageText.fragment program}' was killed{tail}"
+        | ProcessError.Timeout(program, timeout, _, stderr) ->
+            $"'{MessageText.fragment program}' timed out after {timeout.TotalSeconds}s{MessageText.diagnosticTail stderr}"
+        | ProcessError.Unobserved(program, detail) ->
+            $"'{MessageText.fragment program}' concluded, but its exit status is unknown: {MessageText.fragment detail}"
+        | ProcessError.Cancelled program -> $"'{MessageText.fragment program}' was cancelled"
+        | ProcessError.NotReady(program, timeout) ->
+            $"'{MessageText.fragment program}' was not ready within {timeout.TotalSeconds}s"
+        | ProcessError.Parse(program, detail) ->
+            $"failed to parse output of '{MessageText.fragment program}': {MessageText.fragment detail}"
         | ProcessError.RetryPredicate(program, original, detail) ->
-            $"retry predicate for '{program}' threw: {detail}; original attempt: {original.Message}"
+            // The nested original is previewed as a whole, so nesting cannot walk around the bound: the
+            // inner message is already bounded in its own right, and this caps it again as one fragment.
+            $"retry predicate for '{MessageText.fragment program}' threw: {MessageText.fragment detail}; original attempt: {MessageText.fragment original.Message}"
         | ProcessError.JsonRpc(program, methodName, code, detail, _) ->
+            let head =
+                $"'{MessageText.fragment program}' answered '{MessageText.fragment methodName}' with JSON-RPC error {code}"
+
             if System.String.IsNullOrEmpty detail then
-                $"'{program}' answered '{methodName}' with JSON-RPC error {code}"
+                head
             else
-                $"'{program}' answered '{methodName}' with JSON-RPC error {code}: {detail}"
+                $"{head}: {MessageText.fragment detail}"
         | ProcessError.OutputTooLarge(program, lineLimit, byteLimit, totalLines, totalBytes) ->
+            let name = MessageText.fragment program
+
             match lineLimit, byteLimit, totalLines with
-            | Some _, _, _ -> $"'{program}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
-            | None, Some _, _ -> $"'{program}' produced too much byte output ({totalBytes} bytes)"
+            | Some _, _, _ -> $"'{name}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
+            | None, Some _, _ -> $"'{name}' produced too much byte output ({totalBytes} bytes)"
             | None, None, events when events > 0 ->
-                $"'{program}' produced too many events ({events} events / {totalBytes} bytes)"
-            | None, None, _ -> $"'{program}' produced too much output ({totalBytes} bytes)"
-        | ProcessError.Stdin(program, detail) -> $"could not read the stdin source for '{program}': {detail}"
-        | ProcessError.ResourceLimit detail -> $"resource limit could not be enforced: {detail}"
-        | ProcessError.Adopt(pid, detail) -> $"could not adopt process {pid} into the group: {detail}"
-        | ProcessError.CassetteMiss program -> $"no recorded cassette entry for '{program}'"
-        | ProcessError.Io detail -> $"I/O error: {detail}"
-        | ProcessError.Unsupported operation -> $"unsupported: {operation}"
+                $"'{name}' produced too many events ({events} events / {totalBytes} bytes)"
+            | None, None, _ -> $"'{name}' produced too much output ({totalBytes} bytes)"
+        | ProcessError.Stdin(program, detail) ->
+            $"could not read the stdin source for '{MessageText.fragment program}': {MessageText.fragment detail}"
+        | ProcessError.ResourceLimit detail -> $"resource limit could not be enforced: {MessageText.fragment detail}"
+        | ProcessError.Adopt(pid, detail) ->
+            $"could not adopt process {pid} into the group: {MessageText.fragment detail}"
+        | ProcessError.CassetteMiss program -> $"no recorded cassette entry for '{MessageText.fragment program}'"
+        | ProcessError.Io detail -> $"I/O error: {MessageText.fragment detail}"
+        | ProcessError.Unsupported operation -> $"unsupported: {MessageText.fragment operation}"
 
     override this.ToString() = this.Message
 

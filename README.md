@@ -461,6 +461,12 @@ non-zero exit never short-circuits the batch — the caller folds the outcomes. 
 in one shared kill-on-dispose group. `Exec.outputAllBytes` is the identical fan-out with each
 result captured as `byte[]`.
 
+Need the batch to stop early instead? `Exec.outputAllWithPolicy` / `outputAllBytesWithPolicy` take
+an explicit `BatchPolicy`: `BatchPolicy.CollectAll` behaves exactly like `outputAll` itself, while
+`BatchPolicy.FailFast` stops starting new commands and cancels every command already running on the
+batch's first `Error` (see [cookbook.md → Top-level Exec helpers](docs/cookbook.md#top-level-exec-helpers)
+for the full contract).
+
 ## Sampling stats over time
 
 A point-in-time `Stats()` becomes a series with `SampleStatsAsync`, and a single run can be profiled
@@ -890,6 +896,9 @@ if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and w
 }
 // …then read proc.StdoutLinesAsync() for the answers.
 ```
+
+`WriteLineAsync` appends LF for an ordinary stdin pipe or POSIX PTY, and CR for Windows ConPTY so
+console line readers receive Enter. `WriteAsync` always sends exactly the supplied bytes.
 
 > For a **large** interactive stdin, write from one task and read `StdoutLinesAsync()` from another —
 > otherwise the child can block writing stdout while you block writing stdin, a full-duplex

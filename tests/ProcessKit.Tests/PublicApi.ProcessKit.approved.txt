@@ -1,3 +1,28 @@
+class ProcessKit.BatchPolicy
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.BatchPolicy>
+  member Equals(ProcessKit.BatchPolicy) : System.Boolean
+  member Equals(ProcessKit.BatchPolicy, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsCollectAll() : System.Boolean
+  member get_IsFailFast() : System.Boolean
+  member get_Tag() : System.Int32
+  property CollectAll : ProcessKit.BatchPolicy { get }
+  property FailFast : ProcessKit.BatchPolicy { get }
+  property IsCollectAll : System.Boolean { get }
+  property IsFailFast : System.Boolean { get }
+  property Tag : System.Int32 { get }
+  static member get_CollectAll() : ProcessKit.BatchPolicy
+  static member get_FailFast() : ProcessKit.BatchPolicy
+
+module ProcessKit.BatchPolicy+Tags
+  field literal CollectAll : System.Int32
+  field literal FailFast : System.Int32
+
 class ProcessKit.CliClient
   member Command(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
   member EnsureAvailableAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
@@ -197,6 +222,8 @@ module ProcessKit.Exec
   static member detach(System.String, System.Collections.Generic.IEnumerable<System.String>) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.DetachedProcess, ProcessKit.ProcessError>
   static member outputAll(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>[]>
   static member outputAllBytes(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>[]>
+  static member outputAllBytesWithPolicy(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, ProcessKit.BatchPolicy, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>[]>
+  static member outputAllWithPolicy(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, ProcessKit.BatchPolicy, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>[]>
   static member outputBytes(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
   static member outputString(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   static member run(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>

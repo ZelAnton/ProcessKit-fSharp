@@ -342,8 +342,24 @@ module internal Windows =
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private TerminateJobObject(nativeint hJob, uint32 uExitCode)
 
+    // Test seam: `TerminateJobObject`, overridable so a fault-injection test can force a REFUSED job
+    // terminate (access denied / an invalid handle) deterministically — a Job we hold a TERMINATE right
+    // to cannot be made to refuse on demand. A hook that models a failure sets the Win32 error the
+    // production classification reads back with `Marshal.SetLastPInvokeError`. Production always runs the
+    // real entry point; only the (sequential) tests reassign it, and restore it in a `finally`.
+    let mutable terminateJobObjectHook: nativeint -> uint32 -> bool =
+        fun job exitCode -> TerminateJobObject(job, exitCode)
+
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private TerminateProcess(nativeint hProcess, uint32 uExitCode)
+
+    // Test seam: `TerminateProcess`, on the same terms as `terminateJobObjectHook` above — a child whose
+    // handle we opened with full access never refuses termination, so the honest-failure branch is only
+    // reachable by injection. It covers ONLY the kill verbs' `terminateWindowsProcess`; the spawn-rollback
+    // `TerminateProcess` calls run the real entry point directly, so a test that forces a kill failure can
+    // never leave a half-spawned child alive.
+    let mutable terminateProcessHook: nativeint -> uint32 -> bool =
+        fun hProcess exitCode -> TerminateProcess(hProcess, exitCode)
 
     // `lpCommandLine` is a `nativeint` pointer to a WRITABLE unmanaged buffer, NOT a managed `string`.
     // `CreateProcessW` may modify `lpCommandLine` in place while probing executable candidates (Win32
@@ -379,6 +395,19 @@ module internal Windows =
 
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern uint32 private WaitForSingleObject(nativeint hHandle, uint32 dwMilliseconds)
+
+    // `GetExitCodeProcess`'s "this process has not exited" sentinel. It is deliberately NOT trusted on its
+    // own below: 259 is also a perfectly legal exit code a child can call `ExitProcess(259)` with, so it
+    // answers "still running OR exited with 259" — the classic Win32 ambiguity. The process handle's own
+    // signalled state resolves it (a process object signals on exit and never un-signals).
+    [<Literal>]
+    let private STILL_ACTIVE = 259u
+
+    [<Literal>]
+    let private WAIT_OBJECT_0 = 0u
+
+    [<Literal>]
+    let private WAIT_TIMEOUT = 0x102u
 
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern bool private CloseHandle(nativeint hObject)
@@ -606,7 +635,8 @@ module internal Windows =
             finally
                 Marshal.FreeHGlobal buffer
 
-    let terminateWindowsJob (job: nativeint) = TerminateJobObject(job, 1u) |> ignore
+    // `terminateWindowsJob` lives further down, next to `jobTreeAliveWindows`: classifying a REFUSED job
+    // terminate needs that liveness read, and F# resolves declarations strictly top-to-bottom.
 
     let closeWindowsHandle (handle: nativeint) = CloseHandle handle |> ignore
 
@@ -686,9 +716,56 @@ module internal Windows =
 
         tcs.Task
 
-    /// Hard-kill one Windows process (not its descendants — for that, terminate the whole Job).
-    let terminateWindowsProcess (hProcess: nativeint) =
-        TerminateProcess(hProcess, 1u) |> ignore
+    /// Has this process provably concluded? Answered through the handle the CALLER already owns — never
+    /// through a pid, so it can neither race a recycle nor need a fresh open. `Some true` = provably
+    /// exited, `Some false` = provably still running, `None` = the OS would not say (the handle lacks
+    /// query rights, or is no longer usable), which callers must treat as "unknown", never as "dead".
+    ///
+    /// Two questions, because neither alone is conclusive. `GetExitCodeProcess` answers with a code, but
+    /// its `STILL_ACTIVE` (259) sentinel collides with a legitimate `ExitProcess(259)`; a zero-timeout wait
+    /// on the process object disambiguates exactly that case, because the object signals on exit and stays
+    /// signalled. Any code other than 259 is already unambiguous and needs no wait.
+    let private processHasExitedWindows (hProcess: nativeint) : bool option =
+        let mutable exitCode = 0u
+
+        if not (GetExitCodeProcess(hProcess, &exitCode)) then
+            None
+        elif exitCode <> STILL_ACTIVE then
+            Some true
+        else
+            match WaitForSingleObject(hProcess, 0u) with
+            | WAIT_OBJECT_0 -> Some true // signalled: it really did exit, with code 259
+            | WAIT_TIMEOUT -> Some false // not signalled: genuinely still running
+            | _ -> None // WAIT_FAILED (or an abandoned-mutex answer that cannot apply here)
+
+    /// Hard-kill one Windows process (not its descendants — for that, terminate the whole Job). Returns
+    /// what the OS actually did, never a fabricated success: `TerminateProcess` can be refused (access
+    /// denied, an unusable handle), and reporting that as `Ok` would tell a caller a live process is dead.
+    ///
+    /// A refusal is classified through the process handle we were handed, not through the Win32 error
+    /// number: a target that has ALREADY exited is an idempotent no-op success (killing a corpse is what
+    /// the caller wanted, and racing the child's own exit is not a caller error), while a target still
+    /// running — or whose state the OS will not disclose — is an honest `ProcessError.Io`. Error numbers
+    /// alone cannot make that call: `ERROR_ACCESS_DENIED` is returned BOTH for a process that is already
+    /// terminating and for one we simply may not kill. This mirrors the Rust prototype's fix
+    /// (`1bd19ff53697`), which suppresses the failure only for a provably concluded process.
+    ///
+    /// The last-error read happens BEFORE the classification probe, since that probe issues its own
+    /// P/Invokes and would otherwise overwrite the code being reported.
+    let terminateWindowsProcess (hProcess: nativeint) : Result<unit, ProcessError> =
+        if terminateProcessHook hProcess 1u then
+            Ok()
+        else
+            let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+
+            match processHasExitedWindows hProcess with
+            | Some true -> Ok()
+            | Some false -> Error(ProcessError.Io $"failed to terminate the process (it is still running): {message}")
+            | None ->
+                Error(
+                    ProcessError.Io
+                        $"failed to terminate the process, and its handle could not confirm that it had exited: {message}"
+                )
 
     // Console control events — the best-effort SOFT stop for a console child spawned with
     // `CREATE_NEW_PROCESS_GROUP`. `CTRL_BREAK_EVENT` is used rather than `CTRL_C_EVENT` because only
@@ -1726,6 +1803,34 @@ module internal Windows =
         match jobStatsWindows job with
         | Some(active, _, _, _) -> active > 0
         | None -> true
+
+    /// Hard-kill the whole contained tree: `TerminateJobObject` kills every process in the Job atomically.
+    /// Returns what the OS actually did, never a fabricated success — a refused terminate on a Job that is
+    /// still running processes is the one case a caller most needs to hear about, because "the tree is
+    /// dead" is the entire promise of this call.
+    ///
+    /// A refusal is classified through the Job handle itself rather than through the Win32 error number
+    /// (the same rule `terminateWindowsProcess` follows for a process handle): if the Job is provably
+    /// EMPTY — its accounting reports no active process — there was nothing left to kill and the refusal is
+    /// an idempotent no-op success, exactly like re-killing an already-reaped tree. If it still holds live
+    /// members, or its accounting cannot be read at all (`jobTreeAliveWindows` fails SAFE to "alive", so an
+    /// unreadable Job is never silently declared dead), the failure is reported as `ProcessError.Io`.
+    ///
+    /// The last-error read happens BEFORE the liveness probe, whose own P/Invokes would overwrite it.
+    ///
+    /// `KILL_ON_JOB_CLOSE` remains the backstop for the tree even when this returns `Error` — but it fires
+    /// only when the last handle closes, so it must never be passed off as a completed kill NOW; that is
+    /// precisely the difference this `Result` exists to express.
+    let terminateWindowsJob (job: nativeint) : Result<unit, ProcessError> =
+        if terminateJobObjectHook job 1u then
+            Ok()
+        else
+            let message = Win32Exception(Marshal.GetLastWin32Error()).Message
+
+            if jobTreeAliveWindows job then
+                Error(ProcessError.Io $"failed to terminate the job object (its tree is still live): {message}")
+            else
+                Ok()
 
     // ----------------------------------------------------------------------------------
     // Windows: best-effort WM_CLOSE soft close for GUI children (Electron/desktop tools)

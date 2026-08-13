@@ -7,7 +7,8 @@ next stage's stdin by an in-process relay — there is no shell string anywhere,
 are no quoting rules, no word splitting, and no injection surface. Every stage spawns
 into one shared kill-on-dispose [process group](process-groups.md), so the whole chain
 lives and dies as a unit: tear the chain down (a timeout, a cancellation, an early
-return) and every stage goes with it.
+return) and every stage goes with it. Each stage participates in the shared-group ownership
+rules detailed in [Lifecycle state machine](internals/lifecycle.md).
 
 The relay is a copy loop, not a kernel splice. When a consumer exits early it closes the
 upstream read end, so the producer stops on a *broken pipe* — its next write fails once
@@ -20,6 +21,17 @@ an upstream stage's stdout is reported as `ProcessError.Io` instead of being mis
 including when the downstream stage observes a truncated stream. A downstream broken pipe,
 or an `IOException`/`ObjectDisposedException` caused by whole-chain teardown, remains a normal
 termination race and stays quiet.
+
+Such a genuine relay failure also **ends the run immediately**: the chain is hard-killed and
+reaped the moment the failure is seen, rather than after every stage has exited on its own.
+Closing the pipe ends is not enough by itself — an upstream stage that stops writing and keeps
+running never earns a broken pipe — so waiting for its natural exit would stall the pipeline on
+a failure already diagnosed. Buffered verbs and a `StartAsync` session share that behaviour, and
+the reported error is the first relay failure seen. One consequence is worth knowing: because the
+whole chain is torn down at once, the final stage's output is truncated wherever the kill lands.
+A whole-chain [timeout or cancellation](#timeouts-and-cancellation) that is already tearing the
+chain down still takes precedence — a relay exception raised into that teardown stays a quiet
+termination race, so the run reports `TimedOut`/`Cancelled` rather than `ProcessError.Io`.
 
 The samples below run inside a `task { }` block and use `match!`; from C# the same
 surface is `await`-able fluent methods.

@@ -451,6 +451,8 @@ type internal JsonLinesEnumerable<'T>(program: string, source: IAsyncEnumerable<
 type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) list) =
 
     let config = host.Config
+    let hasPseudoTerminal = config.Pty.IsSome || host.ResizePty.IsSome
+    let stdinTarget = ProcessStdinTarget.forRun hasPseudoTerminal
 
     // The one lock that serializes every transition of this handle's consumption state machine —
     // claiming the pipes (`claimBuffered`, the streaming-session setup), memoizing the single exit
@@ -1481,7 +1483,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             // the interactive writer and the source feeder single-writer: the feeder drains the source
             // first, then the caller writes.
             host.StdinFeedComplete()
-            Some(ProcessStdin(stream, host.Config.StdinEncoding))
+            Some(ProcessStdin(stream, host.Config.StdinEncoding, stdinTarget))
         | None -> None
 
     /// The non-blocking form of `TakeStdin`: the once-only claim above still happens SYNCHRONOUSLY, before
@@ -1504,7 +1506,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 // caller's `SynchronizationContext` to pump — the feeder itself already runs detached
                 // there (`Pump.feedStdin`'s `backgroundTask`), so it makes progress regardless.
                 do! Task.Run(fun () -> host.StdinFeedComplete())
-                return Some(ProcessStdin(stream, host.Config.StdinEncoding))
+                return Some(ProcessStdin(stream, host.Config.StdinEncoding, stdinTarget))
             }
         | None -> Task.FromResult None
 
@@ -2629,7 +2631,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// from the spawned host (`ResizePty` is `Some` exactly for a pty-backed run) as well as the
     /// config, so a test double that models a PTY (`FakeProcess.WithPty`) answers the same as the real
     /// spawn it stands in for, rather than diverging on a config field it never set.
-    member internal _.HasPseudoTerminal: bool = config.Pty.IsSome || host.ResizePty.IsSome
+    member internal _.HasPseudoTerminal: bool = hasPseudoTerminal
 
     /// Wait until a stdout line satisfies `predicate`, or fail with `NotReady` after `timeout`
     /// (or `Cancelled` if `cancellationToken` fires first). Consumed lines are not re-delivered; a

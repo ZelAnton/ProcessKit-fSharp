@@ -574,6 +574,9 @@ See [testing.md](testing.md) for the `CliClient` wrapper pattern.
 
 ## Precedence and interactions
 
+See [Lifecycle state machine](internals/lifecycle.md) for the complete terminal-operation,
+exit-wait, and ownership rules.
+
 **Timeout vs cancellation.** A timeout is *captured*; a cancellation is *always an
 error*. When both land on the same run, **cancellation wins** — you asked the run
 to stop mattering, so no result is synthesized and the verb reports

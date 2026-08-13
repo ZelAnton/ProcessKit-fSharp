@@ -11,11 +11,13 @@ open System.Threading.Tasks
 /// Internal: reading captured output into lines, raw bytes, and feeding stdin.
 module internal Pump =
 
-    /// Encode one nullable text line and append the protocol's LF without first allocating `text + "\n"`.
+    /// The default line terminator for input interpreted as a terminal Enter key or as a plain line.
+    let defaultInputLineTerminator (terminalEnter: bool) = if terminalEnter then "\r" else "\n"
+
+    /// Encode one nullable text line and append `terminator` without first concatenating strings.
     /// `Stdin.FromLines` historically treats a null element as an empty line, so retain that behaviour.
-    let lineWithLf (encoding: Encoding) (text: string) : byte[] =
+    let lineWithTerminator (encoding: Encoding) (terminator: string) (text: string) : byte[] =
         let text = if isNull (box text) then String.Empty else text
-        let terminator = "\n"
 
         let bytes =
             Array.zeroCreate<byte> (encoding.GetByteCount text + encoding.GetByteCount terminator)
@@ -23,6 +25,10 @@ module internal Pump =
         let written = encoding.GetBytes(text.AsSpan(), bytes.AsSpan())
         encoding.GetBytes(terminator.AsSpan(), bytes.AsSpan(written)) |> ignore
         bytes
+
+    /// Encode one nullable text line and append the protocol's LF.
+    let lineWithLf (encoding: Encoding) (text: string) : byte[] =
+        lineWithTerminator encoding (defaultInputLineTerminator false) text
 
     /// Accumulates retained output lines under an `OutputBufferPolicy`, tracking cumulative
     /// totals and whether the fail-loud ceiling tripped. Not thread-safe; one per stream.
