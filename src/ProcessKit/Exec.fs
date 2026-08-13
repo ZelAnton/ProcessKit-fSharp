@@ -136,6 +136,16 @@ module Exec =
 
                     if not acquired then
                         return Error(ProcessError.Cancelled command.Program)
+                    elif effectiveToken.IsCancellationRequested then
+                        // `SemaphoreSlim.WaitAsync` can still complete successfully even after
+                        // `effectiveToken` is cancelled, if the slot's release and the cancellation
+                        // request race each other inside `SemaphoreSlim` itself. Honour "stop starting
+                        // any command still waiting for a concurrency slot" even when that race lands
+                        // this way: release the slot immediately without ever calling `capture`, so a
+                        // command the FailFast contract promised to leave unstarted never performs a
+                        // side effect.
+                        gate.Release() |> ignore
+                        return Error(ProcessError.Cancelled command.Program)
                     else
                         try
                             let! result =
@@ -159,7 +169,18 @@ module Exec =
                                 // has returned, so it is always live here — `Cancel` is also idempotent, so
                                 // a race between two failing commands cancels the batch exactly once either
                                 // way, and both keep their own real errors since both had already finished.
-                                internalCts.Cancel()
+                                try
+                                    internalCts.Cancel()
+                                with ex ->
+                                    // `Cancel()` synchronously re-invokes every callback registered on
+                                    // `effectiveToken` (including a sibling `IProcessRunner`'s own
+                                    // kill-the-child registration) and re-throws if any of them faults. A
+                                    // buggy registration must never fault THIS command's already-computed
+                                    // `result` — and, through it, the whole batch's `Task.WhenAll` — so
+                                    // swallow it here; there is nothing this batch can do to recover a
+                                    // caller-owned callback's own bug, and every other command still needs
+                                    // its own `Result` regardless.
+                                    ignore ex
                             | _ -> ()
 
                             return result
@@ -214,6 +235,10 @@ module Exec =
         (cancellationToken: CancellationToken)
         =
         let items = prepareBatch concurrency runner commands
+        // `BatchPolicy` is a reference type at the IL level, so a C# (or any non-F#) caller can pass
+        // `null` for it; without this guard `null` falls through the `runAll` match's wildcard case
+        // exactly like `CollectAll` does, silently disabling FailFast instead of failing loudly.
+        ArgumentNullException.ThrowIfNull(policy :> obj, nameof policy)
         runAll concurrency runner items policy cancellationToken (fun r tok c -> Runner.outputString r tok c)
 
     /// The raw-bytes companion to `outputAllWithPolicy` — captures each command's stdout as bytes.
@@ -225,4 +250,7 @@ module Exec =
         (cancellationToken: CancellationToken)
         =
         let items = prepareBatch concurrency runner commands
+        // See `outputAllWithPolicy`: `null` must fail loudly at the boundary, not fall through the
+        // `runAll` match's wildcard case as a silent `CollectAll`.
+        ArgumentNullException.ThrowIfNull(policy :> obj, nameof policy)
         runAll concurrency runner items policy cancellationToken (fun r tok c -> Runner.outputBytes r tok c)
