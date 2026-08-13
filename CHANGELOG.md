@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Changed
--
+- `Command.Retry` no longer refuses a one-shot stdin source (`Stdin.FromStream`/`FromLines`/`FromAsyncLines`) before the first attempt: the command always runs once, and a second attempt follows only after a failure that precedes a live child (`NotFound`, `Spawn`, or a launch-boundary `Unsupported`) — after anything that may have reached one (`Exit`, `Timeout`, `Signalled`, `Stdin`, `OutputTooLarge`, `Cancelled`, or the ambiguous `Io`) the run ends with that first error, never passed to the retry predicate, instead of replaying an exhausted source.
+- A retrying run now reserves its one-shot stdin source for itself, so a concurrent run over the same source — or a later one, once a child has read it — is refused with `ProcessError.Unsupported` instead of being fed the exhausted remains of it; a source that no attempt ever fed to a child is handed back for the next run.
 
 ### Fixed
 - `SupervisionSession.StopAsync` now immediately cancels an active capture-only incarnation instead of waiting for its capture to finish, including during initial capability detection and after the capture-only mode is latched; a stopped active capture reports `StopReason.Stopped`, while external cancellation remains `ProcessError.Cancelled`.

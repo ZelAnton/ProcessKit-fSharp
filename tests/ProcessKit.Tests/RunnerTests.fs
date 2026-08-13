@@ -112,6 +112,35 @@ type private FirstLineFinishGate(stdinError: exn option) =
 
         new RunningProcess(host)
 
+/// A `RunningProcess` over a host with no real child — enough for a runner double to route through the
+/// real capture launch boundary (`CaptureVerbs.runToCompletion`). That boundary is what commits a
+/// one-shot stdin payload once a child exists, so a double that goes through it can tell a pre-child
+/// failure apart from a post-child one exactly as a live runner does.
+module private LaunchedDouble =
+
+    let runningProcess (command: Command) : RunningProcess =
+        let host: RunningHost =
+            { Config = command.Config
+              Pid = None
+              Stdout = Some(new MemoryStream(Array.empty<byte>) :> Stream)
+              Stderr = None
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = 0L
+              StartTimeIdentity = None
+              Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+              // No background feed on this double, so its (absent) stdin fault is already decided.
+              StdinError = fun () -> Task.FromResult None
+              StdinFeedComplete = ignore
+              StartKill = ignore
+              Signal = fun _ -> Ok()
+              GracefulKill = fun _ -> Task.CompletedTask
+              ResizePty = None
+              TreeStats = None
+              Teardown = fun () -> ValueTask() }
+
+        new RunningProcess(host)
+
 [<TestFixture>]
 type RunnerTests() =
 
@@ -703,10 +732,99 @@ type RunnerTests() =
         }
         :> Task
 
-    // ----- one-shot stdin + retry (T-088) -----
+    // ----- one-shot stdin + retry (T-088, narrowed to a post-attempt gate by T-340) -----
 
     [<Test>]
-    member _.``retry refuses a one-shot stdin source (FromStream) before the first attempt``() : Task =
+    member _.``a pre-spawn failure leaves a one-shot stdin source (FromStream) intact for the retry``() : Task =
+        task {
+            let mutable calls = 0
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            // Attempt 1 fails the way a transient spawn failure does — before any child exists, so
+            // nothing has read the stream. Attempt 2 drains it, exactly as a live child's stdin feeder
+            // would, and reports what it read: proof the retried attempt got the ORIGINAL payload
+            // rather than the empty input an exhausted source would have fed it.
+            let flaky =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+
+                        if calls = 1 then
+                            Task.FromResult(Error(ProcessError.Spawn("svc", "resource temporarily unavailable")))
+                        else
+                            task {
+                                use fed = new MemoryStream()
+                                do! stream.CopyToAsync fed
+                                return Ok(ProcessResult.Success(Encoding.UTF8.GetString(fed.ToArray())))
+                            }
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run flaky CancellationToken.None
+
+            match result with
+            | Ok text -> Assert.That(text, Is.EqualTo "payload")
+            | Error error -> Assert.Fail $"expected the retry to succeed on the original payload, got {error}"
+
+            Assert.That(calls, Is.EqualTo 2)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a pre-spawn NotFound is retried for a one-shot stdin source (FromLines)``() : Task =
+        task {
+            let mutable calls = 0
+
+            let flaky =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+
+                        if calls = 1 then
+                            Task.FromResult(Error(ProcessError.NotFound("svc", Some "/usr/bin")))
+                        else
+                            Task.FromResult(Ok(ProcessResult.Success "hello"))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (
+                    Stdin.FromLines(
+                        seq {
+                            "one"
+                            "two"
+                        }
+                    )
+                )
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run flaky CancellationToken.None
+
+            match result with
+            | Ok text -> Assert.That(text, Is.EqualTo "hello")
+            | Error error -> Assert.Fail $"expected the retry to succeed, got {error}"
+
+            // The program was never located, so no child could have enumerated the lines.
+            Assert.That(calls, Is.EqualTo 2)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a post-child Exit ends a one-shot stdin run after exactly one attempt``() : Task =
         task {
             let mutable calls = 0
 
@@ -731,52 +849,342 @@ type RunnerTests() =
 
             let! result = command |> Runner.run alwaysFailing CancellationToken.None
 
+            // A non-zero exit means a child ran and may already have drained the stream, so the run ends
+            // on the first attempt's own error instead of replaying empty stdin into a second one.
             match result with
-            | Error(ProcessError.Unsupported _) -> ()
-            | other -> Assert.Fail $"expected an Unsupported error, got {other}"
+            | Error(ProcessError.Exit(_, 1, _, _)) -> ()
+            | other -> Assert.Fail $"expected the first attempt's Exit error, got {other}"
 
-            // Refused before the first attempt — never spawned at all, so it can never observe the
-            // stream already exhausted by a prior attempt.
-            Assert.That(calls, Is.EqualTo 0)
+            Assert.That(calls, Is.EqualTo 1)
         }
         :> Task
 
     [<Test>]
-    member _.``retry refuses a one-shot stdin source (FromLines) before the first attempt``() : Task =
+    member _.``a post-child Timeout ends a one-shot stdin run after exactly one attempt``() : Task =
         task {
             let mutable calls = 0
 
-            let alwaysFailing =
+            let timingOut =
                 { new IProcessRunner with
                     member _.CaptureStringAsync(_, _) =
                         calls <- calls + 1
-                        Task.FromResult(Ok(ProcessResult.Failure "" "boom" 1))
+
+                        if calls = 1 then
+                            Task.FromResult(
+                                Error(ProcessError.Timeout("svc", TimeSpan.FromSeconds 5.0, "partial", "slow"))
+                            )
+                        else
+                            Task.FromResult(Ok(ProcessResult.Success "hello"))
 
                     member _.CaptureBytesAsync(_, _) =
-                        Task.FromResult(Ok(ProcessResult.Failure [||] "boom" 1))
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run timingOut CancellationToken.None
+
+            // The first error survives intact — it is not replaced by a later attempt's result, nor by a
+            // `RetryPredicate` from a classifier the gate never consults.
+            match result with
+            | Error(ProcessError.Timeout(_, timeout, stdout, _)) ->
+                Assert.That(timeout, Is.EqualTo(TimeSpan.FromSeconds 5.0))
+                Assert.That(stdout, Is.EqualTo "partial")
+            | other -> Assert.Fail $"expected the first attempt's Timeout error, got {other}"
+
+            Assert.That(calls, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a Cancelled error is never retried for a one-shot stdin source``() : Task =
+        task {
+            let mutable calls = 0
+
+            let cancelling =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+
+                        if calls = 1 then
+                            Task.FromResult(Error(ProcessError.Cancelled "svc"))
+                        else
+                            Task.FromResult(Ok(ProcessResult.Success "hello"))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run cancelling CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+            Assert.That(calls, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an ambiguous Io error is never retried for a one-shot stdin source``() : Task =
+        task {
+            let mutable calls = 0
+
+            // `Io` is what `ProcessError.isTransient` (and this command's own always-true classifier)
+            // would happily retry — but it is raised both before a child and while driving a live one,
+            // so it can never authorize re-feeding a one-shot payload.
+            let failing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+
+                        if calls = 1 then
+                            Task.FromResult(Error(ProcessError.Io "the pipe broke"))
+                        else
+                            Task.FromResult(Ok(ProcessResult.Success "hello"))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run failing CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Io detail) -> Assert.That(detail, Is.EqualTo "the pipe broke")
+            | other -> Assert.Fail $"expected the first attempt's Io error, got {other}"
+
+            Assert.That(calls, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an Unsupported refused at the launch boundary is retried for a one-shot stdin source``() : Task =
+        task {
+            let mutable launches = 0
+
+            // Routes through the real capture launch boundary: the first launch is refused before any
+            // child exists (the shape of a platform primitive this host cannot honour), so nothing
+            // committed the payload and the run may attempt again.
+            let refusingOnce =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(command, cancellationToken) =
+                        CaptureVerbs.runToCompletion
+                            command
+                            cancellationToken
+                            (fun () ->
+                                launches <- launches + 1
+
+                                if launches = 1 then
+                                    Task.FromResult(Error(ProcessError.Unsupported "Pty (needs Windows 10 1809+)"))
+                                else
+                                    Task.FromResult(Ok(LaunchedDouble.runningProcess command)))
+                            (fun running ->
+                                task {
+                                    use _ = running
+                                    return Ok(ProcessResult.Success "hello")
+                                })
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run refusingOnce CancellationToken.None
+
+            match result with
+            | Ok text -> Assert.That(text, Is.EqualTo "hello")
+            | Error error -> Assert.Fail $"expected the retry to succeed, got {error}"
+
+            Assert.That(launches, Is.EqualTo 2)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an Unsupported raised after the child was launched is not retried for a one-shot stdin source``
+        ()
+        : Task =
+        task {
+            let mutable launches = 0
+
+            // The same error CASE, on the other side of the launch boundary: a child exists (so the
+            // launch committed the one-shot payload) and the failure arrives afterwards, the way a live
+            // `RunningProcess` verb reports an unsupported operation. Evidence, not the case name,
+            // decides — so this run must stop with one launch.
+            let failingAfterLaunch =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(command, cancellationToken) =
+                        CaptureVerbs.runToCompletion
+                            command
+                            cancellationToken
+                            (fun () ->
+                                launches <- launches + 1
+                                Task.FromResult(Ok(LaunchedDouble.runningProcess command)))
+                            (fun running ->
+                                task {
+                                    use _ = running
+                                    return Error(ProcessError.Unsupported "Resize (not a PTY run)")
+                                })
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! result = command |> Runner.run failingAfterLaunch CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Is.EqualTo "Resize (not a PTY run)")
+            | other -> Assert.Fail $"expected the post-child Unsupported error, got {other}"
+
+            Assert.That(launches, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a run that never reached a child hands the one-shot payload back to the next run``() : Task =
+        task {
+            let mutable calls = 0
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            // The first run burns its whole budget on pre-spawn failures, so it never fed the payload:
+            // it must hand the source back rather than keep it reserved for good.
+            let notFoundThenReading =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+
+                        if calls <= 2 then
+                            Task.FromResult(Error(ProcessError.NotFound("svc", None)))
+                        else
+                            task {
+                                use fed = new MemoryStream()
+                                do! stream.CopyToAsync fed
+                                return Ok(ProcessResult.Success(Encoding.UTF8.GetString(fed.ToArray())))
+                            }
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
 
                     member _.SpawnAsync(command, _) =
                         Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
 
             let command =
                 Command.create "svc"
-                |> Command.stdin (
-                    Stdin.FromLines(
-                        seq {
-                            "one"
-                            "two"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 2 TimeSpan.Zero (fun _ -> true)
+
+            let! first = command |> Runner.run notFoundThenReading CancellationToken.None
+
+            match first with
+            | Error(ProcessError.NotFound _) -> ()
+            | other -> Assert.Fail $"expected the exhausted budget to report NotFound, got {other}"
+
+            Assert.That(calls, Is.EqualTo 2)
+
+            let! second = command |> Runner.run notFoundThenReading CancellationToken.None
+
+            match second with
+            | Ok text -> Assert.That(text, Is.EqualTo "payload")
+            | Error error -> Assert.Fail $"expected the returned payload to be usable, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``two concurrent retrying runs never feed one one-shot stdin source to two children``() : Task =
+        task {
+            let mutable drains = 0
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+            use attemptStarted = new SemaphoreSlim(0)
+
+            let release =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            // Holds its attempt open until released, so the second run is started while the first is
+            // still inside one. Only one attempt is ever expected to reach the drain, so the counter
+            // has a single writer by design — and the payload assertions below fail loudly if that
+            // stops being true.
+            let gated =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        task {
+                            attemptStarted.Release() |> ignore
+                            do! release.Task
+                            drains <- drains + 1
+                            use fed = new MemoryStream()
+                            do! stream.CopyToAsync fed
+                            return Ok(ProcessResult.Success(Encoding.UTF8.GetString(fed.ToArray())))
                         }
-                    )
-                )
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
                 |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
 
-            let! result = command |> Runner.run alwaysFailing CancellationToken.None
+            let first = command |> Runner.run gated CancellationToken.None
+            do! attemptStarted.WaitAsync()
 
-            match result with
-            | Error(ProcessError.Unsupported _) -> ()
-            | other -> Assert.Fail $"expected an Unsupported error, got {other}"
+            let! second = command |> Runner.run gated CancellationToken.None
 
-            Assert.That(calls, Is.EqualTo 0)
+            // The loser is refused loudly instead of being handed a source the winner is feeding.
+            match second with
+            | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "one-shot stdin source")
+            | other -> Assert.Fail $"expected the concurrent run to be refused, got {other}"
+
+            release.SetResult()
+            let! firstResult = first
+
+            match firstResult with
+            | Ok text -> Assert.That(text, Is.EqualTo "payload")
+            | Error error -> Assert.Fail $"expected the owning run to read the whole payload, got {error}"
+
+            Assert.That(drains, Is.EqualTo 1)
         }
         :> Task
 

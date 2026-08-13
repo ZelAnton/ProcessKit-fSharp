@@ -255,7 +255,8 @@ type StdinInheritTests() =
 
             // Fails twice, then succeeds on the 3rd attempt — proves the retry loop runs normally with
             // InheritStdin (a repeatable source: the child re-inherits the parent's stdin each attempt),
-            // instead of being refused up front like a one-shot FromStream/FromLines source.
+            // rather than being gated on a pre-child failure the way a one-shot FromStream/FromLines
+            // source is.
             let flaky =
                 { new IProcessRunner with
                     member _.CaptureStringAsync(_, _) =

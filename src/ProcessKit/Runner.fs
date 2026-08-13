@@ -166,6 +166,16 @@ module internal CaptureVerbs =
                 match! start () with
                 | Error error -> return Error error
                 | Ok running ->
+                    // The launch boundary, and the only place that can witness it for a captured run: a
+                    // child now exists, so a one-shot stdin payload (`FromStream`/`FromLines`/
+                    // `FromAsyncLines`) is spent. Commit it before the run can be observed, so a retrying
+                    // run (`Runner.withRetry`) tells "no child ever saw this payload" from "a child may
+                    // already have drained it" by evidence instead of by the error case alone. The
+                    // `Error` branch above commits nothing, and is right not to: both built-in runners
+                    // start the stdin feeder only after a successful spawn (`ProcessGroup.BuildHost`), so
+                    // a failed launch leaves the payload untouched.
+                    OneShotStdin.commitLaunch command.Config.StdinSource
+
                     use _registration = effectiveToken.Register(fun () -> running.Kill())
                     let! result = consume running
 
@@ -183,6 +193,30 @@ module internal CaptureVerbs =
 /// - `probe` — read the exit code as a yes/no: 0 -> true, 1 -> false, anything else errors.
 [<RequireQualifiedAccess>]
 module Runner =
+
+    // Failures GUARANTEED to precede a live child, so an attempt that ends in one cannot have fed the
+    // command's stdin source to anything: the program was never located (`NotFound`), the spawn itself
+    // failed (`Spawn` — including a transient one that `ProcessError.isTransient` accepts), or a
+    // platform/configuration primitive was refused before launch (`Unsupported`). Both built-in runners
+    // start the stdin feeder only once the spawn has succeeded (`ProcessGroup.BuildHost`), so for them
+    // these are exactly the failures that leave a one-shot payload intact — and for a captured run the
+    // launch-boundary commit in `CaptureVerbs.runToCompletion` verifies it independently, catching an
+    // `Unsupported` a runner raises AFTER its child exists (`RunningProcess` has such a case) even
+    // though the case alone reads as an up-front refusal.
+    //
+    // Deliberately a conservative allow-list rather than an exhaustive match: everything else — `Exit`,
+    // `Timeout`, `Signalled`, `Stdin`, `OutputTooLarge`, `Unobserved`, `NotReady`, `Parse`,
+    // `RetryPredicate`, `JsonRpc`, `CassetteMiss`, `ResourceLimit`, `Adopt`, `Cancelled`, and the
+    // ambiguous `Io` (raised both before a child, e.g. a process group that could not be created, and
+    // while driving a live one) — may have reached a child that already drained the source, so a future
+    // error case is refused a one-shot retry until it is deliberately added here. Ports ProcessKit-rs
+    // `is_pre_child_launch_failure` (`237c4679`).
+    let private isPreChildLaunchFailure (error: ProcessError) =
+        match error with
+        | ProcessError.NotFound _
+        | ProcessError.Spawn _
+        | ProcessError.Unsupported _ -> true
+        | _ -> false
 
     // Apply the command's `Retry` policy to a verb's final `Result`. Lives at the verb layer (not
     // the runner) so it wraps `ensureSuccess` — a non-zero exit is data to `outputString` but an
@@ -205,19 +239,6 @@ module Runner =
         match command.Config.RetryDisabled, command.Config.Retry with
         | true, _
         | _, None -> action command
-        | false, Some(maxAttempts, _, _) when maxAttempts > 1 && Stdin.isOneShot command.Config.StdinSource ->
-            // A one-shot stdin source (`FromStream`/`FromLines`/`FromAsyncLines`) can only be pumped
-            // once: a second attempt would silently feed the child empty/truncated input instead of
-            // replaying the original one. Fail loudly, before the first attempt even runs, rather than
-            // let a retry quietly corrupt the input on attempt 2 (T-088; ports ProcessKit-rs
-            // `c1f39c7`/`8472007`). `maxAttempts <= 1` (a single run, no retry) is unaffected, and so is
-            // every repeatable source (`Bytes`/`String`/`File`/`Empty`).
-            Task.FromResult(
-                Error(
-                    ProcessError.Unsupported
-                        $"'{command.Program}' has a one-shot stdin source and cannot be retried ({maxAttempts} attempts requested): a second attempt would find the source already exhausted"
-                )
-            )
         | false, Some(maxAttempts, delayPolicy, shouldRetry) ->
             task {
                 // A command-scoped `CancelOn` covers the whole retrying run, including a pending
@@ -234,72 +255,124 @@ module Runner =
                 // run, `3` means one run and up to two retries. (Matches the vocabulary of the source
                 // crate's `retry`.) Guard the `- 1` so `Int32.MinValue` can't wrap to a huge retry count.
                 let maxRetries = if maxAttempts <= 1 then 0 else maxAttempts - 1
-                let mutable attempt = 0
-                let mutable final = None
 
-                while final.IsNone do
-                    match! action command with
-                    | Ok value -> final <- Some(Ok value)
-                    | Error error ->
-                        // A cancelled run is always terminal: never retry a `Cancelled` error (even if a
-                        // custom `shouldRetry` would), or each attempt would re-fail instantly through the
-                        // still-cancelled token, burning every attempt and its backoff. Mirrors how the
-                        // supervisor treats cancellation as terminal.
-                        let isCancelled =
-                            match error with
-                            | ProcessError.Cancelled _ -> true
-                            | _ -> false
+                // A one-shot stdin source (`FromStream`/`FromLines`/`FromAsyncLines`) feeds exactly one
+                // child, so a run that may attempt the command more than once takes ownership of that
+                // payload before its first attempt: a concurrent run — or a later one, once some child
+                // has drained it — is refused loudly here instead of silently feeding its own child
+                // empty or truncated input. A single-run policy (`maxAttempts <= 1`) reserves nothing
+                // and behaves exactly as it did before, and so does every repeatable source.
+                let reservationResult =
+                    if maxRetries > 0 then
+                        OneShotStdin.reserve command.Program command.Config.StdinSource
+                    else
+                        Ok None
 
-                        // Invoke the user predicate under the same typed-result boundary as parsers. A
-                        // predicate fault ends this run immediately, preserving the failed attempt as
-                        // `RetryPredicate.Original` instead of leaking the callback exception or starting
-                        // another attempt. Keep the existing short-circuit order: when the retry budget
-                        // is available, the predicate is still observed before cancellation is checked.
-                        let retryDecision =
-                            if attempt < maxRetries then
+                match reservationResult with
+                | Error error -> return Error error
+                | Ok reservation ->
+                    let mutable attempt = 0
+                    let mutable final = None
+
+                    while final.IsNone do
+                        match! action command with
+                        | Ok value -> final <- Some(Ok value)
+                        | Error error ->
+                            // A cancelled run is always terminal: never retry a `Cancelled` error (even if a
+                            // custom `shouldRetry` would), or each attempt would re-fail instantly through the
+                            // still-cancelled token, burning every attempt and its backoff. Mirrors how the
+                            // supervisor treats cancellation as terminal.
+                            let isCancelled =
                                 match error with
-                                | ProcessError.RetryPredicate _ -> Ok false
-                                | _ ->
+                                | ProcessError.Cancelled _ -> true
+                                | _ -> false
+
+                            // The first attempt always runs, even for a one-shot stdin source; the gate is
+                            // here, on that attempt's outcome. A second attempt is allowed only when the
+                            // payload provably survived: no attempt has reached the launch boundary (the
+                            // reservation is still uncommitted) AND this failure is one that precedes a live
+                            // child. Any other outcome may have reached a child that already drained the
+                            // source, so the run ends with this attempt's own error — no predicate (a
+                            // throwing classifier would replace it with `RetryPredicate`), no backoff, and
+                            // no further attempt that could only replay empty stdin or re-classify the
+                            // re-consume. (T-340; ports ProcessKit-rs `237c4679`, which replaced the same
+                            // blanket up-front refusal this gate supersedes.)
+                            let oneShotStopsRetry =
+                                match reservation with
+                                | Some reservation -> reservation.IsConsumed || not (isPreChildLaunchFailure error)
+                                | None -> false
+
+                            // Invoke the user predicate under the same typed-result boundary as parsers. A
+                            // predicate fault ends this run immediately, preserving the failed attempt as
+                            // `RetryPredicate.Original` instead of leaking the callback exception or starting
+                            // another attempt. Keep the existing short-circuit order: when the retry budget
+                            // is available, the predicate is still observed before cancellation is checked —
+                            // except behind the one-shot gate above, which short-circuits to "no retry"
+                            // ahead of the predicate so this attempt's own error is what the run returns.
+                            let retryDecision =
+                                if oneShotStopsRetry then
+                                    Ok false
+                                elif attempt < maxRetries then
+                                    match error with
+                                    | ProcessError.RetryPredicate _ -> Ok false
+                                    | _ ->
+                                        try
+                                            Ok(shouldRetry.Invoke error)
+                                        with ex ->
+                                            // A callback fault is part of the typed retry-result contract, not a raw runner exception.
+                                            Error ex
+                                else
+                                    Ok false
+
+                            match retryDecision with
+                            | Error ex ->
+                                final <- Some(Error(ProcessError.RetryPredicate(command.Program, error, ex.Message)))
+                            | Ok shouldRetry ->
+                                if shouldRetry && not retryToken.IsCancellationRequested && not isCancelled then
+                                    attempt <- attempt + 1
+
+                                    let delay =
+                                        RetryDelayPolicy.delay attempt command.Config.RetryJitterSource delayPolicy
+
+                                    let runId = command.Config.RunId |> Option.defaultValue ""
+                                    Log.retry command.Config.Logger command.Program attempt delay runId
+                                    Diag.retried command.Program
+
                                     try
-                                        Ok(shouldRetry.Invoke error)
-                                    with ex ->
-                                        // A callback fault is part of the typed retry-result contract, not a raw runner exception.
-                                        Error ex
-                            else
-                                Ok false
+                                        // Clamp the backoff into the armable timer range so a misconfigured delay
+                                        // (negative / `InfiniteTimeSpan` / over-long) can't throw synchronously out
+                                        // of `Task.Delay` — which would break the honest-result contract — the same
+                                        // guard `Timeouts` applies to `Command.Timeout`.
+                                        do!
+                                            Task.Delay(
+                                                Timeouts.clampArmable delay,
+                                                command.Config.TimeProvider,
+                                                retryToken
+                                            )
+                                    with :? System.OperationCanceledException ->
+                                        // Cancelled mid-backoff: don't sleep out the rest of the delay. Report it
+                                        // as `Cancelled` (not the prior attempt's error), consistent with every
+                                        // other cancellation path, so a caller matching on `Cancelled` is not
+                                        // misrouted into its generic-failure branch.
+                                        final <- Some(Error(ProcessError.Cancelled command.Program))
+                                else
+                                    final <- Some(Error error)
 
-                        match retryDecision with
-                        | Error ex ->
-                            final <- Some(Error(ProcessError.RetryPredicate(command.Program, error, ex.Message)))
-                        | Ok shouldRetry ->
-                            if shouldRetry && not retryToken.IsCancellationRequested && not isCancelled then
-                                attempt <- attempt + 1
+                    // Roll the reservation back only when this run provably never fed the payload to a
+                    // child: nothing committed it at a launch boundary, and the run ended on a failure
+                    // that precedes a live child. The payload is then intact, so a later run may have it
+                    // — while every other ending (a success, or any possibly-post-child failure) keeps it
+                    // held, so no later run can be handed a source some child has already drained.
+                    match reservation with
+                    | Some reservation when not reservation.IsConsumed ->
+                        match final with
+                        | Some(Error error) when isPreChildLaunchFailure error -> reservation.Rollback()
+                        | _ -> ()
+                    | _ -> ()
 
-                                let delay =
-                                    RetryDelayPolicy.delay attempt command.Config.RetryJitterSource delayPolicy
-
-                                let runId = command.Config.RunId |> Option.defaultValue ""
-                                Log.retry command.Config.Logger command.Program attempt delay runId
-                                Diag.retried command.Program
-
-                                try
-                                    // Clamp the backoff into the armable timer range so a misconfigured delay
-                                    // (negative / `InfiniteTimeSpan` / over-long) can't throw synchronously out
-                                    // of `Task.Delay` — which would break the honest-result contract — the same
-                                    // guard `Timeouts` applies to `Command.Timeout`.
-                                    do! Task.Delay(Timeouts.clampArmable delay, command.Config.TimeProvider, retryToken)
-                                with :? System.OperationCanceledException ->
-                                    // Cancelled mid-backoff: don't sleep out the rest of the delay. Report it
-                                    // as `Cancelled` (not the prior attempt's error), consistent with every
-                                    // other cancellation path, so a caller matching on `Cancelled` is not
-                                    // misrouted into its generic-failure branch.
-                                    final <- Some(Error(ProcessError.Cancelled command.Program))
-                            else
-                                final <- Some(Error error)
-
-                match final with
-                | Some result -> return result
-                | None -> return Error(ProcessError.Io "Retry loop ended without a final result.")
+                    match final with
+                    | Some result -> return result
+                    | None -> return Error(ProcessError.Io "Retry loop ended without a final result.")
             }
 
     // Each capture verb is `withRetry` wrapped around a `CaptureVerbs` derivation of the runner's
