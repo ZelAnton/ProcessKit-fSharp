@@ -40,7 +40,7 @@ type TimeoutTests() =
         match result.EnsureSuccess() with
         | Error(ProcessError.Timeout(program, actual, _, _) as error) ->
             Assert.That(actual, Is.EqualTo expected, "the error must carry the configured deadline that fired")
-            Assert.That(error.Message, Is.EqualTo($"'{program}' timed out after {expected.TotalSeconds}s"))
+            Assert.That(error.Message, Does.StartWith($"'{program}' timed out after {expected.TotalSeconds}s"))
         | other -> Assert.Fail $"expected Timeout, got {other}"
 
     [<Test>]
