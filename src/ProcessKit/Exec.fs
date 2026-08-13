@@ -26,9 +26,12 @@ type BatchPolicy =
     /// - The triggering command keeps its own real error.
     /// - A command that already finished (success or failure) before the trigger keeps its own outcome
     ///   — a `FailFast` batch is never rewritten retroactively.
-    /// - A command still queued for a concurrency slot, or already running, when the trigger fires
-    ///   becomes `ProcessError.Cancelled` — unless it reaches its own outcome first, since cancelling
-    ///   and finishing race like any other cancellation.
+    /// - A command still queued for a concurrency slot when the trigger fires never enters `capture` at
+    ///   all and becomes `ProcessError.Cancelled` — this one IS guaranteed.
+    /// - A command already running when the trigger fires receives the same cancellation signal as the
+    ///   caller's own token, but keeps whatever result its own `capture` call returns — cancelling and
+    ///   finishing race like any other cancellation, so it is NOT guaranteed to become `Cancelled`; it
+    ///   may complete with its own success or failure first.
     /// - Two commands failing at nearly the same time is not a special case: whichever's `Error` is
     ///   observed first triggers the cancellation (idempotent — a second trigger is a no-op), and both
     ///   keep their own real errors, since both had already finished.

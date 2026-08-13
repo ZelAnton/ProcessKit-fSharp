@@ -793,9 +793,11 @@ Opt into fail-fast instead: on the FIRST command whose result is an `Error`, `ou
 `outputAllBytesWithPolicy` stop starting any command still waiting for a concurrency slot and cancel
 every command already running (the batch's own `CancellationToken` fires exactly the same way).
 Every element still gets a `Result` in input order — a command that already finished keeps its own
-outcome, and a command still queued or already running when the trigger fires becomes
-`ProcessError.Cancelled` *unless it reaches its own outcome first*, since cancelling and finishing
-race like any other cancellation (see the `BatchPolicy.FailFast` doc comment for the full contract).
+outcome, a command still waiting for a concurrency slot when the trigger fires never starts and is
+guaranteed to become `ProcessError.Cancelled`, and a command already running when the trigger fires
+receives that same cancellation signal but keeps whatever result its own capture returns — cancelling
+and finishing race like any other cancellation, so an already-running command is *not* guaranteed to
+become `Cancelled` (see the `BatchPolicy.FailFast` doc comment for the full contract).
 `BatchPolicy.CollectAll` behaves exactly like `outputAll`/`outputAllBytes` themselves; it is the
 default when no policy is given a reason to differ.
 
