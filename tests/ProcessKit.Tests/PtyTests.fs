@@ -971,6 +971,8 @@ type PtyTests() =
     [<Test>]
     member _.``stray shared-console CTRL+C does not terminate a default ConPTY child``() : Task =
         task {
+            // Spawn the child while the helper owns its private console, then broadcast CTRL+C to that
+            // same console. The completion marker proves that default ConPTY process-group isolation works.
             if not isWindows then
                 Assert.Ignore "Windows-only ConPTY console isolation"
             else
@@ -1013,7 +1015,10 @@ type PtyTests() =
                                 "no status"
 
                         Assert.Fail $"{message}; helper status: {status}"
+                    | Ok 71u -> Assert.Ignore "host cannot install a private-console CTRL+C handler"
+                    | Ok 76u -> Assert.Ignore "host cannot detach the helper from its inherited console"
                     | Ok 77u -> Assert.Ignore "host lacks ConPTY"
+                    | Ok 78u -> Assert.Ignore "host cannot allocate a private console"
                     | Ok 0u -> ()
                     | Ok exitCode -> Assert.Fail $"private-console helper failed with exit code {exitCode}"
 

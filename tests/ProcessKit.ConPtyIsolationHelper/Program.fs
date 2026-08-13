@@ -35,7 +35,12 @@ module Program =
 
             if not (FreeConsole()) then
                 return 76
+            elif not (AllocConsole()) then
+                return 78
+            elif not (SetConsoleCtrlHandler(handler, true)) then
+                return 71
             else
+                handlerInstalled <- true
                 report "starting-child"
 
                 try
@@ -62,8 +67,8 @@ module Program =
                         let! exitCode =
                             task {
                                 // Give PowerShell time to enter Start-Sleep. The child's completion marker,
-                                // not this delay, proves that it survived both the terminal input and the
-                                // console broadcast.
+                                // not this delay, proves that it survived the later broadcast into the
+                                // private console to which it belonged when it was spawned.
                                 do! Task.Delay 500
 
                                 match running.TakeStdin() with
@@ -73,23 +78,16 @@ module Program =
                                     do! stdin.FlushAsync()
                                     report "ctrl-c-input-sent"
 
-                                    if not (AllocConsole()) then
-                                        return 78
-                                    elif not (SetConsoleCtrlHandler(handler, true)) then
-                                        return 71
+                                    if not (GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0u)) then
+                                        return 74
                                     else
-                                        handlerInstalled <- true
+                                        report "ctrl-c-broadcast-sent"
 
-                                        if not (GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0u)) then
-                                            return 74
-                                        else
-                                            report "ctrl-c-broadcast-sent"
-
-                                            match! running.WaitAsync() with
-                                            | Outcome.Exited 23 when File.Exists completionMarker ->
-                                                report "child-completed"
-                                                return 0
-                                            | _ -> return 75
+                                        match! running.WaitAsync() with
+                                        | Outcome.Exited 23 when File.Exists completionMarker ->
+                                            report "child-completed"
+                                            return 0
+                                        | _ -> return 75
                             }
 
                         report $"disposing-after-{exitCode}"
