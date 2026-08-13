@@ -1266,6 +1266,185 @@ type PipelineTests() =
         }
         :> Task
 
+    // --- T-329: a stage-0 stdin source that fails only AFTER the chain exits ----------------------
+    //
+    // The pipeline carried its own copy of the single-command race: it peeked once at stage 0's feeder
+    // the moment every stage was terminal, so a source still reading then was read as "no failure" and
+    // the chain reported a silent success. Both pipeline paths — the buffered `run` and the streaming
+    // session's whole-chain wait — go through the SAME bounded final observation as a single command, so
+    // both are pinned here, along with the precedence a pipefail failure keeps over a stdin failure.
+
+    [<Test>]
+    member _.``a pipeline surfaces a stage-0 stdin source that fails only after the chain exits``() : Task =
+        task {
+            // Stage 0 exits at once without reading stdin; the source concludes only when the bounded
+            // observation window opens — strictly after every stage is terminal and the drains are done.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use _observation =
+                new StdinFinalObservationScope((fun () -> source.Release()), None)
+
+            let pipeline =
+                ((shell "exit 0") |> Command.stdin (Stdin.FromAsyncLines source)).Pipe sortStage
+
+            match! pipeline.OutputStringAsync() with
+            | Error(ProcessError.Stdin _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Stdin, got {other.Message}"
+            | Ok _ -> Assert.Fail "a stage-0 source failing after the chain exited must not report success"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a streaming pipeline session surfaces a stage-0 stdin source that fails after the chain exits``
+        ()
+        : Task =
+        task {
+            // The session classifies from the whole-chain capture stashed by the chain's own wait, so the
+            // observation has to happen there too — otherwise the streaming path keeps the bug the
+            // buffered path just lost.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use _observation =
+                new StdinFinalObservationScope((fun () -> source.Release()), None)
+
+            let pipeline =
+                ((shell "exit 0") |> Command.stdin (Stdin.FromAsyncLines source)).Pipe sortStage
+
+            match! pipeline.StartAsync() with
+            | Error error -> Assert.Fail $"start failed: {error}"
+            | Ok session ->
+                use session = session
+                let! _ = collect (session.StdoutLinesAsync())
+
+                match! session.FinishAsync() with
+                | Error(ProcessError.Stdin _) -> ()
+                | Error other -> Assert.Fail $"expected ProcessError.Stdin from FinishAsync, got {other.Message}"
+                | Ok _ -> Assert.Fail "a stage-0 source failing after the chain exited must not finish clean"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a pipefail failure still wins over a stage-0 stdin source that fails after exit``() : Task =
+        task {
+            // Precedence is unchanged, and decided before the window: the last stage's unaccepted exit is
+            // the realer failure, so it passes through as data and no observation window opens at all.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use observation = new StdinFinalObservationScope((fun () -> source.Release()), None)
+
+            let pipeline =
+                ((shell "exit 0") |> Command.stdin (Stdin.FromAsyncLines source)).Pipe(shell "exit 4")
+
+            match! pipeline.OutputStringAsync() with
+            | Ok result ->
+                match result.Outcome with
+                | Outcome.Exited 4 -> ()
+                | other -> Assert.Fail $"expected pipefail exit 4 to pass through, got {other}"
+            | Error(ProcessError.Stdin _) ->
+                Assert.Fail "a pipefail failure must win over the delayed stdin failure, not surface Stdin"
+            | Error other -> Assert.Fail $"unexpected error: {other.Message}"
+
+            Assert.That(
+                observation.Windows,
+                Is.EqualTo 0,
+                "a failing pipeline must not pay for the bounded observation window at all"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a hung stage-0 stdin source cannot hold a pipeline open past the bounded budget``() : Task =
+        task {
+            // The hung-source bound, on the pipeline path: the source never concludes, so the window must
+            // close on its budget, stop the feed, and let the chain report its honest success.
+            let source = DelayedStdinAsyncLines FailWhenReleased // never released
+
+            use _observation =
+                new StdinFinalObservationScope(ignore, Some(TimeSpan.FromMilliseconds 200.0))
+
+            let pipeline =
+                ((shell "exit 0") |> Command.stdin (Stdin.FromAsyncLines source)).Pipe sortStage
+
+            let run = pipeline.OutputStringAsync()
+            do! assertFinishesPromptly run
+
+            match! run with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"a stopped hung stage-0 source must not fail the chain, got {error}"
+
+            let! stopped = Task.WhenAny(source.Cancelled, Task.Delay 15000)
+            Assert.That(stopped, Is.SameAs source.Cancelled, "the hung stage-0 source was never stopped")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a fail-loud stderr overflow costs a pipeline no bounded stdin observation window``() : Task =
+        task {
+            // A fail-loud output overflow outranks `ProcessError.Stdin` in the pipeline's classification
+            // exactly as it does for a single command (which returns `OutputTooLarge` before it ever
+            // consults its stdin feeder), so an already-decided overflowing chain must not wait on stage 0's
+            // still-reading source for a fault it could never surface. The source is never released: only a
+            // gate that honours the overflow step keeps the window count at zero.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use observation =
+                new StdinFinalObservationScope(ignore, Some(TimeSpan.FromMilliseconds 200.0))
+
+            let noisy =
+                stderrStage 50 ((OutputBufferPolicy.Unbounded.WithMaxBytes 16).WithOverflow OverflowMode.Error)
+                |> Command.stdin (Stdin.FromAsyncLines source)
+
+            match! (noisy.Pipe sortStage).OutputStringAsync() with
+            | Error(ProcessError.OutputTooLarge _) -> ()
+            | Error other -> Assert.Fail $"expected OutputTooLarge, got {other.Message}"
+            | Ok _ -> Assert.Fail "a fail-loud stderr overflow must fail the pipeline"
+
+            Assert.That(
+                observation.Windows,
+                Is.EqualTo 0,
+                "an overflowing pipeline must not pay for the bounded observation window at all"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a cancelled streaming pipeline costs no bounded stdin observation window``() : Task =
+        task {
+            // Whole-chain cancellation is the streaming session's FIRST classification step, above the
+            // stage-0 stdin rule, so a cancelled session must not pay the window either. Both stages are
+            // unchecked, so the pipefail representative stays "accepted" however the cancellation kill
+            // caught them — leaving the cancellation check as the only thing that can keep the window shut.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use observation =
+                new StdinFinalObservationScope(ignore, Some(TimeSpan.FromMilliseconds 200.0))
+
+            use cts = new CancellationTokenSource()
+
+            let first =
+                ((shell "exit 0") |> Command.stdin (Stdin.FromAsyncLines source)).UncheckedInPipe()
+
+            match! (first.Pipe(sortStage.UncheckedInPipe())).StartAsync cts.Token with
+            | Error error -> Assert.Fail $"start failed: {error}"
+            | Ok session ->
+                use session = session
+                // Parked inside the user's source: the feed is still running, so a window could be opened.
+                do! source.Parked
+                cts.Cancel()
+
+                match! session.FinishAsync() with
+                | Error(ProcessError.Cancelled _) -> ()
+                | Error other -> Assert.Fail $"expected Cancelled from FinishAsync, got {other.Message}"
+                | Ok _ -> Assert.Fail "a cancelled session must not finish clean"
+
+                Assert.That(
+                    observation.Windows,
+                    Is.EqualTo 0,
+                    "a cancelled pipeline must not pay for the bounded observation window at all"
+                )
+        }
+        :> Task
+
     // --- Observability: a pipeline run is whole-chain, not per-stage (T-013) ---
 
     [<Test>]

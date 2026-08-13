@@ -96,7 +96,9 @@ type private FirstLineFinishGate(stdinError: exn option) =
                 fun () ->
                     finishStarted.TrySetResult() |> ignore
                     finishOutcome.Task
-              StdinError = fun () -> stdinError
+              // This double has no background feed, so its (already-decided) fault needs no bounded
+              // observation window — it answers the verb's final observation immediately.
+              StdinError = fun () -> Task.FromResult stdinError
               StdinFeedComplete = ignore
               StartKill = fun () -> Interlocked.Increment(&killCount) |> ignore
               Signal = fun _ -> Ok()

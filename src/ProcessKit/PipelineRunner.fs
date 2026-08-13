@@ -153,6 +153,27 @@ module internal PipelineClassify =
         |> List.tryHead
         |> Option.map (fun (_, _, error) -> error)
 
+    /// Whether this finished chain's classification would actually REACH the stage-0 stdin rule — i.e.
+    /// whether `stdinErrorOnSuccess` is the step that still gets to decide the result, or a louder failure
+    /// above it has already decided it. Expressed as the SAME steps in the SAME order both consumers apply
+    /// (`Pipeline`'s buffering verbs and `PipelineSession.classify`), so it cannot drift from them: a relay
+    /// read fault, then a fail-loud output overflow, then a pipefail failure/timeout (a non-accepted
+    /// representative) each outrank `ProcessError.Stdin`.
+    ///
+    /// Its one caller is `PipelineRunner.observeStage0Fault`, which pays for the bounded final observation
+    /// of stage 0's feed only when this holds — the pipeline analogue of a single command classifying
+    /// `OutputTooLarge` *before* it ever consults `RunningHost.StdinError`. The streaming session's
+    /// whole-chain cancellation check sits above all of these and is NOT derivable from the capture (a
+    /// cancelled chain's stages can still look accepted), so that one stays the caller's to apply.
+    let reachesStdinRule (commands: Command list) (capture: PipelineCapture) : bool =
+        if (copyError capture).IsSome then
+            false
+        elif (outputTooLargeError commands capture).IsSome then
+            false
+        else
+            let stage = representative capture
+            stage.Outcome.IsAcceptedBy stage.OkCodes
+
 /// Runs a multi-stage pipeline inside one fresh shared `ProcessGroup` — the staging/wiring/teardown
 /// for the `Pipeline` type. Kept next to `Pipeline` (its only consumer) rather than inside
 /// `ProcessGroup`, which it drives purely through that group's public/internal surface.
@@ -366,6 +387,41 @@ module internal PipelineRunner =
         // The upstream the NEXT stage relays from. For the last stage nothing relays it: it is the
         // chain's output, captured by `run` / streamed by the session.
         sp.Stdout
+
+    /// The FINAL observation of stage 0's stdin feed, for the `Stdin0Error` a finished chain hands to
+    /// `PipelineClassify.stdinErrorOnSuccess` — shared by the buffered `run` and the streaming session's
+    /// `waitWhole` so the single-command fix cannot be present on one pipeline path and missing on the
+    /// other. `capture` is this chain's observation with `Stdin0Error` not yet filled in; nothing read
+    /// here depends on that field.
+    ///
+    /// Only a pipeline whose classification would actually REACH the stage-0 stdin rule pays for the
+    /// bounded window — every louder failure keeps the old non-blocking peek and adds no wait at all, so an
+    /// already-decided run is never delayed by a source whose fault it could not surface anyway. That is
+    /// the whole-chain cancellation `wasCancelled` reports (the streaming session classifies a cancelled
+    /// chain as `Cancelled` however its stages exited), plus the three capture-derived steps
+    /// `PipelineClassify.reachesStdinRule` applies in `Pipeline`'s own order: a relay read fault
+    /// (`CopyError`), a fail-loud output overflow (the last stage's stdout or ANY stage's stderr), and a
+    /// pipefail failure/timeout (a non-accepted representative). It is the same "a losing branch pays
+    /// nothing" property a single command gets by returning its `OutputTooLarge`/`Cancelled` before it ever
+    /// consults `RunningHost.StdinError`.
+    ///
+    /// On the path that does reach the rule, this gives a source still reading when the chain exited a
+    /// bounded window to conclude — the same fix, and the same budget, as a single command's
+    /// `RunningHost.StdinError` — instead of dropping a genuine failure that merely lost the race with a
+    /// fast stage 0. The caller stops the feeder immediately afterwards either way.
+    let internal observeStage0Fault
+        (feed: Pump.StdinFeeder option)
+        (commands: Command list)
+        (wasCancelled: unit -> bool)
+        (capture: PipelineCapture)
+        : Task<exn option> =
+        match feed with
+        | None -> Task.FromResult<exn option> None
+        | Some feeder ->
+            if not (wasCancelled ()) && PipelineClassify.reachesStdinRule commands capture then
+                feeder.ObserveFaultAsync()
+            else
+                Task.FromResult feeder.Fault
 
     /// Spawn every stage into one fresh shared group, wire each stage's stdout to the next stage's
     /// stdin (no shell involved), capture the last stage's stdout, and reap the whole tree on exit.
@@ -804,25 +860,39 @@ module internal PipelineRunner =
                                         StderrTotalBytes = stderrCaptures[i].TotalBytes
                                         TornDown = observation.TornDown[i] } ]
 
-                            // Observe the stage-0 stdin fault without blocking: only a feed that has
-                            // finished (a missing `FromFile` faults synchronously at spawn) yields its
-                            // stashed source failure — matching the single-command observer. Stop the
-                            // feeder afterwards so a still-parked source feed (a hung `FromAsyncLines`)
-                            // is cancelled and its enumerator disposed rather than leaked past the run.
-                            let stdin0Error = stage0Feed |> Option.bind (fun feeder -> feeder.Fault)
+                            let observed =
+                                { LastStdout = lastCapture.Bytes
+                                  LastStdoutTruncated = lastCapture.Truncated
+                                  LastStdoutTooLarge = lastCapture.TooLarge
+                                  LastStdoutTotalBytes = lastCapture.TotalBytes
+                                  Stages = stageResults
+                                  Duration = duration
+                                  TimedOut = timedOut
+                                  Stdin0Error = None
+                                  CopyError = copyError }
+
+                            // The chain is fully observed, so this is the point that decides whether a
+                            // stage-0 source failure can still be the pipeline's result — the bounded final
+                            // observation (see `observeStage0Fault`; the single-command analogue is
+                            // `RunningHost.StdinError`). The cancellation predicate is already false on this
+                            // branch (the `if` above returns `Cancelled` instead of reaching here); it is
+                            // passed rather than hardcoded so the gate stays honest — and identical to the
+                            // streaming path's — if that early return ever moves. Stop the feeder immediately
+                            // afterwards so a still-parked source feed (a hung `FromAsyncLines`) is cancelled
+                            // and its enumerator disposed rather than leaked past the run.
+                            let! stdin0Error =
+                                observeStage0Fault
+                                    stage0Feed
+                                    commands
+                                    (fun () -> cancellationToken.IsCancellationRequested)
+                                    observed
+
                             stopStage0Feed ()
 
                             return
                                 Ok
-                                    { LastStdout = lastCapture.Bytes
-                                      LastStdoutTruncated = lastCapture.Truncated
-                                      LastStdoutTooLarge = lastCapture.TooLarge
-                                      LastStdoutTotalBytes = lastCapture.TotalBytes
-                                      Stages = stageResults
-                                      Duration = duration
-                                      TimedOut = timedOut
-                                      Stdin0Error = stdin0Error
-                                      CopyError = copyError }
+                                    { observed with
+                                        Stdin0Error = stdin0Error }
         }
 
     /// The live materials a streaming pipeline session (`Pipeline.StartAsync`) is built from. `Host` is a
@@ -1050,6 +1120,17 @@ module internal PipelineRunner =
                                 else
                                     Error(ProcessError.Unsupported "the pipeline has already been torn down"))
 
+                        // The whole-chain cancellation predicate the SESSION classifies with — the verb
+                        // token or the chain-level `CancelOn`, exactly the pair `Pipeline.StartAsync` builds
+                        // its `wasCancelled` from (deliberately NOT `linkedCts`, whose third token is the
+                        // deadline: a timeout is classified from the capture's own `TimedOut`, not here). A
+                        // cancelled chain reports `Cancelled` however its stages exited, so it must not pay
+                        // for the bounded stage-0 observation either — the buffered `run` gets the same
+                        // exclusion from its own cancellation check.
+                        let wasCancelled () =
+                            cancellationToken.IsCancellationRequested
+                            || (cancelOn |> Option.exists (fun t -> t.IsCancellationRequested))
+
                         // Observe the whole chain through the shared reap-once choke point, drain the
                         // relay/stderr tail, build + stash the pipefail capture, and return the SAME
                         // telemetry outcome `run` reports (`TimedOut`, else the last stage's raw outcome —
@@ -1095,10 +1176,7 @@ module internal PipelineRunner =
                                             StderrTotalBytes = stderrCaptures[i].TotalBytes
                                             TornDown = observation.TornDown[i] } ]
 
-                                let stdin0Error = stage0Feed |> Option.bind (fun feeder -> feeder.Fault)
-                                stopStage0Feed ()
-
-                                let capture =
+                                let observed =
                                     { LastStdout = Array.empty
                                       LastStdoutTruncated = false
                                       LastStdoutTooLarge = false
@@ -1106,8 +1184,20 @@ module internal PipelineRunner =
                                       Stages = stageResults
                                       Duration = duration
                                       TimedOut = observation.TimedOut
-                                      Stdin0Error = stdin0Error
+                                      Stdin0Error = None
                                       CopyError = copyError }
+
+                                // The same bounded final observation the buffered `run` makes, through the
+                                // same helper — the streaming session classifies from this stashed capture,
+                                // so a stage-0 source that failed only after the chain exited must reach it
+                                // here or be lost. The feeder is stopped immediately afterwards.
+                                let! stdin0Error = observeStage0Fault stage0Feed commands wasCancelled observed
+
+                                stopStage0Feed ()
+
+                                let capture =
+                                    { observed with
+                                        Stdin0Error = stdin0Error }
 
                                 captureTcs.TrySetResult capture |> ignore
 
@@ -1204,7 +1294,7 @@ module internal PipelineRunner =
                               Wait = waitWhole
                               // Stage-0 stdin faults are surfaced through the stashed capture's `Stdin0Error`
                               // by the session, not the inner handle, so it never errors on stdin itself.
-                              StdinError = (fun () -> None)
+                              StdinError = RunningHost.NoStdinError
                               StdinFeedComplete = (fun () -> ())
                               StartKill = killTreeGated
                               Signal = signalGated

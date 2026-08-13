@@ -362,8 +362,11 @@ container exists — `cgroup.freeze` on Linux, `SIGSTOP`/`SIGCONT` on macOS/BSD 
 process-group fallback, per-thread suspension on Windows.
 
 `ProcessGroup.KillAll()` is reusable: on Linux kernels without `cgroup.kill`, it reports
-`ProcessError.Io` if the fallback cannot verify that `cgroup.freeze` returned to `0`; an already-unfrozen or
-removed freezer remains a best-effort success, and final disposal still removes the cgroup.
+`ProcessError.Io` if the fallback cannot verify that `cgroup.freeze` returned to `0`, or if a member could
+not be signalled and the group is still populated afterwards; an already-unfrozen or
+removed freezer remains a best-effort success, and final disposal still removes the cgroup. That fallback
+pins each member and reconfirms its cgroup membership before delivering SIGKILL, so a recycled pid is
+skipped rather than killed.
 
 *Deeper: [Process groups → signals, suspend/resume](docs/process-groups.md#signals-and-suspendresume).*
 

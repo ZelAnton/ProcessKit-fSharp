@@ -9,10 +9,10 @@ open ProcessKit.Native.Posix
 
 /// Linux cgroup v2 — the `limits` backend and cgroup-scoped tree control. All plain file I/O over
 /// /sys/fs/cgroup, plus per-member signal delivery. Depends on `Native.Common` (`SignalDelivery`) and
-/// `Native.Posix` (the raw `kill` and the `SIGKILL`/`SIGTERM` numbers used by the best-effort teardown
-/// sweep in `killCgroup`, and the pidfd primitives `pidfdOpenChecked`/`pidfdSendSignalChecked`/
-/// `closePidfd` that make per-member SIGTERM / arbitrary-signal delivery identity-safe against pid
-/// recycling), so it compiles after both.
+/// `Native.Posix` (the `SIGKILL`/`SIGTERM` numbers, and the pidfd primitives
+/// `pidfdOpenChecked`/`pidfdSendSignalChecked`/`closePidfd` that make every per-member delivery —
+/// arbitrary signals, and the legacy teardown sweep's SIGKILL — identity-safe against pid recycling),
+/// so it compiles after both.
 module internal Cgroup =
 
     // ----------------------------------------------------------------------------------
@@ -507,121 +507,6 @@ module internal Cgroup =
         | Ok members -> not (List.isEmpty members)
         | Error _ -> true
 
-    [<Literal>]
-    let private MaxThawAttempts = 3
-
-    [<Literal>]
-    let private ThawRetryDelayMilliseconds = 2
-
-    /// Test-only seam for the legacy kill fallback's cgroup file writes. Production leaves it unset;
-    /// fault-injection tests use it to model a kernel/delegation write refusal without depending on
-    /// the test runner's effective uid or a real delegated cgroup hierarchy.
-    let mutable internal killCgroupWriteTestHook: (string -> string -> unit) option =
-        None
-
-    let private writeKillCgroupFile (file: string) (content: string) =
-        killCgroupWriteTestHook |> Option.iter (fun hook -> hook file content)
-        File.WriteAllText(file, content)
-
-    /// Thaw the legacy fallback's reusable cgroup and verify the kernel-visible state. A successful
-    /// write is not enough: cgroup.freeze is asynchronous, and a refused write can leave a previously
-    /// frozen cgroup unchanged. A missing freezer means the cgroup was removed or the filesystem no
-    /// longer exposes the control, so there is no reusable frozen group left to protect. Any other
-    /// unreadable or unexpected state remains an error rather than a false success.
-    let private thawCgroupAfterKill (cgroupPath: string) : Result<unit, string> =
-        let freezeFile = Path.Combine(cgroupPath, "cgroup.freeze")
-        let mutable attempt = 0
-        let mutable thawed = false
-        let mutable lastFailure = "cgroup.freeze did not report an unfrozen state"
-
-        while attempt < MaxThawAttempts && not thawed do
-            try
-                writeKillCgroupFile freezeFile "0"
-            with ex ->
-                lastFailure <- $"could not write {freezeFile} to thaw the cgroup: {ex.Message}"
-
-            try
-                let state = File.ReadAllText freezeFile |> fun value -> value.Trim()
-
-                if state = "0" then
-                    thawed <- true
-                elif state = "1" then
-                    lastFailure <- $"{freezeFile} still reports frozen state (1) after thaw attempt"
-                else
-                    lastFailure <- $"{freezeFile} returned unexpected state '{state}' while verifying thaw"
-            with
-            | :? FileNotFoundException
-            | :? DirectoryNotFoundException ->
-                // A removed cgroup cannot remain as a frozen reusable group; teardown may continue.
-                thawed <- true
-            | ex -> lastFailure <- $"could not read {freezeFile} while verifying thaw: {ex.Message}"
-
-            attempt <- attempt + 1
-
-            if not thawed && attempt < MaxThawAttempts then
-                System.Threading.Thread.Sleep ThawRetryDelayMilliseconds
-
-        if thawed then Ok() else Error lastFailure
-
-    /// Hard-kill the whole subtree via `cgroup.kill` (kernel >= 5.14) — the atomic, race-free whole-subtree
-    /// SIGKILL that also catches a process forked after any membership snapshot. On older kernels (< 5.14,
-    /// no `cgroup.kill`) fall back to freezing the tree and running a bounded per-pid `kill(pid, SIGKILL)`
-    /// sweep.
-    ///
-    /// That fallback sweep is deliberately **best-effort, not identity-safe against pid recycling** — it is
-    /// NOT presented as TOCTOU-safe. Unlike `signalCgroup` (which pins each pid with a pidfd before
-    /// delivering, see `deliverIdentitySafe`), it signals raw pid numbers snapshotted from
-    /// `cgroup.procs`, so in the tiny window between the snapshot and the `kill` a member could exit and its
-    /// number be recycled by an unrelated process that then receives the SIGKILL. This is an accepted
-    /// trade-off confined to teardown on ancient kernels: the freeze halts new forks while the sweep runs,
-    /// SIGKILL is the least-harmful signal to misdirect, and a kernel without `cgroup.kill` (< 5.14) is old
-    /// enough that pinning is not the point of this legacy path. The atomic `cgroup.kill` above is the
-    /// race-free path used on every current kernel.
-    let killCgroup (cgroupPath: string) : Result<unit, string> =
-        let viaKillFile =
-            try
-                writeKillCgroupFile (Path.Combine(cgroupPath, "cgroup.kill")) "1"
-                true
-            with _ ->
-                false
-
-        if not viaKillFile then
-            (try
-                writeKillCgroupFile (Path.Combine(cgroupPath, "cgroup.freeze")) "1"
-             with _ ->
-                 // Best-effort freeze to stop members forking faster than the sweep can kill them; if
-                 // the freeze controller is unavailable we still SIGKILL the members below.
-                 ())
-
-            let mutable sweep = 0
-
-            // `cgroupAlive` reports a read failure as "still alive," so a persistent (or transient)
-            // `cgroup.procs` read failure keeps this loop running for its full iteration budget instead
-            // of stopping on the first failed read — self-healing if the failure clears within the
-            // budget, and otherwise leaving the caller correctly unsure the tree is fully dead rather
-            // than falsely told it drained.
-            while cgroupAlive cgroupPath && sweep < 50 do
-                match cgroupMembers cgroupPath with
-                | Ok members ->
-                    // Best-effort raw sweep (see the docstring): NOT identity-safe against pid recycling,
-                    // unlike the pidfd-pinned `signalCgroup` path. Confined to teardown on
-                    // kernels < 5.14 that lack the atomic `cgroup.kill`; the freeze above halts new forks
-                    // while it runs, and SIGKILL is the least-harmful signal to misdirect in the tiny
-                    // snapshot->kill window.
-                    for pid in members do
-                        kill (pid, SIGKILL) |> ignore
-                | Error _ ->
-                    // Unknown membership this iteration — nothing safe to target; the loop condition
-                    // above already keeps sweeping rather than treating this as drained.
-                    ()
-
-                System.Threading.Thread.Sleep 2
-                sweep <- sweep + 1
-
-            thawCgroupAfterKill cgroupPath
-        else
-            Ok()
-
     // errno: the kernel does not implement the syscall — a pre-5.3 kernel lacking `pidfd_open`, a pre-5.1
     // kernel lacking `pidfd_send_signal`, or a seccomp filter blocking either. Turned into an honest
     // fail-safe error below rather than a racy raw-kill fallback.
@@ -715,38 +600,208 @@ module internal Cgroup =
             finally
                 closePin handle
 
+    /// Deliver `signalNum` to every pid of an already-read membership snapshot through the identity-safe
+    /// choke above, reconfirming membership against `cgroupPath` *after* each pin (step 2 of
+    /// `deliverIdentitySafe`). Shared by the per-member broadcast (`signalCgroup`) and the legacy teardown
+    /// sweep (`killCgroup`), so both deliver through the one pin -> reconfirm -> send mechanism instead of
+    /// two implementations of it.
+    ///
+    /// A benign race never cuts the pass short — a member gone before its pin, and a pid that left the
+    /// cgroup (its number may have been recycled by a process outside the tree, so it is skipped
+    /// unsignalled), both leave every remaining member its own chance. The FIRST genuine failure is
+    /// returned as `Some (errno, message)` once each member has had that chance; `None` means no member
+    /// reported one. Factored over the syscall seam for the same reason `deliverIdentitySafe` is.
+    let private deliverToMembers
+        (cgroupPath: string)
+        (signalNum: int)
+        (members: int list)
+        (openPin: int -> Result<'H, int>)
+        (send: 'H -> int -> Result<unit, int>)
+        (closePin: 'H -> unit)
+        : (int * string) option =
+        // Reconfirm membership *after* each pidfd pins its pid: re-read cgroup.procs and ask whether the
+        // pinned pid is still listed. If it left, the pidfd may now point at a process outside the cgroup
+        // that recycled the number, so `deliverIdentitySafe` refuses to send.
+        let stillMember (pid: int) : Result<bool, string> =
+            match cgroupMembers cgroupPath with
+            | Ok current -> Ok(List.contains pid current)
+            | Error message -> Error message
+
+        let mutable firstFailure: (int * string) option = None
+
+        for pid in members do
+            match deliverIdentitySafe pid signalNum openPin stillMember send closePin with
+            | Delivery.Delivered
+            | Delivery.Skipped -> ()
+            | Delivery.Failed(errno, message) ->
+                if firstFailure.IsNone then
+                    firstFailure <- Some(errno, message)
+
+        firstFailure
+
+    [<Literal>]
+    let private MaxThawAttempts = 3
+
+    [<Literal>]
+    let private ThawRetryDelayMilliseconds = 2
+
+    /// Test-only seam for the legacy kill fallback's cgroup file writes. Production leaves it unset;
+    /// fault-injection tests use it to model a kernel/delegation write refusal without depending on
+    /// the test runner's effective uid or a real delegated cgroup hierarchy.
+    let mutable internal killCgroupWriteTestHook: (string -> string -> unit) option =
+        None
+
+    let private writeKillCgroupFile (file: string) (content: string) =
+        killCgroupWriteTestHook |> Option.iter (fun hook -> hook file content)
+        File.WriteAllText(file, content)
+
+    /// Thaw the legacy fallback's reusable cgroup and verify the kernel-visible state. A successful
+    /// write is not enough: cgroup.freeze is asynchronous, and a refused write can leave a previously
+    /// frozen cgroup unchanged. A missing freezer means the cgroup was removed or the filesystem no
+    /// longer exposes the control, so there is no reusable frozen group left to protect. Any other
+    /// unreadable or unexpected state remains an error rather than a false success.
+    let private thawCgroupAfterKill (cgroupPath: string) : Result<unit, string> =
+        let freezeFile = Path.Combine(cgroupPath, "cgroup.freeze")
+        let mutable attempt = 0
+        let mutable thawed = false
+        let mutable lastFailure = "cgroup.freeze did not report an unfrozen state"
+
+        while attempt < MaxThawAttempts && not thawed do
+            try
+                writeKillCgroupFile freezeFile "0"
+            with ex ->
+                lastFailure <- $"could not write {freezeFile} to thaw the cgroup: {ex.Message}"
+
+            try
+                let state = File.ReadAllText freezeFile |> fun value -> value.Trim()
+
+                if state = "0" then
+                    thawed <- true
+                elif state = "1" then
+                    lastFailure <- $"{freezeFile} still reports frozen state (1) after thaw attempt"
+                else
+                    lastFailure <- $"{freezeFile} returned unexpected state '{state}' while verifying thaw"
+            with
+            | :? FileNotFoundException
+            | :? DirectoryNotFoundException ->
+                // A removed cgroup cannot remain as a frozen reusable group; teardown may continue.
+                thawed <- true
+            | ex -> lastFailure <- $"could not read {freezeFile} while verifying thaw: {ex.Message}"
+
+            attempt <- attempt + 1
+
+            if not thawed && attempt < MaxThawAttempts then
+                System.Threading.Thread.Sleep ThawRetryDelayMilliseconds
+
+        if thawed then Ok() else Error lastFailure
+
+    /// Hard-kill the whole subtree via `cgroup.kill` (kernel >= 5.14) — the atomic, race-free whole-subtree
+    /// SIGKILL that also catches a process forked after any membership snapshot. On older kernels (< 5.14,
+    /// no `cgroup.kill`) fall back to freezing the tree and running a bounded per-member SIGKILL sweep.
+    ///
+    /// That fallback sweep is **identity-safe against pid recycling**: every SIGKILL goes through the same
+    /// pin -> reconfirm-membership -> send choke `signalCgroup` uses (`deliverIdentitySafe`), never a raw
+    /// `kill(pid, SIGKILL)` on a number snapshotted from `cgroup.procs`. The freeze does not close that
+    /// window on its own — it stops members forking, not exiting, and pid numbers are recycled globally —
+    /// so between the snapshot and the syscall a raw kill could land on an unrelated process outside the
+    /// cgroup. Pinning the task first and re-reading membership after the pin is what confines each SIGKILL
+    /// to a confirmed member.
+    ///
+    /// A pid that is gone, or that left the cgroup before its membership could be reconfirmed, is skipped
+    /// rather than signalled, and that skip is not a failure by itself: the drain check driving this loop
+    /// is the authority on whether the tree is dead. A pin/send failure is remembered and reported when the
+    /// cgroup is still populated (or its membership unreadable) once the sweep ends, so a teardown that did
+    /// not do its job can never read as success. On a kernel without pidfd (< 5.3) the sweep stops on the
+    /// spot and returns that honest error instead of downgrading to the racy raw kill.
+    ///
+    /// Factored over the pidfd syscall seam exactly like `deliverIdentitySafe`, so the sweep's pid-reuse
+    /// behaviour is testable without a real kernel; `killCgroup` wires the production primitives.
+    let killCgroupUsing
+        (openPin: int -> Result<'H, int>)
+        (send: 'H -> int -> Result<unit, int>)
+        (closePin: 'H -> unit)
+        (cgroupPath: string)
+        : Result<unit, string> =
+        let viaKillFile =
+            try
+                writeKillCgroupFile (Path.Combine(cgroupPath, "cgroup.kill")) "1"
+                true
+            with _ ->
+                false
+
+        if not viaKillFile then
+            (try
+                writeKillCgroupFile (Path.Combine(cgroupPath, "cgroup.freeze")) "1"
+             with _ ->
+                 // Best-effort freeze to stop members forking faster than the sweep can kill them; if
+                 // the freeze controller is unavailable we still SIGKILL the members below.
+                 ())
+
+            let mutable sweep = 0
+            // The first genuine pin/send failure seen across all sweeps, so one that leaves the cgroup
+            // populated is reported instead of masked by a success return.
+            let mutable firstFailure: (int * string) option = None
+            // A kernel that does not implement pidfd cannot be retried into implementing it: stop on the
+            // first ENOSYS instead of spending the whole budget re-failing, and surface it below.
+            let mutable pidfdMissing = false
+
+            // `cgroupAlive` reports a read failure as "still alive," so a persistent (or transient)
+            // `cgroup.procs` read failure keeps this loop running for its full iteration budget instead
+            // of stopping on the first failed read — self-healing if the failure clears within the
+            // budget, and otherwise leaving the caller correctly unsure the tree is fully dead rather
+            // than falsely told it drained.
+            while cgroupAlive cgroupPath && sweep < 50 && not pidfdMissing do
+                match cgroupMembers cgroupPath with
+                | Ok members ->
+                    // Identity-safe sweep (see the docstring): each member is pinned, reconfirmed as a
+                    // member, and only then SIGKILLed through the pinned handle, so a number recycled
+                    // between this snapshot and the syscall is skipped instead of killed.
+                    match deliverToMembers cgroupPath SIGKILL members openPin send closePin with
+                    | None -> ()
+                    | Some(errno, message) ->
+                        if firstFailure.IsNone then
+                            firstFailure <- Some(errno, message)
+
+                        if errno = ENOSYS then
+                            pidfdMissing <- true
+                | Error _ ->
+                    // Unknown membership this iteration — nothing safe to target; the loop condition
+                    // above already keeps sweeping rather than treating this as drained.
+                    ()
+
+                System.Threading.Thread.Sleep 2
+                sweep <- sweep + 1
+
+            let thawed = thawCgroupAfterKill cgroupPath
+
+            // The drain check is authoritative for "the tree is gone": a skipped (gone or recycled) pid, or
+            // even a failed delivery, still ends in success when nothing is left in the cgroup. A recorded
+            // failure with the group still populated — or unreadable, which `cgroupAlive` fail-safes to
+            // "alive" — is a teardown that did not do its job, and is reported rather than thawed away.
+            match firstFailure with
+            | Some(errno, message) when cgroupAlive cgroupPath ->
+                Error $"the identity-safe SIGKILL sweep left the cgroup populated: {message} (errno {errno})"
+            | _ -> thawed
+        else
+            Ok()
+
+    /// `killCgroupUsing` wired to the production pidfd primitives.
+    let killCgroup (cgroupPath: string) : Result<unit, string> =
+        killCgroupUsing pidfdOpenChecked pidfdSendSignalChecked closePidfd cgroupPath
+
     /// Broadcast `signalNum` to every current member through the identity-safe pidfd primitive
-    /// (`deliverIdentitySafe`), aggregating the per-member outcomes into one `SignalDelivery`: a benign
-    /// race (a member gone, or a pid that left the cgroup) never aborts the broadcast — every member still
-    /// gets its chance — while the first genuine delivery failure is what the aggregate reports. An
-    /// unreadable member list is itself a delivery failure (never a false "delivered to nobody" success).
+    /// (`deliverIdentitySafe`, applied member by member by `deliverToMembers`), aggregating the per-member
+    /// outcomes into one `SignalDelivery`: a benign race (a member gone, or a pid that left the cgroup)
+    /// never aborts the broadcast — every member still gets its chance — while the first genuine delivery
+    /// failure is what the aggregate reports. An unreadable member list is itself a delivery failure (never
+    /// a false "delivered to nobody" success).
     let private broadcastIdentitySafe (cgroupPath: string) (signalNum: int) : SignalDelivery =
         match cgroupMembers cgroupPath with
         | Error message ->
             SignalDelivery.DeliveryFailed(0, $"could not read cgroup.procs to broadcast the signal: {message}")
         | Ok members ->
-            // Reconfirm membership *after* each pidfd pins its pid: re-read cgroup.procs and ask whether the
-            // pinned pid is still listed. If it left, the pidfd may now point at a process outside the
-            // cgroup that recycled the number, so `deliverIdentitySafe` refuses to send.
-            let stillMember (pid: int) : Result<bool, string> =
-                match cgroupMembers cgroupPath with
-                | Ok current -> Ok(List.contains pid current)
-                | Error message -> Error message
-
-            let mutable firstFailure: SignalDelivery option = None
-
-            for pid in members do
-                match
-                    deliverIdentitySafe pid signalNum pidfdOpenChecked stillMember pidfdSendSignalChecked closePidfd
-                with
-                | Delivery.Delivered
-                | Delivery.Skipped -> ()
-                | Delivery.Failed(errno, message) ->
-                    if firstFailure.IsNone then
-                        firstFailure <- Some(SignalDelivery.DeliveryFailed(errno, message))
-
-            match firstFailure with
-            | Some failure -> failure
+            match deliverToMembers cgroupPath signalNum members pidfdOpenChecked pidfdSendSignalChecked closePidfd with
+            | Some(errno, message) -> SignalDelivery.DeliveryFailed(errno, message)
             | None -> SignalDelivery.Delivered
 
     /// Broadcast a raw signal to every member of a cgroup, aggregating the per-pid outcomes: a member
