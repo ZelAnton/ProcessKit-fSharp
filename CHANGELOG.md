@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Changed
+- A `ProcessError.NotFound` message now reports **how many entries** the `PATH` it searched held — `program 'tool' was not found (searched 84 PATH entries)` — instead of quoting the `PATH` value itself, so an environment value no longer lands in every not-found log line and the message no longer grows with the caller's `PATH`. The searched path is unchanged and complete on the `Searched` field; read it when you want to name the directories.
 - A failed run's message now quotes only the **last non-blank line of `Stderr`** rather than the whole captured stream: `ProcessError.Exit` no longer folds a multi-line stderr into its message, and `ProcessError.Signalled`/`ProcessError.Timeout` now carry that same one-line diagnostic (a hung or killed tool's last stderr line is usually the explanation) where they previously carried none. `Stdout` stays out of the render, and both streams remain available in full on `Stdout`/`Stderr`/`Combined`.
 
 ### Fixed

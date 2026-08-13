@@ -20,10 +20,19 @@ open System.Text
 /// that wants the full text still has it.
 module internal MessageText =
 
-    /// The character budget for ONE embedded fragment of a message. Deliberately generous enough to
-    /// leave every diagnostic this library itself writes intact (the longest run to roughly 400
-    /// characters), while turning a 100 KB stderr line or unparsed dump into a small, stable preview.
-    /// A message embeds at most a handful of fragments, so the whole render stays bounded too.
+    /// The character budget for ONE embedded fragment of a message. Chosen to clear the longest text
+    /// this library writes *by hand* — its wordiest literal diagnostic runs to roughly 400 characters —
+    /// while turning a 100 KB stderr line or unparsed dump into a small, stable preview. A message
+    /// embeds at most a handful of fragments, so the whole render stays bounded too.
+    ///
+    /// It is deliberately **not** a promise that every fragment survives whole. A fragment carrying text
+    /// this library did not author is cut whenever it exceeds the budget — that is the point — and so is
+    /// a *composite* detail the library builds around such text (an OS or exception message, a nested
+    /// error's own render; `Supervisor`'s callback failures compose one). A fragment is previewed from
+    /// its start, so compose such a detail with its short, actionable part first and the foreign text
+    /// last, and the cut falls on the least useful end. Nothing is lost either way: the untruncated text
+    /// stays on the structured field the fragment came from. Raising this budget to keep some particular
+    /// fragment whole is therefore the wrong lever — order or bound that fragment where it is composed.
     [<Literal>]
     let MaxFragmentChars = 512
 
@@ -133,6 +142,46 @@ module internal MessageText =
         else
             previewRange text 0 text.Length
 
+    /// How a probed search path is *reported* in a message: **how many entries it held**, never the
+    /// entries themselves — `"84 PATH entries"`, `"1 PATH entry"`, `"an empty PATH"`.
+    ///
+    /// `NotFound`'s `Searched` is a whole `PATH` value (`Native.Common.resolveWith`, the one resolution
+    /// every lookup goes through, passes the effective `PATH` verbatim). Quoting it would put an
+    /// environment value — several
+    /// thousand characters of it on an ordinary developer machine — into every "not found" log line;
+    /// quoting a 512-character prefix of it would be worse, an arbitrary slice that still reads like the
+    /// search path. The count is the part of it a one-line message can honestly carry: it separates "the
+    /// `PATH` I gave this command was empty/short" from "it had 84 entries and none of them had the
+    /// program", which is the question a not-found failure actually raises. The value itself stays on
+    /// the `Searched` field, in full, for a caller that wants to print or diff it.
+    ///
+    /// Entries are counted the way the resolver splits that value — on `Path.PathSeparator`, empty
+    /// entries dropped — so the number is how many `PATH` entries the lookup walked. It is not the total
+    /// number of directories probed, and `Searched` never was either: a bare name is tried against
+    /// `Command.PreferLocal` first, and on Windows against the pre-`PATH` locations `CreateProcessW`
+    /// searches. Counted by index rather than by `Split`, so a pathologically long value is never
+    /// materialized into an array.
+    let searchedPath (searched: string) : string =
+        let mutable entries = 0
+
+        if not (String.IsNullOrEmpty searched) then
+            let mutable index = 0
+            let mutable insideEntry = false
+
+            while index < searched.Length do
+                if searched[index] = IO.Path.PathSeparator then
+                    insideEntry <- false
+                elif not insideEntry then
+                    insideEntry <- true
+                    entries <- entries + 1
+
+                index <- index + 1
+
+        match entries with
+        | 0 -> "an empty PATH"
+        | 1 -> "1 PATH entry"
+        | count -> $"{count} PATH entries"
+
     /// The **last non-blank line** of a captured stream, trimmed and previewed — the actionable one
     /// (`git push` ends with `remote: permission denied`, it does not start with it) — or `None` when
     /// the stream holds nothing worth quoting. The line is located and trimmed by index, so a
@@ -197,7 +246,13 @@ type ProcessError =
     /// The process could not be spawned (a failure before or during launch).
     | Spawn of Program: string * Detail: string
 
-    /// The program could not be found. `Searched` is the search path that was probed, when known.
+    /// The program could not be found. `Searched` is the search path that was probed, when known — the
+    /// whole `PATH` value the lookup walked, `None` when no `PATH` search applied (a path-form program
+    /// is resolved against its own directory instead).
+    ///
+    /// `Message` reports only **how many entries** that path held, not the entries: a `PATH` is an
+    /// environment value, and a several-thousand-character one has no place in a log line. Read this
+    /// field when you want to name the directories that were searched.
     | NotFound of Program: string * Searched: string option
 
     /// A success-requiring verb (`run`) observed a non-zero exit code.
@@ -287,15 +342,17 @@ type ProcessError =
     /// bounded.
     ///
     /// Every fragment this render embeds that ProcessKit did not author — the program name, a captured
-    /// stream, a detail, a searched path, a peer's method name — goes through `MessageText`: terminal
-    /// and bidirectional-formatting controls, `CR`/`LF`, and the Unicode line/paragraph separators
+    /// stream, a detail, a peer's method name — goes through `MessageText`: terminal and
+    /// bidirectional-formatting controls, `CR`/`LF`, and the Unicode line/paragraph separators
     /// become `U+FFFD` (an ordinary TAB is kept), and anything past 512 characters per fragment is cut
     /// with a trailing `…`. So a hostile child, a JSON-RPC peer, or a caller's own parser cannot repaint
     /// an operator's terminal, forge extra log lines, or flood the log through this string — and a
     /// message stays the same small size whether the child wrote 20 bytes of stderr or 100 KB.
     ///
     /// A stream-carrying failure (`Exit`/`Signalled`/`Timeout`) quotes at most the **last non-blank line
-    /// of `Stderr`**, never the whole stream.
+    /// of `Stderr`**, never the whole stream. A `NotFound` reports how many entries the `PATH` it
+    /// searched held, never the `PATH` itself — an environment value stays out of the message (read
+    /// `Searched` for it).
     ///
     /// This is the *render* only. `Detail`, `Stdout`, `Stderr`, `Data`, `Original` and their accessors
     /// still carry the full, unmodified text — read them when you need the whole thing.
@@ -306,7 +363,7 @@ type ProcessError =
         | ProcessError.NotFound(program, searched) ->
             match searched with
             | Some path ->
-                $"program '{MessageText.fragment program}' was not found (searched {MessageText.fragment path})"
+                $"program '{MessageText.fragment program}' was not found (searched {MessageText.searchedPath path})"
             | None -> $"program '{MessageText.fragment program}' was not found"
         | ProcessError.Exit(program, code, _, stderr) ->
             $"'{MessageText.fragment program}' exited with code {code}{MessageText.diagnosticTail stderr}"

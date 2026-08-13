@@ -246,8 +246,9 @@ type ProcessErrorSanitizationTests() =
               "Adopt", ProcessError.Adopt(9, hugeStream)
               "Io", ProcessError.Io hugeStream
               "Unsupported", ProcessError.Unsupported hugeStream
-              "NotFound/searched path", ProcessError.NotFound("tool", Some hugeStream)
               "Cancelled/program name", ProcessError.Cancelled hugeStream ]
+        // `NotFound`'s searched path is deliberately absent: it is not embedded and bounded, it is
+        // reported as a count - see the two tests below.
 
         for name, error in cases do
             let bounded: string = $"{name}: a 100 KB fragment must render bounded"
@@ -255,6 +256,66 @@ type ProcessErrorSanitizationTests() =
 
             let marked: string = $"{name}: a truncated fragment must be marked with an ellipsis"
             Assert.That(error.Message, Does.Contain "…", marked)
+
+    [<Test>]
+    member _.``a not-found failure counts the searched PATH instead of quoting it``() =
+        // `Searched` is a whole `PATH` environment value - thousands of characters on an ordinary
+        // machine. Neither quoting it nor quoting an arbitrary 512-character slice of it belongs in a
+        // log line, so the message reports how many entries were probed and the value stays on the
+        // field. This pins the wording, since the count is now the only thing the line says about it.
+        let separator = string IO.Path.PathSeparator
+
+        let path =
+            String.concat separator [ "/opt/tools/bin"; "SENTINEL-DIR"; "/usr/local/bin" ]
+
+        let counted = ProcessError.NotFound("tool", Some path)
+        Assert.That(counted.Message, Is.EqualTo "program 'tool' was not found (searched 3 PATH entries)")
+
+        let excluded: string = "the PATH value itself must not reach the message"
+        Assert.That(counted.Message, Does.Not.Contain "SENTINEL", excluded)
+
+        let single = ProcessError.NotFound("tool", Some "/usr/local/bin")
+        Assert.That(single.Message, Is.EqualTo "program 'tool' was not found (searched 1 PATH entry)")
+
+        // Empty entries are dropped exactly as the resolver drops them, so the number is how many PATH
+        // entries the lookup walked...
+        let padded =
+            ProcessError.NotFound("tool", Some $"{separator}{separator}/opt/bin{separator}")
+
+        Assert.That(padded.Message, Is.EqualTo "program 'tool' was not found (searched 1 PATH entry)")
+
+        // ...and a value that holds no entry at all says so, rather than claiming "0 PATH entries".
+        let empty = ProcessError.NotFound("tool", Some separator)
+        Assert.That(empty.Message, Is.EqualTo "program 'tool' was not found (searched an empty PATH)")
+
+        // No PATH search applied (a path-form program): no parenthetical at all.
+        let unsearched = ProcessError.NotFound("./tool", None)
+        Assert.That(unsearched.Message, Is.EqualTo "program './tool' was not found")
+
+    [<Test>]
+    member _.``a huge or hostile searched PATH neither floods nor injects``() =
+        let separator = string IO.Path.PathSeparator
+
+        let huge =
+            String.concat separator (List.replicate 4000 "/some/rather/long/directory/name")
+
+        let flooded = ProcessError.NotFound("tool", Some huge)
+
+        let bounded: string =
+            "a PATH of 4000 entries (over 100 KB of text) must render as short a line as a one-entry PATH"
+
+        Assert.That(flooded.Message, Is.EqualTo "program 'tool' was not found (searched 4000 PATH entries)", bounded)
+
+        let whole: string = "the searched path stays whole on the field"
+
+        match flooded with
+        | ProcessError.NotFound(_, searched) -> Assert.That(searched, Is.EqualTo(Some huge), whole)
+        | other -> Assert.Fail $"expected a NotFound, got {other}"
+
+        // A caller-controlled PATH (a `Command.Env` override can set one) carrying the full injection
+        // payload: a count is a number, so nothing of it can reach the terminal either way.
+        let hostilePath = String.concat separator [ hostile; hostile ]
+        assertDisplaySafe "NotFound/searched" (ProcessError.NotFound(hostile, Some hostilePath)).Message
 
     [<Test>]
     member _.``nesting a RetryPredicate cannot walk around the bound``() =
