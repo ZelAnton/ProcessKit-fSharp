@@ -461,6 +461,12 @@ non-zero exit never short-circuits the batch — the caller folds the outcomes. 
 in one shared kill-on-dispose group. `Exec.outputAllBytes` is the identical fan-out with each
 result captured as `byte[]`.
 
+Need the batch to stop early instead? `Exec.outputAllWithPolicy` / `outputAllBytesWithPolicy` take
+an explicit `BatchPolicy`: `BatchPolicy.CollectAll` behaves exactly like `outputAll` itself, while
+`BatchPolicy.FailFast` stops starting new commands and cancels every command already running on the
+batch's first `Error` (see [cookbook.md → Top-level Exec helpers](docs/cookbook.md#top-level-exec-helpers)
+for the full contract).
+
 ## Sampling stats over time
 
 A point-in-time `Stats()` becomes a series with `SampleStatsAsync`, and a single run can be profiled

@@ -789,6 +789,33 @@ var commands = files.Select(f => new Command("gzip").Arg(f));
 var results = await Exec.outputAll(4, runner, commands, CancellationToken.None); // at most 4 live at once
 ```
 
+Opt into fail-fast instead: on the FIRST command whose result is an `Error`, `outputAllWithPolicy` /
+`outputAllBytesWithPolicy` stop starting any command still waiting for a concurrency slot and cancel
+every command already running (the batch's own `CancellationToken` fires exactly the same way).
+Every element still gets a `Result` in input order — a command that already finished keeps its own
+outcome, and everything still in flight becomes `ProcessError.Cancelled`. `BatchPolicy.CollectAll`
+behaves exactly like `outputAll`/`outputAllBytes` themselves; it is the default when no policy is
+given a reason to differ.
+
+**F#**
+
+```fsharp
+let runner = JobRunner() :> IProcessRunner
+let commands = files |> List.map (fun f -> Command.create "gzip" |> Command.arg f)
+
+let! results =
+    Exec.outputAllWithPolicy 4 runner commands BatchPolicy.FailFast CancellationToken.None
+```
+
+**C#**
+
+```csharp
+var runner = new JobRunner();
+var commands = files.Select(f => new Command("gzip").Arg(f));
+
+var results = await Exec.outputAllWithPolicy(4, runner, commands, BatchPolicy.FailFast, CancellationToken.None);
+```
+
 ## Preflight: is a program installed?
 
 `Exec.which` resolves a program to a full path without running it — a `doctor` check for an

@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- `Exec.outputAllWithPolicy` / `outputAllBytesWithPolicy` add an explicit `BatchPolicy` to the batch fan-out verbs: `BatchPolicy.CollectAll` behaves exactly like `outputAll`/`outputAllBytes` (the default, unchanged), while `BatchPolicy.FailFast` stops starting any command still waiting for a concurrency slot and cancels every command already running on the batch's first `Error`, while every element still gets a `Result` in input order and a command's own `Retry` policy sees the cancellation exactly like the caller's own `CancellationToken`.
 
 ### Changed
 -
