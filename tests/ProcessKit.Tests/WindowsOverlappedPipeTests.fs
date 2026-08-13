@@ -428,7 +428,9 @@ type WindowsNativeContainmentFaultTests() =
                 )
             finally
                 Windows.resumeThreadHook <- original
-                Windows.terminateWindowsJob job
+                // Best-effort test cleanup: the job may already be empty here, and the following
+                // `closeWindowsHandle` reaps it either way through KILL_ON_JOB_CLOSE.
+                Windows.terminateWindowsJob job |> ignore
                 Windows.closeWindowsHandle job
         }
         :> Task
@@ -570,7 +572,8 @@ type WindowsNativeContainmentFaultTests() =
 
                 WindowsCloseHandleInstrumentation.CloseHandle nulStdin |> ignore
                 Windows.resumeThreadHook <- originalResume
-                Windows.terminateWindowsJob job
+                // Best-effort test cleanup, as above.
+                Windows.terminateWindowsJob job |> ignore
                 Windows.closeWindowsHandle job
                 File.Delete redirectFile
         }
@@ -683,7 +686,8 @@ type WindowsNativeContainmentFaultTests() =
                     | other -> Assert.Fail $"{other}"
                 finally
                     Windows.queryInformationJobObjectHook <- original
-                    Windows.terminateWindowsJob job
+                    // Best-effort test cleanup, as above.
+                    Windows.terminateWindowsJob job |> ignore
                     Windows.closeWindowsHandle job
         }
         :> Task
