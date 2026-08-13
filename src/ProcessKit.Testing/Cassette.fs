@@ -85,9 +85,10 @@ type CassetteFailure =
         Detail: string | null
         /// The search path a `NotFound` lookup probed (`ProcessError.NotFound.Searched`), or `null`
         /// when no `PATH` search applied. This is an environment **value** kept verbatim — the one
-        /// exception to this format's names-only environment rule (see `CassetteEntry.EnvNames`) — so
-        /// that a not-found failure replays with the payload it was recorded with; the redaction hook
-        /// covers it.
+        /// exception to this format's names-only environment rule (see `CassetteEntry.EnvNames`), and
+        /// it is the child's *effective* `PATH`, so a value the command set through `Env("PATH", …)`
+        /// lands here too — so that a not-found failure replays with the payload it was recorded with;
+        /// the redaction hook covers it.
         Searched: string | null
         /// The captured stdout a stream-carrying failure (`Exit`, `Signalled`, `Timeout`) held; `null`
         /// for the kinds that carry none. Always text, because a `ProcessError`'s streams are text

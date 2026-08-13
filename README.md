@@ -1005,9 +1005,12 @@ else
 ```
 
 Entries are matched by program + args + cwd + a stdin **source digest**; environment override
-*values never reach the file* (only the variable names). `program`, `args`, `stdout`, and `stderr`
-*are* stored verbatim and can carry secrets — review a fixture before committing it; on Unix the
-file is written `0600`.
+*values* reach the file only as a hashed fingerprint (alongside the variable names). `program`,
+`args`, `stdout`, `stderr`, and a recorded **failure**'s own text — its streams, detail, JSON-RPC
+`data`, and the `PATH` a `NotFound` searched (the one environment *value* a cassette keeps, an
+`Env("PATH", …)` override included) — *are* stored verbatim and can carry secrets. `WithRedaction`
+scrubs the captured text and every one of those failure fields (`program`/`args` are stored as
+given), so review a fixture before committing it; on Unix the file is written `0600`.
 
 *Deeper: [Testing your code → record/replay](docs/testing.md#record-and-replay).*
 

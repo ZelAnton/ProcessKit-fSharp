@@ -318,11 +318,13 @@ assert a call streamed (`Spawn`) rather than buffered.
 - **The journal is per instance.** `On` / `When` / `Fallback` are fluent and
   return a **new** runner with its own empty journal, so record and assert
   against the *same* instance you handed the code under test.
-- **The secret invariant holds** — the same one the [cassettes](#record-and-replay)
-  keep. Only environment-variable **names** are recorded (never their values),
-  and only *whether* stdin was present (never its content). A secret passed as
-  `Command.Env("TOKEN", secret)` or fed to stdin never lands in `Received`, so a
-  dumped journal is safe to log or attach to a failing test.
+- **The secret invariant holds** — the one the [cassettes](#record-and-replay)
+  keep, without the exception a cassette carries (a recorded `NotFound`'s
+  searched `PATH`; nothing like it is journalled here). Only environment-variable
+  **names** are recorded (never their values), and only *whether* stdin was
+  present (never its content). A secret passed as `Command.Env("TOKEN", secret)`
+  or fed to stdin never lands in `Received`, so a dumped journal is safe to log
+  or attach to a failing test.
 
 ## Custom doubles and mocking frameworks
 
@@ -642,7 +644,7 @@ Semantics worth knowing before you commit a cassette:
 | Aspect | Behaviour |
 |---|---|
 | Match key | program + args + a stdin **source digest** (plus whether stdin was present). In-memory bytes hash their content; a `Stdin.FromFile` source hashes its path (opt into hashing its **contents** with `RecordReplayOptions.WithFileStdinContentHashing`). The working directory does **not** participate by default — a cassette recorded in one `cwd` still replays from another — opt in with `RecordReplayOptions.WithCwdMatching()` |
-| Environment | now part of the match key through a redacting **fingerprint** of the effective environment — the `EnvClear` flag plus the net effect of the `Env`/`EnvRemove` overrides (removals and last-write-wins included; env-name case is insensitive on Windows, sensitive on POSIX), while repeated/no-op overrides with the same final effect still match. Override **values never reach the file** — only the variable names and a versioned SHA-256 fingerprint — so env secrets can't leak, yet a call with a different value, name, removal, or `EnvClear` no longer replays an unrelated recording |
+| Environment | now part of the match key through a redacting **fingerprint** of the effective environment — the `EnvClear` flag plus the net effect of the `Env`/`EnvRemove` overrides (removals and last-write-wins included; env-name case is insensitive on Windows, sensitive on POSIX), while repeated/no-op overrides with the same final effect still match. Override **values never reach the file through it** — only the variable names and a versioned SHA-256 fingerprint — so an env secret can't leak through the match key, yet a call with a different value, name, removal, or `EnvClear` no longer replays an unrelated recording. (The one place an env value *is* stored is a recorded `NotFound`'s searched `PATH` — see the secrets note below the table.) |
 | Miss | an unmatched call is `ProcessError.CassetteMiss` (distinct from a missing program) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
 | Duplicates of one key | replay in capture order, then the **last entry repeats** — a recorded before/after sequence replays faithfully, while retry/probe loops keep getting a stable final answer |
 | Bytes | `CaptureBytesAsync` / `outputBytes` is supported: a **bytes recording** stores the exact stdout bytes (base64) and replays them byte-for-byte, including non-UTF-8 output. A **text** recording (or a pre-v2 cassette) replayed through the bytes verb is honestly `ProcessError.Unsupported` — it never hands back a lossy re-encode — so re-record that call through the bytes verb |
@@ -663,12 +665,15 @@ a typed error (a future version is rejected rather than misread). This is enforc
 adversarial, randomized (FsCheck) parsing-robustness suite (`CassetteRobustnessTests.fs`) alongside
 the example-based cassette tests.
 
-Only env *values* are redacted. `program`, `args`, `stdout`, `stderr`, and a
-recorded failure's own text (its streams, detail, JSON-RPC `data`, and — the one
-exception to the env-values rule — the `PATH` a `NotFound` searched) are stored
+Only env *values* are redacted by construction, into the fingerprint. `program`,
+`args`, `stdout`, `stderr`, and a recorded failure's own text (its streams,
+detail, JSON-RPC `data`, and — the one exception to the env-values rule, an
+`Env("PATH", …)` override included — the `PATH` a `NotFound` searched) are stored
 **verbatim** and can carry secrets (a `--password=…` flag, a token echoed to
 output), so review a fixture before committing it. The
-[`WithRedaction`](#record-and-replay) hook covers all of them. On Unix the file is written
+[`WithRedaction`](#record-and-replay) hook covers the captured text (a string
+capture's stdout/stderr, a bytes capture's stderr) and every one of those failure
+fields; `program` and `args` are recorded as given. On Unix the file is written
 **atomically and owner-only** (`0600` from creation — a temp file renamed into
 place, so it is never briefly world-readable); on Windows it inherits the
 containing directory's ACL, so keep secret-bearing fixtures out of world-readable

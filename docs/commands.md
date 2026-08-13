@@ -334,8 +334,15 @@ await new Command("hermetic-tool").EnvClear().RunAsync();
 There is **no allow-list / inherit-subset mode**. To run with a deliberately
 minimal environment, `EnvClear` and then add back only what the child needs with
 `Env` — that keeps the set explicit and visible at the call site. Environment
-*values* are treated as secrets by the rest of the library: they are never logged
-and never written to a record/replay cassette (only the variable names are).
+*values* are treated as secrets by the rest of the library: they are never logged,
+and a record/replay cassette stores only the variable *names* plus a hashed
+fingerprint of the effective environment. The one exception is a cassette that
+records a `NotFound` failure: it keeps the search path that lookup walked — the
+child's effective `PATH`, including one you set here with `Env("PATH", …)` —
+verbatim, so scrub such a fixture with `RecordReplayOptions.WithRedaction` or
+review it before committing it (see
+[record and replay](testing.md#record-and-replay) and
+[Hardening → Secrets in logs, traces, metrics, and cassettes](hardening.md#secrets-in-logs-traces-metrics-and-cassettes)).
 
 ## Standard input
 

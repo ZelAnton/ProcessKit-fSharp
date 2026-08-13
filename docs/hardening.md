@@ -361,17 +361,18 @@ everywhere:
   [Observability](observability.md).
 - **Cassettes are more selective — verify what's actually redacted before
   committing a fixture.** `RecordReplayRunner`'s environment **fingerprint** (part
-  of the match key) redacts override *values* by construction — only variable
-  names and a SHA-256 fingerprint are ever written to a cassette file. But
-  `program`, `args`, `stdout`, `stderr`, and — for a call recorded as a typed
-  **failure** — that failure's own streams, detail, JSON-RPC `data`, and the
-  `PATH` a `NotFound` searched (the one place an environment *value* is stored)
-  are kept **verbatim** by default and can carry secrets (a `--password=…`
-  argument, a token echoed to output) — scrubbing those needs the opt-in
-  [`RecordReplayOptions.WithRedaction`](testing.md#record-and-replay) hook (applied
-  to a string capture's stdout/stderr, a bytes capture's stderr, and every one of
-  those failure fields; a raw `byte[]` stdout capture is stored opaquely and is
-  *not* passed through the redactor). A
+  of the match key) redacts override *values* by construction — what it puts in
+  the file is only the variable names and a SHA-256 fingerprint. But `program`,
+  `args`, `stdout`, `stderr`, and — for a call recorded as a typed **failure** —
+  that failure's own streams, detail, JSON-RPC `data`, and the `PATH` a
+  `NotFound` searched (the one place an environment *value* is stored verbatim,
+  and it is the child's effective `PATH`, so an `Env("PATH", …)` override lands
+  there too) are kept **verbatim** by default and can carry secrets (a
+  `--password=…` argument, a token echoed to output) — scrubbing those needs
+  the opt-in [`RecordReplayOptions.WithRedaction`](testing.md#record-and-replay)
+  hook (applied to a string capture's stdout/stderr, a bytes capture's stderr,
+  and every one of those failure fields; a raw `byte[]` stdout capture is stored
+  opaquely and is *not* passed through the redactor). A
   PTY recording's merged stream goes through the same `WithRedaction` hook, which
   is how an echoed credential is kept out of a PTY cassette even with
   `PtyConfig.Echo = true`. Review any fixture recorded from an untrusted or

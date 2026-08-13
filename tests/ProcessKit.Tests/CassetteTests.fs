@@ -1832,6 +1832,63 @@ type CassetteTests() =
             })
 
     [<Test>]
+    member _.``a recorded NotFound stores the child's effective PATH (an Env override included)``() : Task =
+        withCassette (fun path ->
+            task {
+                // The single documented exception to this format's names-only environment rule, and a
+                // security contract the docs (README, commands.md, hardening.md, testing.md) tell a
+                // reader to rely on when deciding whether a fixture is committable: the searched path
+                // of a recorded `NotFound` is an environment VALUE, and it is the child's EFFECTIVE
+                // one — so a `PATH` the command set itself lands in the fixture verbatim. Pinned
+                // through a real resolution (no child is ever spawned: the lookup fails first).
+                let searchDir =
+                    Path.Combine(Path.GetTempPath(), $"pk-empty-path-{Guid.NewGuid():N}")
+
+                Directory.CreateDirectory searchDir |> ignore
+
+                try
+                    let command =
+                        Command.create $"pk-missing-tool-{Guid.NewGuid():N}"
+                        |> Command.env "PATH" searchDir
+
+                    do!
+                        task {
+                            use recorder = RecordReplayRunner.Record(path, JobRunner())
+
+                            match! (runner recorder).CaptureStringAsync(command, CancellationToken.None) with
+                            | Error(ProcessError.NotFound(_, searched)) ->
+                                Assert.That(
+                                    searched,
+                                    Is.EqualTo(Some searchDir),
+                                    "the lookup walks the command's OVERRIDDEN PATH, not the process's own"
+                                )
+                            | other -> Assert.Fail $"expected NotFound for a missing program, got {other}"
+
+                            match recorder.Save() with
+                            | Ok() -> ()
+                            | Error error -> Assert.Fail $"save: {error}"
+                        }
+
+                    use document = JsonDocument.Parse(readCassetteText path)
+
+                    let recordedSearched =
+                        document.RootElement.GetProperty("Entries").EnumerateArray()
+                        |> Seq.map (fun entry ->
+                            match entry.GetProperty("Failure").GetProperty("Searched").GetString() with
+                            | null -> ""
+                            | value -> value)
+                        |> Seq.toArray
+
+                    CollectionAssert.AreEqual(
+                        [| searchDir |],
+                        recordedSearched,
+                        "the env value the lookup searched reaches disk verbatim — the documented exception"
+                    )
+                finally
+                    Directory.Delete(searchDir, true)
+            })
+
+    [<Test>]
     member _.``an Auto session replays a recorded failure instead of calling the inner runner again``() : Task =
         withCassette (fun path ->
             task {
