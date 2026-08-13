@@ -1792,6 +1792,39 @@ type CorrectnessBugTests() =
         :> Task
 
     [<Test>]
+    member _.``a dry-run preview leaves the one-shot payload for the real run that follows``() : Task =
+        task {
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "bravo\nalpha\n")
+
+            // The `--dry-run` flow in full: preview the command, then actually run it. The retry budget
+            // is what makes the preview take a run-level hold on the payload before it knows that its
+            // runner spawns nothing at all; that hold is a loan, returned when no attempt launched a
+            // child, so the real run below still finds the caller's whole input. (Held for good, it
+            // refused every later run of this payload with `Unsupported` — a source no child had read.)
+            let command =
+                (shell "sort")
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let preview: IProcessRunner = ProcessKit.Testing.DryRunRunner()
+
+            match! preview.OutputStringAsync(command, CancellationToken.None) with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"a preview must never be refused a one-shot source: {error.Message}"
+
+            match! command.OutputStringAsync() with
+            | Ok result -> Assert.That(result.Stdout, Does.Contain "alpha", "the real run lost the previewed payload")
+            | Error error -> Assert.Fail $"the real run must be handed the previewed payload: {error.Message}"
+
+            // And the run that DID feed a child keeps the payload spent, preview or no preview.
+            match! command.OutputStringAsync() with
+            | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "one-shot stdin source")
+            | Error other -> Assert.Fail $"expected the one-shot refusal, got {other.Message}"
+            | Ok _ -> Assert.Fail "a run after the payload was fed to a child must be refused"
+        }
+        :> Task
+
+    [<Test>]
     member _.``a repeatable stdin source still feeds every run``() : Task =
         task {
             // The other half of the contract: only a ONE-SHOT payload is owned. A repeatable source has

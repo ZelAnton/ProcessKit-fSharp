@@ -12,9 +12,13 @@ and is fully testable without spawning a process.
 
 Each *incarnation* is one full captured run of the command, driven through the runner's
 `OutputStringAsync` verb. The command's own `Timeout`, `Stdin`, environment, encoding, and
-`OkCodes` therefore apply to every incarnation — with the usual
-[one-shot-stdin caveat](commands.md) for the second run onward (feed a reusable source such as
-`Stdin.FromString` rather than a stream you can read only once). One thing that does **not**
+`OkCodes` therefore apply to every incarnation — including the rule that a
+[one-shot stdin source](commands.md#one-shot-stdin-sources-feed-one-incarnation)
+(`Stdin.FromStream` / `FromLines` / `FromAsyncLines`) feeds a single incarnation. A supervisor
+that can restart therefore refuses such a command up front with `ProcessError.Unsupported`
+rather than starting a first incarnation whose successor would find the source empty, and an
+incarnation that does start takes the source at its own spawn like any other launch — so a
+supervised command wants a reusable source such as `Stdin.FromString`. One thing that does **not**
 carry over is the command's own `Command.Retry`: supervision runs the bare runner, so a
 supervised command is never internally retried per incarnation. Use the supervisor's restart
 policy and backoff instead — see [Supervisor versus retry](#supervisor-versus-retry).

@@ -843,6 +843,13 @@ type Command internal (config: CommandConfig) =
 
     /// Feed the child's standard input from `source`. Rejected (`ArgumentException`) when `InheritStdin`
     /// is already set — the inherited stdin has no pipe for a feeder source to write into.
+    ///
+    /// A **one-shot** source (`Stdin.FromStream`/`FromLines`/`FromAsyncLines`) feeds at most ONE
+    /// incarnation: the launch that creates a child takes it before spawning, so a second consumer —
+    /// a later run, a concurrent one, another verb or runner — is refused with
+    /// `ProcessError.Unsupported` before any child of its own exists, rather than being handed the
+    /// exhausted remains. A launch that produced no child leaves the source intact for the next one.
+    /// The repeatable sources (`Stdin.FromString`/`FromBytes`/`FromFile`/`Stdin.Empty`) feed every run.
     member _.Stdin(source: Stdin) =
         ArgumentNullException.ThrowIfNull source
         CommandConfig.ensureNoStdinInherit config "Stdin"
@@ -1665,7 +1672,8 @@ module Command =
     /// Start the child's environment empty instead of inheriting the parent's.
     let envClear (command: Command) = command.EnvClear()
 
-    /// Feed the child's standard input from `source`.
+    /// Feed the child's standard input from `source`. A one-shot source feeds at most one incarnation
+    /// (see `Command.Stdin`).
     let stdin (source: Stdin) (command: Command) = command.Stdin source
 
     /// Hand the child the parent process's own standard input directly (inherited, no pipe/feeder), for

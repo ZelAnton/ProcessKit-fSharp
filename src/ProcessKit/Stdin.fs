@@ -256,12 +256,20 @@ type internal OneShotStdinLaunch internal (claim: OneShotStdinClaim option, owns
 /// claim (`StdinSource.oneShotPayload` returns `None` for it), so every verb here is a no-op for it and
 /// it stays replayable as often as the caller likes.
 ///
-/// **Residual scope.** A custom `IProcessRunner` that neither spawns through `BuildHost` nor drives a
-/// pipeline never commits — but it also cannot reach the payload (`Stdin.Source` and `StdinSource` are
-/// internal, and the feeder that reads them is `Pump`'s), so nothing outside the library can drain a
-/// payload unrecorded. `CaptureVerbs.runToCompletion` still commits at the capture boundary as well,
-/// which is what records a launch made by an in-library double/seam that hands back a `RunningProcess`
-/// without going through `BuildHost` at all.
+/// **Runners that spawn nothing.** A runner that launches no child never commits — `DryRunRunner`'s
+/// preview and `ScriptedRunner`'s canned reply serve their verbs through `Seam`, which deliberately has
+/// no commit — and that is the whole point: such a runner cannot read the payload either (`Stdin.Source`
+/// and `StdinSource` are internal, and the feeder that reads them is `Pump`'s), so it must leave the
+/// source intact for the real run it stands in for. A retrying run's own hold is likewise handed back
+/// when no attempt committed (`Runner.withRetry`'s `finally`), so previewing a command neither spends
+/// its payload nor strands it as reserved. The same reasoning covers a custom `IProcessRunner`: it
+/// cannot reach the payload at all, so nothing outside the library can drain one unrecorded.
+///
+/// `CaptureVerbs.runToCompletion` commits once more at the capture boundary. For the two production
+/// callers that reach it (`JobRunner`, `ProcessGroup`) that is a second write of the value their
+/// `BuildHost` spawn already wrote, changing nothing; it exists for a caller with `InternalsVisibleTo`
+/// (today the runner doubles in `ProcessKit.Tests`) that reaches that internal boundary with a
+/// `RunningProcess` no spawn produced, so "a child was launched" reads the same there.
 [<RequireQualifiedAccess>]
 module internal OneShotStdin =
 

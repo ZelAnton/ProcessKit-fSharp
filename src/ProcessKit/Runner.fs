@@ -167,17 +167,24 @@ module internal CaptureVerbs =
                 | Error error -> return Error error
                 | Ok running ->
                     // A child now exists, so a one-shot stdin payload (`FromStream`/`FromLines`/
-                    // `FromAsyncLines`) is spent. The real spawn boundary
-                    // (`ProcessGroup.BuildHost.reserveLaunch`) has already committed it for every child
-                    // ProcessKit starts itself — this is the CAPTURE boundary's own witness, for a
-                    // `start` that hands back a `RunningProcess` without going through that spawn (an
-                    // in-library seam or test double). Not a duplicate that decides anything on a real
-                    // run: `Commit` is a single unconditional write of the same value, so the second one
-                    // changes nothing; what it buys is that the retry loop can still tell "no child ever
-                    // saw this payload" from "a child may already have drained it" by evidence, whichever
-                    // way the attempt reached its handle. The `Error` branch above commits nothing, and
-                    // is right not to: a launch that produced no child rolls its reservation back and
-                    // leaves the payload intact.
+                    // `FromAsyncLines`) is spent. Who actually reaches this line: `JobRunner` and
+                    // `ProcessGroup`, the only two production callers — and both spawn through
+                    // `ProcessGroup.BuildHost`, which already committed the payload inside the spawn's own
+                    // critical section. For them this is a second unconditional write of the same value
+                    // and decides nothing; the payload was spent the moment their child existed, not here.
+                    //
+                    // What it is still for: this module is `internal`, and a caller with
+                    // `InternalsVisibleTo` (today the runner doubles in `ProcessKit.Tests`) can reach this
+                    // boundary with a `RunningProcess` no `BuildHost` spawn produced. Committing on the
+                    // handle keeps the capture boundary's own promise — `start` returning `Ok` means a
+                    // child exists — so the retry loop reads the same "a child was launched" evidence
+                    // whichever way the attempt got its handle. It deliberately does NOT reach the shipped
+                    // in-library doubles: `DryRunRunner`/`ScriptedRunner` serve their verbs through
+                    // `Seam.complete`, never through here, which is exactly what lets a preview spawn
+                    // nothing and leave the payload untouched.
+                    //
+                    // The `Error` branch above commits nothing, and is right not to: a launch that produced
+                    // no child rolls its reservation back and leaves the payload intact.
                     OneShotStdin.commitLaunch command.Config.StdinSource
 
                     use _registration = effectiveToken.Register(fun () -> running.Kill())
@@ -264,8 +271,12 @@ module Runner =
                 // child, so a run that may attempt the command more than once takes ownership of that
                 // payload before its first attempt: a concurrent run — or a later one, once some child
                 // has drained it — is refused loudly here instead of silently feeding its own child
-                // empty or truncated input. A single-run policy (`maxAttempts <= 1`) reserves nothing
-                // and behaves exactly as it did before, and so does every repeatable source.
+                // empty or truncated input. This hold is a LOAN for the duration of the run, whoever the
+                // runner turns out to be: the `finally` below hands it straight back unless some attempt
+                // actually launched a child over it, so a run through a runner that spawns nothing leaves
+                // the payload exactly as it found it. A single-run policy (`maxAttempts <= 1`) reserves
+                // nothing (each launch takes the payload for itself) and behaves exactly as it did
+                // before, and so does every repeatable source.
                 let reservationResult =
                     if maxRetries > 0 then
                         OneShotStdin.reserve command.Program command.Config.StdinSource
@@ -291,31 +302,10 @@ module Runner =
                     let mutable attempt = 0
                     let mutable final = None
 
-                    // Evidence, accumulated across the run's ATTEMPTS, that the one-shot payload may
-                    // already have reached a live child — the input to the hand-back decision below.
-                    // The run's final error cannot answer that on its own: the retry machinery produces
-                    // some finals itself (`Cancelled` from an interrupted backoff, `RetryPredicate` from
-                    // a throwing classifier) long after the only attempt failed short of a child, and an
-                    // attempt's own `Cancelled` is ambiguous unless its token was already cancelled when
-                    // it started. Anything else an attempt does — a success, or any failure not provably
-                    // pre-child — sets this, so the payload is handed back only when nothing this run did
-                    // could have fed it. (T-340 R-01.)
-                    let mutable payloadMayBeSpent = false
-
                     try
                         while final.IsNone do
-                            // Sampled BEFORE the attempt: with the run's token already cancelled here, the
-                            // capture launch boundary refuses to start a child at all
-                            // (`CaptureVerbs.runToCompletion`, which links the same two sources this
-                            // `retryToken` does), so a `Cancelled` coming back from this attempt cannot
-                            // have reached one. Cancellation that arrives DURING an attempt stays
-                            // ambiguous — it may have killed a live child — and keeps the payload held.
-                            let cancelledBeforeAttempt = retryToken.IsCancellationRequested
-
                             match! action command with
-                            | Ok value ->
-                                payloadMayBeSpent <- true
-                                final <- Some(Ok value)
+                            | Ok value -> final <- Some(Ok value)
                             | Error error ->
                                 // A cancelled run is always terminal: never retry a `Cancelled` error (even if a
                                 // custom `shouldRetry` would), or each attempt would re-fail instantly through the
@@ -326,17 +316,6 @@ module Runner =
                                     | ProcessError.Cancelled _ -> true
                                     | _ -> false
 
-                                // What this attempt proves about the payload. A pre-child failure leaves it
-                                // untouched, and so does a `Cancelled` from an attempt whose token was
-                                // already cancelled before it began (no child could be started under it).
-                                // Everything else — including a cancellation that arrived mid-attempt — may
-                                // have reached a child that drained the source.
-                                if
-                                    not (isPreChildLaunchFailure error)
-                                    && not (isCancelled && cancelledBeforeAttempt)
-                                then
-                                    payloadMayBeSpent <- true
-
                                 // The first attempt always runs, even for a one-shot stdin source; the gate is
                                 // here, on that attempt's outcome. A second attempt is allowed only when the
                                 // payload provably survived: no attempt has reached the launch boundary (the
@@ -346,11 +325,12 @@ module Runner =
                                 // throwing classifier would replace it with `RetryPredicate`), no backoff, and
                                 // no further attempt that could only replay empty stdin or re-classify the
                                 // re-consume. (T-340; ports ProcessKit-rs `237c4679`, which replaced the same
-                                // blanket up-front refusal this gate supersedes.) Deliberately the strict
-                                // error-class rule rather than `payloadMayBeSpent`: the one case they disagree
-                                // on — a `Cancelled` under an already-cancelled token — must not reach the
-                                // classifier either, since a throwing one would replace that `Cancelled` with
-                                // `RetryPredicate`, and the loop refuses to retry under it anyway.
+                                // blanket up-front refusal this gate supersedes.) Deliberately stricter than
+                                // the hand-back rule in the `finally` below, which asks only whether a child
+                                // was launched: a `Cancelled` leaves no child behind but must not reach the
+                                // classifier either, since a throwing one would replace it with
+                                // `RetryPredicate`, and the loop refuses to retry under a cancelled token
+                                // anyway.
                                 let oneShotStopsRetry =
                                     match reservation with
                                     | Some reservation -> reservation.IsConsumed || not (isPreChildLaunchFailure error)
@@ -413,24 +393,32 @@ module Runner =
                                     else
                                         final <- Some(Error error)
                     finally
-                        // Hand the payload back exactly when this run provably never fed it to a child: no
-                        // launch boundary committed it (this run's, or a concurrent run's) and no attempt
-                        // got far enough to have reached one. Decided on the ATTEMPTS' evidence, not on the
-                        // run's final error, so a `Cancelled` produced by an already-cancelled token or by
-                        // an interrupted backoff, and a `RetryPredicate` from a throwing classifier, all
-                        // release a payload that is demonstrably intact instead of stranding it as reserved
-                        // for the life of the object. Every other ending — a success, or any
-                        // possibly-post-child failure — keeps it held, so no later run can be handed a
-                        // source some child has already drained.
+                        // Hand the payload back exactly when no child was ever launched over it — read off
+                        // the claim itself, not guessed from how the run ended. Every boundary that can
+                        // create a child over this payload commits it there and then, inside the spawn's
+                        // own critical section and before that child's feeder reads a byte
+                        // (`ProcessGroup.BuildHost` for every single-command launch, the pipeline's own
+                        // stage 0), so a claim still uncommitted when the run is over is POSITIVE evidence
+                        // that nothing read the source. That covers, without having to enumerate them: an
+                        // attempt refused before the spawn, a run refused by an already-cancelled token,
+                        // one cancelled during its backoff, one ended by a throwing classifier, one whose
+                        // attempt threw instead of returning a typed result — and equally a run driven
+                        // through a runner that SPAWNS NOTHING (a `DryRunRunner` preview, a `ScriptedRunner`
+                        // reply), whose successful result must not strand a payload no child ever saw: such
+                        // a runner cannot read the payload either (`Stdin.Source` is internal and the feeder
+                        // that reads it is `Pump`'s), so the source is exactly as this run found it.
                         //
-                        // In a `finally` because an attempt that throws instead of returning a typed result
-                        // is the same situation: for both built-in runners the launch boundary commits
-                        // before anything a caller can observe, so an uncommitted payload at that point
-                        // never reached a child, and stranding it would be a worse answer than the narrow,
-                        // already-documented gap for a runner that launches without committing.
+                        // A committed claim means a child WAS launched over the payload, so it stays spent
+                        // for good however this run ended — a success, a post-child failure, or a
+                        // cancellation that arrived mid-attempt — and no later run can be handed the
+                        // remains. `Rollback` is idempotent and only ever moves *reserved* back to
+                        // *available*, so it can neither free a committed payload nor take one from a run
+                        // that reserved it afterwards.
+                        //
+                        // In a `finally` so an attempt that throws instead of returning is settled the same
+                        // way, on the same evidence.
                         match reservation with
-                        | Some reservation when not (payloadMayBeSpent || reservation.IsConsumed) ->
-                            reservation.Rollback()
+                        | Some reservation when not reservation.IsConsumed -> reservation.Rollback()
                         | _ -> ()
 
                     match final with

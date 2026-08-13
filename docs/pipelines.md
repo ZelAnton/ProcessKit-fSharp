@@ -533,8 +533,16 @@ A `Pipeline` is an immutable value: building it spawns nothing, and each verb ca
 the chain afresh, so you can hold one and run it more than once. The one caveat is
 inherited from `Command` — when a chain runs repeatedly, feed the first stage from a
 **reusable** stdin source (`Stdin.FromString` / `Stdin.FromBytes` / `Stdin.FromFile`)
-rather than a stream you can only read once. See [commands.md](commands.md) for the full
-set of stdin sources and their semantics.
+rather than a stream you can only read once. A **one-shot** source
+(`Stdin.FromStream` / `FromLines` / `FromAsyncLines`) feeds one chain and one chain
+only: stage 0's spawn takes it, so a second run of the chain — buffered or
+`StartAsync` — is refused with `ProcessError.Unsupported` at stage 0, which means no
+stage of that chain starts at all, and a run over a source some other child already
+read is refused the same way. If stage 0's spawn itself fails, the source is handed
+back untouched. See
+[One-shot stdin sources feed one incarnation](commands.md#one-shot-stdin-sources-feed-one-incarnation)
+for the whole contract and [commands.md](commands.md) for the full set of stdin
+sources and their semantics.
 
 ---
 

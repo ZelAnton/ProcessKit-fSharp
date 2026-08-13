@@ -307,6 +307,12 @@ backoff vocabulary as `Supervisor`, applied to a finite one-operation retry loop
 `maxAttempts - 1` retries), so `Retry 3` runs the command at most three times, and
 `0`/`1` both mean a single run — a command always runs at least once.
 
+A command whose stdin is a **one-shot** source (`Stdin.FromStream` / `FromLines` /
+`FromAsyncLines`) still runs its first attempt, but retries only after a failure
+that precedes a live child, and it holds that source for the whole run so no other
+run can take it between attempts — see
+[One-shot stdin sources feed one incarnation](commands.md#one-shot-stdin-sources-feed-one-incarnation).
+
 The classifier is part of the typed result boundary. If it throws, ProcessKit stops
 the retry loop and returns `Error (ProcessError.RetryPredicate(program, original, detail))`:
 `original` is the failed attempt's complete typed `ProcessError`, while `detail` is

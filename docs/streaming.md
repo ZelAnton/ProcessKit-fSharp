@@ -776,6 +776,15 @@ interactivity at all — give the command `Stdin.FromLines seq`,
 background writer feed it; those sources run concurrently with the output pumps and
 never deadlock. See the stdin source table in [Running commands](commands.md).
 
+Those three sources are **one-shot**, and `StartAsync` is a launch like any other:
+it takes the source at the spawn, so the started handle owns it and a second start
+over the same stream or sequence is refused with `ProcessError.Unsupported` before
+any child exists — it is never handed the drained remains. A start that fails
+before a child (`NotFound`, a failed spawn) leaves the source for the next one. See
+[One-shot stdin sources feed one incarnation](commands.md#one-shot-stdin-sources-feed-one-incarnation)
+for the full contract, and use a repeatable source (`Stdin.FromString` /
+`FromBytes` / `FromFile`) when you start the same command more than once.
+
 ## Content-Length framed sessions (LSP / DAP)
 
 Language servers, debug adapters, and BSP servers usually do not speak newline-delimited JSON.
