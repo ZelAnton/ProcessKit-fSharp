@@ -1372,13 +1372,29 @@ type PtyTests() =
                 // exactly the contract this test exists to prove. A batch file (not an inline `cmd.exe /c`
                 // one-liner) avoids `%line%`'s parse-time (not run-time) expansion inside a single compound
                 // command line — an unrelated batch-scripting quirk, not a ConPTY one.
+                // R-02: `Command.args` only applies Windows argv-quoting, not cmd.exe metacharacter
+                // escaping — quotes do not stop cmd.exe's own command-line parser from acting on `&`,
+                // `|`, `^`, `<`, `>`, `%`, or `!` before the quoted argument ever reaches the target
+                // exe. A `IO.Path.GetTempPath()` containing one of those would make this test either
+                // fail to run the intended batch file or, worse, run an attacker-shaped command line.
+                // Document and enforce the assumption instead of trusting it silently: skip rather than
+                // give a false pass/fail on a host whose TEMP path violates it.
+                let tempPath = IO.Path.GetTempPath()
+                let cmdMetacharacters = [| '&'; '|'; '^'; '<'; '>'; '%'; '!'; '"' |]
+
+                if tempPath |> Seq.exists (fun c -> Array.contains c cmdMetacharacters) then
+                    Assert.Ignore
+                        $"IO.Path.GetTempPath() ({tempPath}) contains a cmd.exe metacharacter; this test assumes a TEMP path free of shell metacharacters for its `cmd.exe /c <path>` invocation"
+
                 let batchFile =
-                    IO.Path.Combine(IO.Path.GetTempPath(), "conpty-writeline-" + Guid.NewGuid().ToString("N") + ".cmd")
+                    IO.Path.Combine(tempPath, "conpty-writeline-" + Guid.NewGuid().ToString("N") + ".cmd")
 
                 IO.File.WriteAllLines(
                     batchFile,
                     [| "@echo off"
+                       "set \"line=\""
                        "set /p line=<CON"
+                       "if errorlevel 1 goto :fail"
                        "if not \"%line%\"==\"hello\" goto :fail"
                        "exit 7"
                        ":fail"
