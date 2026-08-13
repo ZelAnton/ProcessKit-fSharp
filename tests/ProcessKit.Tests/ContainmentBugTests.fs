@@ -294,6 +294,39 @@ type ContainmentBugTests() =
         else
             Command.create "/bin/sh" |> Command.args [ "-c"; script ]
 
+    // POSIX errno numbers the legacy cgroup sweep's injected pidfd seam returns below (T-330).
+    let ESRCH = 3
+    let ENOSYS = 38
+    let EPERM = 1
+
+    /// A synthetic cgroup directory standing in for the LEGACY teardown path — a kernel < 5.14 with no
+    /// `cgroup.kill`. `cgroup.procs` carries the membership the sweep snapshots and re-reads, and
+    /// `cgroup.freeze` starts frozen exactly as the fallback's own freeze leaves it. `cgroup.kill` is
+    /// created as a DIRECTORY so writing that control file fails just as it does where the kernel does not
+    /// expose it, which is what routes `killCgroupUsing` into the fallback — no process-wide test hook, so
+    /// this stays valid on any OS and cannot race another fixture.
+    let withLegacyCgroup (members: int list) (body: string -> unit) =
+        let dir = Path.Combine(Path.GetTempPath(), $"pk-legacy-cgroup-{Guid.NewGuid():N}")
+
+        Directory.CreateDirectory dir |> ignore
+        Directory.CreateDirectory(Path.Combine(dir, "cgroup.kill")) |> ignore
+
+        File.WriteAllText(Path.Combine(dir, "cgroup.procs"), members |> List.map string |> String.concat "\n")
+
+        File.WriteAllText(Path.Combine(dir, "cgroup.freeze"), "1\n")
+
+        try
+            body dir
+        finally
+            try
+                Directory.Delete(dir, true)
+            with
+            | :? DirectoryNotFoundException
+            | :? IOException
+            | :? UnauthorizedAccessException ->
+                // Best-effort cleanup of a temp directory; a leftover must not fail the test.
+                ()
+
     [<Test>]
     member _.``spawning into a released group fails fast and is not transient``() : Task =
         task {
@@ -803,3 +836,214 @@ type ContainmentBugTests() =
                 GC.KeepAlive running
                 (group :> IDisposable).Dispose()
         }
+
+    // --- T-330: the legacy (kernel < 5.14, no `cgroup.kill`) teardown sweep is identity-safe against pid
+    // recycling. It used to SIGKILL raw pid numbers snapshotted from `cgroup.procs`, so a member that
+    // exited in the snapshot->syscall window could have its number recycled by a process OUTSIDE the
+    // cgroup and be killed in its place — the freeze stops members forking, not exiting. Every SIGKILL now
+    // goes through the same pin -> reconfirm-membership -> send choke `signalCgroup` uses. These tests
+    // drive `killCgroupUsing` with injected pidfd closures, so each race is deterministic and no real
+    // kernel, pidfd, or cgroup mount is involved. ---
+
+    [<Test>]
+    member _.``the legacy cgroup sweep SIGKILLs a confirmed member through its pinned handle (T-330)``() =
+        let memberPid = 4_242
+        let signalled = ResizeArray<int>()
+        let mutable signalNumber = 0
+        let mutable pins = 0
+        let mutable closes = 0
+
+        withLegacyCgroup [ memberPid ] (fun dir ->
+            let procs = Path.Combine(dir, "cgroup.procs")
+
+            // The fake pin handle IS the pid, so `send` records exactly which task the signal reached.
+            let openPin (pid: int) : Result<int, int> =
+                pins <- pins + 1
+                Ok pid
+
+            let send (handle: int) (signalNum: int) : Result<unit, int> =
+                signalled.Add handle
+                signalNumber <- signalNum
+                // The kernel drops a SIGKILLed member from cgroup.procs; model that so the group drains.
+                File.WriteAllText(procs, "")
+                Ok()
+
+            let closePin (_handle: int) = closes <- closes + 1
+
+            match Native.Cgroup.killCgroupUsing openPin send closePin dir with
+            | Ok() -> ()
+            | Error detail -> Assert.Fail $"the identity-safe sweep should have torn the cgroup down: {detail}"
+
+            Assert.That(signalled.Count, Is.EqualTo 1, "a confirmed member must be signalled exactly once")
+
+            Assert.That(signalled[0], Is.EqualTo memberPid, "the SIGKILL must reach the pinned member itself")
+
+            Assert.That(
+                signalNumber,
+                Is.EqualTo Native.Posix.SIGKILL,
+                "the fallback still delivers SIGKILL, only through a pinned handle"
+            )
+
+            Assert.That(pins, Is.EqualTo closes, "every pin the sweep opens must be released")
+            Assert.That(File.ReadAllText(Path.Combine(dir, "cgroup.freeze")).Trim(), Is.EqualTo "0"))
+
+    [<Test>]
+    member _.``the legacy cgroup sweep never SIGKILLs a pid recycled between snapshot and delivery (T-330)``() =
+        let memberPid = 4_243
+        let signalled = ResizeArray<int>()
+        let mutable pins = 0
+        let mutable closes = 0
+
+        withLegacyCgroup [ memberPid ] (fun dir ->
+            let procs = Path.Combine(dir, "cgroup.procs")
+
+            let openPin (pid: int) : Result<int, int> =
+                pins <- pins + 1
+                // Between the `cgroup.procs` snapshot and this pin the member exited and a process OUTSIDE
+                // the cgroup recycled its number, so the pin lands on that stranger — and the membership
+                // reconfirm, which re-reads cgroup.procs AFTER the pin, no longer lists the pid.
+                File.WriteAllText(procs, "")
+                Ok pid
+
+            let send (handle: int) (_signalNum: int) : Result<unit, int> =
+                signalled.Add handle
+                Ok()
+
+            let closePin (_handle: int) = closes <- closes + 1
+
+            match Native.Cgroup.killCgroupUsing openPin send closePin dir with
+            | Ok() -> ()
+            | Error detail -> Assert.Fail $"a skipped recycled pid is not a teardown failure: {detail}"
+
+            Assert.That(
+                signalled,
+                Is.Empty,
+                "a pid recycled by a process outside the cgroup received the sweep's SIGKILL — the "
+                + "wrong-target kill window is open"
+            )
+
+            Assert.That(pins, Is.EqualTo 1, "the snapshotted member must be pinned before anything is decided")
+            Assert.That(closes, Is.EqualTo pins, "every pin the sweep opens must be released"))
+
+    [<Test>]
+    member _.``the legacy cgroup sweep treats a member gone before its pin as a benign no-op (T-330)``() =
+        let memberPid = 4_244
+        let signalled = ResizeArray<int>()
+        let mutable closes = 0
+
+        withLegacyCgroup [ memberPid ] (fun dir ->
+            let procs = Path.Combine(dir, "cgroup.procs")
+
+            let openPin (_pid: int) : Result<int, int> =
+                // The member exited before it could be pinned: the intended end state (gone) already holds,
+                // and nothing has taken its number yet.
+                File.WriteAllText(procs, "")
+                Error ESRCH
+
+            let send (handle: int) (_signalNum: int) : Result<unit, int> =
+                signalled.Add handle
+                Ok()
+
+            let closePin (_handle: int) = closes <- closes + 1
+
+            match Native.Cgroup.killCgroupUsing openPin send closePin dir with
+            | Ok() -> ()
+            | Error detail -> Assert.Fail $"a member that exited before its pin is a benign race: {detail}"
+
+            Assert.That(signalled, Is.Empty, "nothing may be signalled once the pin reports the target gone")
+            Assert.That(closes, Is.EqualTo 0, "a pin that never opened must not be released"))
+
+    [<Test>]
+    member _.``the legacy cgroup sweep fails honestly on a kernel without pidfd (T-330)``() =
+        let memberPid = 4_245
+        let signalled = ResizeArray<int>()
+        let mutable pins = 0
+
+        withLegacyCgroup [ memberPid ] (fun dir ->
+            let openPin (_pid: int) : Result<int, int> =
+                pins <- pins + 1
+                Error ENOSYS
+
+            let send (handle: int) (_signalNum: int) : Result<unit, int> =
+                signalled.Add handle
+                Ok()
+
+            match Native.Cgroup.killCgroupUsing openPin send ignore dir with
+            | Ok() -> Assert.Fail "a kernel that cannot pin a member must not report a successful teardown"
+            | Error detail ->
+                Assert.That(detail, Does.Contain "pidfd", "the error must name the missing kernel primitive")
+
+            Assert.That(signalled, Is.Empty, "a kernel without pidfd must never be downgraded to a raw kill")
+
+            Assert.That(
+                pins,
+                Is.EqualTo 1,
+                "a missing syscall cannot be retried into existence, so the sweep must stop on the first one"
+            )
+
+            Assert.That(File.ReadAllText(Path.Combine(dir, "cgroup.procs")).Trim(), Is.EqualTo(string memberPid)))
+
+    [<Test>]
+    member _.``a refused pinned SIGKILL is reported when the legacy sweep leaves the cgroup populated (T-330)``() =
+        let memberPid = 4_246
+        let mutable attempts = 0
+
+        withLegacyCgroup [ memberPid ] (fun dir ->
+            let openPin (pid: int) : Result<int, int> = Ok pid
+
+            let send (_handle: int) (_signalNum: int) : Result<unit, int> =
+                attempts <- attempts + 1
+                Error EPERM
+
+            match Native.Cgroup.killCgroupUsing openPin send ignore dir with
+            | Ok() -> Assert.Fail "a member that refused the SIGKILL and is still in the cgroup is not a success"
+            | Error detail ->
+                Assert.That(detail, Does.Contain "populated", "the error must say the cgroup was not cleared")
+                Assert.That(detail, Does.Contain $"errno {EPERM}", "the error must carry the refusing errno")
+
+            Assert.That(attempts, Is.GreaterThan 1, "one refusal must not cut the bounded sweep short"))
+
+    [<Test>]
+    member _.``an unreadable membership is not a legacy sweep delivery failure (T-330)``() =
+        // `cgroup.procs` is a directory here, so reading the membership throws on any OS. The sweep then
+        // has nothing safe to target and attempts no delivery at all — so there is no pin/send failure to
+        // report, and the teardown stays the bounded best-effort it has always been rather than turning a
+        // concurrently removed or briefly unreadable cgroup into a `KillTree` error. Only a delivery that
+        // actually failed is escalated, and only while the group is still populated.
+        let mutable pins = 0
+
+        withLegacyCgroup [] (fun dir ->
+            let procs = Path.Combine(dir, "cgroup.procs")
+            File.Delete procs
+            Directory.CreateDirectory procs |> ignore
+
+            let openPin (_pid: int) : Result<int, int> =
+                pins <- pins + 1
+                Error ENOSYS
+
+            let send (_handle: int) (_signalNum: int) : Result<unit, int> = Ok()
+
+            match Native.Cgroup.killCgroupUsing openPin send ignore dir with
+            | Ok() -> ()
+            | Error detail -> Assert.Fail $"an unreadable membership is not a delivery failure: {detail}"
+
+            Assert.That(pins, Is.EqualTo 0, "no pid can be pinned honestly while the membership is unknown"))
+
+    [<Test>]
+    member _.``a legacy sweep delivery failure whose cgroup drained anyway stays a success (T-330)``() =
+        // The member refused its pinned SIGKILL (EPERM) but exited on its own immediately after, so the
+        // drain check — the authority on "the tree is gone" — finds nothing left. A recorded failure must
+        // not turn that into a teardown error.
+        let memberPid = 4_247
+
+        withLegacyCgroup [ memberPid ] (fun dir ->
+            let procs = Path.Combine(dir, "cgroup.procs")
+            let openPin (pid: int) : Result<int, int> = Ok pid
+
+            let send (_handle: int) (_signalNum: int) : Result<unit, int> =
+                File.WriteAllText(procs, "")
+                Error EPERM
+
+            match Native.Cgroup.killCgroupUsing openPin send ignore dir with
+            | Ok() -> ()
+            | Error detail -> Assert.Fail $"an empty cgroup is a completed teardown: {detail}")
