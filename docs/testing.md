@@ -652,6 +652,7 @@ Semantics worth knowing before you commit a cassette:
 | One-shot stdin | `Stdin.FromStream` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
 | Format | a versioned JSON envelope — `{ "Version", "Entries" }` (current version **4**); a cassette **newer** than this build understands is rejected on load, while an older compatible one (a v1/v2/v3 cassette) still loads (missing fields default — a pre-v3 entry with no env fingerprint keys as the default, un-customized environment; a pre-v4 entry with no `Pty` flag loads as a non-PTY recording). A partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
 | PTY | a [`Command.Pty`](#pseudo-terminal-pty-doubles) recording carries a `Pty` flag and its geometry (`PtyCols`/`PtyRows`) and replays as a **merged-stream** handle (only `OutputEvent.Stdout`). Because a PTY captures one merged stream, the [`WithRedaction`](#record-and-replay) hook scrubs that whole stream — an echoed credential is scrubbed before it lands in the cassette |
+| Concurrent saves | saves of one recorder run **one at a time and in order**, so a slower earlier `Save()` can never put an older recording back over a newer one. Saves from *different* recorders or processes to the same path are serialized by an advisory lock on a sibling `<path>.lock` file (a deny-share open on Windows, `flock` on Unix); it is taken **without waiting**, so a writer that loses it gets a transient `ProcessError.Io` (`IsTransient` — retry when the other save finishes) rather than overwriting what the winner just saved. The lock file is a 0-byte rendezvous that saves never delete — a crash releases the OS lock by itself — so it holds no recording and is worth adding to `.gitignore` next to the fixtures |
 
 **Robust against a corrupt or hostile cassette.** A cassette is untrusted input — it may be
 hand-edited, truncated by a failed write, corrupted on disk, or crafted. Loading (and replaying)
@@ -668,7 +669,10 @@ to output), so review a fixture before committing it. On Unix the file is writte
 **atomically and owner-only** (`0600` from creation — a temp file renamed into
 place, so it is never briefly world-readable); on Windows it inherits the
 containing directory's ACL, so keep secret-bearing fixtures out of world-readable
-directories.
+directories. The write is also **crash-safe**: the new cassette is flushed to disk
+before it replaces the old one, and on Unix the directory entry the rename creates
+is fsync'd too, so an interrupted save leaves the previously saved cassette intact
+rather than a truncated file.
 
 A neat trick: in tests, record against a `ScriptedRunner` instead of
 `JobRunner()` — the whole record → save → replay round trip is then itself
