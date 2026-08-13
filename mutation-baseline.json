@@ -1,0 +1,39 @@
+{
+	"scope": {
+		"assembly": "ProcessKit.dll",
+		"includeTypes": [
+			"ProcessKit.Backoff",
+			"ProcessKit.RetryDelayPolicyModule",
+			"ProcessKit.CgroupCpuMax",
+			"ProcessKit.LineTerminator",
+			"ProcessKit.LineTerminatorRules",
+			"ProcessKit.OutputBufferPolicy",
+			"ProcessKit.StreamBufferPolicy",
+			"ProcessKit.Pump/LineBuffer",
+			"ProcessKit.Pump/RawBuffer"
+		],
+		"excludeTypes": [],
+		"excludeMethods": [
+			".cctor",
+			"Equals",
+			"GetHashCode",
+			"CompareTo",
+			"ToString",
+			"get_Tag"
+		],
+		"excludeGeneratedClosureTypes": true,
+		"excludeCompilerGeneratedMethods": true,
+		"seed": 20260813
+	},
+	"testFilter": "FullyQualifiedName~MutationBoundaryTests|FullyQualifiedName~PumpTests|FullyQualifiedName~OutputPolicyPropertyTests",
+	"framework": "net10.0",
+	"shardCount": 4,
+	"minimumMutantsForVerdict": 8,
+	"minimumScore": null,
+	"toleranceScorePoints": 5.0,
+	"recordedOn": "2026-08-13",
+	"recordedFrom": "not yet recorded from CI - the value below is only the observed local number",
+	"observedLocalScore": 84.09,
+	"notes": "minimumScore is deliberately null: the ratchet RECORDS instead of gating until a full, unbudgeted shard matrix has run in CI and its number can be read off real artifacts. A complete local run (Windows, net10.0, 132 mutants) scored 84.09 percent - 105 killed, 6 timed out, 21 survived, 0 errored - which is recorded here as orientation ONLY and must not be copied into minimumScore: a local single-machine run is not the population the CI matrix measures. The surviving 21 are overwhelmingly equivalent mutants (Int32.MaxValue saturation guards, the true constant a short-circuiting || pushes, no-op boundary shifts in the raw-byte eviction loop), which is why the reachable ceiling sits well below 100 percent. Scope and score are one document on purpose - the score only means something relative to the mutant set it was computed over, so widening includeTypes and moving the baseline has to be a single reviewable diff.",
+	"howToUpdate": "CONTRIBUTING.md, section: Mutation testing"
+}

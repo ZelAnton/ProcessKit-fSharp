@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- Mutation-testing tier for the library's boundary core (retained-output buffers, retry backoff, resource-limit and line-splitting rules): `pwsh ./scripts/mutate.ps1` runs it locally, and a weekly `Mutation tier` workflow runs it sharded in CI, publishing every surviving and timed-out mutant with its source location. It is a ratchet on its own schedule and never runs on pull requests, so it cannot slow down or block ordinary CI. Contributor documentation, including why an in-repo Mono.Cecil/IL engine replaces Stryker.NET (which cannot mutate F#), is in `CONTRIBUTING.md`.
 
 ### Changed
 -

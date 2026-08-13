@@ -43,6 +43,10 @@
 		<PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.10" />
 		<PackageVersion Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.10" />
 		<PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+		<!-- IL reader/writer for the mutation-testing engine (tests/ProcessKit.Mutation, driven by
+		     scripts/mutate.ps1). Used ONLY by that out-of-solution tool project, so it never enters a
+		     shipped package's dependency graph and the ordinary CI jobs never restore it. -->
+		<PackageVersion Include="Mono.Cecil" Version="0.11.6" />
 		<PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.301" />
 		<PackageVersion Include="NUnit" Version="4.6.1" />
 		<PackageVersion Include="NUnit3TestAdapter" Version="6.2.0" />

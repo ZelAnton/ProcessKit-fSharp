@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<!-- IL mutation engine for the mutation-testing tier (scripts/mutate.ps1). Deliberately NOT part
+	     of ProcessKit.slnx — same reasoning as docs/snippets/DocSnippets.slnx: this is a build-time
+	     tool, so it must never join the library's build graph, `dotnet test`, packing or ApiCompat,
+	     and the ordinary CI jobs must never pay for restoring/compiling it. scripts/mutate.ps1 builds
+	     this project on its own.
+
+	     It reads and rewrites a COMPILED assembly, so it needs no reference to ProcessKit at all —
+	     which is exactly why it works on F#: the mutation operators are defined over CIL, not over
+	     F# syntax. See CONTRIBUTING.md, "Mutation testing", for why no off-the-shelf .NET mutation
+	     tester could be used here. -->
+	<PropertyGroup>
+		<!-- Single TFM on purpose (Directory.Build.props multi-targets the shipped projects): this is
+		     a local/CI tool, never a package, and it only has to run on the SDK pinned by global.json. -->
+		<TargetFrameworks>net10.0</TargetFrameworks>
+		<OutputType>Exe</OutputType>
+		<AssemblyName>ProcessKit.Mutation</AssemblyName>
+		<IsPackable>false</IsPackable>
+		<GenerateDocumentationFile>false</GenerateDocumentationFile>
+		<RollForward>LatestMajor</RollForward>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Compile Include="Scope.fs" />
+		<Compile Include="Mutators.fs" />
+		<Compile Include="Catalog.fs" />
+		<Compile Include="Program.fs" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- See the library .fsproj: an explicit FSharp.Core reference is required under CPM. -->
+		<PackageReference Include="FSharp.Core" />
+		<!-- The IL reader/writer. Language-agnostic by construction (it works on CIL), which is the
+		     whole reason this tier can exist for an F# codebase. PrivateAssets is irrelevant here —
+		     the project is not packable and nothing references it. -->
+		<PackageReference Include="Mono.Cecil" />
+	</ItemGroup>
+
+</Project>

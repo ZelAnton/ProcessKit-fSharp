@@ -154,6 +154,157 @@ reads the summary ReportGenerator already produced, so it needs a full set of ma
 cannot say anything useful about a local single platform run; its exit codes are 0 for honoured or
 skipped, 1 for a real regression, and 2 for a broken baseline or summary file.
 
+## Mutation testing
+
+Coverage answers "was this line executed". The mutation tier answers the harder question: **would the
+tests notice if it were wrong?** It rewrites one instruction in the built `ProcessKit.dll` — a `<`
+into a `<=`, a `+` into a `-`, a constant into the next one along — re-runs a small hermetic slice of
+the suite, and records whether anything failed. A mutant nothing noticed is a limit the suite executes
+but does not pin.
+
+Run it locally (the whole catalog, one shard, roughly fifteen minutes):
+
+```sh
+pwsh ./scripts/mutate.ps1
+```
+
+Useful switches: `-ShardIndex`/`-ShardCount` to take one slice, `-TimeBudgetSeconds` to bound the
+loop, `-SkipBuild` to reuse the current build output, `-RetryTimeouts` when a machine is genuinely
+overloaded. Every parameter is documented in the script's own help. The report lands in
+`artifacts/mutation/shard-<n>/mutation-report.json`.
+
+### Why an in-repo engine and not Stryker.NET
+
+**Stryker.NET cannot mutate F#, and this was established by running it, not by reading its docs.**
+Against this repository, `dotnet-stryker` 4.16.0 fails from both directions:
+
+- pointed at the F# test project, it aborts during analysis with
+  `System.FormatException: Commandline could not be parsed` — its Buildalyzer-based analysis only
+  knows how to parse a `csc` command line, and an `.fsproj` hands it an `fsc` one;
+- pointed at the C# test project instead (`tests/ProcessKit.CSharp.Tests`, which does analyse
+  cleanly), it reports `Analyzing 0 projects` / `No project found` and exits — it cannot treat an
+  `.fsproj` as a mutatable source project at all.
+
+That is structural, not a configuration mistake: Stryker mutates C# **syntax trees** through Roslyn.
+No maintained .NET alternative covers F# either — the IL-level mutation testers (Testura.Mutation,
+NinjaTurtles, VisualMutator) are abandoned and .NET Framework-era, and Fettle is Roslyn/C# like
+Stryker.
+
+So the engine is [`tests/ProcessKit.Mutation`](tests/ProcessKit.Mutation), four F# files over
+[Mono.Cecil](https://github.com/jbevain/cecil). Its operators are defined over **CIL**, which is
+what makes the tier possible here at all: the compiled IL of an F# assembly is as mutatable as any
+other. It is deliberately kept **out of `ProcessKit.slnx`** — the same treatment as
+`docs/snippets/DocSnippets.slnx` — so the ordinary CI jobs never restore, build or pack it.
+
+The engine has two stateless verbs, `list` (catalog the mutants) and `apply` (produce one mutated
+assembly); `scripts/mutate.ps1` owns the loop, the schedule and the classification.
+
+### How a mutant is judged
+
+| Verdict | Meaning | Counts as |
+|---|---|---|
+| Killed | the slice failed, having executed at least one test | detected |
+| Timeout | no verdict inside the per-mutant budget — a mutated loop condition really can be unbounded, and a suite that hangs on it has noticed | detected |
+| Survived | the slice passed | **not** detected |
+| Errored | the mutated assembly did not load, or the run exited non-zero without executing a single test | excluded from both sides |
+
+`score = (killed + timeout) / (killed + timeout + survived)`. Errored mutants are excluded rather
+than folded in either direction — nothing was measured about them — and are reported separately, so an
+engine regression that quietly errors everything is visible instead of hidden in a denominator.
+
+**Sharding and the budget.** The engine shuffles the catalog deterministically, seeded from the
+committed baseline, and the driver splits it by `index % shardCount`. The shuffle is what makes a
+budget-truncated shard a representative sample rather than "the alphabetically first types", and the
+seed is what keeps it reproducible. A shard that stops on its budget reports `budgetExhausted`, and
+the gate refuses to compare a partial run with a baseline recorded from a complete one.
+
+**Retry controller.** Killed and Survived come from a deterministic, hermetic slice, so they are final
+and never retried. Errored is infrastructure-shaped and is retried. Timeout is **not** retried by
+default: it is the correct verdict for a whole class of mutants, and retrying it only re-pays an
+already generous budget — the first full local run spent about 1000 of its 1300 seconds re-running six
+mutants that were always going to time out.
+
+### What is out of scope, and why
+
+The scope is the critical boundary core, listed in [`mutation-baseline.json`](mutation-baseline.json):
+the retained-output buffers (`Pump.LineBuffer`, `Pump.RawBuffer`), the retry backoff math (`Backoff`,
+`RetryDelayPolicy`), the resource-limit boundaries (`CgroupCpuMax`), the line-splitting rules
+(`LineTerminator`, `LineTerminatorRules`) and the buffer policies. Everything else is excluded:
+
+- **Compiler-generated closure and async state-machine types** (`excludeGeneratedClosureTypes`, F#
+  names them with an `@`). Their logic is asynchronous orchestration, whose mutants are decided by
+  timing and yield Timeout verdicts and flaky kills rather than statements about assertion strength.
+  Their names also embed the source *line* they were generated at, so an individual exclusion entry
+  would silently stop matching the moment the file above it grew — a structural rule cannot drift that
+  way. Extending the tier to the async layer means flipping this flag and re-recording the baseline.
+- **Compiler-generated methods** (`excludeCompilerGeneratedMethods`): the structural
+  `Equals`/`GetHashCode`/`CompareTo` members, and — the reason this rule exists — the union case
+  testers (`LineTerminator.IsLf`, …). F# *inlines* those at every F# call site, so their emitted bodies
+  never run and their mutants are unkillable from F#. Measured, not assumed: eight such mutants
+  survived a full run whose boundary test asserts the entire case/predicate matrix.
+- **Static initialisers** (`.cctor`, by name): mutating module init breaks everything at once, which
+  measures nothing about any individual assertion.
+- **Equivalent mutants.** The mutants that survive today are overwhelmingly *equivalent* ones — a
+  mutation whose behaviour is genuinely indistinguishable, so no test can kill it. They cluster in
+  three shapes: saturation guards (`min total (int64 Int32.MaxValue)`, where `>=` and `>` differ only
+  at exactly `Int32.MaxValue`), the `true` constant a short-circuiting `||` pushes (still truthy when
+  bumped), and no-op boundary shifts in the raw-byte eviction loop (`available <= over` versus `<`,
+  which copies the same bytes either way). They are why the score has a ceiling well below 100 % and
+  why `minimumScore` is a ratchet rather than a target.
+
+### The policy: a ratchet that never blocks ordinary CI
+
+[`.github/workflows/mutation.yml`](.github/workflows/mutation.yml) runs **weekly and on demand only** —
+never on `pull_request` or `push`. A mutation regression therefore fails *that* workflow, loudly and
+reviewably, and cannot slow down or block an ordinary CI run. Each shard uploads its
+`mutation-report.json`; the `summary` job merges them and appends a table of the surviving mutants,
+with source file and line, to the job summary.
+
+Like the coverage ratchet, the gate reports **skipped** rather than failing whenever it cannot compare
+honestly. This is written against a failure mode this repository has already lived through — coverage
+collected empty on every matrix leg for months, where reading the absent percentage as `0.00 %` would
+have announced a collapse that never happened. So each "nothing was measured" shape is its own skip
+state: a shard whose *unmutated* baseline run was red or executed no tests; a scope that produced no
+mutants (a renamed type empties it silently); a shard that aborted part way through, or never reported
+at all (each shard holds a slice of the catalog, so a lost one changes the population the score is
+computed over); a partial run; a sample below `minimumMutantsForVerdict`; and — the one that would
+otherwise pass as a real, terrible score — a run in which **no** mutant was detected at all over a
+large enough sample, which is the signature of a harness whose test host never loaded the mutated
+assembly. Division is guarded on the denominator, not on the report being well formed.
+
+The tier is immune to the mechanism behind that coverage incident, and this was checked rather than
+asserted: with `ContinuousIntegrationBuild=true` and `DeterministicSourcePaths=true` genuinely active
+(confirmed by querying the MSBuild properties, since the trigger is `GITHUB_ACTIONS=true`), the
+catalog is **identical** — same 132 mutants, same ids — to the ordinary build's, because mutants are
+addressed by IL metadata and never by source path. Source locations are decoration: they survive the
+deterministic build (the engine normalizes SourceLink's `/_/…` prefix back to a repo-relative path),
+and stripping the PDB entirely still yields the identical catalog with empty source fields.
+
+### Moving the baseline
+
+`minimumScore` ships as `null`, which makes the gate **record** the observed score instead of gating
+on it. That is the supported way to bootstrap: arm it from a **complete** shard matrix run in CI, not
+from a local one, because a partial or single-machine run measured something else.
+
+1. Take `Mutation score` from the **Mutation tier** table in the `summary` job of a run where no shard
+   reported `budgetExhausted` or a skip state.
+2. Set `minimumScore` in `mutation-baseline.json` to that number, and refresh `recordedOn` /
+   `recordedFrom`.
+3. Say in the pull request why it moved. Raising it after adding boundary tests locks the gain in;
+   lowering it states on the record that this change trades assertion strength away on purpose.
+
+Widening `scope.includeTypes` changes the population the score is computed over, so it invalidates the
+baseline: record it again from a run of the new scope, in the same change. Scope and score live in one
+file precisely so that has to be one reviewable diff.
+
+The boundary tests written to kill specific survivors live in
+[`tests/ProcessKit.Tests/MutationBoundaryTests.fs`](tests/ProcessKit.Tests/MutationBoundaryTests.fs),
+each naming the mutant it kills. Loosening one of those assertions is a regression of this tier, not a
+tidy-up. The gate itself is
+[`scripts/check-mutation-report.ps1`](scripts/check-mutation-report.ps1); its exit codes match the
+coverage ratchet's — 0 for honoured or skipped, 1 for a real regression, 2 for a broken baseline or a
+missing report.
+
 ## Link checking
 
 [`.github/workflows/link-check.yml`](.github/workflows/link-check.yml) checks Markdown

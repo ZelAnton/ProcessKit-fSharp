@@ -1,0 +1,101 @@
+name: Mutation tier
+
+# Deliberately NOT on pull_request or push. Mutation testing re-runs a test slice once per mutant, so
+# it is measured in tens of minutes; putting it on the ordinary paths would slow down every change for
+# a signal that moves slowly. It runs weekly and on demand instead, exactly like the `fuzz` workflow
+# and the scheduled `stress`/`interleaving` jobs in ci.yml. A mutation regression therefore fails THIS
+# workflow -- loudly and reviewably -- and never blocks an ordinary CI run.
+#
+# Wednesday, to keep it off the days the fuzz (Tuesday) and stress/interleaving (Monday) suites use.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * 3'
+
+permissions:
+  contents: read
+
+jobs:
+  # One shard per job. The engine deterministically shuffles the catalog with the seed committed in
+  # mutation-baseline.json and the driver splits it by `index % shardCount`, so the shards are
+  # reproducible, balanced, and each one is a representative sample rather than a contiguous slice of
+  # the alphabet. Keep the matrix and `shardCount` in the baseline file in step.
+  mutate:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    # Comfortably above the per-shard time budget below, so the budget (which reports itself as a
+    # partial run) is what stops the loop, not a job kill that would lose the report entirely.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          # The 8.0.x runtime is not needed: the tier mutates and tests a single TFM (net10.0). The
+          # scoped modules are pure boundary logic with no TFM-specific paths, so a second leg would
+          # double the wall clock for identical verdicts.
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Directory.Packages.props', 'nuget.config', 'global.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      # The mutation engine lives outside ProcessKit.slnx (so the ordinary CI jobs never restore or
+      # build it); scripts/mutate.ps1 builds both the solution and the engine when not given
+      # -SkipBuild, which is what happens here.
+      #
+      # NOTE on this repo's deterministic builds: GitHub Actions sets GITHUB_ACTIONS=true, which turns
+      # on ContinuousIntegrationBuild in Directory.Build.props, which (with SourceLink) rewrites PDB
+      # document paths to `/_/src/...`. That combination once silently disabled coverlet instrumentation
+      # here. It cannot do the same to this tier: mutants are addressed by IL metadata, never by source
+      # path, so the catalog is identical with and without it -- verified by building both ways and
+      # diffing the catalogs. Source paths are decoration only, and the engine normalizes the `/_/`
+      # prefix back to a repo-relative path so the artifact stays readable on the runner.
+      - name: Run mutation shard ${{ matrix.shard }}
+        shell: pwsh
+        run: >-
+          ./scripts/mutate.ps1
+          -ShardIndex ${{ matrix.shard }}
+          -ShardCount 4
+          -TimeBudgetSeconds 1800
+
+      # Uploaded even when the step fails, so a partial or degraded shard can be diagnosed from its
+      # report instead of by re-running the whole matrix.
+      - name: Upload mutation report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-shard-${{ matrix.shard }}
+          path: artifacts/mutation/shard-${{ matrix.shard }}/mutation-report.json
+          if-no-files-found: ignore
+
+  summary:
+    name: Mutation summary
+    # `always()` so a matrix leg that died still reaches the gate: the gate's job is precisely to tell
+    # "the score dropped" from "a shard measured nothing", and it can only do that if it runs.
+    if: ${{ always() }}
+    needs: mutate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pattern download succeeds when one or more shards published nothing; keeping the artifacts in
+      # separate directories avoids overwriting their identically named reports.
+      - name: Download available shard reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mutation-shard-*
+          path: artifacts/mutation
+
+      # Merges the shards, guards every "nothing was measured" shape as its own SKIP (never as a 0 %),
+      # and only then compares with the committed baseline. See the script's own notes for why each
+      # degradation exists.
+      - name: Check the mutation ratchet
+        shell: pwsh
+        run: ./scripts/check-mutation-report.ps1 -ReportRoot artifacts/mutation

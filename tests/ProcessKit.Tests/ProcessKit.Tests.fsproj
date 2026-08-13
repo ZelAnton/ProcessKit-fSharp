@@ -62,6 +62,9 @@
 		<Compile Include="InterleavingTests.fs" />
 		<Compile Include="HostedProcessTests.fs" />
 		<Compile Include="HostedProcessHealthCheckTests.fs" />
+		<!-- Boundary assertions written against specific surviving mutants (scripts/mutate.ps1).
+		     Appended last: it depends on nothing here and nothing here depends on it. -->
+		<Compile Include="MutationBoundaryTests.fs" />
 	</ItemGroup>
 
 	<ItemGroup>
