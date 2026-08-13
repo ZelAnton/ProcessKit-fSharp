@@ -8,20 +8,49 @@ open System.Threading.Tasks
 
 /// Shared graceful-teardown shape for all containment backends: request the platform/configured soft
 /// stop, poll until the tree is dead or `grace` elapses, then force-kill whatever remains.
-module private GracefulTeardown =
+module internal GracefulTeardown =
 
-    let poll (terminate: unit -> unit) (alive: unit -> bool) (forceKill: unit -> unit) (grace: TimeSpan) : Task =
+    let internal pollUsing
+        (startClock: unit -> (unit -> TimeSpan))
+        (delay: TimeSpan -> Task)
+        (terminate: unit -> unit)
+        (alive: unit -> bool)
+        (forceKill: unit -> unit)
+        (grace: TimeSpan)
+        : Task =
         task {
             terminate ()
-            let stopwatch = Stopwatch.StartNew()
+            let elapsed = startClock ()
+            let deadline = grace
+            let pollInterval = TimeSpan.FromMilliseconds 50.0
 
-            while alive () && stopwatch.Elapsed < grace do
-                do! Task.Delay 50
+            while alive () && elapsed () < deadline do
+                let remaining = deadline - elapsed ()
+                let boundedDelay = min pollInterval remaining
+
+                let armableDelay =
+                    if Timeouts.isArmable boundedDelay then
+                        boundedDelay
+                    else
+                        Timeouts.clampArmable boundedDelay
+
+                do! delay armableDelay
 
             if alive () then
                 forceKill ()
         }
         :> Task
+
+    let poll (terminate: unit -> unit) (alive: unit -> bool) (forceKill: unit -> unit) (grace: TimeSpan) : Task =
+        pollUsing
+            (fun () ->
+                let stopwatch = Stopwatch.StartNew()
+                fun () -> stopwatch.Elapsed)
+            (fun duration -> Task.Delay duration)
+            terminate
+            alive
+            forceKill
+            grace
 
 /// Kill and reap a single POSIX leader we `posix_spawn`ed, in this exact order: `killpg` SIGKILLs its
 /// whole process group (any subtree it backgrounded), then `waitpid` reaps the leader itself (`killpg`
