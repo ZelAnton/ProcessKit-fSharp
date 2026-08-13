@@ -612,6 +612,36 @@ module internal PipelineRunner =
                             (fun feeder -> stage0Feed <- Some feeder)
                             (fun () -> teardownCts.IsCancellationRequested)
 
+                    // Stage 0's launch boundary for a one-shot stdin payload (`FromStream`/`FromLines`/
+                    // `FromAsyncLines`). A chain spawns its own stages through `SpawnInto` rather than
+                    // `ProcessGroup.BuildHost`, so the reserve/commit that guards every single-command
+                    // launch is taken here instead — otherwise the pipeline would be the one path left
+                    // that can quietly drain a payload another run is about to feed (or has already fed)
+                    // to a child of its own. Reserved BEFORE the spawn, so a chain that cannot have the
+                    // payload is refused as a stage-0 spawn failure with no stage started at all;
+                    // committed the moment stage 0 exists, before `wireStage` starts its feeder; rolled
+                    // back when the spawn produced no child. Later stages cannot carry a stdin source
+                    // (`Pipeline` rejects one), so they take no hold and spawn exactly as before.
+                    let spawnStage (index: int) (stage: Command) : Result<Native.Common.Spawned, ProcessError> =
+                        if index > 0 then
+                            group.SpawnInto stage
+                        else
+                            match
+                                OneShotStdin.reserveLaunch
+                                    stage.Program
+                                    stage.Config.StdinSource
+                                    stage.Config.StdinReservation
+                            with
+                            | Error error -> Error error
+                            | Ok launch ->
+                                match group.SpawnInto stage with
+                                | Ok spawned ->
+                                    launch.Commit()
+                                    Ok spawned
+                                | Error error ->
+                                    launch.Rollback()
+                                    Error error
+
                     // Set exactly once, the moment stage 0 actually spawns — mirroring the
                     // single-command rule that a spawn failure is never counted as a run
                     // (`RunningProcess` — and its `Diag.runStarted` — only exists after a successful
@@ -637,12 +667,14 @@ module internal PipelineRunner =
                         // callback's "mark fired + KillTree" (above): either we observe `cancellationFired`
                         // and start nothing (the loop halts), or the child becomes a group member BEFORE the
                         // callback's sweep, which then reaps it. Either way no stage outlives the sweep.
+                        // Stage 0's one-shot stdin reserve/commit rides inside the same gate (see
+                        // `spawnStage`), so a chain halted by cancellation never takes the payload at all.
                         let spawnOutcome =
                             lock stagingGate (fun () ->
                                 if cancellationFired then
                                     ValueNone
                                 else
-                                    ValueSome(group.SpawnInto stage))
+                                    ValueSome(spawnStage index stage))
 
                         match spawnOutcome with
                         | ValueNone ->
@@ -1110,6 +1142,31 @@ module internal PipelineRunner =
                             (fun feeder -> stage0Feed <- Some feeder)
                             (fun () -> teardownCts.IsCancellationRequested)
 
+                    // Stage 0's one-shot stdin launch boundary, identical to the buffered `run`'s: the
+                    // payload is reserved before stage 0 spawns, committed the moment its child exists
+                    // (ahead of `wireStage`'s feeder), and rolled back if no child was created. Streaming
+                    // a chain is exactly as much of a launch as buffering one, so it must not be the path
+                    // that escapes the guard.
+                    let spawnStage (index: int) (stage: Command) : Result<Native.Common.Spawned, ProcessError> =
+                        if index > 0 then
+                            group.SpawnInto stage
+                        else
+                            match
+                                OneShotStdin.reserveLaunch
+                                    stage.Program
+                                    stage.Config.StdinSource
+                                    stage.Config.StdinReservation
+                            with
+                            | Error error -> Error error
+                            | Ok launch ->
+                                match group.SpawnInto stage with
+                                | Ok spawned ->
+                                    launch.Commit()
+                                    Ok spawned
+                                | Error error ->
+                                    launch.Rollback()
+                                    Error error
+
                     while index < stages.Length && spawnError.IsNone && not stagingHalted do
                         // Force `Piped` stdout on every stage (the last stage's is the streamed output), and
                         // an open stdin pipe on every stage after the first (fed the previous stage's stdout).
@@ -1121,7 +1178,7 @@ module internal PipelineRunner =
                                 if cancellationFired then
                                     ValueNone
                                 else
-                                    ValueSome(group.SpawnInto stage))
+                                    ValueSome(spawnStage index stage))
 
                         match spawnOutcome with
                         | ValueNone ->

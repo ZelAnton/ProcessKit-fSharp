@@ -166,14 +166,18 @@ module internal CaptureVerbs =
                 match! start () with
                 | Error error -> return Error error
                 | Ok running ->
-                    // The launch boundary, and the only place that can witness it for a captured run: a
-                    // child now exists, so a one-shot stdin payload (`FromStream`/`FromLines`/
-                    // `FromAsyncLines`) is spent. Commit it before the run can be observed, so a retrying
-                    // run (`Runner.withRetry`) tells "no child ever saw this payload" from "a child may
-                    // already have drained it" by evidence instead of by the error case alone. The
-                    // `Error` branch above commits nothing, and is right not to: both built-in runners
-                    // start the stdin feeder only after a successful spawn (`ProcessGroup.BuildHost`), so
-                    // a failed launch leaves the payload untouched.
+                    // A child now exists, so a one-shot stdin payload (`FromStream`/`FromLines`/
+                    // `FromAsyncLines`) is spent. The real spawn boundary
+                    // (`ProcessGroup.BuildHost.reserveLaunch`) has already committed it for every child
+                    // ProcessKit starts itself — this is the CAPTURE boundary's own witness, for a
+                    // `start` that hands back a `RunningProcess` without going through that spawn (an
+                    // in-library seam or test double). Not a duplicate that decides anything on a real
+                    // run: `Commit` is a single unconditional write of the same value, so the second one
+                    // changes nothing; what it buys is that the retry loop can still tell "no child ever
+                    // saw this payload" from "a child may already have drained it" by evidence, whichever
+                    // way the attempt reached its handle. The `Error` branch above commits nothing, and
+                    // is right not to: a launch that produced no child rolls its reservation back and
+                    // leaves the payload intact.
                     OneShotStdin.commitLaunch command.Config.StdinSource
 
                     use _registration = effectiveToken.Register(fun () -> running.Kill())
@@ -197,10 +201,10 @@ module Runner =
     // Failures GUARANTEED to precede a live child, so an attempt that ends in one cannot have fed the
     // command's stdin source to anything: the program was never located (`NotFound`), the spawn itself
     // failed (`Spawn` — including a transient one that `ProcessError.isTransient` accepts), or a
-    // platform/configuration primitive was refused before launch (`Unsupported`). Both built-in runners
-    // start the stdin feeder only once the spawn has succeeded (`ProcessGroup.BuildHost`), so for them
-    // these are exactly the failures that leave a one-shot payload intact — and for a captured run the
-    // launch-boundary commit in `CaptureVerbs.runToCompletion` verifies it independently, catching an
+    // platform/configuration primitive was refused before launch (`Unsupported`). The spawn boundary
+    // starts the stdin feeder only once the spawn has succeeded, and commits the payload in the same
+    // breath (`ProcessGroup.BuildHost`), so these are exactly the failures that leave a one-shot payload
+    // intact — with the reservation's own `IsConsumed` verifying it independently, catching an
     // `Unsupported` a runner raises AFTER its child exists (`RunningProcess` has such a case) even
     // though the case alone reads as an up-front refusal.
     //
@@ -271,6 +275,19 @@ module Runner =
                 match reservationResult with
                 | Error error -> return Error error
                 | Ok reservation ->
+                    // Carry this run's hold down to the boundary that actually spawns each attempt
+                    // (`ProcessGroup.BuildHost`, the pipeline's stage 0), which reserves the payload for
+                    // every launch it makes. Without the hold in hand it would refuse this run's own
+                    // attempts as a second consumer of a payload this run itself is holding; with it, an
+                    // attempt commits on a live child but never releases — that stays the run's call,
+                    // made once below, so the payload is never handed to a concurrent run in the gap
+                    // between two attempts. A run that reserved nothing (single attempt, or a repeatable
+                    // source) drives the command exactly as it did before.
+                    let command =
+                        match reservation with
+                        | Some reservation -> command.WithStdinReservation reservation
+                        | None -> command
+
                     let mutable attempt = 0
                     let mutable final = None
 

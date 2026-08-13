@@ -107,6 +107,13 @@ type internal CommandConfig =
       EnvOverrides: ImmutableList<string * string option>
       ClearEnv: bool
       StdinSource: Stdin option
+      // The run-level hold on this command's one-shot stdin payload (`FromStream`/`FromLines`/
+      // `FromAsyncLines`), taken by `Runner.withRetry` for a run that may attempt the command more than
+      // once and carried here so each attempt's launch boundary can tell "the run that already owns
+      // this payload is launching it" from "a second consumer is trying to feed the same payload"
+      // (`OneShotStdin.reserveLaunch`). Set only by that internal stamp — never by the public builder —
+      // so an ordinary command carries `None` and every launch reserves the payload for itself.
+      StdinReservation: OneShotStdinReservation option
       KeepStdinOpen: bool
       // The encoding for text sent through `Stdin.FromString`/`FromLines`/`FromAsyncLines` and an
       // interactive `ProcessStdin.WriteLineAsync`. Raw-byte stdin remains byte-exact.
@@ -283,6 +290,7 @@ module internal CommandConfig =
           EnvOverrides = ImmutableList<string * string option>.Empty
           ClearEnv = false
           StdinSource = None
+          StdinReservation = None
           KeepStdinOpen = false
           StdinEncoding = Encoding.UTF8
           TimeProvider = TimeProvider.System
@@ -1600,6 +1608,17 @@ type Command internal (config: CommandConfig) =
     /// the verb layer sets it once per logical run; a direct spawn falls back to a per-incarnation id.
     member internal _.WithRunId(runId: string) =
         Command({ config with RunId = Some runId })
+
+    /// Carry a retrying run's hold on this command's one-shot stdin payload down to the launch
+    /// boundary that will spawn each attempt. Internal: `Runner.withRetry` stamps it on the copy of the
+    /// command it drives, so the attempt's `OneShotStdin.reserveLaunch` recognizes the run's own hold
+    /// instead of refusing the attempt as a second consumer of a payload the run already owns. Never
+    /// part of a caller's command — the reservation belongs to one run, not to the command value.
+    member internal _.WithStdinReservation(reservation: OneShotStdinReservation) =
+        Command(
+            { config with
+                StdinReservation = Some reservation }
+        )
 
     member internal _.WithRetryJitterSource(source: unit -> float) =
         ArgumentNullException.ThrowIfNull source

@@ -242,14 +242,58 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     member private this.BuildHost
         (command: Command, ownsGroup: bool)
         : Result<RunningHost * (int * Stream) list, ProcessError> =
-        // Spawn+track AND read the child's pid atomically with the release transition, all under `sync`
-        // (via `SpawnInto`/`WhenLive`): a `RunningProcess` is therefore never built over a backend whose
-        // teardown has already begun, and reading the pid can't race the Job handle being closed. Once
-        // this returns Ok the child is tracked, so a later Dispose/ShutdownAsync reaps it exactly once.
-        this.WhenLive(fun () ->
-            match spawnAndTrack command with
+        // THE launch boundary for a one-shot stdin payload (`FromStream`/`FromLines`/`FromAsyncLines`).
+        // Every real child ProcessKit starts on its own — `StartAsync`, the capture verbs, streaming,
+        // supervision, whichever runner drives them — is spawned right here, so taking the payload here
+        // is what makes "at most one incarnation ever reads it" true for all of them at once, instead of
+        // for the handful of high-level paths that used to guard it individually.
+        //
+        // Reserved BEFORE the spawn: a second run — concurrent, or merely later — is refused with a
+        // typed `Unsupported` while it still has no child of its own, rather than creating one and then
+        // feeding it the exhausted remains of someone else's payload. A run that already owns the
+        // payload (`Runner.withRetry`, whose hold rides on the command) is lending it to its own
+        // attempt and passes straight through.
+        let launchResult =
+            OneShotStdin.reserveLaunch command.Program command.Config.StdinSource command.Config.StdinReservation
+
+        let spawnResult =
+            match launchResult with
             | Error error -> Error error
-            | Ok spawned -> Ok(spawned, backend.PidOf spawned))
+            | Ok launch ->
+                // Spawn+track AND read the child's pid atomically with the release transition, all under
+                // `sync` (via `WhenLive`): a `RunningProcess` is therefore never built over a backend whose
+                // teardown has already begun, and reading the pid can't race the Job handle being closed.
+                // Once this returns Ok the child is tracked, so a later Dispose/ShutdownAsync reaps it
+                // exactly once.
+                //
+                // The commit rides INSIDE that same critical section, on the success arm: it is the very
+                // step that makes the payload spent, so it belongs with the spawn+track transaction it
+                // witnesses rather than alongside it — and it lands well before `stdinFeeder` (built
+                // below, off the lock) can read a byte. Deliberately no new synchronization of its own
+                // (K-025): the claim's state is a lock-free `Interlocked`/`Volatile` cell owned by
+                // `OneShotStdinClaim`, and this call is a single bounded write, exactly like the other
+                // bounded native work the group runs under `sync`.
+                let spawnOutcome =
+                    this.WhenLive(fun () ->
+                        match spawnAndTrack command with
+                        | Error error -> Error error
+                        | Ok spawned ->
+                            launch.Commit()
+                            Ok(spawned, backend.PidOf spawned))
+
+                match spawnOutcome with
+                | Ok tracked -> Ok tracked
+                | Error error ->
+                    // No child exists — the program was never found, the spawn or the track failed, an
+                    // up-front capability was refused, or the group was already released — so nothing can
+                    // have read the payload: hand it back for the next attempt or run. Committing only on
+                    // the success arm and releasing here is what keeps "a failed launch leaves the source
+                    // intact" true while "a launched child spends it" stays irreversible, even if the feed
+                    // itself fails afterwards.
+                    launch.Rollback()
+                    Error error
+
+        spawnResult
         |> Result.map (fun (spawned, pid) ->
             // The rest of the host is closures and stream references, built outside the lock. They do not
             // touch the container's release state at construction; the kill closures below route each LATER
