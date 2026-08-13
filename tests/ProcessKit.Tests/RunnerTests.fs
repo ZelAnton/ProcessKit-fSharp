@@ -1362,14 +1362,71 @@ type RunnerTests() =
         :> Task
 
     [<Test>]
-    member _.``a cancellation that arrives mid-attempt keeps the one-shot payload held``() : Task =
+    member _.``a cancellation that arrives after the launch keeps the one-shot payload held``() : Task =
         task {
             use cts = new CancellationTokenSource()
             use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
 
-            // The token is live when the attempt starts and fires while it is in flight — the shape of
-            // a cancellation that may have killed a child already draining the source. Nothing proves
-            // the payload survived, so this run must keep holding it.
+            // A child exists — the attempt reached the real capture launch boundary, which spends the
+            // payload at the launch itself — and the token then fires while that attempt is still in
+            // flight: the shape of a cancellation that kills a child already draining the source. What
+            // decides is that launch, not the shape of the ending, so no later run may be handed the
+            // remains.
+            let cancellingAfterLaunch =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(command, cancellationToken) =
+                        CaptureVerbs.runToCompletion
+                            command
+                            cancellationToken
+                            (fun () -> Task.FromResult(Ok(LaunchedDouble.runningProcess command)))
+                            (fun running ->
+                                task {
+                                    use _ = running
+                                    cts.Cancel()
+                                    return Ok(ProcessResult.Success "partial")
+                                })
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! first = command |> Runner.run cancellingAfterLaunch cts.Token
+
+            match first with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+            let! second =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+                |> Runner.run (DrainingDouble.over stream) CancellationToken.None
+
+            match second with
+            | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "one-shot stdin source")
+            | other -> Assert.Fail $"expected the held payload to refuse a later run, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a run cancelled mid-attempt without ever launching hands the one-shot payload back``() : Task =
+        task {
+            use cts = new CancellationTokenSource()
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            // The mirror case, and the one the hand-back rule is decided on: the token fires while the
+            // attempt is in flight, but this runner launches nothing at all, so no launch boundary
+            // committed the payload and nothing can have read it. Evidence — an uncommitted claim —
+            // beats the shape of the ending: the source goes back to the next run intact, rather than
+            // staying reserved for the life of the stream because a cancellation *might* have reached a
+            // child somewhere.
             let cancellingMidAttempt =
                 { new IProcessRunner with
                     member _.CaptureStringAsync(command, _) =
@@ -1400,8 +1457,8 @@ type RunnerTests() =
                 |> Runner.run (DrainingDouble.over stream) CancellationToken.None
 
             match second with
-            | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "one-shot stdin source")
-            | other -> Assert.Fail $"expected the held payload to refuse a later run, got {other}"
+            | Ok text -> Assert.That(text, Is.EqualTo "payload")
+            | Error error -> Assert.Fail $"expected the untouched payload to be usable, got {error}"
         }
         :> Task
 

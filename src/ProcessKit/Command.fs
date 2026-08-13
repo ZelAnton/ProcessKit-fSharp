@@ -107,6 +107,18 @@ type internal CommandConfig =
       EnvOverrides: ImmutableList<string * string option>
       ClearEnv: bool
       StdinSource: Stdin option
+      // The run-level hold on this command's one-shot stdin payload (`FromStream`/`FromLines`/
+      // `FromAsyncLines`), taken by `Runner.withRetry` for a run that may attempt the command more than
+      // once and carried here so each attempt's launch boundary can ask that hold for the loan on the
+      // payload instead of being refused as a second consumer of what its own run holds
+      // (`OneShotStdin.reserveLaunch`). Set only by that internal stamp — never by the public builder —
+      // so an ordinary command carries `None` and every launch reserves the payload for itself.
+      //
+      // Carrying it exempts nothing: a command is a value that outlives its run and travels through any
+      // `IProcessRunner` a caller cares to write, so the loan it asks for is exclusive, refused over a
+      // payload some child has already read, and refused once the run has settled its hold — a second
+      // launch bearing this stamp is checked exactly like a launch bearing none.
+      StdinReservation: OneShotStdinReservation option
       KeepStdinOpen: bool
       // The encoding for text sent through `Stdin.FromString`/`FromLines`/`FromAsyncLines` and an
       // interactive `ProcessStdin.WriteLineAsync`. Raw-byte stdin remains byte-exact.
@@ -183,10 +195,10 @@ type internal CommandConfig =
       UncheckedInPipe: bool
       OkCodes: int list
       CreateNoWindow: bool
-      // Windows: spawn the child as its own console process group (`CREATE_NEW_PROCESS_GROUP`) so
-      // `ProcessGroup.Signal(Signal.Int/Term)` can deliver a best-effort console CTRL+BREAK to it
-      // instead of the hard Job kill. Default `false`; no effect on Unix (which signals the child's
-      // process group through `killpg` regardless).
+      // Windows: opt the child into registration for targeted CTRL+BREAK through
+      // `ProcessGroup.Signal(Signal.Int/Term)`. Regular children are also spawned in their own console
+      // process group; ConPTY children already have one unconditionally for isolation. Default `false`;
+      // no effect on Unix (which signals the child's process group through `killpg` regardless).
       WindowsCtrlSignals: bool
       // The child's CPU-scheduling priority, applied at spawn (Windows priority class / Unix nice).
       // `None` (the default) leaves the OS default untouched.
@@ -283,6 +295,7 @@ module internal CommandConfig =
           EnvOverrides = ImmutableList<string * string option>.Empty
           ClearEnv = false
           StdinSource = None
+          StdinReservation = None
           KeepStdinOpen = false
           StdinEncoding = Encoding.UTF8
           TimeProvider = TimeProvider.System
@@ -835,6 +848,16 @@ type Command internal (config: CommandConfig) =
 
     /// Feed the child's standard input from `source`. Rejected (`ArgumentException`) when `InheritStdin`
     /// is already set — the inherited stdin has no pipe for a feeder source to write into.
+    ///
+    /// A **one-shot** source (`Stdin.FromStream`/`FromLines`/`FromAsyncLines`) feeds at most ONE
+    /// incarnation: the launch that creates a child takes it before spawning, so a second consumer —
+    /// a later run, a concurrent one, another verb or runner — is refused with
+    /// `ProcessError.Unsupported` before any child of its own exists, rather than being handed the
+    /// exhausted remains. That holds whatever drives the command and whether or not it carries a
+    /// `Retry` policy: a decorator that calls its inner runner twice with the same command, or a
+    /// command a runner kept and started afterwards, is a second consumer like any other.
+    /// A launch that produced no child leaves the source intact for the next one.
+    /// The repeatable sources (`Stdin.FromString`/`FromBytes`/`FromFile`/`Stdin.Empty`) feed every run.
     member _.Stdin(source: Stdin) =
         ArgumentNullException.ThrowIfNull source
         CommandConfig.ensureNoStdinInherit config "Stdin"
@@ -1311,7 +1334,7 @@ type Command internal (config: CommandConfig) =
     member _.CreateNoWindow() =
         Command({ config with CreateNoWindow = true })
 
-    /// Windows: spawn the child as its own console process group (`CREATE_NEW_PROCESS_GROUP`), so that
+    /// Windows: register the child leader for targeted console signalling, so that
     /// `ProcessGroup.Signal(Signal.Int)` / `Signal.Term` can deliver it a best-effort console
     /// **CTRL+BREAK** — the closest Windows analogue to a graceful `SIGINT`/`SIGTERM` — instead of the
     /// hard atomic Job-Object kill, giving a console child a chance to clean up. **Best-effort and
@@ -1320,9 +1343,11 @@ type Command internal (config: CommandConfig) =
     /// cannot receive it — the send then fails honestly with `ProcessError.Unsupported` rather than a
     /// silent downgrade — and even on a successful send delivery is not guaranteed (the child may
     /// install its own console handler). `Signal.Kill` is unaffected (always the atomic Job kill), and
-    /// this has no effect on Unix, where signals reach the child's process group regardless. Note that
-    /// `CREATE_NEW_PROCESS_GROUP` also disables the child's default CTRL+C handling, which is why the
-    /// soft signal is delivered as CTRL+BREAK rather than CTRL+C.
+    /// this has no effect on Unix, where signals reach the child's process group regardless. Regular children
+    /// get `CREATE_NEW_PROCESS_GROUP` through this option. ConPTY children always receive that flag for
+    /// isolation, regardless of this option, and Windows consequently disables their default CTRL+C handling:
+    /// sending U+0003 through ConPTY input does not interrupt the child. For ConPTY, this option only registers
+    /// the leader for targeted CTRL+BREAK; it does not control creation of the process group.
     member _.WindowsCtrlSignals() =
         Command(
             { config with
@@ -1601,6 +1626,18 @@ type Command internal (config: CommandConfig) =
     member internal _.WithRunId(runId: string) =
         Command({ config with RunId = Some runId })
 
+    /// Carry a retrying run's hold on this command's one-shot stdin payload down to the launch
+    /// boundary that will spawn each attempt. Internal: `Runner.withRetry` stamps it on the copy of the
+    /// command it drives, so the attempt's `OneShotStdin.reserveLaunch` can take the loan on the run's
+    /// own hold instead of refusing the attempt as a second consumer of a payload the run already owns.
+    /// Never part of a caller's command — the reservation belongs to one run, not to the command value,
+    /// which is why the loan (and not the stamp) is what a launch is actually allowed to spawn on.
+    member internal _.WithStdinReservation(reservation: OneShotStdinReservation) =
+        Command(
+            { config with
+                StdinReservation = Some reservation }
+        )
+
     member internal _.WithRetryJitterSource(source: unit -> float) =
         ArgumentNullException.ThrowIfNull source
 
@@ -1646,7 +1683,8 @@ module Command =
     /// Start the child's environment empty instead of inheriting the parent's.
     let envClear (command: Command) = command.EnvClear()
 
-    /// Feed the child's standard input from `source`.
+    /// Feed the child's standard input from `source`. A one-shot source feeds at most one incarnation
+    /// (see `Command.Stdin`).
     let stdin (source: Stdin) (command: Command) = command.Stdin source
 
     /// Hand the child the parent process's own standard input directly (inherited, no pipe/feeder), for
@@ -1778,8 +1816,9 @@ module Command =
     /// Windows: run the child with `CREATE_NO_WINDOW` (no effect on Unix).
     let createNoWindow (command: Command) = command.CreateNoWindow()
 
-    /// Windows: spawn the child as its own console process group so `ProcessGroup.Signal(Signal.Int/Term)`
-    /// can deliver a best-effort CTRL+BREAK (no effect on Unix). See `Command.WindowsCtrlSignals`.
+    /// Windows: register a ConPTY child as the target for best-effort CTRL+BREAK through
+    /// `ProcessGroup.Signal(Signal.Int/Term)`; ConPTY children already have process-group isolation.
+    /// Regular children are put in a new process group. No effect on Unix. See `Command.WindowsCtrlSignals`.
     let windowsCtrlSignals (command: Command) = command.WindowsCtrlSignals()
 
     /// Launch the child (and its spawned tree) at a lower/higher CPU-scheduling priority (Windows

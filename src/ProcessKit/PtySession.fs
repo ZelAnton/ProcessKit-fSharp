@@ -328,7 +328,8 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     /// Send `text` to the child exactly as given — no line ending appended — encoded with the
     /// command's terminal encoding (`Command.StdoutEncoding`, UTF-8 by default). Use it for a control
     /// character (U+0003 is Ctrl+C to a terminal) or to answer a prompt that reads a single
-    /// keystroke rather than a line.
+    /// keystroke rather than a line. On Windows ConPTY, U+0003 does not interrupt the child by default:
+    /// ProcessKit's unconditional `CREATE_NEW_PROCESS_GROUP` isolation disables default CTRL+C handling.
     ///
     /// Returns a typed `Unsupported` when the run has no interactive stdin (build the command with
     /// `Command.KeepStdinOpen`), `Cancelled` if `cancellationToken` fires, and `Io` if the child has

@@ -1,5 +1,7 @@
 namespace ProcessKit.Tests
 
+open System.IO
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
@@ -170,4 +172,72 @@ type DryRunRunnerTests() =
             | other -> Assert.Fail $"expected a Cancelled error, got {other}"
 
             Assert.That(runner.History.Count, Is.EqualTo 0)
+        }
+
+    [<Test>]
+    member _.``a dry run neither reserves nor consumes a one-shot stdin source (T-342)``() : Task =
+        task {
+            // A one-shot stdin payload (`FromStream`/`FromLines`/`FromAsyncLines`) belongs to at most one
+            // real incarnation: the launch boundary takes it before it spawns, so a second consumer is
+            // refused rather than handed an exhausted source. A dry run spawns nothing at all, so it must
+            // stay outside that ownership entirely — it validates the configuration (the render, the
+            // history, the fact that a stdin source is set) and leaves the payload exactly where it was.
+            // Otherwise a `--dry-run` preview would silently spend the input of the real run it previews.
+            let runner: IProcessRunner = DryRunRunner()
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command =
+                Command.create "git"
+                |> Command.args [ "apply"; "-" ]
+                |> Command.stdin (Stdin.FromStream stream)
+
+            // Repeatable as often as the caller likes: three previews of the SAME command, each a
+            // success with the identical render.
+            for _ in 1..3 do
+                match! runner.OutputStringAsync(command, CancellationToken.None) with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "git apply -")
+                | Error error -> Assert.Fail $"a dry run must not be refused a one-shot stdin source: {error.Message}"
+
+            // And the payload itself is untouched — nothing read a byte of the stream, so a real run
+            // afterwards would still be handed the caller's original input.
+            Assert.That(stream.Position, Is.EqualTo 0L, "a dry run must not read the one-shot payload")
+        }
+
+    [<Test>]
+    member _.``a dry run of a command with a retry budget still leaves the one-shot source available``() : Task =
+        task {
+            // Same contract, with the knob that used to break it: a retry budget makes the run take a
+            // run-level hold on the payload BEFORE it knows which runner will serve it. That hold is a
+            // loan — a runner that spawns nothing hands it straight back — so a `--dry-run` preview of a
+            // command carrying `Retry` stays as repeatable as one without it, and does not leave the
+            // payload reserved for the life of the stream (which would refuse every later run of it,
+            // real or previewed, with `ProcessError.Unsupported`).
+            let runner: IProcessRunner = DryRunRunner()
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let command =
+                Command.create "git"
+                |> Command.args [ "apply"; "-" ]
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 System.TimeSpan.Zero (fun _ -> true)
+
+            for preview in 1..3 do
+                match! runner.OutputStringAsync(command, CancellationToken.None) with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "git apply -")
+                | Error error -> Assert.Fail $"preview {preview} must not be refused the source: {error.Message}"
+
+            Assert.That(stream.Position, Is.EqualTo 0L, "a dry run must not read the one-shot payload")
+
+            // The proof that the hold was really returned rather than merely re-taken by the same
+            // command: another retrying run over the SAME stream through a DIFFERENT `Stdin` wrapper and
+            // a DIFFERENT command — the claim is keyed on the payload object, and a retry budget is what
+            // makes a run take the run-level hold — is handed the payload rather than refused.
+            let other =
+                Command.create "hg"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 2 System.TimeSpan.Zero (fun _ -> true)
+
+            match! runner.OutputStringAsync(other, CancellationToken.None) with
+            | Ok result -> Assert.That(result.Stdout, Is.EqualTo "hg")
+            | Error error -> Assert.Fail $"a previewed payload must stay available to another run: {error.Message}"
         }

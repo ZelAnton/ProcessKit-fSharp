@@ -399,6 +399,45 @@ sequence that the first run drains, so they are one-shot — prefer a reusable
 source whenever a command may run more than once (under [`Retry`](#timeouts-and-retries)
 or [record/replay](testing.md)).
 
+### One-shot stdin sources feed one incarnation
+
+A one-shot source is **owned by at most one incarnation, ever**, and ProcessKit
+enforces that rather than leaving it to you:
+
+- The boundary that actually creates a child takes the source **before** it
+  spawns, so a second consumer — a later run, one racing it, another verb, or
+  another runner — is refused with `ProcessError.Unsupported` while it still has
+  no child of its own, instead of being started and then handed the exhausted
+  remains (usually nothing at all). Two concurrent runs can no longer split one
+  stream between two children.
+- Nothing about *how* the command is driven buys a second launch a free pass. A
+  retrying run holds the source for the whole of its run, but that hold is lent to
+  one launch at a time and never covers a payload a child has already read — so a
+  decorator that calls its inner runner twice with the same command, or a command a
+  runner hook kept and started later, is refused exactly like any other second
+  consumer, with or without a [`Retry`](#timeouts-and-retries) policy.
+- Every path that can drain the source is behind that boundary: the capture verbs
+  (`RunAsync` / `OutputStringAsync` / `OutputBytesAsync` / `ExitCodeAsync` /
+  `ProbeAsync`), a streaming [`StartAsync`](streaming.md) handle, both
+  [`Pipeline`](pipelines.md) paths through stage 0 — where the refusal starts no
+  stage of the chain at all — a [supervised](supervision.md) incarnation's own
+  spawn, `JobRunner`, and a [`ProcessGroup`](process-groups.md), owned or shared.
+- A launch that produced **no** child (`NotFound`, a failed spawn, an up-front
+  capability refusal, a released group) hands the source back intact for the next
+  attempt or run, and so does a runner that spawns nothing at all — a
+  [`DryRunRunner`](testing.md) preview neither reads the source nor keeps it, so
+  the real run you preview still gets the whole payload.
+- A child that *was* started keeps the source spent even if its stdin feed then
+  fails (a `ProcessError.Stdin`): that child did read it, so there is nothing
+  intact to replay.
+
+Repeatable sources (`Stdin.FromString` / `FromBytes` / `FromFile` / `Stdin.Empty`)
+and [`InheritStdin`](#inheriting-the-parents-standard-input-inheritstdin) are never
+involved in this: they feed every run, as often as you like. Sharing one stream or
+sequence across runs is therefore a typed error you are told about before anything
+spawns — not silent wrong input — so give each run its own source, or a repeatable
+one.
+
 ### Inheriting the parent's standard input (`InheritStdin`)
 
 `Command.InheritStdin` hands the child the **parent process's own standard
@@ -871,35 +910,22 @@ Console.WriteLine(await cmd.RunAsync() switch
   `Detail` contains the callback exception message. The callback exception never
   escapes as a raw task fault, and no additional attempt is started.
   A **one-shot** stdin source (`Stdin.FromStream` / `FromLines` / `FromAsyncLines`)
-  runs its first attempt like any other, but can be retried only after a failure
-  that precedes a live child — `NotFound`, `Spawn`, or a launch refused as
-  `Unsupported` — because nothing has read the source yet. After anything that may
-  have reached a child (`Exit`, `Timeout`, `Signalled`, `Stdin`, `OutputTooLarge`,
-  `Cancelled`, or the ambiguous `Io`) the run ends with that first error, without
-  consulting your classifier, rather than feeding a second child an exhausted
-  source. Such a run also reserves the source while it holds it: another
-  **retrying** run over the same stream or sequence — one that starts while this
-  one still holds it, or a later one, once a capture verb (`run` /
-  `outputString` / `outputBytes` / `exitCode` / `probe`) has launched a child
-  over it — is refused with `ProcessError.Unsupported` instead of being handed
-  the remains. The reservation is released again whenever the run ends without
-  any attempt reaching a child — an already-cancelled token, a cancellation
-  during the backoff, a throwing classifier, or an attempt that threw before
-  launching all hand the source back to the next run — while a run that may have
-  reached one (a success, a post-child failure, or a cancellation that arrived
-  mid-attempt) keeps it.
-  That guard is scoped to retry; it is **not** a general cross-runner
-  reservation. Only a run with a retry budget takes the reservation, so a run
-  without one is never refused: it feeds its child from the same source whoever
-  else holds it (though its capture verb's child does mark the source spent for
-  later retrying runs). And only a capture verb's launch marks a source spent: a
-  child started outside those verbs — a streaming [`StartAsync`](streaming.md)
-  handle, a [`Pipeline`](pipelines.md) stage, a [supervised](supervision.md)
-  incarnation's own spawn, or a custom `IProcessRunner` — drains the source
-  without recording it, so a later retrying run can still reserve what is
-  already empty and hand its child nothing. Sequencing a one-shot source shared
-  across those paths is yours: give each run its own source, or a repeatable one
-  (`Stdin.FromString` / `FromBytes` / `FromFile`).
+  [feeds a single incarnation](#one-shot-stdin-sources-feed-one-incarnation), and
+  retry works within that: the first attempt runs like any other, but a second one
+  follows only after a failure that precedes a live child — `NotFound`, `Spawn`, or
+  a launch refused as `Unsupported` — because nothing has read the source yet.
+  After anything that may have reached a child (`Exit`, `Timeout`, `Signalled`,
+  `Stdin`, `OutputTooLarge`, `Cancelled`, or the ambiguous `Io`) the run ends with
+  that first error, without consulting your classifier, rather than feeding a
+  second child an exhausted source. A run with a retry budget also **holds** the
+  source for the whole run, not just for one attempt, so it stays off-limits to
+  another run in the gaps *between* attempts; a concurrent run over the same stream
+  or sequence is refused with `ProcessError.Unsupported` while that hold lasts. The
+  hold is a loan: it is handed back unless some attempt actually launched a child
+  over the source, so an already-cancelled token, a cancellation during the
+  backoff, a throwing classifier, and an attempt that threw before launching all
+  leave the source to the next run — as does a run through a runner that spawns
+  nothing at all, such as a [`DryRunRunner`](testing.md) preview.
 - **`RetryBackoff`** uses the same attempt/classifier contract with a growing
   `baseDelay × factor^n` pause, capped by `maxDelay` before optional `[0.5, 1.5)`
   jitter. Base/cap delays must be non-negative and `factor` must be finite and at
