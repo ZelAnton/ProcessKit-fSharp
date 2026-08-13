@@ -30,7 +30,11 @@
       * a run in which no mutant was killed at all, over a sample large enough that this cannot be
         real — the signature of a harness that mutated an assembly the test host never loaded;
       * a partial run (any shard stopped on its time budget), which cannot be compared with a
-        baseline recorded from a complete one.
+        baseline recorded from a complete one;
+      * a catalog that no longer matches the population pinned in the baseline
+        (`expectedCatalogMutants`). This is the one degradation that is not an EMPTY measurement but
+        a smaller one: part of the scope quietly stopping to match still yields well formed reports
+        and a plausible score, over a different program than the baseline describes.
 
     Division is guarded by the denominator, never by trusting the report to be well formed.
 
@@ -222,6 +226,48 @@ if ($baselineIsArmed) {
     }
 }
 
+# The population the score was computed over, pinned next to the score itself.
+#
+# Every other guard in this file triggers on an EMPTY measurement. The case none of them sees is a
+# PARTIAL one: if some of `scope.includeTypes` stops matching — a type or module renamed during an
+# ordinary refactor, which mutate.ps1 calls out as "a renamed type silently empties the scope" — the
+# catalog just gets smaller. Every shard still reports `status: ok`, every counter is still positive,
+# and the arithmetic is still well formed; it simply describes a different, smaller program than the
+# baseline does. Without a pinned population, `catalogTotal` is a number nothing compares against, and
+# an armed ratchet would keep passing (or fail for a reason that has nothing to do with the change)
+# over a set of mutants nobody noticed shrinking.
+$expectedCatalogField = Get-Field $baseline 'expectedCatalogMutants'
+$catalogToleranceField = Get-Field $baseline 'catalogTolerancePercent'
+
+$expectedCatalog = 0
+$catalogIsPinned = $null -ne $expectedCatalogField
+$catalogTolerancePercent = 0.0
+
+if ($catalogIsPinned) {
+    if (-not [int]::TryParse([string] $expectedCatalogField, [ref] $expectedCatalog) -or $expectedCatalog -lt 1) {
+        Write-Annotation error "Mutation baseline 'expectedCatalogMutants' must be null or a positive integer: $BaselinePath"
+        exit 2
+    }
+
+    if ($null -eq $catalogToleranceField -or -not [double]::TryParse(
+            [string] $catalogToleranceField, [Globalization.NumberStyles]::Float,
+            [cultureinfo]::InvariantCulture, [ref] $catalogTolerancePercent) -or
+        $catalogTolerancePercent -lt 0 -or $catalogTolerancePercent -gt 100) {
+        Write-Annotation error ('Mutation baseline needs a percentage between 0 and 100 in ' +
+            "'catalogTolerancePercent' alongside 'expectedCatalogMutants': $BaselinePath")
+        exit 2
+    }
+}
+
+# Arming the score without pinning the population it came from would re-open exactly the hole above,
+# so it is a configuration fault rather than something to warn about once the gate is already live.
+if ($baselineIsArmed -and -not $catalogIsPinned) {
+    Write-Annotation error ("Mutation baseline arms 'minimumScore' without an 'expectedCatalogMutants': a score " +
+        'only means something relative to the mutant set it was computed over. Record both, in the same ' +
+        "change: $BaselinePath")
+    exit 2
+}
+
 # --- Collect the shard reports -------------------------------------------------------------------
 
 $reportFiles = @()
@@ -300,7 +346,16 @@ $facts = @(
     '| Metric | Value |',
     '| --- | --- |',
     "| Shard reports merged | $($reportFiles.Count) of $expectedShards |",
-    "| Mutants in catalog | $catalogTotal |",
+    "| Mutants in catalog | $catalogTotal |"
+)
+
+# The pinned population belongs in the reading, not only in the verdict: it is what tells a reader
+# whether the catalog above is the one the baseline is talking about.
+if ($catalogIsPinned) {
+    $facts += "| Catalog pinned at | $expectedCatalog +/- $(Format-Percent $catalogTolerancePercent) % |"
+}
+
+$facts += @(
     "| Mutants evaluated | $evaluated |",
     "| Killed | $killed |",
     "| Timed out (detected) | $timedOut |",
@@ -382,6 +437,36 @@ if ($detected -eq 0 -and $evaluated -ge $minimumMutants) {
 $score = 100.0 * $detected / $decided
 $scoreText = Format-Percent $score
 $facts += "| Mutation score | $scoreText % |"
+
+# --- Degradation: the score was computed over a different population ------------------------------
+
+# The score is printed first, deliberately: a contributor who widened the scope on purpose needs both
+# the new catalog size and the new score to re-record the baseline, and one skipped run should hand
+# them both rather than sending them round again.
+if ($catalogIsPinned) {
+    $allowedDrift = $expectedCatalog * $catalogTolerancePercent / 100.0
+    $drift = [math]::Abs($catalogTotal - $expectedCatalog)
+
+    if ($drift - $comparisonEpsilon -gt $allowedDrift) {
+        $direction = if ($catalogTotal -lt $expectedCatalog) { 'shrank to' } else { 'grew to' }
+
+        Add-StepSummary ($facts + @(
+                '',
+                "Skipped: the catalog $direction $catalogTotal mutant(s), against the $expectedCatalog this baseline",
+                "pins (tolerance $(Format-Percent $catalogTolerancePercent) %). The score above was computed over a",
+                'different population than the baseline was recorded over, so comparing them would measure the change',
+                'in scope rather than any change in assertion strength.',
+                'A shrink is the case to look at first, because nothing else here can see it: a type renamed during an',
+                'ordinary refactor drops out of `scope.includeTypes` silently, every shard still reports `ok`, and the',
+                'mutants that went missing are simply never counted. If the new population is intended, re-record',
+                '`expectedCatalogMutants` and `minimumScore` together in the same change; if it is not, fix the scope.',
+                'CONTRIBUTING.md, section "Mutation testing", has the procedure.'
+            ))
+        Write-Annotation warning ("Mutation ratchet skipped: the catalog holds $catalogTotal mutant(s) but the " +
+            "baseline pins $expectedCatalog; the score was computed over a different population.")
+        exit 0
+    }
+}
 
 # --- Degradation: too small a sample to mean anything --------------------------------------------
 

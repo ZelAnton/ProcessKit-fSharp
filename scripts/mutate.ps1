@@ -17,8 +17,10 @@
     mutated" and "produce that one mutant". It writes facts, never a verdict — the pass/fail decision
     lives in scripts/check-mutation-report.ps1, which merges the shards.
 
-    Sharding and the time budget. The catalog is deterministically shuffled by the engine (seeded from
-    the baseline file), then split by `index % ShardCount`. A shard evaluates its list until the time
+    Sharding and the time budget. Sharding is always explicit: without -ShardCount this runs the WHOLE
+    catalog as a single shard, and only a caller that asks for a split (the CI matrix passes
+    -ShardCount 4) gets one. The catalog is deterministically shuffled by the engine (seeded from the
+    baseline file), then split by `index % ShardCount`. A shard evaluates its list until the time
     budget runs out and reports `budgetExhausted` when it stopped early, so a partial run is visibly
     partial rather than quietly reported as a complete one. Because the catalog is shuffled, a
     truncated shard is still a representative sample instead of "the alphabetically first types".
@@ -47,7 +49,9 @@
     Zero-based index of this shard.
 
 .PARAMETER ShardCount
-    Total number of shards. Defaults to the baseline file's `shardCount`.
+    Total number of shards. 1 by default, which is the whole catalog in one report — the local run and
+    the documented invocation therefore measure the same population the score is defined over. A split
+    is never implicit: the CI matrix passes -ShardCount 4 next to its -ShardIndex.
 
 .PARAMETER TimeBudgetSeconds
     Wall-clock budget for the mutant loop (the build and the baseline run are not charged to it).
@@ -82,7 +86,10 @@
 
 .EXAMPLE
     pwsh ./scripts/mutate.ps1
-    Runs the whole catalog locally (single shard) with the default 15 minute budget.
+    Runs the whole catalog locally, as one shard (-ShardCount defaults to 1), with the default 15
+    minute budget. A complete run of the 132 mutants in scope took about 12 minutes when this was
+    written, so a slower machine may need -TimeBudgetSeconds raised; a run that stops on the budget
+    says so in its report (`budgetExhausted`) and the gate refuses to score it.
 
 .EXAMPLE
     pwsh ./scripts/mutate.ps1 -ShardIndex 2 -ShardCount 4 -TimeBudgetSeconds 1200
@@ -98,8 +105,8 @@ param(
     [ValidateRange(0, 63)]
     [int] $ShardIndex = 0,
 
-    [ValidateRange(0, 64)]
-    [int] $ShardCount = 0,
+    [ValidateRange(1, 64)]
+    [int] $ShardCount = 1,
 
     [ValidateRange(1, 86400)]
     [int] $TimeBudgetSeconds = 900,
@@ -327,11 +334,6 @@ if ([string]::IsNullOrWhiteSpace($Framework)) {
     $Framework = [string] (Get-Field $baseline 'framework')
 }
 
-if ($ShardCount -lt 1) {
-    $configuredShards = Get-Field $baseline 'shardCount'
-    $ShardCount = if ($null -eq $configuredShards) { 1 } else { [int] $configuredShards }
-}
-
 $testFilter = [string] (Get-Field $baseline 'testFilter')
 
 if ([string]::IsNullOrWhiteSpace($Framework) -or [string]::IsNullOrWhiteSpace($testFilter)) {
@@ -340,7 +342,10 @@ if ([string]::IsNullOrWhiteSpace($Framework) -or [string]::IsNullOrWhiteSpace($t
 }
 
 if ($ShardIndex -ge $ShardCount) {
-    Write-Annotation error "ShardIndex $ShardIndex is out of range for ShardCount $ShardCount"
+    # Reached by `-ShardIndex 2` on its own: sharding is explicit, so an index without a count is an
+    # index into a one-shard run rather than into whatever split the caller had in mind.
+    Write-Annotation error ("ShardIndex $ShardIndex is out of range for ShardCount $ShardCount. " +
+        '-ShardCount is 1 unless you pass it: give -ShardIndex and -ShardCount together.')
     exit 2
 }
 
@@ -476,6 +481,34 @@ try {
     $catalog = Get-Content -Raw -LiteralPath $catalogPath | ConvertFrom-Json
     $allMutants = @(Get-Field $catalog 'mutants')
     $report.catalogTotal = $allMutants.Count
+
+    # A catalog that no longer matches the population pinned in the baseline is the one degradation
+    # this tier cannot see from the counters: part of `scope.includeTypes` no longer matching leaves
+    # every shard reporting `ok` over a quietly smaller program. The verdict on it belongs to
+    # scripts/check-mutation-report.ps1 (this script writes facts, never verdicts), but the change that
+    # causes it — a type renamed during a refactor — is made locally, weeks before the weekly run, so
+    # it is worth saying here too. Never affects the status or the exit code.
+    $expectedCatalog = Get-Field $baseline 'expectedCatalogMutants'
+
+    if ($null -ne $expectedCatalog) {
+        # The same rule the gate applies, so the two never disagree about what counts as a drift: a
+        # tolerance band around the pin absorbs the ordinary edit to scoped code, and anything wider
+        # is the scope itself having moved.
+        $catalogTolerance = Get-Field $baseline 'catalogTolerancePercent'
+        $allowedDrift = 0.0
+
+        if ($null -ne $catalogTolerance) {
+            $allowedDrift = [double] $expectedCatalog * [double] $catalogTolerance / 100.0
+        }
+
+        if ([math]::Abs($allMutants.Count - [int] $expectedCatalog) -gt $allowedDrift) {
+            Write-Annotation warning ("The scope produced $($allMutants.Count) mutant(s); " +
+                "$([System.IO.Path]::GetFileName($BaselinePath)) pins $([int] $expectedCatalog). If the change " +
+                "to the population is intended, re-record 'expectedCatalogMutants' and the score next to it in " +
+                'the same change; if it is not, a renamed type has dropped out of the scope and the mutants it ' +
+                'contributed are simply not being measured. The gate will not compare a score across this.')
+        }
+    }
 
     # The engine already shuffled the catalog with the committed seed, so a straight modulo split
     # gives each shard a representative slice and the assignment is reproducible.

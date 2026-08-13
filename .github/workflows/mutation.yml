@@ -17,9 +17,11 @@ permissions:
 
 jobs:
   # One shard per job. The engine deterministically shuffles the catalog with the seed committed in
-  # mutation-baseline.json and the driver splits it by `index % shardCount`, so the shards are
+  # mutation-baseline.json and the driver splits it by `index % ShardCount`, so the shards are
   # reproducible, balanced, and each one is a representative sample rather than a contiguous slice of
-  # the alphabet. Keep the matrix and `shardCount` in the baseline file in step.
+  # the alphabet. Splitting is explicit -- the driver runs the whole catalog unless told otherwise --
+  # so the matrix below and the `-ShardCount` it passes have to stay in step with each other. They are
+  # deliberately both in this file: a split configured elsewhere would silently shrink a local run.
   mutate:
     strategy:
       fail-fast: false

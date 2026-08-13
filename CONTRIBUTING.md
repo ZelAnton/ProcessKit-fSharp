@@ -162,15 +162,20 @@ into a `<=`, a `+` into a `-`, a constant into the next one along — re-runs a 
 the suite, and records whether anything failed. A mutant nothing noticed is a limit the suite executes
 but does not pin.
 
-Run it locally (the whole catalog, one shard, roughly fifteen minutes):
+Run it locally — the whole catalog as a single shard, about twelve minutes for the 132 mutants in
+scope today, inside the default fifteen minute budget:
 
 ```sh
 pwsh ./scripts/mutate.ps1
 ```
 
-Useful switches: `-ShardIndex`/`-ShardCount` to take one slice, `-TimeBudgetSeconds` to bound the
-loop, `-SkipBuild` to reuse the current build output, `-RetryTimeouts` when a machine is genuinely
-overloaded. Every parameter is documented in the script's own help. The report lands in
+That is the entire catalog because sharding is explicit: `-ShardCount` is `1` unless you pass it, so
+what you measure locally is the same population the score is defined over. Taking a slice is a
+deliberate act — `-ShardIndex 1 -ShardCount 4` runs a quarter of it, which is how the CI matrix runs
+(and a report from one such shard is knowingly partial: the gate will say so rather than score it).
+The other useful switches are `-TimeBudgetSeconds` to bound the loop, `-SkipBuild` to reuse the
+current build output, and `-RetryTimeouts` when a machine is genuinely overloaded. Every parameter is
+documented in the script's own help. The report lands in
 `artifacts/mutation/shard-<n>/mutation-report.json`.
 
 ### Why an in-repo engine and not Stryker.NET
@@ -183,7 +188,7 @@ Against this repository, `dotnet-stryker` 4.16.0 fails from both directions:
   knows how to parse a `csc` command line, and an `.fsproj` hands it an `fsc` one;
 - pointed at the C# test project instead (`tests/ProcessKit.CSharp.Tests`, which does analyse
   cleanly), it reports `Analyzing 0 projects` / `No project found` and exits — it cannot treat an
-  `.fsproj` as a mutatable source project at all.
+  `.fsproj` as a source project it could mutate at all.
 
 That is structural, not a configuration mistake: Stryker mutates C# **syntax trees** through Roslyn.
 No maintained .NET alternative covers F# either — the IL-level mutation testers (Testura.Mutation,
@@ -192,8 +197,8 @@ Stryker.
 
 So the engine is [`tests/ProcessKit.Mutation`](tests/ProcessKit.Mutation), four F# files over
 [Mono.Cecil](https://github.com/jbevain/cecil). Its operators are defined over **CIL**, which is
-what makes the tier possible here at all: the compiled IL of an F# assembly is as mutatable as any
-other. It is deliberately kept **out of `ProcessKit.slnx`** — the same treatment as
+what makes the tier possible here at all: the compiled IL of an F# assembly can be rewritten like
+any other. It is deliberately kept **out of `ProcessKit.slnx`** — the same treatment as
 `docs/snippets/DocSnippets.slnx` — so the ordinary CI jobs never restore, build or pack it.
 
 The engine has two stateless verbs, `list` (catalog the mutants) and `apply` (produce one mutated
@@ -213,7 +218,7 @@ than folded in either direction — nothing was measured about them — and are 
 engine regression that quietly errors everything is visible instead of hidden in a denominator.
 
 **Sharding and the budget.** The engine shuffles the catalog deterministically, seeded from the
-committed baseline, and the driver splits it by `index % shardCount`. The shuffle is what makes a
+committed baseline, and the driver splits it by `index % ShardCount`. The shuffle is what makes a
 budget-truncated shard a representative sample rather than "the alphabetically first types", and the
 seed is what keeps it reproducible. A shard that stops on its budget reports `budgetExhausted`, and
 the gate refuses to compare a partial run with a baseline recorded from a complete one.
@@ -272,6 +277,19 @@ otherwise pass as a real, terrible score — a run in which **no** mutant was de
 large enough sample, which is the signature of a harness whose test host never loaded the mutated
 assembly. Division is guarded on the denominator, not on the report being well formed.
 
+One skip state is not about an *empty* measurement but a **smaller** one, and it is the only defence
+against the failure this tier would otherwise share with the coverage incident: a catalog that no
+longer matches `expectedCatalogMutants`. Every guard above triggers when nothing at all was measured;
+none of them notices when a *part* of `scope.includeTypes` stops matching — a type renamed during an
+ordinary refactor drops out of the scope in silence, all shards still report `ok`, and the score is
+computed, honestly and meaninglessly, over a program that is missing a module. So the baseline pins
+the size of the population its score was recorded over, the gate compares the catalog it actually
+measured against that pin (within `catalogTolerancePercent`), and a mismatch skips the comparison with
+a message saying which way it moved. `scripts/mutate.ps1` prints the same warning as soon as it builds
+the catalog, because the refactor that causes this happens locally, long before the weekly run. Arming
+`minimumScore` without pinning `expectedCatalogMutants` is refused outright (exit 2): a score without
+its population is not a threshold, it is a number.
+
 The tier is immune to the mechanism behind that coverage incident, and this was checked rather than
 asserted: with `ContinuousIntegrationBuild=true` and `DeterministicSourcePaths=true` genuinely active
 (confirmed by querying the MSBuild properties, since the trigger is `GITHUB_ACTIONS=true`), the
@@ -286,16 +304,46 @@ and stripping the PDB entirely still yields the identical catalog with empty sou
 on it. That is the supported way to bootstrap: arm it from a **complete** shard matrix run in CI, not
 from a local one, because a partial or single-machine run measured something else.
 
-1. Take `Mutation score` from the **Mutation tier** table in the `summary` job of a run where no shard
-   reported `budgetExhausted` or a skip state.
-2. Set `minimumScore` in `mutation-baseline.json` to that number, and refresh `recordedOn` /
-   `recordedFrom`.
+1. Take `Mutation score` **and** `Mutants in catalog` from the **Mutation tier** table in the `summary`
+   job of a run where no shard reported `budgetExhausted` or a skip state.
+2. Set `minimumScore` and `expectedCatalogMutants` in `mutation-baseline.json` to those two numbers —
+   both, always, because one without the other is a threshold with no population — and refresh
+   `recordedOn` / `recordedFrom`.
 3. Say in the pull request why it moved. Raising it after adding boundary tests locks the gain in;
    lowering it states on the record that this change trades assertion strength away on purpose.
 
-Widening `scope.includeTypes` changes the population the score is computed over, so it invalidates the
-baseline: record it again from a run of the new scope, in the same change. Scope and score live in one
-file precisely so that has to be one reviewable diff.
+**Any change to the size of the catalog invalidates the baseline**, not only a widening of
+`scope.includeTypes`: narrowing it, renaming a scoped type, and changing the scoped code enough to add
+or remove branches all move the population the score is computed over. Record both numbers again from
+a run of the new scope, in the same change — `catalogTolerancePercent` (10 % today) exists to absorb
+the ordinary edit, not to let a module go missing. Scope, population and score live in one file
+precisely so that stays one reviewable diff.
+
+#### Before this baseline can be armed
+
+**Open as of 2026-08-13.** `minimumScore` must stay `null` — and this section must stay here — until
+the tier has been shown to produce data *in CI*, verified from real artifacts rather than from a local
+run. The reason is specific rather than procedural: every "nothing could be measured" state of this
+tier exits 0 by design, so a green weekly workflow is not evidence that anything was measured, and the
+mechanism this repository has already been bitten by (`ContinuousIntegrationBuild` plus deterministic
+source paths silently emptying coverage instrumentation, for months, on every leg) was invisible
+locally by construction. What was checked before this shipped is that the *catalog* is identical under
+those settings and even with the PDB removed; what is still unchecked is that a shard on an
+`ubuntu-latest` runner — different OS, different build, real timings — evaluates mutants at all.
+
+Verification is a `gh run download` of the first `Mutation tier` run (`workflow_dispatch` on the
+published commit), and it passes only when **every** shard artifact satisfies all of:
+
+- `status == "ok"`;
+- `catalogTotal > 0`, and equal to `expectedCatalogMutants` in this repository's baseline;
+- `evaluated > 0`;
+- `counts.killed > 0`;
+- `budgetExhausted == false`;
+
+and the `summary` job's step summary shows an actual `Mutation score` row rather than any skip state.
+Anything less is a tier that is green without measuring, which is the incident this whole design is
+written against. Only once that holds are `minimumScore` and `recordedFrom` filled in from that run —
+see the steps above — and this section deleted.
 
 The boundary tests written to kill specific survivors live in
 [`tests/ProcessKit.Tests/MutationBoundaryTests.fs`](tests/ProcessKit.Tests/MutationBoundaryTests.fs),
