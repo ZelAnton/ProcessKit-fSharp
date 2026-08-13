@@ -170,7 +170,9 @@ type PtyTests() =
         task {
             // A deliberately non-default end-of-input character (Ctrl-Q, 0x11) instead of Ctrl-D: what is
             // delivered must be the character the pty is CONFIGURED with, read from its slave termios when
-            // the pair was created, never an assumed default.
+            // the pair was created, never an assumed default. This entire test runs through the mocked pty
+            // write seam (`ptyWriteForTests`), which does not involve a real kernel, termios policy, or
+            // IXON flow control, so 0x11 is perfectly safe here — the test is pure mock behavior.
             let written = ResizeArray<byte>()
             recordPtyWrites written 64
 
@@ -205,8 +207,16 @@ type PtyTests() =
                 // Configure the actual slave-side termios before openPtyPair reads c_cc[VEOF]. The child then
                 // proves both halves of the contract: the non-default byte is discovered and the canonical
                 // line discipline turns two of those bytes into payload delivery followed by EOF.
+                //
+                // A deliberately non-default end-of-input character (Ctrl-A, 0x01 / SOH) is chosen specifically
+                // because a real pty and the Linux kernel line discipline are involved. The byte 0x11
+                // (Ctrl-Q / VSTART, the original value) collides with the default c_cc[VSTART] used by IXON
+                // (software flow control) on Linux. The kernel intercepts 0x11 as an XON flow-control signal
+                // BEFORE the line discipline's VEOF processing runs, causing the byte to be silently swallowed
+                // as a flow control byte rather than delivered to the child as end-of-input. Using 0x01 avoids
+                // this collision entirely and ensures the VEOF byte reaches the child correctly.
                 Native.Posix.ptyConfigureTermiosForTests <-
-                    Some(fun slave -> Native.Posix.setPtyEofCharForTests slave 0x11uy)
+                    Some(fun slave -> Native.Posix.setPtyEofCharForTests slave 0x01uy)
 
                 try
                     let payload = "termios-configured-vEOF"
