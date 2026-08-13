@@ -558,6 +558,11 @@ of hammering restarts at backoff speed. Supervision runs through the `IProcessRu
 `.WithRunner(group)` to keep every incarnation in one shared kill-on-dispose group, or a
 `ScriptedRunner` to test supervision logic hermetically.
 
+`Supervisor.StartAsync()` exposes a live `SupervisionSession`. Its `StopAsync` gracefully stops a
+spawned process, while a capture-only runner is interrupted immediately through the capture token;
+in both cases the session completes with `StopReason.Stopped`. External token cancellation remains
+`ProcessError.Cancelled`.
+
 The optional `LivenessMemory` probe intentionally samples attributable **peak** tree memory for each
 incarnation. A transient peak remains a violation after current usage falls, so choose a threshold above
 expected startup spikes when they should not cause a restart; unsupported backends return a typed error.
