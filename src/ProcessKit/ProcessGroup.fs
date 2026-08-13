@@ -197,7 +197,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     member internal _.WaitHandle(handle: nativeint) : Task<Outcome> = waitOutcome handle
 
     /// Hard-kill the contained tree now (no grace) without releasing the group. Internal — used by
-    /// pipeline cancellation/timeout.
+    /// pipeline cancellation/timeout, which are fire-and-forget sweeps with no result channel of their
+    /// own: the pipeline's honest answer is the `Cancelled`/`TimedOut` outcome its stages resolve to, so
+    /// a refused kill shows up as a stage that did not conclude, never as a fabricated success. The public
+    /// `KillAll` is the verb that reports the kill's real outcome.
     member internal _.KillTree() = backend.KillTree() |> ignore
 
     // Tree-control / accounting verbs, spawn+track, and the release transition all serialize on `sync`.
@@ -653,6 +656,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// sweep kills nothing at all rather than downgrading to a raw `kill(pid, ...)` that a recycled pid
     /// could land on an unrelated process. Final disposal remains best-effort — it removes the cgroup
     /// regardless of either error.
+    ///
+    /// **Windows** reports `ProcessError.Io` when `TerminateJobObject` is REFUSED and the Job still holds
+    /// live members (or its accounting cannot be read at all, which is never read as "drained"). A refusal
+    /// on an already-empty Job stays a successful no-op, so repeating `KillAll` on a reaped tree — or
+    /// racing the tree's own exit — is idempotent as before. Closing the Job handle (`Dispose`) still kills
+    /// the tree through `KILL_ON_JOB_CLOSE`, but that backstop fires at teardown, not now, so it is
+    /// deliberately NOT reported as a completed kill here.
     member this.KillAll() : Result<unit, ProcessError> =
         this.WhenLive(fun () -> backend.KillTree())
 
@@ -706,7 +716,9 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// delivery failure and returns `ProcessError.Io` with the errno detail; when the group has several
     /// members, the first genuine failure is reported but every member still receives the signal.
     ///
-    /// On **Windows** `Signal.Kill` maps to the atomic Job terminate. `Signal.Int` and `Signal.Term`
+    /// On **Windows** `Signal.Kill` maps to the atomic Job terminate, and reports a refusal on exactly the
+    /// terms `KillAll` documents — `ProcessError.Io` while the Job still holds live members, an idempotent
+    /// success once it is empty. `Signal.Int` and `Signal.Term`
     /// are a best-effort soft stop combining two individually-targeted deliveries: a console
     /// **CTRL+BREAK** to each child started with `Command.WindowsCtrlSignals()` (spawned in its own
     /// console process group) AND a **`WM_CLOSE`** posted to the top-level windows of every member that

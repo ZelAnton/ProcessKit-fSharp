@@ -659,7 +659,7 @@ task {
 
         match proc.TakeStdin() with
         | Some stdin ->
-            do! stdin.WriteLineAsync "2 + 2" // writes "2 + 2\n", flushed
+            do! stdin.WriteLineAsync "2 + 2" // writes "2 + 2\n" to this pipe
             do! stdin.WriteLineAsync "6 * 7"
             do! stdin.FinishAsync() // send EOF so bc exits
         | None -> ()
@@ -677,7 +677,7 @@ await using var proc = (await new Command("bc").KeepStdinOpen().StartAsync()).Ge
 
 if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and won't match
 {
-    await stdin.WriteLineAsync("2 + 2"); // writes "2 + 2\n", flushed
+    await stdin.WriteLineAsync("2 + 2"); // writes "2 + 2\n" to this pipe
     await stdin.WriteLineAsync("6 * 7");
     await stdin.FinishAsync(); // send EOF so bc exits
 }
@@ -685,7 +685,8 @@ if (proc.TakeStdin() is { Value: var stdin }) // Some(stdin); None is null and w
 // ... then read proc.StdoutLinesAsync() for the answers.
 ```
 
-`ProcessStdin` offers `WriteLineAsync(line)` (appends a newline and flushes),
+`ProcessStdin` offers `WriteLineAsync(line)` (appends LF for a plain stdin pipe or POSIX PTY,
+and CR for Windows ConPTY so a cooked console reader receives Enter),
 `WriteAsync(bytes)` (raw bytes, for binary input), `FlushAsync()`, and `FinishAsync()` (close
 stdin / send EOF). Disposing the writer — or the whole `RunningProcess` — closes
 stdin too; `FinishAsync()` just makes the EOF explicit and awaitable. The write verbs
