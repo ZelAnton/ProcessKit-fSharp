@@ -232,11 +232,16 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
             Native.Windows.processIdWindows spawned.Handle
 
         member _.KillChild(spawned) =
-            Native.Windows.terminateWindowsProcess spawned.Handle
+            // `KillChild` is the interface's deliberately fire-and-forget verb (it backs
+            // `RunningProcess.Kill()`, which is `unit` by design, like `Process.Kill()`), so there is no
+            // result channel to report a refused terminate on. Discarding it here is NOT the fabricated
+            // success this backend used to report from `SignalChild`/`Signal`/`KillTree`: a caller who needs
+            // to know whether the kill landed uses `RunningProcess.Signal(Signal.Kill)` or simply awaits the
+            // run — a child that refused to die keeps its exit wait pending instead of being reported dead.
+            Native.Windows.terminateWindowsProcess spawned.Handle |> ignore
 
         member _.KillTree() =
             Native.Windows.terminateWindowsJob jobHandle
-            Ok()
 
         member _.GracefulKillTree (_signal) (grace) =
             // A best-effort SOFT phase before the atomic Job kill. Windows has no per-job graceful
@@ -264,9 +269,18 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
             // lock with a valid handle), fall back to an immediate hard kill on the still-valid `jobHandle`
             // rather than poll a handle we cannot protect — the unconditional kill-on-drop guarantee holds
             // either way.
+            //
+            // Both hard kills below discard the terminate's `Result`, and that is a different thing from
+            // the fabricated `Ok()` this task removed from `KillTree`/`Signal`/`SignalChild`: the graceful
+            // teardown's contract is `Task`, so it makes no success CLAIM to falsify. What it must not do is
+            // react to a refusal by waiting longer, and it does not — `GracefulTeardown.poll` is bounded by
+            // `grace` and force-kills at most once at the end, so a refused terminate returns immediately
+            // instead of spinning on a tree that will not die. The observable consequence of the refusal
+            // reaches the caller through the exit wait it is already awaiting (`StopAsync`/`ShutdownAsync`
+            // resolve on the child's real conclusion), never as a fake "the tree is gone".
             match Native.Windows.duplicateJobHandle jobHandle with
             | None ->
-                Native.Windows.terminateWindowsJob jobHandle
+                Native.Windows.terminateWindowsJob jobHandle |> ignore
                 Task.CompletedTask
             | Some ownedJob ->
                 task {
@@ -275,7 +289,7 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
                             GracefulTeardown.poll
                                 (fun () -> Native.Windows.postCloseToJobWindows ownedJob |> ignore)
                                 (fun () -> Native.Windows.jobTreeAliveWindows ownedJob)
-                                (fun () -> Native.Windows.terminateWindowsJob ownedJob)
+                                (fun () -> Native.Windows.terminateWindowsJob ownedJob |> ignore)
                                 grace
                     finally
                         Native.Windows.closeWindowsHandle ownedJob
@@ -285,8 +299,10 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
         member _.SignalChild(spawned, signal) =
             match signal with
             | Signal.Kill ->
+                // The honest outcome of the native terminate: a still-live child that refused to die is a
+                // `ProcessError.Io`, while one that had already exited stays an idempotent `Ok` (see
+                // `terminateWindowsProcess`, which classifies through this very handle).
                 Native.Windows.terminateWindowsProcess spawned.Handle
-                Ok()
             | Signal.Int
             | Signal.Term ->
                 let ctrlDelivered =
@@ -316,8 +332,10 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
         member _.Signal(signal) =
             match signal with
             | Signal.Kill ->
+                // Same honesty as `KillTree` (this IS the whole-tree kill, reached through the signal
+                // vocabulary): a refused `TerminateJobObject` on a Job that still holds live members is a
+                // `ProcessError.Io`, an already-drained Job stays an idempotent `Ok`.
                 Native.Windows.terminateWindowsJob jobHandle
-                Ok()
             | Signal.Int
             | Signal.Term ->
                 // Best-effort SOFT stop combining TWO complementary, individually-targeted deliveries so
