@@ -1353,42 +1353,71 @@ type PtyTests() =
             if not isWindows then
                 Assert.Ignore "Windows-only ConPTY path"
             else
-                let script =
-                    "$line = [Console]::In.ReadLine(); "
-                    + "[Console]::Out.WriteLine('REPLY=' + $line); "
-                    + "if ($null -ne $line -and $line.Contains('hello')) { exit 0 } else { exit 9 }"
+                // Same style as the T-335 tests above (R-01): the verdict is the EXIT CODE, reachable only if
+                // the cooked console reader actually saw the line "hello" terminated by Enter — i.e. only if
+                // `WriteLineAsync`'s CR terminator was accepted as Enter. No dependency on captured stdout, and
+                // no skip gate on the outcome itself (removed per R-01) — the only legitimate skip is the
+                // pre-1809 no-ConPTY host, handled below before any data is sent.
+                //
+                // The reader has to be `cmd.exe`'s `set /p ... <CON`, not a managed line reader
+                // (`[Console]::In.ReadLine()`, `Read-Host`): investigating this finding's original failure
+                // (Exited 9, empty line) traced it to a Windows/ConPTY host-process quirk, unrelated to the CR
+                // terminator this task changes — a managed process's inherited `STD_INPUT_HANDLE` under this
+                // spawn does not resolve to the pseudoconsole's console (confirmed: `GetConsoleMode` on it
+                // fails), so anything reading through that handle (`[Console]::In`, and even `cmd.exe`'s own
+                // `set /p` without `<CON`) sees no input at all before any terminator byte is even in play. The
+                // T-335 tests above sidestep this the same way `copy con` always has: by opening the console
+                // device explicitly (`CON`) rather than trusting the inherited standard handle. `<CON` applies
+                // that same, already-proven-reliable path to a genuine Enter-terminated line read, which is
+                // exactly the contract this test exists to prove. A batch file (not an inline `cmd.exe /c`
+                // one-liner) avoids `%line%`'s parse-time (not run-time) expansion inside a single compound
+                // command line — an unrelated batch-scripting quirk, not a ConPTY one.
+                let batchFile =
+                    IO.Path.Combine(IO.Path.GetTempPath(), "conpty-writeline-" + Guid.NewGuid().ToString("N") + ".cmd")
 
-                let command =
-                    Command.create "powershell.exe"
-                    |> Command.args [ "-NoLogo"; "-NoProfile"; "-NonInteractive"; "-Command"; script ]
-                    |> Command.pty
-                    |> Command.keepStdinOpen
-                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+                IO.File.WriteAllLines(
+                    batchFile,
+                    [| "@echo off"
+                       "set /p line=<CON"
+                       "if not \"%line%\"==\"hello\" goto :fail"
+                       "exit 7"
+                       ":fail"
+                       "exit 9" |]
+                )
 
-                match! runner.StartAsync(command, CancellationToken.None) with
-                | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
-                    Assert.Ignore $"host lacks ConPTY: {message}"
-                | Error other -> Assert.Fail $"unexpected error from a ConPTY spawn: {other}"
-                | Ok running ->
-                    use running = running
+                try
+                    let command =
+                        Command.create "cmd.exe"
+                        |> Command.args [ "/c"; batchFile ]
+                        |> Command.pty
+                        |> Command.keepStdinOpen
+                        |> Command.timeout (TimeSpan.FromSeconds 30.0)
 
-                    match running.TakeStdin() with
-                    | None -> Assert.Fail "a KeepStdinOpen ConPTY run must hand out an interactive stdin"
-                    | Some stdin -> do! stdin.WriteLineAsync "hello"
+                    match! runner.StartAsync(command, CancellationToken.None) with
+                    | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
+                        Assert.Ignore $"host lacks ConPTY: {message}"
+                    | Error other -> Assert.Fail $"unexpected error from a ConPTY spawn: {other}"
+                    | Ok running ->
+                        use running = running
 
-                    match! running.OutputStringAsync() with
-                    | Error error -> Assert.Fail $"the ConPTY line-reader run failed: {error}"
-                    | Ok result ->
-                        match result.Outcome with
-                        | Outcome.Exited 0 ->
-                            if result.Stdout.Contains "REPLY=" then
-                                Assert.That(result.Stdout, Does.Contain "REPLY=hello")
-                        | Outcome.Exited 9 when not (result.Stdout.Contains "REPLY=") ->
-                            // A console-attached parent can make a console-subsystem child use that console
-                            // instead of ConPTY for text I/O (fixture note). The console-less CI host runs
-                            // the full assertion above; this environment cannot exercise that round trip.
-                            Assert.Ignore "ConPTY round-trip needs a console-less test host"
-                        | other -> Assert.Fail $"the ConPTY line reader did not receive hello: {other}"
+                        match running.TakeStdin() with
+                        | None -> Assert.Fail "a KeepStdinOpen ConPTY run must hand out an interactive stdin"
+                        | Some stdin -> do! stdin.WriteLineAsync "hello"
+
+                        let! outcome = running.WaitAsync()
+
+                        match outcome with
+                        | Outcome.Exited 7 -> ()
+                        | other ->
+                            Assert.Fail
+                                $"WriteLineAsync's CR terminator did not submit Enter to the cooked console reader, got {other}"
+                finally
+                    try
+                        IO.File.Delete batchFile
+                    with :? IOException ->
+                        // Best-effort cleanup of the scratch batch file; a leaked temp file does not affect
+                        // correctness of this or later runs (each run gets a fresh GUID-named file).
+                        ()
         }
 
     [<Test>]
