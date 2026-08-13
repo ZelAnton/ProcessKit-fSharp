@@ -141,6 +141,26 @@ module private LaunchedDouble =
 
         new RunningProcess(host)
 
+/// A runner double that drains `stream` into its captured stdout — the same evidence a live child's
+/// stdin feeder would leave behind — so a run that follows one which ended without a child can prove
+/// it was handed the ORIGINAL payload rather than the empty remains of an exhausted source.
+module private DrainingDouble =
+
+    let over (stream: Stream) : IProcessRunner =
+        { new IProcessRunner with
+            member _.CaptureStringAsync(_, _) =
+                task {
+                    use fed = new MemoryStream()
+                    do! stream.CopyToAsync fed
+                    return Ok(ProcessResult.Success(Encoding.UTF8.GetString(fed.ToArray())))
+                }
+
+            member _.CaptureBytesAsync(_, _) =
+                Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+            member _.SpawnAsync(command, _) =
+                Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
 [<TestFixture>]
 type RunnerTests() =
 
@@ -1127,6 +1147,261 @@ type RunnerTests() =
             match second with
             | Ok text -> Assert.That(text, Is.EqualTo "payload")
             | Error error -> Assert.Fail $"expected the returned payload to be usable, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a run refused by an already-cancelled token hands the one-shot payload back``() : Task =
+        task {
+            let mutable launches = 0
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            // Routes through the real capture launch boundary, which refuses to start a child under an
+            // already-cancelled token: the first run below therefore reports `Cancelled` without ever
+            // reaching one, and its reservation must not outlive it.
+            let launching =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(command, cancellationToken) =
+                        CaptureVerbs.runToCompletion
+                            command
+                            cancellationToken
+                            (fun () ->
+                                launches <- launches + 1
+                                Task.FromResult(Ok(LaunchedDouble.runningProcess command)))
+                            (fun running ->
+                                task {
+                                    use _ = running
+                                    use fed = new MemoryStream()
+                                    do! stream.CopyToAsync fed
+                                    return Ok(ProcessResult.Success(Encoding.UTF8.GetString(fed.ToArray())))
+                                })
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            use cts = new CancellationTokenSource()
+            cts.Cancel()
+
+            let! cancelled = command |> Runner.run launching cts.Token
+
+            match cancelled with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+            Assert.That(launches, Is.EqualTo 0)
+
+            // No child was ever started, so the payload is untouched: the next run is handed it rather
+            // than the reservation's "another run already holds it" refusal.
+            let! second = command |> Runner.run launching CancellationToken.None
+
+            match second with
+            | Ok text -> Assert.That(text, Is.EqualTo "payload")
+            | Error error -> Assert.Fail $"expected the returned payload to be usable, got {error}"
+
+            Assert.That(launches, Is.EqualTo 1)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a retry backoff cancelled after a pre-spawn failure hands the one-shot payload back``() : Task =
+        task {
+            let provider = RetryTimeProvider()
+            use cancelOn = new CancellationTokenSource()
+            let mutable calls = 0
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let spawnFailing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Error(ProcessError.Spawn("svc", "resource temporarily unavailable")))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.timeProvider provider
+                |> Command.cancelOn cancelOn.Token
+                |> Command.retry 3 (TimeSpan.FromSeconds 60.0) (fun _ -> true)
+
+            let run = command |> Runner.run spawnFailing CancellationToken.None
+
+            // The armed backoff timer is the deterministic signal that attempt 1 failed before any
+            // child and the loop is now waiting to retry. Cancelling there ends the run on a
+            // `Cancelled` produced by the retry machinery itself, over a payload nothing has read.
+            let! _ = provider.WaitForTimer 0
+            cancelOn.Cancel()
+
+            match! run with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+            Assert.That(calls, Is.EqualTo 1)
+
+            // A fresh command over the SAME stream — the claim is keyed on the payload object, not on
+            // the command — must be handed the untouched payload.
+            let! second =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+                |> Runner.run (DrainingDouble.over stream) CancellationToken.None
+
+            match second with
+            | Ok text -> Assert.That(text, Is.EqualTo "payload")
+            | Error error -> Assert.Fail $"expected the returned payload to be usable, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing retry classifier after a pre-spawn failure hands the one-shot payload back``() : Task =
+        task {
+            let mutable calls = 0
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            let spawnFailing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        calls <- calls + 1
+                        Task.FromResult(Error(ProcessError.Spawn("svc", "resource temporarily unavailable")))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            // The classifier is only ever consulted after a pre-child failure, so a fault out of it
+            // ends the run over a payload that provably survived attempt 1.
+            let throwing = fun _ -> raise (InvalidOperationException "classifier boom")
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero throwing
+
+            let! result = command |> Runner.run spawnFailing CancellationToken.None
+
+            match result with
+            | Error(ProcessError.RetryPredicate(_, original, _)) ->
+                Assert.That(original, Is.EqualTo(ProcessError.Spawn("svc", "resource temporarily unavailable")))
+            | other -> Assert.Fail $"expected RetryPredicate, got {other}"
+
+            Assert.That(calls, Is.EqualTo 1)
+
+            let! second =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+                |> Runner.run (DrainingDouble.over stream) CancellationToken.None
+
+            match second with
+            | Ok text -> Assert.That(text, Is.EqualTo "payload")
+            | Error error -> Assert.Fail $"expected the returned payload to be usable, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an attempt that throws before launching hands the one-shot payload back``() : Task =
+        task {
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            // A runner that faults instead of returning a typed result never reached a launch boundary
+            // here, so the payload is exactly as intact as after a `Spawn` failure. The reservation is
+            // settled on the way out rather than stranded for the life of the stream.
+            let throwing =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(_, _) =
+                        raise (InvalidOperationException "runner boom")
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let mutable faulted = false
+
+            try
+                let! _ = command |> Runner.run throwing CancellationToken.None
+                ()
+            with :? InvalidOperationException ->
+                // The runner's own fault is what this arm is proving reaches the caller unchanged; the
+                // reservation settlement it must NOT skip is asserted by the second run below.
+                faulted <- true
+
+            Assert.That(faulted, Is.True)
+
+            let! second =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+                |> Runner.run (DrainingDouble.over stream) CancellationToken.None
+
+            match second with
+            | Ok text -> Assert.That(text, Is.EqualTo "payload")
+            | Error error -> Assert.Fail $"expected the returned payload to be usable, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a cancellation that arrives mid-attempt keeps the one-shot payload held``() : Task =
+        task {
+            use cts = new CancellationTokenSource()
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "payload")
+
+            // The token is live when the attempt starts and fires while it is in flight — the shape of
+            // a cancellation that may have killed a child already draining the source. Nothing proves
+            // the payload survived, so this run must keep holding it.
+            let cancellingMidAttempt =
+                { new IProcessRunner with
+                    member _.CaptureStringAsync(command, _) =
+                        cts.Cancel()
+                        Task.FromResult(Error(ProcessError.Cancelled command.Program))
+
+                    member _.CaptureBytesAsync(_, _) =
+                        Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+                    member _.SpawnAsync(command, _) =
+                        Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+            let command =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+            let! first = command |> Runner.run cancellingMidAttempt cts.Token
+
+            match first with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+            let! second =
+                Command.create "svc"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+                |> Runner.run (DrainingDouble.over stream) CancellationToken.None
+
+            match second with
+            | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "one-shot stdin source")
+            | other -> Assert.Fail $"expected the held payload to refuse a later run, got {other}"
         }
         :> Task
 

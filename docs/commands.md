@@ -872,7 +872,12 @@ Console.WriteLine(await cmd.RunAsync() switch
   consulting your classifier, rather than feeding a second child an exhausted
   source. Such a run also reserves the source while it holds it: a concurrent run
   over the same stream or sequence — or a later one, once a child has read it — is
-  refused with `ProcessError.Unsupported` instead of being handed the remains.
+  refused with `ProcessError.Unsupported` instead of being handed the remains. The
+  reservation is released again whenever the run ends without any attempt reaching a
+  child — an already-cancelled token, a cancellation during the backoff, a throwing
+  classifier, or an attempt that threw before launching all hand the source back to
+  the next run — while a run that may have reached one (a success, a post-child
+  failure, or a cancellation that arrived mid-attempt) keeps it.
 - **`RetryBackoff`** uses the same attempt/classifier contract with a growing
   `baseDelay × factor^n` pause, capped by `maxDelay` before optional `[0.5, 1.5)`
   jitter. Base/cap delays must be non-negative and `factor` must be finite and at

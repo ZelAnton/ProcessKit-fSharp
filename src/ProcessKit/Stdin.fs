@@ -202,8 +202,11 @@ type internal OneShotStdinReservation internal (claim: OneShotStdinClaim) =
 /// **Scope, honestly stated.** This is *not* a general cross-runner reservation: only a retrying run
 /// reserves, and only the capture launch boundary commits. A payload drained by a streaming
 /// `SpawnAsync`, a pipeline, or a supervised incarnation is therefore not recorded here, so a later
-/// retrying run can still reserve it and feed its child an exhausted source. Making every launch
-/// reserve — for every runner and every verb — is a separate, wider change.
+/// retrying run can still reserve it and feed its child an exhausted source. That same boundary is
+/// what lets a run hand an unspent payload back (`Runner.withRetry` releases only what no attempt of
+/// its own could have fed to a child), so a custom `IProcessRunner` that launches without going
+/// through it is invisible to both halves. Making every launch reserve — for every runner and every
+/// verb — is a separate, wider change.
 [<RequireQualifiedAccess>]
 module internal OneShotStdin =
 
