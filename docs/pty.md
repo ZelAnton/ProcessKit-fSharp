@@ -131,6 +131,17 @@ output until the run ends.
 Because this is a character the line discipline interprets, it only ends the input of a child whose
 terminal is in canonical (cooked) mode. A child that switches its own tty to raw mode receives that
 byte as ordinary input, as it would from a real terminal; end it by stopping the child instead.
+
+On Windows the same three callers send the console's own end-of-input gesture instead: Ctrl-Z followed
+by Enter, the end of input `copy con` has always been finished with. The pseudoconsole's input stays
+open either way, and for the same reason: closing it asks the console host to end the whole session
+rather than telling the child its input is over, which can tear down a child that has not even reached
+its first read. A Windows PTY run therefore holds that input open for the child's whole lifetime —
+including a run with no stdin source and no `KeepStdinOpen` at all — and closes it once the child has
+exited. The cooked-mode caveat applies here too: a child whose `CONIN$` console mode is no longer in line
+mode reads Ctrl-Z as ordinary input. And as on POSIX, a child that reads to end of input needs a source
+or an explicit finish to see one.
+
 A delivery that genuinely fails is reported — an `IOException` from `FinishAsync`, a typed
 `ProcessError.Io` from `CloseStdinAsync` — rather than leaving the child waiting.
 

@@ -64,11 +64,13 @@ module internal Common =
     /// A parent-side stdin stream whose LOGICAL end of input is more than closing the handle, so the
     /// ordinary teardown-race-safe dispose would leave the child waiting for an EOF that never comes.
     ///
-    /// The one implementation today is the POSIX pty stdin view (`Native.Posix.PtyStdinStream`): it is a
-    /// NON-owning second view over the pty master fd the merged-output stream owns, so closing it releases
-    /// nothing and the child's terminal never hangs up — the child sees end of input only once the line
-    /// discipline receives the terminal's own end-of-input character. Every stdin stream that is simply a
-    /// pipe end (the socketpair paths, Windows) does NOT implement this, and keeps being closed by dispose.
+    /// Both implementations today are PTY stdin views, and both are NON-owning: the POSIX one
+    /// (`Native.Posix.PtyStdinStream`) is a second view over the pty master fd the merged-output stream owns,
+    /// and the Windows one (`Native.Windows.ConPtyStdinStream`) writes through the ConPTY host-input pipe the
+    /// pseudoconsole session itself keeps open. Closing either releases nothing and the child's terminal
+    /// never goes away under it — the child sees end of input only once its terminal receives that terminal's
+    /// own end-of-input gesture. Every stdin stream that is simply a pipe end (the socketpair paths, a
+    /// non-PTY Windows spawn) does NOT implement this, and keeps being closed by dispose.
     ///
     /// Both reliable finish paths route through this when the stream implements it — `ProcessStdin.FinishAsync`
     /// (the interactive handle) and the bulk stdin feeder (`Pump.feedStdin*`, when the source is the child's

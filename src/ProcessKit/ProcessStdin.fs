@@ -43,14 +43,16 @@ type ProcessStdin internal (stream: Stream, encoding: Text.Encoding) =
     /// calls above before closing rather than the close itself. Writes through this handle are refused
     /// once it has been finished.
     ///
-    /// Under a POSIX **PTY** there is no stdin pipe to close — stdin is a view over the terminal the
-    /// child's output also comes from — so the end of input is delivered as the terminal's own
-    /// end-of-input character (`termios.c_cc[VEOF]`, Ctrl-D on a default terminal) instead. The child
-    /// therefore sees EOF only while its terminal is in canonical mode; one that switched its tty to raw
-    /// mode reads that character as ordinary input, which is the line discipline's contract. A genuine
-    /// failure to deliver it throws (an `IOException`) rather than leaving a child that reads to EOF
-    /// waiting forever — a child that has already closed its terminal, and a run whose own teardown has
-    /// been through here, both still complete quietly.
+    /// Under a **PTY** there is no stdin pipe to close — stdin writes into the terminal the child's output
+    /// also comes from, and closing it would end the child's terminal rather than its input — so the end of
+    /// input is delivered as the terminal's own end-of-input gesture instead: on POSIX the pty's configured
+    /// end-of-input character (`termios.c_cc[VEOF]`, Ctrl-D on a default terminal), on Windows the console's
+    /// Ctrl-Z followed by Enter. The child therefore sees EOF only while its terminal is still in cooked
+    /// mode (POSIX canonical mode, or a Windows console its own `CONIN$` mode has not switched to raw); one
+    /// that reads its terminal raw gets those bytes as ordinary input, which is the terminal's contract. A
+    /// genuine failure to deliver the gesture throws (an `IOException`) rather than leaving a child that
+    /// reads to EOF waiting forever — a child that has already closed its terminal, and a run whose own
+    /// teardown has been through here, both still complete quietly.
     member _.FinishAsync() : Task =
         match box stream with
         | :? Native.Common.IStdinFinisher as finisher -> finisher.FinishAsync()

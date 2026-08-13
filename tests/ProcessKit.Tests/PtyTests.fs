@@ -10,6 +10,57 @@ open Microsoft.Win32.SafeHandles
 open NUnit.Framework
 open ProcessKit
 
+/// A stand-in for the ConPTY session's host-input pipe (T-335): it records every byte written, counts how
+/// many times it is actually closed, and can be told to fail writes with a chosen exception. The parts under
+/// test — who owns that pipe (`Native.Windows.ConPtyInputKeepalive`), the non-owning writer over it
+/// (`Native.Windows.ConPtyStdinStream`), and the console end-of-input gesture the writer's finish delivers —
+/// are ordinary managed code over a `Stream`, so they are exercised on every platform rather than only where
+/// a real pseudoconsole can be created.
+type internal ConPtyHostInputDouble(failWrites: exn option) =
+    inherit Stream()
+
+    let written = ResizeArray<byte>()
+    let mutable disposeCount = 0
+
+    new() = new ConPtyHostInputDouble(None)
+
+    /// Everything written through this pipe, in order.
+    member _.Written = written.ToArray()
+
+    /// How many times this pipe has actually been closed — the "exactly once" a session teardown owes it.
+    member _.DisposeCount = disposeCount
+
+    override _.CanRead = false
+    override _.CanSeek = false
+    override _.CanWrite = true
+
+    override _.Length =
+        raise (NotSupportedException "the host-input pipe double has no length")
+
+    override _.Position
+        with get () = raise (NotSupportedException "the host-input pipe double has no position")
+        and set (_: int64) = raise (NotSupportedException "the host-input pipe double has no position")
+
+    override _.Flush() = ()
+
+    override _.Read(_buffer: byte[], _offset: int, _count: int) =
+        raise (NotSupportedException "the host-input pipe double is write-only")
+
+    override _.Seek(_offset: int64, _origin: SeekOrigin) =
+        raise (NotSupportedException "the host-input pipe double is not seekable")
+
+    override _.SetLength(_value: int64) =
+        raise (NotSupportedException "the host-input pipe double has no length")
+
+    override _.Write(buffer: byte[], offset: int, count: int) =
+        match failWrites with
+        | Some ex -> raise ex
+        | None -> written.AddRange(Array.sub buffer offset count)
+
+    override _.Dispose(disposing) =
+        disposeCount <- disposeCount + 1
+        base.Dispose disposing
+
 /// Tests for the opt-in PTY (pseudo-terminal) mode: Stage 1 (T-137) — `PtyConfig`, the `Command.Pty` /
 /// `Command.pty` builders, the build-time guards (D4/D8 + the pipeline guard), the Windows ConPTY spawn;
 /// and Stage 2 (T-138) — the real POSIX `openpty` (`posix_openpt`) + `setsid --ctty` spawn: a merged
@@ -763,6 +814,169 @@ type PtyTests() =
         }
 
     // ----------------------------------------------------------------------------------
+    // T-335: a ConPTY run's host-input pipe belongs to the SESSION, not to the stdin writer. Closing it asks
+    // conhost to end the console session (a child that has not run yet can be closed out from under itself),
+    // so ending stdin delivers the console's own end-of-input gesture — Ctrl-Z + Enter — instead.
+    // ----------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``finishing a ConPTY stdin delivers Ctrl-Z + Enter and leaves the session's pipe open (T-335)``() : Task =
+        task {
+            let pipe = new ConPtyHostInputDouble()
+            let keepalive = new Native.Windows.ConPtyInputKeepalive(pipe)
+            use stdin = new Native.Windows.ConPtyStdinStream(keepalive)
+
+            do! stdin.WriteAsync([| 0x41uy |], 0, 1)
+            do! stdin.FinishAsync()
+
+            // The payload first, then the gesture: Ctrl-Z (0x1A) submits the pending console line as end of
+            // input, and the carriage return is the Enter a terminal sends to commit it.
+            Assert.That(pipe.Written, Is.EqualTo<byte[]>([| 0x41uy; 0x1Auy; 0x0Duy |]))
+            Assert.That(stdin.IsFinished, Is.True)
+
+            // The session's pipe is untouched by the finish — closing it would end the child's console
+            // instead of its input, which is the whole point of the split.
+            Assert.That(pipe.DisposeCount, Is.Zero, "finishing stdin must not close the session's host-input pipe")
+
+            // Input after the end of input is refused, never written silently past the EOF the child saw.
+            Assert.Throws<ObjectDisposedException>(Action(fun () -> stdin.Write([| 1uy |], 0, 1)))
+            |> ignore
+
+            // Idempotent, as `ProcessStdin.FinishAsync`/`PtySession.CloseStdinAsync` both promise.
+            do! stdin.FinishAsync()
+
+            Assert.That(pipe.Written.Length, Is.EqualTo 3, "a repeated finish must not deliver a second gesture")
+        }
+
+    [<Test>]
+    member _.``a dropped ConPTY stdin writer leaves the session running, and teardown closes the pipe once (T-335)``
+        ()
+        : Task =
+        task {
+            let pipe = new ConPtyHostInputDouble()
+            let keepalive = new Native.Windows.ConPtyInputKeepalive(pipe)
+
+            // Dropping the writer (or never taking one, which is the same code path with no writer at all)
+            // must not take the console session with it.
+            let writer = new Native.Windows.ConPtyStdinStream(keepalive)
+            writer.Dispose()
+
+            Assert.That(pipe.DisposeCount, Is.Zero, "a non-owning writer must not close the session's pipe")
+            Assert.That(keepalive.IsReleased, Is.False)
+
+            // A released writer refuses further input rather than pushing bytes into a session it no longer
+            // has a handle on, and its finish is quiet: the run's own teardown has been through here.
+            Assert.Throws<ObjectDisposedException>(Action(fun () -> writer.Write([| 1uy |], 0, 1)))
+            |> ignore
+
+            do! writer.FinishAsync()
+            Assert.That(pipe.Written, Is.Empty, "a writer the run already released has no end of input to send")
+
+            // Child exit and the setup unwind are two independent paths onto the same pipe; the shared
+            // one-shot guard means whichever arrives first is the only real close.
+            keepalive.Release()
+            (keepalive :> IDisposable).Dispose()
+            keepalive.Release()
+
+            Assert.That(pipe.DisposeCount, Is.EqualTo 1, "the session's host-input pipe must be closed exactly once")
+            Assert.That(keepalive.IsReleased, Is.True)
+        }
+
+    [<Test>]
+    member _.``finishing a ConPTY stdin whose session already ended completes quietly (T-335)``() : Task =
+        task {
+            // The child exited: the child-exit teardown closed the pseudoconsole and released the session's
+            // pipe. There is no console left to hand an end of input to, and no child left to read one —
+            // moot, not a failed delivery, exactly as closing a pipe whose peer is gone is not an error.
+            let pipe = new ConPtyHostInputDouble()
+            let keepalive = new Native.Windows.ConPtyInputKeepalive(pipe)
+            use stdin = new Native.Windows.ConPtyStdinStream(keepalive)
+            keepalive.Release()
+
+            do! stdin.FinishAsync()
+
+            Assert.That(stdin.IsFinished, Is.True)
+            Assert.That(pipe.Written, Is.Empty)
+
+            // The same applies when the write itself is what reports the hangup: conhost let go of the read
+            // end (ERROR_BROKEN_PIPE as HRESULT_FROM_WIN32) a moment before our own teardown got there.
+            let brokenPipe =
+                new ConPtyHostInputDouble(Some(IOException("Pipe is broken.", 0x8007006D)))
+
+            let liveKeepalive = new Native.Windows.ConPtyInputKeepalive(brokenPipe)
+            use brokenStdin = new Native.Windows.ConPtyStdinStream(liveKeepalive)
+
+            do! brokenStdin.FinishAsync()
+            Assert.That(brokenStdin.IsFinished, Is.True)
+        }
+
+    [<Test>]
+    member _.``a failed ConPTY end-of-input delivery surfaces instead of being swallowed (T-335)``() : Task =
+        task {
+            // A genuine write failure — not the "the console is already gone" hangup — must reach the caller:
+            // a child reading to EOF would otherwise wait forever on a gesture that was silently dropped.
+            let pipe =
+                new ConPtyHostInputDouble(Some(IOException "the console host rejected the write"))
+
+            let keepalive = new Native.Windows.ConPtyInputKeepalive(pipe)
+            use stdin = new Native.Windows.ConPtyStdinStream(keepalive)
+
+            let first = stdin.FinishAsync()
+            let second = stdin.FinishAsync()
+            Assert.That(Object.ReferenceEquals(first, second), Is.True)
+
+            let observe (delivery: Task) =
+                task {
+                    try
+                        do! delivery
+                        return None
+                    with :? IOException as ex ->
+                        return Some ex.Message
+                }
+
+            let! firstError = observe first
+            let! secondError = observe second
+
+            match firstError, secondError with
+            | Some firstMessage, Some secondMessage ->
+                Assert.That(firstMessage, Does.Contain "the console host rejected the write")
+                Assert.That(secondMessage, Is.EqualTo firstMessage)
+            | _ -> Assert.Fail "every repeated FinishAsync caller must observe the delivery failure"
+        }
+
+    [<Test>]
+    member _.``a ConPTY child that never reads stdin runs to its last statement (T-335)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only ConPTY path"
+            else
+                // The regression this guards: with no stdin source and no `KeepStdinOpen`, the spawn used to
+                // close the pseudoconsole's host-input pipe the moment the child was resumed, which asks
+                // conhost to end the console session and can reach the child as a CTRL_CLOSE_EVENT before it
+                // has run. The proof is the child's own EXIT CODE, not its output: a ConPTY child's captured
+                // text depends on the parent's console (see the fixture note), while `exit 7` can only be
+                // reached by a child that survived to its last statement. The `ping` ahead of it is the
+                // window that close used to land in.
+                let cmd =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/c"; "ping -n 3 127.0.0.1 >NUL & exit 7" ]
+                    |> Command.pty
+                    |> Command.timeout (TimeSpan.FromSeconds 60.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) when msg.Contains "1809" ->
+                    // Pre-1809 host without ConPTY — the documented typed-Unsupported path (D9).
+                    Assert.Ignore $"host lacks ConPTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a ConPTY spawn: {other}"
+                | Ok result ->
+                    match result.Outcome with
+                    | Outcome.Exited 7 -> ()
+                    | other ->
+                        Assert.Fail
+                            $"a ConPTY child that never reads stdin must run to its last statement (exit 7), got {other}"
+        }
+
+    // ----------------------------------------------------------------------------------
     // Stage 4 (T-140): RunningProcess.ResizeAsync + PtyConfig.Echo effect
     // ----------------------------------------------------------------------------------
 
@@ -1045,6 +1259,87 @@ type PtyTests() =
                     match result.Outcome with
                     | Outcome.Exited 0 -> ()
                     | other -> Assert.Fail $"the child should have seen EOF and exited cleanly, got {other}"
+        }
+
+    [<Test>]
+    member _.``a ConPTY bulk stdin source ends the child's input with the console gesture (T-335)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only ConPTY path"
+            else
+                // The Windows counterpart of the POSIX bulk-stdin test above. `copy con` is the canonical
+                // console reader that ends only at the console's own end of input, so this run can finish at
+                // all only if draining the source delivers the Ctrl-Z + Enter gesture through the
+                // pseudoconsole; without it the child reads forever and the run ends as a timeout kill
+                // instead (confirmed by deleting the gesture bytes: the same child then burns its whole
+                // timeout). The payload carries no trailing newline, so the gesture also has to submit the
+                // line the child is holding.
+                //
+                // The EXIT CODE is the assertion, not the captured text: a ConPTY child's text capture
+                // depends on the parent's console (see the fixture note), while `exit 7` can only be reached
+                // by a child whose `copy con` actually saw end of input.
+                let cmd =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/c"; "copy con NUL & exit 7" ]
+                    |> Command.pty
+                    |> Command.stdin (Stdin.FromString "conpty-end-of-input")
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) when msg.Contains "1809" ->
+                    // Pre-1809 host without ConPTY — the documented typed-Unsupported path (D9).
+                    Assert.Ignore $"host lacks ConPTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a ConPTY spawn: {other}"
+                | Ok result ->
+                    match result.Outcome with
+                    | Outcome.Exited 7 -> ()
+                    | other ->
+                        Assert.Fail $"draining the stdin source must end the ConPTY child's input (exit 7), got {other}"
+        }
+
+    [<Test>]
+    member _.``an interactive ConPTY stdin ends the child's input on FinishAsync (T-335)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only ConPTY path"
+            else
+                // The interactive half of the same contract: the writer handed out by `TakeStdin` sends a
+                // line and then ends the child's input through `ProcessStdin.FinishAsync`, which must reach
+                // `copy con` as end of input rather than closing the console session under it. A second
+                // finish is a no-op and a write afterwards is refused.
+                let cmd =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/c"; "copy con NUL & exit 7" ]
+                    |> Command.pty
+                    |> Command.keepStdinOpen
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! runner.StartAsync(cmd, CancellationToken.None) with
+                | Error(ProcessError.Unsupported msg) when msg.Contains "1809" ->
+                    // Pre-1809 host without ConPTY — the documented typed-Unsupported path (D9).
+                    Assert.Ignore $"host lacks ConPTY: {msg}"
+                | Error other -> Assert.Fail $"unexpected error from a ConPTY spawn: {other}"
+                | Ok running ->
+                    use _running = running
+
+                    match running.TakeStdin() with
+                    | None -> Assert.Fail "a KeepStdinOpen ConPTY run must hand out an interactive stdin"
+                    | Some stdin ->
+                        do! stdin.WriteAsync(Text.Encoding.UTF8.GetBytes "conpty-interactive")
+                        do! stdin.FinishAsync()
+                        // Idempotent, and no further input can trail past the end of input the child saw.
+                        do! stdin.FinishAsync()
+
+                        Assert.ThrowsAsync<ObjectDisposedException>(
+                            Func<Task>(fun () -> stdin.WriteAsync(Text.Encoding.UTF8.GetBytes "late"))
+                        )
+                        |> ignore
+
+                    let! outcome = running.WaitAsync()
+
+                    match outcome with
+                    | Outcome.Exited 7 -> ()
+                    | other -> Assert.Fail $"FinishAsync must end the ConPTY child's input (exit 7), got {other}"
         }
 
     // ----------------------------------------------------------------------------------

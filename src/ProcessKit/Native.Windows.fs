@@ -2790,15 +2790,270 @@ module internal Windows =
 
     let conptyAvailable () : bool = conptyAvailability.Value
 
-    /// Close the pseudoconsole `hPC` — tearing down the conhost sidecar (which lives OUTSIDE the Job) —
-    /// once the child `hProcess` exits. Closing the pseudoconsole also closes the merged-output pipe's
-    /// write end, so the parent's read reaches EOF and the capture/streaming pumps conclude (they never
-    /// would while conhost holds that write handle open). Waits on our OWN duplicate of the process handle
-    /// (the backend may close its copy on reap) via a thread-pool registered wait — one pool wait thread
-    /// serves ~63 handles, so no dedicated thread is parked per PTY child. `hPC` is closed exactly once, by
-    /// this one-shot wait — never elsewhere (no double-close). Returns `false` only if the initial handle
-    /// duplication fails (near-impossible for a just-created process).
-    let private closePseudoConsoleOnChildExit (hProcess: nativeint) (hPC: nativeint) : bool =
+    /// The parent's write end of a ConPTY host-input pipe, held open for the pseudoconsole SESSION's whole
+    /// lifetime — deliberately NOT owned by whoever writes the child's stdin.
+    ///
+    /// Closing that pipe is not the ordinary "peer closed stdin" EOF a plain pipe delivers: it tells conhost
+    /// the console session is over, and a child that has not reached its first read yet can be torn down
+    /// (`CTRL_CLOSE_EVENT`) instead of running to completion. So the pipe belongs to the session — a run with
+    /// no stdin writer at all keeps it open, and a writer that finishes or is dropped does not take the
+    /// child's terminal with it. It is released exactly once, after the child has exited and the
+    /// pseudoconsole has been closed (`closePseudoConsoleOnChildExit`), or by the spawn's failure unwind.
+    ///
+    /// Those two are independent "this might need closing" paths in an order neither controls, which is why
+    /// the release is a shared one-shot — the same discipline this file applies to its raw Win32 handles
+    /// (`disposableHandle`). Writers get a NON-owning `ConPtyStdinStream` view over `Stream` instead.
+    type internal ConPtyInputKeepalive(pipe: Stream) =
+        // A ref cell rather than a `let mutable`, so the guard can be raised with `Interlocked` from either
+        // path — the spawning thread's unwind or the thread-pool child-exit callback.
+        let released = ref 0
+
+        /// The session's host-input pipe. Writers wrap it in a non-owning view; nobody else disposes it.
+        member _.Stream = pipe
+
+        /// Whether the session's host-input pipe has already been released — the child exited (or the run
+        /// was torn down), so there is no console left for a stdin write to reach.
+        member _.IsReleased = Volatile.Read(&released.contents) <> 0
+
+        /// Close the host-input pipe, exactly once however many paths reach here. The flag is raised BEFORE
+        /// the close, so a close that itself throws is never retried on a handle Win32 may have recycled.
+        member _.Release() =
+            if Interlocked.Exchange(&released.contents, 1) = 0 then
+                try
+                    pipe.Dispose()
+                with
+                | :? ObjectDisposedException ->
+                    // Already disposed elsewhere (a teardown race): the pipe is gone, which is what this
+                    // release wanted. Nothing to recover.
+                    ()
+                | :? IOException ->
+                    // The pipe broke while flushing on dispose (conhost is already gone) — the same
+                    // teardown-race close `Pump.disposeQuietly` tolerates. This runs from the child-exit
+                    // callback, which must never throw.
+                    ()
+
+        interface IDisposable with
+            member this.Dispose() = this.Release()
+
+    // The Windows console's own end-of-input gesture — the ConPTY counterpart of a POSIX terminal's
+    // `c_cc[VEOF]`: Ctrl-Z (SUB, 0x1A) followed by the carriage return a terminal sends for Enter. A console
+    // read in cooked (line) mode ends at the Ctrl-Z and the child's next read returns zero bytes: the EOF
+    // `copy con`, `sort`, and every `ReadToEnd` on a console have always been ended with. Both bytes go out
+    // in ONE write so the Enter can neither be separated from the Ctrl-Z it submits nor race a child that
+    // acts on the first byte. Like the POSIX end-of-input character, it only reaches a child whose console
+    // input is still in cooked mode — one that switched CONIN$ to raw mode reads it as ordinary input, which
+    // is the console's contract rather than something this can paper over.
+    let private conptyEndOfInputGesture = [| 0x1Auy; 0x0Duy |]
+
+    // `HRESULT_FROM_WIN32` (facility 7) for the three Win32 write errors that all mean the same thing: the
+    // host-input pipe has no reader any more, because conhost let go of its end when the pseudoconsole was
+    // closed. ERROR_BROKEN_PIPE (109), ERROR_NO_DATA (232), ERROR_PIPE_NOT_CONNECTED (233) — the codes the
+    // .NET pipe layer wraps into an `IOException` for a write whose peer is gone.
+    let private isHostInputHangup (ex: IOException) =
+        match uint32 ex.HResult with
+        | 0x8007006Du
+        | 0x800700E8u
+        | 0x800700E9u -> true
+        | _ -> false
+
+    /// The parent-side stdin writer for a ConPTY run: a NON-owning view over the session's host-input pipe.
+    ///
+    /// It writes through `keepalive.Stream` and never closes it, because on Windows closing that pipe ends
+    /// the console session rather than delivering a stdin EOF (see `ConPtyInputKeepalive`). Ending this
+    /// stdin is therefore not a close: `FinishAsync` delivers the console's own end-of-input gesture
+    /// (Ctrl-Z + Enter) so a child reading to EOF actually sees one, and the session's pipe stays open until
+    /// the child exits.
+    ///
+    /// The finish is once-only and its outcome is honest: the first call claims it and every later caller
+    /// gets that same delivery task (including its failure), writes are refused from the claim onwards, and
+    /// a genuine delivery failure faults the returned task instead of silently leaving the child hanging.
+    /// The two cases where end of input is moot rather than lost complete successfully — the session's pipe
+    /// has already been released (the child exited, or the run's own teardown got there first), or the write
+    /// reports that the pipe has no reader any more, which is the same thing observed a moment before our
+    /// own teardown reached it.
+    type internal ConPtyStdinStream(keepalive: ConPtyInputKeepalive) =
+        inherit Stream()
+
+        let pipe = keepalive.Stream
+
+        // Serializes payload writes against the once-only end-of-input delivery, so the gesture can never
+        // overtake a write that was already admitted, and a write that arrives after it is refused rather
+        // than trailing past the end of input the child has seen. Held across one stream write only, never
+        // across a caller's whole session. Not a hot path: one stdin view per ConPTY run, caller-paced.
+        let writeGate = new SemaphoreSlim(1, 1)
+
+        // Guards the finish claim/memo and the released flag; never held across I/O.
+        let claimGate = obj ()
+        let mutable finished = false
+        let mutable released = false
+        let mutable finishTask: Task option = None
+
+        // Refuse a write the same way every closed .NET stream does — the `ObjectDisposedException` the
+        // POSIX pty stdin view and a plain closed stdin pipe both raise — rather than inventing a third
+        // shape for the one public `ProcessStdin` contract.
+        let ensureWritable () =
+            lock claimGate (fun () ->
+                if finished then
+                    raise (
+                        ObjectDisposedException(
+                            nameof ConPtyStdinStream,
+                            "the child's stdin has been finished: the console's end-of-input gesture was already delivered, so further input would trail past the end of input the child has seen"
+                        )
+                    )
+                elif released then
+                    raise (
+                        ObjectDisposedException(
+                            nameof ConPtyStdinStream,
+                            "this stdin writer has been released; the ConPTY session's host-input pipe belongs to the run, not to this writer"
+                        )
+                    ))
+
+        // One admitted synchronous write: take the gate, check the gate-protected state, hand the bytes over.
+        let writeThrough (write: unit -> unit) =
+            writeGate.Wait()
+
+            try
+                ensureWritable ()
+                write ()
+            finally
+                writeGate.Release() |> ignore
+
+        // The asynchronous counterpart. The refusal check happens AFTER the gate is taken, so a write that
+        // loses the race to the end-of-input delivery is refused instead of landing behind it.
+        let writeThroughAsync (cancellationToken: CancellationToken) (write: unit -> Task) : Task =
+            task {
+                do! writeGate.WaitAsync cancellationToken
+
+                try
+                    ensureWritable ()
+                    do! write ()
+                finally
+                    writeGate.Release() |> ignore
+            }
+
+        /// Whether the logical end of input has been claimed — after which this view refuses writes.
+        member _.IsFinished = lock claimGate (fun () -> finished)
+
+        override _.CanRead = false
+        override _.CanSeek = false
+        override _.CanWrite = true
+
+        override _.Length = raise (NotSupportedException "a ConPTY stdin writer has no length")
+
+        override _.Position
+            with get () = raise (NotSupportedException "a ConPTY stdin writer has no position")
+            and set (_: int64) = raise (NotSupportedException "a ConPTY stdin writer has no position")
+
+        override _.Read(_buffer: byte[], _offset: int, _count: int) =
+            raise (NotSupportedException "a ConPTY stdin writer is write-only")
+
+        override _.Seek(_offset: int64, _origin: SeekOrigin) =
+            raise (NotSupportedException "a ConPTY stdin writer is not seekable")
+
+        override _.SetLength(_value: int64) =
+            raise (NotSupportedException "a ConPTY stdin writer has no length")
+
+        override _.Flush() = pipe.Flush()
+
+        override _.FlushAsync(cancellationToken: CancellationToken) = pipe.FlushAsync cancellationToken
+
+        override _.Write(buffer: byte[], offset: int, count: int) =
+            writeThrough (fun () -> pipe.Write(buffer, offset, count))
+
+        override _.WriteAsync(buffer: byte[], offset: int, count: int, cancellationToken: CancellationToken) : Task =
+            writeThroughAsync cancellationToken (fun () -> pipe.WriteAsync(buffer, offset, count, cancellationToken))
+
+        override _.WriteAsync(buffer: ReadOnlyMemory<byte>, cancellationToken: CancellationToken) : ValueTask =
+            ValueTask(
+                writeThroughAsync cancellationToken (fun () -> pipe.WriteAsync(buffer, cancellationToken).AsTask())
+            )
+
+        /// Deliver the console's end-of-input gesture, leaving the session's pipe open. Runs the claim's
+        /// delivery only; see the type doc for the contract. Prefer the `IStdinFinisher` interface at call
+        /// sites — this concrete member exists so the behaviour can be exercised directly in tests.
+        member this.FinishAsync() : Task =
+            lock claimGate (fun () ->
+                match finishTask with
+                | Some task ->
+                    // Every caller observes the one delivery task, including its eventual failure.
+                    task
+                | None ->
+                    finished <- true
+                    // Captured under the claim rather than read inside the delivery: a writer the run's own
+                    // teardown has already released has nothing left to end, and `ProcessStdin.FinishAsync`
+                    // promises to stay quiet there instead of pushing input into a session it no longer owns.
+                    let task = this.DeliverEndOfInput released
+                    finishTask <- Some task
+                    task)
+
+        // The delivery itself. Failures propagate to the `FinishAsync` task except for the cases where end of
+        // input is moot rather than undelivered (see the handlers).
+        member private this.DeliverEndOfInput(alreadyReleased: bool) : Task =
+            task {
+                // The claim already stops new writes; this waits out any write admitted before it, so the
+                // gesture can never overtake input the caller had already handed over.
+                do! writeGate.WaitAsync()
+
+                try
+                    try
+                        if not (alreadyReleased || keepalive.IsReleased) then
+                            do! pipe.WriteAsync(conptyEndOfInputGesture.AsMemory(), CancellationToken.None)
+                            do! pipe.FlushAsync CancellationToken.None
+                    with
+                    | :? ObjectDisposedException ->
+                        // The session's pipe was released while this delivery was in flight (the child
+                        // exited, or the run's own teardown got there first). There is no console left to
+                        // hand an end of input to, exactly as closing a pipe whose peer is gone is not a
+                        // failed close.
+                        ()
+                    | :? IOException as ex when this.IsHangup ex ->
+                        // The console host has already let go of the read end: the same "the terminal is
+                        // gone" case as above, observed a moment before our own child-exit teardown reached
+                        // it. Any OTHER I/O failure is a genuinely undelivered end of input and propagates.
+                        ()
+                finally
+                    writeGate.Release() |> ignore
+            }
+
+        // Whether an I/O failure of the gesture write means there is no console left to receive an end of
+        // input (moot) rather than one that did not get it (a real failure the caller must hear about).
+        // Three independent signals, because no single one covers the whole window: the session's pipe has
+        // been released by the child-exit teardown; the write itself reported a Win32 hangup code; or the
+        // .NET pipe has already latched into its broken state from an EARLIER write (the stdin feeder's),
+        // whose follow-up exception carries the generic I/O HResult instead of a Win32 one.
+        member private _.IsHangup(ex: IOException) =
+            keepalive.IsReleased
+            || isHostInputHangup ex
+            || (match pipe with
+                | :? PipeStream as hostInput -> not hostInput.IsConnected
+                | _ -> false)
+
+        override _.Dispose(disposing) =
+            lock claimGate (fun () -> released <- true)
+
+            // Deliberately does NOT dispose `pipe`: this view is non-owning, and closing the session's
+            // host-input pipe here would end the child's console session instead of its stdin. The gate is
+            // left undisposed too — it holds no unmanaged resource (its wait handle is never materialised),
+            // and disposing it under an in-flight finish would turn a quiet teardown into a fault.
+            base.Dispose disposing
+
+        interface IStdinFinisher with
+            member this.FinishAsync() : Task = this.FinishAsync()
+
+    /// Close the pseudoconsole `hPC` — tearing down the conhost sidecar (which lives OUTSIDE the Job) — and
+    /// release the session's host-input pipe, once the child `hProcess` exits. Closing the pseudoconsole also
+    /// closes the merged-output pipe's write end, so the parent's read reaches EOF and the capture/streaming
+    /// pumps conclude (they never would while conhost holds that write handle open). Waits on our OWN
+    /// duplicate of the process handle (the backend may close its copy on reap) via a thread-pool registered
+    /// wait — one pool wait thread serves ~63 handles, so no dedicated thread is parked per PTY child. `hPC`
+    /// is closed exactly once, by this one-shot wait — never elsewhere (no double-close) — and `hostInput` is
+    /// released exactly once by its own shared guard. Returns `false` only if the initial handle duplication
+    /// fails (near-impossible for a just-created process).
+    let private closePseudoConsoleOnChildExit
+        (hProcess: nativeint)
+        (hPC: nativeint)
+        (hostInput: ConPtyInputKeepalive)
+        : bool =
         let current = GetCurrentProcess()
         let mutable duplicate = IntPtr.Zero
 
@@ -2811,12 +3066,16 @@ module internal Windows =
             let tcs = TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
 
             // Fires once, when the child exits: close the pseudoconsole (conhost flushes its final output
-            // to the pipe, then exits), then let the continuation unregister the wait and release the
-            // duplicate. Publishing the registration before attaching the continuation makes the unregister
-            // race-free even if the child had already exited when we registered (mirrors `waitWindows`).
+            // to the pipe, then exits), release the session's host-input pipe now that there is no child
+            // left for its closure to disturb, then let the continuation unregister the wait and release
+            // the duplicate. Publishing the registration before attaching the continuation makes the
+            // unregister race-free even if the child had already exited when we registered (mirrors
+            // `waitWindows`). Neither step can throw into the pool: `ClosePseudoConsole` is a void Win32
+            // call and `Release` swallows its own teardown-race exceptions.
             let callback =
                 WaitOrTimerCallback(fun _ _ ->
                     ClosePseudoConsole hPC
+                    hostInput.Release()
                     tcs.TrySetResult() |> ignore)
 
             let registration =
@@ -2891,11 +3150,18 @@ module internal Windows =
         | Ok commandLine ->
 
             try
-                // Two async pipe pairs. Parent keeps the input WRITE end (pty master stdin) and the output READ
-                // end (the single merged terminal stream); the child-side ends are handed to CreatePseudoConsole
-                // and closed once it has duplicated them into the conhost sidecar.
+                // Two async pipe pairs. Parent keeps the input WRITE end (the pseudoconsole's host input) and
+                // the output READ end (the single merged terminal stream); the child-side ends are handed to
+                // CreatePseudoConsole and closed once it has duplicated them into the conhost sidecar.
+                //
+                // The host-input end goes straight into a session keepalive: it stays open for as long as the
+                // console session does, whether or not this run ever hands out a stdin writer, because closing
+                // it asks conhost to end the session rather than delivering a stdin EOF. The keepalive (not
+                // the raw stream) is what goes on the unwind list, so the unwind and the child-exit teardown
+                // share ONE one-shot release.
                 let inServer, inClient = createAsyncPipePair PipeDirection.Out
-                createdPipes.Add inServer
+                let hostInput = new ConPtyInputKeepalive(inServer)
+                createdPipes.Add hostInput
                 createdPipes.Add inClient
                 let outServer, outClient = createAsyncPipePair PipeDirection.In
                 createdPipes.Add outServer
@@ -3082,7 +3348,7 @@ module internal Windows =
                         else
                             CloseHandle info.hThread |> ignore
 
-                            if not (closePseudoConsoleOnChildExit info.hProcess hPC) then
+                            if not (closePseudoConsoleOnChildExit info.hProcess hPC hostInput) then
                                 // Near-impossible (duplicating a just-created process handle failed): fail
                                 // honestly rather than leak the conhost sidecar. The child is a Job member, so
                                 // terminate it, close the pseudoconsole, and release the pipes.
@@ -3104,10 +3370,18 @@ module internal Windows =
 
                                 let stdinStream =
                                     if stdinPipeKept then
-                                        Some(inServer :> Stream)
+                                        // A NON-owning view: finishing or dropping the writer must not take
+                                        // the console session with it (see `ConPtyStdinStream`).
+                                        Some(new ConPtyStdinStream(hostInput) :> Stream)
                                     else
-                                        // No feeder/interactive writer: close the pty master input end.
-                                        inServer.Dispose()
+                                        // No feeder/interactive writer — and deliberately NOT a close of the
+                                        // host-input pipe. Closing it here asks conhost to end the console
+                                        // session, which can hit a child that has not run a single
+                                        // instruction yet with a CTRL_CLOSE_EVENT; the keepalive holds it
+                                        // until the child exits instead. A child that reads to EOF under a
+                                        // PTY needs a stdin source or an explicit finish to see one, exactly
+                                        // as on a POSIX pty, whose master the merged-output stream keeps open
+                                        // for the same reason.
                                         None
 
                                 Ok
