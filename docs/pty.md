@@ -324,7 +324,13 @@ Calling it on a non-PTY `RunningProcess` returns `Error (ProcessError.Unsupporte
 
 PTY support is available on Windows through ConPTY (Windows 10 1809+) and on Linux through `openpty` plus `setsid --ctty` — the latter loaded from a trusted system directory (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) rather than `PATH`, so it cannot be replaced by a planted binary ([why](hardening.md#where-the-unix-helper-binaries-come-from)); unsupported hosts return `ProcessError.Unsupported` rather than falling back to pipes. See the full [platform capability matrix](platform-support.md#pseudo-terminal-pty-capabilities), including macOS/BSD helper requirements and containment caveats.
 
-Every Windows ConPTY child starts in a fresh console process group so a CTRL+C broadcast on the caller's shared console cannot terminate the isolated terminal child. This isolation does not make a default PTY run publicly signal-capable: `WindowsCtrlSignals()` remains the opt-in that registers its leader for ProcessKit's directed CTRL+BREAK API.
+Every Windows ConPTY child starts with `CREATE_NEW_PROCESS_GROUP`, regardless of
+`WindowsCtrlSignals()`, so a CTRL+C broadcast on the caller's shared console cannot terminate the
+isolated terminal child. Windows also disables default CTRL+C handling for a process created with
+that flag. Consequently, sending U+0003 (Ctrl+C) through `SendAsync` or the interactive stdin does
+not interrupt a ConPTY child by default, unlike a POSIX pty where the terminal's `VINTR` normally
+delivers `SIGINT`. `WindowsCtrlSignals()` does not add the process-group flag; it only opts the
+leader into ProcessKit's best-effort targeted CTRL+BREAK path for `Signal(Int/Term)`.
 
 ---
 

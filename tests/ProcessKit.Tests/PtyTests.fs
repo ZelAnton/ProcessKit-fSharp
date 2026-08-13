@@ -61,34 +61,125 @@ type internal ConPtyHostInputDouble(failWrites: exn option) =
         disposeCount <- disposeCount + 1
         base.Dispose disposing
 
-module private WindowsConsoleBroadcast =
+module private WindowsPrivateConsoleProcess =
 
     [<Literal>]
-    let private CTRL_C_EVENT = 0u
+    let private CREATE_NEW_CONSOLE = 0x00000010u
 
-    [<UnmanagedFunctionPointer(CallingConvention.Winapi)>]
-    type Handler = delegate of uint32 -> bool
+    [<Literal>]
+    let private WAIT_OBJECT_0 = 0u
+
+    [<Literal>]
+    let private WAIT_TIMEOUT = 258u
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private StartupInfo =
+        struct
+            val mutable cb: int
+            val mutable lpReserved: nativeint
+            val mutable lpDesktop: nativeint
+            val mutable lpTitle: nativeint
+            val mutable dwX: int
+            val mutable dwY: int
+            val mutable dwXSize: int
+            val mutable dwYSize: int
+            val mutable dwXCountChars: int
+            val mutable dwYCountChars: int
+            val mutable dwFillAttribute: int
+            val mutable dwFlags: uint32
+            val mutable wShowWindow: uint16
+            val mutable cbReserved2: uint16
+            val mutable lpReserved2: nativeint
+            val mutable hStdInput: nativeint
+            val mutable hStdOutput: nativeint
+            val mutable hStdError: nativeint
+        end
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type private ProcessInformation =
+        struct
+            val mutable hProcess: nativeint
+            val mutable hThread: nativeint
+            val mutable dwProcessId: uint32
+            val mutable dwThreadId: uint32
+        end
+
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern bool private CreateProcessW(
+        nativeint lpApplicationName,
+        nativeint lpCommandLine,
+        nativeint lpProcessAttributes,
+        nativeint lpThreadAttributes,
+        bool bInheritHandles,
+        uint32 dwCreationFlags,
+        nativeint lpEnvironment,
+        string lpCurrentDirectory,
+        StartupInfo& lpStartupInfo,
+        ProcessInformation& lpProcessInformation
+    )
 
     [<DllImport("kernel32.dll", SetLastError = true)>]
-    extern bool private SetConsoleCtrlHandler(Handler handlerRoutine, bool add)
+    extern uint32 private WaitForSingleObject(nativeint hHandle, uint32 dwMilliseconds)
 
     [<DllImport("kernel32.dll", SetLastError = true)>]
-    extern bool private GenerateConsoleCtrlEvent(uint32 ctrlEvent, uint32 processGroupId)
+    extern bool private GetExitCodeProcess(nativeint hProcess, uint32& lpExitCode)
 
-    let tryInstallHostHandler () : Handler option =
-        let handler = Handler(fun _ -> true)
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private TerminateProcess(nativeint hProcess, uint32 uExitCode)
 
-        if SetConsoleCtrlHandler(handler, true) then
-            Some handler
-        else
-            None
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool private CloseHandle(nativeint hObject)
 
-    let removeHostHandler (handler: Handler) =
-        SetConsoleCtrlHandler(handler, false) |> ignore
-        GC.KeepAlive handler
+    let private quoteArgument (argument: string) =
+        let escaped = argument.Replace("\"", "\\\"")
+        "\"" + escaped + "\""
 
-    let broadcastCtrlC () =
-        GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0u)
+    let run (arguments: string list) (workingDirectory: string) (timeout: TimeSpan) : Result<uint32, string> =
+        let commandLine = arguments |> List.map quoteArgument |> String.concat " "
+        let commandLineBuffer = Marshal.StringToHGlobalUni commandLine
+        let mutable startupInfo = StartupInfo()
+        startupInfo.cb <- Marshal.SizeOf<StartupInfo>()
+        let mutable processInformation = ProcessInformation()
+
+        try
+            if
+                not (
+                    CreateProcessW(
+                        0n,
+                        commandLineBuffer,
+                        0n,
+                        0n,
+                        false,
+                        CREATE_NEW_CONSOLE,
+                        0n,
+                        workingDirectory,
+                        &startupInfo,
+                        &processInformation
+                    )
+                )
+            then
+                Error $"CreateProcessW(CREATE_NEW_CONSOLE) failed: {Marshal.GetLastPInvokeError()}"
+            else
+                CloseHandle processInformation.hThread |> ignore
+
+                try
+                    match WaitForSingleObject(processInformation.hProcess, uint32 timeout.TotalMilliseconds) with
+                    | WAIT_OBJECT_0 ->
+                        let mutable exitCode = 0u
+
+                        if GetExitCodeProcess(processInformation.hProcess, &exitCode) then
+                            Ok exitCode
+                        else
+                            Error $"GetExitCodeProcess failed: {Marshal.GetLastPInvokeError()}"
+                    | WAIT_TIMEOUT ->
+                        TerminateProcess(processInformation.hProcess, 1u) |> ignore
+                        Error $"private-console helper timed out after {timeout}"
+                    | waitResult ->
+                        Error $"WaitForSingleObject failed with result {waitResult}: {Marshal.GetLastPInvokeError()}"
+                finally
+                    CloseHandle processInformation.hProcess |> ignore
+        finally
+            Marshal.FreeHGlobal commandLineBuffer
 
 /// Tests for the opt-in PTY (pseudo-terminal) mode: Stage 1 (T-137) — `PtyConfig`, the `Command.Pty` /
 /// `Command.pty` builders, the build-time guards (D4/D8 + the pipeline guard), the Windows ConPTY spawn;
@@ -883,54 +974,57 @@ type PtyTests() =
             if not isWindows then
                 Assert.Ignore "Windows-only ConPTY console isolation"
             else
-                match WindowsConsoleBroadcast.tryInstallHostHandler () with
-                | None -> Assert.Ignore "the test host has no console on which to broadcast CTRL+C"
-                | Some handler ->
-                    let completionMarker = Path.GetFullPath $"pk-conpty-complete-{Guid.NewGuid():N}.txt"
+                let completionMarker = Path.GetFullPath $"pk-conpty-complete-{Guid.NewGuid():N}.txt"
+                let statusMarker = completionMarker + ".status"
 
-                    try
-                        let script =
-                            "Start-Sleep -Seconds 2; "
-                            + "[System.IO.File]::WriteAllText($env:PK_CONPTY_COMPLETE, 'complete'); exit 23"
+                let repoRoot =
+                    Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."))
 
-                        let command =
-                            Command.create "powershell.exe"
-                            |> Command.args [ "-NoLogo"; "-NoProfile"; "-NonInteractive"; "-Command"; script ]
-                            |> Command.env "PK_CONPTY_COMPLETE" completionMarker
-                            |> Command.pty
-                            |> Command.timeout (TimeSpan.FromSeconds 30.0)
+                let outputSegments =
+                    Path.GetRelativePath(repoRoot, AppContext.BaseDirectory).Split(Path.DirectorySeparatorChar)
 
-                        match! runner.StartAsync(command, CancellationToken.None) with
-                        | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
-                            Assert.Ignore $"host lacks ConPTY: {message}"
-                        | Error error -> Assert.Fail $"unexpected error from a ConPTY spawn: {error}"
-                        | Ok running ->
-                            use _running = running
-                            // Give cmd.exe time to enter the ping window before broadcasting. The completion
-                            // marker below, not this delay, is the proof that the child survived the event.
-                            do! Task.Delay 500
+                let configuration = outputSegments[3]
+                let targetFramework = outputSegments[4]
 
-                            if not (WindowsConsoleBroadcast.broadcastCtrlC ()) then
-                                running.Kill()
-                                let! _ = running.WaitAsync()
-                                Assert.Ignore "the test host lost its console before CTRL+C could be broadcast"
+                let helperAssembly =
+                    Path.Combine(
+                        repoRoot,
+                        "tests",
+                        "ProcessKit.ConPtyIsolationHelper",
+                        "bin",
+                        configuration,
+                        targetFramework,
+                        "ProcessKit.ConPtyIsolationHelper.dll"
+                    )
 
-                            let! outcome = running.WaitAsync()
+                try
+                    let result =
+                        WindowsPrivateConsoleProcess.run
+                            [ "dotnet"; helperAssembly; completionMarker; statusMarker ]
+                            AppContext.BaseDirectory
+                            (TimeSpan.FromSeconds 45.0)
 
-                            match outcome with
-                            | Outcome.Exited 23 -> ()
-                            | other ->
-                                Assert.Fail
-                                    $"the default ConPTY child did not survive shared-console CTRL+C to its completion exit, got {other}"
+                    match result with
+                    | Error message ->
+                        let status =
+                            if File.Exists statusMarker then
+                                File.ReadAllText statusMarker
+                            else
+                                "no status"
 
-                            Assert.That(
-                                File.Exists completionMarker,
-                                Is.True,
-                                "the default ConPTY child did not reach its completion marker after shared-console CTRL+C"
-                            )
-                    finally
-                        WindowsConsoleBroadcast.removeHostHandler handler
-                        File.Delete completionMarker
+                        Assert.Fail $"{message}; helper status: {status}"
+                    | Ok 77u -> Assert.Ignore "host lacks ConPTY"
+                    | Ok 0u -> ()
+                    | Ok exitCode -> Assert.Fail $"private-console helper failed with exit code {exitCode}"
+
+                    Assert.That(
+                        File.Exists completionMarker,
+                        Is.True,
+                        "the default ConPTY child did not reach its completion marker after private-console CTRL+C"
+                    )
+                finally
+                    File.Delete completionMarker
+                    File.Delete statusMarker
         }
 
     [<Test>]

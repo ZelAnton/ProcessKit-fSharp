@@ -1311,7 +1311,7 @@ type Command internal (config: CommandConfig) =
     member _.CreateNoWindow() =
         Command({ config with CreateNoWindow = true })
 
-    /// Windows: opt the child into targeted console signalling, so that
+    /// Windows: register the child leader for targeted console signalling, so that
     /// `ProcessGroup.Signal(Signal.Int)` / `Signal.Term` can deliver it a best-effort console
     /// **CTRL+BREAK** — the closest Windows analogue to a graceful `SIGINT`/`SIGTERM` — instead of the
     /// hard atomic Job-Object kill, giving a console child a chance to clean up. **Best-effort and
@@ -1321,8 +1321,10 @@ type Command internal (config: CommandConfig) =
     /// silent downgrade — and even on a successful send delivery is not guaranteed (the child may
     /// install its own console handler). `Signal.Kill` is unaffected (always the atomic Job kill), and
     /// this has no effect on Unix, where signals reach the child's process group regardless. Regular children
-    /// get a new group through this option; ConPTY children always have one for isolation, while the option
-    /// only registers their leader for directed CTRL+BREAK. The flag disables default CTRL+C handling.
+    /// get `CREATE_NEW_PROCESS_GROUP` through this option. ConPTY children always receive that flag for
+    /// isolation, regardless of this option, and Windows consequently disables their default CTRL+C handling:
+    /// sending U+0003 through ConPTY input does not interrupt the child. For ConPTY, this option only registers
+    /// the leader for targeted CTRL+BREAK; it does not control creation of the process group.
     member _.WindowsCtrlSignals() =
         Command(
             { config with
@@ -1778,8 +1780,9 @@ module Command =
     /// Windows: run the child with `CREATE_NO_WINDOW` (no effect on Unix).
     let createNoWindow (command: Command) = command.CreateNoWindow()
 
-    /// Windows: spawn the child as its own console process group so `ProcessGroup.Signal(Signal.Int/Term)`
-    /// can deliver a best-effort CTRL+BREAK (no effect on Unix). See `Command.WindowsCtrlSignals`.
+    /// Windows: register a ConPTY child as the target for best-effort CTRL+BREAK through
+    /// `ProcessGroup.Signal(Signal.Int/Term)`; ConPTY children already have process-group isolation.
+    /// Regular children are put in a new process group. No effect on Unix. See `Command.WindowsCtrlSignals`.
     let windowsCtrlSignals (command: Command) = command.WindowsCtrlSignals()
 
     /// Launch the child (and its spawned tree) at a lower/higher CPU-scheduling priority (Windows

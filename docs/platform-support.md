@@ -386,6 +386,7 @@ pipes.
 | `ResizeAsync` on a PTY | ✅ `ResizePseudoConsole` | ✅ `TIOCSWINSZ` + `SIGWINCH` | ✅ `TIOCSWINSZ` + `SIGWINCH` |
 | `ResizeAsync` on a non-PTY | ❌ `Unsupported` | ❌ `Unsupported` | ❌ `Unsupported` |
 | Containment under PTY | ✅ Job Object | ✅ cgroup v2 or pgid | ✅ pgid |
+| U+0003 (Ctrl+C) sent through interactive stdin | 🟡 delivered as input, but does not interrupt by default | ✅ terminal `VINTR` | ✅ terminal `VINTR` |
 
 Windows older than 10 version 1809 returns `Unsupported`. Linux needs the `setsid --ctty` helper
 in one of the trusted system directories (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, where util-linux
@@ -395,7 +396,7 @@ as well as a usable PTY device. `openpty` exists on macOS/BSD, but their standar
 provide `--ctty`; until a helper is supplied, a PTY spawn there is `Unsupported` rather than a
 controlling-terminal-less half implementation.
 
-Everything not listed here — capture, line streaming, interactive stdin, encodings, buffer
+Apart from the Ctrl+C row above, everything not listed here — capture, line streaming, interactive stdin, encodings, buffer
 policies, timeouts, retry, pipelines, supervision, readiness probes, cancellation, redirecting
 stdout/stderr straight to a file (`Command.StdoutToFile`/`StderrToFile` — an inheritable file
 handle in `STARTUPINFO` on Windows, a file fd via a `posix_spawn` file action on POSIX; the same
@@ -403,6 +404,12 @@ create/truncate/append semantics and the same builder-boundary conflict rules on
 and the testing seams — is platform-agnostic and behaves identically everywhere. See [commands.md](commands.md),
 [streaming.md](streaming.md), [pipelines.md](pipelines.md), [supervision.md](supervision.md),
 and [testing.md](testing.md).
+
+Every ConPTY child receives `CREATE_NEW_PROCESS_GROUP` for isolation, whether or not
+`WindowsCtrlSignals()` is enabled. By Windows contract that creation flag disables the process's
+default Ctrl+C handling, so writing U+0003 to ConPTY input does not interrupt it. The
+`WindowsCtrlSignals()` opt-in only registers the leader for ProcessKit's targeted CTRL+BREAK path;
+it does not add or remove the process-group flag.
 
 ## Caveats
 
