@@ -74,7 +74,7 @@
 	     blanket suppression. The ONE known, pre-existing break carried from before this gate existed is
 	     the ProcessKit.Testing.CassetteEntry positional-constructor arity change (the Pty/PtyCols/PtyRows
 	     fields added in [Unreleased], cassette format v4, and the additive fields that followed it in the
-	     same unreleased line — Signalled in v6, Failure in v7). It is allowed by exactly one narrow, documented
+	     same unreleased line — Signalled in v6, Failure in v7, OutputWiring in v8). It is allowed by exactly one narrow, documented
 	     entry in src/ProcessKit.Testing/CompatibilitySuppressions.xml; no other package carries a
 	     suppression file, and no other break is suppressed. See ROADMAP.md "Versioning & stability" for
 	     the major-release baseline-bump / suppression-reset process.

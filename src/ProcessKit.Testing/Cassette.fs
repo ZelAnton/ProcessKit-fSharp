@@ -211,6 +211,18 @@ type CassetteEntry =
         /// can rebuild exactly is ever written (see `CassetteFailure.Kind`); any other error is
         /// returned to the caller unrecorded, exactly as before this field existed.
         Failure: CassetteFailure | null
+        /// A stable, versioned fingerprint of the child's **effective output wiring**: where its stdout
+        /// and stderr actually went (`Piped`, `Null`, `Inherit`, or a direct `StdoutToFile`/`StderrToFile`
+        /// redirect with its append flag), whether stderr was folded into stdout (`MergeStderr`), and
+        /// whether the run was a PTY. It is part of the replay match key, because the wiring decides what
+        /// a real run can capture at all — only a piped (or PTY) stream reaches the parent — so a
+        /// recording made over a pipe no longer replays its captured output for a call whose stdout never
+        /// reaches the parent, and vice versa. A redirect **path** is folded in as a SHA-256 digest, never
+        /// stored in clear text (like an env value), and is keyed verbatim: two spellings of one path are
+        /// two wirings, which costs a miss rather than a wrong hit. `null` in a pre-v8 cassette (no
+        /// wiring recorded): such an entry is served only to a call it could honestly have been recorded
+        /// for (see `RecordReplayRunner`).
+        OutputWiring: string | null
     }
 
 /// The on-disk cassette envelope: a format `version` (so a format newer than this build understands is
@@ -292,9 +304,10 @@ type RecordReplayOptions
 
 // Match key: program + args + cwd (only when `RecordReplayOptions.WithCwdMatching` is set; `None`
 // otherwise, so `cwd` never distinguishes two entries by default) + whether-stdin + stdin digest +
-// effective-environment fingerprint. F# tuple/list have structural equality, so this works as a
-// Dictionary key.
-type private Key = string * string list * string option * bool * string option * string
+// effective-environment fingerprint + effective-output-wiring fingerprint (so a recording made over a
+// pipe cannot answer a call whose stdout never reaches the parent). F# tuple/list have structural
+// equality, so this works as a Dictionary key.
+type private Key = string * string list * string option * bool * string option * string * string
 
 // One key's entries in capture order, with the order-then-repeat-last cursor. `Entries` is mutable so
 // Auto mode can append a freshly-recorded (missed) entry to an existing key's group.
@@ -337,7 +350,12 @@ type private SaveLockAttempt =
 /// come back as the very `ProcessError` case and payload that was recorded — with **no subprocess**: a match is keyed on
 /// program + args + stdin-source digest + an effective-environment fingerprint (so a call whose env
 /// values/names/removals or `EnvClear` differ no longer replays an unrelated recording — a pre-v3
-/// cassette with no fingerprint keys as the un-customized environment); the working directory does
+/// cassette with no fingerprint keys as the un-customized environment) + an effective **output-wiring**
+/// fingerprint (stdout/stderr destination, `MergeStderr`, PTY), so a recording made over a pipe is not
+/// handed to a call whose stdout never reaches the parent — `Stdout(Null)`, inherited stdout, a
+/// `StdoutToFile` redirect — nor the reverse; a pre-v8 cassette with no wiring recorded is served only
+/// where it could honestly have been recorded (an entry holding captured output is not replayed for a
+/// call that captures none), and anything else is an ordinary miss; the working directory does
 /// **not** participate in the key by default (a cassette recorded in one `cwd` replays from another),
 /// though `CassetteEntry.Cwd` still stores it verbatim for inspection — opt into cwd-sensitive matching
 /// with `RecordReplayOptions.WithCwdMatching()`, applied symmetrically at record and replay time;
@@ -370,8 +388,11 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // adds `Signalled` so a signal with an unavailable number remains distinct from no terminal state.
     // v7 adds `Failure`, the recorded typed-failure half of an entry, so a call that ended in a
     // `ProcessError` replays as that error instead of missing; a pre-v7 entry has no `Failure` and
-    // loads as exactly the recorded-result entry it always was.
-    static let currentFormatVersion = 7
+    // loads as exactly the recorded-result entry it always was. v8 adds `OutputWiring`, the effective
+    // output-wiring fingerprint that joins the match key so a piped recording cannot answer a call whose
+    // stdout never reaches the parent (`Null`/`Inherit`/a file redirect) or the reverse; a pre-v8 entry
+    // has none and is served only where it could honestly have been recorded (see `legacyEntryFits`).
+    static let currentFormatVersion = 8
 
     static let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
@@ -574,6 +595,131 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             DurationMs = clampMilliseconds entry.DurationMs
             Failure = normalizeFailure entry.Failure }
 
+    // The output-wiring fingerprint's own scheme version, independent of the cassette FILE version: it
+    // tags the string below so a fingerprint from an older scheme can never silently compare equal to a
+    // newer one. Bump it if the canonical form changes.
+    static let outputWiringScheme = 1
+
+    // The wiring a PRE-v8 entry (recorded before the fingerprint existed, so its own wiring is unknown)
+    // is indexed under. Scheme `0` is never emitted by `outputWiring`, so a legacy entry can never
+    // collide with a real fingerprint — it is reachable only through the gated legacy lookup.
+    static let legacyOutputWiring = "0|legacy"
+
+    // A redirect target folded into the fingerprint as a digest rather than in clear text: a path can
+    // carry as much as an env value (a token in a temp directory's name), and this format stores env
+    // values only as digests. Hashed VERBATIM, with no normalization: two spellings of one path are two
+    // wirings, which costs a miss, never a wrong hit.
+    static let redirectDigest (path: string) : string =
+        hashBytes (Encoding.UTF8.GetBytes("file:" + path))
+
+    // A stable, versioned fingerprint of a command's EFFECTIVE output wiring: where the child's stdout
+    // and stderr actually go, whether stderr is folded into stdout, and whether the run is a PTY. It is
+    // part of the replay match key because the wiring decides what a real run can capture at all — a
+    // `Piped` stream reaches the parent, while `Null`, `Inherit`, and a direct file redirect do not (the
+    // capture verbs honestly report empty text there, and `Spawned.Stdout` is `None`) — so without it a
+    // recording made over a pipe would hand its captured output to a call whose stdout never reaches the
+    // parent, and a non-capturing recording would hide a piped call's real output.
+    //
+    // Canonical rather than literal, so a knob the spawn IGNORES cannot split the key: a PTY replaces
+    // the child's whole stdio with one terminal device (both backends skip `StdoutMode`/`StdoutFile`
+    // under it), so it fingerprints as that one merged terminal whatever those knobs say; under
+    // `MergeStderr` stderr has no destination of its own (it follows stdout, and `ProcessResult.Stderr`
+    // is empty), so its own mode folds away too. `pty` and `merge` are therefore spellings no ordinary
+    // destination can produce, which keeps the three shapes unambiguous.
+    static let outputWiring (command: Command) : string =
+        let config = command.Config
+
+        let destination (file: (string * bool) option) (mode: StdioMode) =
+            match file with
+            | Some(path, append) ->
+                let disposition = if append then "a" else "t"
+                $"file:{redirectDigest path}:{disposition}"
+            | None ->
+                match mode with
+                | StdioMode.Piped -> "pipe"
+                | StdioMode.Inherit -> "inherit"
+                | StdioMode.Null -> "null"
+
+        if config.Pty.IsSome then
+            $"{outputWiringScheme}|o:pty|e:pty"
+        else
+            let stdout = destination config.StdoutFile config.StdoutMode
+
+            let stderr =
+                if config.MergeStderr then
+                    "merge"
+                else
+                    destination config.StderrFile config.StderrMode
+
+            $"{outputWiringScheme}|o:{stdout}|e:{stderr}"
+
+    // The wiring an entry is indexed under: the recorded fingerprint for a v8 entry, or the legacy
+    // sentinel for a pre-v8 one (`null`). A NON-null value this build's commands cannot produce (a
+    // hand-edited or newer-scheme string) simply keys as itself and never matches — a miss, which is the
+    // safe direction for a wiring nothing here can interpret.
+    static let entryOutputWiring (entry: CassetteEntry) : string =
+        match entry.OutputWiring with
+        | null -> legacyOutputWiring
+        | wiring -> wiring
+
+    // What a REAL run of this command lets the parent capture — the same boundary `RunningProcess` and
+    // `FakeProcess.Build` apply to their streams, stated once here so replay cannot drift from it.
+    // stdout reaches the parent over a pipe or a PTY's terminal, never from `Null`, `Inherit`, or a
+    // direct file redirect; stderr additionally must not have been folded into stdout (`MergeStderr` or
+    // a PTY, where `ProcessResult.Stderr` is empty).
+    static let capturesStdout (command: Command) : bool =
+        let config = command.Config
+
+        config.Pty.IsSome
+        || (config.StdoutFile.IsNone && config.StdoutMode = StdioMode.Piped)
+
+    static let capturesStderr (command: Command) : bool =
+        let config = command.Config
+
+        config.Pty.IsNone
+        && not config.MergeStderr
+        && config.StderrFile.IsNone
+        && config.StderrMode = StdioMode.Piped
+
+    // Whether an entry actually HOLDS captured output on a channel — counting the result half and a
+    // recorded failure's own streams alike, since both come back to a caller. Used only to decide
+    // whether a pre-v8 entry (whose wiring is unknown) could honestly be handed to a given call.
+    static let hasRecordedStdout (entry: CassetteEntry) : bool =
+        (stringOrEmpty entry.Stdout).Length > 0
+        || not (String.IsNullOrWhiteSpace entry.StdoutBase64)
+        || (match entry.Failure with
+            | null -> false
+            | failure -> (stringOrEmpty failure.Stdout).Length > 0)
+
+    static let hasRecordedStderr (entry: CassetteEntry) : bool =
+        (stringOrEmpty entry.Stderr).Length > 0
+        || (match entry.Failure with
+            | null -> false
+            | failure -> (stringOrEmpty failure.Stderr).Length > 0)
+
+    // May a PRE-v8 entry — one recorded before the wiring fingerprint existed, so its own wiring is
+    // unknown — serve THIS call? Only when handing it over could not fabricate anything the call's own
+    // wiring makes impossible:
+    //   * the PTY shape must agree (`Pty` has been recorded since v4): a merged-terminal recording is
+    //     not a separate-streams run, and vice versa;
+    //   * a call whose stdout never reaches the parent may only be served an entry that captured none —
+    //     an entry holding captured stdout must have been recorded over a pipe, and replaying it would
+    //     be exactly the fabrication this fingerprint exists to prevent;
+    //   * the same, channel for channel, for stderr (a `MergeStderr`/PTY call included: its
+    //     `ProcessResult.Stderr` is empty).
+    // Everything else about a legacy entry keeps replaying exactly as it did before v8, so an existing
+    // cassette of ordinary piped recordings is unaffected; a legacy entry a call cannot honestly be
+    // handed is an ordinary `CassetteMiss` (re-record it), never a quietly wrong result.
+    //
+    // Deliberately NOT refused: an entry that captured nothing, whichever call asks for it. A pre-v8
+    // file cannot say whether such an entry came from a silent piped command or from one whose output
+    // went elsewhere, and an empty capture invents nothing either way — so it keeps replaying, exactly
+    // as it did before v8. Only a re-record (writing a v8 wiring) can tell those two apart.
+    static let legacyEntryFits (command: Command) (entry: CassetteEntry) : bool =
+        entry.Pty = command.Config.Pty.IsSome
+        && (capturesStdout command || not (hasRecordedStdout entry))
+        && (capturesStderr command || not (hasRecordedStderr entry))
+
     // Build a replay index from cassette entries, grouping duplicates of a key in capture order and
     // freezing each group to an immutable array once (not `Array.append` per duplicate, which is O(n²)).
     // The key uses the same argument normalizer (and the same cwd-matching setting) that a live match
@@ -592,7 +738,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 (if matchCwd then Option.ofObj entry.Cwd else None),
                 entry.HasStdin,
                 Option.ofObj entry.StdinDigest,
-                entryEnvFingerprint entry
+                entryEnvFingerprint entry,
+                entryOutputWiring entry
 
             match grouped.TryGetValue key with
             | true, bucket -> bucket.Add entry
@@ -1010,7 +1157,10 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                         "record/replay cannot key a one-shot stdin source (FromStream / FromLines / FromAsyncLines)"
                 )
 
-    let keyOf (command: Command) (digest: string option) : Key =
+    // A live command's key under an EXPLICIT output wiring, so the same keying can be asked for this
+    // build's fingerprint (what a recording gets) or for the legacy sentinel (the gated pre-v8 lookup)
+    // without the two spellings of the key drifting apart.
+    let keyWith (command: Command) (digest: string option) (wiring: string) : Key =
         let args = applyNormalizer options.ArgNormalizer (Seq.toArray command.Arguments)
 
         command.Program,
@@ -1018,7 +1168,11 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         (if options.MatchCwd then command.WorkingDirectory else None),
         command.Config.StdinSource.IsSome,
         digest,
-        envFingerprint command.Config.ClearEnv command.Config.EnvOverrides
+        envFingerprint command.Config.ClearEnv command.Config.EnvOverrides,
+        wiring
+
+    let keyOf (command: Command) (digest: string option) : Key =
+        keyWith command digest (outputWiring command)
 
     let envNamesOf (command: Command) : string[] =
         command.Config.EnvOverrides
@@ -1073,7 +1227,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           Pty = pty
           PtyCols = ptyCols
           PtyRows = ptyRows
-          Failure = null }
+          Failure = null
+          OutputWiring = outputWiring command }
 
     // Record a text capture: stdout/stderr are the decoded strings (redacted); no base64. For a PTY run
     // (D3) `Stdout` IS the single merged stream, so the redaction hook that scrubs it covers the whole
@@ -1378,12 +1533,20 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 let fake = if entry.Pty then fake.WithPty() else fake
                 Ok(fake.Build())
 
-    let play (slots: Dictionary<Key, ReplaySlot>) (key: Key) : CassetteEntry option =
+    // Take the entry this key's cursor is on, in capture order then repeating the last. `accept` is the
+    // caller's veto — a candidate it refuses is NOT consumed (the cursor stays put), so a refused
+    // compatibility lookup can never eat a group's next recording on the way past.
+    let play (slots: Dictionary<Key, ReplaySlot>) (key: Key) (accept: CassetteEntry -> bool) : CassetteEntry option =
         match slots.TryGetValue key with
         | true, slot ->
             let index = min slot.Next (slot.Entries.Length - 1)
-            slot.Next <- slot.Next + 1
-            Some slot.Entries[index]
+            let entry = slot.Entries[index]
+
+            if accept entry then
+                slot.Next <- slot.Next + 1
+                Some entry
+            else
+                None
         | _ -> None
 
     // Register a freshly-recorded (missed) entry into the live replay index, so a repeat of the same key
@@ -1393,19 +1556,38 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         | true, slot -> slot.Entries <- Array.append slot.Entries [| entry |]
         | _ -> slots[key] <- { Entries = [| entry |]; Next = 0 }
 
-    // New cassettes use the v5 domain-separated key. A v1-v4 entry has an unprefixed digest, so only a
-    // second legacy lookup can find it; this also lets Auto safely retain old rows while adding v5 rows.
+    // New cassettes use the v5 domain-separated stdin digest and the v8 output-wiring fingerprint. Two
+    // older shapes still have to be found, each by its own fallback lookup, and only once the lookups
+    // before it have missed:
+    //   * a v1-v4 entry has an UNPREFIXED stdin digest (this also lets Auto retain old rows while adding
+    //     new ones);
+    //   * a pre-v8 entry has NO recorded wiring, so it sits under the legacy sentinel and is served only
+    //     where it could honestly have been recorded (`legacyEntryFits`) — a refusal leaves that group's
+    //     cursor untouched, so a rejected legacy candidate is not consumed on the way to a miss.
     let replayEntry
         (slots: Dictionary<Key, ReplaySlot>)
         (command: Command)
         (digest: string option)
         : Result<CassetteEntry option, ProcessError> =
-        match lock gate (fun () -> play slots (keyOf command digest)) with
+        let liveWiring = outputWiring command
+        let anyEntry (_: CassetteEntry) = true
+        let legacyWiringFits = legacyEntryFits command
+
+        let attempt (stdin: string option) (wiring: string) (accept: CassetteEntry -> bool) =
+            lock gate (fun () -> play slots (keyWith command stdin wiring) accept)
+
+        match attempt digest liveWiring anyEntry with
         | Some entry -> Ok(Some entry)
         | None ->
-            match stdinDigest true command with
-            | Error error -> Error error
-            | Ok legacyDigest -> Ok(lock gate (fun () -> play slots (keyOf command legacyDigest)))
+            match attempt digest legacyOutputWiring legacyWiringFits with
+            | Some entry -> Ok(Some entry)
+            | None ->
+                match stdinDigest true command with
+                | Error error -> Error error
+                | Ok legacyDigest ->
+                    match attempt legacyDigest liveWiring anyEntry with
+                    | Some entry -> Ok(Some entry)
+                    | None -> Ok(attempt legacyDigest legacyOutputWiring legacyWiringFits)
 
     // The whole save critical section, shared by `Save` and the drop-time flush: this recorder's own
     // save gate, then the cross-instance/cross-process advisory lock on the target, and only then

@@ -104,6 +104,74 @@ type private ErrorRunner(errors: ProcessError list) =
         member _.SpawnAsync(_command, _cancellationToken) =
             Task.FromResult<Result<RunningProcess, ProcessError>>(Error(next ()))
 
+/// A deterministic inner `IProcessRunner` that answers like a REAL run does at the capture boundary:
+/// `stdout` comes back only when the command's own wiring lets it reach the parent (a pipe, or a PTY's
+/// merged terminal), and `stderr` only when it is neither folded into stdout (`MergeStderr`/`Pty`) nor
+/// sent somewhere the parent cannot see (`Null`/`Inherit`/a direct file redirect) — the same boundary
+/// `RunningProcess` and `FakeProcess.Build` apply to their streams. Recording through it therefore
+/// produces the entry a real record session would, which is what makes a "recorded with stdout going
+/// nowhere" fixture honest rather than synthetic. It does not model a merged run's interleaving: a
+/// folded stderr is simply not returned separately.
+type private WiringAwareRunner(stdout: string, stderr: string) =
+    let capturedStdout (command: Command) =
+        let config = command.Config
+
+        if
+            config.Pty.IsSome
+            || (config.StdoutFile.IsNone && config.StdoutMode = StdioMode.Piped)
+        then
+            stdout
+        else
+            ""
+
+    let capturedStderr (command: Command) =
+        let config = command.Config
+
+        if
+            config.Pty.IsNone
+            && not config.MergeStderr
+            && config.StderrFile.IsNone
+            && config.StderrMode = StdioMode.Piped
+        then
+            stderr
+        else
+            ""
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(command, _cancellationToken) =
+            Task.FromResult(
+                Ok(
+                    ProcessResult<string>(
+                        command.Program,
+                        capturedStdout command,
+                        capturedStderr command,
+                        Outcome.Exited 0,
+                        TimeSpan.Zero,
+                        false,
+                        [ 0 ]
+                    )
+                )
+            )
+
+        member _.CaptureBytesAsync(command, _cancellationToken) =
+            Task.FromResult(
+                Ok(
+                    ProcessResult<byte[]>(
+                        command.Program,
+                        Encoding.UTF8.GetBytes(capturedStdout command),
+                        capturedStderr command,
+                        Outcome.Exited 0,
+                        TimeSpan.Zero,
+                        false,
+                        [ 0 ],
+                        stdoutEncoding = command.Config.StdoutEncoding
+                    )
+                )
+            )
+
+        member _.SpawnAsync(_command, _cancellationToken) =
+            Task.FromResult(Error(ProcessError.Unsupported "WiringAwareRunner has no Spawn"))
+
 /// An inner runner that cancels `source` and only THEN returns its typed failure — the exact race the
 /// record path's cancellation gate is about: the call really has come back with a failure, but the
 /// effective token is already cancellation-requested by the time the recorder looks at it.
@@ -231,6 +299,38 @@ type CassetteTests() =
                 return Error error
             | Ok replayer -> return! (runner replayer).OutputStringAsync(probe, CancellationToken.None)
         }
+
+    /// `recordThenProbe` over an explicit inner runner, so the recording half can be made through one
+    /// that answers like a real run for the wiring under test (`WiringAwareRunner`) instead of the
+    /// fixed reply `recordThenProbe` uses.
+    let recordThenProbeVia
+        (inner: IProcessRunner)
+        (path: string)
+        (recorded: Command)
+        (probe: Command)
+        : Task<Result<ProcessResult<string>, ProcessError>> =
+        task {
+            do!
+                task {
+                    use recorder = RecordReplayRunner.Record(path, inner)
+                    let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
+
+                    match recorder.Save() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"save: {error}"
+                }
+
+            match RecordReplayRunner.Replay path with
+            | Error error ->
+                Assert.Fail $"replay load: {error}"
+                return Error error
+            | Ok replayer -> return! (runner replayer).OutputStringAsync(probe, CancellationToken.None)
+        }
+
+    /// A temp path for a `StdoutToFile`/`StderrToFile` redirect a wiring test keys on. Nothing writes
+    /// it — a replayed redirect must not pretend the file was produced — so tests assert its absence.
+    let redirectPath () =
+        Path.Combine(Path.GetTempPath(), $"pk-wiring-{Guid.NewGuid():N}.log")
 
     [<Test>]
     member _.``replay completion honours an already-cancelled Command.CancelOn``() : Task =
@@ -1526,7 +1626,7 @@ type CassetteTests() =
                     }
 
                 let onDisk = File.ReadAllText path
-                Assert.That(onDisk, Does.Contain "\"Version\": 7", "a PTY recording writes the current format")
+                Assert.That(onDisk, Does.Contain "\"Version\": 8", "a PTY recording writes the current format")
                 Assert.That(onDisk, Does.Contain "\"Pty\": true")
                 // PtyConfig.Default geometry is 80x24.
                 Assert.That(onDisk, Does.Contain "\"PtyCols\": 80")
@@ -1534,13 +1634,14 @@ type CassetteTests() =
             })
 
     [<Test>]
-    member _.``pre-v7 cassettes v1 through v6 still load and replay as recorded results under the v7 build``() : Task =
+    member _.``pre-v8 cassettes v1 through v7 still load and replay as recorded results under the v8 build``() : Task =
         task {
-            // One hand-crafted fixture per legacy version. Each must load under the v7 build (a missing
+            // One hand-crafted fixture per legacy version. Each must load under the v8 build (a missing
             // Pty field defaults to false / non-PTY, a missing Signalled field preserves legacy signal
-            // behavior, and a missing Failure keeps the entry the recorded RESULT it always was) and
-            // replay its recorded stdout, proving the whole v1→v7 back-compat load path, not just the
-            // newest predecessor.
+            // behavior, a missing Failure keeps the entry the recorded RESULT it always was, and a
+            // missing OutputWiring keys the entry as a legacy one served to a call that captures its
+            // output) and replay its recorded stdout, proving the whole v1→v8 back-compat load path, not
+            // just the newest predecessor.
             let fixtures =
                 [ 1,
                   "legacy1",
@@ -1565,7 +1666,11 @@ type CassetteTests() =
                   6,
                   "legacy6",
                   "six",
-                  """{ "Version": 6, "Entries": [ { "Program": "legacy6", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "six", "Stderr": "", "Pty": false, "Signalled": false, "Code": 0 } ] }""" ]
+                  """{ "Version": 6, "Entries": [ { "Program": "legacy6", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "six", "Stderr": "", "Pty": false, "Signalled": false, "Code": 0 } ] }"""
+                  7,
+                  "legacy7",
+                  "seven",
+                  """{ "Version": 7, "Entries": [ { "Program": "legacy7", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "seven", "Stderr": "", "Pty": false, "Signalled": false, "Code": 0, "Failure": null } ] }""" ]
 
             for version, program, expected, json in fixtures do
                 let path = Path.GetTempFileName()
@@ -1574,7 +1679,7 @@ type CassetteTests() =
                     File.WriteAllText(path, json)
 
                     match RecordReplayRunner.Replay path with
-                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v7 build: {error}"
+                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v8 build: {error}"
                     | Ok replayer ->
                         match! (runner replayer).OutputStringAsync(Command.create program, CancellationToken.None) with
                         | Ok result ->
@@ -1820,7 +1925,7 @@ type CassetteTests() =
                     }
 
                 let onDisk = File.ReadAllText path
-                Assert.That(onDisk, Does.Contain "\"Version\": 7", "a recorded failure writes the v7 format")
+                Assert.That(onDisk, Does.Contain "\"Version\": 8", "a recorded failure writes the current format")
                 Assert.That(onDisk, Does.Contain "\"Kind\": \"NotFound\"", "the discriminant names the error case")
                 Assert.That(onDisk, Does.Contain "\"Searched\": \"/usr/bin\"", "the payload keeps the searched path")
 
@@ -2570,4 +2675,518 @@ type CassetteTests() =
                 match RecordReplayRunner.FsyncParentDirectoryForTests path with
                 | Ok() -> ()
                 | Error detail -> Assert.Fail $"the parent-directory fsync must reach the platform: {detail}"
+            })
+
+    // --- Output-wiring fidelity (cassette format v8) -------------------------------------------------
+    //
+    // A real run captures stdout only where it actually reaches the parent — over a pipe, or a PTY's
+    // merged terminal. `Stdout(Null)`, inherited stdout, and a direct `StdoutToFile` redirect all leave
+    // the capture verbs honestly empty. Replay has to agree: a recording made over a pipe must not hand
+    // its captured output to a call whose stdout goes nowhere near the parent, and a recording made with
+    // stdout going elsewhere must not answer a piped call with its (empty) capture. The wiring is part
+    // of the match key, so a wiring the cassette never recorded is an ordinary miss.
+
+    [<Test>]
+    member _.``a piped recording is not replayed for a Stdout(Null) call``() : Task =
+        withCassette (fun path ->
+            task {
+                let recorded = Command.create "tool"
+                let probe = Command.create "tool" |> Command.stdout StdioMode.Null
+
+                match! recordThenProbe path recorded probe with
+                | Error(ProcessError.CassetteMiss "tool") -> ()
+                | other -> Assert.Fail $"a Null-stdout call must not replay a piped recording, got {other}"
+            })
+
+    [<Test>]
+    member _.``a piped recording is not replayed for an inherited-stdout call``() : Task =
+        withCassette (fun path ->
+            task {
+                let recorded = Command.create "tool"
+                let probe = Command.create "tool" |> Command.stdout StdioMode.Inherit
+
+                match! recordThenProbe path recorded probe with
+                | Error(ProcessError.CassetteMiss "tool") -> ()
+                | other -> Assert.Fail $"an inherited-stdout call must not replay a piped recording, got {other}"
+            })
+
+    [<Test>]
+    member _.``a piped recording is not replayed for a StdoutToFile call, and no file is invented``() : Task =
+        withCassette (fun path ->
+            task {
+                let redirect = redirectPath ()
+
+                try
+                    let recorded = Command.create "tool"
+                    let probe = Command.create "tool" |> Command.stdoutToFile redirect false
+
+                    match! recordThenProbe path recorded probe with
+                    | Error(ProcessError.CassetteMiss "tool") -> ()
+                    | other -> Assert.Fail $"a file-redirected call must not replay a piped recording, got {other}"
+
+                    // Replay spawns nothing, so the redirect target must not exist either: a miss can
+                    // never leave a caller believing the file was written.
+                    Assert.That(File.Exists redirect, Is.False, "replay must not invent the redirect file")
+                finally
+                    if File.Exists redirect then
+                        File.Delete redirect
+            })
+
+    [<Test>]
+    member _.``a recording whose stdout went nowhere is not replayed for a piped call``() : Task =
+        withCassette (fun path ->
+            task {
+                // The reverse pair: recorded through a runner that captures what a real run would, so
+                // the entry honestly holds NO stdout. Replaying it for a piped call would hide that
+                // call's real output behind an empty capture.
+                let recorded = Command.create "tool" |> Command.stdout StdioMode.Null
+                let probe = Command.create "tool"
+
+                match! recordThenProbeVia (WiringAwareRunner("captured", "")) path recorded probe with
+                | Error(ProcessError.CassetteMiss "tool") -> ()
+                | other -> Assert.Fail $"a piped call must not replay a Null-stdout recording, got {other}"
+            })
+
+    [<Test>]
+    member _.``the same stdout wiring still replays``() : Task =
+        withCassette (fun path ->
+            task {
+                // No regression for the honest case: one wiring, recorded and replayed, keeps working —
+                // and a non-capturing wiring replays as the empty capture it recorded.
+                let silent = Command.create "tool" |> Command.stdout StdioMode.Null
+
+                match! recordThenProbeVia (WiringAwareRunner("captured", "")) path silent silent with
+                | Ok result ->
+                    Assert.That(result.Stdout, Is.Empty, "a Null-stdout run captures nothing, on replay too")
+                    Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 0))
+                | Error error -> Assert.Fail $"the same wiring must still replay: {error}"
+            })
+
+    [<Test>]
+    member _.``a piped recording still replays unchanged``() : Task =
+        withCassette (fun path ->
+            task {
+                let command = Command.create "tool" |> Command.arg "x"
+
+                match! recordThenProbe path command command with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded-output")
+                | Error error -> Assert.Fail $"an ordinary piped recording must replay: {error}"
+            })
+
+    [<Test>]
+    member _.``a file redirect keys its path and its append flag``() : Task =
+        withCassette (fun path ->
+            task {
+                let first = redirectPath ()
+                let second = redirectPath ()
+
+                let toFile (target: string) (append: bool) =
+                    Command.create "tool" |> Command.stdoutToFile target append
+
+                // Same file, appended rather than truncated: a different destination, so a miss.
+                match!
+                    recordThenProbeVia
+                        (WiringAwareRunner("captured", ""))
+                        path
+                        (toFile first false)
+                        (toFile first true)
+                with
+                | Error(ProcessError.CassetteMiss "tool") -> ()
+                | other -> Assert.Fail $"append and truncate are different wirings, got {other}"
+
+                // A different file is a different destination too.
+                match!
+                    recordThenProbeVia
+                        (WiringAwareRunner("captured", ""))
+                        path
+                        (toFile first false)
+                        (toFile second false)
+                with
+                | Error(ProcessError.CassetteMiss "tool") -> ()
+                | other -> Assert.Fail $"two redirect targets are different wirings, got {other}"
+
+                // The identical redirect replays.
+                match!
+                    recordThenProbeVia
+                        (WiringAwareRunner("captured", ""))
+                        path
+                        (toFile first false)
+                        (toFile first false)
+                with
+                | Ok result -> Assert.That(result.Stdout, Is.Empty)
+                | Error error -> Assert.Fail $"the identical redirect must replay: {error}"
+            })
+
+    [<Test>]
+    member _.``a stderr destination and MergeStderr are part of the wiring key``() : Task =
+        withCassette (fun path ->
+            task {
+                let recorded = Command.create "tool"
+
+                // stderr folded into stdout: `ProcessResult.Stderr` is empty on a real run, so a
+                // separate-streams recording must not answer it.
+                match!
+                    recordThenProbeVia
+                        (WiringAwareRunner("out", "err"))
+                        path
+                        recorded
+                        (Command.create "tool" |> Command.mergeStderr)
+                with
+                | Error(ProcessError.CassetteMiss "tool") -> ()
+                | other ->
+                    Assert.Fail $"a merged-stderr call must not replay a separate-streams recording, got {other}"
+
+                match!
+                    recordThenProbeVia
+                        (WiringAwareRunner("out", "err"))
+                        path
+                        recorded
+                        (Command.create "tool" |> Command.stderr StdioMode.Null)
+                with
+                | Error(ProcessError.CassetteMiss "tool") -> ()
+                | other -> Assert.Fail $"a Null-stderr call must not replay a captured stderr, got {other}"
+            })
+
+    [<Test>]
+    member _.``a PTY recording and a plain run are different wirings``() : Task =
+        withCassette (fun path ->
+            task {
+                let terminal = Command.create "tui" |> Command.pty
+
+                match! recordThenProbeVia (WiringAwareRunner("frame", "")) path terminal (Command.create "tui") with
+                | Error(ProcessError.CassetteMiss "tui") -> ()
+                | other -> Assert.Fail $"a plain run must not replay a PTY recording, got {other}"
+
+                match! recordThenProbeVia (WiringAwareRunner("frame", "")) path terminal terminal with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "frame")
+                | Error error -> Assert.Fail $"a PTY recording must replay for a PTY call: {error}"
+            })
+
+    [<Test>]
+    member _.``the bytes verb applies the same wiring boundary``() : Task =
+        withCassette (fun path ->
+            task {
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, WiringAwareRunner("captured", ""))
+                        let! _ = (runner recorder).CaptureBytesAsync(Command.create "tool", CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    let silent = Command.create "tool" |> Command.stdout StdioMode.Null
+
+                    match! (runner replayer).CaptureBytesAsync(silent, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss "tool") -> ()
+                    | other ->
+                        Assert.Fail $"the bytes verb must not replay a piped recording for a Null call, got {other}"
+
+                    match! (runner replayer).CaptureBytesAsync(Command.create "tool", CancellationToken.None) with
+                    | Ok result -> Assert.That(Encoding.UTF8.GetString result.Stdout, Is.EqualTo "captured")
+                    | Error error -> Assert.Fail $"the identical wiring must still replay exact bytes: {error}"
+            })
+
+    [<Test>]
+    member _.``a replayed SpawnAsync applies the same wiring boundary``() : Task =
+        withCassette (fun path ->
+            task {
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, WiringAwareRunner("line one\n", ""))
+                        let! _ = (runner recorder).OutputStringAsync(Command.create "tool", CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    let silent = Command.create "tool" |> Command.stdout StdioMode.Null
+
+                    match! (runner replayer).StartAsync(silent, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss "tool") -> ()
+                    | Ok _ -> Assert.Fail "a Null-stdout spawn must not replay a piped recording"
+                    | Error other -> Assert.Fail $"expected a cassette miss, got {other}"
+
+                    match! (runner replayer).StartAsync(Command.create "tool", CancellationToken.None) with
+                    | Error error -> Assert.Fail $"the identical wiring must still replay a handle: {error}"
+                    | Ok running ->
+                        use running = running
+
+                        match! running.OutputStringAsync() with
+                        // The reconstructed handle re-splits the recorded stream into lines, so the
+                        // recording's trailing newline is a line terminator rather than content.
+                        | Ok result -> Assert.That(result.Stdout, Is.EqualTo "line one")
+                        | Error error -> Assert.Fail $"the replayed handle must stream the recording: {error}"
+            })
+
+    [<Test>]
+    member _.``a recording stores its wiring fingerprint, keeping a redirect path out of the file``() : Task =
+        withCassette (fun path ->
+            task {
+                let redirect = redirectPath ()
+
+                try
+                    do!
+                        task {
+                            use recorder = RecordReplayRunner.Record(path, WiringAwareRunner("captured", ""))
+                            let command = Command.create "tool" |> Command.stdoutToFile redirect false
+                            let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+
+                            match recorder.Save() with
+                            | Ok() -> ()
+                            | Error error -> Assert.Fail $"save: {error}"
+                        }
+
+                    let onDisk = File.ReadAllText path
+                    Assert.That(onDisk, Does.Contain "\"Version\": 8", "the wiring fingerprint is a v8 field")
+                    Assert.That(onDisk, Does.Contain "\"OutputWiring\"", "every recording stores its own wiring")
+                    Assert.That(onDisk, Does.Contain "o:file:", "a redirect keys as a file destination")
+
+                    // The path itself is digested, exactly as env values are: it can carry as much (a
+                    // token in a temp directory's name), so it must not land in the file in clear text —
+                    // checked against both its JSON-escaped form and its bare file name.
+                    let escapedPath = (JsonSerializer.Serialize redirect).Trim '"'
+
+                    Assert.That(onDisk, Does.Not.Contain escapedPath, "a redirect path must not be stored verbatim")
+
+                    Assert.That(
+                        onDisk,
+                        Does.Not.Contain(Path.GetFileName redirect),
+                        "not even the redirect's file name may reach the cassette"
+                    )
+                finally
+                    if File.Exists redirect then
+                        File.Delete redirect
+            })
+
+    [<Test>]
+    member _.``Auto records a separate entry for a different stdout wiring instead of replaying the first``() : Task =
+        withCassette (fun path ->
+            task {
+                match RecordReplayRunner.Auto(path, WiringAwareRunner("captured", "")) with
+                | Error error -> Assert.Fail $"auto load: {error}"
+                | Ok auto ->
+                    use auto = auto
+                    let piped = Command.create "tool"
+                    let silent = Command.create "tool" |> Command.stdout StdioMode.Null
+
+                    match! (runner auto).OutputStringAsync(piped, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "captured")
+                    | Error error -> Assert.Fail $"the piped miss must be delegated and recorded: {error}"
+
+                    match! (runner auto).OutputStringAsync(silent, CancellationToken.None) with
+                    | Ok result ->
+                        Assert.That(result.Stdout, Is.Empty, "the Null-stdout call must run for real, not replay")
+                    | Error error -> Assert.Fail $"the second wiring must be delegated and recorded: {error}"
+
+                    match auto.Save() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"save: {error}"
+
+                    Assert.That(
+                        (cassettePrograms path).Length,
+                        Is.EqualTo 2,
+                        "two wirings of one call are two recordings, not one shared entry"
+                    )
+            })
+
+    // --- Pre-v8 (no recorded wiring) compatibility ---------------------------------------------------
+    //
+    // A cassette written before v8 says nothing about how its calls were wired, so it is served only
+    // where handing it over cannot fabricate anything: the PTY shape must agree (recorded since v4), and
+    // a call that captures nothing on a channel may only be given an entry that recorded nothing there.
+    // Everything else about such an entry replays exactly as it did before v8.
+
+    [<Test>]
+    member _.``a pre-v8 entry holding captured stdout still replays for a piped call``() : Task =
+        withCassette (fun path ->
+            task {
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "old", "Stderr": "", "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a v7 cassette must load: {error}"
+                | Ok replayer ->
+                    match! (runner replayer).OutputStringAsync(Command.create "tool", CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "old", "an existing cassette keeps replaying")
+                    | Error error -> Assert.Fail $"a legacy entry must still replay for a piped call: {error}"
+            })
+
+    [<Test>]
+    member _.``a pre-v8 entry holding captured stdout is refused by a call that captures none``() : Task =
+        task {
+            let redirect = redirectPath ()
+
+            let probes =
+                [ "Null", Command.create "tool" |> Command.stdout StdioMode.Null
+                  "Inherit", Command.create "tool" |> Command.stdout StdioMode.Inherit
+                  "StdoutToFile", Command.create "tool" |> Command.stdoutToFile redirect false ]
+
+            for label, probe in probes do
+                let path = Path.GetTempFileName()
+
+                try
+                    File.WriteAllText(
+                        path,
+                        """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "old", "Stderr": "", "Code": 0 } ] }"""
+                    )
+
+                    match RecordReplayRunner.Replay path with
+                    | Error error -> Assert.Fail $"a v7 cassette must load: {error}"
+                    | Ok replayer ->
+                        match! (runner replayer).OutputStringAsync(probe, CancellationToken.None) with
+                        | Error(ProcessError.CassetteMiss "tool") -> ()
+                        | other -> Assert.Fail $"a legacy entry must not fabricate stdout for {label}, got {other}"
+                finally
+                    if File.Exists path then
+                        File.Delete path
+
+            Assert.That(File.Exists redirect, Is.False, "replay must not invent the redirect file")
+        }
+
+    [<Test>]
+    member _.``a pre-v8 entry that captured nothing still replays for a call that captures nothing``() : Task =
+        withCassette (fun path ->
+            task {
+                // Nothing can be fabricated from an entry with no captured output, so the legacy
+                // fallback still serves it — and it replays as the honest empty capture it recorded.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "", "Stderr": "", "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a v7 cassette must load: {error}"
+                | Ok replayer ->
+                    let silent = Command.create "tool" |> Command.stdout StdioMode.Null
+
+                    match! (runner replayer).OutputStringAsync(silent, CancellationToken.None) with
+                    | Ok result ->
+                        Assert.That(result.Stdout, Is.Empty)
+                        Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 0))
+                    | Error error -> Assert.Fail $"an empty legacy entry must still replay: {error}"
+            })
+
+    [<Test>]
+    member _.``a pre-v8 entry that captured nothing still replays for a piped call``() : Task =
+        withCassette (fun path ->
+            task {
+                // The other half of the empty-entry rule, stated on purpose: a pre-v8 file cannot say
+                // whether this entry came from a silent piped command or from one whose output went
+                // elsewhere, and an empty capture invents nothing either way — so it keeps replaying for
+                // both, exactly as it did before v8. Only re-recording it (which writes a wiring) can
+                // tell the two apart.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "", "Stderr": "", "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a v7 cassette must load: {error}"
+                | Ok replayer ->
+                    match! (runner replayer).OutputStringAsync(Command.create "tool", CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.Empty)
+                    | Error error -> Assert.Fail $"an empty legacy entry must still replay for a piped call: {error}"
+            })
+
+    [<Test>]
+    member _.``a pre-v8 entry holding captured stderr is refused by a merged-stderr call``() : Task =
+        withCassette (fun path ->
+            task {
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "", "Stderr": "boom", "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a v7 cassette must load: {error}"
+                | Ok replayer ->
+                    let merged = Command.create "tool" |> Command.mergeStderr
+
+                    match! (runner replayer).OutputStringAsync(merged, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss "tool") -> ()
+                    | other ->
+                        Assert.Fail $"a merged run's stderr is empty — a legacy entry must not fill it, got {other}"
+            })
+
+    [<Test>]
+    member _.``a pre-v8 PTY entry and a plain call do not match either way``() : Task =
+        task {
+            let fixtures =
+                [ "merged",
+                  """{ "Version": 7, "Entries": [ { "Program": "tui", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "frame", "Stderr": "", "Pty": true, "PtyCols": 80, "PtyRows": 24, "Code": 0 } ] }""",
+                  Command.create "tui",
+                  (Command.create "tui" |> Command.pty)
+                  "plain",
+                  """{ "Version": 7, "Entries": [ { "Program": "tui", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "frame", "Stderr": "", "Pty": false, "Code": 0 } ] }""",
+                  (Command.create "tui" |> Command.pty),
+                  Command.create "tui" ]
+
+            for label, json, mismatched, matching in fixtures do
+                let path = Path.GetTempFileName()
+
+                try
+                    File.WriteAllText(path, json)
+
+                    match RecordReplayRunner.Replay path with
+                    | Error error -> Assert.Fail $"a v7 {label} cassette must load: {error}"
+                    | Ok replayer ->
+                        match! (runner replayer).OutputStringAsync(mismatched, CancellationToken.None) with
+                        | Error(ProcessError.CassetteMiss "tui") -> ()
+                        | other -> Assert.Fail $"a legacy {label} recording must not serve the other shape, got {other}"
+
+                        match! (runner replayer).OutputStringAsync(matching, CancellationToken.None) with
+                        | Ok result -> Assert.That(result.Stdout, Is.EqualTo "frame")
+                        | Error error ->
+                            Assert.Fail $"a legacy {label} recording must replay for its own shape: {error}"
+                finally
+                    if File.Exists path then
+                        File.Delete path
+        }
+
+    [<Test>]
+    member _.``a refused pre-v8 candidate does not consume its group's capture order``() : Task =
+        withCassette (fun path ->
+            task {
+                // Two pre-v8 recordings of one call, which replay in capture order. A call that captures
+                // no stdout is refused both of them; that refusal must leave the group's cursor exactly
+                // where it was, or the piped call behind it would find the sequence already half spent.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 7, "Entries": [
+                        { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "first", "Stderr": "", "Code": 0 },
+                        { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "second", "Stderr": "", "Code": 0 }
+                    ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a v7 cassette must load: {error}"
+                | Ok replayer ->
+                    let silent = Command.create "tool" |> Command.stdout StdioMode.Null
+
+                    for _ in 1..2 do
+                        match! (runner replayer).OutputStringAsync(silent, CancellationToken.None) with
+                        | Error(ProcessError.CassetteMiss "tool") -> ()
+                        | other -> Assert.Fail $"a refused legacy candidate must stay a miss, got {other}"
+
+                    let piped = Command.create "tool"
+
+                    match! (runner replayer).OutputStringAsync(piped, CancellationToken.None) with
+                    | Ok result ->
+                        Assert.That(result.Stdout, Is.EqualTo "first", "the cursor must still be at entry 0")
+                    | Error error -> Assert.Fail $"the first recording must still replay: {error}"
+
+                    match! (runner replayer).OutputStringAsync(piped, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "second", "capture order must be intact")
+                    | Error error -> Assert.Fail $"the second recording must still replay: {error}"
             })

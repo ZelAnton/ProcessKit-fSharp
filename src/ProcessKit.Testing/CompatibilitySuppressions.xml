@@ -7,10 +7,11 @@
   frameworks (net8.0 + net10.0). Diagnostic CP0002 = "a member present in the baseline (2.4.2) is
   absent in the current build": the F# record `ProcessKit.Testing.CassetteEntry` had its positional
   constructor's arity change when the PTY-cassette fields `Pty` / `PtyCols` / `PtyRows`, then the
-  `Signalled` marker, and then the `Failure` (recorded typed failure) half were added in [Unreleased]
-  (cassette formats v4, v6, and v7 — see src/ProcessKit.Testing/Cassette.fs). Adding a field to an F#
-  positional record replaces its 15-argument constructor with a 20-argument one, so ApiCompat
-  correctly reports the old-arity constructor as removed relative to the last published release.
+  `Signalled` marker, then the `Failure` (recorded typed failure) half, and then the `OutputWiring`
+  (effective output-wiring fingerprint) field were added in [Unreleased] (cassette formats v4, v6, v7,
+  and v8 — see src/ProcessKit.Testing/Cassette.fs). Adding a field to an F# positional record replaces
+  its 15-argument constructor with a 21-argument one, so ApiCompat correctly reports the old-arity
+  constructor as removed relative to the last published release.
 
   The suppressed TARGET is the BASELINE's 15-argument constructor, so it does not change as further
   fields are added — it names what 2.4.2 shipped, not what the current build has.
@@ -22,9 +23,10 @@
        is public only so System.Text.Json can (de)serialize it.
     2. Real consumption is deserialization through the parameterless `[<CLIMutable>]` constructor +
        property setters, which field additions do NOT break: old cassettes still load and the new
-       fields default (documented v1->v7 back-compat — a pre-v4 entry keys as a non-PTY run, a
-       pre-v6 entry without a signal remains unobserved, and a pre-v7 entry with no `Failure` stays
-       the recorded result it always was).
+       fields default (documented v1->v8 back-compat — a pre-v4 entry keys as a non-PTY run, a
+       pre-v6 entry without a signal remains unobserved, a pre-v7 entry with no `Failure` stays
+       the recorded result it always was, and a pre-v8 entry with no `OutputWiring` still replays
+       wherever it could honestly have been recorded).
     3. Fields were already added to `CassetteEntry` in earlier minor releases (`StdoutBase64`,
        `EnvFingerprint`) the same non-breaking way.
 
