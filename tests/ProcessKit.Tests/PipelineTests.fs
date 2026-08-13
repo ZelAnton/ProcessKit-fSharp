@@ -1377,6 +1377,74 @@ type PipelineTests() =
         }
         :> Task
 
+    [<Test>]
+    member _.``a fail-loud stderr overflow costs a pipeline no bounded stdin observation window``() : Task =
+        task {
+            // A fail-loud output overflow outranks `ProcessError.Stdin` in the pipeline's classification
+            // exactly as it does for a single command (which returns `OutputTooLarge` before it ever
+            // consults its stdin feeder), so an already-decided overflowing chain must not wait on stage 0's
+            // still-reading source for a fault it could never surface. The source is never released: only a
+            // gate that honours the overflow step keeps the window count at zero.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use observation =
+                new StdinFinalObservationScope(ignore, Some(TimeSpan.FromMilliseconds 200.0))
+
+            let noisy =
+                stderrStage 50 ((OutputBufferPolicy.Unbounded.WithMaxBytes 16).WithOverflow OverflowMode.Error)
+                |> Command.stdin (Stdin.FromAsyncLines source)
+
+            match! (noisy.Pipe sortStage).OutputStringAsync() with
+            | Error(ProcessError.OutputTooLarge _) -> ()
+            | Error other -> Assert.Fail $"expected OutputTooLarge, got {other.Message}"
+            | Ok _ -> Assert.Fail "a fail-loud stderr overflow must fail the pipeline"
+
+            Assert.That(
+                observation.Windows,
+                Is.EqualTo 0,
+                "an overflowing pipeline must not pay for the bounded observation window at all"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a cancelled streaming pipeline costs no bounded stdin observation window``() : Task =
+        task {
+            // Whole-chain cancellation is the streaming session's FIRST classification step, above the
+            // stage-0 stdin rule, so a cancelled session must not pay the window either. Both stages are
+            // unchecked, so the pipefail representative stays "accepted" however the cancellation kill
+            // caught them — leaving the cancellation check as the only thing that can keep the window shut.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use observation =
+                new StdinFinalObservationScope(ignore, Some(TimeSpan.FromMilliseconds 200.0))
+
+            use cts = new CancellationTokenSource()
+
+            let first =
+                ((shell "exit 0") |> Command.stdin (Stdin.FromAsyncLines source)).UncheckedInPipe()
+
+            match! (first.Pipe(sortStage.UncheckedInPipe())).StartAsync cts.Token with
+            | Error error -> Assert.Fail $"start failed: {error}"
+            | Ok session ->
+                use session = session
+                // Parked inside the user's source: the feed is still running, so a window could be opened.
+                do! source.Parked
+                cts.Cancel()
+
+                match! session.FinishAsync() with
+                | Error(ProcessError.Cancelled _) -> ()
+                | Error other -> Assert.Fail $"expected Cancelled from FinishAsync, got {other.Message}"
+                | Ok _ -> Assert.Fail "a cancelled session must not finish clean"
+
+                Assert.That(
+                    observation.Windows,
+                    Is.EqualTo 0,
+                    "a cancelled pipeline must not pay for the bounded observation window at all"
+                )
+        }
+        :> Task
+
     // --- Observability: a pipeline run is whole-chain, not per-stage (T-013) ---
 
     [<Test>]
