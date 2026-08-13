@@ -1348,6 +1348,97 @@ type PtyTests() =
         }
 
     [<Test>]
+    member _.``Windows ConPTY ProcessStdin WriteLineAsync submits Enter to Console ReadLine``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only ConPTY path"
+            else
+                // Same style as the T-335 tests above (R-01): the verdict is the EXIT CODE, reachable only if
+                // the cooked console reader actually saw the line "hello" terminated by Enter — i.e. only if
+                // `WriteLineAsync`'s CR terminator was accepted as Enter. No dependency on captured stdout, and
+                // no skip gate on the outcome itself (removed per R-01) — the only legitimate skip is the
+                // pre-1809 no-ConPTY host, handled below before any data is sent.
+                //
+                // The reader has to be `cmd.exe`'s `set /p ... <CON`, not a managed line reader
+                // (`[Console]::In.ReadLine()`, `Read-Host`): investigating this finding's original failure
+                // (Exited 9, empty line) traced it to a Windows/ConPTY host-process quirk, unrelated to the CR
+                // terminator this task changes — a managed process's inherited `STD_INPUT_HANDLE` under this
+                // spawn does not resolve to the pseudoconsole's console (confirmed: `GetConsoleMode` on it
+                // fails), so anything reading through that handle (`[Console]::In`, and even `cmd.exe`'s own
+                // `set /p` without `<CON`) sees no input at all before any terminator byte is even in play. The
+                // T-335 tests above sidestep this the same way `copy con` always has: by opening the console
+                // device explicitly (`CON`) rather than trusting the inherited standard handle. `<CON` applies
+                // that same, already-proven-reliable path to a genuine Enter-terminated line read, which is
+                // exactly the contract this test exists to prove. A batch file (not an inline `cmd.exe /c`
+                // one-liner) avoids `%line%`'s parse-time (not run-time) expansion inside a single compound
+                // command line — an unrelated batch-scripting quirk, not a ConPTY one.
+                // R-02: `Command.args` only applies Windows argv-quoting, not cmd.exe metacharacter
+                // escaping — quotes do not stop cmd.exe's own command-line parser from acting on `&`,
+                // `|`, `^`, `<`, `>`, `%`, `!`, `(`/`)` (command-grouping operators), or `@` (documented
+                // by `cmd /?` as special in `/c` quote processing — it can affect whether a quoted
+                // argument's surrounding quotes are preserved) before the quoted argument ever reaches
+                // the target exe. A `IO.Path.GetTempPath()` containing one of those would make this test
+                // either fail to run the intended batch file or, worse, run an attacker-shaped command
+                // line. Document and enforce the assumption instead of trusting it silently: skip rather
+                // than give a false pass/fail on a host whose TEMP path violates it.
+                let tempPath = IO.Path.GetTempPath()
+                let cmdMetacharacters = [| '&'; '|'; '^'; '<'; '>'; '%'; '!'; '"'; '('; ')'; '@' |]
+
+                if tempPath |> Seq.exists (fun c -> Array.contains c cmdMetacharacters) then
+                    Assert.Ignore
+                        $"IO.Path.GetTempPath() ({tempPath}) contains a cmd.exe metacharacter; this test assumes a TEMP path free of shell metacharacters for its `cmd.exe /c <path>` invocation"
+
+                let batchFile =
+                    IO.Path.Combine(tempPath, "conpty-writeline-" + Guid.NewGuid().ToString("N") + ".cmd")
+
+                IO.File.WriteAllLines(
+                    batchFile,
+                    [| "@echo off"
+                       "set \"line=\""
+                       "set /p line=<CON"
+                       "if errorlevel 1 goto :fail"
+                       "if not \"%line%\"==\"hello\" goto :fail"
+                       "exit 7"
+                       ":fail"
+                       "exit 9" |]
+                )
+
+                try
+                    let command =
+                        Command.create "cmd.exe"
+                        |> Command.args [ "/c"; batchFile ]
+                        |> Command.pty
+                        |> Command.keepStdinOpen
+                        |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                    match! runner.StartAsync(command, CancellationToken.None) with
+                    | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
+                        Assert.Ignore $"host lacks ConPTY: {message}"
+                    | Error other -> Assert.Fail $"unexpected error from a ConPTY spawn: {other}"
+                    | Ok running ->
+                        use running = running
+
+                        match running.TakeStdin() with
+                        | None -> Assert.Fail "a KeepStdinOpen ConPTY run must hand out an interactive stdin"
+                        | Some stdin -> do! stdin.WriteLineAsync "hello"
+
+                        let! outcome = running.WaitAsync()
+
+                        match outcome with
+                        | Outcome.Exited 7 -> ()
+                        | other ->
+                            Assert.Fail
+                                $"WriteLineAsync's CR terminator did not submit Enter to the cooked console reader, got {other}"
+                finally
+                    try
+                        IO.File.Delete batchFile
+                    with :? IOException ->
+                        // Best-effort cleanup of the scratch batch file; a leaked temp file does not affect
+                        // correctness of this or later runs (each run gets a fresh GUID-named file).
+                        ()
+        }
+
+    [<Test>]
     member _.``a ConPTY stdin whose FromFile source cannot be opened still ends the child's input (F-17)``() : Task =
         task {
             // The eager `StdinSource.File` open runs at spawn, before any feed exists, so its failure IS where

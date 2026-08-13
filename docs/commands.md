@@ -863,6 +863,21 @@ Console.WriteLine(await cmd.RunAsync() switch
   whose `Original` field is the failed attempt's original `ProcessError` and whose
   `Detail` contains the callback exception message. The callback exception never
   escapes as a raw task fault, and no additional attempt is started.
+  A **one-shot** stdin source (`Stdin.FromStream` / `FromLines` / `FromAsyncLines`)
+  runs its first attempt like any other, but can be retried only after a failure
+  that precedes a live child — `NotFound`, `Spawn`, or a launch refused as
+  `Unsupported` — because nothing has read the source yet. After anything that may
+  have reached a child (`Exit`, `Timeout`, `Signalled`, `Stdin`, `OutputTooLarge`,
+  `Cancelled`, or the ambiguous `Io`) the run ends with that first error, without
+  consulting your classifier, rather than feeding a second child an exhausted
+  source. Such a run also reserves the source while it holds it: a concurrent run
+  over the same stream or sequence — or a later one, once a child has read it — is
+  refused with `ProcessError.Unsupported` instead of being handed the remains. The
+  reservation is released again whenever the run ends without any attempt reaching a
+  child — an already-cancelled token, a cancellation during the backoff, a throwing
+  classifier, or an attempt that threw before launching all hand the source back to
+  the next run — while a run that may have reached one (a success, a post-child
+  failure, or a cancellation that arrived mid-attempt) keeps it.
 - **`RetryBackoff`** uses the same attempt/classifier contract with a growing
   `baseDelay × factor^n` pause, capped by `maxDelay` before optional `[0.5, 1.5)`
   jitter. Base/cap delays must be non-negative and `factor` must be finite and at
