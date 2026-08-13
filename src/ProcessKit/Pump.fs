@@ -1368,6 +1368,29 @@ module internal Pump =
         : Task<exn option> =
         feedStdinWithEncoding Encoding.UTF8 source stdinStream closeWhenDone cancellationToken
 
+    /// The ceiling on the bounded FINAL observation of a still-running stdin feed
+    /// (`StdinFeeder.ObserveFaultAsync`): how long a result-producing verb may wait, after its child has
+    /// already exited cleanly and its output drains have finished, for a slow source to conclude and
+    /// stash its genuine failure. Mirrors the `PUMP_TEARDOWN` window ProcessKit-rs bounds the same
+    /// observation by (`87d6ca498696`/`bc2e43efab45`). Long enough that a source which merely lost the
+    /// race with a fast-exiting child still gets to report honestly; short enough — and always followed
+    /// by `Stop` — that a genuinely hung source can never hold the verb open indefinitely. It is only
+    /// ever *reached* by a feed still running after the child exited, which is the rare case; a feed that
+    /// already finished resolves with no wait at all.
+    let stdinFinalObservationBudget = TimeSpan.FromSeconds 5.0
+
+    /// Internal test seam: overrides `stdinFinalObservationBudget` for the bounded final observation, so
+    /// a regression test can prove the "a hung source never holds the verb" bound in milliseconds instead
+    /// of seconds. `None` (the default) in every production run; nothing but a test ever sets it.
+    let mutable stdinFinalObservationBudgetForTests: TimeSpan option = None
+
+    /// Internal test seam: invoked exactly when a bounded final observation is about to WAIT on a feed
+    /// that is still running — never on the fast path where the feed has already finished, and never when
+    /// the caller decided not to observe at all (a non-accepted outcome). It lets a deterministic
+    /// regression test release its gated source at precisely that instant, so "the source failed AFTER
+    /// the child exited and the pumps drained" needs no timing guesswork. `None` in every production run.
+    let mutable stdinFinalObservationTestHook: (unit -> unit) option = None
+
     /// A started background stdin feed together with the lifecycle token that stops it. Created by
     /// `feedStdinSource`, one per started child.
     ///
@@ -1379,9 +1402,11 @@ module internal Pump =
     /// exception is swallowed into a stashed fault), so a stopped feed simply completes with no fault.
     ///
     /// `Fault` reports a genuine source failure, but only once the feed has finished — a still-running
-    /// feed yields `None` and never blocks — preserving the "surface `ProcessError.Stdin` only on an
-    /// otherwise-successful run" contract (the caller deliberately never awaits the feed, so a
-    /// source fault that loses the race with the child's own exit is not surfaced).
+    /// feed yields `None` and never blocks. It is the non-blocking *peek*, for a caller that has already
+    /// decided the fault could not be surfaced anyway (a louder failure won). A caller about to decide an
+    /// otherwise-successful run's result uses `ObserveFaultAsync` instead: the peek alone loses a source
+    /// that is still reading when the child exits, which is exactly the failure `ProcessError.Stdin`
+    /// exists to report.
     type StdinFeeder internal (feed: Task<exn option>, cts: CancellationTokenSource option) =
         // Serializes the lifecycle CTS's `Cancel` (from `Stop`) against its single `Dispose` (from the
         // completion cleanup below) so cancelling can never race the dispose. Not a hot path — one
@@ -1414,6 +1439,52 @@ module internal Pump =
 
         /// A genuine stdin-source failure, observable only once the feed has finished, else `None`.
         member _.Fault: exn option = if feed.IsCompletedSuccessfully then feed.Result else None
+
+        /// The BOUNDED FINAL observation of this feed, for the one moment a result-producing verb decides
+        /// an otherwise-successful run's result: the child has exited with an accepted code and the output
+        /// drains have finished, so nothing but this feed can still turn that success into a
+        /// `ProcessError.Stdin`.
+        ///
+        /// A feed that has already finished resolves immediately with its stashed fault (the common case —
+        /// no wait, no timer). A feed still running gets `stdinFinalObservationBudget` to conclude on its
+        /// own, so a slow `FromStream`/`FromLines`/`FromAsyncLines` source that only fails AFTER a fast
+        /// child exited is observed and reported as the real cause instead of being torn down unread. A
+        /// source still parked when the budget runs out is `Stop`ped — its lifecycle token is cancelled so
+        /// it unwinds and disposes the user's enumerator/stream — and reported as no fault: this awaits the
+        /// budget, never the source, so a genuinely hung source can delay the verb's result by at most the
+        /// budget and can never hang it. (`Stop` is idempotent, so the teardown that follows is unaffected.)
+        ///
+        /// A routine broken pipe stays a non-failure exactly as before: the classification of what counts
+        /// as a genuine fault lives in the feed itself (`genuineStdinFault`/`StdinSourceFault`) and is not
+        /// touched here — this only decides how long to WAIT for that verdict. The feed never faults, so
+        /// this never throws; it returns `None` for a feed that somehow did not complete successfully.
+        member this.ObserveFaultAsync() : Task<exn option> =
+            if feed.IsCompleted then
+                Task.FromResult(if feed.IsCompletedSuccessfully then feed.Result else None)
+            else
+                task {
+                    stdinFinalObservationTestHook |> Option.iter (fun hook -> hook ())
+
+                    let budget =
+                        stdinFinalObservationBudgetForTests
+                        |> Option.defaultValue stdinFinalObservationBudget
+
+                    // The delay's own token exists solely to release the timer as soon as the feed wins the
+                    // race, so a short verb never leaves a budget-long timer armed behind it.
+                    use timer = new CancellationTokenSource()
+                    let feedTask = feed :> Task
+                    let! finished = Task.WhenAny(feedTask, Task.Delay(budget, timer.Token))
+
+                    if obj.ReferenceEquals(finished, feedTask) then
+                        timer.Cancel()
+                        return (if feed.IsCompletedSuccessfully then feed.Result else None)
+                    else
+                        // Still reading its source after the whole budget: stop it (cancelling the lifecycle
+                        // token unwinds a parked read and disposes the user's enumerator/stream) and report
+                        // no fault rather than waiting on a source that may never conclude.
+                        this.Stop()
+                        return None
+                }
 
         /// Stop the feed: cancel its lifecycle token so a feed parked in the user's source unwinds and
         /// disposes the user's enumerator/stream. Idempotent and teardown-race-safe (a no-op once the

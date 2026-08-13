@@ -323,7 +323,7 @@ type FakeProcess
               Wait = fun () -> Task.FromResult outcome
               // A fake process feeds no stdin source, so it never has a source failure to surface. Its
               // keep-open in-memory sink is ready immediately, with no feeder for `TakeStdin` to wait on.
-              StdinError = fun () -> None
+              StdinError = RunningHost.NoStdinError
               StdinFeedComplete = ignore
               StartKill = fun () -> ()
               Signal =

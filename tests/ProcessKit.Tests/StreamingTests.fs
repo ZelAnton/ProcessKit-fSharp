@@ -178,6 +178,108 @@ type private GatedByteStream(payload: byte[], gate: Task) =
             }
         )
 
+// --- T-329 delayed-stdin-source test doubles, shared across StreamingTests / VerbTests / PipelineTests.
+// Defined here (non-private) because StreamingTests is the earliest of the three in the .fsproj compile
+// order, so the later two can reuse these instead of redefining them.
+
+/// How a `DelayedStdinAsyncLines` source concludes once it is released.
+type DelayedStdinEnding =
+
+    /// It raises — the genuine source failure a bounded final observation has to surface.
+    | FailWhenReleased
+
+    /// It ends cleanly — nothing to surface, and no false failure to invent either.
+    | EndWhenReleased
+
+/// A `FromAsyncLines` stdin source that parks in its FIRST `MoveNextAsync` — before writing anything —
+/// until `Release()` is called, and only then fails or ends (per `ending`).
+///
+/// Released at the exact instant a verb opens its bounded final observation window (see
+/// `StdinFinalObservationScope`), it reproduces T-329's race with no timing guesswork: the source
+/// concludes strictly AFTER the child exited and the output pumps drained, which is precisely when a
+/// single non-blocking peek at the feeder sees no fault at all. Never released, it is instead the hung
+/// source that same window must STOP rather than wait for: it parks on the feeder's own lifecycle token,
+/// so `StdinFeeder.Stop` unwinds it (a cancelled feed is not a failure) and `Cancelled`/`Disposed` report
+/// that it did.
+type DelayedStdinAsyncLines(ending: DelayedStdinEnding) =
+    let parked =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let release =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let cancelled =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let disposed =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    /// Completes once the feed has entered `MoveNextAsync` and parked, before writing anything.
+    member _.Parked: Task = parked.Task
+
+    /// Completes once the feeder's lifecycle token cancelled this source — i.e. `StdinFeeder.Stop` ran.
+    member _.Cancelled: Task = cancelled.Task
+
+    /// Completes once the user's enumerator was disposed (never leaked past the run).
+    member _.Disposed: Task = disposed.Task
+
+    /// Let the parked source conclude, failing or ending per its `ending`.
+    member _.Release() = release.TrySetResult() |> ignore
+
+    interface IAsyncEnumerable<string> with
+        member _.GetAsyncEnumerator(cancellationToken: CancellationToken) : IAsyncEnumerator<string> =
+            let registration =
+                cancellationToken.Register(fun () -> cancelled.TrySetResult() |> ignore)
+
+            { new IAsyncEnumerator<string> with
+                member _.Current = "delayed"
+
+                member _.MoveNextAsync() : ValueTask<bool> =
+                    parked.TrySetResult() |> ignore
+
+                    ValueTask<bool>(
+                        task {
+                            // Park until the test releases the source, or until the feeder's lifecycle
+                            // token cancels this feed (`StdinFeeder.Stop`) — a cancelled feed is not the
+                            // caller's error, so that path must stay a non-failure.
+                            do! release.Task.WaitAsync cancellationToken
+
+                            match ending with
+                            | FailWhenReleased -> return raise (InvalidOperationException "delayed-source-boom")
+                            | EndWhenReleased -> return false
+                        }
+                    )
+              interface IAsyncDisposable with
+                  member _.DisposeAsync() : ValueTask =
+                      registration.Dispose()
+                      disposed.TrySetResult() |> ignore
+                      ValueTask() }
+
+/// Scoped control of the T-329 bounded-final-observation seams: `onWindow` runs at the exact instant a
+/// verb opens a bounded window on a still-running stdin feed (so a gated source can be released precisely
+/// then), `Windows` counts those openings — zero proves a louder failure won and no wait was paid at all —
+/// and `budget` shortens the window so the "a hung source never holds the verb" bound can be proven in
+/// milliseconds. Disposal restores both seams, so no later test inherits them; this suite runs
+/// sequentially (no `[<Parallelizable>]`), so one scope at a time owns them.
+type StdinFinalObservationScope(onWindow: unit -> unit, budget: TimeSpan option) =
+    let mutable windows = 0
+
+    do
+        Pump.stdinFinalObservationBudgetForTests <- budget
+
+        Pump.stdinFinalObservationTestHook <-
+            Some(fun () ->
+                Interlocked.Increment(&windows) |> ignore
+                onWindow ())
+
+    /// How many bounded observation windows were opened while this scope was installed.
+    member _.Windows = Volatile.Read(&windows)
+
+    interface IDisposable with
+        member _.Dispose() =
+            Pump.stdinFinalObservationTestHook <- None
+            Pump.stdinFinalObservationBudgetForTests <- None
+
 [<TestFixture>]
 type StreamingTests() =
 
@@ -293,7 +395,7 @@ type StreamingTests() =
               StartedTimestamp = Stopwatch.GetTimestamp()
               StartTimeIdentity = None
               Wait = fun () -> Task.FromResult(Outcome.Exited 0)
-              StdinError = fun () -> None
+              StdinError = RunningHost.NoStdinError
               StdinFeedComplete = ignore
               StartKill = ignore
               Signal = fun _ -> Ok()
@@ -322,7 +424,7 @@ type StreamingTests() =
               StartedTimestamp = Stopwatch.GetTimestamp()
               StartTimeIdentity = None
               Wait = fun () -> Task.FromResult(Outcome.Exited 0)
-              StdinError = fun () -> None
+              StdinError = RunningHost.NoStdinError
               StdinFeedComplete = ignore
               StartKill = ignore
               Signal = fun _ -> Ok()
@@ -366,6 +468,34 @@ type StreamingTests() =
                     Assert.That(result.Stdout, Does.Contain "line1")
                     Assert.That(result.Stdout, Does.Contain "line3")
                 | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // T-329: `FinishAsync` is the third Result-producing verb classifying through the same feeder
+    // observation as the buffered verbs, so the fix must hold for a streaming consumer too.
+    [<Test>]
+    member _.``Finish surfaces a stdin source that fails only after the child exits``() : Task =
+        task {
+            // The child exits 0 well before this source concludes, so the old single non-blocking peek at
+            // the feeder saw no fault and `FinishAsync` reported a silent success — the stdin failure the
+            // caller needed was then thrown away by teardown. The bounded final observation must wait for
+            // the source's genuine failure and report it as `ProcessError.Stdin`.
+            let source = DelayedStdinAsyncLines FailWhenReleased
+
+            use _observation =
+                new StdinFinalObservationScope((fun () -> source.Release()), None)
+
+            let command = shell "exit 0" |> Command.stdin (Stdin.FromAsyncLines source)
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let! _ = collect (running.StdoutLinesAsync())
+
+                match! running.FinishAsync() with
+                | Error(ProcessError.Stdin _) -> ()
+                | Error other -> Assert.Fail $"expected ProcessError.Stdin from FinishAsync, got {other}"
+                | Ok _ -> Assert.Fail "a source failing after the child exited must not finish as a success"
         }
         :> Task
 
@@ -1248,7 +1378,7 @@ type StreamingTests() =
                   StartedTimestamp = Stopwatch.GetTimestamp()
                   StartTimeIdentity = None
                   Wait = fun () -> Task.FromResult(Outcome.Exited 0)
-                  StdinError = fun () -> None
+                  StdinError = RunningHost.NoStdinError
                   StdinFeedComplete = ignore
                   StartKill = ignore
                   Signal = fun _ -> Ok()
@@ -1335,7 +1465,7 @@ type StreamingTests() =
                   StartedTimestamp = Stopwatch.GetTimestamp()
                   StartTimeIdentity = None
                   Wait = fun () -> Task.FromException<Outcome>(InvalidOperationException "boom")
-                  StdinError = fun () -> None
+                  StdinError = RunningHost.NoStdinError
                   StdinFeedComplete = ignore
                   StartKill = ignore
                   Signal = fun _ -> Ok()
@@ -2020,7 +2150,7 @@ type StreamingTests() =
                   StartedTimestamp = Stopwatch.GetTimestamp()
                   StartTimeIdentity = None
                   Wait = fun () -> Task.FromResult(Outcome.Exited 0)
-                  StdinError = fun () -> None
+                  StdinError = RunningHost.NoStdinError
                   StdinFeedComplete = ignore
                   StartKill = ignore
                   Signal = fun _ -> Ok()
@@ -2165,7 +2295,7 @@ type StreamingTests() =
                   StartedTimestamp = Stopwatch.GetTimestamp()
                   StartTimeIdentity = None
                   Wait = fun () -> Task.FromResult(Outcome.Exited 0)
-                  StdinError = fun () -> None
+                  StdinError = RunningHost.NoStdinError
                   StdinFeedComplete = ignore
                   StartKill = fun () -> releaseStdout.TrySetResult() |> ignore
                   Signal = fun _ -> Ok()
