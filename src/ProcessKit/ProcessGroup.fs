@@ -398,13 +398,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
               // verb once its child has exited with an accepted code and its output drains have finished
               // (`RunningProcess.stdinErrorOnSuccess`). Race-free — `feedStdin` never faults, so the feed's
               // completion establishes the happens-before for the stashed value. A feed that has already
-              // finished (the common case: a missing `FromFile` faults synchronously at spawn in
-              // `File.OpenRead`) answers with no wait; a source still reading when the child exited gets a
-              // short bounded window to conclude, and is STOPPED — never awaited — once it runs out, so a
-              // hung `FromStream`/`FromLines`/`FromAsyncLines` can delay the verb by at most that budget
-              // and can never hang it. Peeking once here (as this did before) instead dropped a genuine
-              // source failure that lost the race with a fast child's own exit, turning it into a silent
-              // success; ProcessKit-rs closed the same race the same way (`87d6ca498696`/`bc2e43efab45`).
+              // finished (the common case: a missing `FromFile` faults at spawn in `File.OpenRead` and then
+              // only has to end the child's stdin) answers with no wait; a source still reading when the
+              // child exited gets a short bounded window to conclude, and is STOPPED — never awaited — once
+              // it runs out, so a hung `FromStream`/`FromLines`/`FromAsyncLines` can delay the verb by at
+              // most that budget and can never hang it. Peeking once here (as this did before) instead
+              // dropped a genuine source failure that lost the race with a fast child's own exit, turning
+              // it into a silent success; ProcessKit-rs closed the same race the same way
+              // (`87d6ca498696`/`bc2e43efab45`).
               StdinError = (fun () -> stdinFeeder.ObserveFaultAsync())
               // Block until the background feeder has drained the source, so `TakeStdin` (on a
               // `Stdin(source)` + `KeepStdinOpen` run) never hands the caller a pipe the feeder is still

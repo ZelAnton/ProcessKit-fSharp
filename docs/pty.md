@@ -121,12 +121,12 @@ The [cookbook PTY recipe](cookbook.md#interactive-password-prompt-through-a-pty)
 
 A PTY has one device for input and output, so ending stdin is not the handle close it is for a pipe.
 On POSIX, `ProcessStdin.FinishAsync` (and `PtySession.CloseStdinAsync`, and a `Command.Stdin` source
-once it has been drained) instead sends the terminal's own end-of-input character — the pty's
-configured `termios.c_cc[VEOF]`, Ctrl-D on a default terminal — twice: the first ends a line the
-input left unterminated, the second lands on the now-empty line and is what makes the child's next
-read return zero bytes. A child that reads to EOF, such as `cat` or a shell `read` loop, therefore
-finishes even when the last input carried no newline. The terminal itself stays open for the child's
-output until the run ends.
+once the run is done delivering it — drained, or failed to open) instead sends the terminal's own
+end-of-input character — the pty's configured `termios.c_cc[VEOF]`, Ctrl-D on a default terminal —
+twice: the first ends a line the input left unterminated, the second lands on the now-empty line and
+is what makes the child's next read return zero bytes. A child that reads to EOF, such as `cat` or a
+shell `read` loop, therefore finishes even when the last input carried no newline. The terminal
+itself stays open for the child's output until the run ends.
 
 Because this is a character the line discipline interprets, it only ends the input of a child whose
 terminal is in canonical (cooked) mode. A child that switches its own tty to raw mode receives that

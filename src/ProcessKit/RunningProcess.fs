@@ -979,8 +979,9 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // the output drains have been awaited. Only then is the feeder observed, and only on the success
     // branch — which is both the correct precedence and why a failing/timed-out run pays nothing for the
     // bounded window: `host.StdinError` waits (bounded) for a source still reading when the child exited,
-    // instead of peeking once and calling a lost race a success. A feed that already finished — every
-    // synchronous source failure, e.g. a missing `FromFile` — answers with no wait at all.
+    // instead of peeking once and calling a lost race a success. A feed that already finished answers with
+    // no wait at all — a synchronous source failure, e.g. a missing `FromFile`, has nothing left to read and
+    // is finished once it has ended the child's stdin.
     let stdinErrorOnSuccess (outcome: Outcome) : Task<ProcessError option> =
         if outcome.IsAcceptedBy config.OkCodes then
             task {

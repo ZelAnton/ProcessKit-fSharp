@@ -107,6 +107,11 @@ type PtyTests() =
                 written.AddRange buffer
                 nativeint take)
 
+    // A path that certainly does not exist, so the eager `StdinSource.File` open fails at spawn — the one
+    // place a bulk stdin delivery ends before it has written anything.
+    let missingStdinPath () =
+        Path.Combine(Path.GetTempPath(), $"pk-pty-missing-{Guid.NewGuid():N}")
+
     // Collect an async sequence (the streaming event/line verbs) into a list for assertions.
     let collect (items: IAsyncEnumerable<'T>) =
         task {
@@ -1340,6 +1345,141 @@ type PtyTests() =
                     match outcome with
                     | Outcome.Exited 7 -> ()
                     | other -> Assert.Fail $"FinishAsync must end the ConPTY child's input (exit 7), got {other}"
+        }
+
+    [<Test>]
+    member _.``a ConPTY stdin whose FromFile source cannot be opened still ends the child's input (F-17)``() : Task =
+        task {
+            // The eager `StdinSource.File` open runs at spawn, before any feed exists, so its failure IS where
+            // this run's bulk delivery ends. Dropping the writer there delivers nothing — the view owns no
+            // handle, the session's pipe stays open by design, and a child reading to EOF would wait forever.
+            let pipe = new ConPtyHostInputDouble()
+            let keepalive = new Native.Windows.ConPtyInputKeepalive(pipe)
+            use stdin = new Native.Windows.ConPtyStdinStream(keepalive)
+
+            let feeder =
+                Pump.feedStdinSource (Some(stdin :> Stream)) (Some(Stdin.FromFile(missingStdinPath ()))) false
+
+            let! fault = feeder.Task
+
+            // The source failure stays the primary cause the terminal verb reports...
+            match fault with
+            | Some ex -> Assert.That(ex, Is.InstanceOf<FileNotFoundException>())
+            | None -> Assert.Fail "a source that could not be opened must still stash its failure"
+
+            // ...and the child's console saw the end of input regardless, through a pipe the session keeps.
+            Assert.That(pipe.Written, Is.EqualTo<byte[]>([| 0x1Auy; 0x0Duy |]))
+            Assert.That(stdin.IsFinished, Is.True)
+
+            Assert.That(
+                pipe.DisposeCount,
+                Is.Zero,
+                "the session's host-input pipe must outlive a source that could not be opened"
+            )
+        }
+
+    [<Test>]
+    member _.``a pty stdin whose FromFile source cannot be opened still ends the child's input (F-17)``() : Task =
+        task {
+            // The POSIX half of the same seam. This view is non-owning too, so closing it hands the line
+            // discipline no end of input — only the terminal's own end-of-input character does.
+            let written = ResizeArray<byte>()
+            recordPtyWrites written 64
+
+            try
+                let stdin = ptyStdinForTests 4uy
+
+                let feeder =
+                    Pump.feedStdinSource (Some(stdin :> Stream)) (Some(Stdin.FromFile(missingStdinPath ()))) false
+
+                let! fault = feeder.Task
+
+                match fault with
+                | Some ex -> Assert.That(ex, Is.InstanceOf<FileNotFoundException>())
+                | None -> Assert.Fail "a source that could not be opened must still stash its failure"
+
+                Assert.That(written.ToArray(), Is.EqualTo<byte[]>([| 4uy; 4uy |]))
+                Assert.That(stdin.IsFinished, Is.True)
+            finally
+                Native.Posix.ptyWriteForTests <- None
+        }
+
+    [<Test>]
+    member _.``a KeepStdinOpen run keeps its PTY stdin after a FromFile source cannot be opened (F-17)``() : Task =
+        task {
+            // `KeepStdinOpen` means the caller keeps writing and ends the child's input itself, so a source
+            // that could not be opened must neither send that unrepeatable gesture on the caller's behalf nor
+            // take away the very stream the caller needs to send it.
+            let pipe = new ConPtyHostInputDouble()
+            let keepalive = new Native.Windows.ConPtyInputKeepalive(pipe)
+            use stdin = new Native.Windows.ConPtyStdinStream(keepalive)
+
+            let feeder =
+                Pump.feedStdinSource (Some(stdin :> Stream)) (Some(Stdin.FromFile(missingStdinPath ()))) true
+
+            let! fault = feeder.Task
+
+            Assert.That(fault.IsSome, Is.True, "the source failure is reported whether or not stdin is kept open")
+            Assert.That(stdin.IsFinished, Is.False)
+            Assert.That(pipe.Written, Is.Empty)
+
+            // The interactive stdin still works, and the caller's own finish is what ends the child's input.
+            do! stdin.WriteAsync([| 0x41uy |], 0, 1)
+            do! stdin.FinishAsync()
+            Assert.That(pipe.Written, Is.EqualTo<byte[]>([| 0x41uy; 0x1Auy; 0x0Duy |]))
+        }
+
+    [<Test>]
+    member _.``a PTY run whose FromFile source is missing reports Stdin instead of hanging (F-17)``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only PTY spawn"
+            else
+                // `cat` reads until EOF and the source failed before one byte could be written, so this run
+                // can finish at all only if that failure still delivers the terminal's end of input. Without
+                // one the child waits forever and the verb reports the timeout kill instead of the real cause.
+                let cmd =
+                    (Command.create "/bin/cat").Pty({ Cols = 80; Rows = 24; Echo = false })
+                    |> Command.stdin (Stdin.FromFile(missingStdinPath ()))
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
+                | Error(ProcessError.Stdin _) -> ()
+                | Error other -> Assert.Fail $"a missing PTY stdin source must report ProcessError.Stdin, got {other}"
+                | Ok result ->
+                    // Before F-17 this is where a hung child landed: the timeout kill is honest data, so the
+                    // verb answered `Ok`/`TimedOut` a whole timeout late, with the source failure lost.
+                    Assert.Fail $"a missing stdin source must not pass through as a success, got {result.Outcome}"
+        }
+
+    [<Test>]
+    member _.``a ConPTY run whose FromFile source is missing reports Stdin instead of hanging (F-17)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only ConPTY path"
+            else
+                // The Windows counterpart: `copy con` ends only at the console's own end of input, so the
+                // child exits (and the verb answers with the honest source failure) only if the failed source
+                // still delivers the Ctrl-Z + Enter gesture. Closing the writer cannot: it owns no handle.
+                let cmd =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/c"; "copy con NUL & exit 0" ]
+                    |> Command.pty
+                    |> Command.stdin (Stdin.FromFile(missingStdinPath ()))
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! cmd.OutputStringAsync() with
+                | Error(ProcessError.Unsupported msg) when msg.Contains "1809" ->
+                    // Pre-1809 host without ConPTY — the documented typed-Unsupported path (D9).
+                    Assert.Ignore $"host lacks ConPTY: {msg}"
+                | Error(ProcessError.Stdin _) -> ()
+                | Error other ->
+                    Assert.Fail $"a missing ConPTY stdin source must report ProcessError.Stdin, got {other}"
+                | Ok result ->
+                    // Before F-17 this is where a hung child landed: the timeout kill is honest data, so the
+                    // verb answered `Ok`/`TimedOut` a whole timeout late, with the source failure lost.
+                    Assert.Fail $"a missing stdin source must not pass through as a success, got {result.Outcome}"
         }
 
     // ----------------------------------------------------------------------------------

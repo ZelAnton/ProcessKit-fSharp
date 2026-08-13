@@ -1231,6 +1231,43 @@ module internal Pump =
         }
         :> Task
 
+    /// End the child's stdin where a bulk stdin feed is done with it: the source was the child's complete
+    /// input, so the child must now see END OF INPUT. For a pipe end that is the ordinary close. A stdin
+    /// stream that owns no handle to close has to deliver its terminal's own end-of-input gesture instead
+    /// (`Native.Common.IStdinFinisher`) — both implementations today are non-owning PTY views, the POSIX one
+    /// over the shared pty master and the Windows one over the ConPTY session's host-input pipe — because
+    /// closing either releases nothing and takes no terminal with it, so a child reading to EOF would wait
+    /// forever for an end of input that can never arrive.
+    ///
+    /// BOTH points where a bulk feed reaches the end of its delivery route through here, so neither can end a
+    /// PTY run's stdin with a close that ends nothing: after the source is drained (`feedStdinWithEncoding`),
+    /// and where delivery ends before it starts because the source could not be opened at all (the eager
+    /// `StdinSource.File` failure in `feedStdinSourceWithEncoding`).
+    ///
+    /// Never throws. The close is best-effort exactly as `disposeQuietly` is, but a failed end-of-input
+    /// delivery is NOT a teardown race to swallow — the child is left waiting on input this feed promised to
+    /// end — so it is RETURNED for the caller to stash behind any earlier fault it already recorded.
+    /// (`FinishAsync` itself already completes successfully for the two cases where end of input is moot
+    /// rather than lost: a hung-up terminal, an already-torn-down run.)
+    ///
+    /// The gesture runs as a `backgroundTask` for the same reason the feed does — one caller is on the thread
+    /// that started the run — while a pipe end's close needs no task at all and completes synchronously.
+    let private endStdinAfterSource (stdinStream: Stream) : Task<exn option> =
+        match box stdinStream with
+        | :? Native.Common.IStdinFinisher as finisher ->
+            backgroundTask {
+                try
+                    do! finisher.FinishAsync()
+                    return None
+                with ex ->
+                    // Returned rather than thrown or swallowed: this task must never fault (one caller
+                    // stashes it behind an earlier fault, the other has nothing left to report it through).
+                    return Some ex
+            }
+        | _ ->
+            disposeQuietly stdinStream
+            Task.FromResult<exn option> None
+
     /// Write a stdin source to the child's stdin stream; close it (EOF) afterwards unless the
     /// caller is keeping it open for interactive writing. Never faults: returns a genuine
     /// source failure — a source-acquisition failure (per `genuineStdinFault`) on the write side, or
@@ -1334,26 +1371,17 @@ module internal Pump =
                     | _ -> genuineStdinFault ex
 
             if closeWhenDone then
-                // The source was the child's complete input, so the child must now see END OF INPUT. For a
-                // pipe end that is the ordinary close (the fallback branch below); a stdin stream that owns
-                // no handle to close (the POSIX pty view over the shared master) has to deliver the
-                // terminal's own end-of-input character instead, or a child reading to EOF waits forever
-                // for one that can never arrive.
-                match box stdinStream with
-                | :? Native.Common.IStdinFinisher as finisher ->
-                    try
-                        do! finisher.FinishAsync()
-                    with ex ->
-                        // Unlike the dispose above, a failed end-of-input delivery is NOT a teardown race to
-                        // swallow: the child is left waiting on input this feed promised to end. Stash it so
-                        // an otherwise-successful run surfaces it as `ProcessError.Stdin`, without displacing
-                        // a source fault already recorded above (that one is the earlier, primary cause).
-                        // `FinishAsync` itself already completes successfully for the two cases where end of
-                        // input is moot rather than lost (a hung-up terminal, an already-torn-down run).
-                        match fault with
-                        | None -> fault <- Some ex
-                        | Some _ -> ()
-                | _ -> disposeQuietly stdinStream
+                // The source was the child's complete input, so the child must now see END OF INPUT — a
+                // close for a pipe end, the terminal's own end-of-input gesture for a stdin stream that owns
+                // no handle to close (see `endStdinAfterSource`).
+                let! endFault = endStdinAfterSource stdinStream
+
+                // A failed end-of-input delivery is stashed so an otherwise-successful run surfaces it as
+                // `ProcessError.Stdin`, but never displaces a source fault already recorded above — that one
+                // is the earlier, primary cause. (A best-effort close never reports one at all.)
+                match fault with
+                | None -> fault <- endFault
+                | Some _ -> ()
 
             return fault
         }
@@ -1547,10 +1575,29 @@ module internal Pump =
 
                     StdinFeeder(feed, Some cts)
                 with ex ->
-                    // No source bytes can be written, so close stdin just as a failed background feed
-                    // would; the completed feeder makes the source error visible to the terminal verb.
-                    disposeQuietly stdinStream
-                    StdinFeeder(Task.FromResult(Some ex), None)
+                    // No source bytes can ever be written, so this IS where bulk delivery ends: end the
+                    // child's stdin exactly as a drained feed does, or a PTY child reading to EOF is left
+                    // waiting on input this run promised to deliver — a close of a non-owning view releases
+                    // nothing and delivers no end of input (see `endStdinAfterSource`). Gated by
+                    // `keepStdinOpen` the same way `closeWhenDone` gates the drained feed: a caller that
+                    // keeps writing interactively has not reached its end of input, and this gesture cannot
+                    // be taken back — that caller ends its own input through `ProcessStdin.FinishAsync`,
+                    // through the very stream this branch would otherwise have taken away from it.
+                    let feed =
+                        backgroundTask {
+                            if not keepStdinOpen then
+                                // A failed delivery does not displace `ex`: the source error is the earlier,
+                                // primary cause and the one the caller must fix, and a feeder reports one
+                                // fault. (Both would surface through the same `ProcessError.Stdin`.)
+                                let! _ = endStdinAfterSource stdinStream
+                                ()
+
+                            return Some ex
+                        }
+
+                    // No lifecycle token: there is no source to stop, so the feeder is finished — carrying the
+                    // source error to the terminal verb — as soon as the child's stdin has been ended.
+                    StdinFeeder(feed, None)
             | _ ->
                 // The lifecycle token: cancelling it stops the feed (unblocking a parked source read),
                 // disposed by the feeder once the feed has finished.
