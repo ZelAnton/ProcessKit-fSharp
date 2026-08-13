@@ -171,6 +171,55 @@ type private ParkThenFaultOnDisposeStream(firstChunk: byte[]) =
         released.TrySetResult() |> ignore
         base.Dispose disposing
 
+/// A decorator of exactly the kind `DelegatingProcessRunner`'s own doc names — "a wrapper: logging,
+/// **retry**, metrics, fault injection" — that drives its inner runner TWICE with the very `Command` it
+/// was handed. Under a retry budget that command carries the verb layer's run-level hold on a one-shot
+/// stdin payload, so the second call is a second launch bearing a hold it did not take: it must be
+/// refused before it can create a child, not waved through onto a payload the first child drained.
+/// `concurrent` picks whether the two calls race or follow one another — both must end with exactly one
+/// child, so the guard cannot be beaten by check-then-act timing either.
+type private DoubleCallingRunner(inner: IProcessRunner, concurrent: bool) =
+    inherit DelegatingProcessRunner(inner)
+
+    let outcomes = ResizeArray<Result<ProcessResult<string>, ProcessError>>()
+
+    /// Both calls' outcomes (completion order for the concurrent variant, call order otherwise).
+    member _.Outcomes = List.ofSeq outcomes
+
+    override this.CaptureStringAsync(command, cancellationToken) =
+        task {
+            if concurrent then
+                let first = this.Inner.CaptureStringAsync(command, cancellationToken)
+                let second = this.Inner.CaptureStringAsync(command, cancellationToken)
+                let! both = Task.WhenAll [| first; second |]
+                outcomes.AddRange both
+            else
+                let! first = this.Inner.CaptureStringAsync(command, cancellationToken)
+                outcomes.Add first
+                let! second = this.Inner.CaptureStringAsync(command, cancellationToken)
+                outcomes.Add second
+
+            // Surface the LAST outcome as the decorated verb's result, as a retry wrapper would.
+            return outcomes[outcomes.Count - 1]
+        }
+
+/// A runner hook that KEEPS the `Command` it is handed and spawns nothing — the seam every user double
+/// occupies (`ScriptedRunner.When(Func<Command,bool>, …)`, a hand-written `IProcessRunner`), here over a
+/// `DryRunRunner` preview so the run it stands in for really does start no child. Under a retry budget
+/// the kept value carries that run's hold on a one-shot payload, so it is a stamped command that
+/// outlives the run which stamped it — starting it later must be checked like any other launch.
+type private CommandKeepingRunner(inner: IProcessRunner) =
+    inherit DelegatingProcessRunner(inner)
+
+    let mutable seen: Command option = None
+
+    /// The command this hook was handed, stamp and all.
+    member _.Seen = seen
+
+    override this.CaptureStringAsync(command, cancellationToken) =
+        seen <- Some command
+        this.Inner.CaptureStringAsync(command, cancellationToken)
+
 /// Regression tests for the correctness & robustness fixes: timeout validation/clamping, the
 /// single-consumption guard on `RunningProcess`, pipeline per-stage `OkCodes`, and pipeline wiring
 /// of a stage whose stdout was set non-piped.
@@ -1934,6 +1983,202 @@ type CorrectnessBugTests() =
                     this.MarkerLines dir,
                     Is.EqualTo(box afterFirst),
                     "no stage of the refused streaming chain may start"
+                )
+            finally
+                this.DeleteDirQuietly dir
+        }
+        :> Task
+
+    // --- T-342 / R-03: a run's hold buys no launch a free pass -----------------------------------
+    //
+    // The run-level hold a retrying run takes rides on the `Command` it drives (`WithStdinReservation`),
+    // and that command is an ordinary value the library hands to whatever `IProcessRunner` drives it. So
+    // "the payload is already reserved BY THIS RUN" cannot be a question answered from the stamp alone:
+    // the launch boundary used to wave any launch carrying the stamp straight through, with no check of
+    // the claim's state, which handed a second child the drained remains — through shipped public API,
+    // and only when a retry policy was set, so having one WEAKENED the guarantee. A launch now takes the
+    // hold's loan atomically instead, and only while the payload is intact and the run still holds it.
+
+    /// The one-child assertions shared by the decorator variants: the double call ends with exactly one
+    /// success and one typed refusal, and the marker file proves only one child ever existed and that it
+    /// got the whole payload.
+    member private this.AssertSingleChildAcrossDoubleCall
+        (dir: string, outcomes: Result<ProcessResult<string>, ProcessError> list)
+        =
+        let succeeded =
+            outcomes
+            |> List.filter (fun outcome ->
+                match outcome with
+                | Ok _ -> true
+                | Error _ -> false)
+            |> List.length
+
+        let refused =
+            outcomes
+            |> List.filter (fun outcome ->
+                match outcome with
+                | Error(ProcessError.Unsupported message) -> message.Contains "one-shot stdin source"
+                | _ -> false)
+            |> List.length
+
+        Assert.That(outcomes |> List.length, Is.EqualTo 2, "the decorator must have called the runner twice")
+        Assert.That(succeeded, Is.EqualTo 1, "exactly one call may own the payload")
+        Assert.That(refused, Is.EqualTo 1, "the other call must be refused loudly, not handed the same payload")
+
+        let recorded = this.MarkerLines dir
+
+        Assert.That(
+            recorded |> List.filter ((=) "ran") |> List.length,
+            Is.EqualTo 1,
+            "the refused call must not have started a child of its own"
+        )
+
+        Assert.That(
+            recorded |> List.filter ((=) "alpha") |> List.length,
+            Is.EqualTo 1,
+            "the payload must have reached exactly one child, whole"
+        )
+
+    [<Test>]
+    member this.``a decorator that calls its inner runner twice with a retrying run's command gets one child``
+        ()
+        : Task =
+        task {
+            let dir = this.MarkerDir()
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "bravo\nalpha\n")
+
+            try
+                // The retry budget is what makes the verb layer stamp its run-level hold on the command
+                // handed to the runner; the decorator then drives that stamped command twice.
+                let command =
+                    this.Recorder dir
+                    |> Command.stdin (Stdin.FromStream stream)
+                    |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+                let decorator = DoubleCallingRunner(runner, concurrent = false)
+                let driver: IProcessRunner = decorator
+
+                match! driver.OutputStringAsync(command, CancellationToken.None) with
+                | Ok _ -> Assert.Fail "the second call must be refused, so the run's last outcome is that refusal"
+                | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "one-shot stdin source")
+                | Error other -> Assert.Fail $"expected the one-shot refusal, got {other.Message}"
+
+                this.AssertSingleChildAcrossDoubleCall(dir, decorator.Outcomes)
+            finally
+                this.DeleteDirQuietly dir
+        }
+        :> Task
+
+    [<Test>]
+    member this.``two concurrent calls under one retrying run's hold still produce exactly one child``() : Task =
+        task {
+            let dir = this.MarkerDir()
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "bravo\nalpha\n")
+
+            try
+                // The same decorator, but with both calls in flight at once: the hold is lent to one
+                // launch at a time, so the loser cannot slip past between "is this our run's payload?"
+                // and the spawn that answers it.
+                let command =
+                    this.Recorder dir
+                    |> Command.stdin (Stdin.FromStream stream)
+                    |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+                let decorator = DoubleCallingRunner(runner, concurrent = true)
+                let driver: IProcessRunner = decorator
+
+                let! _ = driver.OutputStringAsync(command, CancellationToken.None)
+                this.AssertSingleChildAcrossDoubleCall(dir, decorator.Outcomes)
+            finally
+                this.DeleteDirQuietly dir
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a retrying run gets its own hold back between attempts``() : Task =
+        task {
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "bravo\nalpha\n")
+
+            // The other side of the same rule: the loan is exclusive, so it has to come BACK to the run
+            // whenever an attempt creates no child, or the run's second attempt would be refused as a
+            // second consumer of the payload it holds itself. Every attempt here fails at the launch
+            // boundary before a child exists, so the run must end with that honest `NotFound` — a
+            // one-shot refusal in its place would mean an attempt was locked out by its own run.
+            let mutable classified = 0
+
+            let missing =
+                Command.create "pk_t342_r03_no_such_program_canary"
+                |> Command.stdin (Stdin.FromStream stream)
+                |> Command.retry 3 TimeSpan.Zero (fun _ ->
+                    classified <- classified + 1
+                    true)
+
+            match! missing.OutputStringAsync() with
+            | Error(ProcessError.NotFound _) -> ()
+            | Error other -> Assert.Fail $"expected NotFound for a missing program, got {other.Message}"
+            | Ok _ -> Assert.Fail "a non-existent program must not spawn"
+
+            Assert.That(classified, Is.EqualTo 2, "each attempt after the first must have been allowed to run")
+
+            // And no attempt read a byte of it, so the payload is still whole for the next run.
+            let sorted = Command.create "sort" |> Command.stdin (Stdin.FromStream stream)
+
+            match! sorted.OutputStringAsync() with
+            | Ok result -> Assert.That(result.Stdout, Does.Contain "alpha")
+            | Error error -> Assert.Fail $"expected the untouched payload to be usable, got {error.Message}"
+        }
+        :> Task
+
+    [<Test>]
+    member this.``a command kept from a runner hook cannot start a child on a spent payload``() : Task =
+        task {
+            let dir = this.MarkerDir()
+            use stream = new MemoryStream(Encoding.UTF8.GetBytes "bravo\nalpha\n")
+
+            try
+                let recorder = this.Recorder dir |> Command.stdin (Stdin.FromStream stream)
+
+                let previewed = recorder |> Command.retry 3 TimeSpan.Zero (fun _ -> true)
+
+                // A preview run: the verb layer takes the run-level hold and stamps it on the command the
+                // hook is handed, the hook keeps that command, and the run — having spawned nothing —
+                // gives the payload back untouched.
+                let hook = CommandKeepingRunner(ProcessKit.Testing.DryRunRunner())
+                let driver: IProcessRunner = hook
+
+                match! driver.OutputStringAsync(previewed, CancellationToken.None) with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail $"a preview must never be refused a one-shot source: {error.Message}"
+
+                let leaked =
+                    match hook.Seen with
+                    | Some seen -> seen
+                    | None -> failwith "the hook was never handed the command"
+
+                // A DIFFERENT run then feeds the payload to a real child, so it is spent for good.
+                match! recorder.OutputStringAsync() with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail $"the returned payload must be usable by the next run: {error.Message}"
+
+                let afterFirst = this.MarkerLines dir
+                Assert.That(afterFirst |> List.filter ((=) "ran") |> List.length, Is.EqualTo 1)
+                Assert.That(afterFirst, Does.Contain "alpha", "the first child must have been fed the payload")
+
+                // The kept command still carries the stamp of a hold whose run is long over. Started
+                // through the streaming path — which applies no retry, so nothing re-reserves anything on
+                // its behalf — it used to be recognized as "the owning run's own launch" and started a
+                // child over the exhausted payload. It is a second consumer like any other.
+                match! leaked.StartAsync() with
+                | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "one-shot stdin source")
+                | Error other -> Assert.Fail $"expected the one-shot refusal, got {other.Message}"
+                | Ok running ->
+                    use _ = running
+                    Assert.Fail "a command kept from a hook must not start a child over a spent payload"
+
+                Assert.That(
+                    this.MarkerLines dir,
+                    Is.EqualTo(box afterFirst),
+                    "the refused start must not have created a child"
                 )
             finally
                 this.DeleteDirQuietly dir

@@ -109,10 +109,15 @@ type internal CommandConfig =
       StdinSource: Stdin option
       // The run-level hold on this command's one-shot stdin payload (`FromStream`/`FromLines`/
       // `FromAsyncLines`), taken by `Runner.withRetry` for a run that may attempt the command more than
-      // once and carried here so each attempt's launch boundary can tell "the run that already owns
-      // this payload is launching it" from "a second consumer is trying to feed the same payload"
+      // once and carried here so each attempt's launch boundary can ask that hold for the loan on the
+      // payload instead of being refused as a second consumer of what its own run holds
       // (`OneShotStdin.reserveLaunch`). Set only by that internal stamp — never by the public builder —
       // so an ordinary command carries `None` and every launch reserves the payload for itself.
+      //
+      // Carrying it exempts nothing: a command is a value that outlives its run and travels through any
+      // `IProcessRunner` a caller cares to write, so the loan it asks for is exclusive, refused over a
+      // payload some child has already read, and refused once the run has settled its hold — a second
+      // launch bearing this stamp is checked exactly like a launch bearing none.
       StdinReservation: OneShotStdinReservation option
       KeepStdinOpen: bool
       // The encoding for text sent through `Stdin.FromString`/`FromLines`/`FromAsyncLines` and an
@@ -848,7 +853,10 @@ type Command internal (config: CommandConfig) =
     /// incarnation: the launch that creates a child takes it before spawning, so a second consumer —
     /// a later run, a concurrent one, another verb or runner — is refused with
     /// `ProcessError.Unsupported` before any child of its own exists, rather than being handed the
-    /// exhausted remains. A launch that produced no child leaves the source intact for the next one.
+    /// exhausted remains. That holds whatever drives the command and whether or not it carries a
+    /// `Retry` policy: a decorator that calls its inner runner twice with the same command, or a
+    /// command a runner kept and started afterwards, is a second consumer like any other.
+    /// A launch that produced no child leaves the source intact for the next one.
     /// The repeatable sources (`Stdin.FromString`/`FromBytes`/`FromFile`/`Stdin.Empty`) feed every run.
     member _.Stdin(source: Stdin) =
         ArgumentNullException.ThrowIfNull source
@@ -1618,9 +1626,10 @@ type Command internal (config: CommandConfig) =
 
     /// Carry a retrying run's hold on this command's one-shot stdin payload down to the launch
     /// boundary that will spawn each attempt. Internal: `Runner.withRetry` stamps it on the copy of the
-    /// command it drives, so the attempt's `OneShotStdin.reserveLaunch` recognizes the run's own hold
-    /// instead of refusing the attempt as a second consumer of a payload the run already owns. Never
-    /// part of a caller's command — the reservation belongs to one run, not to the command value.
+    /// command it drives, so the attempt's `OneShotStdin.reserveLaunch` can take the loan on the run's
+    /// own hold instead of refusing the attempt as a second consumer of a payload the run already owns.
+    /// Never part of a caller's command — the reservation belongs to one run, not to the command value,
+    /// which is why the loan (and not the stamp) is what a launch is actually allowed to spawn on.
     member internal _.WithStdinReservation(reservation: OneShotStdinReservation) =
         Command(
             { config with

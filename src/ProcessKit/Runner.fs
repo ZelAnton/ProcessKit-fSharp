@@ -290,10 +290,14 @@ module Runner =
                     // (`ProcessGroup.BuildHost`, the pipeline's stage 0), which reserves the payload for
                     // every launch it makes. Without the hold in hand it would refuse this run's own
                     // attempts as a second consumer of a payload this run itself is holding; with it, an
-                    // attempt commits on a live child but never releases — that stays the run's call,
-                    // made once below, so the payload is never handed to a concurrent run in the gap
-                    // between two attempts. A run that reserved nothing (single attempt, or a repeatable
-                    // source) drives the command exactly as it did before.
+                    // attempt takes the hold's LOAN, commits on a live child, and returns only the loan
+                    // — handing the payload back stays the run's call, made once below, so it is never
+                    // given to a concurrent run in the gap between two attempts. The loan is exclusive
+                    // and refused over a spent payload, so this stamped command buys no unchecked
+                    // launch: it travels through whatever `IProcessRunner` drives the run, and a second
+                    // launch bearing it (a decorator calling its inner runner twice, a command a runner
+                    // kept) is checked like any other. A run that reserved nothing (single attempt, or a
+                    // repeatable source) drives the command exactly as it did before.
                     let command =
                         match reservation with
                         | Some reservation -> command.WithStdinReservation reservation
@@ -413,7 +417,11 @@ module Runner =
                         // cancellation that arrived mid-attempt — and no later run can be handed the
                         // remains. `Rollback` is idempotent and only ever moves *reserved* back to
                         // *available*, so it can neither free a committed payload nor take one from a run
-                        // that reserved it afterwards.
+                        // that reserved it afterwards. Should a launch still hold this hold's loan as the
+                        // run ends (a stamped command driven by someone else, racing the run's own last
+                        // attempt), the payload is left to THAT launch to settle — it frees it if its
+                        // spawn produced no child, and keeps it spent if one exists — rather than being
+                        // freed from under a child that may be about to read it.
                         //
                         // In a `finally` so an attempt that throws instead of returning is settled the same
                         // way, on the same evidence.

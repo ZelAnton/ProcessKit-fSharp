@@ -620,8 +620,10 @@ module internal PipelineRunner =
                     // to a child of its own. Reserved BEFORE the spawn, so a chain that cannot have the
                     // payload is refused as a stage-0 spawn failure with no stage started at all;
                     // committed the moment stage 0 exists, before `wireStage` starts its feeder; rolled
-                    // back when the spawn produced no child. Later stages cannot carry a stdin source
-                    // (`Pipeline` rejects one), so they take no hold and spawn exactly as before.
+                    // back when the spawn produced no child — including when it raised instead of
+                    // reporting one, so a hold never outlives the launch that took it. Later stages
+                    // cannot carry a stdin source (`Pipeline` rejects one), so they take no hold and
+                    // spawn exactly as before.
                     let spawnStage (index: int) (stage: Command) : Result<Native.Common.Spawned, ProcessError> =
                         if index > 0 then
                             group.SpawnInto stage
@@ -634,7 +636,16 @@ module internal PipelineRunner =
                             with
                             | Error error -> Error error
                             | Ok launch ->
-                                match group.SpawnInto stage with
+                                let spawnOutcome =
+                                    try
+                                        group.SpawnInto stage
+                                    with _ ->
+                                        // Not swallowed (re-raised unchanged): settle the launch first,
+                                        // or the payload stays held by a launch that is over.
+                                        launch.Rollback()
+                                        reraise ()
+
+                                match spawnOutcome with
                                 | Ok spawned ->
                                     launch.Commit()
                                     Ok spawned
@@ -1144,9 +1155,9 @@ module internal PipelineRunner =
 
                     // Stage 0's one-shot stdin launch boundary, identical to the buffered `run`'s: the
                     // payload is reserved before stage 0 spawns, committed the moment its child exists
-                    // (ahead of `wireStage`'s feeder), and rolled back if no child was created. Streaming
-                    // a chain is exactly as much of a launch as buffering one, so it must not be the path
-                    // that escapes the guard.
+                    // (ahead of `wireStage`'s feeder), and rolled back if no child was created — a raised
+                    // spawn included. Streaming a chain is exactly as much of a launch as buffering one,
+                    // so it must not be the path that escapes the guard.
                     let spawnStage (index: int) (stage: Command) : Result<Native.Common.Spawned, ProcessError> =
                         if index > 0 then
                             group.SpawnInto stage
@@ -1159,7 +1170,16 @@ module internal PipelineRunner =
                             with
                             | Error error -> Error error
                             | Ok launch ->
-                                match group.SpawnInto stage with
+                                let spawnOutcome =
+                                    try
+                                        group.SpawnInto stage
+                                    with _ ->
+                                        // Not swallowed (re-raised unchanged): settle the launch first,
+                                        // or the payload stays held by a launch that is over.
+                                        launch.Rollback()
+                                        reraise ()
+
+                                match spawnOutcome with
                                 | Ok spawned ->
                                     launch.Commit()
                                     Ok spawned

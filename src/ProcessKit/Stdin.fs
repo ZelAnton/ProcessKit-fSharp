@@ -176,28 +176,77 @@ type internal OneShotStdinClaim() =
     member _.IsConsumed = Volatile.Read(&state) = 2
 
 /// One run's transactional hold on a one-shot stdin payload: taken before the run's first attempt,
-/// lent to each attempt's own launch (`OneShotStdinLaunch`, which commits it as soon as that attempt
-/// produces a live child), or rolled back by the run when no attempt ever reached one.
+/// lent to ONE attempt's launch at a time (`OneShotStdinLaunch`, which commits it as soon as that
+/// attempt produces a live child, and returns the loan when it produces none), or rolled back by the
+/// run when no attempt ever reached one.
+///
+/// The loan is what keeps "this is the run's own attempt" from becoming a question anyone may answer
+/// twice. The hold rides on the `Command` the run drives (`Command.WithStdinReservation`), and that
+/// command is an ordinary value the library hands to whatever `IProcessRunner` drives it — a
+/// `DelegatingProcessRunner` decorator that calls its inner runner again, a `ScriptedRunner.When`
+/// predicate that keeps it. So a launch does not merely *recognize* the hold, it TAKES the loan
+/// atomically, and only while the payload is still intact: a second launch over the same hold —
+/// concurrent with the first, after it, or long after the run itself is over — finds the loan already
+/// out, the payload already consumed, or the hold already settled, and is refused exactly like any
+/// other second consumer.
 [<Sealed>]
 type internal OneShotStdinReservation internal (claim: OneShotStdinClaim) =
 
-    let mutable settled = 0
+    // 0 = held (the run owns the payload and has lent it to no launch), 1 = lent (one launch holds the
+    // loan), 2 = settled (the run has given the payload up). One word, moved only by atomic
+    // transitions, so the run's own `Rollback` and a launch's `TryLend`/`ReturnLoan` can never both
+    // conclude that they are the one to hand the payload back.
+    let mutable state = 0
 
     /// True once a child was launched with this payload, so it can no longer be replayed.
     member _.IsConsumed = claim.IsConsumed
 
-    /// True when this reservation is the hold on `candidate`. The identity check a launch boundary
-    /// makes before it treats an already-reserved payload as its own: a run that owns the payload is
-    /// lending it to its own attempt (which may proceed), whereas a payload reserved by SOMEONE ELSE
-    /// is exactly the concurrent second consumer that must be refused.
-    member _.Holds(candidate: OneShotStdinClaim) = obj.ReferenceEquals(claim, candidate)
+    /// Lend this hold to ONE launch of `candidate`, atomically. True — the caller now owns the loan and
+    /// must `Commit()` (a child exists) or return it (none does) — only while ALL of it holds: this
+    /// reservation is the hold on `candidate` (identity), no child has been launched with the payload,
+    /// the run has not settled the hold, and no other launch has the loan out. Everything it refuses is
+    /// a second consumer — another run's payload, a spent one, a hold whose run is over, a second launch
+    /// racing this run's own attempt — and must reserve the payload for itself or be refused.
+    member _.TryLend(candidate: OneShotStdinClaim) =
+        obj.ReferenceEquals(claim, candidate)
+        && not claim.IsConsumed
+        && Interlocked.CompareExchange(&state, 1, 0) = 0
+
+    /// Give the loan back: the launch that held it created no child, so the payload is intact and the
+    /// run keeps it for its next attempt. Should the run have settled while the loan was out (its last
+    /// attempt ended concurrently with this launch), this loan was the payload's last holder, so it is
+    /// handed back to the next run here instead — `Rollback` deliberately leaves that to whoever
+    /// returns the loan rather than freeing a payload a live launch may still be spawning over.
+    member _.ReturnLoan() =
+        match Interlocked.CompareExchange(&state, 0, 1) with
+        | 2 -> claim.Release()
+        | _ -> ()
 
     /// Roll the reservation back — the payload never reached a child, so hand it to the next run.
     /// Idempotent: a second call does nothing, so it can never free a payload that some other run has
-    /// reserved in the meantime.
+    /// reserved in the meantime. A loan still out is not released here (see `ReturnLoan`): that launch
+    /// either commits, and the payload stays spent, or returns the loan, which frees it then.
     member _.Rollback() =
-        if Interlocked.Exchange(&settled, 1) = 0 then
+        if Interlocked.Exchange(&state, 2) = 0 then
             claim.Release()
+
+/// What ONE launch holds while it tries to create a child — and therefore where the payload goes when
+/// it creates none. The three shapes are exhaustive, and only `OneShotStdinLaunch.Rollback` tells them
+/// apart.
+[<RequireQualifiedAccess>]
+[<NoEquality; NoComparison>]
+type internal OneShotStdinHold =
+    /// Nothing to hold: a repeatable source (`FromString`/`FromBytes`/`FromFile`/`Empty`/`InheritStdin`)
+    /// or no stdin source at all, so every verb on the launch is a no-op.
+    | Nothing
+    /// This launch reserved the payload itself, so a spawn that produced no child hands it straight back
+    /// for the next launch to take.
+    | Owned of OneShotStdinClaim
+    /// An enclosing run (`Runner.withRetry`) holds the payload for the whole of its possibly-retried run
+    /// and lent it to this launch. Committing is still this launch's to do (a child now exists), but a
+    /// launch that created none returns the LOAN rather than the payload: the run means to feed it to
+    /// its next attempt, and freeing it here would hand it to a concurrent run in the meantime.
+    | Lent of OneShotStdinClaim * OneShotStdinReservation
 
 /// ONE launch's transactional hold on a one-shot stdin payload, taken at the boundary that actually
 /// creates a child: `ProcessGroup.BuildHost` (every single-command verb, runner and streaming start
@@ -205,17 +254,12 @@ type internal OneShotStdinReservation internal (claim: OneShotStdinClaim) =
 /// consumer is refused before it can create a child of its own; committed the instant that child
 /// exists — before its stdin feeder reads a byte — and rolled back when the spawn never produced one.
 ///
-/// Two shapes, differing only in what `Rollback` does:
-///
-/// - **owned** — this launch reserved the payload itself, so a spawn that produced no child hands it
-///   straight back for the next launch to take.
-/// - **inherited** — an enclosing run (`Runner.withRetry`) already holds the payload for the whole of
-///   its possibly-retried run and lends it to this attempt. Committing is still this launch's to do
-///   (a child now exists), but handing the payload back is the RUN's decision, taken once its last
-///   attempt is over: releasing it here would free a payload the run still means to feed to its next
-///   attempt, and hand it to a concurrent run in the meantime.
+/// Settle it exactly once on every path out of the boundary — `Commit()` when a child exists,
+/// `Rollback()` when none does, including when the spawn threw instead of reporting a failure — or a
+/// hold outlives the launch that took it: an owned one strands the payload for the life of the source,
+/// a lent one locks the run out of its own next attempt.
 [<Sealed>]
-type internal OneShotStdinLaunch internal (claim: OneShotStdinClaim option, ownsReservation: bool) =
+type internal OneShotStdinLaunch internal (hold: OneShotStdinHold) =
 
     let mutable settled = 0
 
@@ -225,14 +269,20 @@ type internal OneShotStdinLaunch internal (claim: OneShotStdinClaim option, owns
     /// that witnesses the same launch again through `OneShotStdin.commitLaunch` writes the same value.
     /// A repeatable source (or no source at all) has no claim, so this is a no-op there.
     member _.Commit() =
-        claim |> Option.iter (fun c -> c.Commit())
+        match hold with
+        | OneShotStdinHold.Nothing -> ()
+        | OneShotStdinHold.Owned claim
+        | OneShotStdinHold.Lent(claim, _) -> claim.Commit()
 
     /// No child was created — nothing can have read the payload — so hand an OWNED reservation back for
-    /// the next launch. Idempotent, and deliberately a no-op for an inherited one, whose enclosing run
-    /// settles it instead.
+    /// the next launch, and a LENT one back to the run that owns it, which may attempt the command
+    /// again. Idempotent, so a boundary may settle a launch it has already settled.
     member _.Rollback() =
-        if ownsReservation && Interlocked.Exchange(&settled, 1) = 0 then
-            claim |> Option.iter (fun c -> c.Release())
+        if Interlocked.Exchange(&settled, 1) = 0 then
+            match hold with
+            | OneShotStdinHold.Nothing -> ()
+            | OneShotStdinHold.Owned claim -> claim.Release()
+            | OneShotStdinHold.Lent(_, reservation) -> reservation.ReturnLoan()
 
 /// Ownership of a one-shot stdin payload, held by at most ONE incarnation at a time.
 ///
@@ -246,11 +296,15 @@ type internal OneShotStdinLaunch internal (claim: OneShotStdinClaim option, owns
 ///   So a second run, a second verb, or a concurrent one is refused with a typed error before its own
 ///   spawn instead of quietly reading the exhausted remains of someone else's payload.
 /// - **A retrying run** (`reserve`) — `Runner.withRetry` takes the payload for the whole of a run that
-///   may attempt the command more than once, and lends it to each attempt's launch (which recognizes
-///   the run's own hold through `OneShotStdinReservation.Holds` and neither re-reserves nor releases
-///   it). That keeps the payload off-limits to other runs across the gaps BETWEEN attempts, and lets
-///   the loop tell "no child ever saw this payload" from "a child may already have drained it" by
-///   evidence — the reservation's own `IsConsumed` — rather than by guessing from the error alone.
+///   may attempt the command more than once, and lends it to ONE attempt's launch at a time (which
+///   takes the loan through `OneShotStdinReservation.TryLend` and returns it, rather than the payload,
+///   when it creates no child). That keeps the payload off-limits to other runs across the gaps BETWEEN
+///   attempts, and lets the loop tell "no child ever saw this payload" from "a child may already have
+///   drained it" by evidence — the reservation's own `IsConsumed` — rather than by guessing from the
+///   error alone. The loan is exclusive and state-checked, so the run's hold buys nobody an unchecked
+///   launch: a second launch bearing the same hold (a decorator that calls its inner runner twice with
+///   the command the run stamped, a command kept from a runner hook and started later) is refused like
+///   any other second consumer.
 ///
 /// A repeatable source (`FromString`/`FromBytes`/`FromFile`/`Empty`/`InheritStdin`) has no payload to
 /// claim (`StdinSource.oneShotPayload` returns `None` for it), so every verb here is a no-op for it and
@@ -309,11 +363,18 @@ module internal OneShotStdin =
     /// Reserve `stdin`'s one-shot payload for ONE launch, about to create a child.
     ///
     /// `held` is the reservation the enclosing run already owns (`Runner.withRetry`'s, carried on the
-    /// command), or `None` for a launch that answers to no run-level hold. A launch whose payload is
-    /// already held by its OWN run proceeds on that hold — it commits at the spawn but never releases,
-    /// leaving the run to settle its reservation when its last attempt is over. Anything else must
-    /// take the payload for itself, and is refused with `Error` when it cannot: another run owns it, or
-    /// a child has already drained it.
+    /// command), or `None` for a launch that answers to no run-level hold. A launch that can TAKE THE
+    /// LOAN on that hold proceeds on it — it commits at the spawn but returns only the loan, leaving the
+    /// run to settle the payload itself when its last attempt is over. Every other launch must take the
+    /// payload for itself, and is refused with `Error` when it cannot: another run owns it, or a child
+    /// has already drained it.
+    ///
+    /// Carrying a hold therefore buys no launch a free pass. The loan is exclusive and refused over a
+    /// spent payload or a settled hold, so a SECOND launch bearing the same run's hold — a decorator
+    /// that drives its inner runner twice with the command the run stamped, a command a runner hook kept
+    /// and started afterwards — falls through to reserving the payload for itself, and is refused if
+    /// anyone else has it or a child has read it. The command's stamp is a value that can outlive its
+    /// run and be handed anywhere; the payload's ownership is not.
     ///
     /// Always call `Commit()` on the returned launch the moment a child exists (before its stdin feeder
     /// starts), and `Rollback()` when the spawn produced none.
@@ -323,14 +384,23 @@ module internal OneShotStdin =
         (held: OneShotStdinReservation option)
         : Result<OneShotStdinLaunch, ProcessError> =
         match claimFor stdin with
-        | None -> Ok(OneShotStdinLaunch(None, false))
+        | None -> Ok(OneShotStdinLaunch OneShotStdinHold.Nothing)
         | Some claim ->
-            if held |> Option.exists (fun reservation -> reservation.Holds claim) then
-                Ok(OneShotStdinLaunch(Some claim, false))
-            elif claim.TryReserve() then
-                Ok(OneShotStdinLaunch(Some claim, true))
-            else
-                Error(refusal program)
+            // Ask the enclosing run's hold for the loan first: it is the only hold that legitimately
+            // covers a launch of an already-reserved payload, and taking it is one atomic transition —
+            // no "is it ours?" answer that a second launch could act on in parallel.
+            let loan =
+                match held with
+                | Some reservation when reservation.TryLend claim -> Some reservation
+                | _ -> None
+
+            match loan with
+            | Some reservation -> Ok(OneShotStdinLaunch(OneShotStdinHold.Lent(claim, reservation)))
+            | None ->
+                if claim.TryReserve() then
+                    Ok(OneShotStdinLaunch(OneShotStdinHold.Owned claim))
+                else
+                    Error(refusal program)
 
     /// Commit `stdin`'s one-shot payload at the launch boundary: a child that reads it now exists, so
     /// the payload is spent whether or not this run reserved it (an unreserved run still consumes it).

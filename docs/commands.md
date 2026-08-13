@@ -403,6 +403,12 @@ enforces that rather than leaving it to you:
   no child of its own, instead of being started and then handed the exhausted
   remains (usually nothing at all). Two concurrent runs can no longer split one
   stream between two children.
+- Nothing about *how* the command is driven buys a second launch a free pass. A
+  retrying run holds the source for the whole of its run, but that hold is lent to
+  one launch at a time and never covers a payload a child has already read — so a
+  decorator that calls its inner runner twice with the same command, or a command a
+  runner hook kept and started later, is refused exactly like any other second
+  consumer, with or without a [`Retry`](#timeouts-and-retries) policy.
 - Every path that can drain the source is behind that boundary: the capture verbs
   (`RunAsync` / `OutputStringAsync` / `OutputBytesAsync` / `ExitCodeAsync` /
   `ProbeAsync`), a streaming [`StartAsync`](streaming.md) handle, both

@@ -274,12 +274,23 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                 // `OneShotStdinClaim`, and this call is a single bounded write, exactly like the other
                 // bounded native work the group runs under `sync`.
                 let spawnOutcome =
-                    this.WhenLive(fun () ->
-                        match spawnAndTrack command with
-                        | Error error -> Error error
-                        | Ok spawned ->
-                            launch.Commit()
-                            Ok(spawned, backend.PidOf spawned))
+                    try
+                        this.WhenLive(fun () ->
+                            match spawnAndTrack command with
+                            | Error error -> Error error
+                            | Ok spawned ->
+                                launch.Commit()
+                                Ok(spawned, backend.PidOf spawned))
+                    with _ ->
+                        // The spawn RAISED instead of reporting a typed failure. Not swallowed — the
+                        // exception is re-raised unchanged — but the launch must still be settled before
+                        // it leaves this boundary, or the hold outlives the launch that took it: an
+                        // owned one would strand the payload for the life of the source, a lent one
+                        // would lock the run out of its own next attempt. `Rollback` only ever moves a
+                        // still-*reserved* payload back, so on the (equally possible) throw from AFTER
+                        // `Commit` — `backend.PidOf` — it correctly does nothing to a spent payload.
+                        launch.Rollback()
+                        reraise ()
 
                 match spawnOutcome with
                 | Ok tracked -> Ok tracked
