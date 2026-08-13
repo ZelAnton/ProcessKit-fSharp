@@ -287,6 +287,14 @@ type StreamingTests() =
     let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
     let runner: IProcessRunner = JobRunner()
 
+    let processStdinWriteLineBytes target text =
+        task {
+            use sink = new MemoryStream()
+            let stdin = ProcessStdin(sink, Encoding.UTF8, target)
+            do! stdin.WriteLineAsync text
+            return sink.ToArray()
+        }
+
     let shell (script: string) =
         if isWindows then
             Command.create "cmd.exe" |> Command.args [ "/c"; script ]
@@ -1049,6 +1057,41 @@ type StreamingTests() =
                 match! running.OutputStringAsync() with
                 | Ok result -> Assert.That(result.Stdout.Trim(), Is.EqualTo "hello")
                 | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ProcessStdin WriteLineAsync appends LF for a pipe``() : Task =
+        task {
+            let! bytes = processStdinWriteLineBytes ProcessStdinTarget.Pipe "hello"
+            Assert.That(bytes, Is.EqualTo<byte[]>(Encoding.UTF8.GetBytes "hello\n"))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ProcessStdin WriteLineAsync appends LF for a POSIX PTY``() : Task =
+        task {
+            let! bytes = processStdinWriteLineBytes ProcessStdinTarget.PosixPty "hello"
+            Assert.That(bytes, Is.EqualTo<byte[]>(Encoding.UTF8.GetBytes "hello\n"))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ProcessStdin WriteLineAsync appends CR for a Windows ConPTY``() : Task =
+        task {
+            let! bytes = processStdinWriteLineBytes ProcessStdinTarget.WindowsConPty "hello"
+            Assert.That(bytes, Is.EqualTo<byte[]>(Encoding.UTF8.GetBytes "hello\r"))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ProcessStdin WriteAsync remains byte exact for a Windows ConPTY``() : Task =
+        task {
+            use sink = new MemoryStream()
+            let stdin = ProcessStdin(sink, Encoding.Unicode, ProcessStdinTarget.WindowsConPty)
+            let payload = [| 0x00uy; 0x0Auy; 0xFFuy |]
+            do! stdin.WriteAsync payload
+            Assert.That(sink.ToArray(), Is.EqualTo<byte[]>(payload))
         }
         :> Task
 

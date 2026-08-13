@@ -1,7 +1,6 @@
 namespace ProcessKit.Samples.FSharpPty
 
 open System
-open System.Text
 open ProcessKit
 
 module Program =
@@ -69,11 +68,7 @@ module Program =
                         Console.Error.WriteLine "PTY stdin was not available."
                         return 1
                     | Some stdin ->
-                        if OperatingSystem.IsWindows() then
-                            do! stdin.WriteAsync(Encoding.UTF8.GetBytes "sample-password\r")
-                        else
-                            do! stdin.WriteLineAsync "sample-password"
-
+                        do! stdin.WriteLineAsync "sample-password"
                         do! stdin.FlushAsync()
                         do! stdin.FinishAsync()
                         do! outputTask

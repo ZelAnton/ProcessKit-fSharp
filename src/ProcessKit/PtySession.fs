@@ -142,9 +142,9 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
 
     let lineEnding =
         match options.LineEnding with
-        | PtyLineEnding.Auto -> if running.HasPseudoTerminal then "\r" else "\n"
-        | PtyLineEnding.Cr -> "\r"
-        | PtyLineEnding.Lf -> "\n"
+        | PtyLineEnding.Auto -> Pump.defaultInputLineTerminator running.HasPseudoTerminal
+        | PtyLineEnding.Cr -> Pump.defaultInputLineTerminator true
+        | PtyLineEnding.Lf -> Pump.defaultInputLineTerminator false
         | PtyLineEnding.CrLf -> "\r\n"
 
     // Claim the pipes and start the raw readers. A handle another verb already owns is a programmer
