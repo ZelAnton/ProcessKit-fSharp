@@ -177,6 +177,9 @@ module internal PipelineStageGuard =
 /// EVERY stage (including a partially started chain), never just the last. A genuine read failure in an
 /// upstream inter-stage relay is returned by `FinishAsync` as `ProcessError.Io`, even if the downstream
 /// stage observed the resulting EOF and exited successfully; a downstream broken pipe remains routine.
+/// That relay failure also tears the whole chain down the moment it is seen — it never waits out a
+/// still-running upstream stage that has simply stopped writing — so the streamed final-stage output
+/// ends wherever that kill lands.
 [<Sealed>]
 type PipelineSession
     internal (inner: RunningProcess, commands: Command list, capture: Task<PipelineCapture>, wasCancelled: unit -> bool)
@@ -244,9 +247,10 @@ type PipelineSession
     /// `Outcome`) plus that stage's stderr — with the same classification `Pipeline.RunAsync` applies:
     /// an `OutputTooLarge` on any stage's fail-loud stream, or a stage-0 stdin-source failure on an
     /// otherwise-successful run, surfaces as `Error`, and a whole-chain cancellation is `Cancelled`. A
-    /// genuine upstream relay read fault also surfaces as `ProcessError.Io`; a downstream broken pipe is
-    /// routine early-consumer teardown. A non-zero pipefail exit is *data* in `Finished.Outcome`, not an
-    /// `Error`. Reaps the whole tree.
+    /// genuine upstream relay read fault also surfaces as `ProcessError.Io` — and, having torn the chain
+    /// down when it happened, returns promptly rather than waiting out a silent upstream stage; a
+    /// downstream broken pipe is routine early-consumer teardown. A non-zero pipefail exit is *data* in
+    /// `Finished.Outcome`, not an `Error`. Reaps the whole tree.
     /// Pairs with `StdoutLinesAsync` (it rejoins that stdout-streaming session); called with no prior
     /// streaming it buffers and discards the final stdout, then reports the outcome.
     member _.FinishAsync() : Task<Result<Finished, ProcessError>> =

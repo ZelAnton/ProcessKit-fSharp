@@ -12,19 +12,26 @@ open System.Threading
 open System.Threading.Tasks
 open ProcessKit
 
-// libc `open`/`fsync`/`close` for the Unix-only best-effort parent-directory fsync in `writeCassette`
-// below (a plain `File.Open` cannot open a directory, so this needs a raw P/Invoke rather than a
-// managed API). A module, not class `static let` bindings, because F# DllImport `extern` declarations
-// must be module-level or type `static member` — a `static let` in a class cannot carry `DllImport`.
-module private NativeDirFsync =
+// libc entry points the cassette writer needs and .NET exposes no managed equivalent for: `open`/
+// `fsync`/`close` for the Unix-only parent-directory fsync in `writeCassette` (a plain `File.Open`
+// cannot open a directory), and `flock` for the POSIX half of the cross-process save lock
+// (`tryAcquireSaveLockOnce`). A module, not class `static let` bindings, because F# DllImport `extern`
+// declarations must be module-level or type `static member` — a `static let` in a class cannot carry
+// `DllImport`. Every binding names its libc symbol through an explicit `EntryPoint`: an F# `extern`
+// otherwise looks the symbol up under the *F# function's* name, which fails at the first call with an
+// `EntryPointNotFoundException` — and inside a best-effort `try` that failure is invisible.
+module private NativeCassetteIo =
     [<DllImport("libc", EntryPoint = "open", SetLastError = true, CharSet = CharSet.Ansi)>]
     extern int openDirFd(string path, int flags)
 
-    [<DllImport("libc", SetLastError = true)>]
+    [<DllImport("libc", EntryPoint = "fsync", SetLastError = true)>]
     extern int fsyncFd(int fd)
 
-    [<DllImport("libc", SetLastError = true)>]
+    [<DllImport("libc", EntryPoint = "close", SetLastError = true)>]
     extern int closeFd(int fd)
+
+    [<DllImport("libc", EntryPoint = "flock", SetLastError = true)>]
+    extern int flockFd(int fd, int operation)
 
 /// One captured `invocation → result` pair — a row inside the `CassetteFile` envelope (public so
 /// `System.Text.Json` can serialize it; inspect a cassette file directly rather than depending on
@@ -202,6 +209,15 @@ type private Mode =
         slots: Dictionary<Key, ReplaySlot> *
         recorded: List<CassetteEntry> *
         dirty: bool ref
+
+// The result of ONE non-blocking attempt at a cassette's sibling save lock: the held handle (closing it
+// releases the lock), a refusal because another writer holds it at that instant, or a genuine I/O
+// failure. `Busy` is kept distinct from `LockFailed` so only real contention is retried/reported as the
+// transient conflict — a broken path or a permissions problem is not.
+type private SaveLockAttempt =
+    | Acquired of handle: FileStream
+    | Busy
+    | LockFailed of error: ProcessError
 
 /// A record/replay `IProcessRunner`.
 ///
@@ -463,42 +479,209 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
     static let O_RDONLY_FOR_DIR_FSYNC = 0
 
-    // Best-effort fsync of the directory containing `path`, so a preceding atomic `rename` into it is
-    // durable across a crash — the renamed file's own bytes are already flushed to disk by `writeContent`
-    // (see `writeCassette`), but the directory-entry swap `rename` performs is a separate metadata write
-    // that needs its own flush. Unix-only (Windows has no portable directory-fsync; NTFS's own metadata
-    // journaling plus `File.Move`'s atomic rename already provide the durable-replacement guarantee
-    // there) and deliberately best-effort: any failure (a read-only/unusual filesystem, a sandboxed host)
-    // is swallowed rather than surfaced, because the rename itself already succeeded and the cassette
-    // write must not fail just because the OS could not also confirm the directory entry hit disk.
-    static let bestEffortFsyncParentDir (path: string) : unit =
-        if not isWindows then
+    // The directory holding `path` — `.` for a bare filename, whose `Path.GetDirectoryName` is empty.
+    static let directoryOf (path: string) : string =
+        match Path.GetDirectoryName path with
+        | null
+        | "" -> "."
+        | dir -> dir
+
+    // fsync the directory containing `path`, so a preceding atomic `rename` into it is durable across a
+    // crash — the renamed file's own bytes are already flushed to disk by `writeContent` (see
+    // `writeCassette`), but the directory-entry swap `rename` performs is a separate metadata write that
+    // needs its own flush. Unix-only: Windows has no portable directory-fsync (NTFS's own metadata
+    // journaling plus the file's `FlushFileBuffers` and `File.Move`'s atomic replace already provide the
+    // durable-replacement guarantee there), so it reports success without doing anything.
+    //
+    // Returns the failure instead of raising it, so the caller can stay best-effort (see
+    // `bestEffortFsyncParentDir`) while a test can still prove the call actually reaches the platform —
+    // a P/Invoke that never resolves would otherwise look exactly like a silent success.
+    static let fsyncParentDir (path: string) : Result<unit, string> =
+        if isWindows then
+            Ok()
+        else
             try
-                let dir =
-                    match Path.GetDirectoryName path with
-                    | null
-                    | "" -> "."
-                    | d -> d
+                let dir = directoryOf path
+                let fd = NativeCassetteIo.openDirFd (dir, O_RDONLY_FOR_DIR_FSYNC)
 
-                let fd = NativeDirFsync.openDirFd (dir, O_RDONLY_FOR_DIR_FSYNC)
-
-                if fd >= 0 then
+                if fd < 0 then
+                    Error $"could not open the parent directory (errno {Marshal.GetLastPInvokeError()})"
+                else
                     try
-                        NativeDirFsync.fsyncFd fd |> ignore
+                        if NativeCassetteIo.fsyncFd fd = 0 then
+                            Ok()
+                        else
+                            Error $"fsync of the parent directory failed (errno {Marshal.GetLastPInvokeError()})"
                     finally
-                        NativeDirFsync.closeFd fd |> ignore
-            with _ ->
-                // Best-effort: an unwriteable/exotic filesystem or a sandboxed host must not fail a
-                // write whose rename already succeeded.
+                        NativeCassetteIo.closeFd fd |> ignore
+            with ex ->
+                Error ex.Message
+
+    // The write path's use of the above: deliberately best-effort — any failure (a read-only/unusual
+    // filesystem, a sandboxed host) is swallowed rather than surfaced, because the rename itself already
+    // succeeded and the cassette write must not fail just because the OS could not also confirm the
+    // directory entry hit disk.
+    static let bestEffortFsyncParentDir (path: string) : unit = fsyncParentDir path |> ignore
+
+    // `flock` operations, whose values are identical on Linux and macOS/BSD: take an EXCLUSIVE lock
+    // (`LOCK_EX` = 2) and fail immediately rather than wait when another open file description holds one
+    // (`LOCK_NB` = 4).
+    static let LOCK_EX_NB = 2 ||| 4
+
+    // The errno `flock(LOCK_NB)` reports when another holder has the lock (`EWOULDBLOCK`, which POSIX
+    // defines equal to `EAGAIN`): 11 on Linux, 35 on macOS/BSD.
+    static let EWOULDBLOCK =
+        if RuntimeInformation.IsOSPlatform OSPlatform.OSX then
+            35
+        else
+            11
+
+    // The sibling advisory-lock path for a cassette. It is a 0-byte rendezvous file and is deliberately
+    // NEVER deleted or truncated by ordinary operation: unlinking a locked file races a fresh
+    // create-and-lock of the same name, which would hand two writers two different inodes and no mutual
+    // exclusion at all. A crashed writer therefore leaves nothing worse than an empty file behind — the
+    // OS drops its lock when the process dies.
+    static let lockPathOf (path: string) : string = path + ".lock"
+
+    // The typed refusal a save gets when another writer holds the lock. `ProcessError.Io` is transient
+    // (`ProcessError.IsTransient` is `true`), so the loser can simply retry once the winner is done —
+    // and, crucially, the last saved cassette is still on disk, untouched.
+    static let concurrentSaveConflict (path: string) : ProcessError =
+        ProcessError.Io
+            $"another writer is saving the cassette '{path}' right now — saves to one cassette path are serialized by an advisory lock on '{lockPathOf path}', and the writer that loses it is refused (a transient, retryable error) rather than silently overwriting the last saved cassette"
+
+    // Windows reports deny-share contention as ERROR_SHARING_VIOLATION (32) or ERROR_LOCK_VIOLATION
+    // (33), carried in the low 16 bits of the exception's HRESULT.
+    static let isWindowsSharingViolation (ex: IOException) : bool =
+        let code = ex.HResult &&& 0xFFFF
+        code = 32 || code = 33
+
+    // Create the sibling lock file if it is not there yet, owner-only on Unix. Creation is separate from
+    // acquisition so the acquiring open below can be a plain `FileMode.Open` whose only job is the OS
+    // lock; an existing file (from this run or any earlier one) is reused as-is, because the lock — not
+    // the file's existence — is what arbitrates.
+    static let ensureLockFile (lockPath: string) : unit =
+        if not (File.Exists lockPath) then
+            try
+                let options =
+                    if isWindows then
+                        FileStreamOptions(
+                            Mode = FileMode.CreateNew,
+                            Access = FileAccess.Write,
+                            Share = FileShare.ReadWrite
+                        )
+                    else
+                        FileStreamOptions(
+                            Mode = FileMode.CreateNew,
+                            Access = FileAccess.Write,
+                            Share = FileShare.ReadWrite,
+                            UnixCreateMode = (UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                        )
+
+                use _rendezvous = new FileStream(lockPath, options)
+                ()
+            with :? IOException ->
+                // Another writer created (or is already holding) the rendezvous file first — the normal
+                // outcome under contention, and exactly what the lock below is there to resolve.
                 ()
 
-    // Write the cassette atomically and owner-only: serialize into a sibling temp file created `0600`
-    // from the start (so the secret-bearing bytes are never even briefly group/world-readable), flush
-    // its content to disk before the rename (so the bytes are durable even if the process crashes right
-    // after), then rename it over the target — same-directory rename is atomic on one filesystem, so a
-    // reader never sees a half-written cassette — and best-effort fsync the parent directory on Unix so
-    // the rename itself is durable too. On Windows the file inherits the directory ACL (restrict the
-    // directory instead). Throws on failure after cleaning up the temp; callers decide how to report.
+    // ONE non-blocking attempt at the cassette's sibling advisory lock. The returned handle holds the
+    // lock until it is disposed — or until this process dies, so a crash never wedges later saves.
+    //
+    // Windows: a deny-share (`FileShare.None`) open — any other handle, in this process or another,
+    // fails with a sharing violation. Unix: the same open (which .NET maps onto `flock`) PLUS an
+    // explicit `flock(LOCK_EX | LOCK_NB)` on the opened descriptor, so the mutual exclusion holds
+    // whichever way the runtime chooses to implement `FileShare`. Both mechanisms are per open file
+    // description, so two threads of one process contend exactly as two processes do.
+    static let tryAcquireSaveLockOnce (path: string) : SaveLockAttempt =
+        let lockPath = lockPathOf path
+
+        let opened =
+            try
+                ensureLockFile lockPath
+                Ok(new FileStream(lockPath, FileMode.Open, FileAccess.Write, FileShare.None))
+            with
+            // A path that does not exist is a real failure, not contention — say so, rather than send the
+            // caller off to retry a conflict that will never clear.
+            | :? DirectoryNotFoundException as ex -> Error(LockFailed(ProcessError.Io ex.Message))
+            | :? FileNotFoundException as ex -> Error(LockFailed(ProcessError.Io ex.Message))
+            | :? IOException as ex ->
+                // Contention surfaces as an IOException on both platforms — a sharing violation on
+                // Windows (which names itself in the HRESULT), a refused advisory lock on Unix (which
+                // does not, so any remaining I/O failure there is read as contention). Any OTHER Windows
+                // I/O failure keeps its own message rather than being mislabelled a retryable conflict.
+                if isWindows && not (isWindowsSharingViolation ex) then
+                    Error(LockFailed(ProcessError.Io ex.Message))
+                else
+                    Error Busy
+            | ex -> Error(LockFailed(ProcessError.Io ex.Message))
+
+        match opened with
+        | Error attempt -> attempt
+        | Ok handle ->
+            if isWindows then
+                Acquired handle
+            else
+                try
+                    let fd = handle.SafeFileHandle.DangerousGetHandle().ToInt32()
+
+                    if NativeCassetteIo.flockFd (fd, LOCK_EX_NB) = 0 then
+                        Acquired handle
+                    elif Marshal.GetLastPInvokeError() = EWOULDBLOCK then
+                        handle.Dispose()
+                        Busy
+                    else
+                        // A filesystem that cannot arbitrate advisory locks at all (a documented
+                        // divergence — see `Save`): the save proceeds, still serialized within this
+                        // process by the recorder's own save gate, rather than failing outright.
+                        Acquired handle
+                with
+                | :? EntryPointNotFoundException
+                | :? DllNotFoundException ->
+                    // A host whose libc this binding cannot reach at all. The deny-share open above is
+                    // still in force, so this is the same documented divergence as a filesystem without
+                    // advisory locks — and never a reason to stop being able to save.
+                    Acquired handle
+
+    // Acquire the sibling save lock, retrying a *busy* lock only while `budget` allows — never longer,
+    // and not at all for `TimeSpan.Zero` (what `Save` passes: it refuses instead of blocking). A genuine
+    // I/O failure is returned immediately; contention that outlives the budget becomes the typed,
+    // retryable conflict.
+    static let acquireSaveLock (budget: TimeSpan) (path: string) : Result<FileStream, ProcessError> =
+        let deadline = Environment.TickCount64 + int64 budget.TotalMilliseconds
+
+        let rec attempt () =
+            match tryAcquireSaveLockOnce path with
+            | Acquired handle -> Ok handle
+            | LockFailed error -> Error error
+            | Busy ->
+                if Environment.TickCount64 < deadline then
+                    Thread.Sleep 10
+                    attempt ()
+                else
+                    Error(concurrentSaveConflict path)
+
+        attempt ()
+
+    // How long the best-effort drop-time flush may wait for another writer's save to finish before
+    // giving up. `Save` itself never waits; a dispose does, briefly, because a momentary overlap should
+    // not silently drop a recording that nothing else will write.
+    static let disposeFlushLockWait = TimeSpan.FromMilliseconds 250.0
+
+    // Write the cassette atomically and owner-only: serialize into a UNIQUELY named sibling temp file,
+    // created exclusively (`CreateNew`) and `0600` from the start on Unix (so the secret-bearing bytes
+    // are never even briefly group/world-readable), flush its content all the way to disk before the
+    // rename (so the bytes are durable even if the process crashes right after), then rename it over the
+    // target — same-directory rename is atomic on one filesystem, so a reader never sees a half-written
+    // cassette — and best-effort fsync the parent directory on Unix so the rename itself is durable too.
+    // On Windows the file inherits the directory ACL (restrict the directory instead).
+    //
+    // The temp is unique per in-flight write and created exclusively, so a writer only ever opens — and,
+    // on failure, only ever deletes — a file it created itself: two concurrent writes cannot stomp one
+    // temp, and a stale temp left behind by a crashed writer is an inert orphan rather than something to
+    // collide with or clear away (it could equally be another writer's live temp). Throws on failure
+    // after cleaning up its own temp; callers decide how to report. Serializing concurrent writers to
+    // one cassette is a level up, in `saveUnderLocks`.
     static let writeCassette (path: string) (snapshot: CassetteEntry[]) : unit =
         let json =
             JsonSerializer.Serialize(
@@ -507,35 +690,37 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 jsonOptions
             )
 
-        let dir =
-            match Path.GetDirectoryName path with
-            | null
-            | "" -> "."
-            | d -> d
-
         let tempPath =
-            Path.Combine(dir, stringOrEmpty (Path.GetFileName path) + ".tmp-" + Guid.NewGuid().ToString "N")
+            Path.Combine(
+                directoryOf path,
+                stringOrEmpty (Path.GetFileName path) + ".tmp-" + Guid.NewGuid().ToString "N"
+            )
+
+        let options =
+            if isWindows then
+                FileStreamOptions(Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None)
+            else
+                FileStreamOptions(
+                    Mode = FileMode.CreateNew,
+                    Access = FileAccess.Write,
+                    Share = FileShare.None,
+                    UnixCreateMode = (UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+                )
+
+        // Only a temp this call actually created may be cleaned up below; a `CreateNew` that failed
+        // means the path is someone else's file, never ours to delete.
+        let mutable created = false
 
         let writeContent () =
-            if isWindows then
-                File.WriteAllText(tempPath, json)
-            else
-                let options =
-                    FileStreamOptions(
-                        Mode = FileMode.CreateNew,
-                        Access = FileAccess.Write,
-                        Share = FileShare.None,
-                        UnixCreateMode = (UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-                    )
-
-                use stream = new FileStream(tempPath, options)
-                use writer = new StreamWriter(stream)
-                writer.Write json
-                writer.Flush()
-                // `flushToDisk = true` asks the OS to fsync the temp file's own bytes, so they are
-                // durable BEFORE the rename below swaps it into place — a crash right after the rename
-                // can then never leave `path` pointing at a renamed-but-not-yet-flushed temp.
-                stream.Flush true
+            use stream = new FileStream(tempPath, options)
+            created <- true
+            use writer = new StreamWriter(stream)
+            writer.Write json
+            writer.Flush()
+            // `flushToDisk = true` asks the OS to fsync the temp file's own bytes (`FlushFileBuffers` on
+            // Windows), so they are durable BEFORE the rename below swaps it into place — a crash right
+            // after the rename can then never leave `path` pointing at a renamed-but-not-yet-flushed temp.
+            stream.Flush true
 
         try
             writeContent () // `use` disposes here, flushing/closing before the rename
@@ -544,15 +729,26 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             // write from the file's own (already-durable) bytes; failure here must not fail the write.
             bestEffortFsyncParentDir path
         with _ ->
-            try
-                File.Delete tempPath
-            with _ ->
-                // The temp may never have been created (CreateNew failed); nothing to clean up.
-                ()
+            if created then
+                try
+                    File.Delete tempPath
+                with _ ->
+                    // Best-effort cleanup of our own temp; the previous cassette (if any) is untouched
+                    // either way, so a failure to remove the orphan must not replace the real error.
+                    ()
 
             reraise ()
 
     let gate = obj ()
+
+    // Serializes THIS recorder's saves end to end — the whole snapshot → write → rename → fsync critical
+    // section runs under it, so two `Save` calls (or a `Save` racing the drop-time flush) can neither
+    // interleave their writes nor land out of order: each snapshot is taken while its own write already
+    // holds the gate, and `recorded` only ever grows, so the save that writes last necessarily carries
+    // the newest snapshot. Deliberately a different lock from `gate` (which guards the recorded entries
+    // for a few instructions at a time) so an in-flight capture never waits on disk I/O. Lock order is
+    // always `saveGate` → `gate`, never the reverse.
+    let saveGate = obj ()
 
     // Apply the optional record-time redaction hook to captured text (coalescing a null return to "").
     let redactText (text: string) : string =
@@ -834,6 +1030,40 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             | Error error -> Error error
             | Ok legacyDigest -> Ok(lock gate (fun () -> play slots (keyOf command legacyDigest)))
 
+    // The whole save critical section, shared by `Save` and the drop-time flush: this recorder's own
+    // save gate, then the cross-instance/cross-process advisory lock on the target, and only then
+    // snapshot → serialize → write → rename → fsync. Taking the snapshot INSIDE both locks is what makes
+    // the write ordered rather than merely atomic: whatever a save publishes always includes everything
+    // recorded up to the moment it won the lock, so a save that finishes later can never put back an
+    // older picture than one that already completed.
+    //
+    // `lockWait` bounds how long a *busy* sibling lock may be waited for — `TimeSpan.Zero` for an
+    // explicit `Save`, which refuses instead of blocking.
+    let saveUnderLocks
+        (recorded: List<CassetteEntry>)
+        (dirty: bool ref)
+        (lockWait: TimeSpan)
+        : Result<unit, ProcessError> =
+        lock saveGate (fun () ->
+            // Acquiring the lock is inside the handler too, so a save reports every failure as a value:
+            // the one thing it may never do is throw where it is expected to return `Error`.
+            try
+                match acquireSaveLock lockWait path with
+                | Error error -> Error error
+                | Ok held ->
+                    use _held = held
+                    let snapshot = lock gate (fun () -> recorded.ToArray())
+                    writeCassette path snapshot
+                    // Clear `dirty` only if nothing was recorded during the write — otherwise a `Capture`
+                    // that raced this `Save` would have its entry dropped from the drop-time flush.
+                    lock gate (fun () ->
+                        if recorded.Count = snapshot.Length then
+                            dirty.Value <- false)
+
+                    Ok()
+            with ex ->
+                Error(ProcessError.Io ex.Message))
+
     /// Start recording real runs (delegated to `inner`) to a cassette at `path`.
     static member Record(path: string, inner: IProcessRunner) =
         RecordReplayRunner.Record(path, inner, RecordReplayOptions())
@@ -915,23 +1145,41 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             )
 
     /// Write the recorded cassette to its path (owner-only `0600` on Unix). A no-op in replay mode.
+    ///
+    /// **Durable and atomic.** The whole cassette is written to a uniquely named sibling temp, flushed to
+    /// disk, then renamed over the target — an atomic replacement within one filesystem — after which the
+    /// parent directory is fsync'd on Unix so the rename itself survives a crash (Windows needs no
+    /// counterpart: NTFS journals that metadata). An interrupted or failed save therefore never truncates
+    /// or corrupts the cassette already on disk; the old file stays intact until the new one is complete.
+    ///
+    /// **Serialized, never silently lost.** Saves of one recorder run one at a time and in order, so a
+    /// slower earlier save can never put back an older recording over a newer one. Saves from *different*
+    /// recorders or processes to the same path are serialized through an advisory lock on a sibling
+    /// `&lt;path&gt;.lock` file (a deny-share open on Windows, `flock` on Unix; both released when the
+    /// process exits, so a crash never wedges later saves, and the file itself is never deleted). That
+    /// lock is taken **without waiting**: if another writer holds it at that instant, this save is refused
+    /// with a transient `ProcessError.Io` (`IsTransient` is `true` — retry once the other save completes)
+    /// rather than overwriting what that writer just saved. Failing loud beats last-writer-wins, which is
+    /// silent. On a filesystem that cannot arbitrate advisory locks at all, cross-process serialization is
+    /// not available and the save proceeds with only this recorder's own ordering guarantee.
     member _.Save() : Result<unit, ProcessError> =
         match mode with
         | ReplayMode _ -> Ok()
         | RecordMode(_, recorded, dirty)
-        | AutoMode(_, _, recorded, dirty) ->
-            try
-                let snapshot = lock gate (fun () -> recorded.ToArray())
-                writeCassette path snapshot
-                // Clear `dirty` only if nothing was recorded during the write — otherwise a `Capture`
-                // that raced this `Save` would have its entry dropped from the drop-time flush.
-                lock gate (fun () ->
-                    if recorded.Count = snapshot.Length then
-                        dirty.Value <- false)
+        | AutoMode(_, _, recorded, dirty) -> saveUnderLocks recorded dirty TimeSpan.Zero
 
-                Ok()
-            with ex ->
-                Error(ProcessError.Io ex.Message)
+    /// Test seam (`InternalsVisibleTo`): hold the very lock `Save` takes for `path`, so a test can prove
+    /// that a save which loses it is refused rather than clobbering the cassette — exercising the real
+    /// primitive instead of a copy of it that could drift. Disposing the handle releases the lock.
+    static member internal HoldSaveLockForTests(path: string) : Result<IDisposable, ProcessError> =
+        match acquireSaveLock TimeSpan.Zero path with
+        | Ok handle -> Ok(handle :> IDisposable)
+        | Error error -> Error error
+
+    /// Test seam (`InternalsVisibleTo`): run the parent-directory fsync a successful save performs and
+    /// report the failure it normally swallows, so a test can prove the call actually reaches the
+    /// platform. Success on Windows, where there is deliberately nothing to do.
+    static member internal FsyncParentDirectoryForTests(path: string) : Result<unit, string> = fsyncParentDir path
 
     // The shared mode logic behind both capture verbs: Record delegates to `inner` and captures the
     // live result; Replay serves strictly from the cassette (a miss is `CassetteMiss`, never a
@@ -1092,9 +1340,13 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             | RecordMode(_, recorded, dirty)
             | AutoMode(_, _, recorded, dirty) when lock gate (fun () -> dirty.Value) ->
                 try
-                    let snapshot = lock gate (fun () -> recorded.ToArray())
-                    writeCassette path snapshot
+                    // Same serialized, atomic write path as `Save`, but best-effort in every direction: a
+                    // busy sibling lock is waited on only briefly and then given up on, and a write error
+                    // is returned rather than raised (an explicit `Save` is what surfaces one). The new
+                    // locking must not turn a drop-time flush into a throwing dispose.
+                    saveUnderLocks recorded dirty disposeFlushLockWait |> ignore
                 with _ ->
-                    // Best-effort drop-time flush; an explicit Save surfaces write errors.
+                    // Belt and braces around the locking itself: a dispose never propagates an exception,
+                    // whatever the filesystem does.
                     ()
             | _ -> ()

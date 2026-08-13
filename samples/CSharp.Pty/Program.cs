@@ -1,5 +1,4 @@
 using System;
-using System.Text;
 using System.Threading.Tasks;
 using ProcessKit;
 
@@ -49,11 +48,7 @@ try
         }
     });
 
-    if (OperatingSystem.IsWindows())
-        await stdin.WriteAsync(Encoding.UTF8.GetBytes("sample-password\r"));
-    else
-        await stdin.WriteLineAsync("sample-password");
-
+    await stdin.WriteLineAsync("sample-password");
     await stdin.FlushAsync();
     await stdin.FinishAsync();
 
