@@ -1374,14 +1374,15 @@ type PtyTests() =
                 // command line — an unrelated batch-scripting quirk, not a ConPTY one.
                 // R-02: `Command.args` only applies Windows argv-quoting, not cmd.exe metacharacter
                 // escaping — quotes do not stop cmd.exe's own command-line parser from acting on `&`,
-                // `|`, `^`, `<`, `>`, `%`, `!`, or `(`/`)` (command-grouping operators) before the
-                // quoted argument ever reaches the target exe. A `IO.Path.GetTempPath()` containing
-                // one of those would make this test either fail to run the intended batch file or,
-                // worse, run an attacker-shaped command line. Document and enforce the assumption
-                // instead of trusting it silently: skip rather than give a false pass/fail on a host
-                // whose TEMP path violates it.
+                // `|`, `^`, `<`, `>`, `%`, `!`, `(`/`)` (command-grouping operators), or `@` (documented
+                // by `cmd /?` as special in `/c` quote processing — it can affect whether a quoted
+                // argument's surrounding quotes are preserved) before the quoted argument ever reaches
+                // the target exe. A `IO.Path.GetTempPath()` containing one of those would make this test
+                // either fail to run the intended batch file or, worse, run an attacker-shaped command
+                // line. Document and enforce the assumption instead of trusting it silently: skip rather
+                // than give a false pass/fail on a host whose TEMP path violates it.
                 let tempPath = IO.Path.GetTempPath()
-                let cmdMetacharacters = [| '&'; '|'; '^'; '<'; '>'; '%'; '!'; '"'; '('; ')' |]
+                let cmdMetacharacters = [| '&'; '|'; '^'; '<'; '>'; '%'; '!'; '"'; '('; ')'; '@' |]
 
                 if tempPath |> Seq.exists (fun c -> Array.contains c cmdMetacharacters) then
                     Assert.Ignore
