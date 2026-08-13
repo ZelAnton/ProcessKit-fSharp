@@ -10,41 +10,38 @@ teardown guards rather than by another `Consumption` case.
 For the consumer-facing contracts, see [Streaming](../streaming.md). This page concentrates on
 the transitions and ownership rules that code extending `RunningProcess` must preserve.
 
-## State diagram
+## State transitions
 
 ```text
-                                      OutputStringAsync / OutputBytesAsync
-                                   +  WaitAsync / ProfileAsync / ExitTask first
-                                   v
-                              +----------+
-                              | Buffered |
-                              +----------+
-                             /            \
-                            /              \
-                           /                \
-+-------+  StdoutLinesAsync / JSON lines     +-------------------+
-| Fresh | ---------------------------------> | StdoutStreaming   |
-+-------+                                    +-------------------+
-    |  |  StdoutChunksAsync                   | FinishAsync
-    |  +------------------------------------> | (same session)
-    |                                         v
-    |                                    +------------------+
-    |  OutputEventsAsync                 | Closing/Disposed |
-    +----------------------------------> +------------------+
-    |       EventStreaming                       ^
-    |                                            |
-    |  ContentLengthSession(...)                 |
-    +----------------------------------> ContentLengthSession
-    |                                      ^     |
-    |                                      |     |
-    |                               JsonRpcSession(...)
-    |                               owns its one frame reader
-    |
-    |  PtySession(...)
-    +------------------------------------------> PtySession
+Fresh -> Buffered
+  via OutputStringAsync, OutputBytesAsync, WaitAsync, ProfileAsync, or ExitTask first
+Fresh -> StdoutStreaming
+  via StdoutLinesAsync or StdoutJsonLinesAsync
+Fresh -> ChunkStreaming
+  via StdoutChunksAsync
+Fresh -> EventStreaming
+  via OutputEventsAsync
+Fresh -> ContentLengthSession
+  via the ContentLengthSession constructor
+Fresh -> JsonRpcSession
+  via the JsonRpcSession constructor
+Fresh -> PtySession
+  via the PtySession constructor
 
-Any live state --------------------------------> Closing/Disposed
-             terminal verb, StopAsync, or explicit disposal
+Buffered -> Closing/Disposed
+  via its terminal verb, StopAsync, or disposal
+StdoutStreaming -> Closing/Disposed
+  via FinishAsync, StopAsync, or disposal
+ChunkStreaming -> Closing/Disposed
+  via FinishAsync, StopAsync, or disposal
+EventStreaming -> Closing/Disposed
+  via StopAsync or disposal
+ContentLengthSession -> Closing/Disposed
+  via StopAsync or disposal
+JsonRpcSession -> Closing/Disposed
+  via StopAsync or disposal
+PtySession -> Closing/Disposed
+  via StopAsync or disposal
 ```
 
 The `OutputEventsAsync`, Content-Length, JSON-RPC, and PTY paths do not support
