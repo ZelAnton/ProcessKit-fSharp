@@ -115,6 +115,12 @@ await foreach (var line in process.StdoutLinesAsync())
 
 On Windows, echo is controlled by the child program’s console mode; ConPTY cannot force it off before the child starts. A Windows password prompt must therefore suppress its own echo. Never log a secret or place it in a recording. The [testing guide](testing.md#pseudo-terminal-pty-doubles) describes the PTY double and cassette redaction boundary.
 
+`ProcessStdin.WriteLineAsync` sends LF to a plain pipe or POSIX PTY and CR to Windows ConPTY, where
+the virtual-terminal input path interprets it as Enter. `WriteAsync` remains byte-exact when a child
+needs an explicit sequence. `PtySession.SendLineAsync` separately follows
+`PtySessionOptions.LineEnding`; its `Auto` default uses the carriage return a terminal sends for any
+PTY and LF for a plain pipe.
+
 The [cookbook PTY recipe](cookbook.md#interactive-password-prompt-through-a-pty) contains the same pattern in context.
 
 ### Ending stdin on a PTY

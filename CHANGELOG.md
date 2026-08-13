@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
+- `ProcessStdin.WriteLineAsync` now sends carriage return for Windows ConPTY input so cooked console line readers receive Enter, while plain pipes and POSIX PTYs continue to receive line feed and raw `WriteAsync` remains byte-exact.
 - `SupervisionSession.StopAsync` now immediately cancels an active capture-only incarnation instead of waiting for its capture to finish, including during initial capability detection and after the capture-only mode is latched; a stopped active capture reports `StopReason.Stopped`, while external cancellation remains `ProcessError.Cancelled`.
 - `SupervisionSession.Status.StartTime` now identifies an active capture-only incarnation even though its process id remains unavailable.
 - `Stdin.FromBytes` now takes a defensive copy of the caller's byte array at the API boundary, so mutating it after building a `Command` (or across retry attempts) no longer changes what is written to the child's stdin.

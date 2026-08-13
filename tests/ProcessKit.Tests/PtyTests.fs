@@ -1348,6 +1348,50 @@ type PtyTests() =
         }
 
     [<Test>]
+    member _.``Windows ConPTY ProcessStdin WriteLineAsync submits Enter to Console ReadLine``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only ConPTY path"
+            else
+                let script =
+                    "$line = [Console]::In.ReadLine(); "
+                    + "[Console]::Out.WriteLine('REPLY=' + $line); "
+                    + "if ($null -ne $line -and $line.Contains('hello')) { exit 0 } else { exit 9 }"
+
+                let command =
+                    Command.create "powershell.exe"
+                    |> Command.args [ "-NoLogo"; "-NoProfile"; "-NonInteractive"; "-Command"; script ]
+                    |> Command.pty
+                    |> Command.keepStdinOpen
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match! runner.StartAsync(command, CancellationToken.None) with
+                | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
+                    Assert.Ignore $"host lacks ConPTY: {message}"
+                | Error other -> Assert.Fail $"unexpected error from a ConPTY spawn: {other}"
+                | Ok running ->
+                    use running = running
+
+                    match running.TakeStdin() with
+                    | None -> Assert.Fail "a KeepStdinOpen ConPTY run must hand out an interactive stdin"
+                    | Some stdin -> do! stdin.WriteLineAsync "hello"
+
+                    match! running.OutputStringAsync() with
+                    | Error error -> Assert.Fail $"the ConPTY line-reader run failed: {error}"
+                    | Ok result ->
+                        match result.Outcome with
+                        | Outcome.Exited 0 ->
+                            if result.Stdout.Contains "REPLY=" then
+                                Assert.That(result.Stdout, Does.Contain "REPLY=hello")
+                        | Outcome.Exited 9 when not (result.Stdout.Contains "REPLY=") ->
+                            // A console-attached parent can make a console-subsystem child use that console
+                            // instead of ConPTY for text I/O (fixture note). The console-less CI host runs
+                            // the full assertion above; this environment cannot exercise that round trip.
+                            Assert.Ignore "ConPTY round-trip needs a console-less test host"
+                        | other -> Assert.Fail $"the ConPTY line reader did not receive hello: {other}"
+        }
+
+    [<Test>]
     member _.``a ConPTY stdin whose FromFile source cannot be opened still ends the child's input (F-17)``() : Task =
         task {
             // The eager `StdinSource.File` open runs at spawn, before any feed exists, so its failure IS where
