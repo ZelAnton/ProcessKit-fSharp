@@ -238,6 +238,16 @@ module internal Windows =
     [<Literal>]
     let private CREATE_NEW_PROCESS_GROUP = 0x00000200u
 
+    // Test seam: observe the exact creation flags computed at the native boundary. The boolean identifies
+    // the ConPTY path (`true`) versus the regular contained path (`false`). Detached spawn deliberately does
+    // not participate: its separate flag branch is outside this seam and outside ConPTY isolation.
+    let mutable windowsCreationFlagsObserverForTests: (bool * uint32 -> unit) option =
+        None
+
+    // Test seam for the separate public-signal registration bit stored on Spawned. Creation flags and
+    // targetability intentionally differ for a default ConPTY child, so tests observe both decisions.
+    let mutable windowsCtrlGroupObserverForTests: (bool * bool -> unit) option = None
+
     [<Literal>]
     let private STARTF_USESTDHANDLES = 0x00000100u
 
@@ -3362,21 +3372,25 @@ module internal Windows =
 
                         let flags =
                             // Spawn SUSPENDED so the child is assigned to the Job before it runs (proven
-                            // containment). EXTENDED_STARTUPINFO_PRESENT selects the STARTUPINFOEX form.
+                            // containment). EXTENDED_STARTUPINFO_PRESENT selects the STARTUPINFOEX form. A
+                            // ConPTY child always gets its own console process group: the isolated terminal
+                            // has no useful shared-group semantics, and the flag prevents a stray CTRL+C
+                            // broadcast on the caller's console from terminating it. WindowsCtrlSignals
+                            // remains only the opt-in registration for ProcessKit's targeted CTRL+BREAK.
                             EXTENDED_STARTUPINFO_PRESENT
                             ||| CREATE_SUSPENDED
+                            ||| CREATE_NEW_PROCESS_GROUP
                             ||| (if environment = IntPtr.Zero then
                                      0u
                                  else
                                      CREATE_UNICODE_ENVIRONMENT)
                             ||| (if config.CreateNoWindow then CREATE_NO_WINDOW else 0u)
-                            ||| (if config.WindowsCtrlSignals then
-                                     CREATE_NEW_PROCESS_GROUP
-                                 else
-                                     0u)
                             ||| (match config.Priority with
                                  | Some priority -> PriorityMapping.windowsCreationFlag priority
                                  | None -> 0u)
+
+                        windowsCreationFlagsObserverForTests
+                        |> Option.iter (fun observer -> observer (true, flags))
 
                         // A PRIVATE, writable copy of the command line: `CreateProcessW` may patch this buffer
                         // in place while probing executable candidates, so it must never be the memory of a
@@ -3472,6 +3486,9 @@ module internal Windows =
                             else
                                 // Ownership of `hPC` is now the exit-wait's; it closes it exactly once.
                                 pendingPseudoConsole <- IntPtr.Zero
+
+                                windowsCtrlGroupObserverForTests
+                                |> Option.iter (fun observer -> observer (true, config.WindowsCtrlSignals))
 
                                 let stdinStream =
                                     if stdinPipeKept then
@@ -4051,6 +4068,9 @@ module internal Windows =
                          | Some priority -> PriorityMapping.windowsCreationFlag priority
                          | None -> 0u)
 
+                windowsCreationFlagsObserverForTests
+                |> Option.iter (fun observer -> observer (false, flags))
+
                 // A PRIVATE, writable copy of the command line: `CreateProcessW` may patch this buffer in
                 // place while probing executable candidates, so it must never be the memory of a managed
                 // `string` (a possibly interned literal) — see the binding above (T-198).
@@ -4126,6 +4146,10 @@ module internal Windows =
                     Error(ProcessError.Spawn(command.Program, $"could not resume the suspended child: {message}"))
                 else
                     CloseHandle info.hThread |> ignore
+
+                    windowsCtrlGroupObserverForTests
+                    |> Option.iter (fun observer -> observer (false, config.WindowsCtrlSignals))
+
                     // Drop the parent's copies of the child-side handles now that the child has inherited
                     // them, so reads see EOF when the child exits.
                     outCleanup ()

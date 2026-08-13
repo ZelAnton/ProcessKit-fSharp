@@ -789,6 +789,69 @@ type PtyTests() =
         }
 
     [<Test>]
+    member _.``Windows creation flags always isolate ConPTY while regular spawn stays opt-in``() : Task =
+        task {
+            // Note: integration-level broadcast CTRL+C isolation testing is not performed here; ConPTY children
+            // are isolated at the pseudoconsole level, not through process group alone, so broadcast testing
+            // cannot validate this flag.
+            if not isWindows then
+                Assert.Ignore "Windows-only creation flags"
+            else
+                let observed = ResizeArray<bool * uint32>()
+                let ctrlGroups = ResizeArray<bool * bool>()
+                let originalObserver = Native.Windows.windowsCreationFlagsObserverForTests
+                let originalCtrlGroupObserver = Native.Windows.windowsCtrlGroupObserverForTests
+
+                let run (command: Command) =
+                    task {
+                        match! command.OutputStringAsync() with
+                        | Ok _ -> ()
+                        | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
+                            Assert.Ignore $"host lacks ConPTY: {message}"
+                        | Error error -> Assert.Fail $"spawn failed while observing creation flags: {error}"
+                    }
+
+                let command () =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/d"; "/c"; "exit /b 0" ]
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                try
+                    Native.Windows.windowsCreationFlagsObserverForTests <-
+                        Some(fun observation -> observed.Add observation)
+
+                    Native.Windows.windowsCtrlGroupObserverForTests <-
+                        Some(fun observation -> ctrlGroups.Add observation)
+
+                    do! run ((command ()).Pty())
+                    do! run (((command ()).Pty()).WindowsCtrlSignals())
+                    do! run (command ())
+                    do! run ((command ()).WindowsCtrlSignals())
+
+                    Assert.That(observed.Count, Is.EqualTo 4)
+
+                    let hasNewProcessGroup (_, flags) = flags &&& 0x00000200u <> 0u
+
+                    Assert.That(fst observed[0], Is.True, "the first observation must be the default ConPTY path")
+                    Assert.That(hasNewProcessGroup observed[0], Is.True, "default ConPTY must be isolated")
+                    Assert.That(fst observed[1], Is.True, "the second observation must be opt-in ConPTY")
+                    Assert.That(hasNewProcessGroup observed[1], Is.True, "opt-in ConPTY must remain isolated")
+                    Assert.That(fst observed[2], Is.False, "the third observation must be regular spawn")
+                    Assert.That(hasNewProcessGroup observed[2], Is.False, "regular spawn must remain opt-in")
+                    Assert.That(fst observed[3], Is.False, "the fourth observation must be opt-in regular spawn")
+                    Assert.That(hasNewProcessGroup observed[3], Is.True, "opt-in regular spawn must keep its flag")
+
+                    Assert.That(
+                        ctrlGroups.ToArray(),
+                        Is.EqualTo<bool * bool>([| (true, false); (true, true); (false, false); (false, true) |]),
+                        "only WindowsCtrlSignals may register either spawn path for directed CTRL+BREAK"
+                    )
+                finally
+                    Native.Windows.windowsCreationFlagsObserverForTests <- originalObserver
+                    Native.Windows.windowsCtrlGroupObserverForTests <- originalCtrlGroupObserver
+        }
+
+    [<Test>]
     member _.``Pty on Windows spawns a ConPTY child, one merged stream, clean exit``() : Task =
         task {
             if not isWindows then
