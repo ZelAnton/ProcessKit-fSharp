@@ -11,9 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Changed
--
+- A failed run's message now quotes only the **last non-blank line of `Stderr`** rather than the whole captured stream: `ProcessError.Exit` no longer folds a multi-line stderr into its message, and `ProcessError.Signalled`/`ProcessError.Timeout` now carry that same one-line diagnostic (a hung or killed tool's last stderr line is usually the explanation) where they previously carried none. `Stdout` stays out of the render, and both streams remain available in full on `Stdout`/`Stderr`/`Combined`.
 
 ### Fixed
+- `ProcessError.Message`, `ProcessError.ToString()`, and the `ProcessException.Message` they become are now sanitized and bounded, so printing a failure (`eprintfn $"{err.Message}"`) can no longer be turned against the operator by whatever the child, the JSON-RPC peer, or a caller's parser wrote: every embedded fragment renders as a single line with terminal controls (ANSI escapes, `BEL`, `NUL`), `CR`/`LF`, the Unicode line/paragraph separators, and bidirectional-formatting controls (the "Trojan Source" class) replaced by `U+FFFD`, and anything past 512 characters cut with a trailing `…` — an ordinary TAB and printable Unicode are untouched, and a 100 KB stderr or unparsed dump now renders as the same small preview as a short one instead of flooding the log. Only the human-readable render is affected: `Detail`, `Stdout`, `Stderr`, `Data`, `Original` and their accessors still carry the caller's bytes in full.
 - `SupervisionSession.StopAsync` now immediately cancels an active capture-only incarnation instead of waiting for its capture to finish, including during initial capability detection and after the capture-only mode is latched; a stopped active capture reports `StopReason.Stopped`, while external cancellation remains `ProcessError.Cancelled`.
 - `SupervisionSession.Status.StartTime` now identifies an active capture-only incarnation even though its process id remains unavailable.
 - `Stdin.FromBytes` now takes a defensive copy of the caller's byte array at the API boundary, so mutating it after building a `Command` (or across retry attempts) no longer changes what is written to the child's stdin.
