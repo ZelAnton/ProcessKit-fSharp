@@ -30,6 +30,9 @@ streams are `await foreach`.
 
 ## Lifecycle
 
+The detailed states, ownership claims, and teardown transitions are documented in
+[Lifecycle state machine](internals/lifecycle.md).
+
 `StartAsync()` spawns the child and returns a `RunningProcess` without waiting for it to
 exit. The handle is an `IAsyncDisposable`: a `use` binding inside `task { }` reaps
 the whole process tree on scope exit, exactly like the disposal at the end of a

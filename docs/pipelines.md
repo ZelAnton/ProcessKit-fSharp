@@ -7,7 +7,8 @@ next stage's stdin by an in-process relay — there is no shell string anywhere,
 are no quoting rules, no word splitting, and no injection surface. Every stage spawns
 into one shared kill-on-dispose [process group](process-groups.md), so the whole chain
 lives and dies as a unit: tear the chain down (a timeout, a cancellation, an early
-return) and every stage goes with it.
+return) and every stage goes with it. Each stage participates in the shared-group ownership
+rules detailed in [Lifecycle state machine](internals/lifecycle.md).
 
 The relay is a copy loop, not a kernel splice. When a consumer exits early it closes the
 upstream read end, so the producer stops on a *broken pipe* — its next write fails once

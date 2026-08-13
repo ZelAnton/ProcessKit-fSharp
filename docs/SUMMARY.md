@@ -38,3 +38,5 @@
 - [Hardening untrusted children](hardening.md)
 - [Running in containers](containers.md)
 - [Troubleshooting](troubleshooting.md)
+- [Internal architecture](internals/architecture.md)
+  - [Lifecycle state machine](internals/lifecycle.md)
