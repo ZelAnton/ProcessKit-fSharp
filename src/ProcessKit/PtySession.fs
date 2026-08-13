@@ -356,9 +356,17 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     /// child that reads until EOF. Idempotent; returns the same typed `Unsupported` as the send verbs
     /// when the run has no interactive stdin.
     ///
-    /// On a POSIX pty the end of input is the terminal's own end-of-input character (see
-    /// `ProcessStdin.FinishAsync`), delivered through the same terminal the conversation runs over. A
-    /// genuine failure to deliver it is a typed `Io` — never a silently dropped close that would leave the
+    /// On a **PTY** there is no stdin pipe to close — input goes into the same terminal the conversation's
+    /// output comes from — so the end of input is delivered as that terminal's own end-of-input gesture
+    /// instead (see `ProcessStdin.FinishAsync`): on POSIX the pty's configured end-of-input character
+    /// (`termios.c_cc[VEOF]`, Ctrl-D on a default terminal), on Windows the console's Ctrl-Z followed by
+    /// Enter. The terminal itself stays open either way, so the child keeps its output — and, on Windows,
+    /// its console session — for the rest of the run. Being a gesture the terminal interprets, it ends the
+    /// input only of a child still reading in cooked mode (POSIX canonical mode, or a Windows console its
+    /// own `CONIN$` mode has not switched to raw); one that reads its terminal raw receives those bytes as
+    /// ordinary input, which is the terminal's contract rather than something this verb can paper over.
+    ///
+    /// A genuine failure to deliver it is a typed `Io` — never a silently dropped close that would leave the
     /// child waiting — while a child that has already closed its terminal is reported as the `Ok` it is:
     /// there is nothing left to tell it.
     member _.CloseStdinAsync() : Task<Result<unit, ProcessError>> =
