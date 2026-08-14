@@ -552,6 +552,12 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     /// or on the representative stage's stderr) is refused with `ProcessError.OutputTooLarge` instead of
     /// being returned as if whole — `OutputStringAsync` is the lenient path, handing back the bounded
     /// payload with `ProcessResult.Truncated` set.
+    ///
+    /// That refusal names the **pipefail representative** stage (the program on the result it judged) and
+    /// quotes the **last** stage's byte ceiling — the only ceiling a verb applied to the chain's captured
+    /// stdout can name. On an ordinary chain they are the same stage; they differ when the last stage opts
+    /// out of pipefail (`UncheckedInPipe`), which makes an earlier stage the representative, so a
+    /// truncation of THAT stage's stderr is reported against its program alongside the last stage's cap.
     member this.RunAsync([<Optional>] cancellationToken: CancellationToken) : Task<Result<string, ProcessError>> =
         // Only the byte ceiling is quoted: a pipeline captures raw bytes, so the last stage's `MaxLines`
         // never applies to it — the same convention `PipelineClassify.outputTooLargeError` follows for
