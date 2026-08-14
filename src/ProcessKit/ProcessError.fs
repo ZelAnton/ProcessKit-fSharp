@@ -304,8 +304,13 @@ type ProcessError =
     | JsonRpc of Program: string * Method: string * Code: int * Detail: string * Data: string option
 
     /// Captured or streamed output exceeded a configured fail-loud ceiling, or a checking verb refused
-    /// output a bounded buffer had already truncated (`Command.RunAsync`/`ParseAsync`/`OutputJsonAsync`
-    /// and their pipeline twins — see `ProcessResult.Truncated` for the lenient path). Metrics are
+    /// output that was already truncated (`Command.RunAsync`/`ParseAsync`/`OutputJsonAsync` and their
+    /// pipeline twins — see `ProcessResult.Truncated` for the lenient path). Truncation has two sources
+    /// and this case covers the refusal of both: a bounded buffer that dropped output, and a bounded
+    /// post-exit output drain that cut the tail short because something which inherited the child's
+    /// stdout/stderr outlived it (`PostExitDrain`). `Message` is worded for the first, much more common
+    /// source; `LineLimit`/`ByteLimit` are the caller's configured ceilings, which are simply absent
+    /// when nothing was capped. Metrics are
     /// populated only when their unit applies to that channel (lines, bytes, merged events, or protocol
     /// frames) AND the producer actually counted it: a `0` total means "not reported here", never a
     /// measured zero, and `Message` quotes only the totals that were populated.

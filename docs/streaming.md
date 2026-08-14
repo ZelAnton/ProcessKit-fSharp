@@ -550,7 +550,9 @@ blocks the child) or `Error` (fails loud instead of stalling) over `Backpressure
 When a line or chunk stream ends (stdout closed), collect the rest with `FinishAsync()`, which returns
 `Result<Finished, ProcessError>`. `Finished` carries the `Outcome`, the `Stderr` that was drained
 while you streamed, and `Truncated`, which is true when the stdout stream dropped items under a
-dropping `StreamBuffer` policy or the captured stderr was truncated by `OutputBuffer`:
+dropping `StreamBuffer` policy, when the captured stderr was truncated by `OutputBuffer`, or when the
+post-exit output drain was bounded because something that inherited the child's stdout/stderr outlived
+it (see [Output a descendant keeps open](#output-a-descendant-keeps-open) below):
 
 **F#**
 
@@ -602,13 +604,46 @@ Calling `FinishAsync()` without having taken the stdout stream is allowed and co
 stdout is then drained to keep the child moving and discarded as it arrives, exactly like
 `WaitAsync()`, since `Finished` carries the `Outcome` and stderr but never stdout. Your
 `OnStdoutLine` handler and `StdoutTee` still see every line — only the backlog is gone, so there is
-nothing left to drop and `Truncated` reports only the stderr capture. That finish is also the point
+nothing left to drop and `Truncated` reports the stderr capture (plus a bounded post-exit drain, if
+one fired — see below). That finish is also the point
 of no return for stdout, and it says so out loud: asking for the discarded stream afterwards is
 refused as already-consumed — `StdoutLinesAsync()`/`StdoutJsonLinesAsync()` throw
 `InvalidOperationException` and `WaitForLineAsync()` returns `ProcessError.Unsupported`, just as they
 do after `WaitAsync()`/`ProfileAsync()` — instead of handing back an empty stream you could mistake
 for a silent child. So take the stream first (`StdoutLinesAsync()`/`StdoutChunksAsync()`) if you want
 to read stdout after finishing: its backlog is retained for its enumerator as before.
+
+## Output a descendant keeps open
+
+A pipe reaches end-of-file only when its **last** writer closes it, and the child's own exit closes
+only the child's copy. If the child spawned something that inherited its stdout/stderr and kept
+running — a daemonized worker, a `setsid` helper, a shell's `&` background job — the parent's read end
+stays open after the child is gone.
+
+ProcessKit does not wait on that indefinitely. Once the child's exit status is known, the output pumps
+get a short window (5 seconds) to finish an ordinary tail; if the pipe is still open after it, the run
+closes its **own** read ends and the verb returns the outcome it already had. What was read is kept,
+and the result says it is incomplete:
+
+- `OutputStringAsync`/`OutputBytesAsync` return the partial capture with `ProcessResult.Truncated`
+  set — symmetric for text and bytes.
+- A line/chunk/event stream ends where it was cut, and `FinishAsync` reports `Finished.Truncated`.
+- `WaitAsync`/`ProfileAsync`, which retain nothing anyway, simply conclude.
+- `WaitAnyAsync`/`WaitAllAsync` resolve on the child's own exit.
+- The **checking** verbs — `RunAsync`, `ParseAsync`, `OutputJsonAsync` — present their capture as the
+  whole of stdout, so they refuse a cut-short one with `ProcessError.OutputTooLarge`, exactly as they
+  already refuse one a buffer policy truncated. Use `OutputStringAsync`/`OutputBytesAsync` when you
+  want the partial payload plus `Truncated` instead.
+
+This is not a timeout: the run's `Outcome` is untouched (it is not turned into `TimedOut`), and
+`Command.Timeout` remains a separate, independent deadline on the run as a whole. It is also not a
+kill of anything the run does not own. A run started by the default runner owns a private group, so
+its teardown reaps whatever the child left behind, exactly as it always did; a run started through a
+shared [`ProcessGroup`](process-groups.md) detaches only its own I/O, and the descendant keeps running under
+the group until you shut the group down.
+
+If you *want* that descendant's output, it is not this run's stdout to capture — give the descendant
+its own pipe, or have the child wait for it before exiting.
 
 ## Streaming a pipeline's final stage
 

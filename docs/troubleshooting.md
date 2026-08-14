@@ -67,6 +67,14 @@ kills the tree and closes its pipes, but a timeout is a safety bound, not a
 replacement for consuming output. See [Streaming lifecycle](streaming.md#lifecycle)
 and [Timeouts, retries and cancellation](timeouts-and-cancellation.md).
 
+**A second cause, already bounded for you:** the child spawned something that
+inherited its stdout/stderr and outlived it, so the pipe still has a writer and
+never reaches end-of-file. ProcessKit gives the pumps a short window after the
+child's exit status is known, then closes its own read ends and returns that
+outcome with `Truncated` set — so this shows up as an incomplete capture rather
+than a hang, with no `Command.Timeout` needed. See
+[Output a descendant keeps open](streaming.md#output-a-descendant-keeps-open).
+
 ## Deadlock behavior with `StreamBuffer`
 
 **Symptom:** A streamed run stops after exactly the configured backlog capacity,

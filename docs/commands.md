@@ -1451,7 +1451,7 @@ The accessors:
 | `IsTimedOut` | The run's own deadline expired |
 | `Outcome` | The three-way enum behind the accessors above |
 | `Duration` | Wall-clock duration of the run |
-| `Truncated` | A buffer policy dropped output |
+| `Truncated` | Output is incomplete: a buffer policy dropped some, or a bounded post-exit drain cut the tail ([details](streaming.md#output-a-descendant-keeps-open)) |
 | `AcceptedCodes` | The exit codes treated as success — `OkCodes` (`{0}` by default) |
 | `Combined` | Stdout and stderr joined (stdout, then stderr on a new line when both are non-empty) — a post-hoc concatenation, *not* the real interleaving; use `MergeStderr` for a byte-exact `2>&1` |
 | `OutputContainsAny(needles)` | Case-insensitive search of both streams — for the "a known marker makes a non-zero exit benign" idiom below |

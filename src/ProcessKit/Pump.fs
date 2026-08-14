@@ -154,12 +154,13 @@ module internal Pump =
     /// Accumulates retained raw stdout bytes under an `OutputBufferPolicy`'s byte cap + `OverflowMode` —
     /// the byte-stream analogue of `LineBuffer` (which retains decoded lines). Only `MaxBytes` and
     /// `Overflow` govern a raw byte stream; `MaxLines` has no meaning without line structure, so it is
-    /// ignored by construction. The unbounded (`MaxBytes = None`) case never constructs this — it uses
-    /// `drainRaw` — so `cap` is always the configured non-negative `MaxBytes`. `DropOldest` keeps the
-    /// LAST `cap` bytes (a byte ring built from retained chunks, evicting the front); `DropNewest` and
-    /// `Error` keep the FIRST `cap` bytes, `Error` additionally tripping its fail-loud ceiling once the
-    /// cap is exceeded. Memory is bounded to `cap` (plus one in-flight read chunk while evicting), so a
-    /// small cap never buffers a large flood. Not thread-safe; one per stream.
+    /// ignored by construction. The unbounded (`MaxBytes = None`) case never constructs this — `RawSink`
+    /// keeps a plain accumulator there — so `cap` is always the configured non-negative `MaxBytes`.
+    /// `DropOldest` keeps the LAST `cap` bytes (a byte ring built from retained chunks, evicting the
+    /// front); `DropNewest` and `Error` keep the FIRST `cap` bytes, `Error` additionally tripping its
+    /// fail-loud ceiling once the cap is exceeded. Memory is bounded to `cap` (plus one in-flight read
+    /// chunk while evicting), so a small cap never buffers a large flood. Not thread-safe on its own;
+    /// `RawSink`, the only production owner, serializes every access to it.
     type RawBuffer(cap: int, overflow: OverflowMode) =
         // DropOldest retains from the tail (evicting the front); Error/DropNewest retain from the head.
         let isTail = overflow = OverflowMode.DropOldest
@@ -868,43 +869,6 @@ module internal Pump =
         }
         :> Task
 
-    /// Read `stream` to EOF as raw bytes (no line splitting), teeing if a sink is set. `tee` is flushed
-    /// once the read loop ends — clean EOF or a read failure alike, via `finally` — so a buffered tee
-    /// sink sees its last bytes without waiting for the caller to dispose it (see `flushTeeQuietly`).
-    let drainRaw (stream: Stream) (tee: Stream option) (cancellationToken: CancellationToken) : Task<byte[]> =
-        task {
-            use buffer = new MemoryStream()
-            // See the comment on `readLines`'s wrapper for why this is hand-rolled instead of an async
-            // `finally` (FS0750): flush unconditionally, then rethrow the original fault (if any).
-            let mutable fault: exn option = None
-
-            try
-                let chunk = Array.zeroCreate<byte> 8192
-                let mutable reading = true
-
-                while reading do
-                    let! read = stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)
-
-                    if read = 0 then
-                        reading <- false
-                    else
-                        do! buffer.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
-
-                        match tee with
-                        | Some sink -> do! sink.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
-                        | None -> ()
-            with ex ->
-                fault <- Some ex
-
-            do! flushTeeQuietly tee
-
-            match fault with
-            | Some ex -> ExceptionDispatchInfo.Throw ex
-            | None -> ()
-
-            return buffer.ToArray()
-        }
-
     /// `drainDiscard` over an optional stream — a completed no-op when the stream isn't piped.
     let drainDiscardOrEmpty (stream: Stream option) (cancellationToken: CancellationToken) : Task =
         match stream with
@@ -934,100 +898,119 @@ module internal Pump =
         }
         :> Task
 
-    /// `drainRaw` over an optional stream — an empty byte array when the stream isn't piped.
-    let drainRawOrEmpty
+    /// A raw-byte capture accumulator the CALLER owns, rather than one the read loop keeps to itself
+    /// and hands back only on completion. That distinction is what lets a consumer report what WAS
+    /// captured without first awaiting the pump: the bounded post-exit output drain (`PostExitDrain`)
+    /// can end a verb's wait on a pump whose pipe a surviving descendant holds open, and the raw
+    /// capture must then still carry the bytes that did arrive — where the old read loop, which
+    /// discarded its private buffer on ANY fault, could only offer an empty one.
+    ///
+    /// Reading a sink while its pump may still be appending IS a concurrent access, so every member
+    /// runs under one uncontended `Monitor` — negligible next to the 8 KiB OS read that produced the
+    /// chunk. `MaxBytes = None` retains everything (the unbounded default, so `Truncated`/`TooLarge`
+    /// are always false); `Some cap` applies the byte cap + `Overflow` mode through `RawBuffer`
+    /// (`MaxLines` never applies to a byte stream — it has no line structure).
+    type RawSink(policy: OutputBufferPolicy) =
+        let gate = obj ()
+
+        // Exactly one of the two is live, chosen once by the policy: the capped ring/prefix buffer, or
+        // the unbounded accumulator. A `match` (never `.IsSome`/`.Value`) at every use, per this
+        // repository's IONIDE-006 rule.
+        let bounded =
+            policy.MaxBytes |> Option.map (fun cap -> RawBuffer(cap, policy.Overflow))
+
+        let unbounded = new MemoryStream()
+
+        /// Record a chunk of raw bytes. `source[offset .. offset+count-1]` is copied out (the caller
+        /// reuses `source` across reads), so the sink owns its retained bytes.
+        member _.Append(source: byte[], offset: int, count: int) =
+            lock gate (fun () ->
+                match bounded with
+                | Some buffer -> buffer.Append(source, offset, count)
+                | None -> unbounded.Write(source, offset, count))
+
+        /// The capture as it stands right now — safe to take while the pump is still running.
+        member _.Snapshot() : RawCapture =
+            lock gate (fun () ->
+                match bounded with
+                | Some buffer ->
+                    { Bytes = buffer.ToArray()
+                      Truncated = buffer.Truncated
+                      TooLarge = buffer.TooLarge
+                      TotalBytes = buffer.TotalBytes }
+                | None ->
+                    let bytes = unbounded.ToArray()
+
+                    { Bytes = bytes
+                      Truncated = false
+                      TooLarge = false
+                      TotalBytes = bytes.Length })
+
+    /// Read an optional raw stdout stream to EOF into a caller-owned `sink`, teeing the FULL byte
+    /// stream if a tee is set (the tee mirrors exactly what the child produced, independently of the
+    /// sink's retention policy — just as `readLines` tees before its line buffer applies). The child
+    /// never blocks: the pipe is drained to EOF even after a cap is reached. `tee` is flushed once the
+    /// read loop ends — clean EOF or a read failure alike — so a buffered tee sink sees its last bytes
+    /// without waiting for the caller to dispose it (see `flushTeeQuietly`). The single raw read loop
+    /// behind both `captureRawOrEmpty` and `RunningProcess`'s byte verb.
+    let captureRawInto
+        (sink: RawSink)
         (stream: Stream option)
         (tee: Stream option)
         (cancellationToken: CancellationToken)
-        : Task<byte[]> =
+        : Task =
         match stream with
-        | Some s -> drainRaw s tee cancellationToken
-        | None -> Task.FromResult Array.empty<byte>
+        | None -> Task.CompletedTask
+        | Some s ->
+            task {
+                // See the comment on `readLines`'s wrapper for why this is hand-rolled instead of an
+                // async `finally` (FS0750): flush unconditionally, then rethrow the original fault.
+                let mutable fault: exn option = None
 
-    /// Read `stream` to EOF as raw bytes under an `OutputBufferPolicy`'s byte `cap` + `overflow` mode,
-    /// teeing the FULL byte stream if a sink is set — the tee mirrors exactly what the child produced,
-    /// so it is independent of the in-memory retention policy (just as `readLines` tees before its line
-    /// buffer applies). Returns the retained bytes plus the truncation / fail-loud / total signals. The
-    /// child never blocks: the pipe is always drained to EOF even after the cap is reached. `tee` is
-    /// flushed once the read loop ends — clean EOF or a read failure alike, via `finally` — so a
-    /// buffered tee sink sees its last bytes without waiting for the caller to dispose it (see
-    /// `flushTeeQuietly`).
-    let drainRawBounded
-        (stream: Stream)
-        (tee: Stream option)
-        (cap: int)
-        (overflow: OverflowMode)
-        (cancellationToken: CancellationToken)
-        : Task<RawCapture> =
-        task {
-            let buffer = RawBuffer(cap, overflow)
-            // See the comment on `readLines`'s wrapper for why this is hand-rolled instead of an async
-            // `finally` (FS0750): flush unconditionally, then rethrow the original fault (if any).
-            let mutable fault: exn option = None
+                try
+                    let chunk = Array.zeroCreate<byte> 8192
+                    let mutable reading = true
 
-            try
-                let chunk = Array.zeroCreate<byte> 8192
-                let mutable reading = true
+                    while reading do
+                        let! read = s.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)
 
-                while reading do
-                    let! read = stream.ReadAsync(chunk.AsMemory(0, chunk.Length), cancellationToken)
+                        if read = 0 then
+                            reading <- false
+                        else
+                            match tee with
+                            | Some target -> do! target.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
+                            | None -> ()
 
-                    if read = 0 then
-                        reading <- false
-                    else
-                        match tee with
-                        | Some sink -> do! sink.WriteAsync(chunk.AsMemory(0, read), cancellationToken)
-                        | None -> ()
+                            sink.Append(chunk, 0, read)
+                with ex ->
+                    fault <- Some ex
 
-                        buffer.Append(chunk, 0, read)
-            with ex ->
-                fault <- Some ex
+                do! flushTeeQuietly tee
 
-            do! flushTeeQuietly tee
-
-            match fault with
-            | Some ex -> ExceptionDispatchInfo.Throw ex
-            | None -> ()
-
-            return
-                { Bytes = buffer.ToArray()
-                  Truncated = buffer.Truncated
-                  TooLarge = buffer.TooLarge
-                  TotalBytes = buffer.TotalBytes }
-        }
+                match fault with
+                | Some ex -> ExceptionDispatchInfo.Throw ex
+                | None -> ()
+            }
+            :> Task
 
     /// Capture an optional raw stdout stream to EOF under `policy`. `policy.MaxBytes = None` keeps the
-    /// capture UNBOUNDED (via `drainRaw`, unchanged) — there is no byte ceiling to enforce, so its
-    /// `Truncated`/`TooLarge` are always false; `Some cap` applies the byte cap + `Overflow` mode
-    /// (`MaxLines` never applies to a raw byte stream — it has no line structure). The single entry
-    /// point the byte verb (`RunningProcess.OutputBytesAsync`) and the pipeline's last-stage capture
-    /// share, so their raw-capture semantics can't drift.
+    /// capture UNBOUNDED — there is no byte ceiling to enforce, so its `Truncated`/`TooLarge` are
+    /// always false; `Some cap` applies the byte cap + `Overflow` mode (`MaxLines` never applies to a
+    /// raw byte stream — it has no line structure). The single entry point the pipeline's stage
+    /// captures use, sharing its read loop and its `RawSink` with `RunningProcess.OutputBytesAsync`
+    /// (which owns the sink itself, so the bounded post-exit drain can read a partial capture off it)
+    /// — so their raw-capture semantics can't drift.
     let captureRawOrEmpty
         (stream: Stream option)
         (tee: Stream option)
         (policy: OutputBufferPolicy)
         (cancellationToken: CancellationToken)
         : Task<RawCapture> =
-        match policy.MaxBytes with
-        | None ->
-            task {
-                let! bytes = drainRawOrEmpty stream tee cancellationToken
-
-                return
-                    { Bytes = bytes
-                      Truncated = false
-                      TooLarge = false
-                      TotalBytes = bytes.Length }
-            }
-        | Some cap ->
-            match stream with
-            | Some s -> drainRawBounded s tee cap policy.Overflow cancellationToken
-            | None ->
-                Task.FromResult
-                    { Bytes = Array.empty<byte>
-                      Truncated = false
-                      TooLarge = false
-                      TotalBytes = 0 }
+        task {
+            let sink = RawSink policy
+            do! captureRawInto sink stream tee cancellationToken
+            return sink.Snapshot()
+        }
 
     /// Dispose a stream, swallowing the exceptions a teardown race raises — a double-close, or a
     /// broken pipe surfaced while flushing on dispose because the peer is already gone. The one
