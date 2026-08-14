@@ -802,9 +802,11 @@ task {
         finally
             e.DisposeAsync().AsTask().Wait()
 
-        // After the stream ends, collect the outcome and stderr (drained in the background).
+        // After the stream ends, collect the outcome, stderr, and any output-truncation signal.
         match! proc.FinishAsync() with
-        | Ok finished -> if finished.Outcome <> Outcome.Exited 0 then eprintfn $"{finished.Stderr}"
+        | Ok finished ->
+            if finished.Outcome <> Outcome.Exited 0 || finished.Truncated then
+                eprintfn $"{finished.Stderr}"
         | Error err -> eprintfn $"{err.Message}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -818,9 +820,9 @@ await using var proc = (await new Command("git").Args(["log", "--oneline", "-n",
 await foreach (var line in proc.StdoutLinesAsync())
     Console.WriteLine($"commit: {line}");
 
-// After the stream ends, collect the outcome and stderr (drained in the background).
+// After the stream ends, collect the outcome, stderr, and any output-truncation signal.
 var finished = (await proc.FinishAsync()).GetValueOrThrow();
-if (finished.Outcome is not { IsExited: true, Code.Value: 0 }) // anything but a clean exit 0
+if (finished.Outcome is not { IsExited: true, Code.Value: 0 } || finished.Truncated)
     Console.Error.WriteLine(finished.Stderr);
 ```
 

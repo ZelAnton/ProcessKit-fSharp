@@ -190,7 +190,7 @@ type PipelineSession
     // is never a truncated version of `RunAsync`'s. A whole-chain cancellation (the verb token or
     // `Pipeline.CancelOn`) wins over the killed chain's raw outcome, mirroring the buffered path's
     // `Cancelled`-takes-precedence classification.
-    let classify (capture: PipelineCapture) : Result<Finished, ProcessError> =
+    let classify (lastStdoutTruncated: bool) (capture: PipelineCapture) : Result<Finished, ProcessError> =
         if wasCancelled () then
             Error(ProcessError.Cancelled (List.last commands).Program)
         else
@@ -204,7 +204,14 @@ type PipelineSession
 
                     match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
                     | Some error -> Error error
-                    | None -> Ok(Finished(stage.Outcome, stage.Stderr))
+                    | None ->
+                        Ok(
+                            Finished(
+                                stage.Outcome,
+                                stage.Stderr,
+                                PipelineClassify.resultTruncated lastStdoutTruncated stage
+                            )
+                        )
 
     /// Stream the FINAL stage's stdout line by line as it arrives — the pipeline analogue of
     /// `RunningProcess.StdoutLinesAsync`. Hands out its ONE enumerator exactly once; a second streaming
@@ -244,7 +251,8 @@ type PipelineSession
         inner.WaitForLineAsync(predicate, timeout, cancellationToken)
 
     /// Wait for the WHOLE chain to finish, then return how it concluded (the pipefail representative's
-    /// `Outcome`) plus that stage's stderr — with the same classification `Pipeline.RunAsync` applies:
+    /// `Outcome`) plus that stage's stderr and a truncation signal combining the final stdout stream with
+    /// that representative stderr — with the same classification `Pipeline.RunAsync` applies:
     /// an `OutputTooLarge` on any stage's fail-loud stream, or a stage-0 stdin-source failure on an
     /// otherwise-successful run, surfaces as `Error`, and a whole-chain cancellation is `Cancelled`. A
     /// genuine upstream relay read fault also surfaces as `ProcessError.Io` — and, having torn the chain
@@ -260,9 +268,9 @@ type PipelineSession
                 // The inner handle drains no stderr of its own (the pipeline owns every stage's stderr),
                 // so this branch is unreachable in practice; forward any inner error rather than mask it.
                 return Error error
-            | Ok _ ->
+            | Ok finished ->
                 let! settled = capture
-                return classify settled
+                return classify finished.Truncated settled
         }
 
     /// Gracefully stop the WHOLE chain (soft signal, wait up to `gracePeriod`, then hard-kill the
@@ -458,6 +466,8 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                         match PipelineClassify.stdinErrorOnSuccess (List.head commands).Program capture stage with
                         | Some err -> return Error err
                         | None ->
+                            let truncated = PipelineClassify.resultTruncated capture.LastStdoutTruncated stage
+
                             return
                                 Ok(
                                     ProcessResult<byte[]>(
@@ -466,7 +476,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                                         stage.Stderr,
                                         stage.Outcome,
                                         capture.Duration,
-                                        capture.LastStdoutTruncated,
+                                        truncated,
                                         stage.OkCodes,
                                         ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None),
                                         stdoutEncoding = (List.last commands).Config.StdoutEncoding
@@ -496,6 +506,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                         | None ->
                             let encoding = (List.last commands).Config.StdoutEncoding
                             let text = encoding.GetString capture.LastStdout
+                            let truncated = PipelineClassify.resultTruncated capture.LastStdoutTruncated stage
 
                             return
                                 Ok(
@@ -505,7 +516,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                                         stage.Stderr,
                                         stage.Outcome,
                                         capture.Duration,
-                                        capture.LastStdoutTruncated,
+                                        truncated,
                                         stage.OkCodes,
                                         ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None),
                                         stdoutEncoding = encoding

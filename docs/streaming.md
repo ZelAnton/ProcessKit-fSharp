@@ -548,8 +548,9 @@ blocks the child) or `Error` (fails loud instead of stalling) over `Backpressure
 ## Finishing a streamed run
 
 When a line or chunk stream ends (stdout closed), collect the rest with `FinishAsync()`, which returns
-`Result<Finished, ProcessError>`. `Finished` carries the `Outcome` and the `Stderr`
-that was drained while you streamed:
+`Result<Finished, ProcessError>`. `Finished` carries the `Outcome`, the `Stderr` that was drained
+while you streamed, and `Truncated`, which is true when the stdout stream dropped items under a
+dropping `StreamBuffer` policy or the captured stderr was truncated by `OutputBuffer`:
 
 **F#**
 

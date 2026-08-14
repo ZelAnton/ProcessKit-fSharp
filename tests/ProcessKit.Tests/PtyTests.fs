@@ -67,14 +67,13 @@ type internal ConPtyHostInputDouble(failWrites: exn option) =
 /// terminal stream (no separate stderr, D3), a real controlling terminal (`isatty` true, `/dev/tty`
 /// openable), and an honest typed `Unsupported` where the ctty helper is absent (D9).
 ///
-/// Live-ConPTY round-trip note (documented skip-gate, per the ADR/task): a ConPTY child's *text* output
-/// is only captured through the pseudoconsole when the parent process has **no** inherited interactive
-/// console; a console-attached parent (a developer terminal, some test hosts) makes a console-subsystem
-/// child attach to that console instead — a well-known ConPTY caveat, not a defect (verified: the spawn,
-/// containment, merged-stream shape, and conhost teardown are all correct, and full text capture works
-/// from a console-less parent). So the Windows test below asserts the robust, environment-independent
-/// contract — the run spawns, produces a single merged stream (no stderr), and exits cleanly — rather
-/// than a specific captured string.
+/// Live-ConPTY round-trip note: a ConPTY child's *text* output used to reach the pseudoconsole only from
+/// a launcher with no console of its own — a console-attached parent (a developer terminal, some test
+/// hosts) let the console-subsystem child keep writing to that console instead, and a headless one with
+/// redirected stdio had the child propagate and write to the redirect. T-338's std-handle binding closes
+/// both halves (see the T-338 section below, which asserts the round-trip in whichever environment runs
+/// it). The older Windows spawn test below still asserts only the environment-independent shape — the run
+/// spawns, produces a single merged stream (no stderr), and exits cleanly — which stays valid.
 ///
 /// The POSIX spawn tests are Linux-gated (the Stage-2 ctty helper is util-linux `setsid --ctty`, absent
 /// on macOS/BSD — an honest `Unsupported` there, asserted deterministically via the internal
@@ -879,6 +878,222 @@ type PtyTests() =
                     match result.Outcome with
                     | Outcome.Exited _ -> ()
                     | other -> Assert.Fail $"expected a clean exit from the ConPTY child, got {other}"
+        }
+
+    // ----------------------------------------------------------------------------------
+    // T-338: a ConPTY child's standard handles must come from the pseudoconsole, never from the launcher —
+    // and a console-attached launcher and a headless one need DIFFERENT guarantees for that. A
+    // console-attached one severs its console handles through `STARTF_USESTDHANDLES` + three null handles;
+    // a headless one must leave that flag clear (with it the child is stranded without an output binding)
+    // and instead null its OWN std-handle slots across the spawn call, under the shared `windowsSpawnLock`.
+    // ----------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``the ConPTY startup info severs std handles only for a console-attached launcher (T-338)``() =
+        // Pure struct building — no pseudoconsole, no Win32 call — so both forms of the decision are
+        // asserted on every platform, not only where a ConPTY can actually be created.
+        let startfUseStdHandles = 0x00000100u
+
+        let severedFlags, severedIn, severedOut, severedError =
+            Native.Windows.conptyStdHandleBindingForTests true
+
+        Assert.That(
+            severedFlags &&& startfUseStdHandles,
+            Is.EqualTo startfUseStdHandles,
+            "a console-attached launcher must ask for STARTF_USESTDHANDLES so ConPTY installs its own handles"
+        )
+
+        Assert.That(severedIn, Is.EqualTo IntPtr.Zero, "the severed standard input slot must be null")
+        Assert.That(severedOut, Is.EqualTo IntPtr.Zero, "the severed standard output slot must be null")
+        Assert.That(severedError, Is.EqualTo IntPtr.Zero, "the severed standard error slot must be null")
+
+        let headlessFlags, _, _, _ = Native.Windows.conptyStdHandleBindingForTests false
+
+        Assert.That(
+            headlessFlags &&& startfUseStdHandles,
+            Is.EqualTo 0u,
+            "a headless launcher must leave the flag clear — with it the child gets no console output binding"
+        )
+
+    [<Test>]
+    member _.``the headless ConPTY std-handle swap restores the launcher's slots on every outcome (T-338)``() =
+        if not isWindows then
+            Assert.Ignore "Windows-only: process-global standard-handle slots are a Win32 concept"
+        else
+            let before = Native.Windows.readLauncherStdHandles ()
+
+            // A successful spawn: the window itself sees three null slots — what makes the child propagate
+            // null defaults for the pseudoconsole to override — and the exact previous values come back.
+            let insideWindow =
+                Native.Windows.withNulledLauncherStdio (fun () -> Native.Windows.readLauncherStdHandles ())
+
+            Assert.That(
+                insideWindow,
+                Is.EqualTo((IntPtr.Zero, IntPtr.Zero, IntPtr.Zero)),
+                "the spawn window must run with the launcher's three std-handle slots nulled"
+            )
+
+            Assert.That(
+                Native.Windows.readLauncherStdHandles (),
+                Is.EqualTo before,
+                "the exact previous slot values must be restored after a successful spawn"
+            )
+
+            // A refused spawn is an ordinary return value (`CreateProcessExtended` returning false with a
+            // Win32 error), not an exception — the slots must come back just the same.
+            let refused = Native.Windows.withNulledLauncherStdio (fun () -> false, 2)
+
+            Assert.That(refused, Is.EqualTo((false, 2)), "the spawn's own result must pass through untouched")
+
+            Assert.That(
+                Native.Windows.readLauncherStdHandles (),
+                Is.EqualTo before,
+                "the exact previous slot values must be restored after a failed spawn"
+            )
+
+            // And an exception — the ConPTY spawn's outer handler turns one into `ProcessError.Spawn`, so it
+            // must not leave the whole process without standard handles on its way out.
+            let throwing () : unit =
+                raise (InvalidOperationException "spawn blew up")
+
+            match
+                Assert.Throws<InvalidOperationException>(
+                    Action(fun () -> Native.Windows.withNulledLauncherStdio throwing)
+                )
+            with
+            | null -> Assert.Fail "the spawn's exception must propagate through the restore"
+            | thrown -> Assert.That(thrown.Message, Is.EqualTo "spawn blew up", "the original failure must propagate")
+
+            Assert.That(
+                Native.Windows.readLauncherStdHandles (),
+                Is.EqualTo before,
+                "the exact previous slot values must be restored after an exception"
+            )
+
+    [<Test>]
+    member _.``a ConPTY child's output reaches the merged stream and leaves the launcher's slots intact (T-338)``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only ConPTY std-handle binding"
+            else
+                let observed = ResizeArray<bool>()
+                let originalObserver = Native.Windows.windowsPtyStdHandleModeObserverForTests
+                let before = Native.Windows.readLauncherStdHandles ()
+                let marker = "pty-stdio-" + Guid.NewGuid().ToString("N").Substring(0, 8)
+
+                let cmd =
+                    Command.create "cmd.exe"
+                    |> Command.args [ "/d"; "/c"; "echo " + marker ]
+                    |> Command.pty
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                try
+                    Native.Windows.windowsPtyStdHandleModeObserverForTests <-
+                        Some(fun observation -> observed.Add observation)
+
+                    match! cmd.OutputStringAsync() with
+                    | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
+                        Assert.Ignore $"host lacks ConPTY: {message}"
+                    | Error other -> Assert.Fail $"unexpected error from a ConPTY spawn: {other}"
+                    | Ok result ->
+                        let consoleAttached = Native.Windows.launcherHasConsole ()
+
+                        Assert.That(
+                            observed.ToArray(),
+                            Is.EqualTo<bool>([| consoleAttached |]),
+                            "the spawn must pick its std-handle binding from this launcher's actual console state"
+                        )
+
+                        // The point of the whole binding: the child's writes land in the pseudoconsole's
+                        // merged stream. Before this was fixed, a headless launcher's ConPTY stream carried
+                        // conhost's own setup frame and nothing else, because the child had propagated (and
+                        // written to) the launcher's redirected stdout instead.
+                        Assert.That(
+                            result.Stdout,
+                            Does.Contain marker,
+                            $"the child's output must reach the merged pty stream (console-attached launcher: {consoleAttached})"
+                        )
+
+                        // The headless path mutates process-global state for the length of the spawn call;
+                        // once the run is over this process must be exactly as it was.
+                        Assert.That(
+                            Native.Windows.readLauncherStdHandles (),
+                            Is.EqualTo before,
+                            "a ConPTY run must leave this process's own standard-handle slots untouched"
+                        )
+                finally
+                    Native.Windows.windowsPtyStdHandleModeObserverForTests <- originalObserver
+        }
+
+    [<Test>]
+    member _.``a concurrent ordinary spawn never observes the ConPTY std-handle swap (T-338)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: the swap is a Win32 process-global std-handle mutation"
+            else
+                let before = Native.Windows.readLauncherStdHandles ()
+                let stdinSlot, _, _ = before
+
+                if stdinSlot = IntPtr.Zero then
+                    Assert.Ignore
+                        "this host's own standard input slot is empty, so no inheriting child can be spawned here"
+                else
+                    // `Command.InheritStdin` duplicates THIS process's standard input slot into the child and
+                    // fails the spawn outright when that slot is empty. So an ordinary spawn that ran while a
+                    // ConPTY spawn had the slots nulled would report `ProcessError.Spawn`, not pass quietly —
+                    // which is what makes this observable at all. Both paths take `windowsSpawnLock`, so the
+                    // windows cannot overlap; a failure here would prove a leak, while a pass is evidence for
+                    // the serialization rather than a proof of it (the structural guarantee is the shared
+                    // lock, asserted directly by the seam tests above).
+                    let ordinary () =
+                        (Command.create "cmd.exe"
+                         |> Command.args [ "/d"; "/c"; "exit /b 0" ]
+                         |> Command.inheritStdin
+                         |> Command.timeout (TimeSpan.FromSeconds 30.0))
+                            .OutputStringAsync()
+
+                    let pty () =
+                        (Command.create "cmd.exe"
+                         |> Command.args [ "/d"; "/c"; "exit /b 0" ]
+                         |> Command.pty
+                         |> Command.timeout (TimeSpan.FromSeconds 30.0))
+                            .OutputStringAsync()
+
+                    // Every run is started before any of them is awaited, so the ConPTY spawns and the
+                    // inheriting ordinary spawns contend for the shared spawn lock at the same time.
+                    let ptyRuns = Array.init 4 (fun _ -> pty ())
+                    let ordinaryRuns = Array.init 16 (fun _ -> ordinary ())
+                    let! ptyResults = Task.WhenAll ptyRuns
+                    let! ordinaryResults = Task.WhenAll ordinaryRuns
+
+                    match
+                        ptyResults
+                        |> Array.tryPick (fun result ->
+                            match result with
+                            | Error(ProcessError.Unsupported message) when message.Contains "1809" -> Some message
+                            | _ -> None)
+                    with
+                    | Some message -> Assert.Ignore $"host lacks ConPTY: {message}"
+                    | None ->
+                        for result in ordinaryResults do
+                            match result with
+                            | Ok _ -> ()
+                            | Error error ->
+                                Assert.Fail
+                                    $"an ordinary spawn inheriting this process's standard input failed while ConPTY spawns ran: {error}"
+
+                        for result in ptyResults do
+                            match result with
+                            | Ok _ -> ()
+                            | Error error -> Assert.Fail $"a concurrent ConPTY spawn failed: {error}"
+
+                        Assert.That(
+                            Native.Windows.readLauncherStdHandles (),
+                            Is.EqualTo before,
+                            "the interleaved runs must leave this process's own standard-handle slots as they found them"
+                        )
         }
 
     // ----------------------------------------------------------------------------------

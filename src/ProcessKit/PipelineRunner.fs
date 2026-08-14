@@ -14,6 +14,10 @@ type internal PipelineStage =
         Unchecked: bool
         Stderr: string
         OkCodes: int list
+        /// Whether this stage's stderr capture dropped bytes under `DropOldest`/`DropNewest`.
+        /// Kept per stage so the final result combines truncation only with the stderr selected by
+        /// the pipefail representative fold, never with an unrelated stage's unpublished diagnostics.
+        StderrTruncated: bool
         /// This stage's stderr capture tripped its OWN `OutputBuffer` fail-loud (`OverflowMode.Error`)
         /// byte ceiling. Carried (with `StderrTotalBytes`) so `Pipeline` can surface a deterministic
         /// `ProcessError.OutputTooLarge` naming this stage — the per-stage stderr analogue of the last
@@ -128,6 +132,12 @@ module internal PipelineClassify =
             |> Option.map (fun ex -> ProcessError.Stdin(program, ex.Message))
         else
             None
+
+    /// Combine final-stage stdout truncation with the stderr truncation of the already-selected
+    /// pipefail representative. Buffered and streaming completion both use this fold; callers supply
+    /// the final stdout signal from their own capture mechanism.
+    let resultTruncated (lastStdoutTruncated: bool) (representative: PipelineStage) =
+        lastStdoutTruncated || representative.StderrTruncated
 
     /// The fail-loud (`OverflowMode.Error`) byte-ceiling classification across EVERY captured stream: the
     /// last stage's captured stdout AND every stage's drained stderr can each trip its own stage's
@@ -848,7 +858,9 @@ module internal PipelineRunner =
                                               ""
 
                                       // A stage that never started (staging halted mid-chain) has no stderr
-                                      // capture, so it never overflowed — default its fail-loud state off.
+                                      // capture, so it was neither truncated nor overflowed.
+                                      let stderrTruncated = i < stderrCaptures.Length && stderrCaptures[i].Truncated
+
                                       let stderrTooLarge = i < stderrCaptures.Length && stderrCaptures[i].TooLarge
 
                                       let stderrTotalBytes =
@@ -862,6 +874,7 @@ module internal PipelineRunner =
                                         Unchecked = stages[i].Config.UncheckedInPipe
                                         Stderr = stderr
                                         OkCodes = stages[i].Config.OkCodes
+                                        StderrTruncated = stderrTruncated
                                         StderrTooLarge = stderrTooLarge
                                         StderrTotalBytes = stderrTotalBytes
                                         TornDown = false } ]
@@ -999,6 +1012,7 @@ module internal PipelineRunner =
                                         Unchecked = stages[i].Config.UncheckedInPipe
                                         Stderr = stages[i].Config.StderrEncoding.GetString stderrCaptures[i].Bytes
                                         OkCodes = stages[i].Config.OkCodes
+                                        StderrTruncated = stderrCaptures[i].Truncated
                                         // Carry this stage's stderr fail-loud state so `Pipeline` can
                                         // surface a stderr overflow on ANY stage, not just the final
                                         // stdout. Every stage spawned on this path, so `stderrCaptures[i]`
@@ -1360,6 +1374,7 @@ module internal PipelineRunner =
                                             Unchecked = stages[i].Config.UncheckedInPipe
                                             Stderr = stages[i].Config.StderrEncoding.GetString stderrCaptures[i].Bytes
                                             OkCodes = stages[i].Config.OkCodes
+                                            StderrTruncated = stderrCaptures[i].Truncated
                                             StderrTooLarge = stderrCaptures[i].TooLarge
                                             StderrTotalBytes = stderrCaptures[i].TotalBytes
                                             TornDown = observation.TornDown[i] } ]

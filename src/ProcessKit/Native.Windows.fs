@@ -488,6 +488,15 @@ module internal Windows =
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern nativeint private GetStdHandle(int nStdHandle)
 
+    // The write half of `GetStdHandle`: replaces one of this process's own standard-handle slots. Used by
+    // exactly one caller — the headless ConPTY launcher's temporary null swap (`withNulledLauncherStdio`,
+    // in the ConPTY section below) — because the value it writes is PROCESS-GLOBAL state, not per-spawn
+    // state. `EntryPoint` is spelled out because an F# `extern` otherwise resolves the export by the F#
+    // function name and a mismatch would only surface as an `EntryPointNotFoundException` at the first
+    // call (K-136).
+    [<DllImport("kernel32.dll", SetLastError = true, EntryPoint = "SetStdHandle")>]
+    extern bool private SetStdHandle(int nStdHandle, nativeint handle)
+
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern nativeint private GetCurrentProcess()
 
@@ -2889,6 +2898,152 @@ module internal Windows =
         PROCESS_INFORMATION& lpProcessInformation
     )
 
+    // ----------------------------------------------------------------------------------
+    // ConPTY std-handle binding: the child's stdio must come from the pseudoconsole
+    // ----------------------------------------------------------------------------------
+    //
+    // `bInheritHandles = false` alone does NOT keep the launcher's own stdio away from a ConPTY child, and
+    // the two launch environments need DIFFERENT remedies for that — each one empirically necessary, and
+    // each one actively harmful in the other environment:
+    //
+    //  * A CONSOLE-ATTACHED launcher (a developer terminal, a debugger, a console-hosted test runner) has
+    //    Windows pre-populate the child's three standard-handle slots from its own console, so the child
+    //    attaches to the pseudoconsole and yet keeps writing to the LAUNCHER's console — its output never
+    //    reaches the captured merged stream. `STARTF_USESTDHANDLES` with three NULL handles severs that;
+    //    ConPTY then installs its own console handles while the child initializes.
+    //
+    //  * A HEADLESS launcher (a service-hosted CI step, a GUI-subsystem parent, a redirected test host)
+    //    must NOT be given that flag: with it the child is stranded with no console output binding at all
+    //    (only conhost's own setup frame ever reaches the master), which is the arrangement the Microsoft
+    //    ConPTY sample avoids. Without the flag, however, `CreateProcessW` propagates the launcher's OWN
+    //    standard-handle VALUES into the child, so a launcher whose stdio is redirected hands the child
+    //    that redirect and the child's output escapes the pseudoconsole just the same. The remedy there is
+    //    on the launcher side: null THIS process's three standard-handle slots across the spawn call, so
+    //    the child propagates null defaults the pseudoconsole overrides — the same end state as the flag
+    //    reaches, without the flag.
+    //
+    // `SetStdHandle` mutates PROCESS-GLOBAL state, so that swap is confined to the one synchronous
+    // `CreateProcessExtended` call and runs under `windowsSpawnLock` — which EVERY ProcessKit Windows
+    // spawn path already takes (ordinary, ConPTY, detached), so no ProcessKit spawn can observe the
+    // temporary nulls, including the `StdioMode.Inherit`/`Command.InheritStdin` paths that read these very
+    // slots to duplicate them into a child. The lock cannot reach code outside ProcessKit: a foreign
+    // `Process.Start` inheriting stdio, or the FIRST `Console.Out`/`Console.In` access in the process
+    // (which caches whatever the slot holds at that moment), can still race that short window from another
+    // thread. That residual race is inherent to the mechanism and is documented rather than hidden — a
+    // caller who needs strict isolation from such foreign activity should run PTY sessions from a
+    // dedicated helper process.
+
+    // Whether the process has a console at all; NULL means it has none. Only the association is read (the
+    // returned HWND is never dereferenced), and the call does not set a Win32 error worth reading.
+    [<DllImport("kernel32.dll", EntryPoint = "GetConsoleWindow")>]
+    extern nativeint private GetConsoleWindow()
+
+    /// Whether THIS process is attached to a console. `GetConsoleWindow` returns NULL exactly when it is
+    /// not — the headless case — and non-null under an interactive terminal. Queried per spawn rather than
+    /// cached, because a process can gain or lose its console at runtime (`AllocConsole`/`FreeConsole`);
+    /// the answer selects which of the two std-handle remedies above a ConPTY spawn needs.
+    let launcherHasConsole () : bool = GetConsoleWindow() <> IntPtr.Zero
+
+    // Test seam: observe which std-handle binding a ConPTY spawn actually chose — `true` for the
+    // console-attached form (severed through `STARTF_USESTDHANDLES`), `false` for the headless one (this
+    // process's own slots nulled across the spawn instead). Production always decides through
+    // `launcherHasConsole`; only the (sequential) tests set this, and restore it in a `finally`.
+    let mutable windowsPtyStdHandleModeObserverForTests: (bool -> unit) option = None
+
+    /// This process's own three standard-handle slot values, in `STARTUPINFO` order (input, output,
+    /// error): what a child created WITHOUT `STARTF_USESTDHANDLES` propagates, and what
+    /// `withNulledLauncherStdio` saves and puts back.
+    let readLauncherStdHandles () : nativeint * nativeint * nativeint =
+        GetStdHandle STD_INPUT_HANDLE, GetStdHandle STD_OUTPUT_HANDLE, GetStdHandle STD_ERROR_HANDLE
+
+    /// Run `spawn` with this process's three standard-handle slots temporarily replaced by NULL, and put
+    /// the exact previous values back afterwards — after a successful spawn, after a failed one, and after
+    /// an exception alike (`finally`). The headless half of the ConPTY std-handle binding described above:
+    /// the caller holds `windowsSpawnLock` for the whole window, and `spawn` is one synchronous
+    /// `CreateProcessExtended`, never an `await`.
+    ///
+    /// `SetStdHandle` writes only the requested slot of this process's own parameter block and can fail
+    /// only for an invalid slot id — the three used here are the fixed Win32 constants — so its result is
+    /// discarded rather than turned into a spawn failure; on the restore path there would in any case be
+    /// nothing to report it through without masking the spawn's own outcome.
+    let withNulledLauncherStdio (spawn: unit -> 'T) : 'T =
+        // Captured BEFORE anything is mutated, so the restore below puts back exactly what was there.
+        let savedInput, savedOutput, savedError = readLauncherStdHandles ()
+
+        try
+            SetStdHandle(STD_INPUT_HANDLE, IntPtr.Zero) |> ignore
+            SetStdHandle(STD_OUTPUT_HANDLE, IntPtr.Zero) |> ignore
+            SetStdHandle(STD_ERROR_HANDLE, IntPtr.Zero) |> ignore
+            spawn ()
+        finally
+            SetStdHandle(STD_INPUT_HANDLE, savedInput) |> ignore
+            SetStdHandle(STD_OUTPUT_HANDLE, savedOutput) |> ignore
+            SetStdHandle(STD_ERROR_HANDLE, savedError) |> ignore
+
+    /// The ConPTY child's `STARTUPINFOEX`: the pseudoconsole attribute list plus the std-handle decision.
+    /// `severConsoleStdHandles` (a console-attached launcher — see `launcherHasConsole`) asks for
+    /// `STARTF_USESTDHANDLES` with three NULL handles; a headless launcher leaves the flag clear, so those
+    /// three slots are never consulted and the pseudoconsole owns the child's handles instead. See the
+    /// section comment above for why the two environments cannot share one form.
+    let private conptyStartupInfo (attributeList: nativeint) (severConsoleStdHandles: bool) : STARTUPINFOEX =
+        let mutable startup = STARTUPINFOEX()
+        startup.StartupInfo.cb <- Marshal.SizeOf<STARTUPINFOEX>()
+
+        if severConsoleStdHandles then
+            startup.StartupInfo.dwFlags <- STARTF_USESTDHANDLES
+            startup.StartupInfo.hStdInput <- IntPtr.Zero
+            startup.StartupInfo.hStdOutput <- IntPtr.Zero
+            startup.StartupInfo.hStdError <- IntPtr.Zero
+
+        startup.lpAttributeList <- attributeList
+        startup
+
+    /// Test seam: the ConPTY std-handle decision exactly as it reaches `STARTUPINFOEX` — `(dwFlags,
+    /// hStdInput, hStdOutput, hStdError)` for a console-attached (`true`) or headless (`false`) launcher.
+    /// The struct type is private to this module, so the seam hands back the four fields the decision
+    /// writes; production builds its own startup info through the very same function.
+    let conptyStdHandleBindingForTests (launcherIsConsoleAttached: bool) : uint32 * nativeint * nativeint * nativeint =
+        let startup = conptyStartupInfo IntPtr.Zero launcherIsConsoleAttached
+
+        startup.StartupInfo.dwFlags,
+        startup.StartupInfo.hStdInput,
+        startup.StartupInfo.hStdOutput,
+        startup.StartupInfo.hStdError
+
+    /// `CreateProcessExtended` over a locally-owned `STARTUPINFOEX`/`PROCESS_INFORMATION` pair, returning
+    /// `(created, lastWin32Error, processInformation)`. The Win32 error is read HERE, immediately after the
+    /// call, rather than by the caller: on the headless path the caller's std-handle restore runs
+    /// `SetStdHandle` (another `SetLastError = true` P/Invoke) before the caller could get to it, which
+    /// would replace the spawn's own error with the restore's. Everything in here is a P/Invoke over
+    /// already-built arguments, so this cannot throw between the caller's command-line buffer allocation
+    /// and its free.
+    let private createProcessInPseudoConsole
+        (commandLineBuffer: nativeint)
+        (flags: uint32)
+        (environment: nativeint)
+        (workingDirectory: string)
+        (startupInfo: STARTUPINFOEX)
+        : bool * int * PROCESS_INFORMATION =
+        let mutable startup = startupInfo
+        let mutable info = PROCESS_INFORMATION()
+
+        let created =
+            CreateProcessExtended(
+                IntPtr.Zero,
+                commandLineBuffer,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                // A ConPTY child inherits no handles; its stdio comes from the pseudoconsole.
+                false,
+                flags,
+                environment,
+                workingDirectory,
+                &startup,
+                &info
+            )
+
+        created, Marshal.GetLastWin32Error(), info
+
     /// Whether this Windows build exposes ConPTY (`CreatePseudoConsole` arrived in Windows 10 1809 / build
     /// 17763). Probed once via the kernel32 export table — never a blind call that would throw
     /// `EntryPointNotFoundException` on a pre-1809 host — so `Command.Pty` there fails with a typed
@@ -3357,13 +3512,17 @@ module internal Windows =
                         disposeCreatedPipes ()
                         Error(ProcessError.Spawn(command.Program, $"UpdateProcThreadAttribute failed: {message}"))
                     else
-                        let mutable startup = STARTUPINFOEX()
-                        startup.StartupInfo.cb <- Marshal.SizeOf<STARTUPINFOEX>()
-                        // Deliberately NO STARTF_USESTDHANDLES and no std handles — a ConPTY child's std handles
-                        // come from the pseudoconsole. The fundamental divergence from the pipe path.
-                        startup.lpAttributeList <- attrList
+                        // A ConPTY child's std handles come from the pseudoconsole, never from this process
+                        // — the fundamental divergence from the pipe path — but a console-attached and a
+                        // headless launcher need different remedies to guarantee it (see "ConPTY std-handle
+                        // binding" above). Decided once here, then applied in the two matching places: the
+                        // startup info's `STARTF_USESTDHANDLES` for a console-attached launcher, and the
+                        // launcher-side null swap around the spawn call itself for a headless one.
+                        let consoleAttached = launcherHasConsole ()
+                        let startup = conptyStartupInfo attrList consoleAttached
 
-                        let mutable info = PROCESS_INFORMATION()
+                        windowsPtyStdHandleModeObserverForTests
+                        |> Option.iter (fun observer -> observer consoleAttached)
 
                         let workingDirectory =
                             config.WorkingDirectory |> Option.defaultWith Directory.GetCurrentDirectory
@@ -3397,22 +3556,28 @@ module internal Windows =
                         // managed `string` (a possibly interned literal) — see the binding above (T-198).
                         let commandLineBuffer = Marshal.StringToHGlobalUni commandLine
 
-                        let created =
-                            CreateProcessExtended(
-                                IntPtr.Zero,
-                                commandLineBuffer,
-                                IntPtr.Zero,
-                                IntPtr.Zero,
-                                // A ConPTY child inherits no handles; its stdio comes from the pseudoconsole.
-                                false,
-                                flags,
-                                environment,
-                                workingDirectory,
-                                &startup,
-                                &info
-                            )
-
-                        let lastError = Marshal.GetLastWin32Error()
+                        // The spawn itself, and on a headless launcher the null std-handle swap around it —
+                        // as narrow as the mechanism allows: the swap covers this one synchronous call and
+                        // nothing else, and restores the slots however the call ends. Both branches make
+                        // only P/Invoke calls, so nothing between the buffer allocation above and its free
+                        // below can throw. The Win32 error comes back WITH the result because the restore's
+                        // own `SetStdHandle` would otherwise overwrite it.
+                        let created, lastError, info =
+                            if consoleAttached then
+                                createProcessInPseudoConsole
+                                    commandLineBuffer
+                                    flags
+                                    environment
+                                    workingDirectory
+                                    startup
+                            else
+                                withNulledLauncherStdio (fun () ->
+                                    createProcessInPseudoConsole
+                                        commandLineBuffer
+                                        flags
+                                        environment
+                                        workingDirectory
+                                        startup)
 
                         // Free the writable command-line copy now: `CreateProcess` has finished reading (and
                         // restoring) it by the time it returns, and no throwing code runs between its
