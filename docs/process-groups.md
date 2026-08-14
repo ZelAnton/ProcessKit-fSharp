@@ -938,7 +938,7 @@ resource usage, wrapped in a `Result`:
 ```fsharp
 match group.Stats() with
 | Ok stats ->
-    printfn $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} read={stats.IoReadBytes} write={stats.IoWriteBytes}"
+    printfn $"procs={stats.ActiveProcessCount} peakProcs={stats.PeakProcessCount} cpu={stats.TotalCpuTime} read={stats.IoReadBytes} write={stats.IoWriteBytes}"
 | Error err -> eprintfn $"{err.Message}"
 ```
 
@@ -947,18 +947,21 @@ match group.Stats() with
 ```csharp
 Console.WriteLine((group.Stats()) switch
 {
-    { IsOk: true, ResultValue: var stats } => $"procs={stats.ActiveProcessCount} cpu={stats.TotalCpuTime} read={stats.IoReadBytes} write={stats.IoWriteBytes}",
+    { IsOk: true, ResultValue: var stats } => $"procs={stats.ActiveProcessCount} peakProcs={stats.PeakProcessCount} cpu={stats.TotalCpuTime} read={stats.IoReadBytes} write={stats.IoWriteBytes}",
     { IsOk: false, ErrorValue: var err }  => err.Message,
 });
 ```
 
 `ProcessGroupStats` carries `ActiveProcessCount` (an `int`, always populated),
-`TotalCpuTime` (`TimeSpan option`), `PeakMemoryBytes` (`int64 option`), and four
-`int64 option` I/O counters: `IoReadBytes`, `IoWriteBytes`, `IoReadOperations`, and
-`IoWriteOperations`. Windows Job Object accounting and Linux cgroup v2 provide the
-tree aggregates (cgroup bytes/operations come from block-device `io.stat` when the
-I/O controller is delegated to that hierarchy). On the POSIX process-group backend
-only the live count is reported and all optional metrics stay `None`.
+`PeakProcessCount` (`int64 option`), `TotalCpuTime` (`TimeSpan option`),
+`PeakMemoryBytes` (`int64 option`), and four `int64 option` I/O counters:
+`IoReadBytes`, `IoWriteBytes`, `IoReadOperations`, and `IoWriteOperations`. Linux
+cgroup v2 supplies `PeakProcessCount` from the kernel's lifetime `pids.peak` counter;
+it is `None` on Windows and the POSIX fallback, never estimated from caller-driven
+`Stats()` samples. Windows Job Object accounting and Linux cgroup v2 provide the
+other tree aggregates (cgroup bytes/operations come from block-device `io.stat`
+when the I/O controller is delegated to that hierarchy). On the POSIX process-group
+backend only the live count is reported and all optional metrics stay `None`.
 
 `MemberStats()` provides the per-member view when a tree aggregate is not enough:
 

@@ -95,7 +95,7 @@ type internal LimitContractBackend(initial: ResourceLimits, shouldFail: Resource
         member _.Resume() = Ok()
 
         member _.Stats() =
-            Ok(ProcessGroupStats(0, None, None, None))
+            Ok(ProcessGroupStats(0, None, None, None, None))
 
         member _.MemberStats() = Ok []
 
@@ -1626,6 +1626,70 @@ type LimitsTests() =
                         running.Kill()
                         let! _ = running.WaitAsync()
                         ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``cgroup peak process count grows with concurrency and survives member exit``() : Task =
+        task {
+            if isWindows || isMacOs then
+                Assert.Ignore "cgroup v2 is Linux-only"
+            else
+                let options =
+                    ProcessGroupOptions().WithMemoryMax(256L * 1024L * 1024L).WithMaxProcesses(64)
+
+                match ProcessGroup.Create options with
+                | Error(ProcessError.ResourceLimit _) ->
+                    Assert.Ignore "cgroup v2 limits not enforceable here (not at the real cgroup root)"
+                | Error other -> Assert.Fail $"{other}"
+                | Ok group ->
+                    use group = group
+                    Assert.That(group.Mechanism, Is.EqualTo Mechanism.CgroupV2)
+
+                    match! group.StartAsync(Command.create "/bin/sleep" |> Command.arg "30") with
+                    | Error error -> Assert.Fail $"first cgroup member failed to start: {error}"
+                    | Ok first ->
+                        use first = first
+
+                        let firstPeak =
+                            match group.Stats() with
+                            | Ok stats ->
+                                match stats.PeakProcessCount with
+                                | Some peak -> peak
+                                | None ->
+                                    raise (AssertionException "a delegated cgroup v2 pids.peak should be available")
+                            | Error error -> raise (AssertionException $"first stats snapshot failed: {error}")
+
+                        match! group.StartAsync(Command.create "/bin/sleep" |> Command.arg "30") with
+                        | Error error -> Assert.Fail $"second cgroup member failed to start: {error}"
+                        | Ok second ->
+                            use second = second
+
+                            let concurrentPeak =
+                                match group.Stats() with
+                                | Ok stats ->
+                                    Assert.That(stats.ActiveProcessCount, Is.GreaterThanOrEqualTo 2)
+
+                                    match stats.PeakProcessCount with
+                                    | Some peak -> peak
+                                    | None ->
+                                        raise (AssertionException "a delegated cgroup v2 pids.peak should be available")
+                                | Error error -> raise (AssertionException $"concurrent stats snapshot failed: {error}")
+
+                            Assert.That(concurrentPeak, Is.GreaterThan firstPeak)
+
+                            second.Kill()
+                            let! _ = second.WaitAsync()
+
+                            match group.Stats() with
+                            | Ok stats ->
+                                Assert.That(stats.ActiveProcessCount, Is.EqualTo 1)
+                                Assert.That(stats.PeakProcessCount, Is.EqualTo(Some concurrentPeak))
+                            | Error error -> Assert.Fail $"post-exit stats snapshot failed: {error}"
+
+                            first.Kill()
+                            let! _ = first.WaitAsync()
+                            ()
         }
         :> Task
 

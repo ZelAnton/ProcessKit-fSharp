@@ -554,7 +554,7 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
 
         member _.Stats() =
             match Native.Windows.jobStatsWindows jobHandle with
-            | Some(active, cpu, peak, io) -> Ok(ProcessGroupStats(active, Some cpu, Some peak, Some io))
+            | Some(active, cpu, peak, io) -> Ok(ProcessGroupStats(active, None, Some cpu, Some peak, Some io))
             | None -> Error(ProcessError.Io "failed to query Job Object accounting")
 
         member _.MemberStats() =
@@ -894,8 +894,8 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                 )
             | Ok members ->
                 let active = List.length members
-                let cpu, peak, io = Native.Cgroup.cgroupStats cgroupPath
-                Ok(ProcessGroupStats(active, cpu, peak, io))
+                let cpu, peakMemory, peakProcesses, io = Native.Cgroup.cgroupStats cgroupPath
+                Ok(ProcessGroupStats(active, peakProcesses, cpu, peakMemory, io))
 
         member _.MemberStats() =
             // The cgroup membership read is the authoritative point-in-time list. A second membership
@@ -1267,7 +1267,7 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
 
         member _.Stats() =
             let active = children.Snapshot() |> List.filter stillOurs |> List.length
-            Ok(ProcessGroupStats(active, None, None, None))
+            Ok(ProcessGroupStats(active, None, None, None, None))
 
         member _.MemberStats() =
             let pids = children.Snapshot() |> List.filter stillOurs

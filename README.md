@@ -495,8 +495,10 @@ var profile = await proc.ProfileAsync();
 Console.WriteLine($"exit={profile.ExitCode} took={profile.Duration} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpuCores}");
 ```
 
-`Stats()`/`SampleStatsAsync` report full CPU/memory on Windows and the Linux cgroup backend, and active
-counts only on the POSIX process-group fallback; `ProfileAsync` samples the started child itself.
+`Stats()`/`SampleStatsAsync` report full CPU/memory on Windows and the Linux cgroup backend. Linux
+cgroup v2 also reports the kernel's lifetime `pids.peak` as `PeakProcessCount`; Windows and the POSIX
+process-group fallback return `None` for that metric rather than estimating it from samples. The POSIX
+fallback otherwise reports active counts only; `ProfileAsync` samples the started child itself.
 
 For attribution inside a shared tree, `MemberStats()` returns a point-in-time `MemberStats` record for
 each member: its `Pid`, cumulative `CpuTime`, current `ResidentMemoryBytes`, and optional per-process

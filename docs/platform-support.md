@@ -296,13 +296,15 @@ are reported.
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
 |---|:---:|:---:|:---:|
 | `ActiveProcessCount` | ✅ | ✅ | ✅ |
+| `PeakProcessCount` | ❌ `None` | ✅ `pids.peak` | ❌ `None` |
 | `TotalCpuTime` + `PeakMemoryBytes` | ✅ | ✅ | ❌ active count only |
 | `IoReadBytes` / `IoWriteBytes` + operation counts | ✅ Job aggregate | 🟡 `io.stat` when I/O is delegated | ❌ `None` |
 
 On the POSIX process-group mechanism, all optional `ProcessGroupStats` metrics are `None` — only the
-live process count is available. Windows reads Job Object accounting; the cgroup mechanism reads
-`cpu.stat`, `memory.peak`, and, when that controller is delegated, block-device counters from
-`io.stat`.
+live process count is available. Windows reads Job Object accounting but has no lifetime peak-process
+counter. The cgroup mechanism reads `pids.peak`, `cpu.stat`, `memory.peak`, and, when that controller is
+delegated, block-device counters from `io.stat`; an unavailable controller file yields `None` rather
+than a fabricated zero or a sampled estimate.
 
 **Resource limits (`ProcessGroupOptions`)**
 

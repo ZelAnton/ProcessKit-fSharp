@@ -152,7 +152,7 @@ type internal SyntheticBackend() =
 
         member _.Stats() =
             requireLive "Stats"
-            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None))
+            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None, None))
 
         member _.MemberStats() =
             requireLive "MemberStats"
@@ -273,7 +273,7 @@ type internal CtrlSignalRaceBackend() =
         member _.Resume() = Ok()
 
         member _.Stats() =
-            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None))
+            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None, None))
 
         member _.MemberStats() = Ok []
 

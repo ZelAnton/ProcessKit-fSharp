@@ -921,6 +921,7 @@ class ProcessKit.ProcessGroupStats
   property IoWriteBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property IoWriteOperations : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property PeakProcessCount : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property TotalCpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
 
 module ProcessKit.ProcessKitDiagnostics
