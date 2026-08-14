@@ -1538,3 +1538,4 @@ enum ProcessKit.WindowsUiRestrictions
   field literal SystemParameters : ProcessKit.WindowsUiRestrictions
   field literal WriteClipboard : ProcessKit.WindowsUiRestrictions
   field value__ : System.Int32
+
