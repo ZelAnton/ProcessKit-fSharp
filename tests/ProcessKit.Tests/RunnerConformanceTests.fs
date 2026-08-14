@@ -65,21 +65,31 @@ open ProcessKit.Testing
 /// - **ScriptedOutcome** — the implementation can be driven to conclude with an `Outcome` other than a
 ///   clean `Exited 0`. `false` only for `DryRunRunner`, whose `resolve` always builds
 ///   `FakeProcess.OfCommand(command).WithStdout(render)` with no way to script a different outcome.
-/// - **OsBackedPty** — a `Command.Pty` run against this implementation is expected to complete without
-///   an honest `ProcessError.Unsupported`, so the PTY test can assert the merged-stream contract rather
-///   than skip. `true` unconditionally for every in-memory double (`ScriptedRunner`/`DryRunRunner`, and
-///   `FaultInjectingRunner` wrapping one): `FakeProcess.WithPty()` simulates the merged-stream contract
-///   with no host dependency at all — see `ScriptedRunner.fs`/`DryRunRunner.fs`'s
-///   `if command.Config.Pty.IsSome then fake.WithPty()`. For the two real-subprocess rows (`JobRunner`/
-///   `ProcessGroup`, and `RecordReplayRunner` in `Record` mode, which delegates straight to a real
-///   `JobRunner`) this is a genuine host fact: Windows needs ConPTY (Windows 10 1809+, assumed present
-///   on any host this suite runs on) and POSIX needs the `setsid --ctty` controlling-terminal helper
-///   from util-linux in a trusted directory plus `/dev/ptmx` — present on Linux, absent entirely on
-///   macOS/BSD (no pty devfs at all — see `Command.Pty`'s own doc comment for the full platform
-///   matrix). This fixture makes the same static "Windows or Linux" assumption `PtyTests.fs`'s real
+/// - **OsBackedPty** — a `Command.Pty` run against this implementation is expected to be *architecturally*
+///   capable of the merged-stream contract, i.e. not statically excluded by OS family, so the PTY test
+///   drives a real `Command.Pty` run rather than skipping up front. It does NOT assert the concrete host
+///   has every runtime prerequisite: for the two real-subprocess rows below, the PTY test itself catches
+///   a typed `ProcessError.Unsupported` from the run and skips with `Assert.Ignore`, exactly like
+///   `PtyTests.fs`'s existing real PTY tests already do for this same prerequisite gap (e.g. its
+///   "requires Windows 10 1809" / missing-ctty-helper cases) — a documented fallback, not a silent
+///   pass/fail flip. `true` unconditionally for every in-memory double (`ScriptedRunner`/`DryRunRunner`,
+///   and `FaultInjectingRunner` wrapping one): `FakeProcess.WithPty()` simulates the merged-stream
+///   contract with no host dependency at all — see `ScriptedRunner.fs`/`DryRunRunner.fs`'s
+///   `if command.Config.Pty.IsSome then fake.WithPty()`, so no `ProcessError.Unsupported` can occur there
+///   and the fallback skip never triggers. For the two real-subprocess rows (`JobRunner`/`ProcessGroup`,
+///   and `RecordReplayRunner` in `Record` mode, which delegates straight to a real `JobRunner`) `true`
+///   means only the OS family supports a PTY at all: Windows needs ConPTY (Windows 10 1809+ — an older,
+///   still-in-support Windows host fails the spawn with `ProcessError.Unsupported`, caught by the
+///   fallback above, never a silent downgrade) and POSIX needs the `setsid --ctty` controlling-terminal
+///   helper from util-linux in a trusted directory plus `/dev/ptmx` (same fallback if either is missing)
+///   — present on Linux, absent entirely on macOS/BSD (no pty devfs at all — see `Command.Pty`'s own doc
+///   comment for the full platform matrix). This fixture makes the same static "Windows or Linux"
+///   OS-family assumption `PtyTests.fs`'s real
 ///   POSIX pty tests already make (their "Linux-only" gate) rather than probing a live spawn: `false`
 ///   on macOS/BSD, `true` on Windows/Linux, and the PTY test is skipped up front with `Assert.Ignore`
-///   when it is `false` — a documented matrix exclusion, never a silent per-test error-path catch.
+///   when it is `false` — a documented matrix exclusion, distinct from (but paired with) the documented,
+///   reason-carrying `ProcessError.Unsupported` fallback skip described above for a `true`-but-still-
+///   missing-a-prerequisite host; neither path is a silent per-test error-path catch.
 type ConformanceCapabilities =
     { SupportsSpawn: bool
       SupportsStdinFeed: bool
@@ -341,6 +351,16 @@ type RunnerConformanceFixtureBase() =
                     |> Command.pty
 
                 match! this.Runner.OutputStringAsync(command, CancellationToken.None) with
+                | Error(ProcessError.Unsupported message) ->
+                    // SupportsOsBackedPty=true is an OS-family assumption (Windows or Linux — see
+                    // `ConformanceCapabilities`'s `OsBackedPty` row), not a probed host fact: a real host
+                    // can still lack the concrete prerequisite (ConPTY needs Windows 10 1809+; POSIX
+                    // needs the trusted `setsid --ctty` helper plus `/dev/ptmx` — see `Command.Pty`'s own
+                    // doc comment). `ProcessError.Unsupported` is exactly the typed, honest failure
+                    // `Command.Pty` promises for that gap, never a silent downgrade — skip here rather
+                    // than fail, mirroring the same prerequisite-gap handling `PtyTests.fs`'s real PTY
+                    // tests already do (e.g. its "requires Windows 10 1809" / missing-ctty-helper cases).
+                    Assert.Ignore $"host lacks a Command.Pty prerequisite despite OS-family support: {message}"
                 | Error error -> Assert.Fail $"unexpected error under Command.Pty: {error.Message}"
                 | Ok result ->
                     Assert.That(result.Stderr, Is.Empty, "a PTY run must have no separate stderr channel (D3)")
