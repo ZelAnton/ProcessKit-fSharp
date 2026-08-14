@@ -448,7 +448,8 @@ type internal JsonLinesEnumerable<'T>(program: string, source: IAsyncEnumerable<
 /// A live handle to a started process: stream its output, feed its stdin, wait for it, or
 /// collect it to completion. Disposing it reaps the whole process tree (kill-on-drop).
 [<Sealed>]
-type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) list) =
+type RunningProcess
+    internal (host: RunningHost, extraFdStreams: (int * Stream) list, recordedCompletion: (TimeSpan * bool) option) =
 
     let config = host.Config
     let hasPseudoTerminal = config.Pty.IsSome || host.ResizePty.IsSome
@@ -785,8 +786,17 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             else
                 None, None)
 
+    // A cassette handle represents an already-completed run, so its completion clock must stay frozen
+    // at the recorded value while ordinary live/fake handles continue reading their own stopwatch.
     let elapsed () =
-        Stopwatch.GetElapsedTime host.StartedTimestamp
+        match recordedCompletion with
+        | Some(duration, _) -> duration
+        | None -> Stopwatch.GetElapsedTime host.StartedTimestamp
+
+    let recordedTruncated =
+        match recordedCompletion with
+        | Some(_, truncated) -> truncated
+        | None -> false
 
     // The per-run correlation id: the verb layer stamps one (shared across a run's retries); a direct
     // spawn with none gets a fresh per-incarnation id. Carried on every run-scoped log/trace event.
@@ -1483,7 +1493,12 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // (`JobRunner.start`) adds a defence-in-depth teardown as a backstop for any non-observability fault.
     do Log.spawn config.Logger config.Program host.Pid runId
 
-    internal new(host: RunningHost) = RunningProcess(host, [])
+    internal new(host: RunningHost) = RunningProcess(host, [], None)
+
+    internal new(host: RunningHost, extraFdStreams: (int * Stream) list) = RunningProcess(host, extraFdStreams, None)
+
+    internal new(host: RunningHost, recordedDuration: TimeSpan, recordedTruncated: bool) =
+        RunningProcess(host, [], Some(recordedDuration, recordedTruncated))
 
     /// The pid, when known.
     member _.Pid = host.Pid
@@ -1913,7 +1928,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                     errBuf.Text,
                                     outcome,
                                     elapsed (),
-                                    outBuf.Truncated || errBuf.Truncated,
+                                    recordedTruncated || outBuf.Truncated || errBuf.Truncated,
                                     config.OkCodes,
                                     ?configuredTimeoutDuration = configuredTimeoutDuration,
                                     stdoutEncoding = config.StdoutEncoding,
@@ -1986,7 +2001,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                     errBuf.Text,
                                     outcome,
                                     elapsed (),
-                                    stdoutCapture.Truncated || errBuf.Truncated,
+                                    recordedTruncated || stdoutCapture.Truncated || errBuf.Truncated,
                                     config.OkCodes,
                                     ?configuredTimeoutDuration = configuredTimeoutDuration,
                                     stdoutEncoding = config.StdoutEncoding,
@@ -2440,7 +2455,9 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                 Finished(
                                     settled,
                                     stderrStreamBuffer.Text,
-                                    Volatile.Read(&droppedStreamLineCount) > 0 || stderrStreamBuffer.Truncated
+                                    recordedTruncated
+                                    || Volatile.Read(&droppedStreamLineCount) > 0
+                                    || stderrStreamBuffer.Truncated
                                 )
                             )
             }

@@ -185,17 +185,23 @@ module internal Windows =
                 Ok(sb.ToString())
 
     /// The `CreateProcessW` command line for `command`, honouring the Windows PATHEXT launch substitution
-    /// (T-181) and the prefer-local search (T-182). A bare name whose only match under our own
-    /// PATHEXT-aware resolver (`Common.resolveProgram`/`probeDir`, reused via `resolveWindowsLaunch` — no
-    /// second copy) carries a non-`.exe` extension is launched via that resolved absolute path instead of
-    /// the bare name, because the OS's own bare-name `PATH` search appends only `.exe` and would miss it —
-    /// the `which`-vs-spawn divergence this closes. A prefer-local match (`Command.PreferLocal`) is
-    /// searched first and is likewise substituted by absolute path (even a `.exe`, since the OS never
-    /// searches those directories). A `.cmd`/`.bat` match — on `PATH` or prefer-local — additionally
-    /// routes through `cmd.exe /d /c` with BatBadBut-safe quoting. A relative path-form program is first
-    /// anchored to `CurrentDir` and substituted as an absolute path, keeping Windows aligned with POSIX
-    /// child-side chdir resolution. A `PATH` `.exe` match and a name that resolves to nothing stay verbatim.
-    /// Fails only when a batch-wrapper argument (or script path) cannot be safely quoted for cmd.exe.
+    /// (T-181), the prefer-local search (T-182), and the effective-child-`PATH` substitution (T-339). A
+    /// bare name whose only match under our own PATHEXT-aware resolver (`Common.resolveProgram`/`probeDir`,
+    /// reused via `resolveWindowsLaunch` — no second copy) carries a non-`.exe` extension is launched via
+    /// that resolved absolute path instead of the bare name, because the OS's own bare-name `PATH` search
+    /// appends only `.exe` and would miss it — the `which`-vs-spawn divergence this closes. A prefer-local
+    /// match (`Command.PreferLocal`) is searched first and is likewise substituted by absolute path (even a
+    /// `.exe`, since the OS never searches those directories). So is EVERY match, `.exe` included, once the
+    /// command overrides or clears the child's `PATH`: the OS's own search reads the PARENT's `PATH`, so
+    /// deferring to it there would launch a same-named executable the caller's config never named. A
+    /// `.cmd`/`.bat` match — on `PATH`, prefer-local, or an overridden `PATH` — additionally routes through
+    /// `cmd.exe /d /c` with BatBadBut-safe quoting. A relative path-form program is first anchored to
+    /// `CurrentDir` and substituted as an absolute path, keeping Windows aligned with POSIX child-side
+    /// chdir resolution. Against an unchanged child `PATH`, a `PATH` `.exe` match and a name that resolves
+    /// to nothing both stay verbatim, so the OS's richer search is preserved exactly as before. Fails when
+    /// a batch-wrapper argument (or script path) cannot be safely quoted for cmd.exe, and — for an
+    /// overridden child `PATH` that holds no such program — with the same `ProcessError.NotFound` a
+    /// `Command.ResolveProgram` preflight of this config reports, before any native spawn is attempted.
     let private buildWindowsCommandLine (command: Command) : Result<string, ProcessError> =
         let appendRaw (quoted: string) =
             if command.Config.WindowsRawArgs.IsEmpty then
@@ -204,13 +210,14 @@ module internal Windows =
                 quoted + " " + String.Join(" ", command.Config.WindowsRawArgs)
 
         match resolveWindowsLaunch command with
-        | WindowsLaunch.AsIs ->
+        | Error error -> Error error
+        | Ok WindowsLaunch.AsIs ->
             let parts = command.Program :: List.ofSeq command.Config.Args
             Ok(parts |> List.map quoteWindowsArg |> String.concat " " |> appendRaw)
-        | WindowsLaunch.DirectPath resolved ->
+        | Ok(WindowsLaunch.DirectPath resolved) ->
             let parts = resolved :: List.ofSeq command.Config.Args
             Ok(parts |> List.map quoteWindowsArg |> String.concat " " |> appendRaw)
-        | WindowsLaunch.BatchWrapper resolved ->
+        | Ok(WindowsLaunch.BatchWrapper resolved) ->
             if command.Config.WindowsRawArgs.IsEmpty then
                 buildBatchCommandLine command.Program resolved (List.ofSeq command.Config.Args)
             else
@@ -3412,9 +3419,10 @@ module internal Windows =
         // after CreatePseudoConsole succeeds still tears the sidecar down rather than leaking it.
         let mutable pendingPseudoConsole = IntPtr.Zero
 
-        // Decide the launch (PATHEXT substitution / cmd.exe batch wrapper — T-181) and build the command
-        // line up front: an unsafe batch argument is refused here, BEFORE the pseudoconsole or any pipe is
-        // allocated, so a refusal leaks nothing.
+        // Decide the launch (PATHEXT / effective-child-`PATH` substitution / cmd.exe batch wrapper —
+        // T-181/T-339) and build the command line up front: an unsafe batch argument, or a program the
+        // command's own overridden child `PATH` does not hold, is refused here, BEFORE the pseudoconsole
+        // or any pipe is allocated, so a refusal leaks nothing.
         match buildWindowsCommandLine command with
         | Error error -> Error error
         | Ok commandLine ->
@@ -4063,8 +4071,10 @@ module internal Windows =
                     // report, not a secondary problem tearing down an already-broken pipe.
                     ()
 
-        // Decide the launch (PATHEXT substitution / cmd.exe batch wrapper — T-181) and build the command
-        // line up front: an unsafe batch argument is refused here, BEFORE any pipe/handle is allocated.
+        // Decide the launch (PATHEXT / effective-child-`PATH` substitution / cmd.exe batch wrapper —
+        // T-181/T-339) and build the command line up front: an unsafe batch argument, or a program the
+        // command's own overridden child `PATH` does not hold, is refused here, BEFORE any pipe/handle is
+        // allocated.
         match buildWindowsCommandLine command with
         | Error error -> Error error
         | Ok commandLine ->
@@ -4417,8 +4427,8 @@ module internal Windows =
     //  * no CREATE_SUSPENDED / resume dance — nothing has to happen between creation and execution;
     //  * no `waitWindows` registration and no retained process handle — nobody observes the exit;
     //  * no pipes — a detached child has no parent-side reader (see `detachedChildHandle`).
-    // What is NOT skipped: the shared PATHEXT/prefer-local/cmd.exe-wrapper resolution
-    // (`buildWindowsCommandLine`, T-181/T-182 — no second copy of that logic), the writable
+    // What is NOT skipped: the shared PATHEXT/prefer-local/effective-child-`PATH`/cmd.exe-wrapper
+    // resolution (`buildWindowsCommandLine`, T-181/T-182/T-339 — no second copy of that logic), the writable
     // command-line buffer (T-198), the environment block, and `windowsSpawnLock` — this path passes
     // `bInheritHandles = true`, so it must not run concurrently with another spawn whose inheritable
     // pipe ends would otherwise be snapshotted into this child (which would keep that run's reads from
@@ -4471,8 +4481,11 @@ module internal Windows =
         | _, _, _, true, _ -> Error(ProcessError.Unsupported "setsid")
         | _, _, _, _, Some _ -> Error(ProcessError.Unsupported "groups")
         | None, None, None, false, None ->
-            // Decide the launch (PATHEXT substitution / cmd.exe batch wrapper) BEFORE any handle is
-            // allocated, exactly as `spawnWindowsCore` does — an unsafe batch argument is refused here.
+            // Decide the launch (PATHEXT / effective-child-`PATH` substitution / cmd.exe batch wrapper)
+            // BEFORE any handle is allocated, exactly as `spawnWindowsCore` does — an unsafe batch
+            // argument, or a program the command's own overridden child `PATH` does not hold, is refused
+            // here. A detached launch is fire-and-forget, so refusing a wrong-`PATH` namesake up front is
+            // the only chance to refuse it at all.
             match buildWindowsCommandLine command with
             | Error error -> Error error
             | Ok commandLine ->

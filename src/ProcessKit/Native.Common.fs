@@ -166,12 +166,15 @@ module internal Common =
 
     // ---------------------------------------------------------------------------
     // PATH/PATHEXT resolution — one shared implementation backs BOTH the no-spawn preflight
-    // (`Exec.which` / `CliClient.EnsureAvailableAsync`) and the spawn path's own `ProcessError.NotFound`
-    // diagnostic enrichment (populating `Searched` after the OS itself reports a missing program), so
-    // the two can never disagree on "found vs not found" for the same program name. The actual spawn
-    // call still lets the OS do its own resolution (`CreateProcessW`/`posix_spawnp`) — this logic is
-    // never substituted into the real launch path, only used to resolve ahead of time (preflight) or to
-    // re-derive the searched-directories diagnostic after a genuine spawn failure.
+    // (`Exec.which` / `CliClient.EnsureAvailableAsync` / `Command.ResolveProgram`) and the spawn path's
+    // own `ProcessError.NotFound` diagnostic enrichment (populating `Searched` after the OS itself
+    // reports a missing program), so the two can never disagree on "found vs not found" for the same
+    // program name. It also decides the real Windows launch (`resolveWindowsLaunch`): wherever the OS's
+    // own search cannot reach the match this resolution found — a `PATHEXT` shim, a prefer-local
+    // directory, or a child `PATH` the command overrode, none of which `CreateProcessW` searches — the
+    // resolved absolute path is substituted into the launch instead of the bare name, and a miss the OS
+    // would answer out of a DIFFERENT `PATH` is refused before the spawn. Everywhere else the launch is
+    // still left to the OS's own resolution (`CreateProcessW`/`posix_spawnp`).
     // ---------------------------------------------------------------------------
 
     /// Whether `program` is a bare name — a single path segment with no directory separator — that
@@ -279,10 +282,28 @@ module internal Common =
     /// unset (the resolver then treats `PATH` as empty and `PATHEXT` as the `cmd.exe` default set).
     [<NoComparison; NoEquality>]
     type ResolveContext =
-        { Path: string
-          PathExt: string
-          PreferLocal: string list
-          WorkingDirectory: string option }
+        {
+            Path: string
+            PathExt: string
+            PreferLocal: string list
+            WorkingDirectory: string option
+            /// `true` when `Path` is exactly the CURRENT PROCESS's own `PATH` — the value the OS's own
+            /// bare-name search walks. Windows resolves a `CreateProcessW(lpApplicationName = NULL)` launch
+            /// in the PARENT's context, before the child exists, so it reads the parent's `PATH` and never
+            /// the environment block it is handed for the child. While this is `true` the OS search and this
+            /// resolution can only ever find the same file, which is what makes deferring to it
+            /// (`WindowsLaunch.AsIs`) safe; when a command overrides or clears the child's `PATH` it turns
+            /// `false`, and `resolveWindowsLaunch` substitutes the resolved absolute path (or refuses a
+            /// miss) instead of letting the OS answer out of a `PATH` the child never had.
+            PathIsProcessPath: bool
+        }
+
+    /// The current process's own `PATH` (`""` when unset) — the value Windows' own bare-name search
+    /// walks, and the baseline a command's effective child `PATH` is compared against.
+    let private processSearchPath () =
+        match Environment.GetEnvironmentVariable "PATH" with
+        | null -> ""
+        | value -> value
 
     /// The resolution context of the CURRENT PROCESS: its own `PATH`/`PATHEXT`, and NO prefer-local
     /// directories. This is the historical `Exec.which`/`resolveProgram` behaviour — resolve a program
@@ -297,7 +318,8 @@ module internal Common =
         { Path = read "PATH"
           PathExt = read "PATHEXT"
           PreferLocal = []
-          WorkingDirectory = None }
+          WorkingDirectory = None
+          PathIsProcessPath = true }
 
     /// The resolution context of `command`'s EFFECTIVE CHILD environment: the `PATH`/`PATHEXT` the child
     /// will actually see (its `Env`/`EnvRemove`/`EnvClear` applied to the inherited set — reusing the very
@@ -314,6 +336,7 @@ module internal Common =
             | true, value -> value
             | _ -> ""
 
+        let path = lookup "PATH"
         let baseDir = command.Config.WorkingDirectory
 
         let preferLocal =
@@ -327,10 +350,14 @@ module internal Common =
                     | None -> dir)
             |> List.ofSeq
 
-        { Path = lookup "PATH"
+        { Path = path
           PathExt = lookup "PATHEXT"
           PreferLocal = preferLocal
-          WorkingDirectory = baseDir }
+          WorkingDirectory = baseDir
+          // Ordinal on purpose: anything but the process's own `PATH`, byte for byte, is a `PATH` the OS's
+          // parent-context search would not walk, and the safe answer for a value this resolution cannot
+          // prove identical is to resolve the launch here rather than defer to that search.
+          PathIsProcessPath = String.Equals(path, processSearchPath (), StringComparison.Ordinal) }
 
     [<DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "NeedCurrentDirectoryForExePathW")>]
     extern bool private needCurrentDirectoryForExePath(string fileName)
@@ -432,6 +459,14 @@ module internal Common =
             ctx.PreferLocal
             |> List.tryPick (fun dir -> probeDir ctx.PathExt dir program |> Option.map Path.GetFullPath)
 
+    /// The `NotFound` a **bare-name** lookup produces when neither prefer-local nor the context's `PATH`
+    /// holds the program: `Searched` names the raw `PATH` value that was walked, and is omitted when there
+    /// was none to walk. One helper, so the preflight/diagnostic resolution (`resolveWith`) and the
+    /// Windows launch's own pre-spawn refusal (`resolveWindowsLaunch`) report the IDENTICAL error for the
+    /// same command config instead of two hand-built copies that can drift apart.
+    let private bareNameNotFound (program: string) (searched: string) : ProcessError =
+        ProcessError.NotFound(program, (if searched = "" then None else Some searched))
+
     /// The single resolution both preflight (`Exec.which`/`Command.ResolveProgram`/`CliClient.*`) and the
     /// spawn path's own `NotFound` enrichment (`notFoundFromSpawnFailure`) — plus the Windows launch
     /// substitution (`resolveWindowsLaunch`) and the POSIX prefer-local substitution (`resolvePreferLocal`)
@@ -456,8 +491,7 @@ module internal Common =
                 | None ->
                     match findInContextPath ctx program with
                     | Some found, _ -> Ok found
-                    | None, searched ->
-                        Error(ProcessError.NotFound(program, (if searched = "" then None else Some searched)))
+                    | None, searched -> Error(bareNameNotFound program searched)
             else
                 let programDirectory =
                     match Path.GetDirectoryName program with
@@ -535,20 +569,27 @@ module internal Common =
             findPreferLocal (commandContext command) program
 
     /// How a Windows spawn should launch `program` once the shared PATHEXT-aware resolver above has had
-    /// its say (T-181). It reconciles a `which`/spawn divergence: our `probeDir` finds a bare name under
-    /// ANY `PATHEXT` extension, but the OS's own bare-name `PATH` search only ever appends `.exe`, so a
-    /// bare name whose only match is a `.cmd`/`.bat`/`.com`/… is reported present by `Exec.which` yet
-    /// unreachable by a raw `CreateProcessW(lpApplicationName = NULL)`. Only meaningful on Windows; every
-    /// other case (a `.exe` match, a path-form program, a name that resolves to nothing) is `AsIs` — the
-    /// launch is left byte-for-byte as before and the OS resolves it exactly as it always did.
+    /// its say (T-181). It reconciles two `which`/spawn divergences of the same shape — the OS's own
+    /// bare-name search cannot reach what this resolution found. First, our `probeDir` finds a bare name
+    /// under ANY `PATHEXT` extension, but that search only ever appends `.exe`, so a bare name whose only
+    /// match is a `.cmd`/`.bat`/`.com`/… is reported present by `Exec.which` yet unreachable by a raw
+    /// `CreateProcessW(lpApplicationName = NULL)`. Second (T-339), that search reads the CURRENT
+    /// PROCESS's `PATH` — it resolves the image in the parent's context, never from the child environment
+    /// block it is handed — so for a command that overrides or clears the child's `PATH` it would find a
+    /// same-named executable somewhere else entirely, or nothing at all. Only meaningful on Windows; a
+    /// path-form program, and a bare name resolved against the process's own unchanged `PATH` to an `.exe`
+    /// or to nothing, stay `AsIs` — the launch is left byte-for-byte as before and the OS resolves it
+    /// exactly as it always did.
     [<RequireQualifiedAccess; NoComparison; NoEquality>]
     type WindowsLaunch =
         /// Launch the program verbatim: a bare name goes to the OS's own `PATH` search (whose richer
         /// application/current/system-directory lookup this `PATH`-only model must not override), and a
-        /// path-form program is handed to the OS unchanged.
+        /// path-form program is handed to the OS unchanged. For a bare name this is chosen only while that
+        /// OS search walks the very `PATH` this resolution walked, so the two cannot pick different files.
         | AsIs
         /// Substitute the resolved absolute path directly into the launch — a bare name whose only match
-        /// carries a non-`.exe`, non-batch executable extension (`.com`/…). It is a real image the OS can
+        /// carries a non-`.exe`, non-batch executable extension (`.com`/…), a prefer-local match, or any
+        /// match resolved against a child `PATH` the command overrode. It is a real image the OS can
         /// spawn directly; it just needs the resolved path because the OS would never find it by bare name.
         | DirectPath of ResolvedPath: string
         /// Route the resolved batch file through `cmd.exe /d /c` — a `.cmd`/`.bat` match, which is not a
@@ -562,27 +603,42 @@ module internal Common =
     /// never disagree with what a preflight of the same config reports. The `PATH` walked is the command's
     /// EFFECTIVE child `PATH` (its `Env` override applied), the same block `CreateProcessW` hands the child,
     /// so a bare name reachable only via an overridden `PATH` resolves here exactly as the child would see
-    /// it. `AsIs` on every non-Windows platform (there is no `PATHEXT`) and for a name that resolves to
-    /// nothing; a relative path-form match is substituted by its working-directory-anchored absolute path,
-    /// while a `PATH` `.exe` match is deliberately left `AsIs` so the OS's own
-    /// bare-name search still applies. A **prefer-local** match (`Command.PreferLocal`, T-182) is consulted
-    /// first and is ALWAYS substituted as its resolved absolute path — even a `.exe`, unlike a `PATH`
-    /// `.exe`, because the OS would never find it in a prefer-local directory on its own — with a
-    /// `.cmd`/`.bat` still routed through the batch wrapper.
-    let resolveWindowsLaunch (command: Command) : WindowsLaunch =
+    /// it. `AsIs` on every non-Windows platform (there is no `PATHEXT`); a relative path-form match is
+    /// substituted by its working-directory-anchored absolute path. A **prefer-local** match
+    /// (`Command.PreferLocal`, T-182) is consulted first and is ALWAYS substituted as its resolved absolute
+    /// path — even a `.exe`, because the OS would never find it in a prefer-local directory on its own —
+    /// with a `.cmd`/`.bat` still routed through the batch wrapper.
+    ///
+    /// Whether a bare-name `PATH` match may be left to the OS at all turns on ONE fact (T-339): the OS's
+    /// bare-name search resolves the image in the PARENT's context, so it walks the current process's
+    /// `PATH` and never the child environment block it is handed. While the command leaves the child's
+    /// `PATH` alone (`ctx.PathIsProcessPath`), that search and this resolution can only find the same
+    /// file, so a `.exe` match stays `AsIs` and the OS's richer application/current/system-directory
+    /// lookup is preserved, and a miss is left to the OS too (its failure still flows through
+    /// `notFoundFromSpawnFailure` for an honest, `which`-consistent `NotFound`). Once the command changes
+    /// or clears that `PATH`, deferring would launch whatever the PARENT's `PATH` happens to hold under
+    /// the same name: every match — `.exe` included — is then substituted as its resolved absolute path,
+    /// and a miss is refused HERE, before any native spawn, with exactly the `ProcessError.NotFound` and
+    /// `Searched` a `Command.ResolveProgram` of the same config reports.
+    let resolveWindowsLaunch (command: Command) : Result<WindowsLaunch, ProcessError> =
         let program = command.Program
 
         if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
             // POSIX has no PATHEXT and resolves a relative path-form after the child-side chdir.
-            WindowsLaunch.AsIs
+            Ok WindowsLaunch.AsIs
         else
             let ctx = commandContext command
 
+            // The one condition under which the OS's own bare-name search is NOT interchangeable with this
+            // resolution: it reads the parent's `PATH`, this reads the child's.
+            let childPathOverridden = not ctx.PathIsProcessPath
+
             // Classify a resolved match by extension. `.cmd`/`.bat` is not a PE image and always routes
             // through `cmd.exe /d /c`. A `PATH` `.exe` stays `AsIs` (the OS appends `.exe` itself, so its
-            // richer application/current/system-directory search is preserved); every prefer-local match
-            // is instead substituted by absolute path — the OS never searches those directories, so even
-            // a `.exe` there must be handed over as a full path.
+            // richer application/current/system-directory search is preserved) — but only while that
+            // search walks the same `PATH`; every prefer-local match, and every match at all once the
+            // child's `PATH` is overridden, is instead substituted by absolute path, because the OS would
+            // otherwise look somewhere this resolution never did.
             let classify (resolved: string) (preferLocal: bool) : WindowsLaunch =
                 let ext = Path.GetExtension resolved
 
@@ -591,7 +647,7 @@ module internal Common =
 
                 if isExt ".cmd" || isExt ".bat" then
                     WindowsLaunch.BatchWrapper resolved
-                elif preferLocal then
+                elif preferLocal || childPathOverridden then
                     WindowsLaunch.DirectPath resolved
                 elif isExt ".exe" then
                     WindowsLaunch.AsIs
@@ -600,15 +656,22 @@ module internal Common =
 
             if isBareName program then
                 match findPreferLocal ctx program with
-                | Some resolved -> classify resolved true
+                | Some resolved -> Ok(classify resolved true)
                 | None ->
-                    match findInContextPath ctx program |> fst with
-                    | None ->
-                        // Not found by our resolver either: leave it to the OS, whose failure still flows
-                        // through `notFoundFromSpawnFailure` for an honest, `which`-consistent `NotFound`.
-                        WindowsLaunch.AsIs
-                    | Some resolved -> classify resolved false
+                    match findInContextPath ctx program with
+                    | Some resolved, _ -> Ok(classify resolved false)
+                    | None, searched ->
+                        if childPathOverridden then
+                            // The child's `PATH` holds no such program, but the OS would answer from the
+                            // parent's — launching a same-named executable this command's own config says
+                            // nothing about. Refuse instead, with the very `NotFound` a preflight reports.
+                            Error(bareNameNotFound program searched)
+                        else
+                            // Not found by our resolver either, and the OS searches the same `PATH`: leave
+                            // it to the OS, whose failure still flows through `notFoundFromSpawnFailure`
+                            // for an honest, `which`-consistent `NotFound`.
+                            Ok WindowsLaunch.AsIs
             else
                 match resolveWith ctx program with
-                | Ok resolved -> classify resolved true
-                | Error _ -> WindowsLaunch.AsIs
+                | Ok resolved -> Ok(classify resolved true)
+                | Error _ -> Ok WindowsLaunch.AsIs
