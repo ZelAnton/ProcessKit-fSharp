@@ -12,19 +12,36 @@ open ProcessKit
 /// bounded-reap and handoff decisions can be exercised without a real child wedged in `D`-state.
 ///
 /// `groupAliveBefore`/`groupAliveAfterReap` model what the production gate
-/// (`Native.Posix.processGroupStillTracked`) actually answers on either side of the reap: the
-/// liveness + identity verdict for the process GROUP, `killpg(id, 0)`, which keeps answering `true`
-/// while ANY member of the group is alive — so a group whose leader was just reaped still answers
-/// `true` whenever that leader backgrounded a descendant. `verdict` is the separate question the
-/// owner-side `waitpid` answers about the LEADER itself, and it is the only thing allowed to decide
-/// the handoff.
-type private LeaderProbe(groupAliveBefore: bool, groupAliveAfterReap: bool, verdict: LeaderReap, owned: bool) =
+/// (`Native.Posix.trackedTarget`) actually answers on either side of the reap: the liveness + identity
+/// verdict for the process GROUP, `killpg(id, 0)`, which keeps answering "still ours" while ANY member
+/// of the group is alive — so a group whose leader was just reaped still answers so whenever that
+/// leader backgrounded a descendant. `verdict` is the separate question the owner-side `waitpid`
+/// answers about the LEADER itself, and it is the only thing allowed to decide the handoff.
+///
+/// `liveTarget` says WHICH live verdict a "still ours" answer carries: the default `Group` (the
+/// ordinary child, killed with `killpg`), or `LeaderPid` — a pty leader between `posix_spawn` and its
+/// helper's `setsid()`, whose process group does not exist yet and which is therefore SIGKILLed by pid.
+/// `Kills` records the pids a teardown killed either way; `KillTargets` records which route each took.
+type private LeaderProbe
+    (
+        groupAliveBefore: bool,
+        groupAliveAfterReap: bool,
+        verdict: LeaderReap,
+        owned: bool,
+        ?liveTarget: Native.Posix.TrackedTarget
+    ) =
     let kills = List<int>()
+    let killTargets = List<Native.Posix.TrackedTarget>()
     let reaps = List<bool * int>()
     let adopts = List<int * uint64 option>()
     let mutable reaped = false
 
+    let live = defaultArg liveTarget Native.Posix.TrackedTarget.Group
+
     member _.Kills = List.ofSeq kills
+
+    /// The route each kill took (`Group` = `killpg`, `LeaderPid` = a direct `kill` on the leader pid).
+    member _.KillTargets = List.ofSeq killTargets
 
     /// Every reap attempt as `(the drain budget still allowed a bounded wait, pid)`.
     member _.Reaps = List.ofSeq reaps
@@ -33,9 +50,13 @@ type private LeaderProbe(groupAliveBefore: bool, groupAliveAfterReap: bool, verd
 
     member _.Run(reapNow: bool, pid: int, identity: uint64 option) =
         PosixReap.leaderUsing
-            (fun _ _ -> if reaped then groupAliveAfterReap else groupAliveBefore)
+            (fun _ _ ->
+                let alive = if reaped then groupAliveAfterReap else groupAliveBefore
+                if alive then live else Native.Posix.TrackedTarget.Gone)
             (fun _ _ -> owned)
-            (fun id -> kills.Add id)
+            (fun target id ->
+                kills.Add id
+                killTargets.Add target)
             (fun withinBudget id ->
                 reaps.Add(withinBudget, id)
                 reaped <- true
@@ -267,6 +288,54 @@ type GracefulTeardownTests() =
         )
 
         Assert.That(probe.Adopts, Is.Empty, "a stranger's pgid must never become this ledger's responsibility")
+
+    [<Test>]
+    member _.``a leader whose process group does not exist yet is killed by pid, never skipped (T-359)``() =
+        // The pre-`setsid()` pty window: `killpg(pid, 0)` answers ESRCH — no process group carries that
+        // number yet — while the child itself is alive and still ours. Teardown must therefore kill it
+        // through the exact-pid route instead of reading the group's absence as "the target is gone" and
+        // skipping the kill (which is what used to strand a just-spawned pty child).
+        let probe =
+            LeaderProbe(
+                groupAliveBefore = true,
+                groupAliveAfterReap = true,
+                verdict = LeaderReap.Reaped,
+                owned = false,
+                liveTarget = Native.Posix.TrackedTarget.LeaderPid
+            )
+
+        probe.Run(reapNow = true, pid = 4249, identity = Some 83UL)
+
+        Assert.That(probe.Kills, Is.EqualTo<int list> [ 4249 ], "a live pre-setsid leader must still be killed")
+
+        Assert.That(
+            probe.KillTargets,
+            Is.EqualTo<Native.Posix.TrackedTarget list> [ Native.Posix.TrackedTarget.LeaderPid ],
+            "the kill must be delivered to the exact pid while its process group does not exist"
+        )
+
+        Assert.That(
+            probe.Reaps,
+            Is.EqualTo<(bool * int) list> [ true, 4249 ],
+            "routing the kill must not add a second reap for the same leader (K-016)"
+        )
+
+        Assert.That(probe.Adopts, Is.Empty, "a reaped leader is never handed to a second waiter")
+
+    [<Test>]
+    member _.``an ordinary leader is still killed through its process group (T-359 non-regression)``() =
+        // The default route is unchanged: a child whose group exists is torn down with `killpg`, so the
+        // whole subtree it may have backgrounded goes with it.
+        let probe =
+            LeaderProbe(groupAliveBefore = true, groupAliveAfterReap = true, verdict = LeaderReap.Reaped, owned = false)
+
+        probe.Run(reapNow = true, pid = 4250, identity = Some 84UL)
+
+        Assert.That(
+            probe.KillTargets,
+            Is.EqualTo<Native.Posix.TrackedTarget list> [ Native.Posix.TrackedTarget.Group ],
+            "an ordinary leader's teardown must still go to its whole process group"
+        )
 
     [<Test>]
     member _.``a leader past the drain budget is killed and handed off after a probe that never waits (T-351)``() =

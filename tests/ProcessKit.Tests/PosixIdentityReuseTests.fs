@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.IO
 open System.Runtime.InteropServices
+open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
 
@@ -64,6 +65,42 @@ type PosixIdentityReuseTests() =
             Native.Posix.processGroupAliveForTests <- None
             Native.Posix.readProcessIdentityForTests <- None
             Native.Posix.groupDeliveryObserverForTests <- None
+
+    // Drive a `ProcessGroupBackend` through the PRE-`setsid()` pty window deterministically. The GROUP
+    // probe answers ESRCH for every id — no process group carries that number yet, which is exactly what
+    // `killpg(pid, 0)` reports between `posix_spawn` returning and the `setsid --ctty` helper's own
+    // `setsid()` — while the exact-pid probe (`live`) and the identity reader (`current`) are driven per
+    // id by the test. `delivered` records every id a control path reached at all; `direct` records only
+    // the ones reached by the exact-pid route, so "was the target reached" and "by which route" stay
+    // separate questions. Seams are always reset in the `finally`.
+    let runWithPreSetsidSeams
+        (body: Dictionary<int, uint64 option> -> HashSet<int> -> ResizeArray<int> -> ResizeArray<int> -> unit)
+        =
+        let current = Dictionary<int, uint64 option>()
+        let live = HashSet<int>()
+        let delivered = ResizeArray<int>()
+        let direct = ResizeArray<int>()
+
+        Native.Posix.processGroupAliveForTests <- Some(fun _ -> false)
+        Native.Posix.processAliveForTests <- Some(fun pid -> live.Contains pid)
+
+        Native.Posix.readProcessIdentityForTests <-
+            Some(fun pid ->
+                match current.TryGetValue pid with
+                | true, token -> token
+                | false, _ -> None)
+
+        Native.Posix.groupDeliveryObserverForTests <- Some(fun pid -> delivered.Add pid)
+        Native.Posix.leaderPidDeliveryObserverForTests <- Some(fun pid -> direct.Add pid)
+
+        try
+            body current live delivered direct
+        finally
+            Native.Posix.processGroupAliveForTests <- None
+            Native.Posix.processAliveForTests <- None
+            Native.Posix.readProcessIdentityForTests <- None
+            Native.Posix.groupDeliveryObserverForTests <- None
+            Native.Posix.leaderPidDeliveryObserverForTests <- None
 
     [<Test>]
     member _.``liveness seam keeps permission-denied groups tracked and prunes missing groups``() =
@@ -386,3 +423,336 @@ type PosixIdentityReuseTests() =
             with _ ->
                 // best-effort temp cleanup; a leftover temp dir must not fail the test.
                 ()
+
+    // ---- T-359: the pre-`setsid()` pty window — a live leader whose process GROUP does not exist yet ----
+    //
+    // A `Command.Pty` child is spawned with neither `POSIX_SPAWN_SETPGROUP` nor `POSIX_SPAWN_SETSID`,
+    // because its `setsid --ctty` helper must call `setsid()` itself after `exec`. Until that call lands,
+    // the child is alive but is NOT the leader of a group whose number equals its pid, so `killpg(pid, 0)`
+    // answers ESRCH. Reading that as "the target is gone" dropped a live child out of the container and
+    // skipped its kill/signal entirely; the choke now probes the exact pid too and, while that pid is
+    // still our identity-matched child, keeps the record AND delivers straight to it.
+
+    [<Test>]
+    member _.``a group ESRCH over a live identity-matched pid is a leader-pid target, not a gone one``() =
+        if isWindows then
+            Assert.Ignore "the POSIX liveness + identity choke is POSIX-only"
+
+        runWithPreSetsidSeams (fun current live _delivered _direct ->
+            let pid = 2_000_000_301
+            current[pid] <- Some 7_001UL
+            live.Add pid |> ignore
+
+            Assert.That(
+                Native.Posix.trackedTarget pid (Some 7_001UL),
+                Is.EqualTo Native.Posix.TrackedTarget.LeaderPid,
+                "a live, identity-matched child whose group does not exist yet must route to its exact pid"
+            )
+
+            Assert.That(
+                Native.Posix.processGroupStillTracked pid (Some 7_001UL),
+                Is.True,
+                "a group ESRCH alone must not drop a live child of ours from tracking"
+            ))
+
+    [<Test>]
+    member _.``a target gone by both the group and the pid probe is gone``() =
+        if isWindows then
+            Assert.Ignore "the POSIX liveness + identity choke is POSIX-only"
+
+        runWithPreSetsidSeams (fun current _live _delivered _direct ->
+            // The pid is absent from `live`, so the exact-pid probe answers ESRCH as well.
+            let pid = 2_000_000_302
+            current[pid] <- Some 7_002UL
+
+            Assert.That(
+                Native.Posix.trackedTarget pid (Some 7_002UL),
+                Is.EqualTo Native.Posix.TrackedTarget.Gone,
+                "ESRCH from BOTH probes is the only verdict that means the target really left"
+            )
+
+            Assert.That(Native.Posix.processGroupStillTracked pid (Some 7_002UL), Is.False))
+
+    [<Test>]
+    member _.``a live pid whose identity does not match the captured one is gone, never a leader-pid target``() =
+        if isWindows then
+            Assert.Ignore "the POSIX liveness + identity choke is POSIX-only"
+
+        runWithPreSetsidSeams (fun current live _delivered _direct ->
+            // A stranger recycled the number after our leader was reaped: the pid probes alive, but its
+            // start-time token is not the one captured at track time. The exact-pid route must never
+            // deliver here — that would be the wrong-target kill T-084 closes.
+            let recycled = 2_000_000_303
+            current[recycled] <- Some 9_999UL
+            live.Add recycled |> ignore
+
+            Assert.That(
+                Native.Posix.trackedTarget recycled (Some 7_003UL),
+                Is.EqualTo Native.Posix.TrackedTarget.Gone,
+                "a recycled number must never become an exact-pid delivery target"
+            )
+
+            // The same strictness for an identity that cannot be read on either side: a bare pid NUMBER
+            // is never enough evidence to signal, so the exact-pid route is simply not taken (the
+            // previous behaviour — nothing delivered, the record pruned — is kept).
+            let unreadable = 2_000_000_304
+            live.Add unreadable |> ignore
+
+            Assert.That(
+                Native.Posix.trackedTarget unreadable (Some 7_004UL),
+                Is.EqualTo Native.Posix.TrackedTarget.Gone,
+                "an unreadable current identity is not a match, so the exact-pid route is not taken"
+            )
+
+            let noCapturedToken = 2_000_000_305
+            current[noCapturedToken] <- Some 7_005UL
+            live.Add noCapturedToken |> ignore
+
+            Assert.That(
+                Native.Posix.trackedTarget noCapturedToken None,
+                Is.EqualTo Native.Posix.TrackedTarget.Gone,
+                "with no captured token there is nothing to match the live pid against"
+            ))
+
+    [<Test>]
+    member _.``a signal in the pre-setsid window is delivered to the exact pid and keeps the child tracked``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        runWithPreSetsidSeams (fun current live delivered direct ->
+            let pid = 2_000_000_310
+            current[pid] <- Some 7_100UL
+            live.Add pid |> ignore
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.Track(spawnedFor pid) |> ignore
+
+            match backend.Signal Signal.Term with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Signal failed: {e.Message}"
+
+            Assert.That(delivered, Does.Contain pid, "the live child must actually receive the signal")
+
+            Assert.That(
+                direct,
+                Does.Contain pid,
+                "it must be delivered to the exact pid — killpg would reach nothing before setsid()"
+            )
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Does.Contain pid, "a group ESRCH alone must not untrack a live child")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}")
+
+    [<Test>]
+    member _.``a child gone by both probes receives nothing and is pruned from tracking``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        runWithPreSetsidSeams (fun current live delivered _direct ->
+            let gone = 2_000_000_311
+            let alive = 2_000_000_312
+            current[gone] <- Some 7_110UL
+            current[alive] <- Some 7_111UL
+            // Only the second pid answers the exact-pid probe; the first is gone by both.
+            live.Add alive |> ignore
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.Track(spawnedFor gone) |> ignore
+            backend.Track(spawnedFor alive) |> ignore
+
+            match backend.Signal Signal.Term with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Signal failed: {e.Message}"
+
+            Assert.That(delivered, Does.Not.Contain gone, "a target gone by both probes must receive nothing")
+            Assert.That(delivered, Does.Contain alive)
+
+            match backend.Members() with
+            | Ok members ->
+                Assert.That(members, Does.Not.Contain gone, "group ESRCH plus pid ESRCH must prune the record")
+                Assert.That(members, Does.Contain alive, "the live child must stay tracked")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}")
+
+    [<Test>]
+    member _.``a recycled number is never signalled through the exact-pid route``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        runWithPreSetsidSeams (fun current live delivered direct ->
+            let recycled = 2_000_000_313
+            current[recycled] <- Some 7_120UL
+            live.Add recycled |> ignore
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.Track(spawnedFor recycled) |> ignore
+
+            // Our leader was reaped and a stranger took the number: it still probes alive by pid, but its
+            // identity changed. Every control path must treat it as gone.
+            current[recycled] <- Some 8_888UL
+
+            match backend.Signal Signal.Term with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Signal failed: {e.Message}"
+
+            backend.KillChild(spawnedFor recycled)
+            backend.KillTree() |> ignore
+
+            Assert.That(delivered, Is.Empty, "a recycled number must never be signalled or killed")
+            Assert.That(direct, Is.Empty, "least of all through the exact-pid route")
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Does.Not.Contain recycled, "and it must be pruned from tracking")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}")
+
+    [<Test>]
+    member _.``every control path reaches a freshly spawned leader whose group does not exist yet``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // Kill, kill-tree, per-child signal, suspend/resume, and the teardown drain must ALL reach the
+        // child in this window — an immediate `Kill`/`Stop`/`Dispose`/`Signal` right after a pty spawn
+        // used to skip its delivery entirely and leave the child running.
+        runWithPreSetsidSeams (fun current live delivered direct ->
+            let pid = 2_000_000_320
+            current[pid] <- Some 7_200UL
+            live.Add pid |> ignore
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.Track(spawnedFor pid) |> ignore
+
+            backend.KillChild(spawnedFor pid)
+            Assert.That(direct, Does.Contain pid, "KillChild must SIGKILL the exact pid")
+
+            direct.Clear()
+            backend.KillTree() |> ignore
+            Assert.That(direct, Does.Contain pid, "KillTree must SIGKILL the exact pid")
+
+            direct.Clear()
+
+            match backend.SignalChild(spawnedFor pid, Signal.Term) with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"SignalChild failed: {e.Message}"
+
+            Assert.That(direct, Does.Contain pid, "a per-child signal must reach the exact pid")
+
+            direct.Clear()
+
+            match backend.Suspend() with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Suspend failed: {e.Message}"
+
+            match backend.Resume() with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Resume failed: {e.Message}"
+
+            Assert.That(direct, Does.Contain pid, "Suspend/Resume must reach the exact pid")
+
+            // `Release` is the reap-side bookkeeping: an empty GROUP is not proof the child is gone, so
+            // the live child stays tracked and teardown still owns its kill.
+            backend.Release(spawnedFor pid)
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Does.Contain pid, "Release must not drop a live child")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}"
+
+            direct.Clear()
+            delivered.Clear()
+            backend.HardRelease()
+
+            Assert.That(direct, Does.Contain pid, "the teardown drain must SIGKILL the exact pid")
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Is.Empty, "teardown drains the tracking set")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}")
+
+    [<Test>]
+    member _.``once the group exists the whole tree is signalled through it, not the leader pid``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // The post-`setsid()` regression: with a live process group, delivery goes to the GROUP exactly as
+        // before, so a descendant the leader backgrounded is still reached. The exact-pid route is only
+        // ever the fallback for the window in which no such group exists.
+        runWithPreSetsidSeams (fun current live delivered direct ->
+            let pid = 2_000_000_330
+            current[pid] <- Some 7_300UL
+            live.Add pid |> ignore
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.Track(spawnedFor pid) |> ignore
+
+            // The helper's `setsid()` has now run: the group exists (pgid == pid).
+            Native.Posix.processGroupAliveForTests <- Some(fun _ -> true)
+
+            match backend.Signal Signal.Term with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Signal failed: {e.Message}"
+
+            backend.KillTree() |> ignore
+
+            Assert.That(delivered, Does.Contain pid, "the group must still receive the signal and the kill")
+
+            Assert.That(
+                direct,
+                Is.Empty,
+                "with a live group, delivery must go through killpg so the whole tree is reached"
+            ))
+
+    [<Test>]
+    member _.``a live pty child whose process group probes gone is still killed by the group teardown``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "the POSIX pty ctty helper (and this window) is Linux-only"
+            else
+                // The same window, end to end on a REAL child: only the group probe is overridden — to
+                // answer ESRCH for this one pid, exactly as `killpg(pid, 0)` does before the pty helper's
+                // `setsid()` — while the child, its `/proc` start-time identity, and the kill itself are
+                // all real. Before this fix the tree teardown read that ESRCH as "already gone", skipped
+                // the kill, and left the live child behind.
+                use group =
+                    match ProcessGroup.Create() with
+                    | Ok created -> created
+                    | Error error -> failwith $"ProcessGroup.Create failed: {error}"
+
+                if group.Mechanism <> Mechanism.ProcessGroup then
+                    // A limit-free group falls back to the pgid mechanism; anything else (a delegated
+                    // cgroup v2 container) kills through its own primitive and does not exercise the
+                    // `killpg`-versus-pid routing this test is about.
+                    Assert.Ignore $"this window belongs to the pgid mechanism, not {group.Mechanism}"
+
+                let command =
+                    (Command.create "/bin/cat").Pty({ Cols = 80; Rows = 24; Echo = false })
+
+                match! group.StartAsync command with
+                | Error(ProcessError.Unsupported message) -> Assert.Ignore $"host lacks a PTY: {message}"
+                | Error error -> Assert.Fail $"pty spawn failed: {error}"
+                | Ok running ->
+                    match running.Pid with
+                    | None -> Assert.Fail "a POSIX pty child must report its pid"
+                    | Some pid ->
+                        Native.Posix.processGroupAliveForTests <- Some(fun id -> id <> pid)
+
+                        try
+                            match group.KillAll() with
+                            | Ok() -> ()
+                            | Error error -> Assert.Fail $"KillAll failed: {error}"
+
+                            let wait = running.WaitAsync()
+
+                            let! finished = Task.WhenAny [| (wait :> Task); Task.Delay(TimeSpan.FromSeconds 20.0) |]
+
+                            Assert.That(
+                                obj.ReferenceEquals(finished, wait),
+                                Is.True,
+                                "a live child whose group probes gone must still be killed, not left running"
+                            )
+
+                            let! outcome = wait
+
+                            match outcome with
+                            | Outcome.Signalled _ -> ()
+                            | other -> Assert.Fail $"expected the child to be SIGKILLed, got {other}"
+                        finally
+                            Native.Posix.processGroupAliveForTests <- None
+        }
+        :> Task
