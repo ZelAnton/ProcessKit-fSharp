@@ -1114,7 +1114,11 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // CONFIGURED duration for `ProcessError.Timeout`/`ProcessResult`/`Log.timeout`, and every wait
     // created on this handle — however many consumers reach `waitWithTimeout`, and whenever — resolves
     // to the same single absolute deadline (KB K-149: a window that bounds later-created work must be
-    // computed when that work is created, never fixed at an earlier event).
+    // computed when that work is created, never fixed at an earlier event). A remainder too short for
+    // this wait to have surfaced an exit the child had ALREADY made is topped up by the bounded
+    // `Timeouts.exitSettleWindow` (capped by the configured duration, so it never defers a kill past
+    // what the caller asked for) — the deadline bounds the RUN, and must not turn a late collect of an
+    // already-finished child into a fabricated `TimedOut`.
     //
     // The IDLE deadline is deliberately NOT rewritten this way: it is an inactivity window, so it is
     // armed inside the race when output actually starts being consumed. Backdating it to spawn would

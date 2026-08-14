@@ -1169,10 +1169,13 @@ type Command internal (config: CommandConfig) =
 
     /// Kill the run after `duration`, reporting the result as `Outcome.TimedOut`. The deadline bounds
     /// the run's total wall time and is measured from the **spawn**, so a live `StartAsync` handle
-    /// collected later gets only what is left of it (and one already past its deadline is killed at
-    /// once), while a child that finished on its own inside the deadline still reports its real
-    /// outcome. A fired deadline always reports this configured `duration`. A negative `duration` is
-    /// rejected; one larger than ~24.8 days is treated as no timeout.
+    /// collected later gets only what is left of it, and one already past its deadline is killed as
+    /// soon as it is collected — after at most a quarter-second settle window, itself never longer than
+    /// `duration`, in which an exit the child had already made can still surface. That window is why a
+    /// child that finished on its own inside the deadline still reports its real outcome, however
+    /// little of the budget was left when the collecting verb arrived. A fired deadline always reports
+    /// this configured `duration`. A negative `duration` is rejected; one larger than ~24.8 days is
+    /// treated as no timeout.
     member _.Timeout(duration: TimeSpan) =
         ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero)
         Command({ config with Timeout = Some duration })
