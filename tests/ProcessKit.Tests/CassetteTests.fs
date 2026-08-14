@@ -16,7 +16,10 @@ open ProcessKit.Testing
 
 /// A deterministic inner `IProcessRunner` whose bytes verb returns arbitrary (possibly non-UTF-8)
 /// `stdout` bytes, for record-mode bytes tests. The string/spawn verbs are unused here.
-type private FixedBytesRunner(stdout: byte[], stderr: string, code: int) =
+type private FixedBytesRunner(stdout: byte[], stderr: string, code: int, duration: TimeSpan, truncated: bool) =
+
+    new(stdout: byte[], stderr: string, code: int) = FixedBytesRunner(stdout, stderr, code, TimeSpan.Zero, false)
+
     interface IProcessRunner with
         member _.CaptureBytesAsync(command, _cancellationToken) =
             Task.FromResult(
@@ -26,8 +29,8 @@ type private FixedBytesRunner(stdout: byte[], stderr: string, code: int) =
                         stdout,
                         stderr,
                         Outcome.Exited code,
-                        TimeSpan.Zero,
-                        false,
+                        duration,
+                        truncated,
                         [ 0 ],
                         stdoutEncoding = command.Config.StdoutEncoding
                     )
@@ -42,8 +45,8 @@ type private FixedBytesRunner(stdout: byte[], stderr: string, code: int) =
                         Encoding.UTF8.GetString stdout,
                         stderr,
                         Outcome.Exited code,
-                        TimeSpan.Zero,
-                        false,
+                        duration,
+                        truncated,
                         [ 0 ]
                     )
                 )
@@ -53,11 +56,14 @@ type private FixedBytesRunner(stdout: byte[], stderr: string, code: int) =
             Task.FromResult(Error(ProcessError.Unsupported "FixedBytesRunner has no Spawn"))
 
 /// A deterministic inner `IProcessRunner` for record-mode tests: every call returns `stdout`/`code`.
-type private FixedRunner(stdout: string, code: int) =
+type private FixedRunner(stdout: string, code: int, duration: TimeSpan, truncated: bool) =
+
+    new(stdout: string, code: int) = FixedRunner(stdout, code, TimeSpan.Zero, false)
+
     interface IProcessRunner with
         member _.CaptureStringAsync(command, _cancellationToken) =
             Task.FromResult(
-                Ok(ProcessResult<string>(command.Program, stdout, "", Outcome.Exited code, TimeSpan.Zero, false, [ 0 ]))
+                Ok(ProcessResult<string>(command.Program, stdout, "", Outcome.Exited code, duration, truncated, [ 0 ]))
             )
 
         member _.CaptureBytesAsync(command, _cancellationToken) =
@@ -68,8 +74,8 @@ type private FixedRunner(stdout: string, code: int) =
                         Encoding.UTF8.GetBytes stdout,
                         "",
                         Outcome.Exited code,
-                        TimeSpan.Zero,
-                        false,
+                        duration,
+                        truncated,
                         [ 0 ]
                     )
                 )
@@ -785,6 +791,179 @@ type CassetteTests() =
                             "recorded Duration must survive replay"
                         )
                     | Error error -> Assert.Fail $"{error}"
+            })
+
+    [<Test>]
+    member _.``SpawnAsync replay preserves recorded text completion metadata for buffered and streaming consumers``
+        ()
+        : Task =
+        withCassette (fun path ->
+            task {
+                let command = Command.create "metadata-text" |> Command.arg "replay"
+                let recordedDuration = TimeSpan.FromMilliseconds 250.0
+                let inner = FixedRunner("line1\nline2", 3, recordedDuration, true)
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, inner)
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+                        ()
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok replayer ->
+                    let replay = runner replayer
+
+                    let! direct = replay.OutputStringAsync(command, CancellationToken.None)
+
+                    let directResult =
+                        match direct with
+                        | Ok result -> result
+                        | Error error ->
+                            Assert.Fail $"direct text replay failed: {error}"
+                            Unchecked.defaultof<_>
+
+                    match! replay.SpawnAsync(command, CancellationToken.None) with
+                    | Error error -> Assert.Fail $"spawned text replay failed: {error}"
+                    | Ok spawned ->
+                        use running = spawned
+
+                        match! running.OutputStringAsync() with
+                        | Error error -> Assert.Fail $"spawned OutputStringAsync failed: {error}"
+                        | Ok result ->
+                            Assert.That(result.Outcome, Is.EqualTo directResult.Outcome)
+                            Assert.That(result.Duration, Is.EqualTo directResult.Duration)
+                            Assert.That(result.Truncated, Is.EqualTo directResult.Truncated)
+
+                    match! replay.SpawnAsync(command, CancellationToken.None) with
+                    | Error error -> Assert.Fail $"streaming replay failed: {error}"
+                    | Ok spawned ->
+                        use running = spawned
+                        let! lines = collect (running.StdoutLinesAsync())
+                        CollectionAssert.AreEqual([| "line1"; "line2" |], List.toArray lines)
+
+                        match! running.FinishAsync() with
+                        | Error error -> Assert.Fail $"streaming FinishAsync failed: {error}"
+                        | Ok finished ->
+                            Assert.That(finished.Outcome, Is.EqualTo directResult.Outcome)
+                            Assert.That(finished.Truncated, Is.EqualTo directResult.Truncated)
+                            Assert.That(running.Elapsed, Is.EqualTo directResult.Duration)
+            })
+
+    [<Test>]
+    member _.``SpawnAsync replay preserves recorded bytes completion metadata``() : Task =
+        withCassette (fun path ->
+            task {
+                let payload = Encoding.UTF8.GetBytes "byte payload"
+                let command = Command.create "metadata-bytes" |> Command.arg "replay"
+                let recordedDuration = TimeSpan.FromMilliseconds 250.0
+                let inner = FixedBytesRunner(payload, "warning", 0, recordedDuration, true)
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, inner)
+                        let! _ = (runner recorder).OutputBytesAsync(command, CancellationToken.None)
+                        ()
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok replayer ->
+                    let replay = runner replayer
+                    let! direct = replay.OutputBytesAsync(command, CancellationToken.None)
+
+                    let directResult =
+                        match direct with
+                        | Ok result -> result
+                        | Error error ->
+                            Assert.Fail $"direct bytes replay failed: {error}"
+                            Unchecked.defaultof<_>
+
+                    match! replay.SpawnAsync(command, CancellationToken.None) with
+                    | Error error -> Assert.Fail $"spawned bytes replay failed: {error}"
+                    | Ok spawned ->
+                        use running = spawned
+
+                        match! running.OutputBytesAsync() with
+                        | Error error -> Assert.Fail $"spawned OutputBytesAsync failed: {error}"
+                        | Ok result ->
+                            CollectionAssert.AreEqual(directResult.Stdout, result.Stdout)
+                            Assert.That(result.Outcome, Is.EqualTo directResult.Outcome)
+                            Assert.That(result.Duration, Is.EqualTo directResult.Duration)
+                            Assert.That(result.Truncated, Is.EqualTo directResult.Truncated)
+            })
+
+    [<Test>]
+    member _.``SpawnAsync replay ORs recorded truncation with the current output policy``() : Task =
+        withCassette (fun path ->
+            task {
+                let command = Command.create "metadata-policy"
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("0123456789", 0))
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+                        ()
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok replayer ->
+                    let replay = runner replayer
+
+                    match! replay.SpawnAsync(command, CancellationToken.None) with
+                    | Error error -> Assert.Fail $"unbounded spawn replay failed: {error}"
+                    | Ok spawned ->
+                        use running = spawned
+
+                        match! running.OutputStringAsync() with
+                        | Ok result -> Assert.That(result.Truncated, Is.False)
+                        | Error error -> Assert.Fail $"unbounded replay failed: {error}"
+
+                    let stricterCommand =
+                        command |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes 4)
+
+                    match! replay.SpawnAsync(stricterCommand, CancellationToken.None) with
+                    | Error error -> Assert.Fail $"bounded spawn replay failed: {error}"
+                    | Ok spawned ->
+                        use running = spawned
+
+                        match! running.OutputStringAsync() with
+                        | Ok result -> Assert.That(result.Truncated, Is.True)
+                        | Error error -> Assert.Fail $"bounded replay failed: {error}"
+            })
+
+    [<Test>]
+    member _.``PTY SpawnAsync replay preserves recorded completion metadata``() : Task =
+        withCassette (fun path ->
+            task {
+                let command = Command.create "metadata-pty" |> Command.pty
+                let recordedDuration = TimeSpan.FromMilliseconds 250.0
+
+                do!
+                    task {
+                        use recorder =
+                            RecordReplayRunner.Record(path, FixedRunner("terminal output", 0, recordedDuration, true))
+
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+                        ()
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok replayer ->
+                    match! (runner replayer).SpawnAsync(command, CancellationToken.None) with
+                    | Error error -> Assert.Fail $"PTY spawn replay failed: {error}"
+                    | Ok spawned ->
+                        use running = spawned
+
+                        match! running.OutputStringAsync() with
+                        | Error error -> Assert.Fail $"PTY OutputStringAsync failed: {error}"
+                        | Ok result ->
+                            Assert.That(result.Duration, Is.EqualTo recordedDuration)
+                            Assert.That(result.Truncated, Is.True)
+                            Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 0))
             })
 
     [<Test>]

@@ -1018,6 +1018,9 @@ Entries are matched by program + args + cwd + a stdin **source digest**; environ
 `Env("PATH", …)` override included) — *are* stored verbatim and can carry secrets. `WithRedaction`
 scrubs the captured text and every one of those failure fields (`program`/`args` are stored as
 given), so review a fixture before committing it; on Unix the file is written `0600`.
+Capture replay and live handles reconstructed by `SpawnAsync` both preserve the recorded duration
+and truncation state; a stricter output-buffer policy on the replay command can additionally mark
+the reconstructed handle's result as truncated.
 
 *Deeper: [Testing your code → record/replay](docs/testing.md#record-and-replay).*
 

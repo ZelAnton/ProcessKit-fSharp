@@ -132,13 +132,16 @@ type CommandVerbs =
         ArgumentNullException.ThrowIfNull command
         Runner.start CommandVerbs.DefaultRunner cancellationToken command
 
-    /// Require a zero/accepted exit and return stdout, trailing whitespace trimmed.
+    /// Require a zero/accepted exit and return stdout, trailing whitespace trimmed. Output the
+    /// command's `OutputBuffer` policy truncated is refused with `ProcessError.OutputTooLarge` rather
+    /// than returned as if whole — use `OutputStringAsync` for the bounded payload plus `Truncated`.
     [<Extension>]
     static member RunAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
         ArgumentNullException.ThrowIfNull command
         Runner.run CommandVerbs.DefaultRunner cancellationToken command
 
-    /// Require a zero/accepted exit, discarding the captured output.
+    /// Require a zero/accepted exit, discarding the captured output — including when the buffer
+    /// policy truncated it, which this verb makes no claim about.
     [<Extension>]
     static member RunUnitAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
         ArgumentNullException.ThrowIfNull command

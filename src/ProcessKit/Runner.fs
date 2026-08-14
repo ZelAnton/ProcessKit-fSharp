@@ -8,31 +8,58 @@ open System.Threading.Tasks
 
 /// The capture-derived verbs, factored out so `Runner` (over an `IProcessRunner`) and `Pipeline` (over
 /// a chain) derive `run`/`runUnit`/`exitCode`/`probe`/`parse`/`tryParse` from ONE implementation
-/// instead of maintaining parallel copies that could drift on trimming, success-checking, or
-/// parse-error wrapping. `run`/`runUnit`/`exitCode`/`probe` take a stdout `capture` thunk (the full
-/// `ProcessResult`); `parse`/`tryParse` take a `runText` thunk (the trimmed-text `run` verb) so the
-/// parser is applied outside whatever retry the caller wraps the run in. The caller controls
+/// instead of maintaining parallel copies that could drift on trimming, success-checking,
+/// truncation-refusing, or parse-error wrapping. `run`/`runUnit`/`exitCode`/`probe` take a stdout
+/// `capture` thunk (the full `ProcessResult`); `parse`/`tryParse` take a `runText` thunk (the
+/// trimmed-text `run` verb) so the parser is applied outside whatever retry the caller wraps the run in
+/// — and so it only ever sees output `run` already accepted as complete. The caller controls
 /// invocation — e.g. `Runner` wraps the capture in the command's retry policy, `Pipeline` does not.
 [<RequireQualifiedAccess>]
 module internal CaptureVerbs =
 
-    /// Require an accepted exit; return stdout with trailing whitespace trimmed.
-    let run (capture: unit -> Task<Result<ProcessResult<string>, ProcessError>>) : Task<Result<string, ProcessError>> =
+    /// Require an accepted exit; return stdout with trailing whitespace trimmed — and refuse a capture
+    /// the buffer policy already TRUNCATED, since this verb presents its string as the whole of stdout.
+    /// A `DropOldest`/`DropNewest` policy that dropped output therefore ends in
+    /// `ProcessError.OutputTooLarge` (quoting `lineLimit`/`byteLimit`, the caller's configured ceilings)
+    /// rather than in a clipped tail/prefix the caller cannot tell apart from complete output — the
+    /// distinction the `Truncated` flag carries is destroyed by the string projection, so it is spent
+    /// here instead. `outputString`/`outputBytes` remain the lenient path for a caller that wants the
+    /// bounded payload plus `ProcessResult.Truncated`. The check runs AFTER the success check, so an
+    /// unaccepted exit still reports its own `Exit`/`Signalled`/`Timeout` error, and the fail-loud
+    /// (`OverflowMode.Error`) ceiling — which never yields a successful capture at all — is untouched.
+    let run
+        (lineLimit: int option)
+        (byteLimit: int option)
+        (capture: unit -> Task<Result<ProcessResult<string>, ProcessError>>)
+        : Task<Result<string, ProcessError>> =
         task {
             match! capture () with
             | Error error -> return Error error
             | Ok result ->
                 match ProcessResult.ensureSuccess result with
                 | Error error -> return Error error
-                | Ok ok -> return Ok(ok.Stdout.TrimEnd())
+                | Ok ok ->
+                    match ProcessResult.rejectIfTruncated lineLimit byteLimit ok with
+                    | Error error -> return Error error
+                    | Ok() -> return Ok(ok.Stdout.TrimEnd())
         }
 
-    /// Like `run`, but discard the captured output.
-    let runUnit capture : Task<Result<unit, ProcessError>> =
+    /// Like `run`, but discard the captured output: require an accepted exit, then throw the capture
+    /// away. Deliberately NOT derived from `run` — a side-effect verb promises nothing about stdout, so
+    /// output the caller asked to discard must not turn a successful run into a failure just because a
+    /// bounded buffer dropped some of it. (`run`'s truncation refusal exists because it hands the
+    /// capture back as if complete; there is nothing to hand back here.) Ports ProcessKit-rs `run_unit`,
+    /// which likewise only checks the outcome (`623f2c23`).
+    let runUnit
+        (capture: unit -> Task<Result<ProcessResult<string>, ProcessError>>)
+        : Task<Result<unit, ProcessError>> =
         task {
-            match! run capture with
+            match! capture () with
             | Error error -> return Error error
-            | Ok _ -> return Ok()
+            | Ok result ->
+                match ProcessResult.ensureSuccess result with
+                | Error error -> return Error error
+                | Ok _ -> return Ok()
         }
 
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel.
@@ -58,6 +85,10 @@ module internal CaptureVerbs =
     // a command because *your* parser rejected its (successfully produced) output is a different concern
     // from a flaky run, and folding the parser into the retry loop would let a custom `shouldRetry`
     // silently re-spawn the command on a parse failure.
+    //
+    // Going through `run` is also what keeps a parser away from a TRUNCATED capture: `run` refuses one
+    // (`OutputTooLarge`) before these ever see text, so a bounded-buffer drop can't be parsed as if it
+    // were the whole document — no parser here needs its own truncation check.
 
     /// Parse the trimmed stdout from `runText` into a `'T`; a thrown parser becomes `ProcessError.Parse`.
     let parse
@@ -198,8 +229,10 @@ module internal CaptureVerbs =
 
 /// The run verbs, expressed over any `IProcessRunner`. One verb, one meaning:
 ///
-/// - `run` — require a zero/accepted exit; return stdout, trailing whitespace trimmed.
-/// - `outputString` / `outputBytes` — the full `ProcessResult`; a non-zero exit is data.
+/// - `run` — require a zero/accepted exit; return stdout, trailing whitespace trimmed. Output a
+///   bounded `OutputBuffer` policy truncated is refused (`OutputTooLarge`), never passed off as whole.
+/// - `outputString` / `outputBytes` — the full `ProcessResult`; a non-zero exit is data, and so is a
+///   truncated capture (read `ProcessResult.Truncated`).
 /// - `exitCode` — the exit code; a signal kill or timeout errors instead of inventing one.
 /// - `probe` — read the exit code as a yes/no: 0 -> true, 1 -> false, anything else errors.
 [<RequireQualifiedAccess>]
@@ -447,16 +480,25 @@ module Runner =
     let outputBytes (runner: IProcessRunner) (cancellationToken: CancellationToken) (command: Command) =
         withRetry command cancellationToken (fun command -> runner.CaptureBytesAsync(command, cancellationToken))
 
-    /// Require a zero/accepted exit and return stdout with trailing whitespace trimmed.
+    /// Require a zero/accepted exit and return stdout with trailing whitespace trimmed. Output the
+    /// command's `OutputBuffer` policy truncated (`DropOldest`/`DropNewest` over a cap) is refused with
+    /// `ProcessError.OutputTooLarge` rather than returned as if complete — use `outputString` for the
+    /// lenient path, which hands back the bounded payload with `ProcessResult.Truncated` set.
     let run
         (runner: IProcessRunner)
         (cancellationToken: CancellationToken)
         (command: Command)
         : Task<Result<string, ProcessError>> =
         withRetry command cancellationToken (fun command ->
-            CaptureVerbs.run (captureString runner cancellationToken command))
+            // The ceilings quoted in a truncation error are read off the same (retry-stamped) `command`
+            // whose capture is being judged, so the error always names the policy that actually applied.
+            CaptureVerbs.run
+                command.Config.OutputBuffer.MaxLines
+                command.Config.OutputBuffer.MaxBytes
+                (captureString runner cancellationToken command))
 
-    /// Like `run`, but discard the captured output.
+    /// Like `run`, but discard the captured output. A side-effect run promises nothing about stdout, so
+    /// an accepted exit stays `Ok` even when the buffer policy truncated the output being discarded.
     let runUnit
         (runner: IProcessRunner)
         (cancellationToken: CancellationToken)

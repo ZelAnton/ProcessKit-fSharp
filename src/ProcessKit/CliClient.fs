@@ -85,10 +85,13 @@ type CliClient internal (config: CliClientConfig) =
     // `client.RunAsync [ "status" ]` and `client.RunAsync([ "status" ], ct)` are the same method.
 
     /// Build the command for `args` and run it (requiring a zero/accepted exit), returning trimmed stdout.
+    /// Output the effective `OutputBuffer` policy truncated is refused with `ProcessError.OutputTooLarge`
+    /// rather than returned as if whole — `OutputStringAsync` is the lenient path.
     member this.RunAsync(args: seq<string>, [<Optional>] cancellationToken: CancellationToken) =
         Runner.run config.Runner cancellationToken (this.Command args)
 
-    /// Build the command for `args` and run it (requiring a zero/accepted exit), discarding output.
+    /// Build the command for `args` and run it (requiring a zero/accepted exit), discarding output —
+    /// including output the buffer policy truncated, which this verb makes no claim about.
     member this.RunUnitAsync(args: seq<string>, [<Optional>] cancellationToken: CancellationToken) =
         Runner.runUnit config.Runner cancellationToken (this.Command args)
 

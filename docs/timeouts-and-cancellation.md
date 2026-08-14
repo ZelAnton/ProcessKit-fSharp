@@ -103,6 +103,24 @@ Console.WriteLine(await cmd.RunAsync() switch
 stdout/stderr captured before the kill — a hung tool's last words are still
 available on the error, not discarded.
 
+**The clock starts at the spawn.** The deadline bounds the run's *total wall time*, so it is
+measured from the moment the child started — not from the moment you get around to collecting it.
+The distinction only shows up on a live `StartAsync` handle, because the start-and-collect verbs
+(`RunAsync`, `OutputStringAsync`, …) consume immediately: `Timeout(5s)` on a handle you leave
+running while you do four seconds of other work has one second left, not five, and every consumer of
+that one run — a capture verb, a streaming session, a readiness probe, `WaitAnyAsync`/`WaitAllAsync`
+— shares the same single absolute deadline. Reaching a handle whose deadline has already passed kills
+the tree as soon as you collect it, rather than granting it another full budget — after at most a
+quarter-second *settle window* (never longer than the timeout you configured, so a `Timeout(50ms)` is
+still killed 50 ms after you reach it). That window is not extra budget: it is there so a child that
+had already finished on its own inside the deadline can still be *seen* to have finished, since an
+exit reaches us on a kernel callback rather than instantly. Every wait gets it, whether the budget
+ran out before the wait was created or a sliver of it was left, so you get the child's real outcome
+and output — not a fabricated timeout — regardless of how much was left when you collected. Whatever
+fires, the duration reported by `IsTimedOut` results,
+`ProcessError.Timeout`, and the timeout log is the one you configured — never the remainder that was
+left when the first consumer arrived.
+
 > **Two distinct deadline families — keep them apart.** `Command.Timeout` is the
 > *run's own contract* (this guide): it kills the tree. The readiness probes'
 > `within` parameter (`WaitForLineAsync` / `WaitForPortAsync` / `WaitForAsync`, see

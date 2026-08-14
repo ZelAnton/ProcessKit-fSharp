@@ -575,6 +575,305 @@ type PipelineTests() =
         }
         :> Task
 
+    // --- T-352: the PIPELINE verbs that present stdout as if complete refuse a truncated capture ---
+    //
+    // The single-command contract (`RunnerTests`, same task) carried onto a chain: `Pipeline.RunAsync` —
+    // and the `ParseAsync`/`TryParseAsync`/`OutputJsonAsync` verbs derived from it — spend the `Truncated`
+    // flag on a typed `OutputTooLarge` instead of handing back a tail/head that reads exactly like the
+    // whole of the chain's output, while `OutputStringAsync`/`OutputBytesAsync` stay lenient and
+    // `RunUnitAsync` (which promises nothing about stdout) stays successful. Two pipeline-only details are
+    // pinned here as well: only the last stage's BYTE ceiling is quoted (a pipeline captures raw bytes, so
+    // its `MaxLines` never applies), and the totals come from `PipelineTotals.forResult` — checked below
+    // against an UNCAPPED oracle run of the same chain rather than a hardcoded size, since that arithmetic
+    // is the only source of `TotalBytes` in a pipeline refusal.
+
+    [<Test>]
+    member _.``pipeline RunAsync refuses a last-stage bounded-buffer truncation instead of a clipped capture``
+        ()
+        : Task =
+        task {
+            let cap = 4
+
+            match! pipelineBytes None with
+            | Error error -> Assert.Fail $"the uncapped oracle run failed: {error}"
+            | Ok full ->
+                Assert.That(full.Stdout.Length, Is.GreaterThan cap, "the sorted output must exceed the cap")
+
+                for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest ] do
+                    let policy = (OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow overflow
+
+                    let pipeline =
+                        (emit [ "banana"; "apple" ]).Pipe(sortStage |> Command.outputBuffer policy)
+
+                    match! pipeline.RunAsync() with
+                    | Error(ProcessError.OutputTooLarge(program, lineLimit, byteLimit, totalLines, totalBytes) as error) ->
+                        // Both stages exit 0, so the pipefail representative — and the name on the error —
+                        // is the last checked stage, which is also the stage whose ceiling is quoted.
+                        Assert.That(program, Is.EqualTo "sort", $"{overflow} program")
+
+                        Assert.That(
+                            lineLimit,
+                            Is.EqualTo(None: int option),
+                            $"{overflow}: a raw stdout capture does not enforce MaxLines"
+                        )
+
+                        Assert.That(byteLimit, Is.EqualTo(Some cap), $"{overflow} byte ceiling")
+
+                        Assert.That(
+                            totalLines,
+                            Is.EqualTo 0,
+                            $"{overflow}: a raw byte capture has no line structure to count"
+                        )
+
+                        // The REAL volume the capture saw (retained plus dropped), verified against the
+                        // uncapped run of the same chain — never the retained `cap`.
+                        Assert.That(totalBytes, Is.EqualTo full.Stdout.Length, $"{overflow} total bytes")
+
+                        Assert.That(
+                            error.Message,
+                            Is.EqualTo $"'sort' produced too much byte output ({full.Stdout.Length} bytes)",
+                            $"{overflow} message"
+                        )
+                    | other -> Assert.Fail $"{overflow}: expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``pipeline OutputString and OutputBytes stay lenient on the configuration RunAsync refuses``() : Task =
+        task {
+            let cap = 4
+
+            match! pipelineBytes None with
+            | Error error -> Assert.Fail $"the uncapped oracle run failed: {error}"
+            | Ok full ->
+                // The same chain, the same policy, the other verbs: a caller that asked for the whole
+                // `ProcessResult` still gets the bounded payload plus `Truncated`, and decides for itself.
+                let retained overflow =
+                    if overflow = OverflowMode.DropOldest then
+                        full.Stdout[full.Stdout.Length - cap ..] // the tail
+                    else
+                        full.Stdout[.. cap - 1] // the head
+
+                for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest ] do
+                    let policy = (OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow overflow
+                    let last = sortStage |> Command.outputBuffer policy
+
+                    match! ((emit [ "banana"; "apple" ]).Pipe last).OutputBytesAsync() with
+                    | Ok result ->
+                        Assert.That(result.Truncated, Is.True, $"{overflow} bytes Truncated")
+                        CollectionAssert.AreEqual(retained overflow, result.Stdout)
+                    | Error error -> Assert.Fail $"{overflow}: expected the bounded byte capture, got {error}"
+
+                    match! ((emit [ "banana"; "apple" ]).Pipe last).OutputStringAsync() with
+                    | Ok result ->
+                        Assert.That(result.Truncated, Is.True, $"{overflow} text Truncated")
+                        CollectionAssert.AreEqual(retained overflow, Encoding.UTF8.GetBytes result.Stdout)
+                    | Error error -> Assert.Fail $"{overflow}: expected the bounded text capture, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a pipeline capture exactly on the last stage's byte cap is not a truncation``() : Task =
+        task {
+            match! pipelineBytes None with
+            | Error error -> Assert.Fail $"the uncapped oracle run failed: {error}"
+            | Ok full ->
+                // The boundary the refusal must not overshoot: a capture landing exactly on its ceiling
+                // dropped nothing (`OverflowMode`'s documented rule), so `RunAsync` still returns it whole.
+                let cap = full.Stdout.Length
+
+                for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest ] do
+                    let policy = (OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow overflow
+
+                    let pipeline =
+                        (emit [ "banana"; "apple" ]).Pipe(sortStage |> Command.outputBuffer policy)
+
+                    match! pipeline.RunAsync() with
+                    | Ok output ->
+                        Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana" ]), $"{overflow} on the cap")
+                    | Error error -> Assert.Fail $"{overflow}: expected the whole capture, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``pipeline RunUnit and the outcome-only verbs ignore truncation of the output they discard``() : Task =
+        task {
+            // A side-effect run promises nothing about the chain's stdout, and neither do the verbs that
+            // only read the pipefail outcome — so a dropped capture must not turn a clean run into a failure.
+            let cap = 4
+
+            for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest ] do
+                let policy = (OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow overflow
+
+                let pipeline =
+                    (emit [ "banana"; "apple" ]).Pipe(sortStage |> Command.outputBuffer policy)
+
+                let! unitResult = pipeline.RunUnitAsync()
+                Assert.That(unitResult, Is.EqualTo(Ok(): Result<unit, ProcessError>), $"{overflow} RunUnitAsync")
+
+                let! code = pipeline.ExitCodeAsync()
+                Assert.That(code, Is.EqualTo(Ok 0: Result<int, ProcessError>), $"{overflow} ExitCodeAsync")
+
+                let! answer = pipeline.ProbeAsync()
+                Assert.That(answer, Is.EqualTo(Ok true: Result<bool, ProcessError>), $"{overflow} ProbeAsync")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``pipeline parse never sees a truncated capture``() : Task =
+        task {
+            // Sorted, this chain's whole output is `1234` then `5678`; clipped to its tail it is `5678` —
+            // a number that parses PERFECTLY and is simply the wrong answer. The parser must not run.
+            let cap = 6
+
+            let policy =
+                (OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow OverflowMode.DropOldest
+
+            let clipped =
+                (emit [ "5678"; "1234" ]).Pipe(sortStage |> Command.outputBuffer policy)
+
+            let parsed = ref (None: string option)
+
+            let parser =
+                Func<string, int>(fun text ->
+                    parsed.Value <- Some text
+                    Int32.Parse text)
+
+            match! clipped.ParseAsync(parser) with
+            | Error(ProcessError.OutputTooLarge(program, lineLimit, byteLimit, _, _)) ->
+                Assert.That(program, Is.EqualTo "sort")
+                Assert.That(lineLimit, Is.EqualTo(None: int option))
+                Assert.That(byteLimit, Is.EqualTo(Some cap))
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+
+            Assert.That(parsed.Value, Is.EqualTo(None: string option), "the parser must never see partial output")
+
+            // And the trap is real rather than hypothetical: on this very configuration the lenient verb
+            // hands back a payload that parses cleanly — to a value the chain never produced.
+            match! clipped.OutputStringAsync() with
+            | Ok bounded ->
+                Assert.That(bounded.Truncated, Is.True)
+                Assert.That(bounded.Stdout.Trim(), Is.EqualTo "5678")
+                Assert.That(Int32.Parse(bounded.Stdout.Trim()), Is.EqualTo 5678)
+            | Error error -> Assert.Fail $"expected the bounded capture, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``pipeline tryParse and JSON projections never see a truncated capture``() : Task =
+        task {
+            let cap = 6
+
+            let policy =
+                (OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow OverflowMode.DropOldest
+
+            let clipped =
+                (emit [ "5678"; "1234" ]).Pipe(sortStage |> Command.outputBuffer policy)
+
+            let seen = ref (None: string option)
+
+            let tryInt =
+                TryParser(fun (s: string) (v: byref<int>) ->
+                    seen.Value <- Some s
+                    Int32.TryParse(s.Trim(), &v))
+
+            match! clipped.TryParseAsync tryInt with
+            | Error(ProcessError.OutputTooLarge(_, _, byteLimit, _, _)) -> Assert.That(byteLimit, Is.EqualTo(Some cap))
+            | other -> Assert.Fail $"expected OutputTooLarge from TryParseAsync, got {other}"
+
+            Assert.That(seen.Value, Is.EqualTo(None: string option), "the try-parser must never see partial output")
+
+            // JSON: the chain's whole output (`1` then `2`) is not a JSON document at all, but its clipped
+            // HEAD (`1`) is a perfectly valid one — so a missing refusal here would not surface as a parse
+            // error, it would quietly answer `1`.
+            let headPolicy =
+                (OutputBufferPolicy.Unbounded.WithMaxBytes 1).WithOverflow OverflowMode.DropNewest
+
+            let clippedJson =
+                (emit [ "2"; "1" ]).Pipe(sortStage |> Command.outputBuffer headPolicy)
+
+            match! clippedJson.OutputJsonAsync<int>() with
+            | Error(ProcessError.OutputTooLarge(_, _, byteLimit, _, _)) -> Assert.That(byteLimit, Is.EqualTo(Some 1))
+            | other -> Assert.Fail $"expected OutputTooLarge from OutputJsonAsync, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``pipeline RunAsync refuses a truncated representative stderr, totalling both captures``() : Task =
+        task {
+            // The other half of `PipelineClassify.resultTruncated`: here the captured STDOUT is complete
+            // (empty) and the truncation comes from the pipefail representative's stderr. The representative
+            // is the last stage, so the ceiling quoted belongs to the very stage the error names.
+            let cap = 16
+
+            let noisyLast =
+                stderrStage 50 ((OutputBufferPolicy.Unbounded.WithMaxBytes cap).WithOverflow OverflowMode.DropOldest)
+
+            match! ((shell "exit 0").Pipe(stderrStage 50 OutputBufferPolicy.Unbounded)).OutputStringAsync() with
+            | Error error -> Assert.Fail $"the uncapped oracle run failed: {error}"
+            | Ok oracle ->
+                let stderrBytes = Encoding.UTF8.GetByteCount oracle.Stderr
+                Assert.That(stderrBytes, Is.GreaterThan cap, "the oracle stderr must exceed the cap")
+                Assert.That(oracle.Stdout, Is.Empty, "the stderr-only stage must capture no stdout")
+
+                match! ((shell "exit 0").Pipe noisyLast).OutputStringAsync() with
+                | Ok bounded ->
+                    Assert.That(bounded.Truncated, Is.True, "the lenient verb still reports the drop as data")
+                    Assert.That(Encoding.UTF8.GetByteCount bounded.Stderr, Is.LessThanOrEqualTo cap)
+                | Error error -> Assert.Fail $"expected the bounded capture, got {error}"
+
+                match! ((shell "exit 0").Pipe noisyLast).RunAsync() with
+                | Error(ProcessError.OutputTooLarge(program, lineLimit, byteLimit, totalLines, totalBytes)) ->
+                    Assert.That(program, Is.EqualTo noisyLast.Program)
+                    Assert.That(lineLimit, Is.EqualTo(None: int option))
+                    Assert.That(byteLimit, Is.EqualTo(Some cap))
+                    Assert.That(totalLines, Is.EqualTo 0)
+                    // `PipelineTotals.forResult` sums the last stage's captured stdout (empty here) with the
+                    // representative's stderr, so the quoted total is the real volume the oracle observed.
+                    Assert.That(totalBytes, Is.EqualTo stderrBytes)
+                | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a truncated stderr on a non-final representative names that stage and the last stage's ceiling``
+        ()
+        : Task =
+        task {
+            // The two halves of a pipeline refusal can legitimately come from DIFFERENT stages: the program
+            // is the pipefail representative's (it is read off `ProcessResult.Program`), while the ceiling is
+            // always the LAST stage's captured-stdout ceiling — the only one `RunAsync` can name before the
+            // capture exists. They coincide on an ordinary chain (the test above); they part when the last
+            // stage opts out of pipefail with `UncheckedInPipe`, making an earlier stage the representative.
+            // Documented in `docs/pipelines.md`; pinned here so the split stays a decision, not an accident.
+            let stageCap = 16
+            let lastCap = 64
+
+            let noisyFirst =
+                stderrStage
+                    50
+                    ((OutputBufferPolicy.Unbounded.WithMaxBytes stageCap).WithOverflow OverflowMode.DropOldest)
+
+            let last =
+                (sortStage
+                 |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes lastCap))
+                    .UncheckedInPipe()
+
+            match! (noisyFirst.Pipe last).RunAsync() with
+            | Error(ProcessError.OutputTooLarge(program, _, byteLimit, _, totalBytes)) ->
+                Assert.That(program, Is.EqualTo noisyFirst.Program, "the pipefail representative names the error")
+
+                Assert.That(
+                    byteLimit,
+                    Is.EqualTo(Some lastCap),
+                    "the ceiling quoted is the last stage's, not the named stage's"
+                )
+
+                Assert.That(totalBytes, Is.GreaterThan stageCap, "the real stderr volume, not the retained remainder")
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
     // --- Every stage's stderr is bounded by that stage's own OutputBuffer byte cap (T-034) ---
 
     [<Test>]

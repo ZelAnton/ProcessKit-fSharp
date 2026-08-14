@@ -448,7 +448,8 @@ type internal JsonLinesEnumerable<'T>(program: string, source: IAsyncEnumerable<
 /// A live handle to a started process: stream its output, feed its stdin, wait for it, or
 /// collect it to completion. Disposing it reaps the whole process tree (kill-on-drop).
 [<Sealed>]
-type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) list) =
+type RunningProcess
+    internal (host: RunningHost, extraFdStreams: (int * Stream) list, recordedCompletion: (TimeSpan * bool) option) =
 
     let config = host.Config
     let hasPseudoTerminal = config.Pty.IsSome || host.ResizePty.IsSome
@@ -785,8 +786,17 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             else
                 None, None)
 
+    // A cassette handle represents an already-completed run, so its completion clock must stay frozen
+    // at the recorded value while ordinary live/fake handles continue reading their own stopwatch.
     let elapsed () =
-        Stopwatch.GetElapsedTime host.StartedTimestamp
+        match recordedCompletion with
+        | Some(duration, _) -> duration
+        | None -> Stopwatch.GetElapsedTime host.StartedTimestamp
+
+    let recordedTruncated =
+        match recordedCompletion with
+        | Some(_, truncated) -> truncated
+        | None -> false
 
     // The per-run correlation id: the verb layer stamps one (shared across a run's retries); a direct
     // spawn with none gets a fresh per-incarnation id. Carried on every run-scoped log/trace event.
@@ -1102,6 +1112,27 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // the wait begins and reset by each stdout/stderr read through the activity-tracking wrappers. The
     // exit wait underneath is `boundedExitWait`, so the reap after ANY hard kill on this handle stays
     // bounded (the timeout race bounds its own post-kill reap too, see `Timeouts.raceTimeoutWithCts`).
+    //
+    // The TOTAL deadline is anchored at SPAWN (`host.StartedTimestamp`, the same monotonic stamp
+    // `elapsed ()` and `ProcessResult.Duration` are measured from), not at this call: this exit wait is
+    // created LAZILY by whichever consumer gets here first — a buffered verb through
+    // `ensureBufferedWait`, a streaming/event session, a readiness probe, `WaitAnyAsync`/`WaitAllAsync`
+    // — and on a live `StartAsync` handle that can be long after the child started. Re-issuing the full
+    // `config.Timeout` here would hand the child `(time until the first consumer) + Timeout` to run in,
+    // so `Command.Timeout(1s)` on a handle consumed five seconds later bounded nothing anyone asked
+    // for. `Timeouts.totalDeadline` therefore arms only what is LEFT of the budget while keeping the
+    // CONFIGURED duration for `ProcessError.Timeout`/`ProcessResult`/`Log.timeout`, and every wait
+    // created on this handle — however many consumers reach `waitWithTimeout`, and whenever — resolves
+    // to the same single absolute deadline (KB K-149: a window that bounds later-created work must be
+    // computed when that work is created, never fixed at an earlier event). A remainder too short for
+    // this wait to have surfaced an exit the child had ALREADY made is topped up by the bounded
+    // `Timeouts.exitSettleWindow` (capped by the configured duration, so it never defers a kill past
+    // what the caller asked for) — the deadline bounds the RUN, and must not turn a late collect of an
+    // already-finished child into a fabricated `TimedOut`.
+    //
+    // The IDLE deadline is deliberately NOT rewritten this way: it is an inactivity window, so it is
+    // armed inside the race when output actually starts being consumed. Backdating it to spawn would
+    // charge a handle for the quiet gap before anything was reading — the opposite of what it measures.
     let waitWithTimeout () : Task<Outcome> =
         let onTimeout (configuredDuration: TimeSpan) : Task =
             task {
@@ -1113,7 +1144,12 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             }
             :> Task
 
-        Timeouts.raceTimeout config.Logger config.Program runId config.Timeout idleTimer onTimeout (boundedExitWait ())
+        // Read the elapsed time BEFORE starting the wait, so the budget is never widened by the work of
+        // starting it (the two are microseconds apart; erring towards the smaller remainder is the
+        // honest direction for a deadline).
+        let total = Timeouts.totalDeadline config.Timeout (elapsed ())
+
+        Timeouts.raceTimeout config.Logger config.Program runId total idleTimer onTimeout (boundedExitWait ())
 
     // Start (and memoize) a buffered verb's single exit wait, under `stateLock`. Every buffered verb
     // calls this instead of `waitWithTimeout()` directly; the first caller creates the wait, and both
@@ -1483,7 +1519,12 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // (`JobRunner.start`) adds a defence-in-depth teardown as a backstop for any non-observability fault.
     do Log.spawn config.Logger config.Program host.Pid runId
 
-    internal new(host: RunningHost) = RunningProcess(host, [])
+    internal new(host: RunningHost) = RunningProcess(host, [], None)
+
+    internal new(host: RunningHost, extraFdStreams: (int * Stream) list) = RunningProcess(host, extraFdStreams, None)
+
+    internal new(host: RunningHost, recordedDuration: TimeSpan, recordedTruncated: bool) =
+        RunningProcess(host, [], Some(recordedDuration, recordedTruncated))
 
     /// The pid, when known.
     member _.Pid = host.Pid
@@ -1887,13 +1928,20 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 let! errBuf = stderrTask
                 conclude outcome
 
+                // The volume both captures SAW — retained plus dropped — saturating at `Int32.MaxValue`
+                // like the buffers' own counters. One pair, two consumers: the fail-loud error below,
+                // and (carried on a successful result) the truncation refusal a checking verb makes
+                // later, so both report the same honest totals. `TotalBytes` is `0` when neither a byte
+                // cap nor the fail-loud ceiling is configured — the line pump skips its UTF-8 scan then
+                // — which `ProcessError.OutputTooLarge` renders as "not reported", never as zero bytes.
+                let totalLines =
+                    int (min (int64 outBuf.TotalLines + int64 errBuf.TotalLines) (int64 Int32.MaxValue))
+
+                let totalBytes =
+                    int (min (int64 outBuf.TotalBytes + int64 errBuf.TotalBytes) (int64 Int32.MaxValue))
+
                 if outBuf.TooLarge || errBuf.TooLarge then
-                    return
-                        Error(
-                            tooLargeError
-                                (int (min (int64 outBuf.TotalLines + int64 errBuf.TotalLines) (int64 Int32.MaxValue)))
-                                (int (min (int64 outBuf.TotalBytes + int64 errBuf.TotalBytes) (int64 Int32.MaxValue)))
-                        )
+                    return Error(tooLargeError totalLines totalBytes)
                 else
                     match! stdinErrorOnSuccess outcome with
                     | Some err -> return Error err
@@ -1906,10 +1954,11 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                     errBuf.Text,
                                     outcome,
                                     elapsed (),
-                                    outBuf.Truncated || errBuf.Truncated,
+                                    recordedTruncated || outBuf.Truncated || errBuf.Truncated,
                                     config.OkCodes,
                                     ?configuredTimeoutDuration = configuredTimeoutDuration,
-                                    stdoutEncoding = config.StdoutEncoding
+                                    stdoutEncoding = config.StdoutEncoding,
+                                    overflowTotals = (totalLines, totalBytes)
                                 )
                             )
             }
@@ -1955,19 +2004,17 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 let! errBuf = stderrTask
                 conclude outcome
 
+                // The raw stdout byte cap contributes no lines (a byte stream has none); stderr is
+                // line-pumped, so its totals carry the lines and both streams' bytes are summed. As on
+                // the text verb above, this one pair serves both the fail-loud error and the totals a
+                // successful result carries for a later truncation refusal.
+                let totalLines = errBuf.TotalLines
+
+                let totalBytes =
+                    int (min (int64 stdoutCapture.TotalBytes + int64 errBuf.TotalBytes) (int64 Int32.MaxValue))
+
                 if stdoutCapture.TooLarge || errBuf.TooLarge then
-                    // The raw stdout byte cap contributes no lines (a byte stream has none); stderr is
-                    // line-pumped, so its totals carry the lines and both streams' bytes are summed.
-                    return
-                        Error(
-                            tooLargeError
-                                errBuf.TotalLines
-                                (int (
-                                    min
-                                        (int64 stdoutCapture.TotalBytes + int64 errBuf.TotalBytes)
-                                        (int64 Int32.MaxValue)
-                                ))
-                        )
+                    return Error(tooLargeError totalLines totalBytes)
                 else
                     match! stdinErrorOnSuccess outcome with
                     | Some err -> return Error err
@@ -1980,10 +2027,11 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                     errBuf.Text,
                                     outcome,
                                     elapsed (),
-                                    stdoutCapture.Truncated || errBuf.Truncated,
+                                    recordedTruncated || stdoutCapture.Truncated || errBuf.Truncated,
                                     config.OkCodes,
                                     ?configuredTimeoutDuration = configuredTimeoutDuration,
-                                    stdoutEncoding = config.StdoutEncoding
+                                    stdoutEncoding = config.StdoutEncoding,
+                                    overflowTotals = (totalLines, totalBytes)
                                 )
                             )
             }
@@ -2433,7 +2481,9 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                 Finished(
                                     settled,
                                     stderrStreamBuffer.Text,
-                                    Volatile.Read(&droppedStreamLineCount) > 0 || stderrStreamBuffer.Truncated
+                                    recordedTruncated
+                                    || Volatile.Read(&droppedStreamLineCount) > 0
+                                    || stderrStreamBuffer.Truncated
                                 )
                             )
             }

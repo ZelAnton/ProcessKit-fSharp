@@ -1531,7 +1531,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 // `OutputEvent.Stdout` and `ResizeAsync` is a recorded no-op success. The recorded `Stdout`
                 // is the merged stream; the entry flag is authoritative (independent of the live command).
                 let fake = if entry.Pty then fake.WithPty() else fake
-                Ok(fake.Build())
+                Ok(fake.Build(TimeSpan.FromMilliseconds entry.DurationMs, entry.Truncated))
 
     // Take the entry this key's cursor is on, in capture order then repeating the last. `accept` is the
     // caller's veto — a candidate it refuses is NOT consumed (the cursor stays put), so a refused
