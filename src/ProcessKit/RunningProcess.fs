@@ -1692,7 +1692,11 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                     registration <- None)
 
         let forward () =
-            if Volatile.Read(&disposed) <> 0 then
+            if Volatile.Read(&forwarded) <> 0 then
+                // A repeat signal that was already entering the callback when exit auto-unsubscribed
+                // still belongs to this forwarding attempt and must suppress the parent's default action.
+                true
+            elif Volatile.Read(&disposed) <> 0 then
                 false
             else
                 if Interlocked.CompareExchange(&forwarded, 1, 0) = 0 then
