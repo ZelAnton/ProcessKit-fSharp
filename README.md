@@ -865,7 +865,10 @@ incoming frame whose `jsonrpc` member is missing, non-string, or not exactly `"2
 ### Interactive stdin — write requests, read responses
 
 Keep stdin open with `KeepStdinOpen`, take the writer with `TakeStdin()`, then interleave writes
-and reads:
+and reads. Take it before you drive the handle to completion: the writer has exactly one owner, so
+a completion verb that finds it untaken ends the child's input itself (which is what keeps such a
+verb from hanging on a child that reads to EOF) and `TakeStdin()` then returns `None` — see
+[Who owns the kept-open writer](docs/streaming.md#who-owns-the-kept-open-writer).
 
 **F#**
 

@@ -1149,6 +1149,131 @@ type StreamingTests() =
         }
         :> Task
 
+    // ---- T-354: a completion verb ends a KeepStdinOpen pipe the caller never took ------------------
+    //
+    // `KeepStdinOpen` holds the parent's write end open for `TakeStdin`. A caller that never takes it and
+    // then drives the run to completion leaves a child reading its stdin to EOF waiting forever — and the
+    // high-level verbs (`RunAsync`/`OutputString*`/`FirstLine`) never expose the `RunningProcess` at all, so
+    // that caller has no way to end the input by hand. Every terminal verb therefore ends an UNTAKEN writer,
+    // and none of them touches one the caller already took (the last test below).
+    //
+    // `sort` is the witness on both platforms: it reads its whole input before printing anything, so it
+    // exits — and prints its first line — only once stdin has reached EOF. The generous `Timeout` turns a
+    // regression into a fast, honest `Outcome.TimedOut` failure instead of a hung test suite.
+
+    /// `sort`, keeping stdin open for an interactive writer, bounded so a regression fails instead of hangs.
+    member private _.KeptOpenSort() =
+        shell "sort"
+        |> Command.keepStdinOpen
+        |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+    [<Test>]
+    member this.``OutputStringAsync ends an untaken KeepStdinOpen stdin so the child exits (T-354)``() : Task =
+        task {
+            match! runner.StartAsync(this.KeptOpenSort(), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match! running.OutputStringAsync() with
+                | Ok result ->
+                    let exited =
+                        "the verb must end the untaken stdin, so the child sees EOF and exits instead of timing out"
+
+                    Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 0), exited)
+                | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member this.``every other completion verb ends an untaken KeepStdinOpen stdin (T-354)``() : Task =
+        task {
+            let exited =
+                "the verb must end the untaken stdin, so the child sees EOF and exits instead of timing out"
+
+            match! runner.StartAsync(this.KeptOpenSort(), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match! running.OutputBytesAsync() with
+                | Ok result -> Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 0), exited)
+                | Error error -> Assert.Fail $"OutputBytesAsync: {error}"
+
+            match! runner.StartAsync(this.KeptOpenSort(), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let! outcome = running.WaitAsync()
+                Assert.That(outcome, Is.EqualTo(Outcome.Exited 0), exited)
+
+            match! runner.StartAsync(this.KeptOpenSort(), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let! profile = running.ProfileAsync(TimeSpan.FromMilliseconds 50.0)
+                Assert.That(profile.Outcome, Is.EqualTo(Outcome.Exited 0), exited)
+
+            // The WaitAny/WaitAll ownership path: this handle reaches its terminal wait through
+            // `ExitTask` rather than a buffered verb, and owns the pipes exactly the same way.
+            match! runner.StartAsync(this.KeptOpenSort(), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                let! outcomes = RunningProcess.WaitAllAsync [| running |]
+                Assert.That(outcomes[0], Is.EqualTo(Outcome.Exited 0), exited)
+                do! (running :> IAsyncDisposable).DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the high-level verbs feed the source then end an untaken KeepStdinOpen stdin (T-354)``() : Task =
+        task {
+            // Neither verb hands the caller a `RunningProcess`, so nobody could end this input by hand.
+            // Sorted output containing BOTH source lines proves the whole source was delivered first and the
+            // end of input followed it — a premature EOF would truncate or drop the input entirely.
+            let sorting () =
+                shell "sort"
+                |> Command.stdin (Stdin.FromLines [ "banana"; "apple" ])
+                |> Command.keepStdinOpen
+                |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+            match! (sorting ()).RunAsync() with
+            | Ok stdout ->
+                Assert.That(stdout, Does.Contain "apple", "RunAsync must deliver the whole source before EOF")
+                Assert.That(stdout, Does.Contain "banana", "RunAsync must deliver the whole source before EOF")
+            | Error error -> Assert.Fail $"RunAsync: {error}"
+
+            // `sort` emits nothing until EOF, so a first line at all is the proof `firstLine` ended the input
+            // before it started streaming stdout.
+            match! (sorting ()).FirstLineAsync(fun line -> line.Contains "apple") with
+            | Ok(Some line) -> Assert.That(line, Does.Contain "apple")
+            | Ok None -> Assert.Fail "FirstLineAsync must end the untaken stdin so the child produces a line"
+            | Error error -> Assert.Fail $"FirstLineAsync: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member this.``a completion verb leaves an already-taken stdin to its owner (T-354)``() : Task =
+        task {
+            match! runner.StartAsync(this.KeptOpenSort(), CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match running.TakeStdin() with
+                | None -> Assert.Fail "expected an interactive stdin handle"
+                | Some stdin ->
+                    // The verb runs while the caller still owns the writer, so it must NOT end the input
+                    // itself: completion waits for this owner's own `FinishAsync`, and a line written after
+                    // the verb began still reaches the child (a verb-side close would fail this write, or
+                    // silently cut the line from the child's input).
+                    let capture = running.OutputStringAsync()
+                    do! stdin.WriteLineAsync "written after the verb started"
+                    do! stdin.FinishAsync()
+
+                    match! capture with
+                    | Ok result ->
+                        let delivered =
+                            "a verb must not close a stdin handle the caller took: the later write must still reach the child"
+
+                        Assert.That(result.Stdout, Does.Contain "written after the verb started", delivered)
+                        Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 0))
+                    | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
     [<Test>]
     member _.``interactive stdin writer verbs accept a CancellationToken``() : Task =
         task {

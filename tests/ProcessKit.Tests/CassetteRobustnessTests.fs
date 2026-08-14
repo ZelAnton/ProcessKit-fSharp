@@ -12,6 +12,48 @@ open FsCheck.FSharp
 open ProcessKit
 open ProcessKit.Testing
 
+// A seekable stream whose length metadata is stale: it advertises `advertisedLength` but serves
+// `actualLength` bytes. This deterministically models a cassette growing after the loader's stat-like
+// length check, without creating a second 64 MiB fixture on disk.
+type private StaleLengthStream(advertisedLength: int64, actualLength: int64) =
+    inherit Stream()
+
+    let mutable position = 0L
+
+    override _.CanRead = true
+    override _.CanSeek = true
+    override _.CanWrite = false
+    override _.Length = advertisedLength
+
+    override _.Position
+        with get () = position
+        and set value = position <- value
+
+    override _.Flush() = ()
+
+    override _.Read(buffer: byte[], offset: int, count: int) =
+        let read = int (min (int64 count) (actualLength - position))
+
+        if read > 0 then
+            Array.Fill(buffer, 0x20uy, offset, read)
+            position <- position + int64 read
+
+        read
+
+    override this.Seek(offset: int64, origin: SeekOrigin) =
+        let target =
+            match origin with
+            | SeekOrigin.Begin -> offset
+            | SeekOrigin.Current -> position + offset
+            | SeekOrigin.End -> advertisedLength + offset
+            | _ -> raise (ArgumentOutOfRangeException(nameof origin))
+
+        this.Position <- target
+        target
+
+    override _.SetLength(_value: int64) = raise (NotSupportedException())
+    override _.Write(_buffer: byte[], _offset: int, _count: int) = raise (NotSupportedException())
+
 /// Adversarial (property-based) robustness tests for the cassette parser — the one place in the
 /// library that reads **untrusted external input**: `RecordReplayRunner.Replay` deserializes a
 /// JSON cassette off disk and reconstructs a replay from it (`src/ProcessKit.Testing/Cassette.fs`).
@@ -126,6 +168,20 @@ type CassetteRobustnessTests() =
             ()
 
     static let utf8 (s: string) : byte[] = Encoding.UTF8.GetBytes s
+
+    static let writePaddedCassette (path: string) (length: int64) : unit =
+        let json = utf8 $"{{ \"Version\": {currentVersion}, \"Entries\": [] }}"
+
+        use stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None)
+        stream.Write json
+
+        let padding = Array.create<byte> (64 * 1024) 0x20uy
+        let mutable remaining = length - int64 json.Length
+
+        while remaining > 0L do
+            let count = int (min remaining (int64 padding.Length))
+            stream.Write(padding, 0, count)
+            remaining <- remaining - int64 count
 
     // A JSON string literal (properly quoted and escaped) for any generated content — including one
     // holding quotes, backslashes, or a raw newline — so composing a cassette by hand never emits
@@ -559,6 +615,101 @@ type CassetteRobustnessTests() =
         Check.QuickThrowOnFailure property
 
     // --- Explicit boundary cases (checked directly, not merely relied upon to appear at random). ---
+
+    [<Test>]
+    member _.``a cassette exactly at the byte limit reaches the parser and loads``() =
+        let path = freshTemp ()
+        let limit = RecordReplayRunner.MaximumCassetteSizeBytesForTests
+
+        try
+            writePaddedCassette path limit
+            Assert.That(FileInfo(path).Length, Is.EqualTo limit)
+
+            match RecordReplayRunner.Replay path with
+            | Error error -> Assert.Fail $"an exactly-at-limit cassette must load: {error}"
+            | Ok replayer ->
+                use _replayer = replayer
+                ()
+        finally
+            tryDelete path
+
+    [<Test>]
+    member _.``a sparse cassette one byte over the limit is rejected before JSON parsing``() =
+        let path = freshTemp ()
+        let limit = RecordReplayRunner.MaximumCassetteSizeBytesForTests
+        let size = limit + 1L
+
+        try
+            do
+                use stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None)
+                stream.SetLength size
+
+            match RecordReplayRunner.Replay path with
+            | Error(ProcessError.Io detail) ->
+                Assert.That(detail, Does.Contain(string size), "the error must report the observed byte size")
+                Assert.That(detail, Does.Contain(string limit), "the error must report the byte limit")
+                Assert.That(detail, Does.Contain("cassette size"))
+            | Error error -> Assert.Fail $"an oversized cassette must return ProcessError.Io, got {error}"
+            | Ok replayer ->
+                use _replayer = replayer
+                Assert.Fail "an oversized malformed cassette must be refused before deserialization"
+        finally
+            tryDelete path
+
+    [<Test>]
+    member _.``a cassette that grows after its length check is stopped at the byte limit``() =
+        let limit = RecordReplayRunner.MaximumCassetteSizeBytesForTests
+
+        let openGrowing (_path: string) =
+            new StaleLengthStream(limit, limit + 1L) :> Stream
+
+        match RecordReplayRunner.LoadEntriesWithStreamForTests("growing.json", openGrowing) with
+        | Error(ProcessError.Io detail) ->
+            Assert.That(detail, Does.Contain(string (limit + 1L)))
+            Assert.That(detail, Does.Contain(string limit))
+        | Error error -> Assert.Fail $"race growth must return ProcessError.Io, got {error}"
+        | Ok _ -> Assert.Fail "a cassette that grows past the limit must be refused"
+
+    [<Test>]
+    member _.``Auto opens an existing cassette payload once``() =
+        let mutable opens = 0
+
+        let openCounting (_path: string) =
+            opens <- opens + 1
+            new MemoryStream(seedBytes, false) :> Stream
+
+        match RecordReplayRunner.LoadAutoEntriesWithStreamForTests("existing.json", (fun _ -> true), openCounting) with
+        | Error error -> Assert.Fail $"the seed cassette must load in Auto: {error}"
+        | Ok entries ->
+            Assert.That(entries, Is.Not.Empty)
+            Assert.That(opens, Is.EqualTo 1, "Auto must share one payload between empty-check and parsing")
+
+    [<Test>]
+    member _.``Auto keeps missing empty and whitespace-only files as fresh starts``() =
+        let missing = freshTemp ()
+
+        try
+            match RecordReplayRunner.Auto(missing, seedInner) with
+            | Error error -> Assert.Fail $"a missing Auto cassette must be a fresh start: {error}"
+            | Ok auto ->
+                use _auto = auto
+                ()
+
+            for content in [ ""; " \r\n\t" ] do
+                let path = freshTemp ()
+
+                try
+                    File.WriteAllText(path, content)
+
+                    match RecordReplayRunner.Auto(path, seedInner) with
+                    | Error error -> Assert.Fail $"an empty Auto cassette must be a fresh start: {error}"
+                    | Ok auto ->
+                        use _auto = auto
+                        ()
+                finally
+                    tryDelete path
+        finally
+            tryDelete missing
 
     [<Test>]
     member _.``an empty, whitespace, or JSON-null file is a typed error, not a throw``() =
