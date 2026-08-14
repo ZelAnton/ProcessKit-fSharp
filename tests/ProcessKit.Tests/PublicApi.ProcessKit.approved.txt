@@ -628,6 +628,7 @@ class ProcessKit.ProcessError
   member get_IsJsonRpc() : System.Boolean
   member get_IsNotFound() : System.Boolean
   member get_IsNotReady() : System.Boolean
+  member get_IsOutputIncomplete() : System.Boolean
   member get_IsOutputTooLarge() : System.Boolean
   member get_IsParse() : System.Boolean
   member get_IsResourceLimit() : System.Boolean
@@ -649,6 +650,7 @@ class ProcessKit.ProcessError
   property IsJsonRpc : System.Boolean { get }
   property IsNotFound : System.Boolean { get }
   property IsNotReady : System.Boolean { get }
+  property IsOutputIncomplete : System.Boolean { get }
   property IsOutputTooLarge : System.Boolean { get }
   property IsParse : System.Boolean { get }
   property IsResourceLimit : System.Boolean { get }
@@ -674,6 +676,7 @@ class ProcessKit.ProcessError
   static member NewJsonRpc(System.String, System.String, System.Int32, System.String, Microsoft.FSharp.Core.FSharpOption<System.String>) : ProcessKit.ProcessError
   static member NewNotFound(System.String, Microsoft.FSharp.Core.FSharpOption<System.String>) : ProcessKit.ProcessError
   static member NewNotReady(System.String, System.TimeSpan) : ProcessKit.ProcessError
+  static member NewOutputIncomplete(System.String) : ProcessKit.ProcessError
   static member NewOutputTooLarge(System.String, Microsoft.FSharp.Core.FSharpOption<System.Int32>, Microsoft.FSharp.Core.FSharpOption<System.Int32>, System.Int32, System.Int32) : ProcessKit.ProcessError
   static member NewParse(System.String, System.String) : ProcessKit.ProcessError
   static member NewResourceLimit(System.String) : ProcessKit.ProcessError
@@ -753,6 +756,12 @@ class ProcessKit.ProcessError+NotReady : ProcessKit.ProcessError
   property Program : System.String { get }
   property Timeout : System.TimeSpan { get }
 
+class ProcessKit.ProcessError+OutputIncomplete : ProcessKit.ProcessError
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.ProcessError>
+  member get_Program() : System.String
+  property Program : System.String { get }
+
 class ProcessKit.ProcessError+OutputTooLarge : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.ProcessError>
@@ -828,6 +837,7 @@ module ProcessKit.ProcessError+Tags
   field literal JsonRpc : System.Int32
   field literal NotFound : System.Int32
   field literal NotReady : System.Int32
+  field literal OutputIncomplete : System.Int32
   field literal OutputTooLarge : System.Int32
   field literal Parse : System.Int32
   field literal ResourceLimit : System.Int32

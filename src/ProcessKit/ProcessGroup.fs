@@ -546,10 +546,22 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
                         // Owned group: closing the run reaps the whole tree. `runTornDown` is already set
                         // (above), so a `Kill()`/`StopAsync()` that races or follows this teardown observes the
                         // flag and no-ops rather than signalling a child this run no longer owns.
+                        //
+                        // This is also where the remaining tree of a leader that spawned something which
+                        // inherited its stdout/stderr is reaped. Nothing extra is needed for that case: the
+                        // whole point of `RunningProcess`'s bounded post-exit output drain (`PostExitDrain`)
+                        // is that the verb REACHES this teardown instead of waiting on the pipe that
+                        // descendant holds open — an unbounded pump join used to leave the private group
+                        // this call releases alive, and its survivors with it.
                         (this :> IDisposable).Dispose()
                     else
                         // Shared group: detach this run's I/O only — the GROUP owns the child's lifetime
-                        // (Shutdown/Dispose reaps it). `runTornDown` was set above (before `closeStreams`); here
+                        // (Shutdown/Dispose reaps it), and so does any descendant of it that outlived the
+                        // leader. That asymmetry with the owned arm above is deliberate and is what the
+                        // bounded post-exit output drain relies on: severing this run's read ends is a
+                        // per-HANDLE act with no effect on anyone else's run in the same container, while
+                        // killing the remainder of a tree here would reach into a group this handle does not
+                        // own. `runTornDown` was set above (before `closeStreams`); here
                         // we only stop tracking the child, still under `sync` and still AFTER the flag (T-204's
                         // required order is preserved — the flag now merely leads by a wider margin). Both must
                         // serialize against the control verbs: `runTornDown` fends off a later `Kill()`/
@@ -954,9 +966,15 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // line-level `OutputBufferPolicy` all match every other runner. They honour the per-run
     // `Command.Timeout` (hard-kill of just that child → `TimedOut`: its process group/subtree on POSIX,
     // only the leader process on Windows — descendants stay in the shared Job and are reaped at group
-    // teardown, so a Windows descendant that inherited the output pipe and outlives the leader can delay
-    // the capture's completion until it too exits) and `CancelOn`. `TimeoutGrace` has no per-child
-    // graceful kill in a shared group, so it falls back to the immediate kill.
+    // teardown) and `CancelOn`. `TimeoutGrace` has no per-child graceful kill in a shared group, so it
+    // falls back to the immediate kill.
+    //
+    // A descendant that inherited the output pipe and outlives the leader therefore keeps that pipe
+    // open here in a way a private group would not — but it no longer delays the capture: the run's
+    // bounded post-exit output drain (`PostExitDrain`) severs THIS run's own read ends once the
+    // leader's outcome is settled, and the capture returns marked `Truncated`. Severing is all it
+    // does: the descendant belongs to the shared group, and this library does not kill one run's
+    // survivors out from under a container it shares with everyone else's.
     interface IProcessRunner with
         member this.SpawnAsync(command, cancellationToken) =
             this.StartAsync(command, cancellationToken)

@@ -122,6 +122,27 @@ type WaitAnyResult internal (index: int, outcome: Outcome) =
     /// How that process concluded.
     member _.Outcome = outcome
 
+/// A `Pump.LineBuffer` whose captured state stays safely readable from the consumer's thread while
+/// its pump may still be writing into it — the line-capture counterpart of `Pump.RawSink`, and for
+/// the same reason. The bounded post-exit output drain (`PostExitDrain`) can end a verb's wait on a
+/// pump whose pipe a surviving descendant holds open, and the verb must then still report what WAS
+/// captured; reading the buffer without first awaiting that pump IS a concurrent access, and
+/// `LineBuffer` retains its lines in a `LinkedList` that a concurrent `Add` would be walking.
+///
+/// One uncontended `Monitor` per framed line, on a path that has just decoded and allocated that
+/// line — immeasurable next to it, and it buys every reader of these counters (`FinishAsync`'s
+/// `stderrStreamBuffer`, the buffered verbs' captures) a consistent snapshot instead of a race.
+type internal GuardedLineBuffer(policy: OutputBufferPolicy) =
+    let gate = obj ()
+    let buffer = Pump.LineBuffer policy
+
+    member _.Add(line: string) = lock gate (fun () -> buffer.Add line)
+    member _.Text = lock gate (fun () -> buffer.Text)
+    member _.Truncated = lock gate (fun () -> buffer.Truncated)
+    member _.TooLarge = lock gate (fun () -> buffer.TooLarge)
+    member _.TotalLines = lock gate (fun () -> buffer.TotalLines)
+    member _.TotalBytes = lock gate (fun () -> buffer.TotalBytes)
+
 /// The single output consumption a `RunningProcess` has been claimed for. Its output pipes are
 /// pumped exactly once: a buffered one-shot verb, a stdout-streaming session, a byte-chunk session, or
 /// an event-streaming session — never two readers on the same pipe.
@@ -535,7 +556,7 @@ type RunningProcess
     let mutable stdoutStreamedByteCount = 0L
     let mutable stderrStreamedByteCount = 0L
     let mutable stdoutChunkStreamedByteCount = 0L
-    let mutable stderrStreamBuffer = Unchecked.defaultof<Pump.LineBuffer>
+    let mutable stderrStreamBuffer = Unchecked.defaultof<GuardedLineBuffer>
     let mutable streamOutcome = Unchecked.defaultof<Task<Outcome>>
     let mutable chunkOutcome = Unchecked.defaultof<Task<Outcome>>
 
@@ -625,8 +646,19 @@ type RunningProcess
             |> Option.map (fun s -> new Timeouts.ActivityStream(s, timer.Reset) :> Stream)
         | None -> stream
 
-    let stdoutStream = watchActivity host.Stdout
-    let stderrStream = watchActivity host.Stderr
+    // Fires once the bounded post-exit output drain gives up on a tail nobody is going to finish (see
+    // `PostExitDrain` and `severOutputStreams` below). Every read of this handle's own stdout/stderr
+    // goes through a `SeverableStream` carrying it, so severing ends each pump at a clean EOF rather
+    // than at a fault anything has to classify. Like `disposalCts` it arms no timer and owns nothing to
+    // release, so it is deliberately never disposed — nothing would be freed, and a `Cancel` racing a
+    // `Dispose` would only add an `ObjectDisposedException` to a completion path.
+    let severCts = new CancellationTokenSource()
+
+    let severable (stream: Stream option) : Stream option =
+        stream |> Option.map (fun s -> new SeverableStream(s, severCts.Token) :> Stream)
+
+    let stdoutStream = host.Stdout |> watchActivity |> severable
+    let stderrStream = host.Stderr |> watchActivity |> severable
 
     // Cancels a writer parked on a bounded stream's `StreamFullMode.Backpressure` (`WriteAsync`) once
     // this handle is torn down, so an abandoned bounded stream can't leave its pump running forever: a
@@ -1037,10 +1069,20 @@ type RunningProcess
         | :? ObjectDisposedException -> ProcessException(ProcessError.Io ex.Message) :> exn
         | _ -> ex
 
-    let pumpToBuffer (stream: Stream) encoding terminator tee (callback: Action<string> option) counter =
+    // Captures into a `buffer` the CALLER owns (a `GuardedLineBuffer`), not one this task hands back on
+    // completion: the bounded post-exit output drain can end the verb's wait on this pump while a
+    // descendant still holds the pipe open, and the verb must then be able to report what was captured
+    // without awaiting a task that may never complete.
+    let pumpToBuffer
+        (stream: Stream)
+        encoding
+        terminator
+        tee
+        (callback: Action<string> option)
+        counter
+        (buffer: GuardedLineBuffer)
+        : Task =
         task {
-            let buffer = Pump.LineBuffer(config.OutputBuffer)
-
             let onLine (line: string) : ValueTask =
                 invokeLine callback line
                 counter ()
@@ -1073,9 +1115,8 @@ type RunningProcess
                 ()
             | :? IOException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
             | :? ObjectDisposedException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
-
-            return buffer
         }
+        :> Task
 
     // Drain a stream to EOF discarding output (`WaitAsync`/`ProfileAsync`), reclassifying a genuine
     // OS read fault into `ProcessError.Io` exactly like `pumpToBuffer` above — T-087.
@@ -1093,25 +1134,25 @@ type RunningProcess
         }
         :> Task
 
-    // The raw stdout capture backing `OutputBytesAsync` shares the buffered-pump teardown race above, but
-    // through the shared `Pump.captureRawOrEmpty`/`drainRaw` primitive, which discards its in-flight buffer
-    // on ANY fault. So the bytes read before a concurrent `StopAsync`/`Dispose` disposed the pipe can't be
-    // recovered here — on that routine teardown race report an honest, incomplete empty capture rather than
-    // faulting the verb. A genuine mid-run read fault (teardown not begun) is left to propagate unchanged,
-    // exactly as before — T-087.
-    let captureRawStdout () : Task<Pump.RawCapture> =
+    // The raw stdout capture backing `OutputBytesAsync`, into a `Pump.RawSink` the VERB owns — same
+    // reason `pumpToBuffer` takes its `GuardedLineBuffer`: the bounded post-exit output drain can end
+    // the verb's wait on this pump, and the bytes that did arrive must survive that.
+    //
+    // It shares the buffered-pump teardown race above: a concurrent `StopAsync`/`Dispose` can dispose
+    // the pipe mid-read. That is quiet here, and now honest as well — the sink keeps everything read
+    // before the race instead of the empty capture the old read loop was forced to report (it owned
+    // its buffer privately and discarded it on ANY fault). A genuine mid-run read fault (teardown not
+    // begun) still propagates unchanged — T-087.
+    let captureRawStdout (sink: Pump.RawSink) : Task =
         task {
             try
-                return! Pump.captureRawOrEmpty stdoutStream config.StdoutTee config.OutputBuffer CancellationToken.None
+                do! Pump.captureRawInto sink stdoutStream config.StdoutTee CancellationToken.None
             with (:? IOException | :? ObjectDisposedException) when isTearingDown () ->
-                return
-                    { Pump.RawCapture.Bytes = Array.empty<byte>
-                      Truncated = false
-                      TooLarge = false
-                      TotalBytes = 0 }
+                ()
         }
+        :> Task
 
-    let pumpStdoutBuffer () =
+    let pumpStdoutBuffer (buffer: GuardedLineBuffer) : Task =
         match stdoutStream with
         | Some s ->
             pumpToBuffer
@@ -1121,9 +1162,10 @@ type RunningProcess
                 config.StdoutTee
                 config.OnStdoutLine
                 bumpStdoutLine
-        | None -> Task.FromResult(Pump.LineBuffer config.OutputBuffer)
+                buffer
+        | None -> Task.CompletedTask
 
-    let pumpStderrBuffer () =
+    let pumpStderrBuffer (buffer: GuardedLineBuffer) : Task =
         match stderrStream with
         | Some s ->
             pumpToBuffer
@@ -1133,7 +1175,8 @@ type RunningProcess
                 config.StderrTee
                 config.OnStderrLine
                 bumpStderrLine
-        | None -> Task.FromResult(Pump.LineBuffer config.OutputBuffer)
+                buffer
+        | None -> Task.CompletedTask
 
     let tooLargeError (totalLines: int) (totalBytes: int) =
         ProcessError.OutputTooLarge(
@@ -1568,6 +1611,96 @@ type RunningProcess
         )
         |> ignore
 
+    // ---- the bounded post-exit output drain for THIS handle (see `PostExitDrain`) -----------------
+    //
+    // 0 until the drain had to SEVER this handle's parent read ends: the child's fate was already
+    // settled, but something that inherited its stdout/stderr — a daemonized worker, a `setsid`
+    // helper, a shell's background job — still held the pipe open when the window ran out. Read into
+    // every capture's `Truncated`, so a capture cut short by the bound is never reported as complete.
+    // Written from a pump-joining task, read from the verb building the result, hence `Volatile`.
+    let mutable outputDrainSevered = 0
+
+    // 0 until even the sever could not end a pump inside the window that follows it — a read the OS
+    // will not let go of (a POSIX pty master's blocking `read`, which no token interrupts). Such a
+    // pump is handed to `PostExitDrain.abandon`: never awaited again, its eventual fault observed.
+    // A diagnostic, not a control input; the verb's answer is the same either way.
+    let mutable outputPumpsAbandoned = 0
+
+    let markOutputDrainSevered () = Volatile.Write(&outputDrainSevered, 1)
+
+    let markOutputPumpsAbandoned () =
+        Volatile.Write(&outputPumpsAbandoned, 1)
+
+    /// Whether this handle's captures were cut short by the bounded post-exit output drain.
+    let outputDrainWasBounded () = Volatile.Read(&outputDrainSevered) = 1
+
+    // Stop this handle's own parent read ends. Every pump reading them then ends at a clean EOF with
+    // everything it had captured — no fault to classify, tees still flushed — so the verb can report
+    // its already-decided `Outcome` instead of waiting on a writer that is no longer this run's child.
+    //
+    // Deliberately NOT a stream close, and deliberately no kill: closing the fd and deciding the fate
+    // of the remaining tree both belong to the OWNER's teardown (`RunningHost.Teardown`, reached by
+    // `reapGuard` moments later), which is the one place that knows whether this run owns a private
+    // group — where reaping the descendants is right — or shares a group, where they belong to the
+    // group and must outlive this handle untouched.
+    let severOutputStreams () =
+        try
+            severCts.Cancel()
+        with :? AggregateException ->
+            // `Cancel()` aggregates whatever a registered cancellation callback raised. The only
+            // registrations on this token are the runtime's own pending-read cancellations (CancelIoEx
+            // on Windows, the socket engine's operation cancel on POSIX), and a failure to wake one is
+            // not actionable here: the bound has already decided to stop waiting, and a pump it could
+            // not end is abandoned-and-observed below either way.
+            ()
+
+    // The ONE bounded post-exit output drain, shared by every consumer that joins its own output
+    // pumps once the child's fate is settled — the buffered captures, the discard drains, the
+    // line/chunk/event streaming outcomes, the interactive sessions, and the shared `ExitTask`.
+    //
+    // Returns whether the pumps SETTLED. `true` is the answer on every ordinary run (they were already
+    // at EOF, or reached it inside the window, or the sever ended them); `false` means they were
+    // abandoned to `PostExitDrain` and must never be awaited again — the caller then reports what its
+    // caller-owned capture holds rather than blocking on a task that may never complete.
+    //
+    // A pump fault is untouched by all of this: whenever the pumps settled, they are awaited here
+    // exactly as the unbounded `Task.WhenAll` this replaces awaited them, so a throwing
+    // `OnStdoutLine`/tee/decoder before the bound stays the error it always was.
+    let awaitPumpsSettled (pumps: Task[]) : Task<bool> =
+        let all = Task.WhenAll pumps
+
+        task {
+            let! drained = PostExitDrain.settlesWithin (PostExitDrain.budget ()) all
+
+            if drained then
+                do! all
+                return true
+            else
+                markOutputDrainSevered ()
+                severOutputStreams ()
+                // The sever's EOF still has to travel back through the pump's own read loop, line
+                // framing, tee flush and channel completion, so give that unwinding the same window
+                // rather than declaring the pumps lost the instant we cut them.
+                let! settled = PostExitDrain.settlesWithin (PostExitDrain.budget ()) all
+
+                if settled then
+                    do! all
+                    return true
+                else
+                    markOutputPumpsAbandoned ()
+                    PostExitDrain.abandon all
+                    return false
+        }
+
+    // `awaitPumpsSettled` for a consumer with no capture to salvage — the discard drains, and the
+    // streaming sessions whose output has already reached its channel.
+    let drainPumpsBounded (pumps: Task[]) : Task =
+        task {
+            let! _settled = awaitPumpsSettled pumps
+            ()
+        }
+        :> Task
+
     // Await a buffered verb's exit wait (`waitTask`, from `ensureBufferedWait`) together with its
     // already-running `pumps`. Fault-aware in both directions:
     //  - A pump fault kills the tree at once (see `killTreeOnPumpFault`), so the child can't wedge
@@ -1578,8 +1711,10 @@ type RunningProcess
     //    CAN throw. `reapGuard`'s teardown disposes the streams the pumps read, so a pump still
     //    in-flight when such a fault escaped this scope would race that dispose; awaiting the pumps
     //    best-effort before re-raising closes that gap.
-    // A pump's own fault on the success path (thrown from `Task.WhenAll pumps`) still propagates
-    // exactly as before.
+    // A pump's own fault on the success path (thrown from the pump join) still propagates exactly as
+    // before. Both joins go through `awaitPumpsSettled`, so neither can outlast the bounded post-exit
+    // output drain — including the best-effort one on the fault path, which would otherwise turn a
+    // held-open inherited pipe into an unbounded wait on the way OUT of an already-failed verb.
     let awaitBufferedOutcome (waitTask: Task<Outcome>) (pumps: Task[]) : Task<Outcome> =
         pumps |> Array.iter killTreeOnPumpFault
 
@@ -1589,14 +1724,14 @@ type RunningProcess
 
             try
                 let! settled = waitTask
-                do! Task.WhenAll pumps
+                do! drainPumpsBounded pumps
                 outcome <- settled
             with ex ->
                 error <- Some ex
                 // A fault from `waitTask` before the pumps were awaited must not orphan them — observe
                 // them best-effort. Their own fault, if any, is secondary to the error we surface.
                 try
-                    do! Task.WhenAll pumps
+                    do! drainPumpsBounded pumps
                 with _ ->
                     // best-effort drain; the original fault above is what we report.
                     ()
@@ -2051,21 +2186,24 @@ type RunningProcess
 
             task {
                 use _reap = reapGuard ()
-                let stdoutTask = pumpStdoutBuffer ()
-                let stderrTask = pumpStderrBuffer ()
+                // The captures are owned HERE, not by the pumps: a pump the bounded post-exit output
+                // drain could not end (an inherited pipe a descendant still holds open) is abandoned
+                // rather than awaited, and this verb must still report what it captured.
+                let outBuf = GuardedLineBuffer config.OutputBuffer
+                let errBuf = GuardedLineBuffer config.OutputBuffer
+                let stdoutTask = pumpStdoutBuffer outBuf
+                let stderrTask = pumpStderrBuffer errBuf
                 // This verb runs the child to completion, so no caller can write its stdin past here: end
                 // the input of a `KeepStdinOpen` writer nobody took, or a child reading to EOF never exits.
                 // A no-op when there is none (see `finishUnclaimedStdin`). After the pumps, so the drains
                 // that keep the child moving are already in place when its input ends.
                 finishUnclaimedStdin ()
-                // Observe BOTH buffer pumps before reading either, so a throwing line handler in one
-                // never orphans the other as an unobserved task (mirrors the streaming path's WhenAll);
-                // `awaitBufferedOutcome` additionally guarantees this even if the exit wait itself faults.
-                let! outcome =
-                    awaitBufferedOutcome (ensureBufferedWait ()) [| (stdoutTask :> Task); (stderrTask :> Task) |]
+                // Observe BOTH buffer pumps before reading either capture, so a throwing line handler in
+                // one never orphans the other as an unobserved task (mirrors the streaming path's
+                // WhenAll); `awaitBufferedOutcome` additionally guarantees this even if the exit wait
+                // itself faults, and bounds the join so a held-open inherited pipe can't hang this verb.
+                let! outcome = awaitBufferedOutcome (ensureBufferedWait ()) [| stdoutTask; stderrTask |]
 
-                let! outBuf = stdoutTask
-                let! errBuf = stderrTask
                 conclude outcome
 
                 // The volume both captures SAW — retained plus dropped — saturating at `Int32.MaxValue`
@@ -2094,11 +2232,20 @@ type RunningProcess
                                     errBuf.Text,
                                     outcome,
                                     elapsed (),
-                                    recordedTruncated || outBuf.Truncated || errBuf.Truncated,
+                                    recordedTruncated
+                                    || outBuf.Truncated
+                                    || errBuf.Truncated
+                                    // A capture the post-exit drain bound cut short is incomplete, and
+                                    // says so — never a partial capture reported as the whole output.
+                                    || outputDrainWasBounded (),
                                     config.OkCodes,
                                     ?configuredTimeoutDuration = configuredTimeoutDuration,
                                     stdoutEncoding = config.StdoutEncoding,
-                                    overflowTotals = (totalLines, totalBytes)
+                                    overflowTotals = (totalLines, totalBytes),
+                                    // WHICH of the two truncation sources this was, so a checking verb
+                                    // refusing the capture names the real cause instead of quoting a
+                                    // ceiling that was never configured (`rejectIfTruncated`).
+                                    outputDrainBounded = outputDrainWasBounded ()
                                 )
                             )
             }
@@ -2128,23 +2275,23 @@ type RunningProcess
 
                 // The raw stdout capture now honours the byte cap + overflow of `config.OutputBuffer`
                 // (unbounded when `MaxBytes = None`, exactly as before); `MaxLines` does not apply to a
-                // byte stream, so it is ignored here — it still governs the line-pumped stderr below. Goes
-                // through `captureRawStdout` so a concurrent `StopAsync`/`Dispose` teardown race ends as an
-                // honest incomplete capture rather than faulting the verb (see its comment) — T-087.
-                let stdoutTask = captureRawStdout ()
-
-                let stderrTask = pumpStderrBuffer ()
+                // byte stream, so it is ignored here — it still governs the line-pumped stderr below. Both
+                // captures are owned HERE (see the text verb above): a concurrent `StopAsync`/`Dispose`
+                // teardown race, and a pump the post-exit drain bound had to abandon, both leave this verb
+                // holding the bytes that did arrive rather than nothing — T-087.
+                let stdoutSink = Pump.RawSink config.OutputBuffer
+                let errBuf = GuardedLineBuffer config.OutputBuffer
+                let stdoutTask = captureRawStdout stdoutSink
+                let stderrTask = pumpStderrBuffer errBuf
                 // As on the text verb above: nobody can write this child's stdin past a completion verb, so
                 // an untaken `KeepStdinOpen` writer's input ends here (a no-op when there is none).
                 finishUnclaimedStdin ()
-                // Observe both pumps before reading either, so a throwing stderr handler (or a raw-drain
-                // I/O fault) can't orphan the other as an unobserved task; `awaitBufferedOutcome`
-                // additionally guarantees this even if the exit wait itself faults.
-                let! outcome =
-                    awaitBufferedOutcome (ensureBufferedWait ()) [| (stdoutTask :> Task); (stderrTask :> Task) |]
+                // Observe both pumps before reading either capture, so a throwing stderr handler (or a
+                // raw-drain I/O fault) can't orphan the other as an unobserved task; `awaitBufferedOutcome`
+                // additionally guarantees this even if the exit wait itself faults, and bounds the join.
+                let! outcome = awaitBufferedOutcome (ensureBufferedWait ()) [| stdoutTask; stderrTask |]
 
-                let! stdoutCapture = stdoutTask
-                let! errBuf = stderrTask
+                let stdoutCapture = stdoutSink.Snapshot()
                 conclude outcome
 
                 // The raw stdout byte cap contributes no lines (a byte stream has none); stderr is
@@ -2170,11 +2317,19 @@ type RunningProcess
                                     errBuf.Text,
                                     outcome,
                                     elapsed (),
-                                    recordedTruncated || stdoutCapture.Truncated || errBuf.Truncated,
+                                    recordedTruncated
+                                    || stdoutCapture.Truncated
+                                    || errBuf.Truncated
+                                    // Symmetric with the text verb: a capture the post-exit drain bound
+                                    // cut short reports itself as incomplete.
+                                    || outputDrainWasBounded (),
                                     config.OkCodes,
                                     ?configuredTimeoutDuration = configuredTimeoutDuration,
                                     stdoutEncoding = config.StdoutEncoding,
-                                    overflowTotals = (totalLines, totalBytes)
+                                    overflowTotals = (totalLines, totalBytes),
+                                    // Symmetric with the text verb here too: the refusal a checking verb
+                                    // builds from this result must name the drain bound, not a ceiling.
+                                    outputDrainBounded = outputDrainWasBounded ()
                                 )
                             )
             }
@@ -2278,14 +2433,17 @@ type RunningProcess
 
             try
                 let! settled = ensureBufferedWait ()
-                do! Task.WhenAll([| stdoutTask; stderrTask |])
+                // Bounded exactly like every other post-exit pump join on this handle: a descendant that
+                // inherited the child's stdout/stderr must not be able to hold this profile open past
+                // the leader's own conclusion (see `awaitPumpsSettled`).
+                do! drainPumpsBounded [| stdoutTask; stderrTask |]
                 outcome <- settled
             with ex ->
                 error <- Some ex
                 // A fault before the drains were awaited (e.g. waitWithTimeout threw) must not orphan
                 // them — observe them best-effort. Their own fault is secondary to the error we surface.
                 try
-                    do! Task.WhenAll([| stdoutTask; stderrTask |])
+                    do! drainPumpsBounded [| stdoutTask; stderrTask |]
                 with _ ->
                     // best-effort teardown drain; the original fault above is what we report.
                     ()
@@ -2353,7 +2511,7 @@ type RunningProcess
             else
                 latchTerminalDiscard ()
                 consumption <- Consumption.StdoutStreaming
-                let stderrBuffer = Pump.LineBuffer(config.OutputBuffer)
+                let stderrBuffer = GuardedLineBuffer(config.OutputBuffer)
                 stderrStreamBuffer <- stderrBuffer
 
                 // Where a framed stdout line goes. Normally into `stdoutChannel` for the streaming
@@ -2453,8 +2611,16 @@ type RunningProcess
                 streamOutcome <-
                     task {
                         let! outcome = waitWithTimeout ()
-                        // Await both pumps together so neither task is left unobserved if the other faults.
-                        do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
+                        // Await both pumps together so neither task is left unobserved if the other
+                        // faults, bounded so a descendant that inherited this child's stdout/stderr
+                        // cannot hold `FinishAsync`/`ExitTask` open past the leader's own conclusion.
+                        do! drainPumpsBounded [| stdoutPump :> Task; stderrPump :> Task |]
+                        // Normally the stdout pump completed the channel on its own EOF (including the
+                        // EOF the sever hands it). A pump the bound had to abandon never will, so end
+                        // the channel here too — a `StdoutLinesAsync` consumer must reach the end of its
+                        // stream when this session concludes, not wait on a pump nobody owns any more.
+                        // Idempotent with the pump's own completion.
+                        stdoutChannel.TryComplete() |> ignore
                         return outcome
                     }
 
@@ -2484,7 +2650,7 @@ type RunningProcess
                 false
             else
                 consumption <- Consumption.StdoutChunkStreaming
-                let stderrBuffer = Pump.LineBuffer(config.OutputBuffer)
+                let stderrBuffer = GuardedLineBuffer(config.OutputBuffer)
                 stderrStreamBuffer <- stderrBuffer
 
                 let stdoutPump =
@@ -2549,7 +2715,11 @@ type RunningProcess
                 chunkOutcome <-
                     task {
                         let! outcome = waitWithTimeout ()
-                        do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
+                        do! drainPumpsBounded [| stdoutPump :> Task; stderrPump :> Task |]
+                        // As on the line session above: end the chunk channel here as well, so a
+                        // consumer is never left enumerating a channel whose abandoned pump can no
+                        // longer complete it. Idempotent with the pump's own completion.
+                        stdoutChunkChannel.TryComplete() |> ignore
                         return outcome
                     }
 
@@ -2712,6 +2882,10 @@ type RunningProcess
                                     recordedTruncated
                                     || Volatile.Read(&droppedStreamLineCount) > 0
                                     || stderrStreamBuffer.Truncated
+                                    // Symmetric with the buffered capture verbs: output this session's
+                                    // post-exit drain bound cut short is reported as incomplete, whether
+                                    // it was the captured stderr or the stdout a consumer streamed.
+                                    || outputDrainWasBounded ()
                                 )
                             )
             }
@@ -2857,8 +3031,11 @@ type RunningProcess
                         try
                             let! settled = waitWithTimeout ()
                             outcome <- settled
-                            // Await both pumps together so neither is left unobserved if the other faults.
-                            do! Task.WhenAll([| stdoutPump :> Task; stderrPump :> Task |])
+                            // Await both pumps together so neither is left unobserved if the other
+                            // faults, bounded like every other post-exit pump join on this handle. The
+                            // channel completion below then also releases an `OutputEventsAsync`
+                            // consumer whose pump the bound had to abandon.
+                            do! drainPumpsBounded [| stdoutPump :> Task; stderrPump :> Task |]
                             eventChannel.TryComplete() |> ignore
                         with ex ->
                             error <- Some ex
@@ -2953,7 +3130,11 @@ type RunningProcess
                 // Close the window as soon as BOTH readers finish, independently of the exit wait, so a
                 // pattern wait ends promptly on the child's end-of-output instead of burning its whole
                 // timeout. Never faults (it stashes the reader fault into the window instead), so
-                // awaiting it below can't mask the pump fault `interactiveOutcome` re-raises.
+                // awaiting it below can't mask the pump fault `interactiveOutcome` re-raises. It is
+                // deliberately left UNBOUNDED: it is not a wait anything blocks on, and it must stay
+                // able to close the window mid-run. Should the post-exit drain bound have to abandon a
+                // reader, `interactiveOutcome` closes the window itself and this task simply never
+                // completes — `ExpectWindow.Complete` is idempotent, so a late arrival changes nothing.
                 let drained =
                     task {
                         let mutable fault: exn option = None
@@ -2976,13 +3157,38 @@ type RunningProcess
                         // rather than start a second `host.Wait()` racing its reap (KB K-016). It is
                         // reentrant on `stateLock`, which this setup already holds.
                         let! outcome = ensureBufferedWait ()
-                        do! drained
-                        // Re-await the readers themselves so a genuine read fault still surfaces to
-                        // whoever awaits this outcome (`ExitTask`/`StopAsync`), exactly as it does for
-                        // the streaming sessions.
-                        do! Task.WhenAll pumps
-                        conclude outcome
-                        return outcome
+                        // Bounded, and taken on the READERS rather than on `drained`: `drained` only
+                        // ever completes once they do, so joining it first would reintroduce exactly the
+                        // unbounded wait this bound exists to remove.
+                        let mutable readerFault: exn option = None
+                        let mutable readersSettled = true
+
+                        try
+                            let! settled = awaitPumpsSettled pumps
+                            readersSettled <- settled
+                        with ex ->
+                            // A genuine read fault. The readers HAVE ended — that is the only way it can
+                            // surface here — so hold it until the window has been closed with it below,
+                            // preserving the "no pattern waiter outlives this outcome" ordering the
+                            // unbounded join had. It is re-raised unchanged for whoever awaits this
+                            // outcome (`ExitTask`/`StopAsync`), as on the streaming sessions.
+                            readerFault <- Some ex
+
+                        if readersSettled then
+                            // The readers ended, so the window they fill is closed by `drained` with
+                            // their fault (if any) — its own completion is now immediate.
+                            do! drained
+                        else
+                            // A reader the bound had to abandon can no longer close the window, and a
+                            // pattern waiter must not outlive this session's conclusion. Close it with
+                            // no fault: nothing failed — the output simply stops here.
+                            window.Complete None
+
+                        match readerFault with
+                        | Some ex -> return! Task.FromException<Outcome> ex
+                        | None ->
+                            conclude outcome
+                            return outcome
                     }
 
                 // Observe any fault on this otherwise fire-and-forget task (the expect-only case, where
@@ -3042,7 +3248,7 @@ type RunningProcess
                     interactiveOutcome <-
                         task {
                             let! outcome = ensureBufferedWait ()
-                            do! Task.WhenAll pumps
+                            do! drainPumpsBounded pumps
                             conclude outcome
                             return outcome
                         }
@@ -3069,6 +3275,20 @@ type RunningProcess
     /// config, so a test double that models a PTY (`FakeProcess.WithPty`) answers the same as the real
     /// spawn it stands in for, rather than diverging on a config field it never set.
     member internal _.HasPseudoTerminal: bool = hasPseudoTerminal
+
+    /// Whether this handle's bounded post-exit output drain (`PostExitDrain`) had to sever its parent
+    /// read ends because something that inherited the child's stdout/stderr held the pipe open past the
+    /// window. Internal, and a per-HANDLE fact rather than a process-wide counter, so a regression can
+    /// assert that THIS run's capture was cut short without reading state shared with any other test.
+    /// It is exactly the bit every capture ORs into its `Truncated`.
+    member internal _.OutputDrainWasBounded: bool = outputDrainWasBounded ()
+
+    /// Whether even the sever could not end a pump inside the window that follows it, so it was handed
+    /// to `PostExitDrain.abandon` — observed, never awaited again. Internal diagnostic: the verb's
+    /// answer is identical either way, but a regression covering the uninterruptible-read path needs to
+    /// prove it actually took that path rather than the ordinary sever.
+    member internal _.OutputPumpsWereAbandoned: bool =
+        Volatile.Read(&outputPumpsAbandoned) = 1
 
     /// Wait until a stdout line satisfies `predicate`, or fail with `NotReady` after `timeout`
     /// (or `Cancelled` if `cancellationToken` fires first). Consumed lines are not re-delivered; a
@@ -3362,7 +3582,10 @@ type RunningProcess
                             // already in flight, or starts it fresh otherwise — reentrant on `stateLock`,
                             // which we already hold here (see the `Buffered` branch above, which does the same).
                             let! outcome = ensureBufferedWait ()
-                            do! Task.WhenAll([| stdoutDrain; stderrDrain |])
+                            // Bounded like every other post-exit pump join on this handle: a
+                            // `WaitAny`/`WaitAll` on a leader whose descendant inherited its stdout must
+                            // resolve on the leader's own exit, not on that descendant's lifetime.
+                            do! drainPumpsBounded [| stdoutDrain; stderrDrain |]
                             // Racing this handle to exit *is* its completion (conclude does not reap, so the
                             // no-reap contract holds), so a `WaitAny`/`WaitAll`-only run still records its
                             // exit/metrics/span and clears the in-flight mark. Once-guarded, so a terminal verb
