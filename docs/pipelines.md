@@ -162,9 +162,10 @@ single command's `StartAsync` → `RunningProcess`.
 The outcome follows shell **pipefail** (`set -o pipefail`):
 
 - **stdout** is always the **last** stage's output — that is what the chain produced.
-- **code**, **stderr**, and the reported **program** come from the **rightmost** stage that
-  did not finish successfully — a code outside *its* accepted `OkCodes` (just `0` unless
-  widened), a signal kill, or a timeout — or from the last stage when every stage succeeded.
+- **code**, **stderr**, and the reported **program** come from the **rightmost checked** stage
+  that did not finish successfully — a code outside *its* accepted `OkCodes` (just `0` unless
+  widened), a signal kill, or a timeout. When no checked stage failed, they come from the real
+  last stage; an unchecked last stage's voluntary exit is accepted without replacing its code.
 
 So when an inner stage fails, the result's stdout is whatever the tail still printed,
 while the diagnostics point at the culprit:
@@ -359,13 +360,16 @@ Console.WriteLine(await first.RunAsync() switch
 
 The rules:
 
-- An unchecked stage's voluntary non-zero exit is **skipped** when the chain decides whether
-  a checked stage failed. A signal, timeout, or unobserved outcome is never made acceptable.
+- Every unchecked non-last stage is excluded from culprit selection, whatever its outcome; this
+  is why an expected broken-pipe failure or POSIX `SIGPIPE` is skipped. Its outcome is not made
+  acceptable — it simply is not selected as the representative result.
 - A **checked** failure always trumps an unchecked one, regardless of position:
   `uncheckedInPipe` never shields another stage's real failure.
 - When no checked stage failed, the result preserves the real last stage's program, outcome,
   stderr, and exit code. If that last stage is unchecked and exited voluntarily, its actual
-  code is included in `AcceptedCodes`, so the result is successful without rewriting it to `0`.
+  code is included in `AcceptedCodes`, so the result is successful without rewriting it to `0`;
+  a signal, timeout, or unobserved outcome on that last stage has no code to accept and remains
+  a failure.
 - `uncheckedInPipe` forgives exit *status* only — never a whole-chain
   [`Pipeline.Timeout`](#timeouts-and-cancellation) — and it has no effect on a `Command`
   run outside a pipeline, where a single run's status is already plain data in its
