@@ -13,13 +13,17 @@ type Outcome =
     /// Killed because it exceeded its timeout.
     | TimedOut
 
-    /// The process concluded, but its actual exit status could not be observed — a native API
-    /// failure (e.g. Windows `DuplicateHandle`/`GetExitCodeProcess`), or a POSIX reap race whose
-    /// winner never reported the real decoded status within a grace period. `Reason` is a short,
-    /// human-readable explanation for logs/diagnostics. This is deliberately NOT a sentinel for a
-    /// clean exit — never fabricate `Exited 0` for a process whose outcome genuinely was not seen;
-    /// use this case instead. Always treated as a failure (`IsAcceptedBy` is always `false`, like
-    /// `Signalled`/`TimedOut`), and never itself a `-1`/`0` stand-in.
+    /// The run's actual exit status was never observed. Usually the process concluded and its status
+    /// could not be read — a native API failure (e.g. Windows `DuplicateHandle`/`GetExitCodeProcess`),
+    /// or a POSIX reap race whose winner never reported the real decoded status within a grace period
+    /// — but it also covers a hard-killed tree that was not reaped inside the bounded post-kill
+    /// window, where the process may still be alive (a child wedged in uninterruptible sleep defers
+    /// even SIGKILL) and a background reaper holds the single remaining wait. `Reason` is a short,
+    /// human-readable explanation for logs/diagnostics, and says which case this was. This is
+    /// deliberately NOT a sentinel for a clean exit — never fabricate `Exited 0` for a process whose
+    /// outcome genuinely was not seen; use this case instead. Always treated as a failure
+    /// (`IsAcceptedBy` is always `false`, like `Signalled`/`TimedOut`), and never itself a `-1`/`0`
+    /// stand-in.
     | Unobserved of Reason: string
 
     /// The exit code, or `None` for a signal kill, timeout, or unobserved outcome (never a `-1` sentinel).

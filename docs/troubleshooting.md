@@ -90,17 +90,42 @@ the defensive configuration is summarized in
 **Symptom:** An operating system tool shows a remaining child, or a result ends
 with `Outcome.Unobserved reason`.
 
-**Cause:** `Unobserved` does not mean the child is still running. It means the
-process concluded but ProcessKit could not obtain a trustworthy exit status,
-usually because a native wait failed or a POSIX reap race could not be resolved.
-An actual orphan is more commonly caused by losing ownership of a live handle,
-starting descendants outside ProcessKit, or the parent being killed so abruptly
-that disposal cannot run.
+**Cause:** Read the `Unobserved` reason: it says which case this is, and the
+cases differ in whether the child can still be running. The two you are most
+likely to see:
 
-**Solution:** Keep `RunningProcess` and `ProcessGroup` in `use` or
-`await using` scope and drive each run through a terminal verb. ProcessKit's kill
-on drop ownership kills and reaps the contained tree during normal disposal, and
-the finalizer is a fallback. Preserve the `Unobserved` reason if it recurs.
+- *The tree was hard-killed but not reaped in time* — the reason names the
+  bounded post-kill reap window. A wait on a handle whose tree was hard-killed
+  through `RunningProcess.Kill()`, and a `StopAsync` whose grace window escalated
+  to a hard kill, wait at most a post-kill budget for that reap to land
+  (5 seconds; `StopAsync` gets its grace period plus that budget). When the
+  window elapses the verb reports `Unobserved`, and the child *may still be
+  alive* — for example wedged in uninterruptible (`D`-state) sleep, which defers
+  even `SIGKILL` until its I/O unblocks. The wait is transferred, not dropped: a
+  background reaper holds the single remaining right to wait for and reap that
+  tree, so it is still reaped exactly once when the kernel lets it die. A fired
+  timeout and a cancelled run bound the same reap but keep their own answer,
+  `Outcome.TimedOut` and `ProcessError.Cancelled`.
+- *The status read itself failed* — most other reasons. The process concluded,
+  but ProcessKit could not obtain a trustworthy exit status for it, usually
+  because a native wait failed or a POSIX reap race could not be resolved.
+
+An actual orphan — a live process nothing owns any more — is a third, separate
+case, more commonly caused by losing ownership of a live handle, starting
+descendants outside ProcessKit, or the parent being killed so abruptly that
+disposal cannot run.
+
+**Solution:** For a lost or never-disposed handle, keep `RunningProcess` and
+`ProcessGroup` in `use` or `await using` scope and drive each run through a
+terminal verb. ProcessKit's kill on drop ownership kills and reaps the contained
+tree during normal disposal, and the finalizer is a fallback.
+
+That is not the fix for the post-kill case: the kill has already been delivered
+and the remaining wait already belongs to the background reaper, so disposing or
+killing again cannot make the reap land sooner. Look instead at what the child is
+blocked in — on Linux, `ps -o stat= -p <pid>` reports `D` for uninterruptible
+sleep — and at the storage, device, or network filesystem it was using; the tree
+is reaped once that I/O completes. Preserve the `Unobserved` reason if it recurs.
 
 Sudden parent death is a separate platform concern; use
 `Command.KillOnParentDeath` only after reading its scope in the

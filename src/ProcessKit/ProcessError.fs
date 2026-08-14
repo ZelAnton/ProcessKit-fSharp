@@ -264,9 +264,11 @@ type ProcessError =
     /// The run exceeded its configured timeout.
     | Timeout of Program: string * Timeout: TimeSpan * Stdout: string * Stderr: string
 
-    /// The process concluded but its actual exit status could not be observed (see
-    /// `Outcome.Unobserved`) — a native API failure or an unresolved POSIX reap race. `Detail` carries
-    /// the reason. Always a failure; never fabricated as a clean exit.
+    /// The run's actual exit status was never observed (see `Outcome.Unobserved`) — a native API
+    /// failure, an unresolved POSIX reap race, or a hard-killed tree that was not reaped inside the
+    /// bounded post-kill window, where the process may still be alive and a background reaper holds
+    /// the remaining wait. `Detail` carries the reason. Always a failure; never fabricated as a clean
+    /// exit.
     | Unobserved of Program: string * Detail: string
 
     /// The run was cancelled through its `CancellationToken`. A cancellation is always an error.
@@ -376,7 +378,7 @@ type ProcessError =
         | ProcessError.Timeout(program, timeout, _, stderr) ->
             $"'{MessageText.fragment program}' timed out after {timeout.TotalSeconds}s{MessageText.diagnosticTail stderr}"
         | ProcessError.Unobserved(program, detail) ->
-            $"'{MessageText.fragment program}' concluded, but its exit status is unknown: {MessageText.fragment detail}"
+            $"'{MessageText.fragment program}' has no observed exit status: {MessageText.fragment detail}"
         | ProcessError.Cancelled program -> $"'{MessageText.fragment program}' was cancelled"
         | ProcessError.NotReady(program, timeout) ->
             $"'{MessageText.fragment program}' was not ready within {timeout.TotalSeconds}s"

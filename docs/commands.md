@@ -1454,10 +1454,15 @@ semantics (no exit could count as success) and is **rejected** at the builder bo
 
 When the distinction matters, match on `Outcome` instead of decoding the
 `Code` / `IsTimedOut` pair. There are four cases — the fourth, `Unobserved`, is
-the rare honest fallback for a process that concluded but whose actual exit
-status could not be observed (a native API failure, or an unresolved POSIX
-reap race); it is never a stand-in for a clean exit, and (like `Signalled` /
-`TimedOut`) never counts as success:
+the rare honest fallback for a run whose actual exit status was never observed.
+`Reason` says which case it was; the two common ones are a process that concluded
+but whose status could not be read (a native API failure, or an unresolved POSIX
+reap race), and a tree ProcessKit hard-killed — through `RunningProcess.Kill()`
+or `StopAsync` — that was not reaped inside the bounded post-kill window, where
+the child may still be alive and a background reaper owns the remaining wait
+(see [Zombie or orphaned processes](troubleshooting.md#zombie-or-orphaned-processes)).
+It is never a stand-in for a clean exit, and (like `Signalled` / `TimedOut`)
+never counts as success:
 
 **F#**
 

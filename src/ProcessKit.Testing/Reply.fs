@@ -41,7 +41,7 @@ type Reply private (outcome: Outcome, stdout: string, stderr: string, error: Pro
     /// Killed by its timeout (`Outcome.TimedOut`).
     static member TimedOut = Reply(Outcome.TimedOut, "", "", None)
 
-    /// Concluded, but its exit status could not be observed (`Outcome.Unobserved`).
+    /// The run's exit status was not observed (`Outcome.Unobserved`).
     static member Unobserved(reason: string) =
         ArgumentNullException.ThrowIfNull(reason, nameof reason)
         Reply(Outcome.Unobserved reason, "", "", None)
