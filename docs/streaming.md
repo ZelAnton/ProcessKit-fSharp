@@ -602,9 +602,13 @@ Calling `FinishAsync()` without having taken the stdout stream is allowed and co
 stdout is then drained to keep the child moving and discarded as it arrives, exactly like
 `WaitAsync()`, since `Finished` carries the `Outcome` and stderr but never stdout. Your
 `OnStdoutLine` handler and `StdoutTee` still see every line — only the backlog is gone, so there is
-nothing left to drop and `Truncated` reports only the stderr capture. Take the stream first
-(`StdoutLinesAsync()`/`StdoutChunksAsync()`) if you want to read stdout after finishing: its backlog
-is retained for its enumerator as before.
+nothing left to drop and `Truncated` reports only the stderr capture. That finish is also the point
+of no return for stdout, and it says so out loud: asking for the discarded stream afterwards is
+refused as already-consumed — `StdoutLinesAsync()`/`StdoutJsonLinesAsync()` throw
+`InvalidOperationException` and `WaitForLineAsync()` returns `ProcessError.Unsupported`, just as they
+do after `WaitAsync()`/`ProfileAsync()` — instead of handing back an empty stream you could mistake
+for a silent child. So take the stream first (`StdoutLinesAsync()`/`StdoutChunksAsync()`) if you want
+to read stdout after finishing: its backlog is retained for its enumerator as before.
 
 ## Streaming a pipeline's final stage
 

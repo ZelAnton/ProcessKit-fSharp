@@ -158,9 +158,13 @@ lifecycle transition even though they share the backend safety gate.
 - Reaching `FinishAsync()` with the line-stream enumerator never handed out — a fresh handle, or one
   only `WaitForLineAsync` looked at — latches a retain-nothing stdout sink for the rest of the run:
   the pump keeps framing lines (handlers, tee, counters, and fault classification are unchanged) but
-  stops queueing them, because no reader for that channel exists and the claim gate can no longer
-  produce one. Framing and queueing are unchanged once the enumerator *was* handed out, and nothing
-  already queued is discarded.
+  stops queueing them, because no reader for that channel exists. The same latch closes the claim gate
+  behind it, so one cannot be created either: a later `StdoutLinesAsync`/`StdoutJsonLinesAsync` throws
+  the already-consumed `InvalidOperationException` and a later `WaitForLineAsync` returns
+  `Unsupported`, exactly as after `WaitAsync`/`ProfileAsync` — never an empty stream or a `NotReady`
+  standing in for output that was deliberately dropped. `FinishAsync()` itself stays repeatable.
+  Framing and queueing are unchanged once the enumerator *was* handed out, and nothing already queued
+  is discarded.
 - Streaming verbs cannot be chained. A completed or failed stream still owns its original claim.
 - Buffered verbs, each public stream enumerator, and each interactive session constructor are
   once-only alternatives.

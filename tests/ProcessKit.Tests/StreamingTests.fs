@@ -771,22 +771,88 @@ type StreamingTests() =
                 Assert.That(finished.Truncated, Is.False, "a discarded stdout stream drops nothing to report")
 
             // The lines were still framed and counted — handlers, tee and counters behave exactly as on
-            // the streamed path; only the sink changed.
+            // the streamed path; only the sink changed. Nothing reached a backlog, so nothing could be
+            // dropped from one either: this pair is how the retain-nothing sink is observed now that the
+            // channel itself can no longer be read back (below). The ~48 MB sibling test measures the
+            // heap directly.
             Assert.That(running.StdoutLineCount, Is.EqualTo total)
             Assert.That(running.DroppedStreamLineCount, Is.EqualTo 0)
 
-            // And none of them is still sitting in the streaming channel. Reading it after the fact is
-            // the one way to observe what it retained: the channel is completed, so this ends at once.
-            let residue = collect (running.StdoutLinesAsync())
-            let! winner = Task.WhenAny(residue :> Task, Task.Delay 5000)
-            Assert.That(obj.ReferenceEquals(winner, residue), Is.True, "the post-finish stdout reader hung")
-            let! retained = residue
+            // And that discarded stdout is refused rather than served empty. An enumerator that simply
+            // completes would be indistinguishable from a child that printed nothing, so the claim gate
+            // closes with the sink: asking for a stream this handle can no longer produce is the same
+            // already-consumed error a stdout verb gets after `WaitAsync`/`ProfileAsync`.
+            match Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutLinesAsync() |> ignore)) with
+            | null -> Assert.Fail "expected StdoutLinesAsync to refuse a discarded stdout stream"
+            | refused -> Assert.That(refused.Message, Does.Contain "already been consumed")
+
+            // The NDJSON overloads fold into `StdoutLinesAsync`, so they are refused with it.
+            Assert.Throws<InvalidOperationException>(
+                Action(fun () -> running.StdoutJsonLinesAsync<JsonLine>() |> ignore)
+            )
+            |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForLineAsync after a terminal fresh FinishAsync refuses instead of reporting NotReady``() : Task =
+        task {
+            use running =
+                syntheticStdoutProcess (Command.create "test").Config (linesPayload 64)
+
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+
+            // `NotReady` would be a false diagnosis here: it means "no matching line arrived within the
+            // timeout", but this stdout was deliberately discarded and no line can ever arrive on it. The
+            // honest answer is the already-consumed refusal — and it must come from the closed claim gate,
+            // not from the deadline, so an ample timeout still returns at once.
+            let clock = Stopwatch.StartNew()
+
+            match! running.WaitForLineAsync((fun _ -> true), TimeSpan.FromSeconds 30.0) with
+            | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "already been consumed")
+            | Error other -> Assert.Fail $"expected an already-consumed refusal, got {other}"
+            | Ok line -> Assert.Fail $"a discarded stdout stream cannot deliver a line, got {line}"
 
             Assert.That(
-                retained.Count,
-                Is.EqualTo 0,
-                "a terminal-only FinishAsync must leave no stdout line queued in the unread channel"
+                clock.Elapsed,
+                Is.LessThan(TimeSpan.FromSeconds 30.0),
+                "the refusal must come from the claim gate, not from waiting out the timeout"
             )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``FinishAsync latches the discard over a WaitForLineAsync session nobody took over``() : Task =
+        task {
+            let total = 32
+
+            use running =
+                syntheticStdoutProcess (Command.create "test").Config (linesPayload total)
+
+            // The OTHER shape that reaches the latch: `WaitForLineAsync` — not `FinishAsync` — started
+            // the stdout session, and no `StdoutLinesAsync` caller ever took its enumerator, so the
+            // terminal `FinishAsync` rejoins an already-claimed session and must latch there too.
+            match! running.WaitForLineAsync((fun line -> line = "line-1"), TimeSpan.FromSeconds 30.0) with
+            | Ok line -> Assert.That(line, Is.EqualTo "line-1")
+            | Error error -> Assert.Fail $"{error}"
+
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished ->
+                Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+                Assert.That(finished.Truncated, Is.False)
+
+            Assert.That(running.StdoutLineCount, Is.EqualTo total)
+            Assert.That(running.DroppedStreamLineCount, Is.EqualTo 0)
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutLinesAsync() |> ignore))
+            |> ignore
+
+            match! running.WaitForLineAsync((fun _ -> true), TimeSpan.FromSeconds 30.0) with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected an already-consumed refusal, got {other}"
         }
         :> Task
 
@@ -866,12 +932,17 @@ type StreamingTests() =
             | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
 
             Assert.That(running.StdoutLineCount, Is.EqualTo total)
+            Assert.That(running.DroppedStreamLineCount, Is.EqualTo 0)
 
-            let residue = collect (running.StdoutLinesAsync())
-            let! winner = Task.WhenAny(residue :> Task, Task.Delay 5000)
-            Assert.That(obj.ReferenceEquals(winner, residue), Is.True, "the post-finish stdout reader hung")
-            let! retained = residue
-            Assert.That(retained.Count, Is.EqualTo 0, "the spawn double must retain no stdout either")
+            // Retaining nothing and refusing afterwards are one contract, so the doubles must publish
+            // both halves — a test double that answered with an empty stream here would let a consumer
+            // write code the real runner rejects.
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutLinesAsync() |> ignore))
+            |> ignore
+
+            match! running.WaitForLineAsync((fun _ -> true), TimeSpan.FromSeconds 30.0) with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected an already-consumed refusal, got {other}"
         }
         :> Task
 

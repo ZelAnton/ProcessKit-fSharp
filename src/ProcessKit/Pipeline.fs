@@ -262,7 +262,9 @@ type PipelineSession
     /// `Finished.Outcome`, not an `Error`. Reaps the whole tree.
     /// Pairs with `StdoutLinesAsync` (it rejoins that stdout-streaming session); called with no prior
     /// streaming it drains and discards the final stdout as it arrives — retaining nothing — then
-    /// reports the outcome.
+    /// reports the outcome, after which `StdoutLinesAsync`/`StdoutJsonLinesAsync`/`WaitForLineAsync` are
+    /// refused as already-consumed rather than answered with an empty stream (see
+    /// `RunningProcess.FinishAsync`).
     member _.FinishAsync() : Task<Result<Finished, ProcessError>> =
         task {
             match! inner.FinishAsync() with

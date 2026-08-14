@@ -489,15 +489,27 @@ type RunningProcess
     // enumerator was never handed out — the "fresh handle, nobody ever streamed" shape `FinishAsync`
     // itself starts the session for, and equally the `WaitForLineAsync`-started session no
     // `StdoutLinesAsync`/`StdoutJsonLinesAsync` caller ever took over. `FinishAsync` returns the outcome
-    // and the captured STDERR; stdout is not part of `Finished` at all, so past that point nobody can
-    // read `stdoutChannel` any more — queueing the child's stdout into it only pins the whole output of
-    // a multi-gigabyte producer in memory (the channel is unbounded unless `Command.StreamBuffer` opts
-    // in) until the handle is disposed, for data that is by then unreachable by construction (T-357).
-    // Once latched, the stdout pump keeps framing lines exactly as before — `OnStdoutLine`, `StdoutTee`,
-    // `StdoutLineCount`, the decoder, and every genuine read/handler fault are all unchanged — and only
-    // the SINK changes: each framed line is dropped instead of queued, the same retain-nothing stdout
-    // contract `WaitAsync`/`ProfileAsync` already publish. Decided under `stateLock` (where
-    // `stdoutLinesClaimed` is decided too) and read by the pump on every line, hence `Volatile`.
+    // and the captured STDERR; stdout is not part of `Finished` at all, so queueing the child's stdout
+    // into `stdoutChannel` only pins the whole output of a multi-gigabyte producer in memory (the channel
+    // is unbounded unless `Command.StreamBuffer` opts in) until the handle is disposed, for output the
+    // caller has just declined to take (T-357).
+    //
+    // The latch turns BOTH ends of that channel off together, under `stateLock`, and it is the second
+    // half that makes the first one honest:
+    //   - the SINK: each framed line is dropped instead of queued. The rest of the pump path is
+    //     unchanged — `OnStdoutLine`, `StdoutTee`, `StdoutLineCount`, the decoder, and every genuine
+    //     read/handler fault behave exactly as on the streamed path.
+    //   - the claim GATE (`StartStdoutStreaming`): every later NON-terminal stdout-line caller
+    //     (`StdoutLinesAsync`/`StdoutJsonLinesAsync`, `WaitForLineAsync`) is refused with the same
+    //     already-consumed error a call after `WaitAsync`/`ProfileAsync` gets. Refusing is the point:
+    //     handing out a reader over a channel that is no longer being filled would answer
+    //     `StdoutLinesAsync` with a silently empty stream and `WaitForLineAsync` with a `NotReady` that
+    //     reads as "the line never came" — a silent downgrade of a result these verbs used to deliver,
+    //     where this library owes a loud, typed refusal.
+    // Together they publish the same retain-nothing stdout contract `WaitAsync`/`ProfileAsync` already
+    // do: stdout is drained so the child keeps moving, kept nowhere, and asked for afterwards it is an
+    // error rather than an empty answer. Decided under `stateLock` (where `stdoutLinesClaimed` is decided
+    // too) and read by the pump on every line, hence `Volatile`.
     let mutable stdoutStreamDiscarding = false
 
     let discardStdoutStream () =
@@ -2297,19 +2309,21 @@ type RunningProcess
         this.ProfileAsync(TimeSpan.FromMilliseconds 100.0)
 
     // Returns false when a different consumption (a buffered verb, or event streaming) already owns the
-    // pipes; true once the stdout streaming session is (or already was) ours. The whole check + claim +
+    // pipes, and — for a non-terminal caller — once a terminal `FinishAsync` has discarded this session's
+    // stdout; true once the stdout streaming session is (or already was) ours. The whole check + claim +
     // session setup runs under `stateLock`, so a concurrent second `StdoutLinesAsync`/`WaitForLineAsync`/
     // `FinishAsync` either observes a fully-constructed session (channel + pumps + `streamOutcome` all
     // assigned) or, if it is an incompatible consumer, is atomically refused — never a half-built
     // session, and never two racing setups building two readers on the one channel.
     //
     // `terminalOnly` marks the ONE caller that ends the run rather than consuming its stdout —
-    // `FinishAsync`. Reaching here from there with no enumerator handed out (`stdoutLinesClaimed`)
-    // means nothing can ever read `stdoutChannel` again, so the session is (or becomes) a
-    // retain-nothing drain instead of a queue nobody will empty — see `stdoutStreamDiscarding`. The
-    // decision is made HERE, under the same lock and before the pumps are built, so the fresh case
-    // never queues even a first line; deciding it after this returns would leave a window in which the
-    // pump had already started filling the channel.
+    // `FinishAsync`. Reaching here from there with no enumerator handed out (`stdoutLinesClaimed`) makes
+    // the session a retain-nothing drain instead of a queue nobody will empty, and closes this gate to
+    // every later non-terminal stdout-line caller — so "nothing can ever read `stdoutChannel` again" is
+    // enforced right here rather than merely assumed; see `stdoutStreamDiscarding`. The decision is made
+    // HERE, under the same lock and before the pumps are built, so the fresh case never queues even a
+    // first line; deciding it after this returns would leave a window in which the pump had already
+    // started filling the channel.
     member private _.StartStdoutStreaming(terminalOnly: bool) : bool =
         lock stateLock (fun () ->
             // A stream that was handed out (`stdoutLinesClaimed`) keeps the existing join semantics in
@@ -2322,7 +2336,16 @@ type RunningProcess
                 if terminalOnly && not stdoutLinesClaimed then
                     discardStdoutStream ()
 
-            if consumption = Consumption.StdoutStreaming then
+            if not terminalOnly && discardingStdoutStream () then
+                // A terminal `FinishAsync` already latched the retain-nothing sink for a stream nobody
+                // took, so this channel is no longer being filled and never will be again. Refuse the
+                // caller with the ordinary already-consumed error — the same answer it would get after
+                // `WaitAsync`/`ProfileAsync`, which retain nothing either — rather than hand out a reader
+                // that could only report an empty stdout the child never had. `FinishAsync` itself
+                // (`terminalOnly`) still passes: repeating it stays the idempotent terminal hand-off it
+                // is for a streamed session.
+                false
+            elif consumption = Consumption.StdoutStreaming then
                 latchTerminalDiscard ()
                 true
             elif consumption <> Consumption.Fresh then
@@ -2337,7 +2360,8 @@ type RunningProcess
                 // consumer; once a terminal-only `FinishAsync` has latched `stdoutStreamDiscarding`
                 // (see there) the line is dropped instead — it was still framed, teed and handed to
                 // `OnStdoutLine` exactly as on the streamed path, it is only never queued, because no
-                // reader for the channel exists and none can still be created. Nothing being queued
+                // reader for the channel exists and the same latch makes the gate above refuse to create
+                // one (that refusal is what keeps this drop from being a silent one). Nothing being queued
                 // also means the channel's `StreamBuffer` capacity has nothing left to overflow: no
                 // fail-loud `OutputTooLarge` and no drop bookkeeping can fire from a stream that
                 // retains nothing, so the byte counter feeding that diagnostic is left alone too.
@@ -2555,7 +2579,10 @@ type RunningProcess
     /// Hands out its ONE enumerator exactly once per handle — a second call (directly, or via
     /// `StdoutJsonLinesAsync`, which itself calls this) throws `InvalidOperationException`, same as any
     /// other already-consumed verb; `FinishAsync`/`WaitForLineAsync` remain free to rejoin the same
-    /// session afterwards (they do not produce a second enumerator).
+    /// session afterwards (they do not produce a second enumerator). Take the stream BEFORE finishing:
+    /// a `FinishAsync` that ran with no enumerator handed out discards stdout as it arrives, so this
+    /// throws the same already-consumed `InvalidOperationException` afterwards rather than returning a
+    /// stream that could only be empty.
     member this.StdoutLinesAsync() : IAsyncEnumerable<string> =
         if not (this.StartStdoutStreaming(terminalOnly = false)) then
             raise (InvalidOperationException alreadyConsumedMessage)
@@ -2565,6 +2592,13 @@ type RunningProcess
                 // `StartStdoutStreaming()` above is deliberately reentrant (it must let `FinishAsync`/
                 // `WaitForLineAsync` rejoin an already-claimed session), so it alone can't refuse this
                 // second enumerator-producing call — that is what this flag is for.
+                raise (InvalidOperationException alreadyConsumedMessage)
+            elif discardingStdoutStream () then
+                // Re-checked here because this verb takes the lock TWICE (gate, then claim): a
+                // `FinishAsync` racing in between still sees no enumerator handed out and latches the
+                // retain-nothing sink, so the stream this call is about to return would quietly run dry.
+                // Concurrent verbs on one handle are undefined API-wide, but "undefined" must not mean
+                // "silently empty" — refuse with the same already-consumed error the gate would have.
                 raise (InvalidOperationException alreadyConsumedMessage)
             else
                 stdoutLinesClaimed <- true)
@@ -2630,8 +2664,11 @@ type RunningProcess
     ///
     /// Safe to call without streaming first: stdout is then drained to keep the child moving and
     /// **discarded as it arrives**, retaining nothing — `Finished` carries the outcome and stderr, never
-    /// stdout, so there is nothing for a caller to come back for (use `OutputStringAsync`/
-    /// `OutputBytesAsync` to capture stdout, or `StdoutLinesAsync`/`StdoutChunksAsync` to stream it).
+    /// stdout. Asking for that stdout afterwards is refused, not answered with an empty stream: a
+    /// later `StdoutLinesAsync`/`StdoutJsonLinesAsync` throws `InvalidOperationException` and a later
+    /// `WaitForLineAsync` returns `ProcessError.Unsupported`, the same already-consumed answer they give
+    /// after `WaitAsync`/`ProfileAsync`. Capture stdout with `OutputStringAsync`/`OutputBytesAsync`, or
+    /// take `StdoutLinesAsync`/`StdoutChunksAsync` BEFORE finishing, if you need it.
     /// A stream that WAS handed out keeps the existing hand-off semantics unchanged: everything the
     /// child wrote stays queued for its enumerator, dropped or bounded only by the `StreamBuffer`
     /// policy the caller opted into.
@@ -3035,7 +3072,9 @@ type RunningProcess
 
     /// Wait until a stdout line satisfies `predicate`, or fail with `NotReady` after `timeout`
     /// (or `Cancelled` if `cancellationToken` fires first). Consumed lines are not re-delivered; a
-    /// later `StdoutLinesAsync`/`FinishAsync` sees the rest.
+    /// later `StdoutLinesAsync`/`FinishAsync` sees the rest. Once a `FinishAsync` that took no stream
+    /// has discarded stdout, this returns `ProcessError.Unsupported` (already consumed) rather than a
+    /// `NotReady` that would read as "the line never arrived" for a stream nobody can be given.
     member this.WaitForLineAsync
         (predicate: Func<string, bool>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<string, ProcessError>> =
