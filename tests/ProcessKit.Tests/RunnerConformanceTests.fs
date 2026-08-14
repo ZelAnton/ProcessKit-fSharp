@@ -18,13 +18,13 @@ open ProcessKit.Testing
 ///
 /// ## Capability matrix
 ///
-/// | Implementation                              | Spawn | StdinFeed | TimeoutEnforcement | DistinctStreams | ScriptedOutcome |
-/// |----------------------------------------------|:-----:|:---------:|:-------------------:|:----------------:|:----------------:|
-/// | `JobRunner` / `ProcessGroup` (real subprocess)|  Y    |    Y      |         Y            |        Y         |        Y         |
-/// | `ScriptedRunner`                              |  Y    |    N      |         N            |        Y         |        Y         |
-/// | `DryRunRunner`                                |  Y    |    N      |         N            |        N         |        N         |
-/// | `FaultInjectingRunner` (delegate mode)        |  Y    |    N      |         N            |        Y         |        Y         |
-/// | `RecordReplayRunner` (`Record` mode)          |  N    |    Y      |         Y            |        Y         |        Y         |
+/// | Implementation                              | Spawn | StdinFeed | TimeoutEnforcement | DistinctStreams | ScriptedOutcome | OsBackedPty |
+/// |----------------------------------------------|:-----:|:---------:|:-------------------:|:----------------:|:----------------:|:-----------:|
+/// | `JobRunner` / `ProcessGroup` (real subprocess)|  Y    |    Y      |         Y            |        Y         |        Y         | Windows/Linux only (see below) |
+/// | `ScriptedRunner`                              |  Y    |    N      |         N            |        Y         |        Y         |     Y       |
+/// | `DryRunRunner`                                |  Y    |    N      |         N            |        N         |        N         |     Y       |
+/// | `FaultInjectingRunner` (delegate mode)        |  Y    |    N      |         N            |        Y         |        Y         |     Y       |
+/// | `RecordReplayRunner` (`Record` mode)          |  N    |    Y      |         Y            |        Y         |        Y         | Windows/Linux only (see below) |
 ///
 /// `JobRunner` and `ProcessGroup` share one row rather than one fixture each: `ProcessGroup` is itself
 /// an `IProcessRunner` whose capture verbs route through the exact same `RunningProcess` primitives as
@@ -65,12 +65,28 @@ open ProcessKit.Testing
 /// - **ScriptedOutcome** — the implementation can be driven to conclude with an `Outcome` other than a
 ///   clean `Exited 0`. `false` only for `DryRunRunner`, whose `resolve` always builds
 ///   `FakeProcess.OfCommand(command).WithStdout(render)` with no way to script a different outcome.
+/// - **OsBackedPty** — a `Command.Pty` run against this implementation is expected to complete without
+///   an honest `ProcessError.Unsupported`, so the PTY test can assert the merged-stream contract rather
+///   than skip. `true` unconditionally for every in-memory double (`ScriptedRunner`/`DryRunRunner`, and
+///   `FaultInjectingRunner` wrapping one): `FakeProcess.WithPty()` simulates the merged-stream contract
+///   with no host dependency at all — see `ScriptedRunner.fs`/`DryRunRunner.fs`'s
+///   `if command.Config.Pty.IsSome then fake.WithPty()`. For the two real-subprocess rows (`JobRunner`/
+///   `ProcessGroup`, and `RecordReplayRunner` in `Record` mode, which delegates straight to a real
+///   `JobRunner`) this is a genuine host fact: Windows needs ConPTY (Windows 10 1809+, assumed present
+///   on any host this suite runs on) and POSIX needs the `setsid --ctty` controlling-terminal helper
+///   from util-linux in a trusted directory plus `/dev/ptmx` — present on Linux, absent entirely on
+///   macOS/BSD (no pty devfs at all — see `Command.Pty`'s own doc comment for the full platform
+///   matrix). This fixture makes the same static "Windows or Linux" assumption `PtyTests.fs`'s real
+///   POSIX pty tests already make (their "Linux-only" gate) rather than probing a live spawn: `false`
+///   on macOS/BSD, `true` on Windows/Linux, and the PTY test is skipped up front with `Assert.Ignore`
+///   when it is `false` — a documented matrix exclusion, never a silent per-test error-path catch.
 type ConformanceCapabilities =
     { SupportsSpawn: bool
       SupportsStdinFeed: bool
       SupportsTimeoutEnforcement: bool
       SupportsDistinctStreams: bool
-      SupportsScriptedOutcome: bool }
+      SupportsScriptedOutcome: bool
+      SupportsOsBackedPty: bool }
 
 /// The shared NUnit conformance fixture: the minimal consumer-visible contract of `IProcessRunner` that
 /// every implementation in the capability matrix above must honour where its capabilities say it can.
@@ -313,26 +329,29 @@ type RunnerConformanceFixtureBase() =
     [<Test>]
     member this.``Command.Pty runs as a single merged stream with no separate stderr``() : Task =
         task {
-            let command =
-                if this.Capabilities.SupportsDistinctStreams then
-                    this.DistinctStreamsCommand("pty-out-marker", "pty-err-marker")
-                else
-                    this.EchoCommand "pty-out-marker"
-                |> Command.pty
+            if not this.Capabilities.SupportsOsBackedPty then
+                Assert.Ignore
+                    "this host/implementation has no OS-backed Command.Pty support (capability matrix: SupportsOsBackedPty=false — see ConformanceCapabilities's doc comment, OsBackedPty row, for the platform requirement)"
+            else
+                let command =
+                    if this.Capabilities.SupportsDistinctStreams then
+                        this.DistinctStreamsCommand("pty-out-marker", "pty-err-marker")
+                    else
+                        this.EchoCommand "pty-out-marker"
+                    |> Command.pty
 
-            match! this.Runner.OutputStringAsync(command, CancellationToken.None) with
-            | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks PTY support: {msg}"
-            | Error other -> Assert.Fail $"unexpected error under Command.Pty: {other.Message}"
-            | Ok result ->
-                Assert.That(result.Stderr, Is.Empty, "a PTY run must have no separate stderr channel (D3)")
-                Assert.That(result.Stdout, Does.Contain "pty-out-marker")
+                match! this.Runner.OutputStringAsync(command, CancellationToken.None) with
+                | Error error -> Assert.Fail $"unexpected error under Command.Pty: {error.Message}"
+                | Ok result ->
+                    Assert.That(result.Stderr, Is.Empty, "a PTY run must have no separate stderr channel (D3)")
+                    Assert.That(result.Stdout, Does.Contain "pty-out-marker")
 
-                if this.Capabilities.SupportsDistinctStreams then
-                    Assert.That(
-                        result.Stdout,
-                        Does.Contain "pty-err-marker",
-                        "stderr must fold into the merged pty stream"
-                    )
+                    if this.Capabilities.SupportsDistinctStreams then
+                        Assert.That(
+                            result.Stdout,
+                            Does.Contain "pty-err-marker",
+                            "stderr must fold into the merged pty stream"
+                        )
         }
 
 /// Shared command-building over a real subprocess shell, reused by every real-runner-backed conformance
@@ -341,6 +360,14 @@ type RunnerConformanceFixtureBase() =
 [<AbstractClass>]
 type RealRunnerConformanceFixtureBase() =
     inherit RunnerConformanceFixtureBase()
+
+    // Static, shared across every subclass: the "Windows or Linux" platform assumption documented on
+    // `ConformanceCapabilities`'s `OsBackedPty` row — the same one `PtyTests.fs`'s real POSIX pty tests
+    // already make (their "Linux-only" gate). macOS/BSD has no pty devfs at all (`Command.Pty`'s own
+    // doc comment), so it is the one platform excluded here.
+    static let osBackedPtySupported =
+        RuntimeInformation.IsOSPlatform OSPlatform.Windows
+        || RuntimeInformation.IsOSPlatform OSPlatform.Linux
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
@@ -355,7 +382,8 @@ type RealRunnerConformanceFixtureBase() =
           SupportsStdinFeed = true
           SupportsTimeoutEnforcement = true
           SupportsDistinctStreams = true
-          SupportsScriptedOutcome = true }
+          SupportsScriptedOutcome = true
+          SupportsOsBackedPty = osBackedPtySupported }
 
     override _.EchoCommand(text) = shell $"echo {text}"
 
@@ -428,7 +456,8 @@ type ScriptedRunnerConformanceTests() =
           SupportsStdinFeed = false
           SupportsTimeoutEnforcement = false
           SupportsDistinctStreams = true
-          SupportsScriptedOutcome = true }
+          SupportsScriptedOutcome = true
+          SupportsOsBackedPty = true }
 
     override _.EchoCommand(text) =
         let program = "conformance-echo"
@@ -473,7 +502,8 @@ type DryRunRunnerConformanceTests() =
           SupportsStdinFeed = false
           SupportsTimeoutEnforcement = false
           SupportsDistinctStreams = false
-          SupportsScriptedOutcome = false }
+          SupportsScriptedOutcome = false
+          SupportsOsBackedPty = true }
 
     override _.EchoCommand(text) = Command.create text
 
@@ -523,7 +553,8 @@ type FaultInjectingRunnerConformanceTests() =
           SupportsStdinFeed = false
           SupportsTimeoutEnforcement = false
           SupportsDistinctStreams = true
-          SupportsScriptedOutcome = true }
+          SupportsScriptedOutcome = true
+          SupportsOsBackedPty = true }
 
     override _.EchoCommand(text) =
         let program = "fi-conformance-echo"
