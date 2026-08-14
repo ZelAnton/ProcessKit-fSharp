@@ -196,6 +196,39 @@ type private CancelThenFailRunner(source: CancellationTokenSource, error: Proces
         member _.SpawnAsync(_command, _cancellationToken) =
             Task.FromResult<Result<RunningProcess, ProcessError>>(Error(fail ()))
 
+/// A tee sink whose every write fails, so a replay that feeds it must surface that failure the way a
+/// real run does — the capture pump reclassifies a write `IOException` into `ProcessError.Io` — instead
+/// of hiding it behind the recorded success. `FlushAsync` deliberately succeeds: the pump's final flush
+/// is best-effort and swallows I/O errors, so a sink that failed only there would prove nothing.
+type private FailingTeeStream() =
+    inherit Stream()
+
+    override _.CanRead = false
+    override _.CanSeek = false
+    override _.CanWrite = true
+    override _.Length = 0L
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+
+    override _.Read(_buffer: byte[], _offset: int, _count: int) : int =
+        raise (NotSupportedException "a tee sink is write-only")
+
+    override _.Seek(_offset: int64, _origin: SeekOrigin) : int64 =
+        raise (NotSupportedException "a tee sink is not seekable")
+
+    override _.SetLength(_value: int64) =
+        raise (NotSupportedException "a tee sink is not seekable")
+
+    override _.Write(_buffer: byte[], _offset: int, _count: int) =
+        raise (IOException "the tee sink is broken")
+
+    override _.WriteAsync(_buffer: ReadOnlyMemory<byte>, _cancellationToken: CancellationToken) : ValueTask =
+        ValueTask(Task.FromException(IOException "the tee sink is broken"))
+
 [<TestFixture>]
 type CassetteTests() =
 
@@ -3369,3 +3402,538 @@ type CassetteTests() =
                     | Ok result -> Assert.That(result.Stdout, Is.EqualTo "second", "capture order must be intact")
                     | Error error -> Assert.Fail $"the second recording must still replay: {error}"
             })
+
+    // --- Replayed output side effects (line handlers and tee sinks) -----------------------------------
+    //
+    // A replay serves the cassette instead of a child, but the CALLER's own output plumbing still has to
+    // run: a command's `OnStdoutLine`/`OnStderrLine` handlers and its `StdoutTee`/`StderrTee` sinks are
+    // what a progress parser or a log file is built on. Reconstructing a `ProcessResult` straight from an
+    // entry touches no stream, so a hermetic replay used to skip all of them silently — turning exactly
+    // the tests those callbacks exist for into no-ops, and swallowing a fault one of them raised along
+    // with the rest. These tests pin what a replay hit reproduces, that it reproduces it exactly once,
+    // that a handler/sink failure still surfaces, and that the record/miss path does not double up.
+
+    [<Test>]
+    member _.``a strict replay drives both line handlers, per stream and in line order``() : Task =
+        withCassette (fun path ->
+            task {
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "out1\nout2", "Stderr": "err1\nerr2", "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    let stdoutLines = ResizeArray<string>()
+                    let stderrLines = ResizeArray<string>()
+
+                    let command =
+                        Command.create "tool"
+                        |> Command.onStdoutLine (fun line -> stdoutLines.Add line)
+                        |> Command.onStderrLine (fun line -> stderrLines.Add line)
+
+                    match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                    | Ok result ->
+                        CollectionAssert.AreEqual([| "out1"; "out2" |], stdoutLines.ToArray())
+                        CollectionAssert.AreEqual([| "err1"; "err2" |], stderrLines.ToArray())
+                        // The value handed back is still the one rebuilt from the entry: replaying the
+                        // side effects must not become a second, disagreeing source of the result.
+                        Assert.That(result.Stdout, Is.EqualTo "out1\nout2")
+                        Assert.That(result.Stderr, Is.EqualTo "err1\nerr2")
+                    | Error error -> Assert.Fail $"replay failed: {error}"
+            })
+
+    [<Test>]
+    member _.``a strict replay feeds both tee sinks the exact recorded bytes``() : Task =
+        withCassette (fun path ->
+            task {
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "out1\nout2", "Stderr": "err1", "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    use stdoutTee = new MemoryStream()
+                    use stderrTee = new MemoryStream()
+
+                    let command =
+                        Command.create "tool"
+                        |> Command.stdoutTee (stdoutTee :> Stream)
+                        |> Command.stderrTee (stderrTee :> Stream)
+
+                    match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                    | Ok _ ->
+                        // A tee is byte-exact and flushed by the pump itself, so the sink holds the
+                        // recorded stream verbatim without the caller disposing it first.
+                        Assert.That(
+                            stdoutTee.ToArray(),
+                            Is.EqualTo<byte>(Encoding.UTF8.GetBytes "out1\nout2"),
+                            "stdout tee"
+                        )
+
+                        Assert.That(stderrTee.ToArray(), Is.EqualTo<byte>(Encoding.UTF8.GetBytes "err1"), "stderr tee")
+                    | Error error -> Assert.Fail $"replay failed: {error}"
+            })
+
+    [<Test>]
+    member _.``a replayed final line without a trailing newline is delivered exactly once``() : Task =
+        task {
+            // A recording normalizes its captured text, so both spellings occur in the wild: the same two
+            // lines must come out of either, with the last one delivered once — never dropped for want of
+            // a terminator, and never followed by a phantom empty line when one is present.
+            let template =
+                """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "@STDOUT@", "Stderr": "", "Code": 0 } ] }"""
+
+            let fixtures = [ "unterminated", "out1\\nout2"; "terminated", "out1\\nout2\\n" ]
+
+            for label, recorded in fixtures do
+                let path = Path.GetTempFileName()
+
+                try
+                    File.WriteAllText(path, template.Replace("@STDOUT@", recorded))
+
+                    match RecordReplayRunner.Replay path with
+                    | Error error -> Assert.Fail $"replay load ({label}): {error}"
+                    | Ok replayer ->
+                        use replayer = replayer
+                        let lines = ResizeArray<string>()
+
+                        let command =
+                            Command.create "tool" |> Command.onStdoutLine (fun line -> lines.Add line)
+
+                        match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                        | Ok _ -> CollectionAssert.AreEqual([| "out1"; "out2" |], lines.ToArray(), label)
+                        | Error error -> Assert.Fail $"replay failed ({label}): {error}"
+                finally
+                    deleteCassette path
+        }
+
+    [<Test>]
+    member _.``a throwing line handler faults a replay instead of returning the recorded success``() : Task =
+        withCassette (fun path ->
+            task {
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "out1\nout2", "Stderr": "", "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    let seen = ResizeArray<string>()
+
+                    let command =
+                        Command.create "tool"
+                        |> Command.onStdoutLine (fun line ->
+                            seen.Add line
+                            raise (InvalidOperationException "handler blew up"))
+
+                    let mutable caught: exn option = None
+
+                    try
+                        let! _ = (runner replayer).CaptureStringAsync(command, CancellationToken.None)
+                        ()
+                    with ex ->
+                        // Captured rather than swallowed: the whole point is that the caller's own fault
+                        // reaches them, so it is asserted on below instead of being ignored here.
+                        caught <- Some ex
+
+                    match caught with
+                    | Some ex -> Assert.That(ex, Is.TypeOf<InvalidOperationException>())
+                    | None -> Assert.Fail "a throwing handler must not be hidden behind the recorded success"
+
+                    Assert.That(seen.Count, Is.EqualTo 1, "the handler must have run before it faulted")
+            })
+
+    [<Test>]
+    member _.``a failing tee sink faults a replay as ProcessError.Io, like a live run``() : Task =
+        withCassette (fun path ->
+            task {
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 7, "Entries": [ { "Program": "tool", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "out1", "Stderr": "", "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    use broken = new FailingTeeStream()
+
+                    let command = Command.create "tool" |> Command.stdoutTee (broken :> Stream)
+                    let mutable caught: exn option = None
+
+                    try
+                        let! _ = (runner replayer).CaptureStringAsync(command, CancellationToken.None)
+                        ()
+                    with ex ->
+                        // Captured for the assertion below, not swallowed — a sink failure must not be
+                        // able to end as a clean replayed success.
+                        caught <- Some ex
+
+                    match caught with
+                    | Some(:? ProcessException as ex) ->
+                        match ex.Error with
+                        | ProcessError.Io _ -> ()
+                        | other -> Assert.Fail $"a broken tee must surface as ProcessError.Io, got {other}"
+                    | Some other -> Assert.Fail $"expected a ProcessException, got {other.GetType().Name}"
+                    | None -> Assert.Fail "a broken tee sink must not be hidden behind the recorded success"
+            })
+
+    [<Test>]
+    member _.``record mode does not re-run the side effects its inner runner already produced``() : Task =
+        withCassette (fun path ->
+            task {
+                // `ScriptedRunner` builds its fake from the very command it is handed, so recording drives
+                // the caller's handler through the real pumps exactly as a live run does. A record path
+                // that ALSO replayed the entry it just wrote would double every line.
+                let inner =
+                    ScriptedRunner().Fallback(Reply.Ok("out1\nout2").WithStderr "err1") :> IProcessRunner
+
+                let stdoutLines = ResizeArray<string>()
+                let stderrLines = ResizeArray<string>()
+
+                let command =
+                    Command.create "tool"
+                    |> Command.onStdoutLine (fun line -> stdoutLines.Add line)
+                    |> Command.onStderrLine (fun line -> stderrLines.Add line)
+
+                use recorder = RecordReplayRunner.Record(path, inner)
+
+                match! (runner recorder).OutputStringAsync(command, CancellationToken.None) with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail $"record failed: {error}"
+
+                CollectionAssert.AreEqual([| "out1"; "out2" |], stdoutLines.ToArray(), "stdout handler")
+                CollectionAssert.AreEqual([| "err1" |], stderrLines.ToArray(), "stderr handler")
+            })
+
+    [<Test>]
+    member _.``an Auto miss produces its side effects once, and the following hit replays them once``() : Task =
+        withCassette (fun path ->
+            task {
+                let inner = ScriptedRunner().Fallback(Reply.Ok "out1\nout2") :> IProcessRunner
+                let lines = ResizeArray<string>()
+
+                let command =
+                    Command.create "tool" |> Command.onStdoutLine (fun line -> lines.Add line)
+
+                match RecordReplayRunner.Auto(path, inner) with
+                | Error error -> Assert.Fail $"auto load: {error}"
+                | Ok recorder ->
+                    use recorder = recorder
+
+                    // The miss delegates to the inner runner, which produces the side effects itself.
+                    match! (runner recorder).OutputStringAsync(command, CancellationToken.None) with
+                    | Ok _ -> CollectionAssert.AreEqual([| "out1"; "out2" |], lines.ToArray(), "the miss")
+                    | Error error -> Assert.Fail $"auto miss failed: {error}"
+
+                    // The repeat hits the entry the miss just recorded, and replays the same lines once.
+                    match! (runner recorder).OutputStringAsync(command, CancellationToken.None) with
+                    | Ok _ ->
+                        CollectionAssert.AreEqual(
+                            [| "out1"; "out2"; "out1"; "out2" |],
+                            lines.ToArray(),
+                            "the hit must replay the lines exactly once more"
+                        )
+                    | Error error -> Assert.Fail $"auto hit failed: {error}"
+            })
+
+    [<Test>]
+    member _.``a text recording tees its lines in the command's configured stdout encoding``() : Task =
+        withCassette (fun path ->
+            task {
+                let command = Command.create "tool" |> Command.stdoutEncoding Encoding.Latin1
+
+                do!
+                    task {
+                        use recorder =
+                            RecordReplayRunner.Record(
+                                path,
+                                ScriptedRunner().Fallback(Reply.Ok "café") :> IProcessRunner
+                            )
+
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    use tee = new MemoryStream()
+                    let lines = ResizeArray<string>()
+
+                    let observed =
+                        command
+                        |> Command.stdoutTee (tee :> Stream)
+                        |> Command.onStdoutLine (fun line -> lines.Add line)
+
+                    match! (runner replayer).OutputStringAsync(observed, CancellationToken.None) with
+                    | Ok _ ->
+                        CollectionAssert.AreEqual([| "café" |], lines.ToArray())
+                        // A tee sees raw bytes, so it must see the command's own encoding — not UTF-8.
+                        Assert.That(tee.ToArray(), Is.EqualTo<byte>(Encoding.Latin1.GetBytes "café"))
+                    | Error error -> Assert.Fail $"replay failed: {error}"
+            })
+
+    [<Test>]
+    member _.``a bytes replay reproduces the bytes verb's own side effects, not the text verb's``() : Task =
+        withCassette (fun path ->
+            task {
+                // The bytes verb captures stdout RAW: its tee sees the bytes, but there is no line
+                // structure, so `OnStdoutLine` is never called — while stderr stays line-pumped. A replay
+                // must reproduce that asymmetry rather than inventing stdout lines, so the live double and
+                // the cassette are driven through the same command shape and compared.
+                let inner =
+                    ScriptedRunner().Fallback(Reply.Ok("café").WithStderr "warn") :> IProcessRunner
+
+                let observed
+                    (stdoutLines: ResizeArray<string>)
+                    (stderrLines: ResizeArray<string>)
+                    (tee: MemoryStream)
+                    =
+                    Command.create "tool"
+                    |> Command.stdoutEncoding Encoding.Latin1
+                    |> Command.stdoutTee (tee :> Stream)
+                    |> Command.onStdoutLine (fun line -> stdoutLines.Add line)
+                    |> Command.onStderrLine (fun line -> stderrLines.Add line)
+
+                let liveStdoutLines = ResizeArray<string>()
+                let liveStderrLines = ResizeArray<string>()
+                use liveTee = new MemoryStream()
+
+                let! live =
+                    inner.CaptureBytesAsync(observed liveStdoutLines liveStderrLines liveTee, CancellationToken.None)
+
+                match live with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail $"live bytes run failed: {error}"
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, inner)
+
+                        let! _ =
+                            (runner recorder)
+                                .OutputBytesAsync(
+                                    Command.create "tool" |> Command.stdoutEncoding Encoding.Latin1,
+                                    CancellationToken.None
+                                )
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    let stdoutLines = ResizeArray<string>()
+                    let stderrLines = ResizeArray<string>()
+                    use tee = new MemoryStream()
+
+                    match!
+                        (runner replayer)
+                            .OutputBytesAsync(observed stdoutLines stderrLines tee, CancellationToken.None)
+                    with
+                    | Ok _ ->
+                        Assert.That(stdoutLines, Is.Empty, "the bytes verb has no stdout line structure")
+                        CollectionAssert.AreEqual(liveStdoutLines.ToArray(), stdoutLines.ToArray(), "stdout handler")
+                        CollectionAssert.AreEqual([| "warn" |], stderrLines.ToArray(), "stderr handler")
+                        CollectionAssert.AreEqual(liveStderrLines.ToArray(), stderrLines.ToArray(), "stderr handler")
+                        Assert.That(tee.ToArray(), Is.EqualTo<byte>(liveTee.ToArray()), "stdout tee")
+                        Assert.That(tee.ToArray(), Is.EqualTo<byte>(Encoding.Latin1.GetBytes "café"), "stdout tee")
+                    | Error error -> Assert.Fail $"replay failed: {error}"
+            })
+
+    [<Test>]
+    member _.``a bytes recording tees its exact non-UTF-8 bytes on replay and through a spawn``() : Task =
+        withCassette (fun path ->
+            task {
+                // Bytes that no encoding round-trip survives (a lone 0xFF, an embedded NUL): the tee must
+                // get the recorded bytes themselves, not a decode-then-re-encode that replaces them with
+                // U+FFFD — that loss is precisely what the bytes capture verb exists to avoid.
+                let raw = [| 0xFFuy; 0xFEuy; 0x00uy; 0x01uy; 0x80uy; 0x41uy |]
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedBytesRunner(raw, "", 0))
+                        let! _ = (runner recorder).OutputBytesAsync(Command.create "tool", CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    use directTee = new MemoryStream()
+
+                    match!
+                        (runner replayer)
+                            .OutputBytesAsync(
+                                Command.create "tool" |> Command.stdoutTee (directTee :> Stream),
+                                CancellationToken.None
+                            )
+                    with
+                    | Ok result ->
+                        Assert.That(result.Stdout, Is.EqualTo<byte>(raw), "the replayed result")
+                        Assert.That(directTee.ToArray(), Is.EqualTo<byte>(raw), "the direct capture's tee")
+                    | Error error -> Assert.Fail $"bytes replay failed: {error}"
+
+                    // The reconstructed handle carries the same bytes, so a streaming consumer of a
+                    // replayed spawn cannot see something the direct capture verb did not.
+                    use spawnTee = new MemoryStream()
+
+                    match!
+                        (runner replayer)
+                            .SpawnAsync(
+                                Command.create "tool" |> Command.stdoutTee (spawnTee :> Stream),
+                                CancellationToken.None
+                            )
+                    with
+                    | Error error -> Assert.Fail $"spawn replay failed: {error}"
+                    | Ok proc ->
+                        use proc = proc
+
+                        match! proc.OutputBytesAsync() with
+                        | Ok result ->
+                            Assert.That(result.Stdout, Is.EqualTo<byte>(raw), "the spawned handle's own bytes")
+                            Assert.That(spawnTee.ToArray(), Is.EqualTo<byte>(raw), "the spawn replay's tee")
+                        | Error error -> Assert.Fail $"spawned bytes capture failed: {error}"
+            })
+
+    [<Test>]
+    member _.``a PTY replay drives the merged stream and has no separate stderr side effect``() : Task =
+        withCassette (fun path ->
+            task {
+                // A PTY is one terminal device, so the builder refuses a separate-stderr observer outright
+                // — there is no such stream for a replay to drive, and the recorded merged output has to
+                // reach the STDOUT handler and tee whole.
+                let ptyCommand = Command.create "tui" |> Command.pty
+
+                Assert.Throws<ArgumentException>(
+                    Action(fun () -> ptyCommand.OnStderrLine(Action<string>(fun _ -> ())) |> ignore)
+                )
+                |> ignore
+
+                Assert.Throws<ArgumentException>(Action(fun () -> ptyCommand.StderrTee(new MemoryStream()) |> ignore))
+                |> ignore
+
+                do!
+                    task {
+                        use recorder =
+                            RecordReplayRunner.Record(
+                                path,
+                                ScriptedRunner().Fallback(Reply.Ok("frame1\nframe2").WithStderr "warn")
+                                :> IProcessRunner
+                            )
+
+                        let! _ = (runner recorder).OutputStringAsync(ptyCommand, CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    use tee = new MemoryStream()
+                    let lines = ResizeArray<string>()
+
+                    let observed =
+                        ptyCommand
+                        |> Command.stdoutTee (tee :> Stream)
+                        |> Command.onStdoutLine (fun line -> lines.Add line)
+
+                    match! (runner replayer).OutputStringAsync(observed, CancellationToken.None) with
+                    | Ok result ->
+                        // The scripted stderr was folded into the terminal stream at record time, so it
+                        // arrives as another stdout line — never as a separate stderr observation.
+                        CollectionAssert.AreEqual([| "frame1"; "frame2"; "warn" |], lines.ToArray())
+                        Assert.That(tee.ToArray(), Is.EqualTo<byte>(Encoding.UTF8.GetBytes "frame1\nframe2\nwarn"))
+                        Assert.That(result.Stderr, Is.EqualTo "", "a PTY result carries no separate stderr")
+                    | Error error -> Assert.Fail $"replay failed: {error}"
+            })
+
+    [<Test>]
+    member _.``a direct replay and a SpawnAsync replay produce the same side effects, PTY included``() : Task =
+        task {
+            for label, isPty in [ "plain", false; "pty", true ] do
+                let path = Path.GetTempFileName()
+
+                try
+                    let bare =
+                        if isPty then
+                            Command.create "tool" |> Command.pty
+                        else
+                            Command.create "tool"
+
+                    let observed (lines: ResizeArray<string>) (tee: MemoryStream) =
+                        bare
+                        |> Command.stdoutTee (tee :> Stream)
+                        |> Command.onStdoutLine (fun line -> lines.Add line)
+
+                    do!
+                        task {
+                            use recorder =
+                                RecordReplayRunner.Record(
+                                    path,
+                                    ScriptedRunner().Fallback(Reply.Ok "out1\nout2") :> IProcessRunner
+                                )
+
+                            let! _ = (runner recorder).OutputStringAsync(bare, CancellationToken.None)
+
+                            match recorder.Save() with
+                            | Ok() -> ()
+                            | Error error -> Assert.Fail $"save ({label}): {error}"
+                        }
+
+                    match RecordReplayRunner.Replay path with
+                    | Error error -> Assert.Fail $"replay load ({label}): {error}"
+                    | Ok replayer ->
+                        use replayer = replayer
+                        let directLines = ResizeArray<string>()
+                        use directTee = new MemoryStream()
+
+                        match!
+                            (runner replayer).OutputStringAsync(observed directLines directTee, CancellationToken.None)
+                        with
+                        | Ok _ -> ()
+                        | Error error -> Assert.Fail $"direct replay ({label}): {error}"
+
+                        // The entry repeats once its capture order is exhausted, so the same recording
+                        // serves the spawned replay below.
+                        let spawnLines = ResizeArray<string>()
+                        use spawnTee = new MemoryStream()
+
+                        match! (runner replayer).SpawnAsync(observed spawnLines spawnTee, CancellationToken.None) with
+                        | Error error -> Assert.Fail $"spawn replay ({label}): {error}"
+                        | Ok proc ->
+                            use proc = proc
+
+                            match! proc.OutputStringAsync() with
+                            | Ok _ -> ()
+                            | Error error -> Assert.Fail $"spawned capture ({label}): {error}"
+
+                        CollectionAssert.AreEqual([| "out1"; "out2" |], directLines.ToArray(), $"{label} direct lines")
+                        CollectionAssert.AreEqual(directLines.ToArray(), spawnLines.ToArray(), $"{label} lines agree")
+                        Assert.That(spawnTee.ToArray(), Is.EqualTo<byte>(directTee.ToArray()), $"{label} tees agree")
+                finally
+                    deleteCassette path
+        }
