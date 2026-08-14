@@ -626,6 +626,11 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // Until one of those arms it, this task never completes and the exit wait behaves exactly as
     // before: an ordinary child is reaped synchronously and reports its REAL outcome, with no budget
     // and no artificial delay anywhere on the normal path.
+    //
+    // It bounds the waits that are IN FLIGHT when the kill lands. A wait that starts later cannot use
+    // it — this is a one-shot latch that stays completed for the life of the handle, so racing it
+    // would answer instantly and read nothing (see `boundedExitWait`, which gives such a wait its own
+    // window instead).
     let postKillDeadline =
         // RunContinuationsAsynchronously: the arming timer's callback must not run the exit wait's
         // continuation inline on the timer thread.
@@ -1048,27 +1053,48 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         "the graceful stop hard-killed the tree, but its conclusion was not observed within the grace period plus the bounded post-kill reap window; a background reaper owns the remaining wait"
 
     // The one `host.Wait()` for this handle (see `ensureBufferedWait`/`ExitTask` for why there is
-    // exactly one), bounded once a hard kill delivered through this handle has spent its post-kill
-    // budget. A delivered SIGKILL/`TerminateProcess` is not a promise that the child is reapable now —
-    // a child wedged in uninterruptible sleep defers even SIGKILL — so a kill-then-wait caller (a
-    // cancelled run's `Kill()`, the pump-fault kill) would otherwise wait forever on a tree it has
-    // already killed. When the budget elapses the native wait keeps running as the SINGLE eventual
-    // reaper, adopted by the `PostKillReap` ledger (which observes its fault; on POSIX it is the same
-    // shared `waitPosix` group, so nothing starts a second reap — K-016), and this wait resolves to an
-    // honest `Unobserved`. Unarmed — the normal case — this is a straight pass-through.
+    // exactly one), bounded once a hard kill has been delivered through this handle. A delivered
+    // SIGKILL/`TerminateProcess` is not a promise that the child is reapable now — a child wedged in
+    // uninterruptible sleep defers even SIGKILL — so a kill-then-wait caller (a cancelled run's
+    // `Kill()`, the pump-fault kill) would otherwise wait forever on a tree it has already killed. When
+    // the budget elapses the native wait keeps running as the SINGLE eventual reaper, adopted by the
+    // `PostKillReap` ledger (which observes its fault; on POSIX it is the same shared `waitPosix` group,
+    // so nothing starts a second reap — K-016), and this wait resolves to an honest `Unobserved`.
+    //
+    // The budget runs from whichever came LAST: the kill, or this wait's own start. That distinction is
+    // the whole point of the two branches below — the window exists to stop a CALLER from blocking
+    // unboundedly after the answer is decided, so a caller that only starts waiting later must get a
+    // window of its own rather than inherit a spent one. Time between the kill and the first verb
+    // (`Kill()`, then any work, then `WaitAsync`/`OutputStringAsync`/... — the exit wait is created
+    // lazily by the first of them) would otherwise leave `postKillDeadline` already completed and
+    // report `Unobserved` for a perfectly ordinary killed child whose status was there for the asking.
+    // Either way the caller blocks at most one budget, and either way a wait that genuinely does not
+    // land inside its window hands ownership over instead of being dropped. With no kill delivered at
+    // all — the normal path — this is a straight pass-through, with no budget and no timer.
     let boundedExitWait () : Task<Outcome> =
         let wait = host.Wait()
         let waitBase = wait :> Task
 
-        task {
-            let! winner = Task.WhenAny(waitBase, postKillDeadline.Task)
+        if Volatile.Read(&postKillArmed) = 1 then
+            // The kill preceded this wait: give it a full budget measured from here. `awaitWithin` also
+            // answers an already-completed wait without arming anything, and adopts on expiry.
+            task {
+                match! PostKillReap.awaitWithin (PostKillReap.budget ()) wait with
+                | ValueSome outcome -> return outcome
+                | ValueNone -> return Outcome.Unobserved postKillUnobservedReason
+            }
+        else
+            // No kill yet: the handle-wide latch is what bounds this wait, one budget after a kill
+            // delivered while it is in flight (and never at all if none is).
+            task {
+                let! winner = Task.WhenAny(waitBase, postKillDeadline.Task)
 
-            if obj.ReferenceEquals(winner, waitBase) then
-                return! wait
-            else
-                PostKillReap.adoptWait waitBase
-                return Outcome.Unobserved postKillUnobservedReason
-        }
+                if obj.ReferenceEquals(winner, waitBase) then
+                    return! wait
+                else
+                    PostKillReap.adoptWait waitBase
+                    return Outcome.Unobserved postKillUnobservedReason
+            }
 
     // Wait for exit, applying the configured total and/or idle timeout: on whichever deadline fires,
     // kill the tree (gracefully if `TimeoutGrace` is set, else hard) — one shared kill for both, so no

@@ -226,7 +226,7 @@ exec "$sp" --pdeathsig=SIGKILL /bin/sh -c "$g" sh "$e" "$@"
                 spawned.Stderr |> Option.iter (fun s -> s.Dispose())
                 spawned.Stdin |> Option.iter (fun s -> s.Dispose())
                 Native.Posix.killProcess (int spawned.Handle)
-                Native.Posix.reapLeader (int spawned.Handle)
+                Native.Posix.reapLeader (int spawned.Handle) |> ignore
                 Assert.Fail "the fault seam did not fail the spawn — a child may have leaked"
         finally
             reset ()
@@ -334,7 +334,7 @@ exec "$sp" --pdeathsig=SIGKILL /bin/sh -c "$g" sh "$e" "$@"
                 | Error other -> Assert.Fail $"expected ProcessError.Spawn, got {other}"
                 | Ok spawned ->
                     Native.Posix.killProcessGroup spawned.Pid
-                    Native.Posix.reapLeader spawned.Pid
+                    Native.Posix.reapLeader spawned.Pid |> ignore
                     Assert.Fail "detached spawn succeeded despite a failed reaper preparation"
 
                 do! Task.Delay 100
@@ -374,7 +374,7 @@ exec "$sp" --pdeathsig=SIGKILL /bin/sh -c "$g" sh "$e" "$@"
                 | true, pid ->
                     try
                         Native.Posix.killProcess pid
-                        Native.Posix.reapLeader pid
+                        Native.Posix.reapLeader pid |> ignore
                     with _ ->
                         // Best-effort cleanup for a deliberately failing path; a correct implementation has
                         // already killed and reaped this pid before returning.
@@ -393,7 +393,7 @@ exec "$sp" --pdeathsig=SIGKILL /bin/sh -c "$g" sh "$e" "$@"
                 | Error other -> Assert.Fail $"expected ProcessError.Spawn, got {other}"
                 | Ok spawned ->
                     Native.Posix.killProcessGroup spawned.Pid
-                    Native.Posix.reapLeader spawned.Pid
+                    Native.Posix.reapLeader spawned.Pid |> ignore
                     Assert.Fail "detached spawn succeeded despite a failed reaper handoff"
 
                 Assert.That(File.Exists ready, Is.True, "handoff failure was reported before the child ran")
@@ -557,7 +557,7 @@ exec "$sp" --pdeathsig=SIGKILL /bin/sh -c "$g" sh "$e" "$@"
                 | Error other -> Assert.Fail $"expected ProcessError.Spawn from the injected fault, got {other}"
                 | Ok spawned ->
                     Native.Posix.killProcessGroup spawned.Pid
-                    Native.Posix.reapLeader spawned.Pid
+                    Native.Posix.reapLeader spawned.Pid |> ignore
                     Assert.Fail "the priority fault seam did not fail the detached spawn"
             finally
                 reset ()

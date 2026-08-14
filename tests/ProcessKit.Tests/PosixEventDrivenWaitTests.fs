@@ -313,7 +313,9 @@ type PosixEventDrivenWaitTests() =
                 let reapTask = Task.Run(fun () -> Native.Posix.reapLeader pid)
 
                 let! outcome = withDeadline 5000 waitTask
-                do! reapTask
+                // The racing reap's own verdict (it may or may not be the side that won the `waitpid`)
+                // is not what this test is about — the shared wait's resolved status is.
+                let! _ = reapTask
 
                 spawned.Stdout |> Option.iter (fun s -> s.Dispose())
                 spawned.Stderr |> Option.iter (fun s -> s.Dispose())

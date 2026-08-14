@@ -28,8 +28,10 @@ open System.Threading.Tasks
 ///    pid/pgid/handle: on POSIX the adopted wait is `Native.Posix.waitPosix`, which joins the one
 ///    shared reap group instead of opening a second pidfd or triggering a second `waitpid` (K-016);
 ///    on Windows the adopted wait already holds its own duplicated handle (K-025). Teardown asks
-///    `ownsLeader` first and stands down for a leader this ledger owns, so a group
-///    `Shutdown`/`Dispose` never re-kills or re-waits it.
+///    `ownsLeader` first and stands down for a leader this ledger provably owns (its captured
+///    start-time identity matches), so a group `Shutdown`/`Dispose` never re-kills or re-waits it;
+///    `adoptLeader` independently refuses a second adoption of the same pid, so the single-waiter
+///    invariant never rests on that verdict alone.
 ///
 /// 3. **Identity safety.** An adopted leader is recorded together with the start-time token captured
 ///    while it was still definitively ours — the snapshot-before-off-lock-work rule (K-086/K-025) —
@@ -40,6 +42,31 @@ open System.Threading.Tasks
 ///
 /// Deliberately NOT a general "kill things later" service: it starts no thread, owns no queue, and
 /// polls nothing. It is bookkeeping plus fault observation over waits the OS is already driving.
+///
+/// What a bounded, owner-side reap of one POSIX leader concluded — the only input that may decide
+/// whether that leader's eventual wait/reap is handed to the ledger. It answers the question the
+/// handoff actually asks (is this still OUR unreaped child?), which is NOT the question the
+/// liveness+identity choke answers (is that process GROUP still ours?): a group stays alive while any
+/// member does, including after its leader has been reaped.
+type internal LeaderReap =
+
+    /// This call performed the reap: the leader's status has been consumed (and fanned out to any wait
+    /// already pending on it). Nothing may open a wait for this pid again — a wait on a reaped pid
+    /// observes `ECHILD`, fabricates an `Unobserved`, and risks racing a recycled number (K-016).
+    | Reaped
+
+    /// `waitpid` reports the leader is not ours to reap: `ECHILD` (whoever owns its wait already
+    /// reaped it, or it was never our child), or a failure that leaves the question unanswered. The
+    /// unanswered case is deliberately folded in here rather than into `StillRunning`: opening a
+    /// waiter on a guess is the outcome with teeth (a blocking `waitpid` on a possibly recycled pid),
+    /// while declining one only falls back to the pre-existing "left for the OS to reap" behaviour.
+    | Gone
+
+    /// The leader is still our LIVE, unreaped child now that the bounded window has ended — a child
+    /// wedged in uninterruptible sleep defers even SIGKILL. This is the one verdict under which the
+    /// single eventual wait/reap is still available and unclaimed, so it can be handed to the ledger.
+    | StillRunning
+
 module internal PostKillReap =
 
     /// How long a completion path waits for the physical reap after its hard kill was delivered. The
@@ -143,16 +170,26 @@ module internal PostKillReap =
             }
 
     /// Does the ledger already own the eventual wait/reap for `pid`? `identity` is the caller's
-    /// captured start-time token for the pid it is about to act on: ownership only carries over when
-    /// the two tokens cannot be shown to differ — a *different* known token is positive proof the
-    /// number was recycled (mirroring `Native.Posix.processGroupStillTracked`'s rule), so the caller
-    /// is looking at a stranger and this ledger's entry says nothing about it.
+    /// captured start-time token for the pid it is about to act on, and ownership carries over ONLY on
+    /// positive proof that this is the same target that was adopted: both tokens known and equal.
+    ///
+    /// The direction matters, because a caller that hears "owned" stands down entirely — including
+    /// from delivering a hard kill (`PosixReap.leaderUsing`). An unknown token on either side (a
+    /// platform with no identity reader, or a read that failed) is not proof of anything, and treating
+    /// a guess as ownership would let this ledger suppress a kill-on-drop the caller genuinely owed.
+    /// So the same rule the liveness+identity choke follows applies here: only positive proof may
+    /// suppress an action, never an unknown (see `Native.Posix.processGroupStillTracked`).
+    ///
+    /// Standing down is not what keeps the "never a second waiter" invariant either — `adoptLeader`
+    /// refuses outright to adopt a pid the ledger already holds. A teardown acting on an unknown token
+    /// therefore re-delivers a choke-gated kill and re-probes the leader, but still cannot open a
+    /// second wait on it.
     let ownsLeader (pid: int) (identity: uint64 option) : bool =
         match leaders.TryGetValue pid with
         | true, adopted ->
             match adopted, identity with
             | Some a, Some b -> a = b
-            | _ -> true
+            | _ -> false
         | false, _ -> false
 
     /// Transfer ownership of the eventual wait/reap of leader `pid` to the ledger, starting that wait

@@ -2532,38 +2532,61 @@ module internal Posix =
 
     /// Best-effort synchronous reap of a POSIX child we own (a group leader, whose pid == its pgid)
     /// during teardown — it was just SIGKILLed, so it becomes a zombie within a moment. Uses a
-    /// *non-blocking* `WNOHANG` wait in a short bounded loop, deliberately NOT a blocking `waitpid`:
-    /// a blocking wait would (a) stall the disposing/finalizer thread indefinitely on a child wedged
-    /// in uninterruptible (D-state) sleep, where SIGKILL is deferred, and (b) compete for the reap a
-    /// run verb may be blocking on. A child already reaped elsewhere yields ECHILD — the harmless
-    /// no-op we want. A still-wedged child is left for the OS to reap at host exit (the prior, rarer
-    /// failure mode), rather than wedging teardown.
-    let reapLeader (pid: int) : unit =
+    /// *non-blocking* `WNOHANG` wait in a bounded loop of at most `maxAttempts` (~1 ms apart),
+    /// deliberately NOT a blocking `waitpid`: a blocking wait would (a) stall the disposing/finalizer
+    /// thread indefinitely on a child wedged in uninterruptible (D-state) sleep, where SIGKILL is
+    /// deferred, and (b) compete for the reap a run verb may be blocking on.
+    ///
+    /// It REPORTS what it concluded, because that verdict — and nothing else — decides whether the
+    /// leader's eventual wait/reap may be handed to the `PostKillReap` ledger: `waitpid` is the only
+    /// probe that answers "is this still OUR unreaped child?", and it cannot be fooled by a recycled
+    /// number (a stranger is not our child, so it yields `ECHILD` → `Gone`).
+    let private reapLeaderWithin (maxAttempts: int) (pid: int) : LeaderReap =
         let mutable status = 0
         let mutable attempts = 0
         let mutable finished = false
+        let mutable verdict = LeaderReap.StillRunning
 
-        // ~200 ms ceiling: the common just-SIGKILLed child is reaped in the first iteration or two;
-        // the bound only matters for a wedged child, which we must not let stall teardown.
-        while not finished && attempts < 200 do
+        while not finished && attempts < maxAttempts do
             attempts <- attempts + 1
             let result = waitpid (pid, &status, WNOHANG)
 
             if result = 0 then
-                // Still alive — SIGKILL not yet reflected; wait a brief, bounded moment and retry.
-                System.Threading.Thread.Sleep 1
+                // Still alive — SIGKILL not yet reflected; wait a brief, bounded moment and retry. Never
+                // on the final attempt: the answer is already "still our live, unreaped child".
+                if attempts < maxAttempts then
+                    System.Threading.Thread.Sleep 1
             elif result < 0 && Marshal.GetLastWin32Error() = EINTR then
                 () // interrupted before we learned anything; loop and retry
             else
-                finished <- true // reaped (result = pid), or ECHILD / other error — nothing more to do
+                finished <- true
 
-                // If event-driven `waitPosix` waits are still pending for this pid (an abandoned run
-                // being torn down concurrently with, or just ahead of, its own exit), hand EVERY waiter on
-                // the group the real decoded status now that we have it, rather than leaving them to notice
-                // only `ECHILD` whenever they next get a chance to look. `completePending` resolves the
-                // whole group at once, so all waiters agree on this one status.
                 if result = pid then
+                    verdict <- LeaderReap.Reaped
+
+                    // If event-driven `waitPosix` waits are still pending for this pid (an abandoned run
+                    // being torn down concurrently with, or just ahead of, its own exit), hand EVERY waiter on
+                    // the group the real decoded status now that we have it, rather than leaving them to notice
+                    // only `ECHILD` whenever they next get a chance to look. `completePending` resolves the
+                    // whole group at once, so all waiters agree on this one status.
                     completePending pid (decodeWaitStatus status)
+                else
+                    // ECHILD (already reaped by whoever owns its wait) or another error: either way there
+                    // is no unreaped child of ours here, so nothing may open a wait for this pid.
+                    verdict <- LeaderReap.Gone
+
+        verdict
+
+    /// The teardown reap on its full window: ~200 ms, because the common just-SIGKILLed child is reaped
+    /// in the first iteration or two and the bound only matters for a wedged child, which must not stall
+    /// teardown. A leader still running when it ends is handed to the ledger by the caller
+    /// (`PosixReap.leaderUsing`) rather than left for the OS to reap at host exit.
+    let reapLeader (pid: int) : LeaderReap = reapLeaderWithin 200 pid
+
+    /// The same reap with no window at all: ONE non-blocking `waitpid`, no sleep. Used once teardown's
+    /// shared drain budget is spent — the budget bounds how long teardown may WAIT, and a single syscall
+    /// is not a wait, while its answer is exactly what the handoff decision needs.
+    let reapLeaderOnce (pid: int) : LeaderReap = reapLeaderWithin 1 pid
 
     // The detached handoff has not succeeded until this returns. Kill both the fresh session and the
     // leader directly (the latter closes the tiny pre-session race defensively), then use the existing
@@ -2572,7 +2595,9 @@ module internal Posix =
     let private terminateAndReapDetached (pid: int) =
         killProcessGroup pid
         kill (pid, SIGKILL) |> ignore
-        reapLeader pid
+        // Spawn-failure teardown of a child nobody else can be waiting on yet: the verdict has no
+        // handoff decision to feed here, so it is deliberately discarded.
+        reapLeader pid |> ignore
 
     // ----------------------------------------------------------------------------------
     // POSIX privilege drop / session detach / parent-death signal
@@ -3571,7 +3596,9 @@ module internal Posix =
                                 if config.Pty.IsSome then
                                     kill (pid, SIGKILL) |> ignore
 
-                                reapLeader pid
+                                // Spawn-fault teardown: the child never reached a caller, so no wait exists
+                                // to hand anywhere and the reap verdict has nothing to decide.
+                                reapLeader pid |> ignore
 
                                 for stream in createdStreams do
                                     try
@@ -4511,7 +4538,9 @@ module internal Posix =
                                     // reapLeader's waitpid therefore remains identity-safe and can never reap
                                     // a recycled or unrelated process.
                                     killProcessGroup pid
-                                    reapLeader pid
+                                    // Same spawn-fault teardown as above: nothing awaits this child, so
+                                    // the reap verdict has no handoff to feed.
+                                    reapLeader pid |> ignore
 
                                     Error(
                                         ProcessError.Spawn(

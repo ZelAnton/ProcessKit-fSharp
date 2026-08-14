@@ -10,27 +10,36 @@ open ProcessKit
 
 /// The injected native gates behind one POSIX leader's teardown (`PosixReap.leaderUsing`), so the
 /// bounded-reap and handoff decisions can be exercised without a real child wedged in `D`-state.
-/// `aliveBefore`/`aliveAfterReap` model the liveness+identity choke's verdict on either side of the
-/// bounded reap: a leader that becomes reapable answers `false` afterwards, one that stays wedged
-/// answers `true`.
-type private LeaderProbe(aliveBefore: bool, aliveAfterReap: bool, owned: bool) =
+///
+/// `groupAliveBefore`/`groupAliveAfterReap` model what the production gate
+/// (`Native.Posix.processGroupStillTracked`) actually answers on either side of the reap: the
+/// liveness + identity verdict for the process GROUP, `killpg(id, 0)`, which keeps answering `true`
+/// while ANY member of the group is alive — so a group whose leader was just reaped still answers
+/// `true` whenever that leader backgrounded a descendant. `verdict` is the separate question the
+/// owner-side `waitpid` answers about the LEADER itself, and it is the only thing allowed to decide
+/// the handoff.
+type private LeaderProbe(groupAliveBefore: bool, groupAliveAfterReap: bool, verdict: LeaderReap, owned: bool) =
     let kills = List<int>()
-    let reaps = List<int>()
+    let reaps = List<bool * int>()
     let adopts = List<int * uint64 option>()
     let mutable reaped = false
 
     member _.Kills = List.ofSeq kills
+
+    /// Every reap attempt as `(the drain budget still allowed a bounded wait, pid)`.
     member _.Reaps = List.ofSeq reaps
+
     member _.Adopts = List.ofSeq adopts
 
     member _.Run(reapNow: bool, pid: int, identity: uint64 option) =
         PosixReap.leaderUsing
-            (fun _ _ -> if reaped then aliveAfterReap else aliveBefore)
+            (fun _ _ -> if reaped then groupAliveAfterReap else groupAliveBefore)
             (fun _ _ -> owned)
             (fun id -> kills.Add id)
-            (fun id ->
-                reaps.Add id
-                reaped <- true)
+            (fun withinBudget id ->
+                reaps.Add(withinBudget, id)
+                reaped <- true
+                verdict)
             (fun id token -> adopts.Add(id, token))
             reapNow
             pid
@@ -147,11 +156,23 @@ type GracefulTeardownTests() =
 
     [<Test>]
     member _.``a leader still wedged after its bounded reap is handed to the reaper (T-351)``() =
-        let probe = LeaderProbe(aliveBefore = true, aliveAfterReap = true, owned = false)
+        let probe =
+            LeaderProbe(
+                groupAliveBefore = true,
+                groupAliveAfterReap = true,
+                verdict = LeaderReap.StillRunning,
+                owned = false
+            )
+
         probe.Run(reapNow = true, pid = 4242, identity = Some 77UL)
 
         Assert.That(probe.Kills, Is.EqualTo<int list> [ 4242 ], "the kill must still be delivered")
-        Assert.That(probe.Reaps, Is.EqualTo<int list> [ 4242 ], "the bounded synchronous reap must still be attempted")
+
+        Assert.That(
+            probe.Reaps,
+            Is.EqualTo<(bool * int) list> [ true, 4242 ],
+            "the bounded synchronous reap must still be attempted"
+        )
 
         Assert.That(
             probe.Adopts,
@@ -161,11 +182,18 @@ type GracefulTeardownTests() =
 
     [<Test>]
     member _.``a leader reaped inside its bounded window is not handed off (T-351)``() =
-        let probe = LeaderProbe(aliveBefore = true, aliveAfterReap = false, owned = false)
+        let probe =
+            LeaderProbe(
+                groupAliveBefore = true,
+                groupAliveAfterReap = false,
+                verdict = LeaderReap.Reaped,
+                owned = false
+            )
+
         probe.Run(reapNow = true, pid = 4243, identity = Some 78UL)
 
         Assert.That(probe.Kills, Is.EqualTo<int list> [ 4243 ])
-        Assert.That(probe.Reaps, Is.EqualTo<int list> [ 4243 ])
+        Assert.That(probe.Reaps, Is.EqualTo<(bool * int) list> [ true, 4243 ])
 
         Assert.That(
             probe.Adopts,
@@ -174,8 +202,45 @@ type GracefulTeardownTests() =
         )
 
     [<Test>]
+    member _.``a leader reaped while its group stays alive is never handed off (T-351)``() =
+        // The handoff must be decided by whether OUR LEADER was reaped, never by whether its process
+        // group is still alive: a group outlives its reaped leader whenever the run backgrounded a
+        // descendant (and `ProcessGroupBackend.Release` deliberately keeps such a pgid tracked until the
+        // group empties, so teardown reaches exactly this state on an ordinary run). Adopting here would
+        // open a wait on an already-reaped pid — ECHILD, a fabricated status, and a blocking `waitpid`
+        // that a recycled number could point at an unrelated child of ours (K-016).
+        let probe =
+            LeaderProbe(groupAliveBefore = true, groupAliveAfterReap = true, verdict = LeaderReap.Reaped, owned = false)
+
+        probe.Run(reapNow = true, pid = 4247, identity = Some 81UL)
+
+        Assert.That(probe.Kills, Is.EqualTo<int list> [ 4247 ], "the group is alive, so its kill still goes out")
+        Assert.That(probe.Reaps, Is.EqualTo<(bool * int) list> [ true, 4247 ])
+        Assert.That(probe.Adopts, Is.Empty, "a reaped leader must never be handed to a second waiter")
+
+    [<Test>]
+    member _.``a leader that was already reaped elsewhere is never handed off (T-351)``() =
+        // `waitpid` answered ECHILD: whoever owns this pid's wait already reaped it (a run verb that
+        // concluded just ahead of teardown), or it was never ours. Either way there is no unclaimed wait
+        // here to transfer, and the same K-016 double-wait applies.
+        let probe =
+            LeaderProbe(groupAliveBefore = true, groupAliveAfterReap = true, verdict = LeaderReap.Gone, owned = false)
+
+        probe.Run(reapNow = true, pid = 4248, identity = Some 82UL)
+
+        Assert.That(probe.Kills, Is.EqualTo<int list> [ 4248 ])
+        Assert.That(probe.Adopts, Is.Empty, "an ECHILD leader has no wait left for this ledger to own")
+
+    [<Test>]
     member _.``a leader the reaper already owns is neither re-killed nor re-waited (T-351)``() =
-        let probe = LeaderProbe(aliveBefore = true, aliveAfterReap = true, owned = true)
+        let probe =
+            LeaderProbe(
+                groupAliveBefore = true,
+                groupAliveAfterReap = true,
+                verdict = LeaderReap.StillRunning,
+                owned = true
+            )
+
         probe.Run(reapNow = true, pid = 4244, identity = Some 79UL)
 
         // This is the group Shutdown/Dispose case: ownership of this leader was already transferred, so
@@ -186,26 +251,43 @@ type GracefulTeardownTests() =
 
     [<Test>]
     member _.``a recycled pgid is neither killed nor adopted (T-351)``() =
-        let probe = LeaderProbe(aliveBefore = false, aliveAfterReap = false, owned = false)
+        // A stranger that recycled the number: the choke reports the group gone, and `waitpid` on a
+        // process that is not our child is the harmless ECHILD the `Gone` verdict stands for.
+        let probe =
+            LeaderProbe(groupAliveBefore = false, groupAliveAfterReap = false, verdict = LeaderReap.Gone, owned = false)
+
         probe.Run(reapNow = true, pid = 4245, identity = Some 80UL)
 
         Assert.That(probe.Kills, Is.Empty, "the identity choke must keep a recycled pgid from being SIGKILLed")
 
         Assert.That(
             probe.Reaps,
-            Is.EqualTo<int list> [ 4245 ],
+            Is.EqualTo<(bool * int) list> [ true, 4245 ],
             "the waitpid gate is unchanged: it only ever reaps our own child (a stranger is a harmless ECHILD)"
         )
 
         Assert.That(probe.Adopts, Is.Empty, "a stranger's pgid must never become this ledger's responsibility")
 
     [<Test>]
-    member _.``a leader past the drain budget is killed and handed off without a synchronous reap (T-351)``() =
-        let probe = LeaderProbe(aliveBefore = true, aliveAfterReap = true, owned = false)
+    member _.``a leader past the drain budget is killed and handed off after a probe that never waits (T-351)``() =
+        let probe =
+            LeaderProbe(
+                groupAliveBefore = true,
+                groupAliveAfterReap = true,
+                verdict = LeaderReap.StillRunning,
+                owned = false
+            )
+
         probe.Run(reapNow = false, pid = 4246, identity = None)
 
         Assert.That(probe.Kills, Is.EqualTo<int list> [ 4246 ], "the kill is never skipped, only the wait for it")
-        Assert.That(probe.Reaps, Is.Empty, "the synchronous reap is what the spent budget skips")
+
+        Assert.That(
+            probe.Reaps,
+            Is.EqualTo<(bool * int) list> [ false, 4246 ],
+            "the spent budget skips the WAITING, not the single non-blocking probe the handoff decision needs"
+        )
+
         Assert.That(probe.Adopts, Is.EqualTo<(int * uint64 option) list> [ 4246, None ])
 
     [<Test>]
@@ -289,6 +371,54 @@ type GracefulTeardownTests() =
                     Is.False,
                     "a concluded leader's entry must be released, or a recycled pid inherits its verdict"
                 )
+            finally
+                PostKillReap.clearLeadersForTests ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an unknown identity token never makes the ledger claim a leader (T-351)``() : Task =
+        task {
+            // A caller that hears "the ledger owns this one" stands down completely — including from
+            // delivering its hard kill. So ownership may only be claimed on POSITIVE proof that this is
+            // the same target that was adopted; an unknown token on either side is not proof, and the
+            // guess must not be allowed to suppress a kill-on-drop (the direction
+            // `Native.Posix.processGroupStillTracked` also follows). The single-waiter invariant does not
+            // depend on that verdict: the ledger refuses a second adoption of the pid outright.
+            let pid = 999_002
+
+            let wait =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let starts = ref 0
+
+            let beginWait (_: int) =
+                Interlocked.Increment(&starts.contents) |> ignore
+                wait.Task
+
+            try
+                // Adopted WITHOUT an identity token (a POSIX host with no identity reader).
+                Assert.That(PostKillReap.adoptLeader pid None beginWait, Is.True)
+
+                Assert.That(
+                    PostKillReap.ownsLeader pid (Some 4242UL),
+                    Is.False,
+                    "an unadopted-token match is a guess, and a guess must never wave a teardown off its kill"
+                )
+
+                Assert.That(
+                    PostKillReap.ownsLeader pid None,
+                    Is.False,
+                    "two unknown tokens are not proof that this is the leader the ledger adopted"
+                )
+
+                // ...and the teardown that acts on that verdict still cannot open a second waiter.
+                Assert.That(PostKillReap.adoptLeader pid None beginWait, Is.False)
+                Assert.That(Volatile.Read(&starts.contents), Is.EqualTo 1, "a second wait was started for one leader")
+
+                wait.TrySetResult(Outcome.Signalled(Some 9)) |> ignore
+                let! _ = wait.Task
+                ()
             finally
                 PostKillReap.clearLeadersForTests ()
         }

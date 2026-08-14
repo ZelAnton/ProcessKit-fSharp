@@ -2330,6 +2330,51 @@ type CorrectnessBugTests() =
             })
 
     [<Test>]
+    member this.``an exit wait started after the post-kill window still reports the real outcome (T-351)``() : Task =
+        this.WithShortPostKillBudget(fun () ->
+            task {
+                // The window belongs to the WAIT, not to the handle: any work between `Kill()` and the
+                // first verb (here, a delay strictly longer than the budget) must not spend the window a
+                // wait that has not even started yet is entitled to. The child here is an ordinary one —
+                // killed, reaped, its status sitting there for the asking — so the verb must report the
+                // REAL signal, and nothing may change hands.
+                let waitTcs =
+                    TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                let host =
+                    { baseHost (Command.create "late-observer").Config with
+                        // Deliberately NOT an already-completed task: a real `host.Wait()` (a pidfd/kqueue/
+                        // SIGCHLD registration, `WaitForExitAsync` on Windows) hands back a pending task and
+                        // resolves it a moment later, so an already-elapsed budget must not beat it to the answer.
+                        Wait = fun () -> waitTcs.Task }
+
+                let running = new RunningProcess(host)
+                let adoptedBefore = PostKillReap.adoptedWaitCount ()
+
+                running.Kill()
+                do! Task.Delay 400 // strictly longer than this fixture's 250ms budget
+
+                let waiting = running.WaitAsync()
+                do! Task.Delay 20
+                waitTcs.TrySetResult(Outcome.Signalled(Some 9)) |> ignore
+                let! outcome = waiting
+
+                Assert.That(
+                    outcome,
+                    Is.EqualTo(Outcome.Signalled(Some 9)),
+                    "a wait that starts after the budget elapsed must still read the real status, not fabricate Unobserved"
+                )
+
+                Assert.That(
+                    PostKillReap.adoptedWaitCount () - adoptedBefore,
+                    Is.Zero,
+                    "nothing was handed over: the wait concluded inside its own window"
+                )
+
+                do! (running :> IAsyncDisposable).DisposeAsync()
+            })
+
+    [<Test>]
     member this.``concurrent Stop, Kill and Dispose on one handle keep a single wait owner (T-351)``() : Task =
         this.WithShortPostKillBudget(fun () ->
             task {
