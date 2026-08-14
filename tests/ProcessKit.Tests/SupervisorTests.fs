@@ -2350,7 +2350,7 @@ type SupervisorTests() =
                 if index + 1 = healthySamples.Length then
                     sampledEnough.TrySetResult() |> ignore
 
-                Some(ProcessGroupStats(1, None, Some bytes, None))
+                Some(ProcessGroupStats(1, None, None, Some bytes, None))
 
             let deterministicDelay (_: TimeSpan) (cancellationToken: CancellationToken) : Task =
                 if Interlocked.Increment(&delayCalls) <= healthySamples.Length then
@@ -2399,7 +2399,7 @@ type SupervisorTests() =
 
             let treeStats () =
                 Interlocked.Increment(&samples) |> ignore
-                Some(ProcessGroupStats(1, None, Some 4096L, None))
+                Some(ProcessGroupStats(1, None, None, Some 4096L, None))
 
             let runner = MemoryLivenessRunner(Some treeStats)
             let events = ResizeArray<SupervisorRestartEvent>()
@@ -2441,7 +2441,7 @@ type SupervisorTests() =
                 // usage has fallen back below it.
                 let currentBytes = if sample = 1 then 4096L else 512L
                 peakBytes <- max peakBytes currentBytes
-                Some(ProcessGroupStats(1, None, Some peakBytes, None))
+                Some(ProcessGroupStats(1, None, None, Some peakBytes, None))
 
             let runner = MemoryLivenessRunner(Some treeStats)
             let events = ResizeArray<SupervisorRestartEvent>()

@@ -10,6 +10,7 @@
 
 	<!-- F# compile order is significant — list test files in dependency order. -->
 	<ItemGroup>
+		<Compile Include="TestHostErrorMode.fs" />
 		<Compile Include="CommandTests.fs" />
 		<Compile Include="ProcessErrorSanitizationTests.fs" />
 		<Compile Include="ConsoleEncodingTests.fs" />

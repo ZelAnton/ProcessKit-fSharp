@@ -959,8 +959,9 @@ module internal Cgroup =
             None
 
     /// cgroup accounting for `stats`: cumulative CPU (`cpu.stat` `usage_usec`), peak memory
-    /// (`memory.peak`), and aggregate block I/O (`io.stat`), each `None` when its file is unavailable.
-    let cgroupStats (cgroupPath: string) : TimeSpan option * int64 option * ProcessIoCounters option =
+    /// (`memory.peak`), peak task count (`pids.peak`), and aggregate block I/O (`io.stat`), each `None`
+    /// when its file is unavailable.
+    let cgroupStats (cgroupPath: string) : TimeSpan option * int64 option * int64 option * ProcessIoCounters option =
         let cpu =
             try
                 File.ReadAllLines(Path.Combine(cgroupPath, "cpu.stat"))
@@ -982,7 +983,17 @@ module internal Cgroup =
             with _ ->
                 None
 
-        cpu, memory, cgroupIoCounters cgroupPath
+        let processCount =
+            try
+                match Int64.TryParse((File.ReadAllText(Path.Combine(cgroupPath, "pids.peak"))).Trim()) with
+                | true, peak when peak >= 0L -> Some peak
+                | _ -> None
+            with _ ->
+                // pids.peak is optional and can disappear during concurrent cgroup teardown; an unreadable
+                // native counter is unavailable, never a fabricated zero or the current membership count.
+                None
+
+        cpu, memory, processCount, cgroupIoCounters cgroupPath
 
     /// How one attempt to remove the cgroup directory ended.
     [<RequireQualifiedAccess; NoComparison>]

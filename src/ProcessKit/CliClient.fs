@@ -86,7 +86,8 @@ type CliClient internal (config: CliClientConfig) =
 
     /// Build the command for `args` and run it (requiring a zero/accepted exit), returning trimmed stdout.
     /// Output the effective `OutputBuffer` policy truncated is refused with `ProcessError.OutputTooLarge`
-    /// rather than returned as if whole — `OutputStringAsync` is the lenient path.
+    /// (and output the bounded post-exit drain cut short, with `ProcessError.OutputIncomplete`) rather
+    /// than returned as if whole — `OutputStringAsync` is the lenient path.
     member this.RunAsync(args: seq<string>, [<Optional>] cancellationToken: CancellationToken) =
         Runner.run config.Runner cancellationToken (this.Command args)
 

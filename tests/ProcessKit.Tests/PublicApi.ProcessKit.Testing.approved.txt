@@ -124,6 +124,7 @@ class ProcessKit.Testing.RecordReplayOptions
 class ProcessKit.Testing.RecordReplayRunner
   :> ProcessKit.IProcessRunner
   :> System.IDisposable
+  member Complete() : System.Void
   member Save() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   static member Auto(System.String, ProcessKit.IProcessRunner) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>
   static member Auto(System.String, ProcessKit.IProcessRunner, ProcessKit.Testing.RecordReplayOptions) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.Testing.RecordReplayRunner, ProcessKit.ProcessError>

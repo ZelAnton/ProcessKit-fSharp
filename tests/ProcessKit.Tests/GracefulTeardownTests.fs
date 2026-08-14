@@ -550,3 +550,100 @@ type GracefulTeardownTests() =
                 ()
         }
         :> Task
+
+    // ---- T-360: the bounded post-exit OUTPUT drain, as a primitive -------------------------------
+    //
+    // A deliberately separate window from the post-kill reap above, because it answers a different
+    // question: not "has the killed tree been reaped yet" but "have this run's own output pumps reached
+    // EOF now that its fate is known". The two share no state and neither bounds the other.
+
+    [<Test>]
+    member _.``the post-exit drain budget is separate from the post-kill reap budget (T-360)``() =
+        // Same default ceiling (both mirror the prototype's PUMP_TEARDOWN), but two independent seams:
+        // overriding one must never move the other, or a test that shortens output draining would
+        // silently shorten every post-kill reap in the same run.
+        let originalDrain = PostExitDrain.budgetOverrideForTests
+        let originalReap = PostKillReap.budgetOverrideForTests
+
+        try
+            PostExitDrain.budgetOverrideForTests <- Some(TimeSpan.FromMilliseconds 7.0)
+            Assert.That(PostExitDrain.budget (), Is.EqualTo(TimeSpan.FromMilliseconds 7.0))
+            Assert.That(PostKillReap.budget (), Is.EqualTo(PostKillReap.DefaultBudget))
+        finally
+            PostExitDrain.budgetOverrideForTests <- originalDrain
+            PostKillReap.budgetOverrideForTests <- originalReap
+
+    [<Test>]
+    member _.``an over-long post-exit drain budget is clamped into the armable range (T-360)``() =
+        // A budget is turned into a `Task.Delay`, which throws on anything a BCL timer cannot be armed
+        // with — a completion path must never fail for that reason.
+        Assert.That(PostExitDrain.armable TimeSpan.MaxValue, Is.LessThan TimeSpan.MaxValue)
+        Assert.That(PostExitDrain.armable (TimeSpan.FromSeconds -1.0), Is.EqualTo TimeSpan.Zero)
+
+    [<Test>]
+    member _.``a drain that is already at EOF answers without arming a window (T-360)``() : Task =
+        task {
+            // The ordinary run: the pumps are done before the exit wait even returns, so the bound must
+            // cost nothing at all — not even the shortest timer.
+            let stopwatch = Stopwatch.StartNew()
+            let! settled = PostExitDrain.settlesWithin (TimeSpan.FromSeconds 30.0) Task.CompletedTask
+            stopwatch.Stop()
+
+            Assert.That(settled, Is.True)
+            Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 5.0))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a drain that outlasts its window is reported unsettled, not awaited (T-360)``() : Task =
+        task {
+            let held = TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let! settled = PostExitDrain.settlesWithin (TimeSpan.FromMilliseconds 20.0) held.Task
+            Assert.That(settled, Is.False, "the window elapsed, so the caller must be told to stop waiting")
+            Assert.That(held.Task.IsCompleted, Is.False, "the drain itself is untouched — only the wait ended")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a drain that faults inside the window is left for the caller to observe (T-360)``() : Task =
+        task {
+            // `settlesWithin` deliberately answers a question instead of awaiting: a pump fault that
+            // lands before the bound must stay the caller's to re-raise, exactly as the unbounded
+            // `Task.WhenAll` it replaces did.
+            let faulted =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            faulted.SetException(InvalidOperationException "a throwing OnStdoutLine")
+
+            let! settled = PostExitDrain.settlesWithin (TimeSpan.FromSeconds 30.0) faulted.Task
+            Assert.That(settled, Is.True, "a faulted pump has settled — the caller decides what that means")
+
+            try
+                do! faulted.Task
+                Assert.Fail "the fault must still be there for the caller"
+            with :? InvalidOperationException ->
+                // The expected fault: the bound neither observed nor replaced it.
+                ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an abandoned pump's late fault never surfaces unobserved (T-360)``() : Task =
+        task {
+            // The K-084 rule applied to a pump the sever could not end: nothing will await it again, so
+            // the ledger observes it instead.
+            let stalled =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            PostExitDrain.abandon stalled.Task
+
+            stalled.TrySetException(InvalidOperationException "a late read failure")
+            |> ignore
+
+            do! Task.Delay 50
+
+            Assert.That(stalled.Task.IsFaulted, Is.True)
+            Assert.That(stalled.Task.Exception, Is.Not.Null)
+        }
+        :> Task

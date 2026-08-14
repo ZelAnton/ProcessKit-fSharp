@@ -476,8 +476,7 @@ module internal PipelineRunner =
         // Drain every stage's stderr so a full stderr pipe never blocks a stage, bounding retained
         // memory by that stage's own `OutputBuffer` byte cap + `Overflow` mode — the same path
         // (`Pump.captureRawOrEmpty`) the buffered run's last-stage stdout capture uses. A stage without
-        // `MaxBytes` set keeps its previous unbounded behaviour (`captureRawOrEmpty` falls back to
-        // `drainRawOrEmpty` in that case).
+        // `MaxBytes` set keeps its previous unbounded behaviour (the sink retains everything then).
         stderrTasks.Add(Pump.captureRawOrEmpty sp.Stderr None stages[index].Config.OutputBuffer CancellationToken.None)
 
         // The upstream the NEXT stage relays from. For the last stage nothing relays it: it is the

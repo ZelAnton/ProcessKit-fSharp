@@ -18,12 +18,15 @@ open System.Threading.Tasks
 module internal CaptureVerbs =
 
     /// Require an accepted exit; return stdout with trailing whitespace trimmed — and refuse a capture
-    /// the buffer policy already TRUNCATED, since this verb presents its string as the whole of stdout.
+    /// that is already TRUNCATED, since this verb presents its string as the whole of stdout.
     /// A `DropOldest`/`DropNewest` policy that dropped output therefore ends in
-    /// `ProcessError.OutputTooLarge` (quoting `lineLimit`/`byteLimit`, the caller's configured ceilings)
-    /// rather than in a clipped tail/prefix the caller cannot tell apart from complete output — the
-    /// distinction the `Truncated` flag carries is destroyed by the string projection, so it is spent
-    /// here instead. `outputString`/`outputBytes` remain the lenient path for a caller that wants the
+    /// `ProcessError.OutputTooLarge` (quoting `lineLimit`/`byteLimit`, the caller's configured ceilings),
+    /// and a capture the bounded post-exit output drain cut short in `ProcessError.OutputIncomplete`
+    /// (which quotes neither, because neither applies) — see `ProcessResult.rejectIfTruncated`, which
+    /// makes that one decision — rather than in a clipped tail/prefix the caller cannot tell apart from
+    /// complete output. The distinction the `Truncated` flag carries is destroyed by the string
+    /// projection, so it is spent here instead.
+    /// `outputString`/`outputBytes` remain the lenient path for a caller that wants the
     /// bounded payload plus `ProcessResult.Truncated`. The check runs AFTER the success check, so an
     /// unaccepted exit still reports its own `Exit`/`Signalled`/`Timeout` error, and the fail-loud
     /// (`OverflowMode.Error`) ceiling — which never yields a successful capture at all — is untouched.
@@ -249,7 +252,7 @@ module Runner =
     // though the case alone reads as an up-front refusal.
     //
     // Deliberately a conservative allow-list rather than an exhaustive match: everything else — `Exit`,
-    // `Timeout`, `Signalled`, `Stdin`, `OutputTooLarge`, `Unobserved`, `NotReady`, `Parse`,
+    // `Timeout`, `Signalled`, `Stdin`, `OutputTooLarge`, `OutputIncomplete`, `Unobserved`, `NotReady`, `Parse`,
     // `RetryPredicate`, `JsonRpc`, `CassetteMiss`, `ResourceLimit`, `Adopt`, `Cancelled`, and the
     // ambiguous `Io` (raised both before a child, e.g. a process group that could not be created, and
     // while driving a live one) — may have reached a child that already drained the source, so a future
@@ -482,8 +485,10 @@ module Runner =
 
     /// Require a zero/accepted exit and return stdout with trailing whitespace trimmed. Output the
     /// command's `OutputBuffer` policy truncated (`DropOldest`/`DropNewest` over a cap) is refused with
-    /// `ProcessError.OutputTooLarge` rather than returned as if complete — use `outputString` for the
-    /// lenient path, which hands back the bounded payload with `ProcessResult.Truncated` set.
+    /// `ProcessError.OutputTooLarge`, and output the bounded post-exit drain cut short (a descendant
+    /// held the child's stdout open past its exit) with `ProcessError.OutputIncomplete`, rather than
+    /// returned as if complete — use `outputString` for the lenient path, which hands back the bounded
+    /// payload with `ProcessResult.Truncated` set.
     let run
         (runner: IProcessRunner)
         (cancellationToken: CancellationToken)

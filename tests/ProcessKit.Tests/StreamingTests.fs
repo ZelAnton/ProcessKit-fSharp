@@ -178,6 +178,113 @@ type private GatedByteStream(payload: byte[], gate: Task) =
             }
         )
 
+/// A parent-side output pipe as it looks once the child that owned it has exited but a DESCENDANT
+/// that inherited the write end is still alive (T-360): `payload` arrives normally, and then the read
+/// after it simply never returns — there is no EOF, because the pipe still has a writer. This is the
+/// shape that used to hang every verb indefinitely, with the leader's outcome already known.
+///
+/// `respectsCancellation` picks which of the two real transports it models, and the bounded post-exit
+/// output drain must handle both:
+///   * `true` — what a piped run actually uses (a Windows overlapped named pipe, a POSIX socketpair):
+///     the pending read is cancellable, so severing unwinds it and the pump ends at a clean EOF.
+///   * `false` — the read the OS will not let go of (a POSIX pty master's blocking `read`, offloaded
+///     to the thread pool). Severing cannot wake it, so the drain must ABANDON the pump — observed,
+///     never awaited again — and the verb must still return what was captured.
+///
+/// `ReachedTail` completes once the read that will never answer has been issued, so a test can
+/// synchronize on the actual state under test rather than on a sleep.
+type internal HeldOpenOutputStream(payload: byte[], respectsCancellation: bool) =
+    inherit Stream()
+
+    // Never completed: this models a pipe whose remaining writer never writes and never closes.
+    let held =
+        TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let reachedTail =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable offset = 0
+
+    /// Completes when the pump has issued the read that can never be answered.
+    member _.ReachedTail: Task = reachedTail.Task
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = ()
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) : int = raise (NotSupportedException())
+
+    override _.ReadAsync(buffer: Memory<byte>, cancellationToken: CancellationToken) : ValueTask<int> =
+        if offset < payload.Length then
+            let count = min buffer.Length (payload.Length - offset)
+            payload.AsSpan(offset, count).CopyTo(buffer.Span)
+            offset <- offset + count
+            ValueTask<int> count
+        else
+            reachedTail.TrySetResult() |> ignore
+
+            if respectsCancellation then
+                ValueTask<int>(held.Task.WaitAsync cancellationToken)
+            else
+                ValueTask<int> held.Task
+
+/// The THIRD ending a severed pipe can have, and the one no cancellable double can model: the read is
+/// aborted by the sever, but the transport reports that abort as an **I/O failure** rather than as an
+/// `OperationCanceledException` — what a stream layered over a raw fd does with
+/// `ERROR_OPERATION_ABORTED`/`ECANCELED`. `payload` arrives normally first; the read after it parks
+/// until the sever token fires and then fails with `fault`.
+///
+/// It matters because that failure would otherwise leave the pump reporting `ProcessError.Io` and fail
+/// a verb whose contract, on exactly this shape, is a truncated capture (T-360 review R-03).
+type internal AbortOnSeverStream(payload: byte[], fault: exn) =
+    inherit Stream()
+
+    let mutable offset = 0
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = ()
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) : int = raise (NotSupportedException())
+
+    override _.ReadAsync(buffer: Memory<byte>, cancellationToken: CancellationToken) : ValueTask<int> =
+        if offset < payload.Length then
+            let count = min buffer.Length (payload.Length - offset)
+            payload.AsSpan(offset, count).CopyTo(buffer.Span)
+            offset <- offset + count
+            ValueTask<int> count
+        else
+            ValueTask<int>(
+                task {
+                    let aborted =
+                        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                    use _registration =
+                        cancellationToken.Register(fun () -> aborted.TrySetResult() |> ignore)
+
+                    do! aborted.Task
+                    return raise fault
+                }
+            )
+
 /// A stdout double that GENERATES `lineCount` copies of `line` (each newline-terminated) as it is
 /// read, rather than holding the payload. The T-357 bounded-memory regression needs tens of megabytes
 /// of stdout to flow past the pumps; materializing that in the test process would defeat the very
@@ -323,6 +430,28 @@ type StdinFinalObservationScope(onWindow: unit -> unit, budget: TimeSpan option)
         member _.Dispose() =
             Pump.stdinFinalObservationTestHook <- None
             Pump.stdinFinalObservationBudgetForTests <- None
+
+/// The `PostExitDrain` budget seam, wrapped so every regression that exercises the bounded post-exit
+/// output drain runs it in milliseconds instead of paying the real five-second ceiling (twice — the
+/// window before the sever and the window after it). Restored in a `finally`, exactly as the
+/// post-kill reap budget seam is used; tests in this repository run sequentially, so the single
+/// process-wide seam is safe.
+module internal PostExitDrainBudget =
+
+    let withBudget (budget: TimeSpan) (body: unit -> Task<'T>) : Task<'T> =
+        task {
+            let previous = PostExitDrain.budgetOverrideForTests
+            PostExitDrain.budgetOverrideForTests <- Some budget
+
+            try
+                return! body ()
+            finally
+                PostExitDrain.budgetOverrideForTests <- previous
+        }
+
+    /// A short budget that still comfortably exceeds the scheduling jitter of a loaded CI runner, so
+    /// "the ordinary tail was not cut" stays a statement about the bound, not about timing luck.
+    let Short = TimeSpan.FromMilliseconds 250.0
 
 [<TestFixture>]
 type StreamingTests() =
@@ -3193,3 +3322,524 @@ type StreamingTests() =
             Action(fun () -> Command.create "x" |> Command.idleTimeout (TimeSpan.FromSeconds -1.0) |> ignore)
         )
         |> ignore
+
+    // ---- T-360: the bounded post-exit output drain ------------------------------------------------
+    //
+    // Every regression below models the one shape that used to hang indefinitely: the leader's fate is
+    // ALREADY settled (the synthetic host's `Wait` answers at once, exactly as a real reap does the
+    // moment the child exits), but the parent's read end never reaches EOF, because something that
+    // inherited it — a daemonized worker, a `setsid` helper, a shell's background job — still holds the
+    // write end. `HeldOpenOutputStream` is that pipe, in both of its real forms: a cancellable
+    // pipe/socket read, and a pty master's uninterruptible one.
+
+    /// A handle over a stdout pipe that delivers `payload` and then never ends, with no stderr.
+    member private _.HeldOpenStdout(payload: string, respectsCancellation: bool) : RunningProcess =
+        let stdout =
+            new HeldOpenOutputStream(Encoding.UTF8.GetBytes payload, respectsCancellation)
+
+        syntheticProcessOverStreams (Command.create "test").Config (Some(stdout :> Stream)) None
+
+    [<Test>]
+    member this.``OutputStringAsync bounds a tail an inherited pipe holds open and reports it truncated``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                use running = this.HeldOpenStdout("line-1\nline-2\n", respectsCancellation = true)
+                let stopwatch = Stopwatch.StartNew()
+                let! result = running.OutputStringAsync()
+                stopwatch.Stop()
+
+                match result with
+                | Error error -> Assert.Fail $"the bounded drain must still produce an honest capture: {error}"
+                | Ok captured ->
+                    // The leader's own outcome, unchanged by the bound.
+                    Assert.That(captured.Outcome, Is.EqualTo(Outcome.Exited 0))
+                    // Everything that DID arrive before the bound is still there...
+                    Assert.That(captured.Stdout, Does.Contain "line-1")
+                    Assert.That(captured.Stdout, Does.Contain "line-2")
+                    // ...and the capture says it is incomplete rather than passing for the whole output.
+                    Assert.That(captured.Truncated, Is.True, "a capture cut short by the bound must be truncated")
+
+                Assert.That(running.OutputDrainWasBounded, Is.True, "the drain should have severed the read end")
+                Assert.That(running.OutputPumpsWereAbandoned, Is.False, "a cancellable read must end at the sever")
+
+                Assert.That(
+                    stopwatch.Elapsed,
+                    Is.LessThan(TimeSpan.FromSeconds 30.0),
+                    "the verb hung on a pipe the leader no longer owns"
+                )
+            })
+        :> Task
+
+    [<Test>]
+    member this.``OutputStringAsync still answers when the held-open read cannot be interrupted``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // The pty-master shape: no token wakes the pending read, so the sever cannot end the
+                // pump and the drain must abandon it — observed, never awaited again — while the verb
+                // still reports the bytes that did arrive.
+                use running = this.HeldOpenStdout("line-1\n", respectsCancellation = false)
+                let stopwatch = Stopwatch.StartNew()
+                let! result = running.OutputStringAsync()
+                stopwatch.Stop()
+
+                match result with
+                | Error error -> Assert.Fail $"an abandoned pump must not fault the verb: {error}"
+                | Ok captured ->
+                    Assert.That(captured.Outcome, Is.EqualTo(Outcome.Exited 0))
+                    Assert.That(captured.Stdout, Does.Contain "line-1")
+                    Assert.That(captured.Truncated, Is.True)
+
+                Assert.That(running.OutputDrainWasBounded, Is.True)
+                Assert.That(running.OutputPumpsWereAbandoned, Is.True, "an uninterruptible read must be abandoned")
+                Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 30.0))
+            })
+        :> Task
+
+    [<Test>]
+    member this.``OutputBytesAsync is symmetric with the text verb under the drain bound``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // The raw byte path was the last consumer without a bound (the Rust prototype closed it
+                // last too), and its read loop discarded its buffer on any non-EOF ending — so it has to
+                // be checked for BOTH properties: it returns, and it returns the bytes.
+                use running = this.HeldOpenStdout("raw-bytes-tail", respectsCancellation = true)
+                let! result = running.OutputBytesAsync()
+
+                match result with
+                | Error error -> Assert.Fail $"the bounded drain must still produce an honest capture: {error}"
+                | Ok captured ->
+                    Assert.That(captured.Outcome, Is.EqualTo(Outcome.Exited 0))
+                    Assert.That(Encoding.UTF8.GetString captured.Stdout, Is.EqualTo "raw-bytes-tail")
+                    Assert.That(captured.Truncated, Is.True)
+
+                Assert.That(running.OutputDrainWasBounded, Is.True)
+            })
+        :> Task
+
+    [<Test>]
+    member this.``OutputBytesAsync keeps its partial bytes when the held-open read cannot be interrupted``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                use running = this.HeldOpenStdout("raw-bytes-tail", respectsCancellation = false)
+                let! result = running.OutputBytesAsync()
+
+                match result with
+                | Error error -> Assert.Fail $"an abandoned pump must not fault the byte verb: {error}"
+                | Ok captured ->
+                    // The bytes live in a sink the VERB owns, so abandoning the pump loses none of them.
+                    Assert.That(Encoding.UTF8.GetString captured.Stdout, Is.EqualTo "raw-bytes-tail")
+                    Assert.That(captured.Truncated, Is.True)
+
+                Assert.That(running.OutputPumpsWereAbandoned, Is.True)
+            })
+        :> Task
+
+    [<Test>]
+    member this.``WaitAsync and ProfileAsync end on the leader's exit, not on the inherited pipe``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // The discard paths have no capture to salvage, so the whole contract is "conclude with
+                // the leader's outcome, promptly, without leaking the drain task".
+                use waiting = this.HeldOpenStdout("ignored\n", respectsCancellation = true)
+                let! waited = waiting.WaitAsync()
+                Assert.That(waited, Is.EqualTo(Outcome.Exited 0))
+                Assert.That(waiting.OutputDrainWasBounded, Is.True)
+
+                use profiling = this.HeldOpenStdout("ignored\n", respectsCancellation = false)
+                let! profile = profiling.ProfileAsync(TimeSpan.FromMilliseconds 20.0)
+                Assert.That(profile.Outcome, Is.EqualTo(Outcome.Exited 0))
+                Assert.That(profiling.OutputPumpsWereAbandoned, Is.True)
+            })
+        :> Task
+
+    [<Test>]
+    member this.``a streamed stdout consumer and FinishAsync both end at the drain bound``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // The streaming session's own contract: the enumerator must reach the END of its stream
+                // (the session completes the channel at the bound, even for a pump it had to abandon),
+                // and the terminal `FinishAsync` must report the run as truncated.
+                use running =
+                    this.HeldOpenStdout("streamed-1\nstreamed-2\n", respectsCancellation = true)
+
+                let! lines = collect (running.StdoutLinesAsync())
+                Assert.That(lines, Is.EqualTo<string list>([ "streamed-1"; "streamed-2" ]))
+
+                match! running.FinishAsync() with
+                | Error error -> Assert.Fail $"FinishAsync must conclude at the bound: {error}"
+                | Ok finished ->
+                    Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+                    Assert.That(finished.Truncated, Is.True, "output cut short by the bound must be reported")
+
+                Assert.That(running.OutputDrainWasBounded, Is.True)
+            })
+        :> Task
+
+    [<Test>]
+    member this.``an event stream ends at the drain bound``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                use running = this.HeldOpenStdout("event-1\n", respectsCancellation = true)
+                let! events = collect (running.OutputEventsAsync())
+
+                Assert.That(
+                    events |> Seq.map (fun (event: OutputEvent) -> event.Text) |> List.ofSeq,
+                    Is.EqualTo<string list>([ "event-1" ]),
+                    "the events that did arrive must still be delivered"
+                )
+
+                Assert.That(running.OutputDrainWasBounded, Is.True)
+            })
+        :> Task
+
+    [<Test>]
+    member this.``WaitAllAsync resolves on a handle whose inherited pipe is held open``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // `ExitTask`'s FRESH branch — no verb ever claimed the pipes, so it starts its own
+                // discard drains and must bound them like every other consumer.
+                use running = this.HeldOpenStdout("ignored\n", respectsCancellation = true)
+                let! outcomes = RunningProcess.WaitAllAsync [| running |]
+                Assert.That(outcomes, Is.EqualTo<Outcome[]>([| Outcome.Exited 0 |]))
+                Assert.That(running.OutputDrainWasBounded, Is.True)
+            })
+        :> Task
+
+    [<Test>]
+    member _.``an ordinary short tail is never cut by the drain bound``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // The other half of the contract, and the one a too-eager bound would break: a child
+                // that closed its pipes on the way out is already at EOF, so the window is never even
+                // armed and nothing is reported as truncated.
+                let stdout = new MemoryStream(Encoding.UTF8.GetBytes "line-1\nline-2\n")
+
+                use running =
+                    syntheticProcessOverStreams (Command.create "test").Config (Some(stdout :> Stream)) None
+
+                match! running.OutputStringAsync() with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok captured ->
+                    Assert.That(captured.Stdout, Does.Contain "line-2")
+                    Assert.That(captured.Truncated, Is.False, "an ordinary tail must not be reported truncated")
+
+                Assert.That(running.OutputDrainWasBounded, Is.False, "the bound must not fire on a normal run")
+            })
+        :> Task
+
+    [<Test>]
+    member this.``a checking verb refuses a drain-bounded capture instead of hanging``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // `RunAsync`/`ParseAsync`/`OutputJsonAsync` present their capture AS the whole of stdout,
+                // so they refuse ANY truncated one — including one this bound cut short. The composition
+                // that matters here is that they now REFUSE, in bounded time, rather than hang: a clipped
+                // string must never reach a caller (or a parser) as if it were complete.
+                use running = this.HeldOpenStdout("partial\n", respectsCancellation = true)
+
+                // No ceiling configured — the ordinary case for this shape, and the one that used to
+                // send the refusal into the shared formatter's EVENT branch.
+                match! CaptureVerbs.run None None (fun () -> running.OutputStringAsync()) with
+                | Ok text -> Assert.Fail $"a clipped capture must not be presented as whole output: {text}"
+                | Error(ProcessError.OutputIncomplete "test" as error) ->
+                    // The MESSAGE, not just the case: this refusal must name the drain bound's own cause.
+                    // Asserting the case alone is what let "'test' produced too many events (1 events)"
+                    // — a line count reported as events, against a ceiling nobody configured — pass for a
+                    // plain text capture.
+                    Assert.That(
+                        error.Message,
+                        Is.EqualTo
+                            "'test' output was cut short: something that inherited its stdout/stderr outlived the run, so the capture is incomplete"
+                    )
+
+                    Assert.That(running.OutputDrainWasBounded, Is.True)
+                | Error other -> Assert.Fail $"expected the drain-bound truncation refusal, got {other}"
+            })
+        :> Task
+
+    [<Test>]
+    member _.``a pump fault before the bound is still an error, not a quiet truncation``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // The bound must never convert a genuine failure into a partial success: a read fault
+                // completes the pump, so the drain sees it settle and re-raises exactly as the
+                // unbounded join did.
+                use stdout =
+                    new ErroringStream([ Encoding.UTF8.GetBytes "line-1\n" ], IOException "disk read error")
+
+                use running =
+                    syntheticProcessOverStreams (Command.create "test").Config (Some(stdout :> Stream)) None
+
+                try
+                    let! _ = running.OutputStringAsync()
+                    Assert.Fail "a genuine read fault must not be reported as a truncated success"
+                with :? ProcessException as pe ->
+                    match pe.Error with
+                    | ProcessError.Io _ -> ()
+                    | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+
+                Assert.That(running.OutputDrainWasBounded, Is.False, "a settled pump must not trip the bound")
+            })
+        :> Task
+
+    [<Test>]
+    member _.``a severed read that aborts with an I/O error still ends at EOF``() : Task =
+        task {
+            // The sever's contract at the seam itself: HOW an aborted pending read comes back is the
+            // transport's choice — a cancellation on a cancellable one, an I/O abort on a stream over a
+            // raw fd — and both are the read WE cut, so both must answer EOF. Asserted directly on
+            // `SeverableStream` because no synthetic pipe above can produce the second shape and no real
+            // pipe can be relied on to produce it on every platform.
+            use severCts = new CancellationTokenSource()
+
+            use inner =
+                new AbortOnSeverStream(Encoding.UTF8.GetBytes "tail", IOException "the I/O operation was aborted")
+
+            use severable = new SeverableStream(inner, severCts.Token)
+            let buffer = Array.zeroCreate<byte> 32
+
+            // The payload still arrives verbatim before the sever.
+            let! first = severable.ReadAsync(Memory<byte> buffer, CancellationToken.None)
+            Assert.That(first, Is.EqualTo 4)
+
+            let pending = severable.ReadAsync(Memory<byte> buffer, CancellationToken.None)
+            severCts.Cancel()
+            let! afterSever = pending
+
+            Assert.That(afterSever, Is.EqualTo 0, "an aborted read the sever caused is this stream's EOF")
+
+            // And every later read stays at EOF rather than touching the pipe again.
+            let! next = severable.ReadAsync(Memory<byte> buffer, CancellationToken.None)
+            Assert.That(next, Is.EqualTo 0)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an I/O fault with no sever still propagates through the severable stream``() : Task =
+        task {
+            // The other half of that rule, and the one that keeps it from becoming a fault-swallower:
+            // with nothing severed, a genuine read failure is still a genuine read failure.
+            use severCts = new CancellationTokenSource()
+
+            use inner =
+                new ErroringStream([ Encoding.UTF8.GetBytes "line-1\n" ], IOException "disk read error")
+
+            use severable = new SeverableStream(inner, severCts.Token)
+            let buffer = Array.zeroCreate<byte> 32
+            let! first = severable.ReadAsync(Memory<byte> buffer, CancellationToken.None)
+            Assert.That(first, Is.GreaterThan 0)
+
+            try
+                let! _ = severable.ReadAsync(Memory<byte> buffer, CancellationToken.None)
+                Assert.Fail "a read fault nobody severed must not be reported as EOF"
+            with :? IOException ->
+                // Exactly what the pump has to see to report `ProcessError.Io`.
+                ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a verb reports a truncated capture when the severed read aborts with an I/O error``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // End to end over the same shape: the bound severs, the transport answers the abort with
+                // an `IOException`, and the verb must still deliver the honest partial capture. Before
+                // this was handled at the sever, that ending faulted the verb with `ProcessError.Io` —
+                // an error where the documented answer is `Truncated`.
+                let stdout =
+                    new AbortOnSeverStream(
+                        Encoding.UTF8.GetBytes "line-1\n",
+                        IOException "the I/O operation was aborted"
+                    )
+
+                use running =
+                    syntheticProcessOverStreams (Command.create "test").Config (Some(stdout :> Stream)) None
+
+                match! running.OutputStringAsync() with
+                | Error error -> Assert.Fail $"an aborted severed read must not fault the verb: {error}"
+                | Ok captured ->
+                    Assert.That(captured.Outcome, Is.EqualTo(Outcome.Exited 0))
+                    Assert.That(captured.Stdout, Does.Contain "line-1")
+                    Assert.That(captured.Truncated, Is.True)
+
+                Assert.That(running.OutputDrainWasBounded, Is.True)
+            })
+        :> Task
+
+    // ---- T-360: the same bound, on a REAL child and a REAL OS pipe ---------------------------------
+    //
+    // Everything above drives a hand-written `Stream`, which can model the two endings the bound has to
+    // cope with but cannot prove the one thing only the OS decides: HOW a pending read on an actual
+    // pipe unwinds when this handle severs it. A cancellable transport unwinds it as an
+    // `OperationCanceledException`, a non-cancellable one as an I/O abort — and reporting the second as
+    // a genuine fault would fail these verbs with `ProcessError.Io` instead of the documented truncated
+    // capture, on exactly the shape the whole task exists for. So the regressions below spawn a real
+    // child that leaves a real descendant holding its real stdout.
+
+    /// A REAL child that hands a long-lived descendant its own stdout and then exits at once: the
+    /// leader's fate settles in milliseconds while the parent's read end stays open for as long as the
+    /// descendant lives, which is what makes an unbounded pump join hang.
+    ///
+    /// POSIX: the background job inherits stdout, writes nothing to it, and `$!` publishes its pid, so
+    /// the ownership half of the contract can be checked against the OS too. Windows: `start /b` hands
+    /// the new process this `cmd`'s own std handles and returns immediately, so `ping` holds (and keeps
+    /// writing to) the pipe long after `cmd` has exited.
+    member private _.RealDescendantHoldingStdout: Command =
+        if isWindows then
+            Command.create "cmd.exe"
+            |> Command.args [ "/c"; "start /b ping -n 30 127.0.0.1 & echo hi" ]
+        else
+            Command.create "/bin/sh" |> Command.args [ "-c"; "sleep 30 & echo $!; echo hi" ]
+
+    /// Is `pid` still a LIVE process? A descendant this run killed but did not father is reaped by init
+    /// rather than by us, so a brief zombie (`Z`) is "not alive" — the assertion is about the kill, not
+    /// about who collects the corpse. Linux-only (`/proc` is the portable-enough source for it).
+    member private _.IsLiveProcess(pid: int) : bool =
+        let statPath = $"/proc/{pid}/stat"
+
+        if not (File.Exists statPath) then
+            false
+        else
+            try
+                let stat = File.ReadAllText statPath
+                // "<pid> (comm) <state> ..." — `comm` may itself contain spaces and parentheses, so the
+                // state is the field after the LAST ')'.
+                match stat.LastIndexOf ')' with
+                | -1 -> false
+                | close ->
+                    let rest = stat.Substring(close + 1).TrimStart()
+                    rest.Length > 0 && rest[0] <> 'Z' && rest[0] <> 'X'
+            with :? IOException ->
+                // The entry vanished between `Exists` and the read — that is the process being gone.
+                false
+
+    [<Test>]
+    member this.``a real child whose descendant holds its stdout is bounded, not hung, and not an Io fault``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                match! runner.StartAsync(this.RealDescendantHoldingStdout, CancellationToken.None) with
+                | Error error -> Assert.Fail $"the real spawn should succeed: {error}"
+                | Ok started ->
+                    use running = started
+                    let stopwatch = Stopwatch.StartNew()
+                    let! result = running.OutputStringAsync()
+                    stopwatch.Stop()
+
+                    match result with
+                    | Error error ->
+                        // The failure mode this test exists to catch: a severed pending read that
+                        // unwinds as an `IOException` would arrive here as `ProcessError.Io`.
+                        Assert.Fail $"a severed real pipe must end as a truncated capture, not a failure: {error}"
+                    | Ok captured ->
+                        // The leader's own outcome, decided long before the bound fired.
+                        Assert.That(captured.Outcome, Is.EqualTo(Outcome.Exited 0))
+                        // What the leader wrote before exiting is still captured in full...
+                        Assert.That(captured.Stdout, Does.Contain "hi")
+                        // ...and the capture admits it is not the whole of stdout (the descendant still
+                        // owns the write end).
+                        Assert.That(captured.Truncated, Is.True, "a capture cut short by the bound must be truncated")
+
+                    Assert.That(running.OutputDrainWasBounded, Is.True, "the held-open real pipe must hit the bound")
+
+                    // The descendant lives ~30s; anything near that means the pump join was never bounded.
+                    Assert.That(
+                        stopwatch.Elapsed,
+                        Is.LessThan(TimeSpan.FromSeconds 20.0),
+                        "the verb waited on a pipe the exited leader no longer owns"
+                    )
+            })
+        :> Task
+
+    [<Test>]
+    member this.``a real drain-bounded run is symmetric for bytes and refused by the checking verb``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // The byte path on a real pipe (the last consumer the Rust prototype bounded, and the one
+                // whose read loop used to discard its buffer on any non-EOF ending)...
+                match! runner.StartAsync(this.RealDescendantHoldingStdout, CancellationToken.None) with
+                | Error error -> Assert.Fail $"the real spawn should succeed: {error}"
+                | Ok started ->
+                    use running = started
+                    let! result = running.OutputBytesAsync()
+
+                    match result with
+                    | Error error -> Assert.Fail $"the bytes verb must not fault on a severed real pipe: {error}"
+                    | Ok captured ->
+                        Assert.That(Encoding.UTF8.GetString captured.Stdout, Does.Contain "hi")
+                        Assert.That(captured.Truncated, Is.True)
+
+                    Assert.That(running.OutputDrainWasBounded, Is.True)
+
+                // ...and the checking verb over a real run of the same shape, which must refuse the
+                // clipped capture — with the error that names the drain bound, not a buffer ceiling
+                // nobody configured.
+                let stopwatch = Stopwatch.StartNew()
+
+                let! refusal = this.RealDescendantHoldingStdout |> Runner.run runner CancellationToken.None
+
+                stopwatch.Stop()
+
+                match refusal with
+                | Ok text -> Assert.Fail $"a clipped capture must not be presented as whole output: {text}"
+                | Error(ProcessError.OutputIncomplete program as error) ->
+                    Assert.That(program, Is.EqualTo(if isWindows then "cmd.exe" else "/bin/sh"))
+
+                    Assert.That(
+                        error.Message,
+                        Does.Contain
+                            "output was cut short: something that inherited its stdout/stderr outlived the run"
+                    )
+                | Error other -> Assert.Fail $"expected the drain-bound refusal, got {other}"
+
+                Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 20.0))
+            })
+        :> Task
+
+    [<Test>]
+    member this.``a real run's private group takes the descendant that held its stdout``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // The ownership half, against the OS rather than a backend's counters: the bound exists
+                // partly BECAUSE a verb that never returned never reached its teardown, so the private
+                // per-run group never reaped what the child left behind. Whether a process is alive is
+                // only portably observable through `/proc`, so this half is Linux-gated; the capture
+                // halves above cover Windows and macOS.
+                if not isLinux then
+                    Assert.Ignore "liveness of a foreign pid is observable via /proc on Linux only"
+
+                let mutable descendant = 0
+
+                match! runner.StartAsync(this.RealDescendantHoldingStdout, CancellationToken.None) with
+                | Error error -> Assert.Fail $"the real spawn should succeed: {error}"
+                | Ok started ->
+                    use running = started
+
+                    match! running.OutputStringAsync() with
+                    | Error error -> Assert.Fail $"{error}"
+                    | Ok captured ->
+                        // `sleep 30 & echo $!` — the first line is the descendant's pid.
+                        let firstLine =
+                            captured.Stdout.Split('\n') |> Array.map (fun l -> l.Trim()) |> Array.head
+
+                        Assert.That(Int32.TryParse firstLine |> fst, Is.True, $"expected a pid, got '{firstLine}'")
+                        descendant <- int firstLine
+                        Assert.That(captured.Truncated, Is.True)
+
+                    Assert.That(running.OutputDrainWasBounded, Is.True)
+
+                // The verb reached its `reapGuard`, so the private group was released — and the
+                // descendant that outlived the leader goes with it. The kill is delivered by us but the
+                // corpse is collected by init (it is not our child), so poll briefly for "no longer
+                // alive" rather than demanding the entry be gone the instant the verb returned.
+                let deadline = Stopwatch.StartNew()
+
+                while this.IsLiveProcess descendant && deadline.Elapsed < TimeSpan.FromSeconds 10.0 do
+                    do! Task.Delay 50
+
+                Assert.That(
+                    this.IsLiveProcess descendant,
+                    Is.False,
+                    "the private group must take the descendant that held the run's stdout"
+                )
+            })
+        :> Task

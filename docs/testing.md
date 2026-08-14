@@ -652,9 +652,11 @@ else if (replayResult is { IsOk: false, ErrorValue: var loadErr })
 
 `Record(path, inner)` wraps `inner` and captures each completed call; `Save()`
 writes the cassette (it is also flushed best-effort on dispose —
-`RecordReplayRunner` is `IDisposable` — but `Save()` is the call that surfaces a
-write error). `Replay(path)` returns a `Result<RecordReplayRunner, ProcessError>`
-loaded from the file.
+`RecordReplayRunner` is `IDisposable` — but only once `Complete()` has declared
+the recording finished, see
+[A crash writes nothing before Complete](#a-crash-writes-nothing-before-complete),
+and `Save()` is the call that surfaces a write error). `Replay(path)` returns a
+`Result<RecordReplayRunner, ProcessError>` loaded from the file.
 
 Semantics worth knowing before you commit a cassette:
 
@@ -668,7 +670,7 @@ Semantics worth knowing before you commit a cassette:
 | Bytes | `CaptureBytesAsync` / `outputBytes` is supported: a **bytes recording** stores the exact stdout bytes (base64) and replays them byte-for-byte, including non-UTF-8 output. A **text** recording (or a pre-v2 cassette) replayed through the bytes verb is honestly `ProcessError.Unsupported` — it never hands back a lossy re-encode — so re-record that call through the bytes verb |
 | `SpawnAsync` | **replay** reconstructs a live handle ([`FakeProcess`](#scripting-replies)) from the recording, so `StdoutLinesAsync` / readiness probes / exit replay too. **Record** mode can't capture a live stream (it would race the consumer) and returns `Unsupported` — record the call through a capture verb, then replay it as a stream |
 | Fidelity | a recording's **truncation** flag and wall-clock **duration** survive both direct capture replay and a live handle reconstructed by `SpawnAsync`, including PTY handles. Buffered `OutputStringAsync` / `OutputBytesAsync` results carry both values; streaming `FinishAsync` carries the truncation flag and the handle's `Elapsed` remains the recorded duration. A replay command's current output-buffer policy still applies to the reconstructed payload, so its final truncation state is the recorded flag OR any truncation caused by that policy |
-| Typed failures | **recorded and replayed** (schema v7): a call that ended in `NotFound`, `Spawn`, `Stdin`, `Exit`, `Signalled`, `Timeout`, `OutputTooLarge`, `Parse`, or `JsonRpc` is stored as that failure with its payload and replays as the same `ProcessError` case — through the capture verbs and `SpawnAsync` alike — so an expected failure is as reproducible as an expected success, and Auto stops re-running the real tool for it. An error the format cannot rebuild exactly (`Cancelled`, `CassetteMiss`, `RetryPredicate`, `Io`, `Unsupported`, `ResourceLimit`, `Unobserved`, `NotReady`, `Adopt`) is returned to the caller and recorded nowhere, as is any failure that arrives once the run's token is already cancelled. A non-zero exit and a captured timeout are *results*, not failures, and are recorded as results |
+| Typed failures | **recorded and replayed** (schema v7): a call that ended in `NotFound`, `Spawn`, `Stdin`, `Exit`, `Signalled`, `Timeout`, `OutputTooLarge`, `Parse`, or `JsonRpc` is stored as that failure with its payload and replays as the same `ProcessError` case — through the capture verbs and `SpawnAsync` alike — so an expected failure is as reproducible as an expected success, and Auto stops re-running the real tool for it. An error the format cannot rebuild exactly, or would be lying to replay (`Cancelled`, `CassetteMiss`, `RetryPredicate`, `Io`, `Unsupported`, `ResourceLimit`, `Unobserved`, `NotReady`, `Adopt`, `OutputIncomplete` — that last one is a race with the recording machine, not a property of the command), is returned to the caller and recorded nowhere, as is any failure that arrives once the run's token is already cancelled. A non-zero exit and a captured timeout are *results*, not failures, and are recorded as results |
 | One-shot stdin | `Stdin.FromStream` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
 | Format | a versioned JSON envelope — `{ "Version", "Entries" }` (current version **8**); a cassette **newer** than this build understands is rejected on load, while every older version (1–7) still loads with its missing fields defaulting — a pre-v3 entry with no env fingerprint keys as the default, un-customized environment; a pre-v4 entry with no `Pty` flag loads as a non-PTY recording; a pre-v7 entry has no failure half and stays the recorded result it always was; a pre-v8 entry, which recorded no wiring, is served only where it could honestly have been recorded (its PTY shape must match, and an entry holding captured stdout/stderr is not replayed for a call that captures none — that is an ordinary miss, so re-record it; an entry that captured *nothing* is served either way, since a pre-v8 file cannot say which wiring produced it and an empty capture invents nothing). A partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
 | PTY | a [`Command.Pty`](#pseudo-terminal-pty-doubles) recording carries a `Pty` flag and its geometry (`PtyCols`/`PtyRows`) and replays as a **merged-stream** handle (only `OutputEvent.Stdout`). Because a PTY captures one merged stream, the [`WithRedaction`](#record-and-replay) hook scrubs that whole stream — an echoed credential is scrubbed before it lands in the cassette |
@@ -706,8 +708,9 @@ hermetic.
 
 **Grow a cassette on miss (VCR "new episodes").** `RecordReplayRunner.Auto(path, inner)`
 replays what the cassette already holds and, on a **miss**, delegates to `inner`, records the
-result, and grows the file on `Save()`/dispose — so you build a cassette up incrementally
-instead of curating every entry by hand. Existing entries still replay hermetically; only a
+result, and grows the file on `Save()` (or on a dispose after `Complete()`, like record mode — see
+[A crash writes nothing before Complete](#a-crash-writes-nothing-before-complete)) — so you build a cassette up
+incrementally instead of curating every entry by hand. Existing entries still replay hermetically; only a
 first-seen call reaches the real tool. A missing (or empty) file starts a fresh cassette. Use
 strict `Replay(path)` in CI, where a miss should fail loudly. (Like record mode, `Auto` can't
 capture a *streaming* miss — record such a call through a capture verb first.)
@@ -743,6 +746,50 @@ if (RecordReplayRunner.Auto("fixtures/git.json", new JobRunner(), options) is { 
     // recorder replays a hit, records a miss, and grows the cassette on Save()...
 }
 ```
+
+### A crash writes nothing before Complete
+
+A cassette keeps `program`, `args`, `cwd`, and captured `stdout`/`stderr` verbatim, so the
+recording a *failed* run left behind is exactly what you do not want landing on disk by accident.
+`Dispose` runs both when a scope ends normally and while the stack unwinds out of a thrown
+exception or a failed assertion, and .NET gives it no way to tell those apart — so the drop-time
+flush is gated on `Complete()`, your own statement that the recording finished as intended:
+
+**F#**
+
+```fsharp
+use recorder = RecordReplayRunner.Record("fixtures/git.json", JobRunner())
+// ... the calls you want recorded ...
+// ... and the assertions about them, which may fail ...
+recorder.Complete() // last: reached only if nothing above threw; the write happens on dispose
+```
+
+**C#**
+
+```csharp
+using var recorder = RecordReplayRunner.Record("fixtures/git.json", new JobRunner());
+// ... the calls you want recorded ...
+// ... and the assertions about them, which may fail ...
+recorder.Complete(); // last: reached only if nothing above threw; the write happens on dispose
+```
+
+Until `Complete()` is called, disposing the recorder writes nothing at all: no cassette is created
+at that path, and one already there is left byte for byte as it was. It is the
+`TransactionScope.Complete()` shape, and `Auto` behaves exactly like `Record` here.
+
+**The mark is the whole gate, so complete last.** Dispose reads that mark and nothing else; it is
+never told how the scope ended. A scope that throws *after* `Complete()` is therefore flushed just
+like one that ended normally — the failed run's verbatim argv and captured output do reach disk —
+which is why the call belongs after everything that can fail, assertions included, and not directly
+after the calls being recorded. If a recording must never be written by anything but a call you can
+point at, leave `Complete()` out entirely and `Save()` where you want the file: with no mark set,
+dispose writes nothing whatever happens.
+
+`Save()` is unaffected in both directions — it writes immediately and returns the I/O error,
+neither needing nor setting the completion mark — so a recording that must reach disk however the
+scope ends is one you `Save()`. `Complete()` itself only marks: it does no I/O, never throws, and
+the write it enables is still the best-effort, silent one dispose has always done (including
+anything captured after the call, so record first, assert next, and complete last).
 
 ## CliClient
 

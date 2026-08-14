@@ -1,10 +1,34 @@
 module ProcessKit.Benchmarks.Program
 
+open System
+open System.Runtime.InteropServices
 open BenchmarkDotNet.Configs
 open BenchmarkDotNet.Exporters.Json
 open BenchmarkDotNet.Jobs
 open BenchmarkDotNet.Running
 open BenchmarkDotNet.Toolchains.InProcess.NoEmit
+
+module private TestHostErrorMode =
+
+    [<Literal>]
+    let private SEM_FAILCRITICALERRORS = 0x00000001u
+
+    [<Literal>]
+    let private SEM_NOGPFAULTERRORBOX = 0x00000002u
+
+    [<Literal>]
+    let private SEM_NOOPENFILEERRORBOX = 0x00008000u
+
+    [<Literal>]
+    let private SuppressedDialogModes =
+        SEM_FAILCRITICALERRORS ||| SEM_NOGPFAULTERRORBOX ||| SEM_NOOPENFILEERRORBOX
+
+    [<DllImport("kernel32.dll")>]
+    extern uint32 SetErrorMode(uint32 uMode)
+
+    let suppressModalDialogs () =
+        if OperatingSystem.IsWindows() then
+            SetErrorMode SuppressedDialogModes |> ignore
 
 /// Run every benchmark in-process, rather than BenchmarkDotNet's default out-of-process toolchain
 /// (which regenerates an isolated project per run). That regeneration only copies well-known
@@ -41,6 +65,8 @@ let private ciConfig =
 /// parser) to run the short/CI configuration used by the scheduled `benchmarks.yml` workflow.
 [<EntryPoint>]
 let main argv =
+    TestHostErrorMode.suppressModalDialogs ()
+
     let isCi = argv |> Array.contains "--ci"
     let remainingArgv = argv |> Array.filter (fun arg -> arg <> "--ci")
     let config = if isCi then ciConfig else defaultConfig
