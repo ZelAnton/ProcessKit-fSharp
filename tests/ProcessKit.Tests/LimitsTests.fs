@@ -206,19 +206,28 @@ type LimitsTests() =
             return! runner.OutputStringAsync(shell "echo limited", CancellationToken.None)
         }
 
-    // Drain an async sequence (the streaming event verbs) into a list for assertions.
-    let collect (items: IAsyncEnumerable<'T>) =
+    // Drain the merged output-event stream into a list for assertions, resolving `sawMarker` as soon as
+    // a line containing `marker` is framed. That signal is what lets a caller wait for the CHILD to have
+    // actually spoken before tearing the run down, instead of inferring it from a parent-side proxy.
+    // `sawMarker` is resolved on stream end too, so a run whose child never wrote the marker fails on the
+    // caller's own assertions rather than hanging on a signal that can no longer arrive.
+    let collectUntil (marker: string) (sawMarker: TaskCompletionSource) (items: IAsyncEnumerable<OutputEvent>) =
         task {
-            let acc = ResizeArray<'T>()
+            let acc = ResizeArray<OutputEvent>()
             let e = items.GetAsyncEnumerator()
             let mutable more = true
 
             while more do
                 match! e.MoveNextAsync() with
-                | true -> acc.Add e.Current
+                | true ->
+                    acc.Add e.Current
+
+                    if e.Current.Text.Contains marker then
+                        sawMarker.TrySetResult() |> ignore
                 | false -> more <- false
 
             do! e.DisposeAsync()
+            sawMarker.TrySetResult() |> ignore
             return acc
         }
 
@@ -1721,9 +1730,15 @@ type LimitsTests() =
                     | Error(ProcessError.Unsupported msg) -> Assert.Ignore $"host lacks a PTY: {msg}"
                     | Error other -> Assert.Fail $"unexpected error starting a pty run inside a cgroup: {other}"
                     | Ok running ->
-                        // Drain the merged pty stream in the background: the child prints CTTY-OK, then
-                        // sleeps, so this completes only once the run is killed below.
-                        let collectTask = collect (running.OutputEventsAsync())
+                        // Drain the merged pty stream in the background: the child prints its verdict, then
+                        // sleeps, so this completes only once the run is killed below. `verdict` resolves as
+                        // soon as that verdict line is framed — the event the kill below waits for. It is
+                        // also resolved when the stream ENDS, so a child that never wrote one fails on the
+                        // assertions here rather than hanging on a signal that can no longer arrive.
+                        let verdict =
+                            TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                        let collectTask = collectUntil "CTTY-" verdict (running.OutputEventsAsync())
 
                         // (b) parent-side cgroup.procs membership — the authoritative check the other
                         // LimitsTests use: the pty child is a real member of the limited group's cgroup.
@@ -1743,6 +1758,23 @@ type LimitsTests() =
                             memberCount,
                             Is.GreaterThanOrEqualTo 1,
                             "the pty child must be a real cgroup.procs member of the limited group"
+                        )
+
+                        // Wait for the child's own verdict BEFORE killing it. Cgroup membership is NOT
+                        // evidence that the target has run: the `/bin/sh` launcher writes its `$$` into
+                        // `cgroup.procs` and only THEN `exec`s the `setsid --ctty` shim and the target, so
+                        // membership is observable while the exec chain is still in flight. Killing on
+                        // membership alone therefore races that chain — and an immediate `Kill()` really
+                        // does reach a pre-`setsid()` pty child now (it used to be skipped as if the child
+                        // were already gone), so the loser of that race is a child killed before it ever
+                        // wrote, leaving this test asserting against an empty stream. Membership stays
+                        // asserted above; it is simply not the event the teardown is allowed to trigger on.
+                        let! signalled = Task.WhenAny(verdict.Task, Task.Delay(TimeSpan.FromSeconds 30.0))
+
+                        Assert.That(
+                            obj.ReferenceEquals(signalled, verdict.Task),
+                            Is.True,
+                            "the pty child produced no controlling-terminal verdict line before the timeout"
                         )
 
                         // Tear the run down, then drain the merged stream captured while it ran (the
