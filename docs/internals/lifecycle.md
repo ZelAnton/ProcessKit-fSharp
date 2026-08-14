@@ -155,6 +155,12 @@ lifecycle transition even though they share the backend safety gate.
   plus `Outcome`. It cannot finish event or interactive sessions. Calling it on a fresh handle starts
   the stdout-streaming machinery even if no enumerator was requested, but its intended use is the
   terminal hand-off after line or chunk streaming.
+- Reaching `FinishAsync()` with the line-stream enumerator never handed out — a fresh handle, or one
+  only `WaitForLineAsync` looked at — latches a retain-nothing stdout sink for the rest of the run:
+  the pump keeps framing lines (handlers, tee, counters, and fault classification are unchanged) but
+  stops queueing them, because no reader for that channel exists and the claim gate can no longer
+  produce one. Framing and queueing are unchanged once the enumerator *was* handed out, and nothing
+  already queued is discarded.
 - Streaming verbs cannot be chained. A completed or failed stream still owns its original claim.
 - Buffered verbs, each public stream enumerator, and each interactive session constructor are
   once-only alternatives.

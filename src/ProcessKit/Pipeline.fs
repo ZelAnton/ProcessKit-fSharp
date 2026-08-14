@@ -261,7 +261,8 @@ type PipelineSession
     /// downstream broken pipe is routine early-consumer teardown. A non-zero pipefail exit is *data* in
     /// `Finished.Outcome`, not an `Error`. Reaps the whole tree.
     /// Pairs with `StdoutLinesAsync` (it rejoins that stdout-streaming session); called with no prior
-    /// streaming it buffers and discards the final stdout, then reports the outcome.
+    /// streaming it drains and discards the final stdout as it arrives — retaining nothing — then
+    /// reports the outcome.
     member _.FinishAsync() : Task<Result<Finished, ProcessError>> =
         task {
             match! inner.FinishAsync() with

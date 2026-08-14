@@ -485,6 +485,25 @@ type RunningProcess
     // The chunk-streaming analogue of `stdoutLinesClaimed`: the session setup is deliberately
     // reentrant for `FinishAsync`/`ExitTask`, but the public enumerator is handed out only once.
     let mutable stdoutChunksClaimed = false
+    // Latched by the TERMINAL `FinishAsync` when it takes over a stdout LINE-streaming session whose one
+    // enumerator was never handed out — the "fresh handle, nobody ever streamed" shape `FinishAsync`
+    // itself starts the session for, and equally the `WaitForLineAsync`-started session no
+    // `StdoutLinesAsync`/`StdoutJsonLinesAsync` caller ever took over. `FinishAsync` returns the outcome
+    // and the captured STDERR; stdout is not part of `Finished` at all, so past that point nobody can
+    // read `stdoutChannel` any more — queueing the child's stdout into it only pins the whole output of
+    // a multi-gigabyte producer in memory (the channel is unbounded unless `Command.StreamBuffer` opts
+    // in) until the handle is disposed, for data that is by then unreachable by construction (T-357).
+    // Once latched, the stdout pump keeps framing lines exactly as before — `OnStdoutLine`, `StdoutTee`,
+    // `StdoutLineCount`, the decoder, and every genuine read/handler fault are all unchanged — and only
+    // the SINK changes: each framed line is dropped instead of queued, the same retain-nothing stdout
+    // contract `WaitAsync`/`ProfileAsync` already publish. Decided under `stateLock` (where
+    // `stdoutLinesClaimed` is decided too) and read by the pump on every line, hence `Volatile`.
+    let mutable stdoutStreamDiscarding = false
+
+    let discardStdoutStream () =
+        Volatile.Write(&stdoutStreamDiscarding, true)
+
+    let discardingStdoutStream () = Volatile.Read(&stdoutStreamDiscarding)
     // The event-streaming analogue of `stdoutLinesClaimed`/`stdoutChunksClaimed`. Unlike stdout
     // line/chunk streaming, `StartEventStreaming()` has no companion verb that needs to rejoin an
     // already-claimed session (`ExitTask`/`StopAsync` reuse `eventOutcome` directly, never
@@ -2283,16 +2302,71 @@ type RunningProcess
     // `FinishAsync` either observes a fully-constructed session (channel + pumps + `streamOutcome` all
     // assigned) or, if it is an incompatible consumer, is atomically refused — never a half-built
     // session, and never two racing setups building two readers on the one channel.
-    member private _.StartStdoutStreaming() : bool =
+    //
+    // `terminalOnly` marks the ONE caller that ends the run rather than consuming its stdout —
+    // `FinishAsync`. Reaching here from there with no enumerator handed out (`stdoutLinesClaimed`)
+    // means nothing can ever read `stdoutChannel` again, so the session is (or becomes) a
+    // retain-nothing drain instead of a queue nobody will empty — see `stdoutStreamDiscarding`. The
+    // decision is made HERE, under the same lock and before the pumps are built, so the fresh case
+    // never queues even a first line; deciding it after this returns would leave a window in which the
+    // pump had already started filling the channel.
+    member private _.StartStdoutStreaming(terminalOnly: bool) : bool =
         lock stateLock (fun () ->
+            // A stream that was handed out (`stdoutLinesClaimed`) keeps the existing join semantics in
+            // full: `FinishAsync` is then the terminal hand-off AFTER streaming, and its caller may still
+            // be holding — or about to drain — the enumerator, so every line stays queued exactly as
+            // before. (Racing `StdoutLinesAsync` against `FinishAsync` from two threads resolves to one
+            // of the two orders under this lock; concurrent verbs on one handle are undefined elsewhere
+            // in this API for the same reason.)
+            let latchTerminalDiscard () =
+                if terminalOnly && not stdoutLinesClaimed then
+                    discardStdoutStream ()
+
             if consumption = Consumption.StdoutStreaming then
+                latchTerminalDiscard ()
                 true
             elif consumption <> Consumption.Fresh then
                 false
             else
+                latchTerminalDiscard ()
                 consumption <- Consumption.StdoutStreaming
                 let stderrBuffer = Pump.LineBuffer(config.OutputBuffer)
                 stderrStreamBuffer <- stderrBuffer
+
+                // Where a framed stdout line goes. Normally into `stdoutChannel` for the streaming
+                // consumer; once a terminal-only `FinishAsync` has latched `stdoutStreamDiscarding`
+                // (see there) the line is dropped instead — it was still framed, teed and handed to
+                // `OnStdoutLine` exactly as on the streamed path, it is only never queued, because no
+                // reader for the channel exists and none can still be created. Nothing being queued
+                // also means the channel's `StreamBuffer` capacity has nothing left to overflow: no
+                // fail-loud `OutputTooLarge` and no drop bookkeeping can fire from a stream that
+                // retains nothing, so the byte counter feeding that diagnostic is left alone too.
+                let sinkStdoutLine (line: string) : ValueTask =
+                    if discardingStdoutStream () then
+                        ValueTask.CompletedTask
+                    else
+                        bumpStdoutStreamedBytes (int64 (Encoding.UTF8.GetByteCount line) + 1L)
+
+                        writeStreamItem
+                            stdoutChannel
+                            (fun policy ->
+                                // One channel item is one framed stdout line, 1:1, so the channel's item
+                                // capacity IS a genuine line limit and `readStdoutLineCount()` is the true
+                                // count of lines produced before the cap tripped — both stayed honest
+                                // already. `TotalBytes` was hardcoded `0` before T-297; it now reports the
+                                // UTF-8 size of those lines using the same "own bytes + 1 separator byte"
+                                // accounting `Pump.LineBuffer`'s doc comment explains (a small, deliberate
+                                // over-count, never an under-count) — this streaming channel retains
+                                // nothing to re-scan, so the cost is tracked incrementally instead.
+                                ProcessError.OutputTooLarge(
+                                    config.Program,
+                                    Some policy.Capacity,
+                                    None,
+                                    readStdoutLineCount (),
+                                    readStdoutStreamedByteCount ()
+                                ))
+                            bumpDroppedStreamLine
+                            line
 
                 let stdoutPump =
                     task {
@@ -2306,31 +2380,7 @@ type RunningProcess
                                     (fun line ->
                                         invokeLine config.OnStdoutLine line
                                         bumpStdoutLine ()
-                                        bumpStdoutStreamedBytes (int64 (Encoding.UTF8.GetByteCount line) + 1L)
-
-                                        writeStreamItem
-                                            stdoutChannel
-                                            (fun policy ->
-                                                // One channel item is one framed stdout line, 1:1, so the
-                                                // channel's item capacity IS a genuine line limit and
-                                                // `readStdoutLineCount()` is the true count of lines
-                                                // produced before the cap tripped — both stayed honest
-                                                // already. `TotalBytes` was hardcoded `0` before T-297; it
-                                                // now reports the UTF-8 size of those lines using the same
-                                                // "own bytes + 1 separator byte" accounting
-                                                // `Pump.LineBuffer`'s doc comment explains (a small,
-                                                // deliberate over-count, never an under-count) — this
-                                                // streaming channel retains nothing to re-scan, so the cost
-                                                // is tracked incrementally instead.
-                                                ProcessError.OutputTooLarge(
-                                                    config.Program,
-                                                    Some policy.Capacity,
-                                                    None,
-                                                    readStdoutLineCount (),
-                                                    readStdoutStreamedByteCount ()
-                                                ))
-                                            bumpDroppedStreamLine
-                                            line)
+                                        sinkStdoutLine line)
                                     None
                                     (fun () -> disposalCts.Token.IsCancellationRequested)
 
@@ -2395,6 +2445,13 @@ type RunningProcess
     // capture, but its pump deliberately does no decoding or line framing: one channel item is one
     // non-empty OS read. The setup is reentrant for `FinishAsync`/`ExitTask`, while the public
     // `StdoutChunksAsync` method below has its own one-enumerator guard.
+    //
+    // Needs no `terminalOnly` discard counterpart (T-357): this session has no "fresh, nobody took the
+    // stream" shape to protect against. `StdoutChunksAsync` — the verb that hands out the enumerator —
+    // is the only caller that can start it from `Fresh`; `FinishAsync`/`ExitTask` reach here only once
+    // `consumption` is ALREADY `StdoutChunkStreaming` (on a fresh handle the line-streaming branch above
+    // them wins), i.e. only after a caller took the chunk enumerator. An enumerator taken and then
+    // abandoned keeps its queued chunks by the same rule the line path applies to a handed-out stream.
     member private _.StartStdoutChunkStreaming() : bool =
         lock stateLock (fun () ->
             if consumption = Consumption.StdoutChunkStreaming then
@@ -2500,7 +2557,7 @@ type RunningProcess
     /// other already-consumed verb; `FinishAsync`/`WaitForLineAsync` remain free to rejoin the same
     /// session afterwards (they do not produce a second enumerator).
     member this.StdoutLinesAsync() : IAsyncEnumerable<string> =
-        if not (this.StartStdoutStreaming()) then
+        if not (this.StartStdoutStreaming(terminalOnly = false)) then
             raise (InvalidOperationException alreadyConsumedMessage)
 
         lock stateLock (fun () ->
@@ -2570,11 +2627,26 @@ type RunningProcess
         JsonLinesEnumerable<'T>(config.Program, this.StdoutLinesAsync(), deserialize) :> IAsyncEnumerable<'T>
 
     /// After streaming stdout, wait for exit and return the captured stderr. Reaps the tree.
+    ///
+    /// Safe to call without streaming first: stdout is then drained to keep the child moving and
+    /// **discarded as it arrives**, retaining nothing — `Finished` carries the outcome and stderr, never
+    /// stdout, so there is nothing for a caller to come back for (use `OutputStringAsync`/
+    /// `OutputBytesAsync` to capture stdout, or `StdoutLinesAsync`/`StdoutChunksAsync` to stream it).
+    /// A stream that WAS handed out keeps the existing hand-off semantics unchanged: everything the
+    /// child wrote stays queued for its enumerator, dropped or bounded only by the `StreamBuffer`
+    /// policy the caller opted into.
     member this.FinishAsync() : Task<Result<Finished, ProcessError>> =
         let outcomeTask =
-            if this.StartStdoutStreaming() then Some streamOutcome
-            elif this.StartStdoutChunkStreaming() then Some chunkOutcome
-            else None
+            // `terminalOnly`: this verb ends the run, it does not consume stdout. With no enumerator
+            // handed out, the session's stdout sink becomes a retain-nothing drain instead of a queue
+            // nobody can read (see `stdoutStreamDiscarding`) — for the fresh handle this call starts the
+            // session for, and for a `WaitForLineAsync`-started one nobody took over either.
+            if this.StartStdoutStreaming(terminalOnly = true) then
+                Some streamOutcome
+            elif this.StartStdoutChunkStreaming() then
+                Some chunkOutcome
+            else
+                None
 
         match outcomeTask with
         | None -> Task.FromResult(Error(alreadyConsumedError ()))
@@ -2612,6 +2684,12 @@ type RunningProcess
     // `OutputEventsAsync()` call; true only for the ONE call that first claims the session. As with
     // `StartStdoutStreaming`, the whole check + claim + setup runs under `stateLock`, so a concurrent
     // second `OutputEventsAsync` observes a fully-constructed session or is atomically refused.
+    //
+    // Needs no `terminalOnly` discard counterpart either (T-357): `OutputEventsAsync()` — the verb that
+    // hands out the enumerator — is this session's ONLY entry point, so an event channel can never be
+    // filled for a consumer that does not exist. No terminal verb starts or rejoins it: `FinishAsync`
+    // goes through the stdout gates above (and is refused outright once `EventStreaming` owns the pipes),
+    // and `ExitTask`/`StopAsync` reuse `eventOutcome` directly without re-entering here.
     member private _.StartEventStreaming() : bool =
         lock stateLock (fun () ->
             if consumption = Consumption.EventStreaming then
@@ -2963,7 +3041,7 @@ type RunningProcess
         : Task<Result<string, ProcessError>> =
         ArgumentNullException.ThrowIfNull predicate
 
-        if not (this.StartStdoutStreaming()) then
+        if not (this.StartStdoutStreaming(terminalOnly = false)) then
             Task.FromResult(Error(alreadyConsumedError ()))
         else
 

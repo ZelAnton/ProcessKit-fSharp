@@ -178,6 +178,50 @@ type private GatedByteStream(payload: byte[], gate: Task) =
             }
         )
 
+/// A stdout double that GENERATES `lineCount` copies of `line` (each newline-terminated) as it is
+/// read, rather than holding the payload. The T-357 bounded-memory regression needs tens of megabytes
+/// of stdout to flow past the pumps; materializing that in the test process would defeat the very
+/// measurement it makes. Reads fill the caller's buffer completely, so it also exercises the pump's
+/// multi-line-per-read path.
+type private GeneratedLinesStream(line: string, lineCount: int) =
+    inherit Stream()
+    let lineBytes = Encoding.UTF8.GetBytes(line + "\n")
+    let mutable remaining = lineCount
+    let mutable offset = 0
+
+    /// How many bytes a full read to EOF yields — the volume the retention budget is measured against.
+    member _.TotalBytes = int64 lineBytes.Length * int64 lineCount
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+
+    override _.Position
+        with get () = 0L
+        and set _ = ()
+
+    override _.Flush() = ()
+    override _.Seek(_offset, _origin) = raise (NotSupportedException())
+    override _.SetLength(_value) = ()
+    override _.Write(_buffer, _offset, _count) = raise (NotSupportedException())
+    override _.Read(_buffer, _offset, _count) : int = raise (NotSupportedException())
+
+    override _.ReadAsync(buffer: Memory<byte>, _cancellationToken: CancellationToken) : ValueTask<int> =
+        let mutable written = 0
+
+        while remaining > 0 && written < buffer.Length do
+            let take = min (lineBytes.Length - offset) (buffer.Length - written)
+            lineBytes.AsSpan(offset, take).CopyTo(buffer.Span.Slice written)
+            written <- written + take
+            offset <- offset + take
+
+            if offset = lineBytes.Length then
+                offset <- 0
+                remaining <- remaining - 1
+
+        ValueTask<int> written
+
 // --- T-329 delayed-stdin-source test doubles, shared across StreamingTests / VerbTests / PipelineTests.
 // Defined here (non-private) because StreamingTests is the earliest of the three in the .fsproj compile
 // order, so the later two can reuse these instead of redefining them.
@@ -704,6 +748,130 @@ type StreamingTests() =
             match! finish with
             | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
             | Error error -> Assert.Fail $"expected FinishAsync to preserve the process outcome, got {error}"
+        }
+        :> Task
+
+    // --- T-357: a terminal-only `FinishAsync` must not queue stdout into a channel nobody can read ---
+
+    [<Test>]
+    member _.``a fresh FinishAsync drains stdout into a retain-nothing sink``() : Task =
+        task {
+            let total = 4096
+
+            use running =
+                syntheticStdoutProcess (Command.create "test").Config (linesPayload total)
+
+            // No streaming verb ever ran, so `FinishAsync` starts the stdout session itself — and
+            // `Finished` carries the outcome and stderr, never stdout, so nothing it pumps can ever be
+            // read back. Every line must therefore be dropped as it is framed, not queued (T-357).
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished ->
+                Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+                Assert.That(finished.Truncated, Is.False, "a discarded stdout stream drops nothing to report")
+
+            // The lines were still framed and counted — handlers, tee and counters behave exactly as on
+            // the streamed path; only the sink changed.
+            Assert.That(running.StdoutLineCount, Is.EqualTo total)
+            Assert.That(running.DroppedStreamLineCount, Is.EqualTo 0)
+
+            // And none of them is still sitting in the streaming channel. Reading it after the fact is
+            // the one way to observe what it retained: the channel is completed, so this ends at once.
+            let residue = collect (running.StdoutLinesAsync())
+            let! winner = Task.WhenAny(residue :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, residue), Is.True, "the post-finish stdout reader hung")
+            let! retained = residue
+
+            Assert.That(
+                retained.Count,
+                Is.EqualTo 0,
+                "a terminal-only FinishAsync must leave no stdout line queued in the unread channel"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a large unread stdout stays bounded in memory through a fresh FinishAsync``() : Task =
+        task {
+            // ~48 MB of stdout, generated as it is read. Queued into the (unbounded by default)
+            // streaming channel for a reader that cannot exist, it would pin roughly twice that in
+            // decoded strings until the handle is disposed — the OOM shape T-357 is about. The budget
+            // sits far above the pump's own fixed buffers and far below the retained volume.
+            let lineCount = 12_000
+            use stdout = new GeneratedLinesStream(String('x', 4000), lineCount)
+            let budget = stdout.TotalBytes / 2L
+
+            use running =
+                syntheticProcessOverStreams (Command.create "test").Config (Some(stdout :> Stream)) None
+
+            let before = GC.GetTotalMemory true
+
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+
+            let retainedBytes = GC.GetTotalMemory true - before
+            // Read through the handle only AFTER the measurement, so whatever it retained is provably
+            // still reachable at the moment the heap is measured — and prove the volume really flowed.
+            Assert.That(running.StdoutLineCount, Is.EqualTo lineCount)
+
+            Assert.That(
+                retainedBytes,
+                Is.LessThan budget,
+                "a fresh FinishAsync retained the child's stdout instead of discarding it"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``FinishAsync keeps every line for a stdout stream that was handed out``() : Task =
+        task {
+            let total = 512
+
+            use running =
+                syntheticStdoutProcess (Command.create "test").Config (linesPayload total)
+
+            // Taken but not yet enumerated: this stream has an owner, so the terminal hand-off must keep
+            // queueing for it exactly as before. The retain-nothing sink is only for a stream nobody took.
+            let lines = running.StdoutLinesAsync()
+
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+
+            let! streamed = collect lines
+            Assert.That(streamed.Count, Is.EqualTo total)
+            Assert.That(streamed[0], Is.EqualTo "line-1")
+            Assert.That(streamed[total - 1], Is.EqualTo $"line-{total}")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the spawn test double finishes a fresh stdout the same way``() : Task =
+        task {
+            // `FakeProcess.Build` is also exactly what a cassette Spawn replay reconstructs a handle with
+            // (`Cassette.fs::spawnFromEntry`), so this pins the same retain-nothing contract on both test
+            // doubles — the real runner is covered by the synthetic-host tests above.
+            let total = 256
+
+            use running =
+                ProcessKit.Testing.FakeProcess
+                    .Create("fake")
+                    .WithStdoutLines([ for i in 1..total -> $"line-{i}" ])
+                    .WithExit(0)
+                    .Build()
+
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+
+            Assert.That(running.StdoutLineCount, Is.EqualTo total)
+
+            let residue = collect (running.StdoutLinesAsync())
+            let! winner = Task.WhenAny(residue :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, residue), Is.True, "the post-finish stdout reader hung")
+            let! retained = residue
+            Assert.That(retained.Count, Is.EqualTo 0, "the spawn double must retain no stdout either")
         }
         :> Task
 

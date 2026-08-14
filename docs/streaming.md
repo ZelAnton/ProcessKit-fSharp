@@ -598,6 +598,14 @@ don't care about output, `WaitAsync()` returns the `Outcome` directly and discar
 captured output; if you skipped streaming altogether, `OutputStringAsync()` /
 `OutputBytesAsync()` buffer and return everything just like the one-shot verbs.
 
+Calling `FinishAsync()` without having taken the stdout stream is allowed and costs no memory:
+stdout is then drained to keep the child moving and discarded as it arrives, exactly like
+`WaitAsync()`, since `Finished` carries the `Outcome` and stderr but never stdout. Your
+`OnStdoutLine` handler and `StdoutTee` still see every line — only the backlog is gone, so there is
+nothing left to drop and `Truncated` reports only the stderr capture. Take the stream first
+(`StdoutLinesAsync()`/`StdoutChunksAsync()`) if you want to read stdout after finishing: its backlog
+is retained for its enumerator as before.
+
 ## Streaming a pipeline's final stage
 
 Everything in this chapter has a **pipeline** counterpart. A [`Pipeline`](pipelines.md)
