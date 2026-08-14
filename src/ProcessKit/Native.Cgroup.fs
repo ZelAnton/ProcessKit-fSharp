@@ -1083,7 +1083,6 @@ module internal Cgroup =
         (budget: TimeSpan)
         : Release =
         let pollInterval = TimeSpan.FromMilliseconds DrainPollIntervalMilliseconds
-        let mutable verdict: Release voption = ValueNone
 
         // What a retained directory would be blamed on if the budget ran out right now, kept as its two
         // independent halves so neither can hide the other: the STATE the last probe found (which is where
@@ -1100,7 +1099,7 @@ module internal Cgroup =
             | Some detail -> $"{drainDetail}; {detail}"
             | None -> drainDetail
 
-        while verdict.IsNone do
+        let rec waitForRelease () =
             let remaining = budget - elapsed ()
             let expired = remaining <= TimeSpan.Zero
 
@@ -1118,24 +1117,27 @@ module internal Cgroup =
                     drainDetail <- $"the cgroup was never confirmed drained: {message}"
                     expired
 
+            let continueWaiting () =
+                if expired then
+                    Release.Retained(retained ())
+                else
+                    sleep (min pollInterval remaining)
+                    waitForRelease ()
+
             if attemptRemoval then
                 match remove () with
-                | Removal.Removed -> verdict <- ValueSome Release.Removed
+                | Removal.Removed -> Release.Removed
                 | Removal.Failed detail ->
-                    verdict <-
-                        ValueSome(Release.Retained $"{drainDetail}; the directory could not be removed: {detail}")
+                    Release.Retained $"{drainDetail}; the directory could not be removed: {detail}"
                 | Removal.Busy detail ->
                     // The kernel's own verdict that the cgroup is not drained after all (a member is still
                     // on its way out, or a child cgroup remains). Keep waiting inside the same budget.
                     refusal <- Some $"the kernel refused to remove the directory: {detail}"
+                    continueWaiting ()
+            else
+                continueWaiting ()
 
-            if verdict.IsNone then
-                if expired then
-                    verdict <- ValueSome(Release.Retained(retained ()))
-                else
-                    sleep (min pollInterval remaining)
-
-        verdict.Value
+        waitForRelease ()
 
     // One `rmdir` of the cgroup directory, classified for the loop above. Deliberately NON-recursive: a
     // cgroup is reclaimed by removing its directory, never by deleting anything inside it.
