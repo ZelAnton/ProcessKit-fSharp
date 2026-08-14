@@ -57,12 +57,9 @@ command -v git >/dev/null 2>&1 || \
 if command -v jj >/dev/null 2>&1; then
   repository_root="$(jj --repository "$script_dir/.." --ignore-working-copy root 2>/dev/null || true)"
   if [ -n "$repository_root" ]; then
-    editor_script="$(printf '%s/scripts/jj-no-editor.ps1' "$repository_root" | tr '\\' '/')"
-    toml_editor_script="$(printf '%s' "$editor_script" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-    expected_editor="[\"pwsh\", \"-NoProfile\", \"-File\", \"$toml_editor_script\"]"
     actual_editor="$(jj --repository "$repository_root" --ignore-working-copy config get ui.editor 2>/dev/null || true)"
 
-    if [ "$actual_editor" != "$expected_editor" ]; then
+    if [[ "$actual_editor" != *'"-Command"'* || "$actual_editor" != *'Error: jj editor opened in non-interactive mode. Use -m flag to provide description inline.'* ]]; then
       [ -n "$actual_editor" ] || actual_editor="unavailable"
       echo "    note: jj's ui.editor is not the repository's non-interactive command ($actual_editor). This can block automation. Run 'pwsh ./scripts/setup-jj-noninteractive.ps1' to configure non-interactive mode."
     fi

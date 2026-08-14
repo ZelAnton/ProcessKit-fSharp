@@ -158,18 +158,20 @@ skipped, 1 for a real regression, and 2 for a broken baseline or summary file.
 
 On Windows, jj defaults to Notepad for commit-description editing, which can leave an unattended
 run blocked on a GUI window. Before automated or otherwise non-interactive work, opt in to the
-repository-local guard:
+repository-wide guard:
 
 ```sh
 pwsh ./scripts/setup-jj-noninteractive.ps1
 ```
 
-The script asks jj to set `ui.editor` in the repo-local config with `jj config set --repo`; it does
-not change your user-level jj configuration or assume where the current jj version stores repository
-configuration. Use `jj config path --repo` if you need to inspect that location. Run
-`pwsh ./scripts/check-env.ps1` or `bash ./scripts/check-env.sh` to verify the setup: neither should
-print the `ui.editor` warning. Commands that provide their message inline, such as
-`jj describe -m "Description"`, work the same before and after setup.
+The script asks jj to set `ui.editor` in the repository config with `jj config set --repo`, so the
+guard applies to the main checkout and every linked workspace. Its inline command contains no
+checkout path and remains valid when a workspace is removed. It does not change your user-level jj
+configuration. To verify the guard directly, run `jj describe` without `-m`: it should fail with the
+non-interactive-mode error. Commands that provide their message inline, such as
+`jj describe -m "Description"`, work the same before and after setup. The environment checks report
+a `ui.editor` note when the guard is absent. Revert the opt-in setting with
+`jj config unset --repo ui.editor`.
 
 ## Mutation testing
 

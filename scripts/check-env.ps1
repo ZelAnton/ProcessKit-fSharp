@@ -90,8 +90,7 @@ if ($null -ne $jjCommand) {
     }
 
     if ($null -ne $repositoryRoot) {
-        $expectedEditor = Get-JjNonInteractiveEditorConfig -RepositoryRoot $repositoryRoot
-        if ($actualEditor -ne $expectedEditor) {
+        if (-not (Test-JjNonInteractiveEditorConfig -EditorValue $actualEditor)) {
             $actualDescription = if ([string]::IsNullOrWhiteSpace($actualEditor)) { 'unavailable' } else { $actualEditor }
             Write-Host "    note: jj's ui.editor is not the repository's non-interactive command ($actualDescription). This can block automation. Run 'pwsh ./scripts/setup-jj-noninteractive.ps1' to configure non-interactive mode." -ForegroundColor Yellow
         }

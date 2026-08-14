@@ -4,8 +4,9 @@
     Configures this jj repository to fail instead of opening an interactive editor.
 
 .DESCRIPTION
-    Uses jj to set only the repository-local ui.editor value. Commands that
-    provide their text inline, such as `jj describe -m "..."`, are unaffected.
+    Uses jj to set only the repository-wide ui.editor value shared by all
+    workspaces. Commands that provide their text inline, such as
+    `jj describe -m "..."`, are unaffected.
 #>
 [CmdletBinding()]
 param()
@@ -25,32 +26,31 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $repositoryRoot = ($rootOutput -join [Environment]::NewLine).Trim()
-$editorScript = Join-Path $repositoryRoot 'scripts/jj-no-editor.ps1'
-if (-not (Test-Path -LiteralPath $editorScript -PathType Leaf)) {
-    throw "Could not find the non-interactive editor script at '$editorScript'."
-}
-
-$expectedEditor = Get-JjNonInteractiveEditorConfig -RepositoryRoot $repositoryRoot
+$expectedEditor = Get-JjNonInteractiveEditorConfig
 $currentEditor = @(& $jjCommand.Source --repository $repositoryRoot --ignore-working-copy config get ui.editor 2>$null)
 $currentEditorValue = if ($LASTEXITCODE -eq 0) { ($currentEditor -join [Environment]::NewLine).Trim() } else { $null }
 
 if ($currentEditorValue -ne $expectedEditor) {
     & $jjCommand.Source --repository $repositoryRoot --ignore-working-copy config set --repo ui.editor $expectedEditor
     if ($LASTEXITCODE -ne 0) {
-        throw "jj could not set the repository-local ui.editor value."
+        throw "jj could not set the repository-wide ui.editor value."
     }
 }
 
-$verifiedOutput = @(& $jjCommand.Source --repository $repositoryRoot --ignore-working-copy config list --include-defaults ui.editor 2>&1)
-$expectedLine = "ui.editor = $expectedEditor"
-if ($LASTEXITCODE -ne 0 -or ($verifiedOutput -join [Environment]::NewLine).Trim() -ne $expectedLine) {
-    throw "jj did not resolve ui.editor to the expected non-interactive command. Expected '$expectedLine'; got '$($verifiedOutput -join [Environment]::NewLine)'."
+$resolvedEditor = @(& $jjCommand.Source --repository $repositoryRoot --ignore-working-copy config get ui.editor 2>$null)
+$resolvedEditorValue = if ($LASTEXITCODE -eq 0) { ($resolvedEditor -join [Environment]::NewLine).Trim() } else { $null }
+if (-not (Test-JjNonInteractiveEditorConfig -EditorValue $resolvedEditorValue)) {
+    throw "jj did not resolve ui.editor to the expected non-interactive command. Got '$resolvedEditorValue'."
+}
+
+if (-not (Test-JjNonInteractiveEditorBehavior -JjPath $jjCommand.Source -RepositoryRoot $repositoryRoot)) {
+    throw "jj resolved ui.editor but did not reject an editor-driven description with the expected guidance."
 }
 
 if ($currentEditorValue -eq $expectedEditor) {
     Write-Host 'Already configured; no changes made.'
 } else {
     $configPath = @(& $jjCommand.Source --repository $repositoryRoot --ignore-working-copy config path --repo 2>$null)
-    $configDescription = if ($LASTEXITCODE -eq 0) { ($configPath -join [Environment]::NewLine).Trim() } else { 'the repo-local config' }
+    $configDescription = if ($LASTEXITCODE -eq 0) { ($configPath -join [Environment]::NewLine).Trim() } else { 'the repository config' }
     Write-Host "Configured ui.editor for non-interactive mode in $configDescription"
 }
