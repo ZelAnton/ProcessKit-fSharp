@@ -300,6 +300,40 @@ type CorrectnessBugTests() =
                 // Best-effort cleanup; the synthetic cgroup is not a production resource.
                 ()
 
+    /// A stand-in cgroup directory with NO files in it (T-363), plus a `killCgroupWriteTestHook` that
+    /// refuses every cgroup control write so nothing teardown does can create one — which is what makes
+    /// the post-kill directory reclaim observable on an ordinary filesystem, where (unlike cgroupfs) a
+    /// directory is not removed together with the files in it. `budget` shortens the bounded drain wait
+    /// through its own seam. Both process-wide seams are restored afterwards; like every other user of
+    /// them, these tests run sequentially.
+    let withReclaimableCgroup (budget: TimeSpan) (body: string -> unit) =
+        let dir =
+            Path.Combine(Path.GetTempPath(), $"processkit-cgroup-reclaim-{Guid.NewGuid():N}")
+
+        Directory.CreateDirectory dir |> ignore
+        let originalHook = Native.Cgroup.killCgroupWriteTestHook
+        let originalBudget = Native.Cgroup.drainBudgetOverrideForTests
+
+        Native.Cgroup.killCgroupWriteTestHook <-
+            Some(fun _file _content -> raise (IOException "this stand-in cgroup takes no control writes"))
+
+        Native.Cgroup.drainBudgetOverrideForTests <- Some budget
+
+        try
+            body dir
+        finally
+            Native.Cgroup.killCgroupWriteTestHook <- originalHook
+            Native.Cgroup.drainBudgetOverrideForTests <- originalBudget
+
+            try
+                Directory.Delete(dir, true)
+            with
+            | :? DirectoryNotFoundException
+            | :? IOException
+            | :? UnauthorizedAccessException ->
+                // Best-effort cleanup; a leftover stand-in directory must not fail the test.
+                ()
+
     // A minimal synthetic `RunningHost` over the given config with no pipes and an immediate clean
     // exit — the T-066 concurrency/fault tests below override just the fields they need (`Stdout`,
     // `Wait`, `StartKill`, `Teardown`) with `{ baseHost cfg with ... }`.
@@ -1860,6 +1894,114 @@ type CorrectnessBugTests() =
             | Ok() -> ()
 
             Assert.That(File.Exists(Path.Combine(dir, "cgroup.freeze")), Is.False))
+
+    // --- T-363: teardown must give a hard-killed cgroup a BOUNDED window to actually empty before it
+    // removes the directory, and must reclaim that directory exactly once. A stand-in directory on an
+    // ordinary filesystem is not a cgroup, so the cgroup control writes are refused through the existing
+    // write hook — that way teardown's kill leaves no interface file behind and the reclaim is observable
+    // here (a real cgroupfs directory is removed together with its kernel-generated files; a plain one is
+    // not). The drain budget is shortened through its test seam so neither test pays the real wait. ---
+
+    [<Test>]
+    member _.``cgroup teardown reclaims the directory, and a repeat teardown never removes it again``() =
+        withReclaimableCgroup (TimeSpan.FromMilliseconds 20.0) (fun dir ->
+            let backend = CgroupBackend dir
+            let teardown = backend :> IContainmentBackend
+            teardown.HardRelease()
+
+            Assert.That(
+                Directory.Exists dir,
+                Is.False,
+                "teardown left the drained cgroup directory behind — the leak this fix closes"
+            )
+
+            match backend.RetainedCgroupDetail with
+            | None -> ()
+            | Some detail -> Assert.Fail $"a reclaimed cgroup must leave no teardown complaint behind: {detail}"
+
+            // A second teardown — a `Dispose` racing a `ShutdownAsync`, or a test driving the backend
+            // directly — must not remove this path again. The cgroup name carries THIS process's pid, which
+            // another process inherits once we exit, so by then the directory can belong to a new cgroup.
+            Directory.CreateDirectory dir |> ignore
+            teardown.HardRelease()
+
+            Assert.That(
+                Directory.Exists dir,
+                Is.True,
+                "a repeat teardown removed a cgroup directory it no longer owns"
+            )
+
+            Assert.That(
+                backend.DirectoryReclaims,
+                Is.EqualTo 1,
+                "the cgroup directory reclaim must run exactly once per backend, however teardown is driven"
+            ))
+
+    [<Test>]
+    member _.``a cgroup that will not drain is reported, and reclaimed once even when teardown races itself``() : Task =
+        task {
+            // The stand-in directory holds an ordinary file here, so the removal is refused exactly as a
+            // populated cgroup's would be — the case a single best-effort `rmdir` used to swallow whole.
+            let dir =
+                Path.Combine(Path.GetTempPath(), $"processkit-cgroup-retained-{Guid.NewGuid():N}")
+
+            Directory.CreateDirectory dir |> ignore
+            File.WriteAllText(Path.Combine(dir, "cgroup.procs"), "")
+            let originalBudget = Native.Cgroup.drainBudgetOverrideForTests
+            Native.Cgroup.drainBudgetOverrideForTests <- Some(TimeSpan.FromMilliseconds 20.0)
+
+            try
+                let backend = CgroupBackend dir
+                let teardown = backend :> IContainmentBackend
+                let recordedBefore = Native.Cgroup.retainedCgroupCount ()
+
+                // Two teardowns at once: exactly one of them may run the reclaim, and neither may hang.
+                let first: Task = Task.Run(fun () -> teardown.HardRelease())
+                let second: Task = Task.Run(fun () -> teardown.HardRelease())
+                do! Task.WhenAll(first, second)
+
+                Assert.That(
+                    backend.DirectoryReclaims,
+                    Is.EqualTo 1,
+                    "concurrent teardowns must reclaim the cgroup directory exactly once between them"
+                )
+
+                match backend.RetainedCgroupDetail with
+                | Some detail ->
+                    Assert.That(
+                        detail,
+                        Does.Contain "refused to remove",
+                        "the verdict kept for diagnosis must say what stopped the reclaim"
+                    )
+                | None -> Assert.Fail "a cgroup teardown could not reclaim must be diagnosable, not silently dropped"
+
+                // The same verdict also reaches the process-wide teardown diagnostic, which is what makes
+                // an accumulating hierarchy visible at all. Asserted as a floor, never an exact delta: any
+                // other group's teardown — including a finalizer-driven one — shares that counter (K-148).
+                Assert.That(
+                    Native.Cgroup.retainedCgroupCount (),
+                    Is.GreaterThanOrEqualTo(recordedBefore + 1),
+                    "an unreclaimed cgroup directory must be counted, not silently dropped"
+                )
+
+                Assert.That(
+                    Directory.Exists dir,
+                    Is.True,
+                    "a cgroup that would not drain keeps its directory rather than losing one still in use"
+                )
+            finally
+                Native.Cgroup.drainBudgetOverrideForTests <- originalBudget
+
+                try
+                    Directory.Delete(dir, true)
+                with
+                | :? DirectoryNotFoundException
+                | :? IOException
+                | :? UnauthorizedAccessException ->
+                    // Best-effort cleanup; a leftover stand-in directory must not fail the test.
+                    ()
+        }
+        :> Task
 
     // --- T-197: a concurrent StopAsync teardown during an in-flight buffered verb must not fault the
     // verb with a false ProcessError.Io (the supervision path drives exactly this: `monitorLiveness`

@@ -507,6 +507,72 @@ module internal Cgroup =
         | Ok members -> not (List.isEmpty members)
         | Error _ -> true
 
+    /// What one emptiness probe of a cgroup concluded — the input to the bounded drain wait teardown runs
+    /// between the hard kill and the `rmdir` (`releaseCgroupUsing`). A probe that FAILED is `Unknown`,
+    /// never `Empty`: an unreadable membership is unknown, and reading it as a drained group is exactly
+    /// how a still-live tree would be declared gone (the same fail-safe rule `cgroupAlive` follows for the
+    /// legacy sweep).
+    [<RequireQualifiedAccess; NoComparison>]
+    type Drain =
+        /// Nothing is left to wait for: the kernel reported `populated 0`, `cgroup.procs` read back empty,
+        /// or there is no cgroup directory at all any more.
+        | Empty
+        /// The kernel says the cgroup (or a descendant of it) still holds live members.
+        | Populated
+        /// The probe itself failed, so the membership is UNKNOWN — which is never "empty".
+        | Unknown of Message: string
+
+    // The kernel's own "is anything still alive in here" flag — the `populated` line of `cgroup.events` —
+    // which is the very condition `rmdir` answers `EBUSY` to, and which (unlike `cgroup.procs`) also
+    // counts a descendant cgroup's members. `None` when the file is unavailable or carries something other
+    // than the documented `0`/`1` (a pre-4.14 kernel, a hierarchy that does not expose it, a cgroup being
+    // torn down): not an answer of its own, so the caller falls back to the honest `cgroup.procs` read
+    // rather than guessing from the absence.
+    let private populatedFlag (cgroupPath: string) : bool option =
+        try
+            File.ReadAllLines(Path.Combine(cgroupPath, "cgroup.events"))
+            |> Array.tryPick (fun line ->
+                match line.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries) with
+                | [| "populated"; "0" |] -> Some false
+                | [| "populated"; "1" |] -> Some true
+                | _ -> None)
+        with _ ->
+            // No readable `cgroup.events` (absent on this kernel, or the cgroup is gone) — the
+            // `cgroup.procs` fallback below is what then decides drained / populated / unknown.
+            None
+
+    /// Is the cgroup empty *right now*? The question the bounded drain wait asks between a hard kill and
+    /// the directory removal, because `cgroup.kill` (and the legacy sweep) only START the members leaving:
+    /// the kernel drops a member from the cgroup when it EXITS, so membership can still be non-empty after
+    /// the kill write returns, and `rmdir` refuses a cgroup that still holds anyone.
+    ///
+    /// Crucially this is a MEMBERSHIP question, never a reap one — a process leaves `cgroup.procs` on exit,
+    /// before anybody reaps it — so it is answerable for an ADOPTED member (which we must never `waitpid`)
+    /// exactly as it is for one of our own children.
+    ///
+    /// `cgroup.events`' `populated` flag is preferred (the kernel's own aggregate, covering a descendant
+    /// cgroup's members too) with the `cgroup.procs` read as the fallback. A failed read is `Unknown`; only
+    /// a positively empty answer — or a cgroup directory that is not there at all — is `Empty`. Note what
+    /// `Empty` does and does not claim: it decides WHEN to try the `rmdir` (`Directory.Exists` also answers
+    /// false for a path this process can no longer even stat), while the authority on whether the cgroup
+    /// really drained is the kernel's own answer to that removal.
+    let cgroupDrainState (cgroupPath: string) : Drain =
+        match populatedFlag cgroupPath with
+        | Some true -> Drain.Populated
+        | Some false -> Drain.Empty
+        | None ->
+            match cgroupMembers cgroupPath with
+            | Ok [] -> Drain.Empty
+            | Ok _ -> Drain.Populated
+            | Error message ->
+                // A cgroup whose directory is gone holds nothing and has nothing left to remove — the one
+                // absent-versus-unreadable distinction worth making here. Anything else is an unreadable
+                // membership: unknown, and never reported as drained.
+                if Directory.Exists cgroupPath then
+                    Drain.Unknown message
+                else
+                    Drain.Empty
+
     // errno: the kernel does not implement the syscall — a pre-5.3 kernel lacking `pidfd_open`, a pre-5.1
     // kernel lacking `pidfd_send_signal`, or a seccomp filter blocking either. Turned into an honest
     // fail-safe error below rather than a racy raw-kill fallback.
@@ -918,9 +984,193 @@ module internal Cgroup =
 
         cpu, memory, cgroupIoCounters cgroupPath
 
-    /// Remove a (drained) cgroup directory. Best-effort cleanup.
-    let removeCgroup (cgroupPath: string) =
+    /// How one attempt to remove the cgroup directory ended.
+    [<RequireQualifiedAccess; NoComparison>]
+    type Removal =
+        /// The directory is gone: the `rmdir` succeeded, or it was already absent.
+        | Removed
+        /// The kernel refused because something is still in there — `EBUSY` while the cgroup holds members
+        /// that have not finished leaving, `ENOTEMPTY` while it holds a child cgroup. Both surface as an
+        /// `IOException`, and both are worth retrying inside the drain budget rather than swallowing.
+        | Busy of Detail: string
+        /// A refusal no amount of waiting fixes (a revoked delegation, a read-only mount): reported at once.
+        | Failed of Detail: string
+
+    /// What reclaiming a cgroup directory concluded, once the bounded wait for its tree to leave is over.
+    [<RequireQualifiedAccess; NoComparison>]
+    type Release =
+        /// The directory is gone — the only verdict the kernel itself confirms (cgroupfs refuses to remove
+        /// a cgroup that still holds members, so a successful `rmdir` IS the drain proof).
+        | Removed
+        /// The budget was spent and the directory is still there, with why: still populated, never
+        /// confirmed drained (an unreadable membership), or a removal the kernel refused.
+        | Retained of Detail: string
+
+    /// How long teardown waits for a hard-killed cgroup to actually empty before it gives up on reclaiming
+    /// the directory. The ordinary cgroup is already empty by the time teardown asks — its members were
+    /// SIGKILLed, and the ones that are our own children reaped, before this runs — so this is a ceiling
+    /// for the straggler case, not latency anyone pays, and it is deliberately short because
+    /// `CgroupBackend.HardRelease` runs under the owning `ProcessGroup`'s lifecycle lock. Matches the
+    /// ProcessKit-rs prototype's own bounded drain wait (50 × 2 ms) before its `rmdir`.
+    let DefaultDrainBudget = TimeSpan.FromMilliseconds 100.0
+
+    [<Literal>]
+    let private DrainPollIntervalMilliseconds = 2.0
+
+    /// Test seam: production NEVER assigns this, so the budget is `DefaultDrainBudget` everywhere. A
+    /// regression that must not pay the real wait sets it (and restores it) around the call, exactly like
+    /// `killCgroupWriteTestHook` and `PostKillReap.budgetOverrideForTests`.
+    ///
+    /// NOT thread-safe, the same convention `migrateWriteTestHook` documents: it is a process-wide,
+    /// unsynchronized mutable, so it relies on the tests that set it running sequentially (no
+    /// `[<Parallelizable>]` in this suite) and always restoring it in a `finally`.
+    let mutable internal drainBudgetOverrideForTests: TimeSpan option = None
+
+    let private drainBudget () =
+        match drainBudgetOverrideForTests with
+        | Some value -> value
+        | None -> DefaultDrainBudget
+
+    // A teardown that could not reclaim its cgroup directory has nowhere to REPORT that: the backend's
+    // `HardRelease` is `unit` by contract (`IContainmentBackend`) and holds no `ILogger`. So the classified
+    // verdict is recorded here rather than dropped on the floor — how many directories this process failed
+    // to reclaim, and the most recent one with its reason — which is what makes an accumulating cgroup
+    // hierarchy diagnosable (and assertable in a regression test) instead of silently invisible. Behind a
+    // small lock so the count and the detail can never disagree about the same teardown.
+    let private diagnosticGate = obj ()
+    let mutable private retainedCgroups = 0
+    let mutable private lastRetainedCgroup: string option = None
+
+    /// Record a cgroup directory a teardown could not reclaim, with the reason it gave.
+    let noteRetainedCgroup (cgroupPath: string) (detail: string) =
+        lock diagnosticGate (fun () ->
+            retainedCgroups <- retainedCgroups + 1
+            lastRetainedCgroup <- Some $"{cgroupPath}: {detail}")
+
+    /// How many cgroup directories this process has failed to reclaim at teardown.
+    let retainedCgroupCount () =
+        lock diagnosticGate (fun () -> retainedCgroups)
+
+    /// The most recent cgroup directory teardown left behind, and why — `None` while there is none.
+    let lastRetainedCgroupDetail () =
+        lock diagnosticGate (fun () -> lastRetainedCgroup)
+
+    /// Wait — BOUNDED — for a hard-killed cgroup to actually empty, then remove its directory, with the
+    /// clock, the sleep, the emptiness probe and the removal all injected so the whole sequence is testable
+    /// without a real kernel (the `killCgroupUsing`/`GracefulTeardown.pollUsing` pattern).
+    ///
+    /// The shape, and why each part is there:
+    ///
+    ///  * **Bounded, always.** Every pass re-reads the clock; once `budget` is spent the loop ends on that
+    ///    pass, whatever the cgroup is doing. No path here sleeps unbounded, and each sleep is additionally
+    ///    clamped to what is left of the budget.
+    ///  * **No wait on the ordinary path.** A cgroup that already reads empty is removed on the FIRST pass,
+    ///    before any sleep — the bounded wait must not become a fixed teardown latency.
+    ///  * **A transient `EBUSY` is retried, not swallowed.** The kernel refusing the removal is its own
+    ///    statement that a member has not finished leaving, so it re-enters the same wait (and the same
+    ///    budget) instead of being dropped after one attempt.
+    ///  * **An unreadable membership is never "drained".** `Drain.Unknown` keeps polling for the whole
+    ///    budget exactly as `Drain.Populated` does, and can only end in `Retained` — never in a `Removed`
+    ///    this function made up. What it does NOT do is refuse to try: once the budget is spent the removal
+    ///    is attempted anyway, because cgroupfs will not remove a cgroup that still holds members, so that
+    ///    attempt can reclaim a directory whose emptiness could not be READ while being unable to take away
+    ///    one still in use. `Removed` therefore always rests on the kernel's answer, never on this loop's.
+    let releaseCgroupUsing
+        (probe: unit -> Drain)
+        (remove: unit -> Removal)
+        (elapsed: unit -> TimeSpan)
+        (sleep: TimeSpan -> unit)
+        (budget: TimeSpan)
+        : Release =
+        let pollInterval = TimeSpan.FromMilliseconds DrainPollIntervalMilliseconds
+        let mutable verdict: Release voption = ValueNone
+
+        // What a retained directory would be blamed on if the budget ran out right now, kept as its two
+        // independent halves so neither can hide the other: the STATE the last probe found (which is where
+        // "still populated" and "never confirmed drained" stay distinguishable), and the kernel's own last
+        // refusal, if it got as far as one. Both are rewritten per pass, so the verdict reports what
+        // actually ended the wait rather than a generic message.
+        let mutable drainDetail =
+            "the cgroup did not drain before the teardown budget ran out"
+
+        let mutable refusal: string option = None
+
+        let retained () =
+            match refusal with
+            | Some detail -> $"{drainDetail}; {detail}"
+            | None -> drainDetail
+
+        while verdict.IsNone do
+            let remaining = budget - elapsed ()
+            let expired = remaining <= TimeSpan.Zero
+
+            let attemptRemoval =
+                match probe () with
+                | Drain.Empty ->
+                    // Nothing left to wait for: remove now, so an already-drained cgroup — the ordinary
+                    // case — pays no part of the budget at all.
+                    drainDetail <- "the cgroup read empty"
+                    true
+                | Drain.Populated ->
+                    drainDetail <- "the cgroup was still populated when the teardown budget ran out"
+                    expired
+                | Drain.Unknown message ->
+                    drainDetail <- $"the cgroup was never confirmed drained: {message}"
+                    expired
+
+            if attemptRemoval then
+                match remove () with
+                | Removal.Removed -> verdict <- ValueSome Release.Removed
+                | Removal.Failed detail ->
+                    verdict <-
+                        ValueSome(Release.Retained $"{drainDetail}; the directory could not be removed: {detail}")
+                | Removal.Busy detail ->
+                    // The kernel's own verdict that the cgroup is not drained after all (a member is still
+                    // on its way out, or a child cgroup remains). Keep waiting inside the same budget.
+                    refusal <- Some $"the kernel refused to remove the directory: {detail}"
+
+            if verdict.IsNone then
+                if expired then
+                    verdict <- ValueSome(Release.Retained(retained ()))
+                else
+                    sleep (min pollInterval remaining)
+
+        verdict.Value
+
+    // One `rmdir` of the cgroup directory, classified for the loop above. Deliberately NON-recursive: a
+    // cgroup is reclaimed by removing its directory, never by deleting anything inside it.
+    let private removeCgroupDirectory (cgroupPath: string) : Removal =
         try
             Directory.Delete cgroupPath
-        with _ ->
-            ()
+            Removal.Removed
+        with
+        | :? DirectoryNotFoundException ->
+            // Already gone — the end state this call wanted, whoever reached it first. Matched ahead of
+            // `IOException`, which it derives from.
+            Removal.Removed
+        | :? IOException as ex ->
+            // `EBUSY` (members still leaving) or `ENOTEMPTY` (a child cgroup): something is still in there,
+            // which is the retryable case.
+            Removal.Busy ex.Message
+        | ex ->
+            // A refusal waiting cannot fix — `UnauthorizedAccessException` on a revoked delegation or a
+            // read-only mount, an argument the runtime rejects outright.
+            Removal.Failed ex.Message
+
+    /// Reclaim a hard-killed cgroup's directory: `releaseCgroupUsing` wired to the real `cgroup.events`/
+    /// `cgroup.procs` probe, the real `rmdir`, a real clock and a real sleep.
+    ///
+    /// This is teardown's LAST step and it is why the wait exists: `cgroup.kill` is asynchronous, so the
+    /// members can still be leaving when it returns, and removing the directory right then fails with
+    /// `EBUSY` — an error that used to be swallowed whole, leaving an empty but permanent cgroup behind on
+    /// every teardown until the hierarchy filled up with them. The wait is bounded (`DefaultDrainBudget`)
+    /// and needs no reap: membership is what it reads, and a process leaves the cgroup when it exits.
+    let releaseCgroup (cgroupPath: string) : Release =
+        let stopwatch = System.Diagnostics.Stopwatch.StartNew()
+
+        releaseCgroupUsing
+            (fun () -> cgroupDrainState cgroupPath)
+            (fun () -> removeCgroupDirectory cgroupPath)
+            (fun () -> stopwatch.Elapsed)
+            (fun (duration: TimeSpan) -> System.Threading.Thread.Sleep duration)
+            (drainBudget ())
