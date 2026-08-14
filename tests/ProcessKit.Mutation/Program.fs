@@ -2,9 +2,32 @@ module ProcessKit.Mutation.Program
 
 open System
 open System.IO
+open System.Runtime.InteropServices
 open System.Text.Json
 open Mono.Cecil
 open Mono.Cecil.Cil
+
+module private TestHostErrorMode =
+
+    [<Literal>]
+    let private SEM_FAILCRITICALERRORS = 0x00000001u
+
+    [<Literal>]
+    let private SEM_NOGPFAULTERRORBOX = 0x00000002u
+
+    [<Literal>]
+    let private SEM_NOOPENFILEERRORBOX = 0x00008000u
+
+    [<Literal>]
+    let private SuppressedDialogModes =
+        SEM_FAILCRITICALERRORS ||| SEM_NOGPFAULTERRORBOX ||| SEM_NOOPENFILEERRORBOX
+
+    [<DllImport("kernel32.dll")>]
+    extern uint32 SetErrorMode(uint32 uMode)
+
+    let suppressModalDialogs () =
+        if OperatingSystem.IsWindows() then
+            SetErrorMode SuppressedDialogModes |> ignore
 
 /// Threads the `Result<_, string>` failures of argument parsing, scope loading and catalog
 /// resolution through one linear block, so every verb below reads as its own happy path and every
@@ -156,6 +179,8 @@ let private runApply (args: Map<string, string>) =
 
 [<EntryPoint>]
 let main argv =
+    TestHostErrorMode.suppressModalDialogs ()
+
     let outcome =
         match List.ofArray argv with
         | "list" :: rest -> parseArgs rest |> Result.bind runList

@@ -3,12 +3,35 @@ namespace ProcessKit.Fuzz
 open System
 open System.Diagnostics
 open System.IO
+open System.Runtime.InteropServices
 open System.Text
 open System.Threading
 open System.Threading.Tasks
 open SharpFuzz
 open ProcessKit
 open ProcessKit.Testing
+
+module private TestHostErrorMode =
+
+    [<Literal>]
+    let private SEM_FAILCRITICALERRORS = 0x00000001u
+
+    [<Literal>]
+    let private SEM_NOGPFAULTERRORBOX = 0x00000002u
+
+    [<Literal>]
+    let private SEM_NOOPENFILEERRORBOX = 0x00008000u
+
+    [<Literal>]
+    let private SuppressedDialogModes =
+        SEM_FAILCRITICALERRORS ||| SEM_NOGPFAULTERRORBOX ||| SEM_NOOPENFILEERRORBOX
+
+    [<DllImport("kernel32.dll")>]
+    extern uint32 SetErrorMode(uint32 uMode)
+
+    let suppressModalDialogs () =
+        if OperatingSystem.IsWindows() then
+            SetErrorMode SuppressedDialogModes |> ignore
 
 module private Targets =
 
@@ -323,6 +346,8 @@ module Program =
 
     [<EntryPoint>]
     let main _ =
+        TestHostErrorMode.suppressModalDialogs ()
+
         match Environment.GetEnvironmentVariable "PROCESSKIT_FUZZ_TARGET" with
         | "pump" -> Fuzzer.LibFuzzer.Run(ReadOnlySpanAction Targets.pump)
         | "framing" -> Fuzzer.LibFuzzer.Run(ReadOnlySpanAction Targets.framing)

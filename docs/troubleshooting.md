@@ -163,6 +163,23 @@ typed error cases are documented in
 [Running commands](commands.md#program-arguments-working-directory) and
 [Running commands: Errors](commands.md#errors).
 
+## Modal Windows error dialogs from failed child processes
+
+**Symptom:** A child that fails during startup displays a modal Windows hard-error
+dialog and blocks an unattended host until somebody dismisses it.
+
+**Cause:** ProcessKit does not pass `CREATE_DEFAULT_ERROR_MODE`, so a Windows
+child inherits the process-wide error mode of its host. The default host mode can
+allow Windows to display a dialog for startup failures even though the failed run
+is otherwise observable through its spawn error or exit status.
+
+**Solution:** An application that must remain unattended should call Windows
+`SetErrorMode` once during host startup, before it can create any child, with
+`SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX`. This is
+an application-level choice because the setting affects the whole process;
+ProcessKit never changes it on the application's behalf. The call should be a
+no-op on non-Windows platforms.
+
 ## `ProcessGroup` uses `Mechanism.ProcessGroup` instead of cgroup v2
 
 **Symptom:** Linux reports `group.Mechanism = Mechanism.ProcessGroup` when cgroup
