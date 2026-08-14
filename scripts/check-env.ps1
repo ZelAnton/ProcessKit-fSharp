@@ -22,6 +22,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $problems = @()
+. (Join-Path $PSScriptRoot 'jj-noninteractive-config.ps1')
 
 Write-Host "==> Checking environment for F# (.NET) development" -ForegroundColor Cyan
 
@@ -71,48 +72,28 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 # Soft: an interactive jj editor can leave unattended runs waiting for input.
 $jjCommand = Get-Command jj -ErrorAction SilentlyContinue
 if ($null -ne $jjCommand) {
-    $jjConfig = $null
-    $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+    $checkoutPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+    $repositoryRoot = $null
+    $actualEditor = $null
 
     try {
-        $configOutput = @(& $jjCommand.Source --repository $repositoryRoot config list --include-defaults ui.editor 2>$null)
+        $rootOutput = @(& $jjCommand.Source --repository $checkoutPath --ignore-working-copy root 2>$null)
         if ($LASTEXITCODE -eq 0) {
-            $jjConfig = $configOutput
-        } else {
-            $configOutput = @(& $jjCommand.Source --repository $repositoryRoot config list ui.editor 2>$null)
-            if ($LASTEXITCODE -eq 0) { $jjConfig = $configOutput }
+            $repositoryRoot = ($rootOutput -join [Environment]::NewLine).Trim()
+            $editorOutput = @(& $jjCommand.Source --repository $repositoryRoot --ignore-working-copy config get ui.editor 2>$null)
+            if ($LASTEXITCODE -eq 0) {
+                $actualEditor = ($editorOutput -join [Environment]::NewLine).Trim()
+            }
         }
     } catch {
         # Advisory only - an unreadable jj config must not make the environment check fail.
     }
 
-    $editorLine = $jjConfig |
-        Where-Object { $_ -match '^\s*ui\.editor\s*=' } |
-        Select-Object -Last 1
-
-    if ($null -ne $editorLine) {
-        $editorValue = ($editorLine -replace '^\s*ui\.editor\s*=\s*', '').Trim()
-        $editorCommand = $null
-
-        if ($editorValue -match '^\[\s*"([^"]+)"') {
-            $editorCommand = $Matches[1]
-        } elseif ($editorValue -match '^"([^"]+)"') {
-            $editorCommand = ($Matches[1] -split '\s+', 2)[0]
-        } elseif ($editorValue -match '^([^\s,\]]+)') {
-            $editorCommand = $Matches[1]
-        }
-
-        if ($null -ne $editorCommand) {
-            $editorName = [System.IO.Path]::GetFileName($editorCommand).ToLowerInvariant()
-            $interactiveEditors = @(
-                'code', 'code.cmd', 'code.exe', 'emacs', 'gedit', 'mate', 'nano',
-                'notepad', 'notepad.exe', 'notepad++', 'notepad++.exe', 'pico',
-                'subl', 'sublime', 'sublime_text', 'vi', 'vim'
-            )
-
-            if ($interactiveEditors -contains $editorName) {
-                Write-Host "    note: jj's ui.editor is set to GUI editor ($editorCommand). This will block automation. Run 'pwsh ./scripts/setup-jj-noninteractive.ps1' to configure non-interactive mode." -ForegroundColor Yellow
-            }
+    if ($null -ne $repositoryRoot) {
+        $expectedEditor = Get-JjNonInteractiveEditorConfig -RepositoryRoot $repositoryRoot
+        if ($actualEditor -ne $expectedEditor) {
+            $actualDescription = if ([string]::IsNullOrWhiteSpace($actualEditor)) { 'unavailable' } else { $actualEditor }
+            Write-Host "    note: jj's ui.editor is not the repository's non-interactive command ($actualDescription). This can block automation. Run 'pwsh ./scripts/setup-jj-noninteractive.ps1' to configure non-interactive mode." -ForegroundColor Yellow
         }
     }
 }

@@ -164,9 +164,11 @@ repository-local guard:
 pwsh ./scripts/setup-jj-noninteractive.ps1
 ```
 
-The script changes only this checkout's `.jj/repo/config.toml`; it does not change your user-level
-jj configuration. Run `pwsh ./scripts/check-env.ps1` to verify the setup: it should no longer print
-the `ui.editor` warning. Commands that provide their message inline, such as
+The script asks jj to set `ui.editor` in the repo-local config with `jj config set --repo`; it does
+not change your user-level jj configuration or assume where the current jj version stores repository
+configuration. Use `jj config path --repo` if you need to inspect that location. Run
+`pwsh ./scripts/check-env.ps1` or `bash ./scripts/check-env.sh` to verify the setup: neither should
+print the `ui.editor` warning. Commands that provide their message inline, such as
 `jj describe -m "Description"`, work the same before and after setup.
 
 ## Mutation testing

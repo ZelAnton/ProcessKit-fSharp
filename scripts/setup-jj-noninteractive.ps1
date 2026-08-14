@@ -1,128 +1,56 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Configures this jj checkout to fail instead of opening an interactive editor.
+    Configures this jj repository to fail instead of opening an interactive editor.
 
 .DESCRIPTION
-    Writes only the repository-local .jj/repo/config.toml. Commands that provide
-    their text inline, such as `jj describe -m "..."`, are unaffected.
+    Uses jj to set only the repository-local ui.editor value. Commands that
+    provide their text inline, such as `jj describe -m "..."`, are unaffected.
 #>
 [CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'jj-noninteractive-config.ps1')
 
-$searchDirectory = Get-Item -LiteralPath (Join-Path $PSScriptRoot '..')
-$repositoryRoot = $null
-
-while ($null -ne $searchDirectory) {
-    if (Test-Path -LiteralPath (Join-Path $searchDirectory.FullName '.jj')) {
-        $repositoryRoot = $searchDirectory.FullName
-        break
-    }
-
-    $parentDirectory = $searchDirectory.Parent
-    if ($null -eq $parentDirectory -or $parentDirectory.FullName -eq $searchDirectory.FullName) {
-        break
-    }
-
-    $searchDirectory = $parentDirectory
+$jjCommand = Get-Command jj -ErrorAction SilentlyContinue
+if ($null -eq $jjCommand) {
+    throw "Could not configure jj because 'jj' is not on PATH."
 }
 
-if ($null -eq $repositoryRoot) {
-    throw "Could not find a jj checkout (.jj) from '$PSScriptRoot' or its parent directories."
+$checkoutPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$rootOutput = @(& $jjCommand.Source --repository $checkoutPath --ignore-working-copy root 2>&1)
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not find the jj checkout containing '$PSScriptRoot': $($rootOutput -join [Environment]::NewLine)"
 }
 
-$configDirectory = Join-Path $repositoryRoot '.jj/repo'
-$configPath = Join-Path $configDirectory 'config.toml'
-$editorLine = 'editor = ["pwsh", "-NoProfile", "-Command", "Write-Host ''Error: jj editor opened in non-interactive mode. Use -m flag to provide description inline.''; exit 1"]'
-
-if (Test-Path -LiteralPath $configPath) {
-    $originalContent = [string](Get-Content -LiteralPath $configPath -Raw)
-} else {
-    $originalContent = ''
+$repositoryRoot = ($rootOutput -join [Environment]::NewLine).Trim()
+$editorScript = Join-Path $repositoryRoot 'scripts/jj-no-editor.ps1'
+if (-not (Test-Path -LiteralPath $editorScript -PathType Leaf)) {
+    throw "Could not find the non-interactive editor script at '$editorScript'."
 }
 
-$normalizedContent = $originalContent -replace "`r`n", "`n" -replace "`r", "`n"
-$lines = [System.Collections.Generic.List[string]]::new([regex]::Split($normalizedContent, "`n"))
-$uiHeaderIndex = -1
+$expectedEditor = Get-JjNonInteractiveEditorConfig -RepositoryRoot $repositoryRoot
+$currentEditor = @(& $jjCommand.Source --repository $repositoryRoot --ignore-working-copy config get ui.editor 2>$null)
+$currentEditorValue = if ($LASTEXITCODE -eq 0) { ($currentEditor -join [Environment]::NewLine).Trim() } else { $null }
 
-for ($index = 0; $index -lt $lines.Count; $index++) {
-    if ($lines[$index] -match '^\s*\[ui\]\s*(?:#.*)?$') {
-        $uiHeaderIndex = $index
-        break
+if ($currentEditorValue -ne $expectedEditor) {
+    & $jjCommand.Source --repository $repositoryRoot --ignore-working-copy config set --repo ui.editor $expectedEditor
+    if ($LASTEXITCODE -ne 0) {
+        throw "jj could not set the repository-local ui.editor value."
     }
 }
 
-$editorIndexes = [System.Collections.Generic.List[int]]::new()
-$legacyEditorArgsIndexes = [System.Collections.Generic.List[int]]::new()
-
-if ($uiHeaderIndex -ge 0) {
-    for ($index = $uiHeaderIndex + 1; $index -lt $lines.Count; $index++) {
-        if ($lines[$index] -match '^\s*\[[^]]+\]\s*(?:#.*)?$') {
-            break
-        }
-
-        if ($lines[$index] -match '^\s*editor\s*=') {
-            $editorIndexes.Add($index)
-        } elseif ($lines[$index] -match '^\s*editor-args\s*=') {
-            $legacyEditorArgsIndexes.Add($index)
-        }
-    }
+$verifiedOutput = @(& $jjCommand.Source --repository $repositoryRoot --ignore-working-copy config list --include-defaults ui.editor 2>&1)
+$expectedLine = "ui.editor = $expectedEditor"
+if ($LASTEXITCODE -ne 0 -or ($verifiedOutput -join [Environment]::NewLine).Trim() -ne $expectedLine) {
+    throw "jj did not resolve ui.editor to the expected non-interactive command. Expected '$expectedLine'; got '$($verifiedOutput -join [Environment]::NewLine)'."
 }
 
-$alreadyConfigured =
-    $editorIndexes.Count -eq 1 -and
-    $legacyEditorArgsIndexes.Count -eq 0 -and
-    $lines[$editorIndexes[0]].Trim() -eq $editorLine
-
-if ($alreadyConfigured) {
+if ($currentEditorValue -eq $expectedEditor) {
     Write-Host 'Already configured; no changes made.'
-    exit 0
-}
-
-if ($uiHeaderIndex -lt 0) {
-    while ($lines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($lines[$lines.Count - 1])) {
-        $lines.RemoveAt($lines.Count - 1)
-    }
-
-    if ($lines.Count -gt 0) {
-        $lines.Add('')
-    }
-
-    $lines.Add('[ui]')
-    $lines.Add($editorLine)
 } else {
-    if ($editorIndexes.Count -gt 0) {
-        $lines[$editorIndexes[0]] = $editorLine
-    }
-
-    $indexesToRemove = [System.Collections.Generic.List[int]]::new()
-    for ($index = 1; $index -lt $editorIndexes.Count; $index++) {
-        $indexesToRemove.Add($editorIndexes[$index])
-    }
-
-    foreach ($index in $legacyEditorArgsIndexes) {
-        $indexesToRemove.Add($index)
-    }
-
-    $indexesToRemove.Sort()
-    $indexesToRemove.Reverse()
-    foreach ($index in $indexesToRemove) {
-        $lines.RemoveAt($index)
-    }
-
-    if ($editorIndexes.Count -eq 0) {
-        $lines.Insert($uiHeaderIndex + 1, $editorLine)
-    }
+    $configPath = @(& $jjCommand.Source --repository $repositoryRoot --ignore-working-copy config path --repo 2>$null)
+    $configDescription = if ($LASTEXITCODE -eq 0) { ($configPath -join [Environment]::NewLine).Trim() } else { 'the repo-local config' }
+    Write-Host "Configured ui.editor for non-interactive mode in $configDescription"
 }
-
-if (-not (Test-Path -LiteralPath $configDirectory)) {
-    New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
-}
-
-$newContent = [string]::Join("`n", $lines).TrimEnd([char[]]"`r`n") + "`n"
-$utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
-[System.IO.File]::WriteAllText($configPath, $newContent, $utf8WithoutBom)
-
-Write-Host 'Configured ui.editor for non-interactive mode in .jj/repo/config.toml'
