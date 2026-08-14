@@ -1102,6 +1102,23 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // the wait begins and reset by each stdout/stderr read through the activity-tracking wrappers. The
     // exit wait underneath is `boundedExitWait`, so the reap after ANY hard kill on this handle stays
     // bounded (the timeout race bounds its own post-kill reap too, see `Timeouts.raceTimeoutWithCts`).
+    //
+    // The TOTAL deadline is anchored at SPAWN (`host.StartedTimestamp`, the same monotonic stamp
+    // `elapsed ()` and `ProcessResult.Duration` are measured from), not at this call: this exit wait is
+    // created LAZILY by whichever consumer gets here first — a buffered verb through
+    // `ensureBufferedWait`, a streaming/event session, a readiness probe, `WaitAnyAsync`/`WaitAllAsync`
+    // — and on a live `StartAsync` handle that can be long after the child started. Re-issuing the full
+    // `config.Timeout` here would hand the child `(time until the first consumer) + Timeout` to run in,
+    // so `Command.Timeout(1s)` on a handle consumed five seconds later bounded nothing anyone asked
+    // for. `Timeouts.totalDeadline` therefore arms only what is LEFT of the budget while keeping the
+    // CONFIGURED duration for `ProcessError.Timeout`/`ProcessResult`/`Log.timeout`, and every wait
+    // created on this handle — however many consumers reach `waitWithTimeout`, and whenever — resolves
+    // to the same single absolute deadline (KB K-149: a window that bounds later-created work must be
+    // computed when that work is created, never fixed at an earlier event).
+    //
+    // The IDLE deadline is deliberately NOT rewritten this way: it is an inactivity window, so it is
+    // armed inside the race when output actually starts being consumed. Backdating it to spawn would
+    // charge a handle for the quiet gap before anything was reading — the opposite of what it measures.
     let waitWithTimeout () : Task<Outcome> =
         let onTimeout (configuredDuration: TimeSpan) : Task =
             task {
@@ -1113,7 +1130,12 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             }
             :> Task
 
-        Timeouts.raceTimeout config.Logger config.Program runId config.Timeout idleTimer onTimeout (boundedExitWait ())
+        // Read the elapsed time BEFORE starting the wait, so the budget is never widened by the work of
+        // starting it (the two are microseconds apart; erring towards the smaller remainder is the
+        // honest direction for a deadline).
+        let total = Timeouts.totalDeadline config.Timeout (elapsed ())
+
+        Timeouts.raceTimeout config.Logger config.Program runId total idleTimer onTimeout (boundedExitWait ())
 
     // Start (and memoize) a buffered verb's single exit wait, under `stateLock`. Every buffered verb
     // calls this instead of `waitWithTimeout()` directly; the first caller creates the wait, and both

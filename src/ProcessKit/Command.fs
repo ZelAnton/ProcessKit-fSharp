@@ -1167,8 +1167,12 @@ type Command internal (config: CommandConfig) =
     /// The configured run timeout, if any.
     member _.ConfiguredTimeout = config.Timeout
 
-    /// Kill the run after `duration`, reporting the result as `Outcome.TimedOut`. A negative
-    /// `duration` is rejected; one larger than ~24.8 days is treated as no timeout.
+    /// Kill the run after `duration`, reporting the result as `Outcome.TimedOut`. The deadline bounds
+    /// the run's total wall time and is measured from the **spawn**, so a live `StartAsync` handle
+    /// collected later gets only what is left of it (and one already past its deadline is killed at
+    /// once), while a child that finished on its own inside the deadline still reports its real
+    /// outcome. A fired deadline always reports this configured `duration`. A negative `duration` is
+    /// rejected; one larger than ~24.8 days is treated as no timeout.
     member _.Timeout(duration: TimeSpan) =
         ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero)
         Command({ config with Timeout = Some duration })
@@ -1759,7 +1763,7 @@ module Command =
     /// Opt in to a bounded/backpressure channel for the streaming verbs (default stays unbounded).
     let streamBuffer (policy: StreamBufferPolicy) (command: Command) = command.StreamBuffer policy
 
-    /// Kill the run after `duration`.
+    /// Kill the run `duration` after it was spawned.
     let timeout (duration: TimeSpan) (command: Command) = command.Timeout duration
 
     /// Terminate gracefully on timeout, force-killing only after `grace`.

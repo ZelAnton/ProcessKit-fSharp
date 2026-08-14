@@ -29,6 +29,71 @@ module internal Timeouts =
         elif duration > maxArmable then maxArmable
         else duration
 
+    /// The total-run deadline (`Command.Timeout`) as the exit-wait race has to see it: the duration the
+    /// caller CONFIGURED — the one every result, error, and log reports — together with the delay this
+    /// particular wait actually arms, which is only what is LEFT of that budget.
+    ///
+    /// The two differ because the budget is anchored at **spawn**, while the exit wait it bounds is
+    /// created lazily by the first consumer (`RunningProcess.ensureBufferedWait`, or a streaming
+    /// session's own `waitWithTimeout`) — which on a live `StartAsync` handle can be long after the
+    /// child started. Arming the whole configured duration there would silently grant the child
+    /// `delay + Timeout` to run in; arming the remainder gives every consumer of one run the same
+    /// single absolute deadline, while `Configured` keeps `ProcessError.Timeout`, `ProcessResult`, and
+    /// `Log.timeout` reporting the deadline that was set rather than whatever slice of it was left when
+    /// someone got around to waiting.
+    type internal TotalDeadline =
+        {
+            /// The duration `Command.Timeout` was set to — what a fired deadline always reports.
+            Configured: TimeSpan
+            /// The delay this wait arms: what remains of `Configured`, measured from spawn. Always
+            /// armable, and never negative (see `totalDeadline`).
+            Armed: TimeSpan
+        }
+
+    /// How long an exit wait whose budget was ALREADY spent before it was created still gives the
+    /// child's own exit to become observable, before the deadline fires and kills the tree.
+    ///
+    /// This is not extra budget for the run — it is the window in which an exit that has ALREADY
+    /// happened can reach us. A child that finished on its own well inside its deadline, on a handle
+    /// whose first consuming verb only arrives afterwards, must still report its real outcome:
+    /// answering `TimedOut` for a run that never exceeded anything would fabricate a failure out of the
+    /// caller's scheduling. Making that exit visible costs only our own asynchronous wait plumbing (a
+    /// pidfd/kqueue readiness callback, a thread-pool hop), which answers in well under a millisecond,
+    /// so a quarter second is generous headroom even on a loaded CI runner — and it stays bounded, so a
+    /// child that genuinely IS still running past its deadline pays this fixed, negligible delay before
+    /// its (already overdue) kill instead of a whole freshly counted timeout.
+    let spentBudgetSettle = TimeSpan.FromMilliseconds 250.0
+
+    /// Build the total deadline for an exit wait created `elapsedSinceSpawn` after the child started.
+    ///
+    /// `isArmable` screens the CONFIGURED value alone, so the builder's contract is decided by what the
+    /// caller set and cannot be changed by how late the wait is created: a negative timeout is already
+    /// rejected at the builder, and one longer than a BCL timer can hold (~24.8 days) is "effectively
+    /// never", i.e. no timeout at all. What is left of an armable budget is what gets armed; a budget
+    /// already spent arms `spentBudgetSettle` instead of firing blind (see it); a zero-length budget
+    /// arms nothing at all, because no exit can have happened inside it that a settle window could
+    /// reveal. The subtraction only ever runs on a non-negative remainder inside the armable range, so
+    /// it cannot overflow, and the result is clamped anyway — a `Task.Delay`/timer here must never
+    /// throw synchronously and orphan the in-flight pumps.
+    let totalDeadline (configured: TimeSpan option) (elapsedSinceSpawn: TimeSpan) : TotalDeadline option =
+        match configured with
+        | Some total when isArmable total ->
+            // A monotonic clock cannot run backwards, but a synthetic host can hand us a spawn stamp
+            // from the future; treat that as "no time has been spent" rather than widening the budget.
+            let spent =
+                if elapsedSinceSpawn > TimeSpan.Zero then
+                    elapsedSinceSpawn
+                else
+                    TimeSpan.Zero
+
+            Some
+                { Configured = total
+                  Armed =
+                    if spent < total then clampArmable (total - spent)
+                    elif total > TimeSpan.Zero then spentBudgetSettle
+                    else TimeSpan.Zero }
+        | _ -> None
+
     /// A resettable "no output" watchdog behind `Command.IdleTimeout`. `Expired` completes once the
     /// idle window elapses with no intervening `Reset`; each stdout/stderr read `Reset`s it (through the
     /// `ActivityStream` wrapper), pushing the deadline out. Created stopped: `Arm` starts the countdown
@@ -117,7 +182,7 @@ module internal Timeouts =
             if disposing then
                 inner.Dispose()
 
-    /// Race a process `wait` against a total deadline (`timeout`) and/or a resettable idle deadline
+    /// Race a process `wait` against a total deadline (`total`) and/or a resettable idle deadline
     /// (`idle`, armed here as the exit wait begins), using an externally supplied `timeoutCts` to arm
     /// the total-timeout timer. With neither deadline armed, just returns `wait`. Otherwise: if the
     /// wait wins, cancel `timeoutCts` and return its outcome; on whichever deadline fires first, cancel
@@ -125,6 +190,12 @@ module internal Timeouts =
     /// a grace-period-bounded kill), pass its configured duration to `onTimeout` (the kill — shared by
     /// both, so there is never a double kill), reap the child within `postKillBudget`, log the cause
     /// that fired (total vs idle), and report `TimedOut`.
+    ///
+    /// The total deadline arrives already resolved (`TotalDeadline`, built by `totalDeadline`): the
+    /// delay armed here is what is LEFT of the spawn-anchored budget, while the duration handed to
+    /// `onTimeout` and to the log is the one the caller CONFIGURED. The idle deadline is deliberately
+    /// unaffected — it is an inactivity window, so it starts when output actually begins to be
+    /// consumed (`timer.Arm()` below), never backdated to spawn.
     ///
     /// The post-kill reap is BOUNDED by `postKillBudget` (`PostKillReap`): the kill has already been
     /// delivered and the disposition is already `TimedOut`, so a child wedged in uninterruptible sleep
@@ -143,16 +214,11 @@ module internal Timeouts =
         (logger: ILogger option)
         (program: string)
         (runId: string)
-        (timeout: TimeSpan option)
+        (total: TotalDeadline option)
         (idle: IdleTimer option)
         (onTimeout: TimeSpan -> Task)
         (wait: Task<Outcome>)
         : Task<Outcome> =
-        let total =
-            match timeout with
-            | Some t when isArmable t -> Some t
-            | _ -> None
-
         match total, idle with
         | None, None -> wait
         | _ ->
@@ -164,8 +230,14 @@ module internal Timeouts =
                 // right cause.
                 let deadlines: (Task * TimeSpan * (unit -> unit)) list =
                     [ match total with
-                      | Some t ->
-                          yield (Task.Delay(t, timeoutCts.Token), t, (fun () -> Log.timeout logger program t runId))
+                      | Some deadline ->
+                          // Arm the REMAINDER of the spawn-anchored budget, but carry the CONFIGURED
+                          // duration into the kill hook and the log — a late first consumer must not be
+                          // told the deadline was the leftover slice it happened to arrive with.
+                          yield
+                              (Task.Delay(clampArmable deadline.Armed, timeoutCts.Token),
+                               deadline.Configured,
+                               (fun () -> Log.timeout logger program deadline.Configured runId))
                       | None -> ()
 
                       match idle with
@@ -209,17 +281,18 @@ module internal Timeouts =
                     return Outcome.TimedOut
             }
 
-    /// Race a process `wait` against a total deadline (`timeout`) and/or a resettable idle deadline
+    /// Race a process `wait` against a total deadline (`total`) and/or a resettable idle deadline
     /// (`idle`). Owns the total-timeout `CancellationTokenSource` for the duration of the race and
     /// disposes it on the way out. See `raceTimeoutWithCts` for the shared behaviour.
     /// One home for the subtle CTS-cancel + reference-equality-winner logic shared by the run verbs and
-    /// the group runner. (Negatives are rejected by the builder; `isArmable` screens the total defensively,
-    /// so `Task.Delay` here can never throw synchronously; the idle timer was screened at construction.)
+    /// the group runner. (Negatives are rejected by the builder; `totalDeadline` screens the configured
+    /// duration and `clampArmable` re-screens the armed one, so `Task.Delay` here can never throw
+    /// synchronously; the idle timer was screened at construction.)
     let raceTimeout
         (logger: ILogger option)
         (program: string)
         (runId: string)
-        (timeout: TimeSpan option)
+        (total: TotalDeadline option)
         (idle: IdleTimer option)
         (onTimeout: TimeSpan -> Task)
         (wait: Task<Outcome>)
@@ -228,5 +301,5 @@ module internal Timeouts =
             use timeoutCts = new CancellationTokenSource()
 
             return!
-                raceTimeoutWithCts timeoutCts (PostKillReap.budget ()) logger program runId timeout idle onTimeout wait
+                raceTimeoutWithCts timeoutCts (PostKillReap.budget ()) logger program runId total idle onTimeout wait
         }
