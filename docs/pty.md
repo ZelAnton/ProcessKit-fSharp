@@ -332,6 +332,19 @@ not interrupt a ConPTY child by default, unlike a POSIX pty where the terminal's
 delivers `SIGINT`. `WindowsCtrlSignals()` does not add the process-group flag; it only opts the
 leader into ProcessKit's best-effort targeted CTRL+BREAK path for `Signal(Int/Term)`.
 
+A ConPTY child's standard handles always come from the pseudoconsole, never from the launcher, so
+its output reaches the run's merged stream in both Windows launch environments — a console-attached
+one (a terminal, a debugger, a console-hosted test runner) and a headless one (a service-hosted CI
+step, a redirected test host). The two need different mechanisms: a console-attached launcher severs
+its console handles in the child's startup information, while a headless launcher instead replaces
+its own three standard-handle slots with null for the length of the `CreateProcess` call and restores
+them immediately afterwards. That short launcher-side window is serialized with every ProcessKit
+Windows spawn, so no command started through ProcessKit — including one inheriting the caller's stdio
+— can observe it. It cannot coordinate anything else: code outside ProcessKit that spawns with
+inherited stdio on another thread, or that reads `Console` for the first time during the window, can
+still race it. If you need strict isolation from such activity, run PTY sessions from a dedicated
+helper process.
+
 ---
 
 Next: [Pipelines](pipelines.md)
