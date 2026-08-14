@@ -63,6 +63,61 @@ type private GracefulFaultBackend() =
         member _.HardRelease() =
             hardReleaseCount <- hardReleaseCount + 1
 
+/// A handle whose tree is killed but never becomes reapable — the `D`-state child T-351 bounds. The
+/// graceful stop IS asked for and returns (the kill is delivered), while the exit wait never completes,
+/// so `StopAsync` must end on its own bounded window with an honest `Unobserved` rather than blocking.
+/// `WaitCalls` proves the racing paths never start a second waiter on the same tree.
+type private WedgedStopHost() =
+    let completion =
+        TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable gracefulStops = 0
+    let mutable waitCalls = 0
+
+    member _.GracefulStops = Volatile.Read(&gracefulStops)
+    member _.WaitCalls = Volatile.Read(&waitCalls)
+
+    /// The conclusion that arrives long after the bounded stop already reported.
+    member _.CompleteLate(outcome: Outcome) =
+        completion.TrySetResult outcome |> ignore
+
+    member _.Build() =
+        let command = Command.create "wedged-child"
+        let stdout = new MemoryStream()
+        let stderr = new MemoryStream()
+
+        let host: RunningHost =
+            { Config = command.Config
+              Pid = Some 5150
+              Stdout = Some(stdout :> Stream)
+              Stderr = Some(stderr :> Stream)
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = None
+              Wait =
+                fun () ->
+                    Interlocked.Increment(&waitCalls) |> ignore
+                    completion.Task
+              StdinError = RunningHost.NoStdinError
+              StdinFeedComplete = ignore
+              StartKill = ignore
+              Signal = fun _ -> Ok()
+              GracefulKill =
+                fun _ ->
+                    // The escalation runs to completion — the tree simply never becomes reapable after it.
+                    Interlocked.Increment(&gracefulStops) |> ignore
+                    Task.CompletedTask
+              ResizePty = None
+              TreeStats = None
+              Teardown =
+                fun () ->
+                    stdout.Dispose()
+                    stderr.Dispose()
+                    ValueTask.CompletedTask }
+
+        new RunningProcess(host)
+
 type private ForwardingHost() =
     let completion =
         TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -682,6 +737,55 @@ type ShutdownTests() =
                 Is.LessThan(TimeSpan.FromSeconds 15.0),
                 "StopAsync() did not return promptly"
             )
+        }
+        :> Task
+
+    // ---- T-351: StopAsync's post-escalation reap is bounded --------------------------------------
+
+    [<Test>]
+    member _.``StopAsync stays bounded and honest when the tree never becomes reapable (T-351)``() : Task =
+        task {
+            // The hard kill after the grace window is delivered, but the tree never becomes reapable — a
+            // child wedged in uninterruptible sleep defers even SIGKILL. `StopAsync` used to await that
+            // reap unbounded, hanging the very teardown whose whole contract is to be bounded.
+            let previous = PostKillReap.budgetOverrideForTests
+            PostKillReap.budgetOverrideForTests <- Some(TimeSpan.FromMilliseconds 250.0)
+
+            try
+                let host = WedgedStopHost()
+                let running = host.Build()
+                let stopwatch = Stopwatch.StartNew()
+                let! outcome = running.StopAsync(TimeSpan.FromMilliseconds 100.0)
+                stopwatch.Stop()
+
+                match outcome with
+                | Outcome.Unobserved reason ->
+                    Assert.That(
+                        reason,
+                        Does.Contain "post-kill",
+                        "an unknown status must say WHY it is unknown, never fabricate an exit"
+                    )
+                | other -> Assert.Fail $"expected an honest Unobserved, got {other}"
+
+                Assert.That(host.GracefulStops, Is.EqualTo 1, "the graceful stop must still have been asked for")
+
+                Assert.That(
+                    stopwatch.Elapsed,
+                    Is.LessThan(TimeSpan.FromSeconds 5.0),
+                    "the never-completing post-kill reap held StopAsync past grace plus its bounded budget"
+                )
+
+                Assert.That(
+                    host.WaitCalls,
+                    Is.EqualTo 1,
+                    "the bounded stop must not start a second waiter on the same tree"
+                )
+
+                // The tree concludes long after the stop reported; the adopted wait is still its owner.
+                host.CompleteLate(Outcome.Signalled(Some 9))
+                do! (running :> IAsyncDisposable).DisposeAsync()
+            finally
+                PostKillReap.budgetOverrideForTests <- previous
         }
         :> Task
 

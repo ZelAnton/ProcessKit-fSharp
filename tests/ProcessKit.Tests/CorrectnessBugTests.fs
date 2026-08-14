@@ -2184,3 +2184,192 @@ type CorrectnessBugTests() =
                 this.DeleteDirQuietly dir
         }
         :> Task
+
+    // ---- T-351: a killed tree that cannot be reaped must not hold a completion path --------------
+    //
+    // A delivered SIGKILL/`TerminateProcess` is not a promise that the child is reapable now: a child
+    // wedged in uninterruptible (`D`-state) sleep defers even SIGKILL until its I/O unblocks. Every
+    // path that kills and then waits is therefore bounded, and hands the single remaining right to
+    // wait/reap the tree to the `PostKillReap` ledger rather than blocking on it or dropping it.
+
+    /// Run `action` with a short post-kill reap budget, so these regressions do not pay the production
+    /// five seconds. Restored afterwards (tests in this assembly run sequentially).
+    member private _.WithShortPostKillBudget(action: unit -> Task<unit>) : Task =
+        task {
+            let previous = PostKillReap.budgetOverrideForTests
+            PostKillReap.budgetOverrideForTests <- Some(TimeSpan.FromMilliseconds 250.0)
+
+            try
+                do! action ()
+            finally
+                PostKillReap.budgetOverrideForTests <- previous
+        }
+        :> Task
+
+    [<Test>]
+    member this.``a cancelled run whose tree never becomes reapable still reports Cancelled (T-351)``() : Task =
+        this.WithShortPostKillBudget(fun () ->
+            task {
+                // The injected never-completing post-kill wait: the cancellation's `Kill()` IS delivered,
+                // the tree simply never becomes reapable afterwards.
+                let waitTcs =
+                    TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                let kills = ref 0
+                let command = Command.create "wedged-child"
+
+                let host =
+                    { baseHost command.Config with
+                        Wait = fun () -> waitTcs.Task
+                        StartKill = fun () -> Interlocked.Increment(&kills.contents) |> ignore }
+
+                let running = new RunningProcess(host)
+                use cts = new CancellationTokenSource()
+                let stopwatch = Stopwatch.StartNew()
+
+                let run =
+                    CaptureVerbs.runToCompletion
+                        command
+                        cts.Token
+                        (fun () -> Task.FromResult(Ok running))
+                        (fun handle -> handle.OutputStringAsync())
+
+                // Cancel once the run is genuinely parked on the exit wait, so the token registration's
+                // kill is what starts the post-kill window (not the pre-start cancellation short-circuit).
+                do! Task.Delay 50
+                cts.Cancel()
+
+                match! run with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+                stopwatch.Stop()
+
+                Assert.That(
+                    Volatile.Read(&kills.contents),
+                    Is.GreaterThanOrEqualTo 1,
+                    "cancellation must still deliver the kill"
+                )
+
+                Assert.That(
+                    stopwatch.Elapsed,
+                    Is.LessThan(TimeSpan.FromSeconds 5.0),
+                    "the never-completing post-kill wait held the cancellation past its bounded budget"
+                )
+
+                waitTcs.TrySetResult(Outcome.Exited 0) |> ignore
+                do! (running :> IAsyncDisposable).DisposeAsync()
+            })
+
+    [<Test>]
+    member this.``Kill then WaitAsync reports an honest Unobserved when the reap never lands (T-351)``() : Task =
+        this.WithShortPostKillBudget(fun () ->
+            task {
+                let waitTcs =
+                    TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                let host =
+                    { baseHost (Command.create "wedged-child").Config with
+                        Wait = fun () -> waitTcs.Task }
+
+                let running = new RunningProcess(host)
+                let adoptedBefore = PostKillReap.adoptedWaitCount ()
+                let stopwatch = Stopwatch.StartNew()
+
+                running.Kill()
+                let! outcome = running.WaitAsync()
+                stopwatch.Stop()
+
+                match outcome with
+                | Outcome.Unobserved reason ->
+                    Assert.That(reason, Does.Contain "post-kill", "the detail must say why the status is unknown")
+                | other -> Assert.Fail $"expected an honest Unobserved, got {other}"
+
+                Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 5.0))
+
+                Assert.That(
+                    PostKillReap.adoptedWaitCount () - adoptedBefore,
+                    Is.EqualTo 1,
+                    "the native wait must be adopted exactly once, never abandoned and never duplicated"
+                )
+
+                // The late conclusion still arrives on the adopted wait, observed by the ledger.
+                waitTcs.TrySetResult(Outcome.Signalled(Some 9)) |> ignore
+                do! (running :> IAsyncDisposable).DisposeAsync()
+            })
+
+    [<Test>]
+    member this.``a fast child is still reaped synchronously and reports its real outcome (T-351)``() : Task =
+        this.WithShortPostKillBudget(fun () ->
+            task {
+                // The ordinary path: the kill lands, the child is reaped at once, and the REAL outcome is
+                // reported — no budget is paid, and no ownership changes hands.
+                let host =
+                    { baseHost (Command.create "prompt-child").Config with
+                        Wait = fun () -> Task.FromResult(Outcome.Signalled(Some 9)) }
+
+                let running = new RunningProcess(host)
+                let adoptedBefore = PostKillReap.adoptedWaitCount ()
+
+                running.Kill()
+                let! outcome = running.WaitAsync()
+
+                Assert.That(
+                    outcome,
+                    Is.EqualTo(Outcome.Signalled(Some 9)),
+                    "a normal kill must report the real signal"
+                )
+
+                Assert.That(
+                    PostKillReap.adoptedWaitCount () - adoptedBefore,
+                    Is.Zero,
+                    "a synchronously reaped child must not hand ownership to the ledger"
+                )
+
+                do! (running :> IAsyncDisposable).DisposeAsync()
+            })
+
+    [<Test>]
+    member this.``concurrent Stop, Kill and Dispose on one handle keep a single wait owner (T-351)``() : Task =
+        this.WithShortPostKillBudget(fun () ->
+            task {
+                let waitTcs =
+                    TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+                let waitCalls = ref 0
+
+                let host =
+                    { baseHost (Command.create "wedged-child").Config with
+                        Wait =
+                            fun () ->
+                                Interlocked.Increment(&waitCalls.contents) |> ignore
+                                waitTcs.Task }
+
+                let running = new RunningProcess(host)
+
+                // Three teardown paths racing on one handle: a terminal wait, a graceful stop, and the
+                // fire-and-forget kill — plus the dispose that follows them.
+                let waiting = running.WaitAsync()
+                let stopping = running.StopAsync(TimeSpan.FromMilliseconds 50.0)
+                running.Kill()
+
+                let! waited = waiting
+                let! stopped = stopping
+                do! (running :> IAsyncDisposable).DisposeAsync()
+
+                Assert.That(
+                    Volatile.Read(&waitCalls.contents),
+                    Is.EqualTo 1,
+                    "the racing paths must share ONE native wait; a second owner would race the reap"
+                )
+
+                Assert.That(
+                    waited.IsUnobserved,
+                    Is.True,
+                    "the bounded wait must report honestly, not fabricate an exit"
+                )
+
+                Assert.That(stopped.IsUnobserved, Is.True, "the bounded stop must report honestly too")
+
+                waitTcs.TrySetResult(Outcome.Exited 0) |> ignore
+            })

@@ -123,14 +123,23 @@ module internal Timeouts =
     /// wait wins, cancel `timeoutCts` and return its outcome; on whichever deadline fires first, cancel
     /// `timeoutCts` immediately (so the losing `Task.Delay` never outlives the race, including through
     /// a grace-period-bounded kill), pass its configured duration to `onTimeout` (the kill — shared by
-    /// both, so there is never a double kill), await `wait` so the child is reaped, log the cause that
-    /// fired (total vs idle), and report `TimedOut`.
+    /// both, so there is never a double kill), reap the child within `postKillBudget`, log the cause
+    /// that fired (total vs idle), and report `TimedOut`.
+    ///
+    /// The post-kill reap is BOUNDED by `postKillBudget` (`PostKillReap`): the kill has already been
+    /// delivered and the disposition is already `TimedOut`, so a child wedged in uninterruptible sleep
+    /// — which defers even SIGKILL — must not hang the very timeout that was supposed to bound it. If
+    /// the reap does not land inside the budget, the single remaining right to await it passes to the
+    /// `PostKillReap` ledger (fault-observed, no second waiter) and `TimedOut` is reported anyway.
+    ///
     /// Split out from `raceTimeout` as a test seam: it lets `ProcessKit.Tests` (via
     /// `InternalsVisibleTo`) observe the total-timeout CTS directly instead of reflecting into the
-    /// `task {}` state machine's private fields. Ownership/disposal of `timeoutCts` stays with the
-    /// caller — this function only cancels it, never disposes it.
+    /// `task {}` state machine's private fields, and drive the post-kill budget without waiting out the
+    /// production one. Ownership/disposal of `timeoutCts` stays with the caller — this function only
+    /// cancels it, never disposes it.
     let raceTimeoutWithCts
         (timeoutCts: CancellationTokenSource)
+        (postKillBudget: TimeSpan)
         (logger: ILogger option)
         (program: string)
         (runId: string)
@@ -187,7 +196,13 @@ module internal Timeouts =
                     // the race resolution, including on the graceful-teardown path.
                     timeoutCts.Cancel()
                     do! onTimeout configuredDuration
-                    let! _ = wait
+                    // Reap the child within the bounded post-kill window. The kill above has already
+                    // been delivered and this race has already decided `TimedOut`, so a reap that does
+                    // not land inside the budget changes nothing about the answer — it is handed to the
+                    // `PostKillReap` ledger (which observes its eventual fault and stays its only
+                    // owner) rather than blocking the timeout it was meant to enforce. A wait that
+                    // completes in time still surfaces its fault here, exactly as before.
+                    let! _ = PostKillReap.awaitWithin postKillBudget wait
 
                     emit ()
 
@@ -211,5 +226,7 @@ module internal Timeouts =
         : Task<Outcome> =
         task {
             use timeoutCts = new CancellationTokenSource()
-            return! raceTimeoutWithCts timeoutCts logger program runId timeout idle onTimeout wait
+
+            return!
+                raceTimeoutWithCts timeoutCts (PostKillReap.budget ()) logger program runId timeout idle onTimeout wait
         }

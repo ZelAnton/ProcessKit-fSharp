@@ -59,6 +59,7 @@
 		<Compile Include="Finished.fs" />
 		<Compile Include="Stats.fs" />
 		<Compile Include="Stdin.fs" />
+		<Compile Include="PostKillReap.fs" />
 		<Compile Include="Timeouts.fs" />
 		<Compile Include="Backoff.fs" />
 		<Compile Include="Priority.fs" />

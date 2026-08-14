@@ -148,6 +148,7 @@ type TimeoutTests() =
             let race =
                 Timeouts.raceTimeoutWithCts
                     timeoutCts
+                    (TimeSpan.FromSeconds 5.0)
                     None
                     "test"
                     "idle-cancels-total"
@@ -179,6 +180,115 @@ type TimeoutTests() =
             finally
                 releaseTimeout.TrySetResult() |> ignore
                 wait.TrySetResult(Outcome.Exited 0) |> ignore
+        }
+        :> Task
+
+    // ---- T-351: the post-kill reap is bounded on the timeout path --------------------------------
+    //
+    // After a deadline fires, the timeout race kills the tree and then reaps it. A child wedged in
+    // uninterruptible (`D`-state) sleep defers even SIGKILL until its I/O unblocks, so that reap can
+    // stall indefinitely — and the race used to await it unbounded, hanging the very timeout it was
+    // enforcing long after the kill had been delivered and `TimedOut` had already been decided.
+
+    [<Test>]
+    member _.``a post-kill reap that never lands still reports TimedOut, bounded (T-351)``() : Task =
+        task {
+            use timeoutCts = new CancellationTokenSource()
+            let budget = TimeSpan.FromMilliseconds 200.0
+
+            // The injected never-completing post-kill wait: the kill IS delivered (onTimeout runs), the
+            // child simply never becomes reapable.
+            let wait =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let kills = ref 0
+
+            let onTimeout (_: TimeSpan) : Task =
+                Interlocked.Increment(&kills.contents) |> ignore
+                Task.CompletedTask
+
+            let adoptedBefore = PostKillReap.adoptedWaitCount ()
+            let stopwatch = Stopwatch.StartNew()
+
+            let! outcome =
+                Timeouts.raceTimeoutWithCts
+                    timeoutCts
+                    budget
+                    None
+                    "test"
+                    "post-kill-bounded"
+                    (Some(TimeSpan.FromMilliseconds 20.0))
+                    None
+                    onTimeout
+                    wait.Task
+
+            stopwatch.Stop()
+
+            Assert.That(
+                outcome,
+                Is.EqualTo Outcome.TimedOut,
+                "the already-decided disposition must survive a late reap"
+            )
+
+            Assert.That(
+                Volatile.Read(&kills.contents),
+                Is.EqualTo 1,
+                "the deadline must still deliver exactly one kill"
+            )
+
+            Assert.That(
+                stopwatch.Elapsed,
+                Is.LessThan(TimeSpan.FromSeconds 3.0),
+                "the never-completing post-kill wait held the timeout past its bounded budget"
+            )
+
+            Assert.That(
+                PostKillReap.adoptedWaitCount () - adoptedBefore,
+                Is.EqualTo 1,
+                "the abandoned wait must be adopted by the ledger exactly once, not simply dropped"
+            )
+
+            // The late conclusion still arrives on the adopted wait; nothing may fault or re-decide.
+            wait.TrySetResult(Outcome.Exited 0) |> ignore
+            Assert.That(outcome, Is.EqualTo Outcome.TimedOut)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a post-kill reap inside the budget is awaited, not adopted (T-351)``() : Task =
+        task {
+            use timeoutCts = new CancellationTokenSource()
+
+            let wait =
+                TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            // The ordinary child: the kill lands and the reap follows immediately. No budget is paid and
+            // no ownership changes hands.
+            let onTimeout (_: TimeSpan) : Task =
+                wait.TrySetResult(Outcome.Signalled(Some 9)) |> ignore
+                Task.CompletedTask
+
+            let adoptedBefore = PostKillReap.adoptedWaitCount ()
+
+            let! outcome =
+                Timeouts.raceTimeoutWithCts
+                    timeoutCts
+                    (TimeSpan.FromSeconds 30.0)
+                    None
+                    "test"
+                    "post-kill-prompt"
+                    (Some(TimeSpan.FromMilliseconds 20.0))
+                    None
+                    onTimeout
+                    wait.Task
+
+            Assert.That(outcome, Is.EqualTo Outcome.TimedOut)
+
+            Assert.That(
+                PostKillReap.adoptedWaitCount () - adoptedBefore,
+                Is.Zero,
+                "a reap that landed inside the budget must not hand ownership to the ledger"
+            )
         }
         :> Task
 

@@ -56,20 +56,99 @@ module internal GracefulTeardown =
 /// whole process group (any subtree it backgrounded), then `waitpid` reaps the leader itself (`killpg`
 /// does not reap our own child). Shared by the cgroup and process-group backends' escapee/teardown
 /// cleanup so the kill-then-reap pairing lives in one place.
-module private PosixReap =
+///
+/// Every reap here is BOUNDED, per leader and for the drain as a whole, and never drops ownership: a
+/// leader still alive when its bounded window ends is handed to the `PostKillReap` ledger, which keeps
+/// the single eventual wait/reap for it (see `leaderUsing`).
+module internal PosixReap =
 
-    /// Reap the leader `id`, gating its `killpg` through the shared liveness + identity choke so a pgid
-    /// recycled since it was tracked is NEVER SIGKILLed (the wrong-target kill T-084 closes). `identity`
-    /// is the start-time token captured at track time; a live number whose current identity differs from
-    /// it is a recycled stranger and the `killpg` is skipped, while a matching or unknown token falls
-    /// back to the by-number kill exactly as before (a leader reaped while descendants keep the pgid
-    /// alive is still cleaned up). `reapLeader`'s `waitpid` only ever reaps our OWN child, so a recycled
-    /// pid there is a harmless `ECHILD` — it needs no gate.
-    let leader (id: int) (identity: uint64 option) =
-        if Native.Posix.processGroupStillTracked id identity then
-            Native.Posix.killProcessGroup id
+    /// The shape of one leader's teardown, with its native dependencies injected so the bounded/handoff
+    /// decisions can be exercised without wedging a real child (the `GracefulTeardown.pollUsing`
+    /// pattern). `reapNow` is false once the drain's shared budget is spent: the kill is still
+    /// delivered, but the synchronous reap is skipped in favour of the handoff.
+    ///
+    /// The order and the gates: a leader the ledger ALREADY owns is left entirely alone — re-killing or
+    /// re-waiting it would be exactly the second owner this contract exists to prevent (and, after the
+    /// pid is reaped, a wrong-target kill). Otherwise `killpg` is gated through the shared liveness +
+    /// identity choke, so a pgid recycled since it was tracked is NEVER SIGKILLed (the wrong-target kill
+    /// T-084 closes): `identity` is the start-time token captured at track time, and a live number whose
+    /// current identity differs from it is a recycled stranger. A matching or unknown token falls back
+    /// to the by-number kill exactly as before (a leader reaped while descendants keep the pgid alive is
+    /// still cleaned up). The bounded `reapLeader`'s `waitpid` only ever reaps our OWN child, so a
+    /// recycled pid there is a harmless `ECHILD` — it needs no gate.
+    ///
+    /// Finally the same choke decides the handoff: a leader still alive after the bounded reap did not
+    /// become reapable inside teardown's window (a child wedged in uninterruptible sleep defers even
+    /// SIGKILL), so its eventual wait/reap is adopted rather than abandoned to the OS — which is what
+    /// turns the old "left for the host to reap at exit" case into a reap we still observe exactly once.
+    let leaderUsing
+        (stillTracked: int -> uint64 option -> bool)
+        (owned: int -> uint64 option -> bool)
+        (killGroup: int -> unit)
+        (reapBounded: int -> unit)
+        (adopt: int -> uint64 option -> unit)
+        (reapNow: bool)
+        (id: int)
+        (identity: uint64 option)
+        : unit =
+        if not (owned id identity) then
+            if stillTracked id identity then
+                killGroup id
 
-        Native.Posix.reapLeader id
+            if reapNow then
+                reapBounded id
+
+            if stillTracked id identity then
+                adopt id identity
+
+    // Transfer the eventual wait/reap of `pid` to the ledger. `waitPosix` is deliberately the adopted
+    // wait: it JOINS the one shared reap group for that pid rather than opening a second pidfd or
+    // racing a second `waitpid` (K-016), so the handoff can never produce two reapers — and if a run
+    // verb is already waiting on the same pid, that existing wait IS the group and simply keeps it.
+    let private adoptLeader (pid: int) (identity: uint64 option) =
+        PostKillReap.adoptLeader pid identity (fun target -> Native.Posix.waitPosix (nativeint target))
+        |> ignore
+
+    // One leader through the production gates. `reapNow` is threaded from the drain's budget.
+    let private leaderWithin (reapNow: bool) (id: int) (identity: uint64 option) =
+        leaderUsing
+            Native.Posix.processGroupStillTracked
+            PostKillReap.ownsLeader
+            Native.Posix.killProcessGroup
+            Native.Posix.reapLeader
+            adoptLeader
+            reapNow
+            id
+            identity
+
+    /// Kill and reap one leader now (the per-child escapee cleanup path).
+    let leader (id: int) (identity: uint64 option) = leaderWithin true id identity
+
+    /// Tear down a whole drained tracking set under ONE shared budget, with the clock and the per-leader
+    /// step injected. Each leader's own reap is already bounded, but a group holding many of them would
+    /// still add those windows up on the disposing thread; once `budget` is spent the remaining leaders
+    /// are killed and handed straight to the ledger, so teardown stays bounded for the WHOLE group. The
+    /// kill itself is never skipped or weakened — only the synchronous wait for it is.
+    let drainUsing
+        (startClock: unit -> (unit -> TimeSpan))
+        (reapOne: bool -> int -> uint64 option -> unit)
+        (budget: TimeSpan)
+        (leaders: (int * uint64 option) list)
+        : unit =
+        let elapsed = startClock ()
+
+        for pid, identity in leaders do
+            reapOne (elapsed () < budget) pid identity
+
+    /// `drainUsing` on the real clock, the production gates, and the configured post-kill budget.
+    let drain (leaders: (int * uint64 option) list) =
+        drainUsing
+            (fun () ->
+                let stopwatch = Stopwatch.StartNew()
+                fun () -> stopwatch.Elapsed)
+            leaderWithin
+            (PostKillReap.budget ())
+            leaders
 
 /// The set of children a backend tracks, behind a single lock — the concurrency invariant every
 /// backend needs: a spawn racing a `Dispose`/teardown must serialize on add / remove / snapshot so a
@@ -816,8 +895,14 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             // killpg/waitpid the OS may reuse that pid, so a second killpg would land on an unrelated
             // process group (wrong-target kill). The captured identity gates each reap's `killpg` so it is
             // also safe against a pid recycled since it was tracked.
-            for pid in children.Drain() do
-                PosixReap.leader pid (takeIdentity pid)
+            //
+            // The whole drain runs under one bounded budget (`PosixReap.drain`): the identities are
+            // snapshotted WITH the pids in a single pass, before any reaping, so the off-lock handoff
+            // that follows works from that snapshot rather than re-reading a dictionary a concurrent
+            // per-child cleanup may be mutating (K-086).
+            children.Drain()
+            |> List.map (fun pid -> pid, takeIdentity pid)
+            |> PosixReap.drain
 
             adoptedIdentities.Clear()
             Native.Cgroup.removeCgroup cgroupPath
@@ -1087,10 +1172,17 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
             // populated after teardown, and a concurrent per-child cleanup (a run's `Release`) could still
             // see (and re-reap) the same pgid — after the first killpg/waitpid the OS may reuse that pid,
             // so a second killpg would land on an unrelated process group (wrong-target kill).
-            for pgid in children.Drain() do
+            //
+            // The whole drain runs under one bounded budget (`PosixReap.drain`), and the identity tokens
+            // are snapshotted WITH the pgids in a single pass before any reaping starts — the same
+            // snapshot-before-off-lock-work rule `GracefulKillTree` follows (K-086), so the handoff that
+            // may outlive this call never re-reads `identities` a concurrent cleanup can mutate.
+            children.Drain()
+            |> List.map (fun pgid ->
                 let identity =
                     match identities.TryRemove pgid with
                     | true, token -> token
                     | false, _ -> None
 
-                PosixReap.leader pgid identity
+                pgid, identity)
+            |> PosixReap.drain

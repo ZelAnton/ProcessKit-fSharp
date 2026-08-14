@@ -618,6 +618,39 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         backpressureCts.Cancel()
         chunkBackpressureCts.Cancel()
 
+    // ---- the bounded post-kill reap window for THIS handle (see `PostKillReap`) ------------------
+    //
+    // Completed once the post-kill budget has elapsed after a hard kill delivered THROUGH this handle
+    // — `Kill()` (which is what a cancelled run fires, via the token registration in
+    // `CaptureVerbs.runToCompletion`), the pump-fault kill, and `StopAsync`'s soft->hard escalation.
+    // Until one of those arms it, this task never completes and the exit wait behaves exactly as
+    // before: an ordinary child is reaped synchronously and reports its REAL outcome, with no budget
+    // and no artificial delay anywhere on the normal path.
+    let postKillDeadline =
+        // RunContinuationsAsynchronously: the arming timer's callback must not run the exit wait's
+        // continuation inline on the timer thread.
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    // 0 until a hard kill armed the budget; `Interlocked.Exchange` flips it for the first one, so a
+    // second kill (a `Kill()` after a `StopAsync`, a pump fault racing either) extends nothing and
+    // cannot restart the window.
+    let mutable postKillArmed = 0
+
+    // Start the one-shot post-kill reap window. Called at the exact points a hard kill has been
+    // delivered, never at the points one is merely intended: arming it before the kill would cut a
+    // still-legitimate graceful grace window short.
+    let armPostKillReap () =
+        if Interlocked.Exchange(&postKillArmed, 1) = 0 then
+            Task
+                .Delay(PostKillReap.budget ())
+                .ContinueWith(
+                    Action<Task>(fun _ -> postKillDeadline.TrySetResult() |> ignore),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default
+                )
+            |> ignore
+
     // The streaming channels and their policy-aware writer live in `StreamChannel`: the stdout channel
     // is written by exactly one pump, the event channel by two (stdout + stderr), and either is bounded
     // when `config.StreamBuffer` opts in (else unbounded, as before).
@@ -1003,10 +1036,46 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
         outcomeTask.ContinueWith(Action<Task<Outcome>>(fun t -> t.Exception |> ignore))
         |> ignore
 
+    // The reason an exit wait reports when a hard kill was delivered but the reap never landed inside
+    // the post-kill budget. Deliberately `Unobserved` and not a fabricated `Exited`/`Signalled`: we
+    // genuinely did not see how the tree concluded, and `Unobserved` is never accepted as success.
+    let postKillUnobservedReason =
+        "the tree was hard-killed, but its exit status was not observed within the bounded post-kill reap window; a background reaper owns the remaining wait"
+
+    // The same honesty for `StopAsync`, whose window also covers the graceful grace period and the
+    // pipe drains its shared `ExitTask` may include.
+    let stopUnobservedReason =
+        "the graceful stop hard-killed the tree, but its conclusion was not observed within the grace period plus the bounded post-kill reap window; a background reaper owns the remaining wait"
+
+    // The one `host.Wait()` for this handle (see `ensureBufferedWait`/`ExitTask` for why there is
+    // exactly one), bounded once a hard kill delivered through this handle has spent its post-kill
+    // budget. A delivered SIGKILL/`TerminateProcess` is not a promise that the child is reapable now —
+    // a child wedged in uninterruptible sleep defers even SIGKILL — so a kill-then-wait caller (a
+    // cancelled run's `Kill()`, the pump-fault kill) would otherwise wait forever on a tree it has
+    // already killed. When the budget elapses the native wait keeps running as the SINGLE eventual
+    // reaper, adopted by the `PostKillReap` ledger (which observes its fault; on POSIX it is the same
+    // shared `waitPosix` group, so nothing starts a second reap — K-016), and this wait resolves to an
+    // honest `Unobserved`. Unarmed — the normal case — this is a straight pass-through.
+    let boundedExitWait () : Task<Outcome> =
+        let wait = host.Wait()
+        let waitBase = wait :> Task
+
+        task {
+            let! winner = Task.WhenAny(waitBase, postKillDeadline.Task)
+
+            if obj.ReferenceEquals(winner, waitBase) then
+                return! wait
+            else
+                PostKillReap.adoptWait waitBase
+                return Outcome.Unobserved postKillUnobservedReason
+        }
+
     // Wait for exit, applying the configured total and/or idle timeout: on whichever deadline fires,
     // kill the tree (gracefully if `TimeoutGrace` is set, else hard) — one shared kill for both, so no
     // double kill — and report `Outcome.TimedOut`. The idle watchdog is armed inside `raceTimeout` as
-    // the wait begins and reset by each stdout/stderr read through the activity-tracking wrappers.
+    // the wait begins and reset by each stdout/stderr read through the activity-tracking wrappers. The
+    // exit wait underneath is `boundedExitWait`, so the reap after ANY hard kill on this handle stays
+    // bounded (the timeout race bounds its own post-kill reap too, see `Timeouts.raceTimeoutWithCts`).
     let waitWithTimeout () : Task<Outcome> =
         let onTimeout (configuredDuration: TimeSpan) : Task =
             task {
@@ -1018,7 +1087,7 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             }
             :> Task
 
-        Timeouts.raceTimeout config.Logger config.Program runId config.Timeout idleTimer onTimeout (host.Wait())
+        Timeouts.raceTimeout config.Logger config.Program runId config.Timeout idleTimer onTimeout (boundedExitWait ())
 
     // Start (and memoize) a buffered verb's single exit wait, under `stateLock`. Every buffered verb
     // calls this instead of `waitWithTimeout()` directly; the first caller creates the wait, and both
@@ -1298,6 +1367,10 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 if completed.IsFaulted then
                     try
                         host.StartKill()
+                        // A hard kill was delivered: start the bounded post-kill reap window, so a
+                        // child that cannot be reaped (wedged in uninterruptible sleep) cannot hold the
+                        // exit wait this kill exists to unblock.
+                        armPostKillReap ()
                     with _ ->
                         // Best-effort: `reapGuard`'s teardown still reaps the tree, and the pump fault
                         // is surfaced by its awaiter, so a hiccup in this early kill loses nothing.
@@ -1512,7 +1585,16 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
 
     /// Signal the process tree to die without waiting (fire-and-forget, like `Process.Kill()`); the
     /// tree is fully reaped when the handle is disposed. For a blocking kill, dispose the handle.
-    member _.Kill() = host.StartKill()
+    ///
+    /// Delivering the kill also starts this handle's bounded post-kill reap window: a tree that cannot
+    /// be reaped afterwards (a child wedged in uninterruptible sleep defers even SIGKILL) resolves this
+    /// handle's exit wait to an honest `Outcome.Unobserved` once the window elapses, instead of leaving
+    /// a caller that killed and then awaited — notably a CANCELLED run, whose token registration calls
+    /// exactly this — blocked forever. The native wait is not abandoned: the `PostKillReap` ledger owns
+    /// it as the single eventual reaper.
+    member _.Kill() =
+        host.StartKill()
+        armPostKillReap ()
 
     /// Forward parent termination requests into this run's graceful tree-stop path. POSIX registers
     /// `SIGINT` and `SIGTERM`; Windows handles Ctrl+C and Ctrl+Break through `Console.CancelKeyPress`.
@@ -1663,6 +1745,14 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     /// A negative `gracePeriod` is rejected with `ArgumentOutOfRangeException`; `TimeSpan.Zero`
     /// skips the grace window and escalates immediately.
     ///
+    /// **Bounded, always.** The whole call — the grace window and the reap that follows the escalated
+    /// hard kill — is bounded by `gracePeriod` plus a post-kill reap budget. A tree that cannot be
+    /// reaped even after the hard kill lands (a child wedged in uninterruptible sleep defers SIGKILL
+    /// until its I/O unblocks) therefore ends this call with an honest `Outcome.Unobserved` carrying
+    /// that detail, never a fabricated exit and never an unbounded block. The wait is not dropped: the
+    /// single remaining right to reap the tree passes to a background reaper, so nothing starts a
+    /// second waiter and the eventual conclusion is still observed exactly once.
+    ///
     /// This drains the child's stdout/stderr while it shuts down (a child blocked writing to a full
     /// pipe would otherwise ignore the soft signal until it could flush). If a streaming or capturing
     /// verb already owns the pipes, `StopAsync` reuses that session's wait rather than starting a
@@ -1696,6 +1786,16 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             // streaming session, or an in-flight buffered verb) rather than racing a second reader,
             // and claims a fresh buffered drain only when no verb has run yet. It never reaps.
             let exitTask = this.ExitTask
+            // Start racing the shared conclusion BEFORE the stop is asked for, bounded by this call's
+            // own window: the grace it was given, plus the post-kill reap budget. Both halves of the
+            // stop live inside that one window — the graceful wait (up to `gracePeriod`) and the reap
+            // that follows the escalated hard kill — so a repeat `StopAsync` (which skips the kill and
+            // only awaits the shared outcome) is bounded by exactly the same rule as the caller that
+            // performs the escalation, without either of them cutting a still-legitimate grace window
+            // short. Mirrors the ProcessKit-rs prototype's `grace.saturating_add(PUMP_TEARDOWN)`.
+            let bounded =
+                PostKillReap.awaitWithin (PostKillReap.plus gracePeriod (PostKillReap.budget ())) exitTask
+
             // Ask the tree to stop: soft signal, wait up to `gracePeriod`, then hard-kill the remainder
             // — reusing `host.GracefulKill`, the timeout machinery's own escalation. Degrades to the
             // documented immediate child/tree kill on Windows or a shared group (see the doc above).
@@ -1703,13 +1803,28 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             // the native kill on a container a prior stop/`Dispose` already released.
             if Interlocked.Exchange(&stopStarted, 1) = 0 then
                 do! host.GracefulKill gracePeriod
+                // The escalation has now delivered the hard kill (`GracefulKill` returns only after its
+                // grace-bounded poll force-killed whatever was still alive), so this is the honest
+                // moment to start the handle's post-kill reap window — for this call and for any other
+                // verb sharing the same exit wait.
+                armPostKillReap ()
 
-            let! outcome = exitTask
-            // Record the run as completed (once-guarded: a no-op if a concurrent terminal verb sharing
-            // the same wait already concluded it). Return the honest outcome; a killed/non-zero exit is
-            // data, so this never raises for the stop itself.
-            conclude outcome
-            return outcome
+            match! bounded with
+            | ValueSome outcome ->
+                // Record the run as completed (once-guarded: a no-op if a concurrent terminal verb
+                // sharing the same wait already concluded it). Return the honest outcome; a killed/
+                // non-zero exit is data, so this never raises for the stop itself.
+                conclude outcome
+                return outcome
+            | ValueNone ->
+                // The tree was asked to stop and then hard-killed, but its conclusion did not land
+                // inside the window. Report that honestly rather than blocking indefinitely or
+                // fabricating an exit: the shared wait is now owned by the `PostKillReap` ledger (no
+                // second waiter, its eventual fault observed), and a verb still awaiting the same
+                // `ExitTask` will still see the real outcome if it ever arrives.
+                let outcome = Outcome.Unobserved stopUnobservedReason
+                conclude outcome
+                return outcome
         }
 
     /// `StopAsync` using the default 2-second grace window (matching `ProcessGroupOptions.ShutdownTimeout`).
