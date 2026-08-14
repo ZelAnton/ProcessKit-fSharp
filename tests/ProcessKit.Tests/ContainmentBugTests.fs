@@ -371,7 +371,7 @@ type internal InheritedPipeBackend() =
         member _.Resume() = Ok()
 
         member _.Stats() =
-            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None))
+            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None, None))
 
         member _.MemberStats() = Ok []
         member _.UpdateLimits(_limits) = Ok()
