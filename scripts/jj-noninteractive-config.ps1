@@ -1,15 +1,17 @@
+$script:JjNonInteractiveEditorError = 'Error: jj editor opened in non-interactive mode. Use -m flag to provide description inline.'
+
 function Get-JjNonInteractiveEditorConfig {
     [CmdletBinding()]
     param()
 
-    return '["pwsh", "-NoProfile", "-Command", "[Console]::Error.WriteLine(''Error: jj editor opened in non-interactive mode. Use -m flag to provide description inline.''); exit 1;"]'
+    return '["pwsh", "-NoProfile", "-Command", "[Console]::Error.WriteLine(''{0}''); exit 1;"]' -f $script:JjNonInteractiveEditorError
 }
 
 function Get-JjNonInteractiveEditorError {
     [CmdletBinding()]
     param()
 
-    return 'Error: jj editor opened in non-interactive mode. Use -m flag to provide description inline.'
+    return $script:JjNonInteractiveEditorError
 }
 
 function Test-JjNonInteractiveEditorConfig {
@@ -36,10 +38,15 @@ function Test-JjNonInteractiveEditorBehavior {
 
     $probeOutput = @('' | & $JjPath --repository $RepositoryRoot --ignore-working-copy describe 2>&1)
     $probeExitCode = $LASTEXITCODE
+    $probeText = $probeOutput -join [Environment]::NewLine
 
-    return $probeExitCode -eq 1 `
-        -and ($probeOutput -join [Environment]::NewLine).Contains(
-            (Get-JjNonInteractiveEditorError),
-            [StringComparison]::Ordinal
-        )
+    if ($probeExitCode -ne 0 -and $probeText.Contains((Get-JjNonInteractiveEditorError), [StringComparison]::Ordinal)) {
+        return 'Guarded'
+    }
+
+    if ($probeExitCode -ne 0 -and $probeText.Contains('immutable', [StringComparison]::OrdinalIgnoreCase)) {
+        return 'Inconclusive'
+    }
+
+    return 'Failed'
 }

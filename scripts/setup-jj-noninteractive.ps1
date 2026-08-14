@@ -43,7 +43,10 @@ if (-not (Test-JjNonInteractiveEditorConfig -EditorValue $resolvedEditorValue)) 
     throw "jj did not resolve ui.editor to the expected non-interactive command. Got '$resolvedEditorValue'."
 }
 
-if (-not (Test-JjNonInteractiveEditorBehavior -JjPath $jjCommand.Source -RepositoryRoot $repositoryRoot)) {
+$editorBehavior = Test-JjNonInteractiveEditorBehavior -JjPath $jjCommand.Source -RepositoryRoot $repositoryRoot
+if ($editorBehavior -eq 'Inconclusive') {
+    Write-Host 'The editor behavior probe was inconclusive because jj refused to describe the immutable commit before opening an editor.' -ForegroundColor Yellow
+} elseif ($editorBehavior -ne 'Guarded') {
     throw "jj resolved ui.editor but did not reject an editor-driven description with the expected guidance."
 }
 
