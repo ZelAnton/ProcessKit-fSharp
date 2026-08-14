@@ -138,14 +138,41 @@ bare-name search appends only `.exe`, so it would report such a program as *not
 found* even though `Exec.which` locates it (both use the same `PATHEXT`-aware
 lookup). ProcessKit closes that gap: for a bare name it substitutes the resolved
 absolute path into the launch, and routes a `.cmd`/`.bat` through `cmd.exe /d /c`
-(a batch file is not a directly-launchable image). A `.exe` match, a path-form
-program, and a name that resolves to nothing are all launched exactly as before —
-the OS's richer bare-name search is never overridden. Arguments to a `.cmd`/`.bat`
+(a batch file is not a directly-launchable image). For a command that leaves the
+child's `PATH` alone (see below), a `.exe` match, a path-form program, and a name
+that resolves to nothing are all launched exactly as before — the OS's richer
+bare-name search is never overridden. Arguments to a `.cmd`/`.bat`
 wrapper are quoted for `cmd.exe`'s own grammar (not just the ordinary argv rules),
 so a metacharacter like `&`, `|`, `<`, `>`, or `"` in an argument is delivered as
 a literal, never executed (the "BatBadBut" class, CVE-2024-24576). An argument
 carrying a character `cmd.exe` cannot escape at all — a `%`, a `!`, or a line
 break — is an honest `ProcessError.Spawn` refusal rather than an unsafe launch.
+
+**Windows: the launch searches the child's `PATH`, not the process's.** Windows
+resolves a bare program name in the *parent's* context — the OS searches the
+current process's `PATH`, not the environment block the child is handed — so a
+command that sets, removes, or clears the child's `PATH` (`Env("PATH", …)`,
+`EnvRemove("PATH")`, `EnvClear`) would otherwise launch whatever the *process's*
+`PATH` happens to hold under that name. ProcessKit resolves such a command itself,
+against its effective child `PATH`, and hands the OS the resolved absolute path,
+so what runs is the executable `ResolveProgram()` names for the same command.
+
+That swaps the child's `PATH` in for the process's; it does not narrow the search
+down to it. The rest of the OS search order is reproduced around that `PATH` — the
+application directory, the *process's* current directory (the command's
+`currentDir` takes effect only after the image has been chosen), and the system
+and Windows directories are all searched **before** it, exactly as
+`ResolveProgram()` reports. So a name one of those directories holds
+still comes from there whatever the child `PATH` says: setting a child `PATH` is
+not a way to pin one particular image — pass an absolute program path, or use
+`PreferLocal` (consulted before all of the above), when that is what you need. The
+run fails `NotFound` — carrying the same `Searched` — before anything is spawned
+only when that whole search, the child's `PATH` included, finds nothing. A command
+that leaves the child's `PATH` alone is unaffected: the OS's own bare-name search
+reads the very `PATH` the resolver walked, so it still applies in full. The change
+is Windows-only; on POSIX a bare name is resolved by `posix_spawnp` itself, whose
+`PATH` search reads the launching process's environment rather than the child
+block ([Platform support → Caveats](platform-support.md#caveats)).
 
 ### Preferring a project-local tool (`PreferLocal`)
 
