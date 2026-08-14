@@ -495,8 +495,13 @@ var profile = await proc.ProfileAsync();
 Console.WriteLine($"exit={profile.ExitCode} took={profile.Duration} peak={profile.PeakMemoryBytes} avgCpu={profile.AvgCpuCores}");
 ```
 
-`Stats()`/`SampleStatsAsync` report full CPU/memory on Windows and the Linux cgroup backend, and active
-counts only on the POSIX process-group fallback; `ProfileAsync` samples the started child itself.
+`Stats()`/`SampleStatsAsync` report full CPU/memory on Windows and the Linux cgroup backend. On Linux
+cgroup v2, `PeakProcessCount` is available from the kernel's lifetime `pids.peak` counter only when
+`MaxProcesses` is configured and the kernel is version 6.6 or later; otherwise it is `None`. The
+counter measures kernel tasks (processes and their threads), so it is not directly comparable with
+`ActiveProcessCount`, which counts process leaders. Windows and the POSIX process-group fallback also
+return `None` rather than estimating the peak from samples. The POSIX fallback otherwise reports
+active counts only; `ProfileAsync` samples the started child itself.
 
 For attribution inside a shared tree, `MemberStats()` returns a point-in-time `MemberStats` record for
 each member: its `Pid`, cumulative `CpuTime`, current `ResidentMemoryBytes`, and optional per-process
@@ -1020,7 +1025,13 @@ Entries are matched by program + args + cwd + a stdin **source digest**; environ
 `data`, and the `PATH` a `NotFound` searched (the one environment *value* a cassette keeps, an
 `Env("PATH", …)` override included) — *are* stored verbatim and can carry secrets. `WithRedaction`
 scrubs the captured text and every one of those failure fields (`program`/`args` are stored as
-given), so review a fixture before committing it; on Unix the file is written `0600`.
+given), so review a fixture before committing it; on Unix the file is written `0600`. A crash writes
+no cassette behind your back *until you declare the recording finished*: the best-effort flush on
+dispose happens only after `Complete()` marks it so, and a scope left by a failed assertion before
+that call creates no cassette and changes none already on disk. That mark is the whole gate — dispose
+is never told how the scope ended — so a throw *after* `Complete()` still flushes the run's verbatim
+argv/output: complete last, after whatever can fail. `Save()` stays the unconditional,
+error-reporting way to persist a recording.
 Capture replay and live handles reconstructed by `SpawnAsync` both preserve the recorded duration
 and truncation state; a stricter output-buffer policy on the replay command can additionally mark
 the reconstructed handle's result as truncated.

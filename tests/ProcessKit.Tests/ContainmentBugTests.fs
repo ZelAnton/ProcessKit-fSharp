@@ -152,7 +152,7 @@ type internal SyntheticBackend() =
 
         member _.Stats() =
             requireLive "Stats"
-            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None))
+            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None, None))
 
         member _.MemberStats() =
             requireLive "MemberStats"
@@ -273,12 +273,113 @@ type internal CtrlSignalRaceBackend() =
         member _.Resume() = Ok()
 
         member _.Stats() =
-            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None))
+            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None, None))
 
         member _.MemberStats() = Ok []
 
         member _.UpdateLimits(_limits) = Ok()
         member _.HardRelease() = lock gate (fun () -> tracked.Clear())
+
+/// A synthetic backend whose spawned "children" hand back a parent-side stdout that a DESCENDANT is
+/// still holding open (T-360): the leader's own wait answers at once — its fate is settled — while the
+/// pipe never reaches EOF, exactly as it does when the leader spawned something that inherited its
+/// stdout and outlived it.
+///
+/// It exists to pin down the OWNERSHIP half of the bounded post-exit output drain, which is decided by
+/// `ProcessGroup.BuildHost`'s `ownsGroup` branch and is invisible from a `RunningProcess`-only test:
+/// a PRIVATE per-run group must be released (reaping whatever the leader left behind) once the bound
+/// lets the verb reach its teardown, while a SHARED group must not be — its members belong to the
+/// group, not to one run. The counters below are exactly those two questions.
+type internal InheritedPipeBackend() =
+    let gate = obj ()
+    let tracked = System.Collections.Generic.HashSet<nativeint>()
+    let mutable hardReleaseCount = 0
+    let mutable killTreeCount = 0
+    let mutable killChildCount = 0
+    let mutable gracefulKillTreeCount = 0
+    let mutable nextHandle = 0
+
+    /// How many times the whole container was torn down — the private group's reap of the remainder.
+    member _.HardReleaseCount = lock gate (fun () -> hardReleaseCount)
+    /// Native whole-tree kills that reached the backend.
+    member _.KillTreeCount = lock gate (fun () -> killTreeCount)
+    /// Native single-child kills that reached the backend.
+    member _.KillChildCount = lock gate (fun () -> killChildCount)
+    /// Native graceful tree kills that reached the backend.
+    member _.GracefulKillTreeCount = lock gate (fun () -> gracefulKillTreeCount)
+    /// Children the container still owns — a shared group keeps its other runs after one is detached.
+    member _.TrackedCount = lock gate (fun () -> tracked.Count)
+
+    interface IContainmentBackend with
+        member _.Mechanism = Mechanism.ProcessGroup
+
+        member _.Spawn(_command) =
+            let handle =
+                lock gate (fun () ->
+                    nextHandle <- nextHandle + 1
+                    nativeint nextHandle)
+
+            // A cancellable held-open read — what a real piped run gets on every supported platform
+            // (a Windows overlapped named pipe, a POSIX socketpair).
+            let stdout =
+                new HeldOpenOutputStream(
+                    System.Text.Encoding.UTF8.GetBytes "from-the-leader\n",
+                    respectsCancellation = true
+                )
+
+            Ok
+                { Native.Common.Spawned.Handle = handle
+                  Stdout = Some(stdout :> Stream)
+                  Stderr = None
+                  Stdin = None
+                  ExtraFds = []
+                  WindowsCtrlGroup = false
+                  PtyControl = None }
+
+        member _.Track(spawned) =
+            lock gate (fun () -> tracked.Add spawned.Handle |> ignore)
+            Ok()
+
+        member _.Adopt(_pid) = Ok()
+
+        member _.Release(spawned) =
+            lock gate (fun () -> tracked.Remove spawned.Handle |> ignore)
+
+        // The leader's fate is settled the moment anything asks — the whole point of this fixture is
+        // what happens to the OUTPUT pipe afterwards.
+        member _.Wait(_handle) = task { return Outcome.Exited 0 }
+        member _.PidOf(spawned) = Some(int spawned.Handle)
+
+        member _.KillChild(_spawned) =
+            lock gate (fun () -> killChildCount <- killChildCount + 1)
+
+        member _.KillTree() =
+            lock gate (fun () -> killTreeCount <- killTreeCount + 1)
+            Ok()
+
+        member _.GracefulKillTree (_signal) (_grace) =
+            lock gate (fun () -> gracefulKillTreeCount <- gracefulKillTreeCount + 1)
+            Task.CompletedTask
+
+        member _.SignalChild(_spawned, _signal) = Ok()
+
+        member _.Members() =
+            lock gate (fun () -> Ok(tracked |> Seq.map int |> List.ofSeq))
+
+        member _.Signal(_signal) = Ok()
+        member _.Suspend() = Ok()
+        member _.Resume() = Ok()
+
+        member _.Stats() =
+            Ok(ProcessGroupStats(lock gate (fun () -> tracked.Count), None, None, None))
+
+        member _.MemberStats() = Ok []
+        member _.UpdateLimits(_limits) = Ok()
+
+        member _.HardRelease() =
+            lock gate (fun () ->
+                tracked.Clear()
+                hardReleaseCount <- hardReleaseCount + 1)
 
 /// Regression tests for containment-integrity fixes: spawning into a released group, pipeline
 /// mid-chain spawn failures, inherited stdio, and teardown reaping (no zombie leaders).
@@ -1380,3 +1481,97 @@ type ContainmentBugTests() =
                 Assert.That(Directory.Exists dir, Is.True, "a cgroup that still holds members keeps its directory"))
         finally
             Native.Cgroup.drainBudgetOverrideForTests <- originalBudget
+
+    // ---- T-360: who owns the remainder once the post-exit drain bound fires ----------------------
+
+    [<Test>]
+    member _.``a private group reaps the remainder once the post-exit drain bound releases the verb``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // The bug this closes was not only the hang: because the verb never returned, it never
+                // reached its `reapGuard`, so the PRIVATE per-run group that owns the leftover tree was
+                // never released and the descendant that inherited the pipe outlived the run for good.
+                // Bounding the drain is what puts the teardown back on the path.
+                let backend = InheritedPipeBackend()
+                let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+                match group.StartInternal(shell "irrelevant-the-backend-is-synthetic") with
+                | Error error -> Assert.Fail $"the synthetic spawn should succeed: {error}"
+                | Ok(host, extraFds) ->
+                    use running = new RunningProcess(host, extraFds)
+
+                    match! running.OutputStringAsync() with
+                    | Error error -> Assert.Fail $"the bounded drain must still produce a capture: {error}"
+                    | Ok captured ->
+                        Assert.That(captured.Outcome, Is.EqualTo(Outcome.Exited 0))
+                        Assert.That(captured.Stdout, Does.Contain "from-the-leader")
+                        Assert.That(captured.Truncated, Is.True)
+
+                    Assert.That(running.OutputDrainWasBounded, Is.True, "the held-open pipe should hit the bound")
+
+                    Assert.That(
+                        backend.HardReleaseCount,
+                        Is.EqualTo 1,
+                        "a private group must be torn down once the bound lets the verb reach its reapGuard"
+                    )
+
+                    Assert.That(backend.TrackedCount, Is.EqualTo 0, "the private group's tree must not survive it")
+            })
+        :> Task
+
+    [<Test>]
+    member _.``a shared group keeps its other runs when one run's drain bound fires``() : Task =
+        PostExitDrainBudget.withBudget PostExitDrainBudget.Short (fun () ->
+            task {
+                // The other side of the ownership rule: severing is a per-HANDLE act, so a run whose
+                // inherited pipe is held open detaches only its own I/O. Nothing may kill the remainder
+                // here — the descendants belong to the shared container, alongside every other run in
+                // it, and this library does not reach into a group one handle does not own.
+                let backend = InheritedPipeBackend()
+                use group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+                match! group.StartAsync(shell "the-neighbour") with
+                | Error error -> Assert.Fail $"the synthetic spawn should succeed: {error}"
+                | Ok neighbour ->
+                    use neighbour = neighbour
+
+                    match! group.StartAsync(shell "the-leader") with
+                    | Error error -> Assert.Fail $"the synthetic spawn should succeed: {error}"
+                    | Ok running ->
+                        use running = running
+
+                        match! running.OutputStringAsync() with
+                        | Error error -> Assert.Fail $"the bounded drain must still produce a capture: {error}"
+                        | Ok captured ->
+                            Assert.That(captured.Stdout, Does.Contain "from-the-leader")
+                            Assert.That(captured.Truncated, Is.True)
+
+                        Assert.That(running.OutputDrainWasBounded, Is.True)
+
+                        Assert.That(
+                            backend.HardReleaseCount,
+                            Is.EqualTo 0,
+                            "one run's teardown must not release a group it shares"
+                        )
+
+                        Assert.That(
+                            backend.KillTreeCount + backend.KillChildCount + backend.GracefulKillTreeCount,
+                            Is.EqualTo 0,
+                            "a shared group's survivors are not this run's to kill"
+                        )
+
+                        Assert.That(
+                            backend.TrackedCount,
+                            Is.EqualTo 1,
+                            "the neighbour must still be owned by the group after the bounded run detached"
+                        )
+
+                        // And the neighbour is untouched: its own streams were never severed, so its own
+                        // capture still runs — and hits the same bound on its own terms.
+                        match! neighbour.OutputStringAsync() with
+                        | Error error -> Assert.Fail $"the neighbouring run must still be usable: {error}"
+                        | Ok captured ->
+                            Assert.That(captured.Outcome, Is.EqualTo(Outcome.Exited 0))
+                            Assert.That(captured.Stdout, Does.Contain "from-the-leader")
+            })
+        :> Task

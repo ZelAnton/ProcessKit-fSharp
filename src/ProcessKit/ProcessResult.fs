@@ -22,7 +22,8 @@ type ProcessResult<'T>
         okCodes: int list,
         ?configuredTimeoutDuration: TimeSpan,
         ?stdoutEncoding: Encoding,
-        ?overflowTotals: int * int
+        ?overflowTotals: int * int,
+        ?outputDrainBounded: bool
     ) =
 
     // Real runners supply the configured deadline that actually fired. Results created by third-party
@@ -51,7 +52,11 @@ type ProcessResult<'T>
     /// Wall-clock duration of the run.
     member _.Duration = duration
 
-    /// True when the captured output was truncated by an output-buffer policy.
+    /// True when this capture is INCOMPLETE — a bounded `OutputBuffer` policy dropped output, or the
+    /// bounded post-exit output drain cut the tail short because something that inherited the child's
+    /// stdout/stderr outlived it. One flag for both, because both mean the same thing to a caller:
+    /// what is here is not all of it. (A checking verb turns the two into their own typed refusals; see
+    /// `ProcessResult.rejectIfTruncated`.)
     member _.Truncated = truncated
 
     /// The cumulative line/byte totals this run's captures SAW — retained plus dropped — carried
@@ -65,6 +70,20 @@ type ProcessResult<'T>
     /// error, and a public total would force every producer that cannot count (test doubles, replay) to
     /// publish a zero that reads like a measurement.
     member internal _.OverflowTotals: (int * int) option = overflowTotals
+
+    /// Why this capture is incomplete, for the ONE consumer that has to tell the two sources apart:
+    /// `true` when the bounded post-exit output drain cut the tail short (something that inherited the
+    /// child's stdout/stderr outlived it), `false` for the ordinary source — a bounded `OutputBuffer`
+    /// policy that dropped output — and for every producer that cannot distinguish them (a replayed
+    /// cassette, a third-party runner), which is why the default is the buffer reading. Meaningless
+    /// unless `Truncated` is set.
+    ///
+    /// Internal, like `OverflowTotals`, and for the same reason: the public signal that output was lost
+    /// is `Truncated` plus the typed error a checking verb produces from it
+    /// (`OutputTooLarge` vs. `OutputIncomplete`, see `ProcessResult.rejectIfTruncated`). A public flag
+    /// would force every producer that cannot tell the sources apart to publish a `false` that reads
+    /// like a measurement.
+    member internal _.OutputDrainBounded: bool = defaultArg outputDrainBounded false
 
     /// The exit code, or `None` for a signal kill or timeout.
     member _.Code = outcome.Code
@@ -150,19 +169,33 @@ module ProcessResult =
     /// (`Exit` / `Signalled` / `Timeout`). Generic over the captured-stdout type.
     let ensureSuccess (result: ProcessResult<'T>) : Result<ProcessResult<'T>, ProcessError> = result.EnsureSuccess()
 
-    /// Refuse a capture a bounded buffer already truncated. The verbs that hand back stdout **as if it
-    /// were the whole thing** — `run` and everything derived from it (`parse`/`tryParse`/the JSON
-    /// projections, on a command or a pipeline) — call this after the success check, so a
-    /// `DropOldest`/`DropNewest` policy surfaces as `ProcessError.OutputTooLarge` instead of feeding a
-    /// caller (or a parser) a clipped prefix/tail that is indistinguishable from complete output. The
-    /// lenient capture verbs (`outputString`/`outputBytes`) deliberately do NOT call it: they return the
-    /// whole `ProcessResult` with `Truncated` set and let the caller decide. Ports ProcessKit-rs
+    /// Refuse a capture that is already TRUNCATED. The verbs that hand back stdout **as if it were the
+    /// whole thing** — `run` and everything derived from it (`parse`/`tryParse`/the JSON projections, on
+    /// a command or a pipeline) — call this after the success check, so an incomplete capture surfaces
+    /// as a typed failure instead of feeding a caller (or a parser) a clipped prefix/tail that is
+    /// indistinguishable from complete output. The lenient capture verbs
+    /// (`outputString`/`outputBytes`) deliberately do NOT call it: they return the whole
+    /// `ProcessResult` with `Truncated` set and let the caller decide. Ports ProcessKit-rs
     /// `ProcessResult::reject_if_truncated` (`623f2c23`).
     ///
-    /// `lineLimit`/`byteLimit` are the ceilings quoted in the error — the caller's own configured
-    /// ceilings for the capture it is presenting, which is why they are passed in rather than read off
-    /// the result (a pipeline captures raw bytes, so it quotes only its byte ceiling). The totals come
-    /// from the result itself and are quoted only where they were actually counted (see
+    /// Truncation has two sources, and each gets the error that names IT — the refusal is one decision,
+    /// but it is not one message:
+    ///
+    ///  * a bounded `OutputBuffer` policy dropped output -> `ProcessError.OutputTooLarge`, quoting the
+    ///    ceilings and the totals below. This is the ordinary source, and the only one a producer that
+    ///    cannot tell the two apart (a replayed cassette, a third-party runner) is ever reported as.
+    ///  * the bounded post-exit output drain cut the tail short -> `ProcessError.OutputIncomplete`.
+    ///    Nothing exceeded anything there: quoting a ceiling (or a line/byte/event total against one)
+    ///    would name a bound that need not exist and point at a knob that cannot help.
+    ///
+    /// A capture both sources touched is reported as `OutputIncomplete`: the drain bound is the cause
+    /// the caller does not already know about — they configured the buffer policy themselves — and it is
+    /// the one that says the run's own read ends were closed on a pipe a descendant still held.
+    ///
+    /// `lineLimit`/`byteLimit` are the ceilings quoted in the buffer-policy error — the caller's own
+    /// configured ceilings for the capture it is presenting, which is why they are passed in rather than
+    /// read off the result (a pipeline captures raw bytes, so it quotes only its byte ceiling). The
+    /// totals come from the result itself and are quoted only where they were actually counted (see
     /// `ProcessResult.OverflowTotals`).
     let internal rejectIfTruncated
         (lineLimit: int option)
@@ -171,6 +204,8 @@ module ProcessResult =
         : Result<unit, ProcessError> =
         if not result.Truncated then
             Ok()
+        elif result.OutputDrainBounded then
+            Error(ProcessError.OutputIncomplete result.Program)
         else
             let totalLines, totalBytes = result.OverflowTotals |> Option.defaultValue (0, 0)
 

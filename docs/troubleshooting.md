@@ -67,6 +67,26 @@ kills the tree and closes its pipes, but a timeout is a safety bound, not a
 replacement for consuming output. See [Streaming lifecycle](streaming.md#lifecycle)
 and [Timeouts, retries and cancellation](timeouts-and-cancellation.md).
 
+**A second cause, bounded for you on a single-command run:** the child spawned
+something that inherited its stdout/stderr and outlived it, so the pipe still has
+a writer and never reaches end-of-file. For a run driven through one
+`RunningProcess` handle — every `Command`/`Exec` capture verb, and every streaming
+or interactive session — ProcessKit gives the pumps a short window after the
+child's exit status is known, then closes its own read ends and returns that
+outcome with `Truncated` set, so this shows up as an incomplete capture rather
+than a hang, with no `Command.Timeout` needed. See
+[Output a descendant keeps open](streaming.md#output-a-descendant-keeps-open).
+
+A **pipeline** does not have that bound yet: `Pipeline`'s buffered verbs wait for
+the last stage's stdout and for every stage's stderr to reach end-of-file, so a
+stage that leaves a background job holding one of them (`sh -c 'daemon & echo hi'`)
+still hangs exactly as described above. The whole-chain
+[`Pipeline.Timeout`](pipelines.md#timeouts-and-cancellation) does not rescue that
+one either: the deadline is disarmed the moment every stage is terminal, which is
+exactly when this wait begins. Cancel the run through its `CancellationToken` (that
+*does* tear the chain's group down, descendants included), or keep the descendant off
+the stage's own stdout/stderr in the first place (`daemon >/dev/null 2>&1 &`).
+
 ## Deadlock behavior with `StreamBuffer`
 
 **Symptom:** A streamed run stops after exactly the configured backlog capacity,

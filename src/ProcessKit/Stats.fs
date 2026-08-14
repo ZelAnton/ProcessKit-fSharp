@@ -14,15 +14,16 @@ type internal ProcessIoCounters =
 
 /// A snapshot of a process group's resource usage.
 ///
-/// Optional CPU, memory, and I/O fields are `None` when the platform can't report them — the POSIX
-/// process-group mechanism (macOS and the Linux fallback) has no kernel accumulator; the Linux
-/// cgroup v2 backend (the `limits` feature) supplies the controller metrics available to it. Sealed
-/// with an internal constructor so it can gain metrics without breaking the frozen API.
+/// Optional peak-process, CPU, memory, and I/O fields are `None` when the platform can't report them —
+/// the POSIX process-group mechanism (macOS and the Linux fallback) has no kernel accumulator; the
+/// Linux cgroup v2 backend (the `limits` feature) supplies the controller metrics available to it.
+/// Sealed with an internal constructor so it can gain metrics without breaking the frozen API.
 [<Sealed>]
 type ProcessGroupStats
     internal
     (
         activeProcessCount: int,
+        peakProcessCount: int64 option,
         totalCpuTime: TimeSpan option,
         peakMemoryBytes: int64 option,
         ioCounters: ProcessIoCounters option
@@ -32,6 +33,13 @@ type ProcessGroupStats
     /// this counts live process *groups* (one per contained child) rather than individual
     /// processes; with a Job Object (or cgroup) it is the exact process count.
     member _.ActiveProcessCount = activeProcessCount
+
+    /// Maximum number of kernel tasks (processes and their threads) charged to the group at once over
+    /// its lifetime, if the containment mechanism exposes a native counter. Linux cgroup v2 reports
+    /// `pids.peak` only when `MaxProcesses` is configured and the kernel is version 6.6 or later. This
+    /// task count is not directly comparable with `ActiveProcessCount`, which counts process leaders.
+    /// Windows Job Objects and the POSIX process-group fallback return `None`.
+    member _.PeakProcessCount = peakProcessCount
 
     /// Total CPU time (user + kernel) accumulated by the group, if available. On Windows this is
     /// cumulative across every process that has ever been in the Job (including terminated ones).

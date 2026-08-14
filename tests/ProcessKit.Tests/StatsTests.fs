@@ -36,7 +36,7 @@ type internal MemberStatsSeamBackend(memberStats: unit -> Result<MemberStats lis
         member _.Resume() = Ok()
 
         member _.Stats() =
-            Ok(ProcessGroupStats(0, None, None, None))
+            Ok(ProcessGroupStats(0, None, None, None, None))
 
         member _.MemberStats() = memberStats ()
         member _.UpdateLimits(_limits) = Ok()
@@ -159,6 +159,7 @@ type StatsTests() =
 
                     if isWindows then
                         // The Job Object reports cumulative CPU and peak committed memory.
+                        Assert.That(stats.PeakProcessCount.IsNone, Is.True)
                         Assert.That(stats.TotalCpuTime.IsSome, Is.True)
                         Assert.That(stats.PeakMemoryBytes.IsSome, Is.True)
                         Assert.That(stats.IoReadBytes.IsSome, Is.True)
@@ -167,6 +168,7 @@ type StatsTests() =
                         Assert.That(stats.IoWriteOperations.IsSome, Is.True)
                     else
                         // The POSIX process-group mechanism has no kernel accumulator.
+                        Assert.That(stats.PeakProcessCount.IsNone, Is.True)
                         Assert.That(stats.TotalCpuTime.IsNone, Is.True)
                         Assert.That(stats.PeakMemoryBytes.IsNone, Is.True)
                         Assert.That(stats.IoReadBytes.IsNone, Is.True)
@@ -859,6 +861,7 @@ type StatsTests() =
         try
             File.WriteAllText(Path.Combine(directory, "cpu.stat"), "usage_usec 5\n")
             File.WriteAllText(Path.Combine(directory, "memory.peak"), "42\n")
+            File.WriteAllText(Path.Combine(directory, "pids.peak"), "7\n")
 
             File.WriteAllText(
                 Path.Combine(directory, "io.stat"),
@@ -866,14 +869,32 @@ type StatsTests() =
                 + "8:16 rbytes=7 wbytes=13 rios=3 wios=4\n"
             )
 
-            let cpu, memory, io = ProcessKit.Native.Cgroup.cgroupStats directory
+            let cpu, memory, processCount, io = ProcessKit.Native.Cgroup.cgroupStats directory
             Assert.That(cpu, Is.EqualTo(Some(TimeSpan.FromTicks 50L)))
             Assert.That(memory, Is.EqualTo(Some 42L))
+            Assert.That(processCount, Is.EqualTo(Some 7L))
             Assert.That(io.IsSome, Is.True)
             Assert.That(io.Value.ReadBytes, Is.EqualTo 11L)
             Assert.That(io.Value.WriteBytes, Is.EqualTo 22L)
             Assert.That(io.Value.ReadOperations, Is.EqualTo 4L)
             Assert.That(io.Value.WriteOperations, Is.EqualTo 6L)
+        finally
+            Directory.Delete(directory, true)
+
+    [<Test>]
+    member _.``cgroup pids.peak stays unavailable when its native counter is absent or unreadable``() =
+        let directory =
+            Path.Combine(Path.GetTempPath(), $"processkit-pids-peak-{Guid.NewGuid():N}")
+
+        Directory.CreateDirectory directory |> ignore
+
+        try
+            let _, _, absent, _ = ProcessKit.Native.Cgroup.cgroupStats directory
+            Assert.That(absent.IsNone, Is.True, "a missing pids.peak must not be reported as zero")
+
+            Directory.CreateDirectory(Path.Combine(directory, "pids.peak")) |> ignore
+            let _, _, unreadable, _ = ProcessKit.Native.Cgroup.cgroupStats directory
+            Assert.That(unreadable.IsNone, Is.True, "an unreadable pids.peak must not be reported as zero")
         finally
             Directory.Delete(directory, true)
 
@@ -886,7 +907,7 @@ type StatsTests() =
                   ReadOperations = 3L
                   WriteOperations = 4L }
 
-            let stats = ProcessGroupStats(0, None, None, Some counters)
+            let stats = ProcessGroupStats(0, None, None, None, Some counters)
 
             let host =
                 { hostOverCurrentProcess None with

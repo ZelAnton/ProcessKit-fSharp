@@ -303,9 +303,14 @@ type ProcessError =
     /// (`Parse`/`Io`/`Timeout`), never folded in here.
     | JsonRpc of Program: string * Method: string * Code: int * Detail: string * Data: string option
 
-    /// Captured or streamed output exceeded a configured fail-loud ceiling, or a checking verb refused
-    /// output a bounded buffer had already truncated (`Command.RunAsync`/`ParseAsync`/`OutputJsonAsync`
-    /// and their pipeline twins — see `ProcessResult.Truncated` for the lenient path). Metrics are
+    /// Captured or streamed output exceeded a configured **ceiling**: a fail-loud buffer/stream cap was
+    /// crossed, or a checking verb refused a capture a bounded buffer had already truncated
+    /// (`Command.RunAsync`/`ParseAsync`/`OutputJsonAsync` and their pipeline twins — see
+    /// `ProcessResult.Truncated` for the lenient path). Always about a *volume* against a bound, which
+    /// is why every wording quotes a unit; a capture cut short with no ceiling in sight — the bounded
+    /// post-exit output drain's — is its own case (`OutputIncomplete`) rather than a metric-free member
+    /// of this one. `LineLimit`/`ByteLimit` are the caller's configured ceilings, absent for a channel
+    /// whose cap is not expressed in that unit (a merged event or protocol-frame stream). Metrics are
     /// populated only when their unit applies to that channel (lines, bytes, merged events, or protocol
     /// frames) AND the producer actually counted it: a `0` total means "not reported here", never a
     /// measured zero, and `Message` quotes only the totals that were populated.
@@ -315,6 +320,20 @@ type ProcessError =
         ByteLimit: int option *
         TotalLines: int *
         TotalBytes: int
+
+    /// A checking verb (`Command.RunAsync`/`ParseAsync`/`OutputJsonAsync`, which present their capture
+    /// **as the whole of stdout**) refused a capture the **bounded post-exit output drain** cut short:
+    /// the child's exit status was already known, but something that inherited its stdout/stderr — a
+    /// daemonized worker, a `setsid` helper, a shell's background job — still held the pipe open when
+    /// the drain's window ran out, so the run closed its own read ends and the capture ends where it was
+    /// cut (docs/streaming.md, "Output a descendant keeps open").
+    ///
+    /// Deliberately **not** `OutputTooLarge`: nothing exceeded anything here — there need not be a
+    /// ceiling configured at all — so this case quotes no limit and no line/byte total, and no
+    /// `OutputBuffer` setting can change the outcome. The lenient capture verbs
+    /// (`OutputStringAsync`/`OutputBytesAsync`) never produce it: they hand back the partial capture
+    /// with `ProcessResult.Truncated` set and let the caller decide.
+    | OutputIncomplete of Program: string
 
     /// The child's stdin source could not be read (e.g. a missing `FromFile` path) on an otherwise-
     /// successful run. A routine broken pipe — the child closed stdin early — is never reported here.
@@ -431,6 +450,10 @@ type ProcessError =
             | None, None, _ ->
                 let counts = quote (counted totalBytes "bytes")
                 $"'{name}' produced too much output{counts}"
+        | ProcessError.OutputIncomplete program ->
+            // No unit and no total by design: this refusal is not about a volume (see the case's doc),
+            // so it names the cause instead of quoting a count nothing here measured against a ceiling.
+            $"'{MessageText.fragment program}' output was cut short: something that inherited its stdout/stderr outlived the run, so the capture is incomplete"
         | ProcessError.Stdin(program, detail) ->
             $"could not read the stdin source for '{MessageText.fragment program}': {MessageText.fragment detail}"
         | ProcessError.ResourceLimit detail -> $"resource limit could not be enforced: {MessageText.fragment detail}"
@@ -472,6 +495,7 @@ type ProcessError =
         | ProcessError.RetryPredicate(program, _, _)
         | ProcessError.JsonRpc(program, _, _, _, _)
         | ProcessError.OutputTooLarge(program, _, _, _, _)
+        | ProcessError.OutputIncomplete program
         | ProcessError.Stdin(program, _)
         | ProcessError.CassetteMiss program -> Some program
         | ProcessError.Adopt _

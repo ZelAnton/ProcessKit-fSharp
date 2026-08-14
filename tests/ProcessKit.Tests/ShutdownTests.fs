@@ -54,7 +54,7 @@ type private GracefulFaultBackend() =
         member _.Resume() = Ok()
 
         member _.Stats() =
-            Ok(ProcessGroupStats(0, None, None, None))
+            Ok(ProcessGroupStats(0, None, None, None, None))
 
         member _.MemberStats() = Ok []
 
