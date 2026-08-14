@@ -446,11 +446,15 @@ type GracefulTeardownTests() =
             let stalled =
                 TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-            let adoptedBefore = PostKillReap.adoptedWaitCount ()
             let! settled = PostKillReap.awaitWithin (TimeSpan.FromMilliseconds 100.0) stalled.Task
 
             Assert.That(settled.IsNone, Is.True, "a wait that outlived its budget must not report an outcome")
-            Assert.That(PostKillReap.adoptedWaitCount () - adoptedBefore, Is.EqualTo 1)
+
+            Assert.That(
+                PostKillReap.adoptedWaitCountFor stalled.Task,
+                Is.EqualTo 1,
+                "this exact wait must be adopted once, regardless of unrelated background adoptions"
+            )
 
             // The ledger observes the adopted wait's eventual fault, so a late failure can never surface
             // as an unobserved task exception at finalization.

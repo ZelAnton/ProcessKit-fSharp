@@ -315,6 +315,21 @@ type WindowsNativeContainmentFaultTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
+    let deleteFileWithRetry (path: string) =
+        let rec delete attemptsRemaining =
+            try
+                File.Delete path
+            with
+            | :? IOException when attemptsRemaining > 1 ->
+                Thread.Sleep 50
+                delete (attemptsRemaining - 1)
+            | :? IOException ->
+                // Endpoint security or indexing may briefly retain the closed redirect on hosted
+                // Windows runners; leaving a unique temp file is preferable to masking the test result.
+                ()
+
+        delete 4
+
     // The message the injected cleanup failure carries, asserted on the returned `ProcessError.Spawn`
     // so the test can tell "the fault took the intended route" from "the spawn failed earlier for an
     // unrelated reason and never reached the teardown sequence under test".
@@ -575,7 +590,7 @@ type WindowsNativeContainmentFaultTests() =
                 // Best-effort test cleanup, as above.
                 Windows.terminateWindowsJob job |> ignore
                 Windows.closeWindowsHandle job
-                File.Delete redirectFile
+                deleteFileWithRetry redirectFile
         }
         :> Task
 

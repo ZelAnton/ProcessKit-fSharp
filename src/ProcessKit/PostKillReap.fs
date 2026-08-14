@@ -2,6 +2,7 @@ namespace ProcessKit
 
 open System
 open System.Collections.Concurrent
+open System.Runtime.CompilerServices
 open System.Threading
 open System.Threading.Tasks
 
@@ -105,13 +106,29 @@ module internal PostKillReap =
         | Some value -> armable value
         | None -> DefaultBudget
 
+    type private AdoptionCount() =
+        let count = ref 0
+
+        member _.Increment() =
+            Interlocked.Increment(&count.contents) |> ignore
+
+        member _.Read() = Volatile.Read(&count.contents)
+
     // Monotonic counters, for tests that assert the ledger adopted a wait EXACTLY once (the
-    // "no second wait owner" invariant) rather than inferring it from timing.
+    // "no second wait owner" invariant) rather than inferring it from timing. Per-wait counts use
+    // weak keys so this test diagnostic never extends an adopted wait's lifetime.
     let private adoptedWaits = ref 0
     let private adoptedLeaders = ref 0
+    let private adoptedWaitCounts = ConditionalWeakTable<Task, AdoptionCount>()
 
     /// How many waits have been handed to the ledger since the process started (test diagnostic).
     let adoptedWaitCount () = Volatile.Read(&adoptedWaits.contents)
+
+    /// How many times this exact wait has been handed to the ledger (test diagnostic).
+    let adoptedWaitCountFor (wait: Task) =
+        match adoptedWaitCounts.TryGetValue wait with
+        | true, count -> count.Read()
+        | false, _ -> 0
 
     /// How many native leaders have been adopted since the process started (test diagnostic).
     let adoptedLeaderCount () = Volatile.Read(&adoptedLeaders.contents)
@@ -127,6 +144,7 @@ module internal PostKillReap =
     /// verbs) keeps seeing the original outcome or fault unchanged.
     let adoptWait (wait: Task) : unit =
         Interlocked.Increment(&adoptedWaits.contents) |> ignore
+        adoptedWaitCounts.GetOrCreateValue(wait).Increment()
 
         wait.ContinueWith(
             Action<Task>(fun completed -> completed.Exception |> ignore),
