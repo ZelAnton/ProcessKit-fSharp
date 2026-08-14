@@ -949,6 +949,28 @@ type CassetteTests() =
 
     [<TestCase("Record")>]
     [<TestCase("Auto")>]
+    member _.``a recorder disposed without Complete writes nothing on a normal exit either``(mode: string) : Task =
+        withUnwrittenCassette (fun path ->
+            task {
+                // The completion mark, not the shape of the exit, is the whole gate — so a scope that ends
+                // NORMALLY is refused the flush exactly as an unwinding one is. That is what makes the
+                // documented alternative real: a caller who wants no write they cannot point at leaves
+                // `Complete` out altogether and `Save`s where the file should appear.
+                do!
+                    task {
+                        use recorder = recorderFor mode path (FixedRunner(crashedRunOutput, 0))
+                        do! recordEntries recorder "uncompleted" 1
+                    }
+
+                Assert.That(
+                    File.Exists path,
+                    Is.False,
+                    $"a dispose without Complete must write no cassette even on a normal scope exit ({mode})"
+                )
+            })
+
+    [<TestCase("Record")>]
+    [<TestCase("Auto")>]
     member _.``an explicit Save persists without Complete and still reports a write failure``(mode: string) : Task =
         withUnwrittenCassette (fun path ->
             task {

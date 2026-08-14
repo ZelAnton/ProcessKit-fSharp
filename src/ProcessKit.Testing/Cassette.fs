@@ -340,7 +340,8 @@ type private SaveLockAttempt =
 ///
 /// **Record** mode wraps a real inner runner, captures each completed call to a JSON cassette
 /// (written on `Save`, or best-effort on dispose once `Complete` has declared the recording finished —
-/// a recorder disposed while an exception unwinds the stack writes nothing), and returns the live
+/// a recorder disposed before that writes nothing, an exception unwinding the stack past it included,
+/// while one disposed after it flushes however the scope ended, so complete last), and returns the live
 /// result. A call that ends in a typed failure this format can rebuild exactly — `NotFound`, `Spawn`,
 /// `Stdin`, `Exit`, `Signalled`,
 /// `Timeout`, `OutputTooLarge`, `Parse`, `JsonRpc` — is recorded as that failure and replays as it,
@@ -1876,13 +1877,21 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     /// that knows the answer: your own code, on the path it reaches only when the recording ran to the
     /// end you intended.
     ///
-    /// Call it once the calls you want recorded have been made, before the scope ends. It only marks —
-    /// no I/O, it never throws, and it is safe to call from any thread and more than once — so the write
-    /// still happens at dispose, best-effort and silent (a failure to write is not reported), and it
-    /// covers everything recorded by the time that dispose runs, including anything captured after this
-    /// call. `Save()` remains the durability path: it writes immediately and returns the I/O error, and
-    /// the two are independent in both directions — saving does not mark the recording complete, and
-    /// completing it does not save. A no-op in replay mode, which records nothing.
+    /// **Call it last — after everything in the scope that can throw, assertions included.** This mark is
+    /// the whole of the gate: dispose reads it and nothing else, and is never told how the scope ended.
+    /// So a scope that throws *before* this call writes no cassette at all, while a scope that throws
+    /// *after* it is flushed exactly as a normal exit would be — the verbatim argv and captured output of
+    /// the failed run reach disk. Completing before the assertions therefore hands a failing test the very
+    /// file this gate exists to withhold. If a recording must never be written by anything but a call you
+    /// can point at, do not complete at all and `Save()` where you want the file: without the mark,
+    /// dispose writes nothing however the scope ends.
+    ///
+    /// It only marks — no I/O, it never throws, and it is safe to call from any thread and more than once
+    /// — so the write still happens at dispose, best-effort and silent (a failure to write is not
+    /// reported), and it covers everything recorded by the time that dispose runs, including anything
+    /// captured after this call. `Save()` remains the durability path: it writes immediately and returns
+    /// the I/O error, and the two are independent in both directions — saving does not mark the recording
+    /// complete, and completing it does not save. A no-op in replay mode, which records nothing.
     member _.Complete() : unit =
         match mode with
         | ReplayMode _ -> ()
@@ -2161,11 +2170,12 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     interface IDisposable with
         member _.Dispose() =
             match mode with
-            // Two conditions, and the completion mark is the one that makes this safe: a dispose reached
-            // while the stack unwinds out of a failed test never gets here, because that path never
-            // called `Complete` (see it for why detecting the unwind itself is not an option). So an
-            // uncompleted recording is dropped rather than written — the cassette at `path`, if any, is
-            // not even opened — and `Save` stays the way to persist one regardless of how a scope ended.
+            // Two conditions, and the completion mark is the one carrying the safety. The shape of the
+            // scope exit is not consulted at all — it cannot be (see `Complete` for why detecting an
+            // unwind is not an option) — so what keeps a crashed test's recording off disk is that such a
+            // test never reached its `Complete`. An uncompleted recording is dropped rather than written
+            // (the cassette at `path`, if any, is not even opened); a completed one is flushed however the
+            // scope ended, unwind included; and `Save` persists one regardless, either way.
             | RecordMode(_, recorded, dirty)
             | AutoMode(_, _, recorded, dirty) when lock gate (fun () -> completed.Value && dirty.Value) ->
                 try

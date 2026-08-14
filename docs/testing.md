@@ -637,8 +637,8 @@ else if (replayResult is { IsOk: false, ErrorValue: var loadErr })
 writes the cassette (it is also flushed best-effort on dispose —
 `RecordReplayRunner` is `IDisposable` — but only once `Complete()` has declared
 the recording finished, see
-[Nothing is written by a crash](#nothing-is-written-by-a-crash), and `Save()` is
-the call that surfaces a write error). `Replay(path)` returns a
+[A crash writes nothing before Complete](#a-crash-writes-nothing-before-complete),
+and `Save()` is the call that surfaces a write error). `Replay(path)` returns a
 `Result<RecordReplayRunner, ProcessError>` loaded from the file.
 
 Semantics worth knowing before you commit a cassette:
@@ -692,7 +692,7 @@ hermetic.
 **Grow a cassette on miss (VCR "new episodes").** `RecordReplayRunner.Auto(path, inner)`
 replays what the cassette already holds and, on a **miss**, delegates to `inner`, records the
 result, and grows the file on `Save()` (or on a dispose after `Complete()`, like record mode — see
-[Nothing is written by a crash](#nothing-is-written-by-a-crash)) — so you build a cassette up
+[A crash writes nothing before Complete](#a-crash-writes-nothing-before-complete)) — so you build a cassette up
 incrementally instead of curating every entry by hand. Existing entries still replay hermetically; only a
 first-seen call reaches the real tool. A missing (or empty) file starts a fresh cassette. Use
 strict `Replay(path)` in CI, where a miss should fail loudly. (Like record mode, `Auto` can't
@@ -730,7 +730,7 @@ if (RecordReplayRunner.Auto("fixtures/git.json", new JobRunner(), options) is { 
 }
 ```
 
-### Nothing is written by a crash
+### A crash writes nothing before Complete
 
 A cassette keeps `program`, `args`, `cwd`, and captured `stdout`/`stderr` verbatim, so the
 recording a *failed* run left behind is exactly what you do not want landing on disk by accident.
@@ -743,7 +743,8 @@ flush is gated on `Complete()`, your own statement that the recording finished a
 ```fsharp
 use recorder = RecordReplayRunner.Record("fixtures/git.json", JobRunner())
 // ... the calls you want recorded ...
-recorder.Complete() // reached only if nothing above threw; the write happens on dispose
+// ... and the assertions about them, which may fail ...
+recorder.Complete() // last: reached only if nothing above threw; the write happens on dispose
 ```
 
 **C#**
@@ -751,18 +752,27 @@ recorder.Complete() // reached only if nothing above threw; the write happens on
 ```csharp
 using var recorder = RecordReplayRunner.Record("fixtures/git.json", new JobRunner());
 // ... the calls you want recorded ...
-recorder.Complete(); // reached only if nothing above threw; the write happens on dispose
+// ... and the assertions about them, which may fail ...
+recorder.Complete(); // last: reached only if nothing above threw; the write happens on dispose
 ```
 
 Until `Complete()` is called, disposing the recorder writes nothing at all: no cassette is created
 at that path, and one already there is left byte for byte as it was. It is the
 `TransactionScope.Complete()` shape, and `Auto` behaves exactly like `Record` here.
 
+**The mark is the whole gate, so complete last.** Dispose reads that mark and nothing else; it is
+never told how the scope ended. A scope that throws *after* `Complete()` is therefore flushed just
+like one that ended normally — the failed run's verbatim argv and captured output do reach disk —
+which is why the call belongs after everything that can fail, assertions included, and not directly
+after the calls being recorded. If a recording must never be written by anything but a call you can
+point at, leave `Complete()` out entirely and `Save()` where you want the file: with no mark set,
+dispose writes nothing whatever happens.
+
 `Save()` is unaffected in both directions — it writes immediately and returns the I/O error,
 neither needing nor setting the completion mark — so a recording that must reach disk however the
 scope ends is one you `Save()`. `Complete()` itself only marks: it does no I/O, never throws, and
 the write it enables is still the best-effort, silent one dispose has always done (including
-anything captured after the call, so record first and complete last).
+anything captured after the call, so record first, assert next, and complete last).
 
 ## CliClient
 

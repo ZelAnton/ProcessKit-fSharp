@@ -383,15 +383,21 @@ everywhere:
   credential-bearing run before committing it, and keep secret-bearing cassette
   files out of world-readable locations (on Unix they are written owner-only,
   `0600`; on Windows a cassette inherits the containing directory's ACL). A
-  cassette is also never written as a side effect of a **crash**: the best-effort
-  flush a recorder performs when it is disposed happens only after `Complete()`
-  has declared the recording finished, so a scope left by a thrown exception or a
-  failed assertion creates no cassette and modifies none that is already there —
-  the verbatim argv/output of a failed run reaches disk only where your code said
-  it should, or through an explicit `Save()`. See
+  cassette is also never written as a side effect of a **crash that interrupts an
+  unfinished recording**: the best-effort flush a recorder performs when it is
+  disposed happens only after `Complete()` has declared the recording finished, so
+  a scope left by a thrown exception or a failed assertion *before* that call
+  creates no cassette and modifies none that is already there.
+  **Know where that protection ends**: the completion mark is the entire gate —
+  `Dispose` is never told how the scope ended — so once `Complete()` has run, a
+  scope left by a throw flushes the recorded verbatim argv/output to disk exactly
+  as a normal exit would. Placing the call before your assertions gives a failing
+  test the very cassette this gate exists to withhold; place it last, after
+  everything that can fail, or skip the dispose flush altogether and `Save()` at
+  the one point you want the file to exist. See
   [Testing your code → Record and replay](testing.md#record-and-replay) and
-  [Nothing is written by a crash](testing.md#nothing-is-written-by-a-crash) for
-  the full cassette contract.
+  [A crash writes nothing before Complete](testing.md#a-crash-writes-nothing-before-complete)
+  for the full cassette contract.
 
 ## Putting it together
 
