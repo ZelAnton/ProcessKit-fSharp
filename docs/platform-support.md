@@ -453,17 +453,38 @@ launching unsafely. A `.exe` match on an unchanged child `PATH` (see the next en
 program, and anything on POSIX are unaffected (POSIX has no `PATHEXT`; the OS resolves them exactly
 as before).
 
-**Windows resolves a bare name against the `PATH` the command sets for the child.** The OS's own
-bare-name search runs in the *parent's* context — it walks the calling process's `PATH`, never the
-environment block the child is given — so a command that overrides or clears the child's `PATH`
-(`Env("PATH", …)`, `EnvClear`) would otherwise launch a same-named executable from the process's own
-`PATH`. ProcessKit resolves such a command against its effective child `PATH` and substitutes the
-resolved absolute path into the launch, on every Windows launch path (ordinary, `Pty`/ConPTY, and
-`LaunchDetached`), so the executable that runs is the one `Command.ResolveProgram()` reports; if that
-`PATH` holds no such program, the launch fails `ProcessError.NotFound` with the same `Searched`
-before any process is created, rather than falling back to the process's `PATH`. A command that
-leaves the child's `PATH` alone keeps the OS's richer application/current/system-directory search
-unchanged. POSIX resolves a bare name through `posix_spawnp` and is unaffected.
+**Windows puts the child's `PATH` into the bare-name search in place of the process's — it does not
+confine the search to it.** The OS's own bare-name search runs in the *parent's* context — it walks
+the calling process's `PATH`, never the environment block the child is given — so a command that
+overrides, removes, or clears the child's `PATH` (`Env("PATH", …)`, `EnvRemove("PATH")`, `EnvClear`)
+would otherwise launch a same-named executable from the process's own `PATH`. ProcessKit resolves
+such a command against its effective child `PATH` and substitutes the resolved absolute path into the
+launch, on every Windows launch path (ordinary, `Pty`/ConPTY, and `LaunchDetached`), so the image
+that runs is the one `Command.ResolveProgram()` reports for the same command. The rest of the
+`CreateProcessW` search order is preserved around that `PATH`: the application directory, the
+*process's* current directory (the one the command sets with `CurrentDir` applies only after the
+image has been chosen, and Windows drops this entry entirely when
+`NoDefaultCurrentDirectoryInExePath` is set in the environment), the system directory followed by its
+legacy 16-bit counterpart, and the Windows directory are all searched **before** it — exactly the
+order `Command.ResolveProgram()` reports. A child `PATH` is therefore not an image-pinning
+mechanism: a bare `curl` still resolves to `System32\curl.exe` even when the child `PATH` names
+another one, and a program sitting in the process's current directory is still reachable from a
+command whose child `PATH` is empty. Pass an absolute program path, or use `PreferLocal` (consulted
+before every directory above), when one specific image must run. `ProcessError.NotFound` — carrying
+the same `Searched` value the preflight reports — is returned before any process is created only when
+that entire search, the child's `PATH` included, finds nothing. A command that leaves the child's
+`PATH` alone keeps the OS's own search unchanged.
+
+**POSIX resolves a bare name from the launching process's `PATH`.** There is no POSIX counterpart to
+the Windows resolution above. A bare name goes to `posix_spawnp`, whose `PATH` search happens inside
+libc and reads the launching process's own environment — the native `environ`, what `getenv("PATH")`
+returns — while the `envp` block ProcessKit hands it becomes the child's environment only once the
+image has been chosen. So `Env("PATH", …)`, `EnvRemove("PATH")`, and `EnvClear` do not decide which
+file a bare name launches on Linux/macOS/BSD, while `Command.ResolveProgram()` answers from that
+child `PATH` — for a command that changes `PATH`, the two can name different files. Prefer-local does not go through that search (a `PreferLocal` hit is
+substituted into the launch as an absolute path on POSIX as well), and neither does a path-form
+program, which is passed to the spawn as it stands — a relative one resolving against the child's
+working directory. Either is the way to pin an image there.
 
 **`Command.WindowsRawArg` is Windows-only.** It appends a trusted fragment verbatim after all
 ordinarily quoted arguments for children with a non-MSVCRT parser. POSIX has an argv vector rather
