@@ -441,12 +441,12 @@ module private Harness =
 /// `processkit.runs.active` telemetry returned to zero. The seed is in each case name (and in every
 /// failure message), so a red case replays deterministically.
 ///
-/// Its own category (`Interleaving`) keeps it — like `Stress` — off the ordinary PR/push `test` job
-/// (which filters `Category!=Stress&Category!=Interleaving`); it runs instead on the scheduled/
-/// `workflow_dispatch` `interleaving` job in `.github/workflows/ci.yml`. Not `[<Parallelizable>]`: the
-/// per-run `MeterListener` telemetry check assumes it observes only its own run's measurements.
+/// Explicit so ordinary local and CI runs skip it; the scheduled/`workflow_dispatch` job selects
+/// `Category=Interleaving` to opt in. Not `[<Parallelizable>]`: the per-run `MeterListener` telemetry
+/// check assumes it observes only its own run's measurements.
 [<TestFixture>]
 [<Category("Interleaving")>]
+[<Explicit>]
 type InterleavingTests() =
 
     // Fixed, varied plan seeds — a fixed set makes a failure reproducible run to run (re-run the seed),

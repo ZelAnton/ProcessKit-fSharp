@@ -116,6 +116,8 @@ try {
     }
 
     Invoke-Stage 'Test suite' {
+        # Keep this ordinary-suite filter aligned with the main CI test job. The two Explicit
+        # concurrency fixtures are exercised by their category-selecting scheduled CI jobs.
         Invoke-External 'dotnet' @(
             'test', 'ProcessKit.slnx',
             '--no-build', '--configuration', 'Release',

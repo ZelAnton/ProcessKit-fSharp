@@ -253,10 +253,11 @@ jobs:
       - name: Build samples
         run: dotnet build samples/Samples.slnx --no-restore --configuration Release
 
-      # The Stress and Interleaving categories are flaky-sensitive concurrency suites (hundreds of
-      # concurrent spawns / randomized lifecycle interleavings, thread-pool/handle/memory baselines)
-      # that would slow down and add noise to every ordinary PR/push run; they have their own
-      # scheduled/workflow_dispatch stages below instead (`stress`, `interleaving`).
+      # The Explicit Stress and Interleaving categories are flaky-sensitive concurrency suites
+      # (hundreds of concurrent spawns / randomized lifecycle interleavings, thread-pool/handle/memory
+      # baselines) that would slow down and add noise to every ordinary PR/push run. Keep this filter
+      # aligned with scripts/verify-all.ps1; scheduled/workflow_dispatch stages explicitly select the
+      # categories below (`stress`, `interleaving`).
       # Coverage is collected via the coverlet.collector data collector. No threshold is enforced
       # per leg: the gate lives in `coverage-summary`, which compares the coverage merged across the
       # whole matrix with the committed baseline. The Cobertura report lands under
@@ -563,7 +564,8 @@ jobs:
             ./samples/FSharp.NativeAot/publish-aot/FSharp.NativeAot
           fi
 
-  # Stress/soak suite (`[<Category("Stress")>]` in tests/ProcessKit.Tests/StressTests.fs): hundreds
+  # Stress/soak suite (`[<Explicit; Category("Stress")>]` in tests/ProcessKit.Tests/StressTests.fs):
+  # hundreds
   # of concurrent runs against thread-pool/managed-memory/handle baselines. Deliberately kept off the
   # ordinary PR/push `test` job (flaky-sensitive, adds real wall-clock time) and run instead on a
   # weekly schedule or on demand via workflow_dispatch. ubuntu-latest is enough to cover the
@@ -594,6 +596,7 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration Release
 
+      # Selecting the category is the NUnit Explicit opt-in and must execute a non-zero test count.
       - name: Stress test
         run: >-
           dotnet test --no-build --configuration Release --filter "Category=Stress"
@@ -607,7 +610,7 @@ jobs:
           path: ./TestResults/*.trx
           if-no-files-found: ignore
 
-  # Randomized lifecycle interleaving search (`[<Category("Interleaving")>]` in
+  # Randomized lifecycle interleaving search (`[<Explicit; Category("Interleaving")>]` in
   # tests/ProcessKit.Tests/InterleavingTests.fs): each seed drives a random sequence of CONCURRENT
   # public RunningProcess/ProcessGroup operations against a real child and asserts the interleaving
   # upheld its invariants (no unexpected exceptions, no zombies, no unobserved task faults, telemetry
@@ -641,6 +644,7 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration Release
 
+      # Selecting the category is the NUnit Explicit opt-in and must execute a non-zero test count.
       - name: Interleaving test
         run: >-
           dotnet test --no-build --configuration Release --filter "Category=Interleaving"

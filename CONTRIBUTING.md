@@ -30,7 +30,17 @@ both fuzz smoke targets. Every unavailable optional tool is reported as `SKIP`
 in the final table rather than disappearing silently.
 
 The build treats **warnings as errors**, so every executed stage must pass before
-opening a pull request. Run a single test with:
+opening a pull request. The `Stress` and `Interleaving` fixtures are marked
+NUnit `Explicit`, so an ordinary `dotnet test ProcessKit.slnx` (and
+`verify-all.ps1`) skips them. Opt in to either suite by selecting its category:
+
+```sh
+dotnet test ProcessKit.slnx --filter "Category=Stress"
+dotnet test ProcessKit.slnx --filter "Category=Interleaving"
+```
+
+The weekly and manually dispatched CI jobs use those same category filters and
+require a non-zero executed test count. Run a single ordinary test with:
 
 ```sh
 dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"

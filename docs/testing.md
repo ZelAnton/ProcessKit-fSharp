@@ -48,6 +48,7 @@ whole verb vocabulary for free. (Calling a verb routes through these primitives;
 single raw capture with no retry, call `CaptureStringAsync` directly.)
 
 - [The `IProcessRunner` seam](#the-iprocessrunner-seam)
+- [Running this repository's tests](#running-this-repositorys-tests)
 - [Scripting replies](#scripting-replies)
 - [Verifying calls](#verifying-calls)
 - [Custom doubles and mocking frameworks](#custom-doubles-and-mocking-frameworks)
@@ -55,6 +56,22 @@ single raw capture with no retry, call `CaptureStringAsync` directly.)
 - [Record and replay](#record-and-replay)
 - [CliClient](#cliclient)
 - [Dependency injection](#dependency-injection)
+
+## Running this repository's tests
+
+An ordinary `dotnet test ProcessKit.slnx` runs the regular F# and C# suites on
+both target frameworks. The long-running, concurrency-sensitive `Stress` and
+`Interleaving` fixtures are NUnit `Explicit`, so that command skips them by
+default. Select a category to opt in:
+
+```sh
+dotnet test ProcessKit.slnx --filter "Category=Stress"
+dotnet test ProcessKit.slnx --filter "Category=Interleaving"
+```
+
+The main CI test job and `scripts/verify-all.ps1` retain the same explicit
+`Category!=Stress&Category!=Interleaving` filter. Weekly and manually dispatched
+CI jobs select each opt-in category and verify it executes tests.
 
 ## The `IProcessRunner` seam
 

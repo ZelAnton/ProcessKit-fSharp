@@ -145,10 +145,11 @@ module private StressHarness =
 /// promise one process at a time. This fixture instead drives hundreds of concurrent runs and asserts
 /// every tracked resource returns to its baseline afterward, so a regression in the shared teardown/
 /// reap path (the source of most past fixes — see CHANGELOG.md) shows up under load rather than going
-/// unnoticed. Excluded from the ordinary CI `test` job (`Category!=Stress`) and run instead by a
-/// separate scheduled/`workflow_dispatch` stage — see `.github/workflows/ci.yml`.
+/// unnoticed. Explicit so ordinary local and CI runs skip it; the scheduled/`workflow_dispatch`
+/// stage selects `Category=Stress` to opt in — see `.github/workflows/ci.yml`.
 [<TestFixture>]
 [<Category("Stress")>]
+[<Explicit>]
 type StressTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
