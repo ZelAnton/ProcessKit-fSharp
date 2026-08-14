@@ -261,6 +261,11 @@ The two ends of the chain behave like a single `Command`:
   apply (an intermediate stdout is plumbing into the next stage, not a capture). Each stage's
   **stderr** cap, by contrast, applies on every stage — see
   [Fail-loud output overflow](#fail-loud-output-overflow).
+- A truncated capture is refused by the same verbs as for a single command: `RunAsync` and the
+  `ParseAsync`/`TryParseAsync`/`OutputJsonAsync` verbs built on it fail with `OutputTooLarge` (quoting
+  the last stage's byte ceiling) rather than presenting a tail or head as the chain's whole output,
+  while `OutputStringAsync`/`OutputBytesAsync` hand it back with `Truncated` set and `RunUnitAsync`
+  stays successful — see [Which verb you use decides what a drop means](commands.md#which-verb-you-use-decides-what-a-drop-means).
 
 **F#**
 

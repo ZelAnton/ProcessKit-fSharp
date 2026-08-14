@@ -422,3 +422,73 @@ type OutputPolicyPropertyTests() =
             match overflow with
             | OverflowMode.Error -> Assert.That(buf.TooLarge, Is.True, $"{overflow} tooLarge")
             | _ -> Assert.That(buf.Truncated, Is.True, $"{overflow} truncated")
+
+    // --- Property 6 (T-352): what the VERBS do with the drop the policy just reported. The properties
+    // above pin what a dropping policy retains and when it flags the drop; this one pins the contract
+    // one layer up, across the same generated space of caps and content: `run` — which presents its
+    // string as the whole of stdout — refuses exactly the captures the buffer marked `Truncated` and no
+    // others (so a capture landing exactly on its cap still comes back), quoting the configured ceilings
+    // and the REAL line total rather than the retained remainder; `outputString` hands every one of them
+    // back with the flag intact. Driven through the production capture path (`BoundedCapture`, over
+    // `RunningProcess`'s own pump), so policy, pump, result totals, and verb are all the real ones.
+    // Only the dropping modes are generated: `OverflowMode.Error` never yields a successful capture to
+    // refuse — it fails inside the capture itself, which Property 2 covers. ---
+
+    [<Test>]
+    member _.``run refuses exactly the captures the buffer truncated, while outputString returns them all``() =
+        let case =
+            gen {
+                let! overflow = Gen.elements [ OverflowMode.DropOldest; OverflowMode.DropNewest ]
+                let! hasMaxLines = Gen.elements [ true; false ]
+                let! maxLines = Gen.choose (0, 5)
+                let! hasMaxBytes = Gen.elements [ true; false ]
+                let! maxBytes = Gen.choose (0, 30)
+                let! lines = Gen.nonEmptyListOf lineGen
+
+                return
+                    {| Overflow = overflow
+                       MaxLines = (if hasMaxLines then Some maxLines else None)
+                       MaxBytes = (if hasMaxBytes then Some maxBytes else None)
+                       Lines = lines |}
+            }
+
+        let property =
+            Prop.forAll (Arb.fromGen case) (fun case ->
+                let policy = buildPolicy case.MaxLines case.MaxBytes case.Overflow
+                let payload = String.Join("\n", case.Lines) + "\n"
+                let command = Command.create "capture" |> Command.outputBuffer policy
+                let runner = BoundedCapture.runner payload
+
+                let captured = (command |> Runner.outputString runner CancellationToken.None).Result
+
+                // A second, identical run of the same command through the presenting verb.
+                let ran = (command |> Runner.run runner CancellationToken.None).Result
+
+                match captured with
+                | Error _ ->
+                    // A dropping policy never fails the lenient capture; reaching here IS the failure.
+                    false
+                | Ok result ->
+                    match ran, result.Truncated with
+                    | Error(ProcessError.OutputTooLarge(program, lineLimit, byteLimit, totalLines, _)), true ->
+                        // Retained line records, read back off the payload the lenient verb returned
+                        // (sound because every generated line is non-empty - see `lineGen`).
+                        let retainedLines =
+                            if result.Stdout = "" then
+                                0
+                            else
+                                result.Stdout.Split('\n').Length
+
+                        // The refusal names the configured ceilings, and reports the volume the pump
+                        // SAW rather than what survived: at least one record per source line (a byte cap
+                        // force-flushes an over-cap line into several, so it can be more) and always
+                        // strictly more than the retained payload holds.
+                        program = "capture"
+                        && lineLimit = policy.MaxLines
+                        && byteLimit = policy.MaxBytes
+                        && totalLines >= List.length case.Lines
+                        && totalLines > retainedLines
+                    | Ok text, false -> text = result.Stdout.TrimEnd()
+                    | _ -> false)
+
+        Check.QuickThrowOnFailure property

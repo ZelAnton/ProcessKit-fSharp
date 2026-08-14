@@ -705,6 +705,20 @@ the head; `OverflowMode.Error` makes the ceiling **fail loud** instead of droppi
 [line handler](#line-handlers-and-tees) is the real consumer. `Unbounded`
 (the `Default`) retains everything.
 
+#### Which verb you use decides what a drop means
+
+A dropping ceiling changes what
+the *capture* holds, not whether the run succeeded — but a tail or a head reads
+exactly like whole output once it becomes a plain string, so the verbs that present
+it that way refuse it instead: `RunAsync`, and the `ParseAsync`/`TryParseAsync`/
+`OutputJsonAsync` verbs built on it, fail with `ProcessError.OutputTooLarge` when
+the policy dropped anything, so a parser is never handed a clipped document. Use
+`OutputStringAsync`/`OutputBytesAsync` when you *want* the bounded payload: they
+return the whole `ProcessResult`, with `Truncated` telling you output was lost.
+`RunUnitAsync` discards output by contract and stays successful either way, as do
+`ExitCodeAsync`/`ProbeAsync`, which never look at the text. Output that lands
+exactly on a cap was not truncated, so every verb still returns it whole.
+
 A line cap alone doesn't bound memory — without a byte cap an enormous newline-free
 "line" grows whole. `WithMaxBytes` caps the retained bytes **and** the in-flight
 (not-yet-terminated) line — force-flushed at the cap — so even a newline-free flood
@@ -1540,7 +1554,7 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 | `ProcessError.Parse` | `program, detail` | A `ParseAsync` / `TryParseAsync` parser rejected the output, or `OutputJsonAsync<'T>` couldn't deserialize it as valid JSON. |
 | `ProcessError.RetryPredicate` | `program, original, detail` | A `Retry` / `RetryBackoff` classifier threw. `original` preserves the failed attempt's typed error; this is terminal and never retried. |
 | `ProcessError.JsonRpc` | `program, method, code, detail, data: string option` | A [JSON-RPC session](streaming.md) peer answered a request with an `error` object instead of a `result`; `code`/`detail` are the peer's own, `data` its optional payload as raw JSON. |
-| `ProcessError.OutputTooLarge` | `program, lineLimit, byteLimit, totalLines, totalBytes` | A `FailLoud` (`OverflowMode.Error`) buffer ceiling was exceeded. |
+| `ProcessError.OutputTooLarge` | `program, lineLimit, byteLimit, totalLines, totalBytes` | A `FailLoud` (`OverflowMode.Error`) buffer ceiling was exceeded, or a verb that presents stdout as complete (`RunAsync` and the parse/JSON verbs built on it) refused a capture a `DropOldest`/`DropNewest` ceiling had truncated. A total of `0` means that unit was not counted for the capture, not that it measured zero — the message quotes only the counted ones. |
 | `ProcessError.Stdin` | `program, detail` | The child's stdin source could not be read — a missing/unreadable `FromFile` path, say — on an otherwise-successful run. A routine broken pipe (the child closed stdin early, as `head` does) is never reported, and a louder exit/signal/timeout failure wins instead. A source that fails only *after* the child has exited is still reported: an otherwise-successful run waits a short bounded window for a still-reading source to conclude, then stops it rather than waiting on one that never will. Also surfaces for a pipeline's first stage. |
 | `ProcessError.CassetteMiss` | `program` | A record/replay cassette found no matching recording — kept distinct from not-found, so `isNotFound` is `false`. |
 | `ProcessError.Unsupported` | `operation` | The platform can't do what was asked (e.g. a POSIX signal on Windows) and silently skipping would be wrong. |
