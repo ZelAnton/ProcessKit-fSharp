@@ -297,6 +297,21 @@ type PipelineSession
         member _.DisposeAsync() =
             (inner :> IAsyncDisposable).DisposeAsync()
 
+/// The overflow metadata a buffered pipeline result carries, alongside `PipelineClassify.resultTruncated`'s
+/// flag: the volume the two captures that result presents actually SAW (retained plus dropped). Used by
+/// `Pipeline`'s buffering verbs only — the streaming session reports its outcome as a `Finished`, which
+/// carries no such totals — which is why it lives here rather than in the shared `PipelineClassify` fold.
+[<RequireQualifiedAccess>]
+module internal PipelineTotals =
+
+    /// The captured totals for a result built from `capture` with `stage` as the pipefail representative:
+    /// the last stage's captured stdout bytes plus that representative's stderr bytes, saturating at
+    /// `Int32.MaxValue` like the buffers' own counters. Both captures are raw byte streams with no line
+    /// structure, so no line total is counted — reported as `0`, which `ProcessError.OutputTooLarge`
+    /// renders as "not reported" rather than as a measured zero.
+    let forResult (capture: PipelineCapture) (stage: PipelineStage) : int * int =
+        (0, int (min (int64 capture.LastStdoutTotalBytes + int64 stage.StderrTotalBytes) (int64 Int32.MaxValue)))
+
 /// An immutable left-to-right chain of commands wired stdout -> stdin, with **no shell** involved:
 /// each stage's standard output feeds the next stage's standard input directly. The whole chain
 /// runs inside one shared kill-on-dispose group, so cancelling, timing out, or disposing the run
@@ -479,7 +494,8 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                                         truncated,
                                         stage.OkCodes,
                                         ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None),
-                                        stdoutEncoding = (List.last commands).Config.StdoutEncoding
+                                        stdoutEncoding = (List.last commands).Config.StdoutEncoding,
+                                        overflowTotals = PipelineTotals.forResult capture stage
                                     )
                                 )
         }
@@ -519,7 +535,8 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
                                         truncated,
                                         stage.OkCodes,
                                         ?configuredTimeoutDuration = (if capture.TimedOut then timeout else None),
-                                        stdoutEncoding = encoding
+                                        stdoutEncoding = encoding,
+                                        overflowTotals = PipelineTotals.forResult capture stage
                                     )
                                 )
         }
@@ -530,11 +547,26 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     // a single command and a pipeline.
 
     /// Require a successful pipefail exit and return the last stage's stdout, trailing whitespace
-    /// trimmed. Any checked stage that did not exit 0 fails the pipeline.
+    /// trimmed. Any checked stage that did not exit 0 fails the pipeline. Output a bounded
+    /// `OutputBuffer` byte cap truncated (`DropOldest`/`DropNewest` on the captured last-stage stdout,
+    /// or on the representative stage's stderr) is refused with `ProcessError.OutputTooLarge` instead of
+    /// being returned as if whole — `OutputStringAsync` is the lenient path, handing back the bounded
+    /// payload with `ProcessResult.Truncated` set.
+    ///
+    /// That refusal names the **pipefail representative** stage (the program on the result it judged) and
+    /// quotes the **last** stage's byte ceiling — the only ceiling a verb applied to the chain's captured
+    /// stdout can name. On an ordinary chain they are the same stage; they differ when the last stage opts
+    /// out of pipefail (`UncheckedInPipe`), which makes an earlier stage the representative, so a
+    /// truncation of THAT stage's stderr is reported against its program alongside the last stage's cap.
     member this.RunAsync([<Optional>] cancellationToken: CancellationToken) : Task<Result<string, ProcessError>> =
-        CaptureVerbs.run (fun () -> this.OutputStringAsync cancellationToken)
+        // Only the byte ceiling is quoted: a pipeline captures raw bytes, so the last stage's `MaxLines`
+        // never applies to it — the same convention `PipelineClassify.outputTooLargeError` follows for
+        // the fail-loud overflow of these very captures.
+        CaptureVerbs.run None (List.last commands).Config.OutputBuffer.MaxBytes (fun () ->
+            this.OutputStringAsync cancellationToken)
 
-    /// Like `RunAsync`, but discard the captured output.
+    /// Like `RunAsync`, but discard the captured output — including when a bounded buffer truncated it:
+    /// a side-effect run promises nothing about stdout, so a clean pipefail outcome stays `Ok`.
     member this.RunUnitAsync([<Optional>] cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
         CaptureVerbs.runUnit (fun () -> this.OutputStringAsync cancellationToken)
 

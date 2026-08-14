@@ -1492,3 +1492,393 @@ type TrustedHelperResolutionTests() =
                 Directory.Delete(trustedDir, true)
         }
         :> Task
+
+/// Which of two same-named executables a Windows launch actually starts when the command supplies its own
+/// child `PATH` (T-339). `CreateProcessW` with `lpApplicationName = NULL` resolves the image in the
+/// PARENT's context — it walks the CURRENT PROCESS's `PATH`, never the environment block it is handed for
+/// the child — so leaving a bare `.exe` name to that search would launch a parent-`PATH` namesake instead
+/// of the match `Command.ResolveProgram` promised, or fail while a namesake sits on the child's own
+/// `PATH`. Every raw Windows launch path is covered — the ordinary spawn, ConPTY, and the fire-and-forget
+/// detached launch — because each calls `CreateProcessW`/`CreateProcessAsUserW` itself.
+///
+/// The two planted images are chosen so the winner is unmistakable: a copy of `cmd.exe` in the child's
+/// `PATH` (the one that must run — only it can exit with the requested code) and a copy of `whoami.exe` in
+/// the process's own `PATH` (the impostor — it refuses `cmd`'s arguments with its own usage error and can
+/// never produce that code). Both are real, launchable PE images, which a hand-written stub could not be.
+///
+/// Sequential (no `[<Parallelizable>]`, as for the fixtures above): every test temporarily prepends a
+/// directory to the process `PATH` and restores it in a `finally`. Windows-only — this is a
+/// `CreateProcessW` contract; the POSIX launch resolves a bare name through `posix_spawnp` against the
+/// native `environ` (see the `NativeEnv` note at the top of this file).
+[<TestFixture>]
+type WindowsChildPathLaunchTests() =
+
+    let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+
+    /// The exit code only the planted `cmd.exe` copy can produce for `childHitArgs`.
+    let childHitCode = 7
+
+    let childHitArgs = [ "/d"; "/c"; "exit 7" ]
+
+    /// Printed by the planted `cmd.exe` copy when a run cannot report an exit code back (the detached
+    /// launch), so a redirected stdout file says which image ran.
+    let childHitMarker = "PK339-CHILD-PATH-HIT"
+
+    let freshDir (tag: string) =
+        let dir =
+            Path.Combine(Path.GetTempPath(), "processkit-t339-" + tag + "-" + Guid.NewGuid().ToString "N")
+
+        Directory.CreateDirectory dir |> ignore
+        dir
+
+    let deleteDirQuietly (dir: string) =
+        try
+            Directory.Delete(dir, true)
+        with
+        | :? IOException
+        | :? UnauthorizedAccessException ->
+            // Windows can still hold a just-exited child's image file open for a moment. A leftover temp
+            // directory is harmless and must never fail the assertion under test.
+            ()
+
+    let deleteFileQuietly (path: string) =
+        try
+            File.Delete path
+        with
+        | :? IOException
+        | :? UnauthorizedAccessException ->
+            // Same rationale as `deleteDirQuietly`: best-effort cleanup of a temp file only.
+            ()
+
+    /// Copy a real system executable into `dir` under `name`.exe, and return its full path — normalized
+    /// the same way the resolver normalizes a match, so the two are directly comparable.
+    let plant (dir: string) (name: string) (systemExe: string) =
+        let target = Path.Combine(dir, name + ".exe")
+        File.Copy(Path.Combine(Environment.SystemDirectory, systemExe), target)
+        Path.GetFullPath target
+
+    let processPath () =
+        match Environment.GetEnvironmentVariable "PATH" with
+        | null -> ""
+        | value -> value
+
+    /// The file's current contents, or `""` while it does not exist yet / is momentarily unreadable.
+    /// Share-compatible so a read never trips a sharing violation against a detached child's write handle.
+    let readIfPresent (path: string) =
+        try
+            use stream =
+                new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)
+
+            use reader = new StreamReader(stream)
+            reader.ReadToEnd()
+        with
+        | :? FileNotFoundException
+        | :? IOException ->
+            // The child has not created (or not yet flushed) the file — an expected step of the poll
+            // below, not a failure; the caller simply tries again until its deadline.
+            ""
+
+    let waitUntil (timeout: TimeSpan) (predicate: unit -> bool) =
+        let deadline = DateTime.UtcNow + timeout
+        let mutable ok = predicate ()
+
+        while not ok && DateTime.UtcNow < deadline do
+            Thread.Sleep 50
+            ok <- predicate ()
+
+        ok
+
+    /// Kill a detached child: nothing in the library owns one, so a test that leaves it running leaks a
+    /// process past the whole run.
+    let killQuietly (pid: int) =
+        try
+            use proc = System.Diagnostics.Process.GetProcessById pid
+            proc.Kill()
+        with _ ->
+            // Best-effort test cleanup: the child may already have exited (`ArgumentException`) or be
+            // exiting concurrently; either way there is nothing left to kill, and a cleanup failure must
+            // never fail the assertion under test.
+            ()
+
+    /// Plant the pair — the `cmd.exe` copy in a directory only the CHILD's `PATH` will name, and the
+    /// `whoami.exe` impostor in a directory prepended to the PROCESS's own `PATH` — then run
+    /// `body childDir childTool`. The process `PATH` and both directories are restored/removed afterwards.
+    member private _.WithPlantedPair(toolName: string, body: string -> string -> Task) : Task =
+        task {
+            let parentDir = freshDir "parent"
+            let childDir = freshDir "child"
+            let originalPath = processPath ()
+
+            try
+                plant parentDir toolName "whoami.exe" |> ignore
+                let childTool = plant childDir toolName "cmd.exe"
+
+                Environment.SetEnvironmentVariable("PATH", parentDir + string Path.PathSeparator + originalPath)
+
+                do! body childDir childTool
+            finally
+                Environment.SetEnvironmentVariable("PATH", originalPath)
+                deleteDirQuietly parentDir
+                deleteDirQuietly childDir
+        }
+
+    [<Test>]
+    member this.``Windows: an ordinary spawn launches the child-PATH match, not the parent-PATH namesake (T-339)``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: CreateProcessW resolves a bare name in the parent's context."
+            else
+                let toolName = "pk339-ordinary"
+
+                do!
+                    this.WithPlantedPair(
+                        toolName,
+                        fun childDir childTool ->
+                            task {
+                                let command =
+                                    Command.create toolName
+                                    |> Command.args childHitArgs
+                                    |> Command.env "PATH" childDir
+                                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                                match command.ResolveProgram() with
+                                | Error error -> Assert.Fail $"the child-PATH match must preflight, got {error}"
+                                | Ok resolved -> Assert.That(resolved, Is.EqualTo(childTool).IgnoreCase)
+
+                                match! command.OutputStringAsync() with
+                                | Error error -> Assert.Fail $"the child-PATH match must launch, got {error}"
+                                | Ok result ->
+                                    let launchedChildMatch: string =
+                                        "an ordinary spawn must launch the executable on the child's own PATH, not the same-named one on the process PATH"
+
+                                    Assert.That(
+                                        result.Outcome,
+                                        Is.EqualTo(Outcome.Exited childHitCode),
+                                        launchedChildMatch
+                                    )
+                            }
+                            :> Task
+                    )
+        }
+        :> Task
+
+    [<Test>]
+    member this.``Windows: a ConPTY spawn launches the child-PATH match, not the parent-PATH namesake (T-339)``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: ConPTY is the Windows PTY launch path."
+            else
+                let toolName = "pk339-conpty"
+
+                do!
+                    this.WithPlantedPair(
+                        toolName,
+                        fun childDir childTool ->
+                            task {
+                                let command =
+                                    Command.create toolName
+                                    |> Command.args childHitArgs
+                                    |> Command.env "PATH" childDir
+                                    |> Command.pty
+                                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                                match command.ResolveProgram() with
+                                | Error error -> Assert.Fail $"the child-PATH match must preflight, got {error}"
+                                | Ok resolved -> Assert.That(resolved, Is.EqualTo(childTool).IgnoreCase)
+
+                                match! command.OutputStringAsync() with
+                                | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
+                                    // Pre-1809 host without ConPTY — the documented typed-Unsupported path.
+                                    Assert.Ignore $"host lacks ConPTY: {message}"
+                                | Error error -> Assert.Fail $"the child-PATH match must launch, got {error}"
+                                | Ok result ->
+                                    let launchedChildMatch: string =
+                                        "a ConPTY spawn must launch the executable on the child's own PATH, not the same-named one on the process PATH"
+
+                                    Assert.That(
+                                        result.Outcome,
+                                        Is.EqualTo(Outcome.Exited childHitCode),
+                                        launchedChildMatch
+                                    )
+                            }
+                            :> Task
+                    )
+        }
+        :> Task
+
+    [<Test>]
+    member this.``Windows: a detached launch starts the child-PATH match, not the parent-PATH namesake (T-339)``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: the detached launch is its own CreateProcessW call site."
+            else
+                let toolName = "pk339-detached"
+
+                let marker =
+                    Path.Combine(Path.GetTempPath(), $"pk339-detached-{Guid.NewGuid():N}.log")
+
+                try
+                    do!
+                        this.WithPlantedPair(
+                            toolName,
+                            fun childDir childTool ->
+                                task {
+                                    // A detached child reports no exit code to anyone, so the proof is what
+                                    // it writes: only the `cmd.exe` copy echoes the marker; the `whoami.exe`
+                                    // impostor answers these arguments with a usage error instead.
+                                    let command =
+                                        Command.create toolName
+                                        |> Command.args [ "/d"; "/c"; "echo " + childHitMarker ]
+                                        |> Command.env "PATH" childDir
+                                        |> Command.stdoutToFile marker false
+
+                                    match command.ResolveProgram() with
+                                    | Error error -> Assert.Fail $"the child-PATH match must preflight, got {error}"
+                                    | Ok resolved -> Assert.That(resolved, Is.EqualTo(childTool).IgnoreCase)
+
+                                    match command.LaunchDetached() with
+                                    | Error error -> Assert.Fail $"the child-PATH match must launch, got {error}"
+                                    | Ok detached ->
+                                        try
+                                            let ran =
+                                                waitUntil (TimeSpan.FromSeconds 30.0) (fun () ->
+                                                    (readIfPresent marker).Contains childHitMarker)
+
+                                            let launchedChildMatch: string =
+                                                "a detached launch must start the executable on the child's own PATH, not the same-named one on the process PATH"
+
+                                            Assert.That(ran, Is.True, launchedChildMatch)
+                                        finally
+                                            killQuietly detached.Pid
+                                }
+                                :> Task
+                        )
+                finally
+                    deleteFileQuietly marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: a child-PATH miss is NotFound before any spawn, on every launch path (T-339)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: CreateProcessW resolves a bare name in the parent's context."
+            else
+                let toolName = "pk339-miss"
+                // The impostor is a `cmd.exe` copy this time: it CAN write the marker, so a leaked launch
+                // leaves positive evidence rather than merely failing differently.
+                let parentDir = freshDir "miss-parent"
+                let childDir = freshDir "miss-child"
+
+                let marker = Path.Combine(Path.GetTempPath(), $"pk339-miss-{Guid.NewGuid():N}.log")
+
+                let originalPath = processPath ()
+
+                try
+                    plant parentDir toolName "cmd.exe" |> ignore
+
+                    Environment.SetEnvironmentVariable("PATH", parentDir + string Path.PathSeparator + originalPath)
+
+                    // The child's PATH names an empty directory, so the program the caller asked for is
+                    // genuinely absent from it — while a same-named, runnable executable sits on the
+                    // process's own PATH, which is exactly what the OS's own search would find. No
+                    // `Timeout`: a detached launch refuses that knob, and this one command is launched
+                    // through all three paths so they answer the identical configuration.
+                    let command =
+                        Command.create toolName
+                        |> Command.args [ "/d"; "/c"; "echo PK339-LEAKED" ]
+                        |> Command.env "PATH" childDir
+
+                    let expectedSearched =
+                        match command.ResolveProgram() with
+                        | Ok resolved -> failwith $"the child PATH must not resolve '{toolName}', got '{resolved}'"
+                        | Error(ProcessError.NotFound(_, searched)) ->
+                            Assert.That(searched, Is.EqualTo(Some childDir))
+                            searched
+                        | Error other -> failwith $"expected NotFound from the preflight, got {other}"
+
+                    // Every launch path must fail with the identical diagnostic the preflight just gave,
+                    // rather than launching the parent-PATH namesake.
+                    let assertRefused (label: string) (error: ProcessError) =
+                        match error with
+                        | ProcessError.NotFound(program, searched) ->
+                            Assert.That(program, Is.EqualTo toolName, label)
+                            Assert.That(searched, Is.EqualTo expectedSearched, label)
+                        | other -> Assert.Fail $"{label}: expected NotFound, got {other}"
+
+                    match! command.OutputStringAsync() with
+                    | Ok result ->
+                        Assert.Fail
+                            $"an ordinary spawn launched a parent-PATH namesake the child's PATH never held (outcome {result.Outcome})"
+                    | Error error -> assertRefused "ordinary spawn" error
+
+                    match! (command |> Command.pty).OutputStringAsync() with
+                    | Error(ProcessError.Unsupported message) when message.Contains "1809" ->
+                        Assert.Ignore $"host lacks ConPTY: {message}"
+                    | Ok result ->
+                        Assert.Fail
+                            $"a ConPTY spawn launched a parent-PATH namesake the child's PATH never held (outcome {result.Outcome})"
+                    | Error error -> assertRefused "ConPTY spawn" error
+
+                    match (command |> Command.stdoutToFile marker false).LaunchDetached() with
+                    | Ok detached ->
+                        killQuietly detached.Pid
+                        Assert.Fail "a detached launch started a parent-PATH namesake the child's PATH never held"
+                    | Error error -> assertRefused "detached launch" error
+
+                    let neverRan: string =
+                        "the same-named executable on the process PATH must never be launched for a command whose own PATH does not hold it"
+
+                    Assert.That((readIfPresent marker).Contains "PK339-LEAKED", Is.False, neverRan)
+                finally
+                    Environment.SetEnvironmentVariable("PATH", originalPath)
+                    deleteFileQuietly marker
+                    deleteDirQuietly parentDir
+                    deleteDirQuietly childDir
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: an unchanged child PATH keeps the OS's own bare-name search (T-339)``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "Windows-only: this is the CreateProcessW bare-name search."
+            else
+                let toolName = "pk339-unchanged"
+                let dir = freshDir "unchanged"
+                let originalPath = processPath ()
+
+                try
+                    let tool = plant dir toolName "cmd.exe"
+                    Environment.SetEnvironmentVariable("PATH", dir + string Path.PathSeparator + originalPath)
+
+                    // No `Env "PATH"`: the child inherits the process's own PATH, so the OS's search and the
+                    // library's resolution walk the identical value. The launch is left to the OS exactly as
+                    // it was before the effective-child-PATH substitution existed.
+                    let command =
+                        Command.create toolName
+                        |> Command.args childHitArgs
+                        |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                    match command.ResolveProgram() with
+                    | Error error -> Assert.Fail $"a PATH-planted tool must preflight, got {error}"
+                    | Ok resolved -> Assert.That(resolved, Is.EqualTo(Path.GetFullPath tool).IgnoreCase)
+
+                    match! command.OutputStringAsync() with
+                    | Error error -> Assert.Fail $"a PATH-planted tool must still launch unchanged, got {error}"
+                    | Ok result ->
+                        let stillLaunches: string =
+                            "a command that leaves the child's PATH alone must still launch through the OS's own bare-name search"
+
+                        Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited childHitCode), stillLaunches)
+                finally
+                    Environment.SetEnvironmentVariable("PATH", originalPath)
+                    deleteDirQuietly dir
+        }
+        :> Task

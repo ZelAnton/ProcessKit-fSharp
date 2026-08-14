@@ -138,14 +138,41 @@ bare-name search appends only `.exe`, so it would report such a program as *not
 found* even though `Exec.which` locates it (both use the same `PATHEXT`-aware
 lookup). ProcessKit closes that gap: for a bare name it substitutes the resolved
 absolute path into the launch, and routes a `.cmd`/`.bat` through `cmd.exe /d /c`
-(a batch file is not a directly-launchable image). A `.exe` match, a path-form
-program, and a name that resolves to nothing are all launched exactly as before —
-the OS's richer bare-name search is never overridden. Arguments to a `.cmd`/`.bat`
+(a batch file is not a directly-launchable image). For a command that leaves the
+child's `PATH` alone (see below), a `.exe` match, a path-form program, and a name
+that resolves to nothing are all launched exactly as before — the OS's richer
+bare-name search is never overridden. Arguments to a `.cmd`/`.bat`
 wrapper are quoted for `cmd.exe`'s own grammar (not just the ordinary argv rules),
 so a metacharacter like `&`, `|`, `<`, `>`, or `"` in an argument is delivered as
 a literal, never executed (the "BatBadBut" class, CVE-2024-24576). An argument
 carrying a character `cmd.exe` cannot escape at all — a `%`, a `!`, or a line
 break — is an honest `ProcessError.Spawn` refusal rather than an unsafe launch.
+
+**Windows: the launch searches the child's `PATH`, not the process's.** Windows
+resolves a bare program name in the *parent's* context — the OS searches the
+current process's `PATH`, not the environment block the child is handed — so a
+command that sets, removes, or clears the child's `PATH` (`Env("PATH", …)`,
+`EnvRemove("PATH")`, `EnvClear`) would otherwise launch whatever the *process's*
+`PATH` happens to hold under that name. ProcessKit resolves such a command itself,
+against its effective child `PATH`, and hands the OS the resolved absolute path,
+so what runs is the executable `ResolveProgram()` names for the same command.
+
+That swaps the child's `PATH` in for the process's; it does not narrow the search
+down to it. The rest of the OS search order is reproduced around that `PATH` — the
+application directory, the *process's* current directory (the command's
+`currentDir` takes effect only after the image has been chosen), and the system
+and Windows directories are all searched **before** it, exactly as
+`ResolveProgram()` reports. So a name one of those directories holds
+still comes from there whatever the child `PATH` says: setting a child `PATH` is
+not a way to pin one particular image — pass an absolute program path, or use
+`PreferLocal` (consulted before all of the above), when that is what you need. The
+run fails `NotFound` — carrying the same `Searched` — before anything is spawned
+only when that whole search, the child's `PATH` included, finds nothing. A command
+that leaves the child's `PATH` alone is unaffected: the OS's own bare-name search
+reads the very `PATH` the resolver walked, so it still applies in full. The change
+is Windows-only; on POSIX a bare name is resolved by `posix_spawnp` itself, whose
+`PATH` search reads the launching process's environment rather than the child
+block ([Platform support → Caveats](platform-support.md#caveats)).
 
 ### Preferring a project-local tool (`PreferLocal`)
 
@@ -704,6 +731,20 @@ the head; `OverflowMode.Error` makes the ceiling **fail loud** instead of droppi
 `OutputBufferPolicy.Bounded 0` retains nothing — useful when a
 [line handler](#line-handlers-and-tees) is the real consumer. `Unbounded`
 (the `Default`) retains everything.
+
+#### Which verb you use decides what a drop means
+
+A dropping ceiling changes what
+the *capture* holds, not whether the run succeeded — but a tail or a head reads
+exactly like whole output once it becomes a plain string, so the verbs that present
+it that way refuse it instead: `RunAsync`, and the `ParseAsync`/`TryParseAsync`/
+`OutputJsonAsync` verbs built on it, fail with `ProcessError.OutputTooLarge` when
+the policy dropped anything, so a parser is never handed a clipped document. Use
+`OutputStringAsync`/`OutputBytesAsync` when you *want* the bounded payload: they
+return the whole `ProcessResult`, with `Truncated` telling you output was lost.
+`RunUnitAsync` discards output by contract and stays successful either way, as do
+`ExitCodeAsync`/`ProbeAsync`, which never look at the text. Output that lands
+exactly on a cap was not truncated, so every verb still returns it whole.
 
 A line cap alone doesn't bound memory — without a byte cap an enormous newline-free
 "line" grows whole. `WithMaxBytes` caps the retained bytes **and** the in-flight
@@ -1540,7 +1581,7 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 | `ProcessError.Parse` | `program, detail` | A `ParseAsync` / `TryParseAsync` parser rejected the output, or `OutputJsonAsync<'T>` couldn't deserialize it as valid JSON. |
 | `ProcessError.RetryPredicate` | `program, original, detail` | A `Retry` / `RetryBackoff` classifier threw. `original` preserves the failed attempt's typed error; this is terminal and never retried. |
 | `ProcessError.JsonRpc` | `program, method, code, detail, data: string option` | A [JSON-RPC session](streaming.md) peer answered a request with an `error` object instead of a `result`; `code`/`detail` are the peer's own, `data` its optional payload as raw JSON. |
-| `ProcessError.OutputTooLarge` | `program, lineLimit, byteLimit, totalLines, totalBytes` | A `FailLoud` (`OverflowMode.Error`) buffer ceiling was exceeded. |
+| `ProcessError.OutputTooLarge` | `program, lineLimit, byteLimit, totalLines, totalBytes` | A `FailLoud` (`OverflowMode.Error`) buffer ceiling was exceeded, or a verb that presents stdout as complete (`RunAsync` and the parse/JSON verbs built on it) refused a capture a `DropOldest`/`DropNewest` ceiling had truncated. A total of `0` means that unit was not counted for the capture, not that it measured zero — the message quotes only the counted ones. |
 | `ProcessError.Stdin` | `program, detail` | The child's stdin source could not be read — a missing/unreadable `FromFile` path, say — on an otherwise-successful run. A routine broken pipe (the child closed stdin early, as `head` does) is never reported, and a louder exit/signal/timeout failure wins instead. A source that fails only *after* the child has exited is still reported: an otherwise-successful run waits a short bounded window for a still-reading source to conclude, then stops it rather than waiting on one that never will. Also surfaces for a pipeline's first stage. |
 | `ProcessError.CassetteMiss` | `program` | A record/replay cassette found no matching recording — kept distinct from not-found, so `isNotFound` is `false`. |
 | `ProcessError.Unsupported` | `operation` | The platform can't do what was asked (e.g. a POSIX signal on Windows) and silently skipping would be wrong. |

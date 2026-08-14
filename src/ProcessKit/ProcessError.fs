@@ -303,8 +303,12 @@ type ProcessError =
     /// (`Parse`/`Io`/`Timeout`), never folded in here.
     | JsonRpc of Program: string * Method: string * Code: int * Detail: string * Data: string option
 
-    /// Captured or streamed output exceeded a configured fail-loud ceiling. Metrics are populated only
-    /// when their unit applies to that channel (lines, bytes, merged events, or protocol frames).
+    /// Captured or streamed output exceeded a configured fail-loud ceiling, or a checking verb refused
+    /// output a bounded buffer had already truncated (`Command.RunAsync`/`ParseAsync`/`OutputJsonAsync`
+    /// and their pipeline twins — see `ProcessResult.Truncated` for the lenient path). Metrics are
+    /// populated only when their unit applies to that channel (lines, bytes, merged events, or protocol
+    /// frames) AND the producer actually counted it: a `0` total means "not reported here", never a
+    /// measured zero, and `Message` quotes only the totals that were populated.
     | OutputTooLarge of
         Program: string *
         LineLimit: int option *
@@ -399,12 +403,34 @@ type ProcessError =
         | ProcessError.OutputTooLarge(program, lineLimit, byteLimit, totalLines, totalBytes) ->
             let name = MessageText.fragment program
 
+            // A `0` total means the producer did not count that unit (see the case's doc), not that it
+            // measured zero — so it is OMITTED rather than quoted as a fact. Which totals a given
+            // wording quotes is unchanged; only an uncounted one now disappears instead of being
+            // printed as `0`. That is what lets a truncation-refusing verb name the ceilings it knows
+            // about even when the capture it refused carried no totals of its own (a line capture with
+            // no byte cap counts no bytes; a replayed cassette or a test double counts neither).
+            let counted (value: int) (unit: string) =
+                if value > 0 then [ $"{value} {unit}" ] else []
+
+            let quote (parts: string list) =
+                if List.isEmpty parts then
+                    ""
+                else
+                    " (" + String.concat " / " parts + ")"
+
             match lineLimit, byteLimit, totalLines with
-            | Some _, _, _ -> $"'{name}' produced too much line output ({totalLines} lines / {totalBytes} bytes)"
-            | None, Some _, _ -> $"'{name}' produced too much byte output ({totalBytes} bytes)"
+            | Some _, _, _ ->
+                let counts = quote (counted totalLines "lines" @ counted totalBytes "bytes")
+                $"'{name}' produced too much line output{counts}"
+            | None, Some _, _ ->
+                let counts = quote (counted totalBytes "bytes")
+                $"'{name}' produced too much byte output{counts}"
             | None, None, events when events > 0 ->
-                $"'{name}' produced too many events ({events} events / {totalBytes} bytes)"
-            | None, None, _ -> $"'{name}' produced too much output ({totalBytes} bytes)"
+                let counts = quote (counted events "events" @ counted totalBytes "bytes")
+                $"'{name}' produced too many events{counts}"
+            | None, None, _ ->
+                let counts = quote (counted totalBytes "bytes")
+                $"'{name}' produced too much output{counts}"
         | ProcessError.Stdin(program, detail) ->
             $"could not read the stdin source for '{MessageText.fragment program}': {MessageText.fragment detail}"
         | ProcessError.ResourceLimit detail -> $"resource limit could not be enforced: {MessageText.fragment detail}"

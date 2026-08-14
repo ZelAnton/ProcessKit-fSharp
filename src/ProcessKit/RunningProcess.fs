@@ -448,7 +448,8 @@ type internal JsonLinesEnumerable<'T>(program: string, source: IAsyncEnumerable<
 /// A live handle to a started process: stream its output, feed its stdin, wait for it, or
 /// collect it to completion. Disposing it reaps the whole process tree (kill-on-drop).
 [<Sealed>]
-type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) list) =
+type RunningProcess
+    internal (host: RunningHost, extraFdStreams: (int * Stream) list, recordedCompletion: (TimeSpan * bool) option) =
 
     let config = host.Config
     let hasPseudoTerminal = config.Pty.IsSome || host.ResizePty.IsSome
@@ -785,8 +786,17 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
             else
                 None, None)
 
+    // A cassette handle represents an already-completed run, so its completion clock must stay frozen
+    // at the recorded value while ordinary live/fake handles continue reading their own stopwatch.
     let elapsed () =
-        Stopwatch.GetElapsedTime host.StartedTimestamp
+        match recordedCompletion with
+        | Some(duration, _) -> duration
+        | None -> Stopwatch.GetElapsedTime host.StartedTimestamp
+
+    let recordedTruncated =
+        match recordedCompletion with
+        | Some(_, truncated) -> truncated
+        | None -> false
 
     // The per-run correlation id: the verb layer stamps one (shared across a run's retries); a direct
     // spawn with none gets a fresh per-incarnation id. Carried on every run-scoped log/trace event.
@@ -1509,7 +1519,12 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
     // (`JobRunner.start`) adds a defence-in-depth teardown as a backstop for any non-observability fault.
     do Log.spawn config.Logger config.Program host.Pid runId
 
-    internal new(host: RunningHost) = RunningProcess(host, [])
+    internal new(host: RunningHost) = RunningProcess(host, [], None)
+
+    internal new(host: RunningHost, extraFdStreams: (int * Stream) list) = RunningProcess(host, extraFdStreams, None)
+
+    internal new(host: RunningHost, recordedDuration: TimeSpan, recordedTruncated: bool) =
+        RunningProcess(host, [], Some(recordedDuration, recordedTruncated))
 
     /// The pid, when known.
     member _.Pid = host.Pid
@@ -1913,13 +1928,20 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 let! errBuf = stderrTask
                 conclude outcome
 
+                // The volume both captures SAW — retained plus dropped — saturating at `Int32.MaxValue`
+                // like the buffers' own counters. One pair, two consumers: the fail-loud error below,
+                // and (carried on a successful result) the truncation refusal a checking verb makes
+                // later, so both report the same honest totals. `TotalBytes` is `0` when neither a byte
+                // cap nor the fail-loud ceiling is configured — the line pump skips its UTF-8 scan then
+                // — which `ProcessError.OutputTooLarge` renders as "not reported", never as zero bytes.
+                let totalLines =
+                    int (min (int64 outBuf.TotalLines + int64 errBuf.TotalLines) (int64 Int32.MaxValue))
+
+                let totalBytes =
+                    int (min (int64 outBuf.TotalBytes + int64 errBuf.TotalBytes) (int64 Int32.MaxValue))
+
                 if outBuf.TooLarge || errBuf.TooLarge then
-                    return
-                        Error(
-                            tooLargeError
-                                (int (min (int64 outBuf.TotalLines + int64 errBuf.TotalLines) (int64 Int32.MaxValue)))
-                                (int (min (int64 outBuf.TotalBytes + int64 errBuf.TotalBytes) (int64 Int32.MaxValue)))
-                        )
+                    return Error(tooLargeError totalLines totalBytes)
                 else
                     match! stdinErrorOnSuccess outcome with
                     | Some err -> return Error err
@@ -1932,10 +1954,11 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                     errBuf.Text,
                                     outcome,
                                     elapsed (),
-                                    outBuf.Truncated || errBuf.Truncated,
+                                    recordedTruncated || outBuf.Truncated || errBuf.Truncated,
                                     config.OkCodes,
                                     ?configuredTimeoutDuration = configuredTimeoutDuration,
-                                    stdoutEncoding = config.StdoutEncoding
+                                    stdoutEncoding = config.StdoutEncoding,
+                                    overflowTotals = (totalLines, totalBytes)
                                 )
                             )
             }
@@ -1981,19 +2004,17 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                 let! errBuf = stderrTask
                 conclude outcome
 
+                // The raw stdout byte cap contributes no lines (a byte stream has none); stderr is
+                // line-pumped, so its totals carry the lines and both streams' bytes are summed. As on
+                // the text verb above, this one pair serves both the fail-loud error and the totals a
+                // successful result carries for a later truncation refusal.
+                let totalLines = errBuf.TotalLines
+
+                let totalBytes =
+                    int (min (int64 stdoutCapture.TotalBytes + int64 errBuf.TotalBytes) (int64 Int32.MaxValue))
+
                 if stdoutCapture.TooLarge || errBuf.TooLarge then
-                    // The raw stdout byte cap contributes no lines (a byte stream has none); stderr is
-                    // line-pumped, so its totals carry the lines and both streams' bytes are summed.
-                    return
-                        Error(
-                            tooLargeError
-                                errBuf.TotalLines
-                                (int (
-                                    min
-                                        (int64 stdoutCapture.TotalBytes + int64 errBuf.TotalBytes)
-                                        (int64 Int32.MaxValue)
-                                ))
-                        )
+                    return Error(tooLargeError totalLines totalBytes)
                 else
                     match! stdinErrorOnSuccess outcome with
                     | Some err -> return Error err
@@ -2006,10 +2027,11 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                     errBuf.Text,
                                     outcome,
                                     elapsed (),
-                                    stdoutCapture.Truncated || errBuf.Truncated,
+                                    recordedTruncated || stdoutCapture.Truncated || errBuf.Truncated,
                                     config.OkCodes,
                                     ?configuredTimeoutDuration = configuredTimeoutDuration,
-                                    stdoutEncoding = config.StdoutEncoding
+                                    stdoutEncoding = config.StdoutEncoding,
+                                    overflowTotals = (totalLines, totalBytes)
                                 )
                             )
             }
@@ -2459,7 +2481,9 @@ type RunningProcess internal (host: RunningHost, extraFdStreams: (int * Stream) 
                                 Finished(
                                     settled,
                                     stderrStreamBuffer.Text,
-                                    Volatile.Read(&droppedStreamLineCount) > 0 || stderrStreamBuffer.Truncated
+                                    recordedTruncated
+                                    || Volatile.Read(&droppedStreamLineCount) > 0
+                                    || stderrStreamBuffer.Truncated
                                 )
                             )
             }

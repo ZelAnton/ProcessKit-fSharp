@@ -21,7 +21,8 @@ type ProcessResult<'T>
         truncated: bool,
         okCodes: int list,
         ?configuredTimeoutDuration: TimeSpan,
-        ?stdoutEncoding: Encoding
+        ?stdoutEncoding: Encoding,
+        ?overflowTotals: int * int
     ) =
 
     // Real runners supply the configured deadline that actually fired. Results created by third-party
@@ -52,6 +53,18 @@ type ProcessResult<'T>
 
     /// True when the captured output was truncated by an output-buffer policy.
     member _.Truncated = truncated
+
+    /// The cumulative line/byte totals this run's captures SAW — retained plus dropped — carried
+    /// internally so a verb that refuses a truncated capture (`ProcessResult.rejectIfTruncated`, behind
+    /// `run`/`parse`/JSON) can report the real volume in its `ProcessError.OutputTooLarge` instead of a
+    /// fabricated one. `None` where the producer counted nothing (a replayed cassette, a test double);
+    /// a `0` inside a `Some` means that unit was not counted for this capture (a raw byte capture has no
+    /// lines, and the line pump skips its UTF-8 byte scan unless a byte cap or the fail-loud ceiling is
+    /// configured) — the same "not reported" convention `ProcessError.OutputTooLarge` documents. Kept
+    /// internal deliberately: the public signal that output was lost is `Truncated` plus the typed
+    /// error, and a public total would force every producer that cannot count (test doubles, replay) to
+    /// publish a zero that reads like a measurement.
+    member internal _.OverflowTotals: (int * int) option = overflowTotals
 
     /// The exit code, or `None` for a signal kill or timeout.
     member _.Code = outcome.Code
@@ -136,6 +149,32 @@ module ProcessResult =
     /// returns the result unchanged on success, otherwise the corresponding `ProcessError`
     /// (`Exit` / `Signalled` / `Timeout`). Generic over the captured-stdout type.
     let ensureSuccess (result: ProcessResult<'T>) : Result<ProcessResult<'T>, ProcessError> = result.EnsureSuccess()
+
+    /// Refuse a capture a bounded buffer already truncated. The verbs that hand back stdout **as if it
+    /// were the whole thing** — `run` and everything derived from it (`parse`/`tryParse`/the JSON
+    /// projections, on a command or a pipeline) — call this after the success check, so a
+    /// `DropOldest`/`DropNewest` policy surfaces as `ProcessError.OutputTooLarge` instead of feeding a
+    /// caller (or a parser) a clipped prefix/tail that is indistinguishable from complete output. The
+    /// lenient capture verbs (`outputString`/`outputBytes`) deliberately do NOT call it: they return the
+    /// whole `ProcessResult` with `Truncated` set and let the caller decide. Ports ProcessKit-rs
+    /// `ProcessResult::reject_if_truncated` (`623f2c23`).
+    ///
+    /// `lineLimit`/`byteLimit` are the ceilings quoted in the error — the caller's own configured
+    /// ceilings for the capture it is presenting, which is why they are passed in rather than read off
+    /// the result (a pipeline captures raw bytes, so it quotes only its byte ceiling). The totals come
+    /// from the result itself and are quoted only where they were actually counted (see
+    /// `ProcessResult.OverflowTotals`).
+    let internal rejectIfTruncated
+        (lineLimit: int option)
+        (byteLimit: int option)
+        (result: ProcessResult<'T>)
+        : Result<unit, ProcessError> =
+        if not result.Truncated then
+            Ok()
+        else
+            let totalLines, totalBytes = result.OverflowTotals |> Option.defaultValue (0, 0)
+
+            Error(ProcessError.OutputTooLarge(result.Program, lineLimit, byteLimit, totalLines, totalBytes))
 
     // Test factories: build a `ProcessResult<'T>` directly (no real process), to unit-test code that
     // consumes one. Generic over the captured-stdout type, so C# infers it (`ProcessResult.Success("x")`,

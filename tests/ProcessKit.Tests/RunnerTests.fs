@@ -141,6 +141,95 @@ module private LaunchedDouble =
 
         new RunningProcess(host)
 
+/// A runner over a synthetic child: no real process, but the REAL buffered capture path —
+/// `RunningProcess`'s stdout pump under the command's own `OutputBuffer` policy — over a fixed payload.
+/// The verb-level truncation contract (T-352) is therefore exercised against genuine `Pump.LineBuffer`
+/// retention, truncation flags, and totals rather than a hand-assembled `ProcessResult`, while staying
+/// deterministic and spawning nothing. `internal` rather than file-private because
+/// `OutputPolicyPropertyTests` drives the same capture path across generated policies (this file
+/// compiles first, per `ProcessKit.Tests.fsproj`).
+module internal BoundedCapture =
+
+    /// `total` newline-terminated lines, `line-1` .. `line-<total>` (7 UTF-8 bytes each as the buffer
+    /// accounts them: 6 content bytes plus the separator byte every retained line is charged).
+    let payload (total: int) =
+        String.Join("\n", [ 1..total ] |> List.map (sprintf "line-%d")) + "\n"
+
+    /// A command capturing at most `maxLines` retained lines under `overflow`, named `capture`.
+    let boundedCommand (overflow: OverflowMode) (maxLines: int) =
+        Command.create "capture"
+        |> Command.outputBuffer ((OutputBufferPolicy.Unbounded.WithMaxLines maxLines).WithOverflow overflow)
+
+    let private child (config: CommandConfig) (exitCode: int) (text: string) : RunningProcess =
+        let host: RunningHost =
+            { Config = config
+              Pid = None
+              Stdout = Some(new MemoryStream(Encoding.UTF8.GetBytes text) :> Stream)
+              Stderr = None
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = 0L
+              StartTimeIdentity = None
+              Wait = fun () -> Task.FromResult(Outcome.Exited exitCode)
+              // No background feed on this double, so its (absent) stdin fault is already decided.
+              StdinError = fun () -> Task.FromResult None
+              StdinFeedComplete = ignore
+              StartKill = ignore
+              Signal = fun _ -> Ok()
+              GracefulKill = fun _ -> Task.CompletedTask
+              ResizePty = None
+              TreeStats = None
+              Teardown = fun () -> ValueTask() }
+
+        new RunningProcess(host)
+
+    /// A runner whose captures are `text` pumped through the command's own buffer policy, ending in
+    /// `exitCode`.
+    let runnerExiting (exitCode: int) (text: string) : IProcessRunner =
+        { new IProcessRunner with
+            member _.CaptureStringAsync(command, _) =
+                task {
+                    use running = child command.Config exitCode text
+                    return! running.OutputStringAsync()
+                }
+
+            member _.CaptureBytesAsync(command, _) =
+                task {
+                    use running = child command.Config exitCode text
+                    return! running.OutputBytesAsync()
+                }
+
+            member _.SpawnAsync(command, _) =
+                Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
+    /// The same, for a successful (exit 0) run.
+    let runner (text: string) : IProcessRunner = runnerExiting 0 text
+
+    /// A runner answering with a result that reports truncation but carries NO totals — what a replayed
+    /// cassette or a third-party double produces, since only the library's own capture paths count.
+    let untotalled (retained: string) : IProcessRunner =
+        { new IProcessRunner with
+            member _.CaptureStringAsync(command, _) =
+                Task.FromResult(
+                    Ok(
+                        ProcessResult<string>(
+                            command.Program,
+                            retained,
+                            "",
+                            Outcome.Exited 0,
+                            TimeSpan.Zero,
+                            true,
+                            [ 0 ]
+                        )
+                    )
+                )
+
+            member _.CaptureBytesAsync(_, _) =
+                Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+            member _.SpawnAsync(command, _) =
+                Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
 /// A runner double that drains `stream` into its captured stdout — the same evidence a live child's
 /// stdin feeder would leave behind — so a run that follows one which ended without a child can prove
 /// it was handed the ORIGINAL payload rather than the empty remains of an exhausted source.
@@ -1736,5 +1825,291 @@ type RunnerTests() =
             | Error(ProcessError.Stdin("first-line", detail)) ->
                 Assert.That(detail, Does.Contain "synthetic stdin failure")
             | other -> Assert.Fail $"expected the finish error, got {other}"
+        }
+        :> Task
+
+    // --- T-352: the verbs that present stdout AS IF COMPLETE refuse a truncated capture ---
+    //
+    // A `DropOldest`/`DropNewest` buffer hands back a tail/prefix that reads exactly like whole output
+    // once `run` projects it to a string: the `Truncated` flag — the only evidence output was lost — is
+    // destroyed at that boundary. So `run` (and everything derived from it: `parse`/`tryParse`/the JSON
+    // projections) spends the flag on a typed `OutputTooLarge` instead. `outputString`/`outputBytes`
+    // stay lenient, `runUnit` (which promises nothing about stdout) stays successful, and a capture that
+    // lands exactly on its limit was never truncated at all.
+
+    [<Test>]
+    member _.``run refuses a bounded-buffer truncation instead of returning a clipped capture``() : Task =
+        task {
+            for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest ] do
+                let command = BoundedCapture.boundedCommand overflow 2
+
+                let! result =
+                    command
+                    |> Runner.run (BoundedCapture.runner (BoundedCapture.payload 5)) CancellationToken.None
+
+                match result with
+                | Error(ProcessError.OutputTooLarge(program, lineLimit, byteLimit, totalLines, totalBytes) as error) ->
+                    Assert.That(program, Is.EqualTo "capture", $"{overflow} program")
+                    Assert.That(lineLimit, Is.EqualTo(Some 2), $"{overflow} line ceiling")
+                    Assert.That(byteLimit, Is.EqualTo(None: int option), $"{overflow} byte ceiling")
+                    // The REAL line total the pump counted (retained plus dropped), not the retained two.
+                    Assert.That(totalLines, Is.EqualTo 5, $"{overflow} total lines")
+                    // No byte cap and no fail-loud ceiling, so the line pump counted no bytes — and the
+                    // message must omit that unit rather than quote a fabricated `0 bytes`.
+                    Assert.That(totalBytes, Is.EqualTo 0, $"{overflow} total bytes")
+
+                    Assert.That(
+                        error.Message,
+                        Is.EqualTo "'capture' produced too much line output (5 lines)",
+                        $"{overflow} message"
+                    )
+                | other -> Assert.Fail $"{overflow}: expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``outputString stays lenient under truncation: the bounded payload plus the Truncated flag``() : Task =
+        task {
+            // Same run, same policy, the other verb: the caller that asked for the whole `ProcessResult`
+            // still gets the bounded capture and decides for itself, exactly as before this fix.
+            for overflow, retained in
+                [ OverflowMode.DropOldest, "line-4\nline-5"
+                  OverflowMode.DropNewest, "line-1\nline-2" ] do
+                let command = BoundedCapture.boundedCommand overflow 2
+
+                let! result =
+                    command
+                    |> Runner.outputString (BoundedCapture.runner (BoundedCapture.payload 5)) CancellationToken.None
+
+                match result with
+                | Ok captured ->
+                    Assert.That(captured.Stdout, Is.EqualTo retained, $"{overflow} retained payload")
+                    Assert.That(captured.Truncated, Is.True, $"{overflow} Truncated")
+                | Error error -> Assert.Fail $"{overflow}: expected the bounded capture, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a capture that lands exactly on its limit is not a truncation``() : Task =
+        task {
+            // The boundary the fix must not overshoot: output exactly equal to a configured ceiling is
+            // retained whole (`OverflowMode`'s documented rule), so `run` still returns it.
+            for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest ] do
+                let runner = BoundedCapture.runner (BoundedCapture.payload 2)
+
+                let! onLineCap =
+                    BoundedCapture.boundedCommand overflow 2
+                    |> Runner.run runner CancellationToken.None
+
+                Assert.That(
+                    onLineCap,
+                    Is.EqualTo(
+                        Ok
+                            "line-1
+line-2"
+                        : Result<string, ProcessError>
+                    ),
+                    $"{overflow} exactly on the line cap"
+                )
+
+                // The byte ceiling's own boundary: two lines accounted at 7 bytes each (6 content bytes
+                // plus the separator byte the buffer charges every retained line).
+                let onByteCap =
+                    Command.create "capture"
+                    |> Command.outputBuffer ((OutputBufferPolicy.Unbounded.WithMaxBytes 14).WithOverflow overflow)
+
+                let! byteResult = onByteCap |> Runner.run runner CancellationToken.None
+
+                Assert.That(
+                    byteResult,
+                    Is.EqualTo(
+                        Ok
+                            "line-1
+line-2"
+                        : Result<string, ProcessError>
+                    ),
+                    $"{overflow} exactly on the byte cap"
+                )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a byte-capped truncation reports the byte total the pump actually counted``() : Task =
+        task {
+            // With a byte cap configured the pump does count bytes, so the refusal quotes the real
+            // volume — five 7-byte lines — rather than reporting the retained remainder.
+            let command =
+                Command.create "capture"
+                |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes 14)
+
+            let! result =
+                command
+                |> Runner.run (BoundedCapture.runner (BoundedCapture.payload 5)) CancellationToken.None
+
+            match result with
+            | Error(ProcessError.OutputTooLarge("capture", None, Some 14, totalLines, totalBytes) as error) ->
+                Assert.That(totalLines, Is.EqualTo 5)
+                Assert.That(totalBytes, Is.EqualTo 35)
+                Assert.That(error.Message, Is.EqualTo "'capture' produced too much byte output (35 bytes)")
+            | other -> Assert.Fail $"expected a byte-capped OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``runUnit ignores truncation of the output it discards``() : Task =
+        task {
+            // The side-effect verb makes no claim about stdout, so a capture it throws away must not
+            // turn an accepted exit into a failure — which is why it no longer derives from `run`.
+            for overflow in [ OverflowMode.DropOldest; OverflowMode.DropNewest ] do
+                let command = BoundedCapture.boundedCommand overflow 2
+                let runner = BoundedCapture.runner (BoundedCapture.payload 5)
+
+                let! unitResult = command |> Runner.runUnit runner CancellationToken.None
+                Assert.That(unitResult, Is.EqualTo(Ok(): Result<unit, ProcessError>), $"{overflow} runUnit")
+
+                // Neither do the outcome-only verbs, which never look at the captured text.
+                let! code = command |> Runner.exitCode runner CancellationToken.None
+                Assert.That(code, Is.EqualTo(Ok 0: Result<int, ProcessError>), $"{overflow} exitCode")
+
+                let! answer = command |> Runner.probe runner CancellationToken.None
+                Assert.That(answer, Is.EqualTo(Ok true: Result<bool, ProcessError>), $"{overflow} probe")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``runUnit still requires an accepted exit``() : Task =
+        task {
+            // The decoupling from `run` must not cost `runUnit` its success check.
+            let! result =
+                Command.create "capture"
+                |> Runner.runUnit (BoundedCapture.runnerExiting 3 "output\n") CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Exit("capture", 3, _, _)) -> ()
+            | other -> Assert.Fail $"expected Exit 3, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an unaccepted exit still reports its own error, not the truncation``() : Task =
+        task {
+            // Order of judgement: the success check runs first, so a failed run keeps reporting WHY it
+            // failed instead of being re-labelled a buffer overflow.
+            let! result =
+                BoundedCapture.boundedCommand OverflowMode.DropOldest 2
+                |> Runner.run (BoundedCapture.runnerExiting 1 (BoundedCapture.payload 5)) CancellationToken.None
+
+            match result with
+            | Error(ProcessError.Exit("capture", 1, _, _)) -> ()
+            | other -> Assert.Fail $"expected Exit 1, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``parse never sees a truncated capture``() : Task =
+        task {
+            // The case that makes this a correctness bug rather than an ergonomics one: `1234\n5678`
+            // clipped to its last line parses PERFECTLY as `5678` — a wrong answer no caller could
+            // detect. The parser must not run at all.
+            let mutable parsed = None
+
+            let parser (text: string) =
+                parsed <- Some text
+                Int32.Parse text
+
+            let! result =
+                BoundedCapture.boundedCommand OverflowMode.DropOldest 1
+                |> Runner.parse (BoundedCapture.runner "1234\n5678\n") CancellationToken.None parser
+
+            match result with
+            | Error(ProcessError.OutputTooLarge("capture", Some 1, None, 2, 0)) -> ()
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+
+            Assert.That(parsed, Is.EqualTo(None: string option), "the parser must never see partial output")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``tryParse never sees a truncated capture``() : Task =
+        task {
+            let mutable parsed = None
+
+            let parser (text: string) =
+                parsed <- Some text
+                Ok text
+
+            let! result =
+                BoundedCapture.boundedCommand OverflowMode.DropNewest 1
+                |> Runner.tryParse (BoundedCapture.runner "1234\n5678\n") CancellationToken.None parser
+
+            match result with
+            | Error(ProcessError.OutputTooLarge("capture", Some 1, None, 2, 0)) -> ()
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+
+            Assert.That(parsed, Is.EqualTo(None: string option), "the parser must never see partial output")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``outputJson never deserializes a truncated capture``() : Task =
+        task {
+            // `1\n2` clipped to `2` is a perfectly valid JSON document — and the wrong one.
+            let! result =
+                BoundedCapture.boundedCommand OverflowMode.DropOldest 1
+                |> Runner.outputJson<int> (BoundedCapture.runner "1\n2\n") CancellationToken.None None
+
+            match result with
+            | Error(ProcessError.OutputTooLarge("capture", Some 1, None, 2, 0)) -> ()
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a fail-loud ceiling still reports its own overflow, with both totals counted``() : Task =
+        task {
+            // The pre-existing `OverflowMode.Error` path is untouched: the capture itself fails, so the
+            // refusal above never runs (and the parser never runs twice). In this mode the pump counts
+            // bytes as well as lines, so both totals are quoted.
+            let mutable parsed = None
+
+            let parser (text: string) =
+                parsed <- Some text
+                text
+
+            let command =
+                Command.create "capture" |> Command.outputBuffer (OutputBufferPolicy.FailLoud 2)
+
+            let! result =
+                command
+                |> Runner.parse (BoundedCapture.runner (BoundedCapture.payload 5)) CancellationToken.None parser
+
+            match result with
+            | Error(ProcessError.OutputTooLarge("capture", Some 2, None, 5, 35) as error) ->
+                Assert.That(error.Message, Is.EqualTo "'capture' produced too much line output (5 lines / 35 bytes)")
+            | other -> Assert.Fail $"expected the fail-loud OutputTooLarge, got {other}"
+
+            Assert.That(parsed, Is.EqualTo(None: string option))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a truncated capture with no totals is refused without inventing any``() : Task =
+        task {
+            // Only the library's own capture paths count lines/bytes; a replayed cassette or a
+            // third-party runner reports truncation with no totals at all. Such a capture is still
+            // refused — the whole point — but the error quotes only the ceilings it genuinely knows,
+            // never a `0` masquerading as a measurement.
+            let command =
+                Command.create "capture"
+                |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxLines 2)
+
+            let! result =
+                command
+                |> Runner.run (BoundedCapture.untotalled "line-4\nline-5") CancellationToken.None
+
+            match result with
+            | Error(ProcessError.OutputTooLarge("capture", Some 2, None, 0, 0) as error) ->
+                Assert.That(error.Message, Is.EqualTo "'capture' produced too much line output")
+            | other -> Assert.Fail $"expected a total-free OutputTooLarge, got {other}"
         }
         :> Task
