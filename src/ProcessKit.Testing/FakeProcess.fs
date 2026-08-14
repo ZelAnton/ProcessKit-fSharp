@@ -240,18 +240,7 @@ type FakeProcess
     /// shows up here regardless of which handle received it.
     member _.Signals = signals.Snapshot
 
-    /// Build a real `RunningProcess` over in-memory streams.
-    ///
-    /// Calling `Build()` more than once on the same `FakeProcess` is supported and produces independent
-    /// handles: each gets its own stdout/stderr/stdin `MemoryStream`s, so disposing one handle's stdin
-    /// (`ProcessStdin.FinishAsync`, or the handle's own teardown) never raises `ObjectDisposedException`
-    /// on a write to a different, still-live handle built from the same fake. `StdinBytes` and `Signals`
-    /// still read as a single combined log across every built handle (see their docs) — that plural
-    /// "handles" wording describes exactly this multi-`Build()` scenario, not just distinct restart
-    /// incarnations each with its own `FakeProcess`. Concurrent writers on different handles do not
-    /// interleave within a single handle's own stream, but the combined `StdinBytes` log's ordering across
-    /// *different* handles is whatever order the underlying writes happened to land in — script one
-    /// handle's conversation before starting the next if the test asserts an exact combined byte sequence.
+    // Common implementation for the public builders, with an optional recorded completion outcome.
     member private _.BuildCore(recordedCompletion: (TimeSpan * bool) option) : RunningProcess =
         let config = template.Config
         let isPty = pty.IsSome
@@ -358,7 +347,20 @@ type FakeProcess
         | Some(duration, truncated) -> new RunningProcess(host, duration, truncated)
         | None -> new RunningProcess(host)
 
+    /// Build a real `RunningProcess` over in-memory streams.
+    ///
+    /// Calling `Build()` more than once on the same `FakeProcess` is supported and produces independent
+    /// handles: each gets its own stdout/stderr/stdin `MemoryStream`s, so disposing one handle's stdin
+    /// (`ProcessStdin.FinishAsync`, or the handle's own teardown) never raises `ObjectDisposedException`
+    /// on a write to a different, still-live handle built from the same fake. `StdinBytes` and `Signals`
+    /// still read as a single combined log across every built handle (see their docs) — that plural
+    /// "handles" wording describes exactly this multi-`Build()` scenario, not just distinct restart
+    /// incarnations each with its own `FakeProcess`. Concurrent writers on different handles do not
+    /// interleave within a single handle's own stream, but the combined `StdinBytes` log's ordering across
+    /// *different* handles is whatever order the underlying writes happened to land in — script one
+    /// handle's conversation before starting the next if the test asserts an exact combined byte sequence.
     member this.Build() : RunningProcess = this.BuildCore None
 
+    /// Build a `RunningProcess` with a recorded completion outcome.
     member internal this.Build(recordedDuration: TimeSpan, recordedTruncated: bool) : RunningProcess =
         this.BuildCore(Some(recordedDuration, recordedTruncated))
