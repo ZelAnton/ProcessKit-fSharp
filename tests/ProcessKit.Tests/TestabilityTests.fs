@@ -58,6 +58,20 @@ type TestabilityTests() =
         }
 
     [<Test>]
+    member _.``FakeProcess without replay metadata measures its own duration``() : Task =
+        task {
+            use proc = FakeProcess.Create("svc").WithStdout("done").Build()
+            let beforeDelay = proc.Elapsed
+            do! Task.Delay 50
+
+            match! proc.OutputStringAsync() with
+            | Error error -> Assert.Fail $"FakeProcess OutputString failed: {error.Message}"
+            | Ok result ->
+                Assert.That(result.Duration, Is.GreaterThan beforeDelay)
+                Assert.That(result.Duration, Is.GreaterThanOrEqualTo(TimeSpan.FromMilliseconds 25.0))
+        }
+
+    [<Test>]
     member _.``FakeProcess streams stdout lines``() : Task =
         task {
             use proc = FakeProcess.Create().WithStdoutLines([ "a"; "b"; "c" ]).Build()

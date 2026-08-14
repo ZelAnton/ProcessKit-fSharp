@@ -252,7 +252,7 @@ type FakeProcess
     /// interleave within a single handle's own stream, but the combined `StdinBytes` log's ordering across
     /// *different* handles is whatever order the underlying writes happened to land in — script one
     /// handle's conversation before starting the next if the test asserts an exact combined byte sequence.
-    member _.Build() : RunningProcess =
+    member private _.BuildCore(recordedCompletion: (TimeSpan * bool) option) : RunningProcess =
         let config = template.Config
         let isPty = pty.IsSome
         let hasMergedStderr = isPty || config.MergeStderr
@@ -354,4 +354,11 @@ type FakeProcess
                     stdinStream |> Option.iter (fun s -> s.Dispose())
                     ValueTask.CompletedTask }
 
-        new RunningProcess(host)
+        match recordedCompletion with
+        | Some(duration, truncated) -> new RunningProcess(host, duration, truncated)
+        | None -> new RunningProcess(host)
+
+    member this.Build() : RunningProcess = this.BuildCore None
+
+    member internal this.Build(recordedDuration: TimeSpan, recordedTruncated: bool) : RunningProcess =
+        this.BuildCore(Some(recordedDuration, recordedTruncated))
