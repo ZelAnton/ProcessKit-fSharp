@@ -7,6 +7,7 @@ open System.Runtime.InteropServices
 open System.Text
 open System.Threading
 open System.Threading.Tasks
+open Microsoft.Win32.SafeHandles
 open NUnit.Framework
 open ProcessKit
 
@@ -114,6 +115,46 @@ type private QueueingSyncContext() =
     override _.Send(callback, state) = callback.Invoke state
 
     override this.CreateCopy() = this :> SynchronizationContext
+
+/// A stdin transport double for the T-354 end-of-input tests: an in-memory pipe that records every byte
+/// AND signals the moment its end of input was delivered, so the assertions never poll or guess at a
+/// delivery that a terminal verb performs off its own thread. Which signal a transport uses differs — a
+/// plain pipe is CLOSED, a ConPTY session's host-input pipe receives a written gesture over a pipe that
+/// deliberately stays open — so both are exposed, alongside the close count that makes "exactly one owner
+/// of the pipe" directly checkable.
+type private EndOfInputPipe() =
+    inherit MemoryStream()
+
+    let closed =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let written =
+        TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable closes = 0
+
+    /// Completes the first time this pipe is CLOSED — how a plain stdin pipe delivers end of input.
+    member _.Closed: Task = closed.Task
+
+    /// Completes the first time anything is WRITTEN to this pipe. The ConPTY writer sends its whole
+    /// end-of-input gesture in a single write, so for that transport the first write IS the delivery.
+    member _.FirstWrite: Task = written.Task
+
+    /// How many times this pipe has actually been closed.
+    member _.Closes = Volatile.Read(&closes)
+
+    override _.Write(buffer: byte[], offset: int, count: int) =
+        base.Write(buffer, offset, count)
+        written.TrySetResult() |> ignore
+
+    override _.Write(buffer: ReadOnlySpan<byte>) =
+        base.Write buffer
+        written.TrySetResult() |> ignore
+
+    override _.Dispose(disposing) =
+        Interlocked.Increment(&closes) |> ignore
+        closed.TrySetResult() |> ignore
+        base.Dispose disposing
 
 /// A stdout double for the T-197 teardown-race tests: its first `ReadAsync` yields `firstChunk`, its
 /// second parks until the stream is disposed, and the parked read then throws `ObjectDisposedException`
@@ -1129,6 +1170,327 @@ type CorrectnessBugTests() =
                 syncContext.Posted,
                 Is.EqualTo 0,
                 "the stdin feed must not post any continuation to the caller's SynchronizationContext"
+            )
+        }
+        :> Task
+
+    // ---- T-354: a terminal verb ends a KeepStdinOpen pipe the caller never took -------------------
+    //
+    // Past a terminal/consuming verb nobody can write this run's stdin any more, so a `KeepStdinOpen`
+    // writer the caller never took must have its input ended — otherwise a child reading to EOF waits
+    // forever and the verb hangs with it. The claim is the SAME once-only claim `TakeStdin` makes, so the
+    // two resolve to exactly one owner; the delivery itself uses the transport's own end-of-input path.
+
+    [<Test>]
+    member _.``a terminal verb ends a KeepStdinOpen pipe the caller never took (T-354)``() : Task =
+        task {
+            let config = (Command.create "test" |> Command.keepStdinOpen).Config
+            let pipe = new EndOfInputPipe()
+
+            let host =
+                { baseHost config with
+                    Stdin = Some(pipe :> Stream) }
+
+            use running = new RunningProcess(host)
+
+            let! outcome = running.WaitAsync()
+            Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+
+            let! ended = Task.WhenAny(pipe.Closed, Task.Delay 5000)
+
+            Assert.That(
+                ended,
+                Is.SameAs pipe.Closed,
+                "a completion verb must end the input of a kept-open stdin the caller never took"
+            )
+
+            Assert.That(pipe.Closes, Is.EqualTo 1, "the kept-open pipe must be ended exactly once")
+
+            Assert.That(
+                running.TakeStdin(),
+                Is.EqualTo(None: ProcessStdin option),
+                "the verb now owns the pipe, so a later TakeStdin must not hand out a stream it has ended"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a terminal verb leaves an already-taken KeepStdinOpen writer to its owner (T-354)``() : Task =
+        task {
+            let config = (Command.create "test" |> Command.keepStdinOpen).Config
+            let pipe = new EndOfInputPipe()
+
+            let host =
+                { baseHost config with
+                    Stdin = Some(pipe :> Stream) }
+
+            use running = new RunningProcess(host)
+
+            match running.TakeStdin() with
+            | None -> Assert.Fail "expected an interactive stdin handle for a KeepStdinOpen run"
+            | Some stdin ->
+                let! outcome = running.WaitAsync()
+                Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+
+                // The claim was already spent by `TakeStdin`, so the verb never even started a delivery —
+                // there is nothing racing this assertion. The owner's writes still land, and its own
+                // `FinishAsync` is what ends the input.
+                Assert.That(pipe.Closes, Is.Zero, "a verb must not close a stdin handle the caller took")
+
+                do! stdin.WriteAsync(Encoding.UTF8.GetBytes "OWNER")
+                do! stdin.FinishAsync()
+
+                Assert.That(pipe.Closes, Is.EqualTo 1, "the owner's own FinishAsync ends the input")
+
+                Assert.That(
+                    Encoding.UTF8.GetString(pipe.ToArray()),
+                    Is.EqualTo "OWNER",
+                    "the owner's bytes must reach the child, so the verb cannot have ended the pipe first"
+                )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``TakeStdin racing a terminal verb leaves exactly one owner of the stdin pipe (T-354)``() : Task =
+        task {
+            // Both paths claim through the SAME once-only guard, so the race has exactly two outcomes and no
+            // third: either the `TakeStdin` caller owns the writer (and the verb ends nothing), or the verb
+            // owns it (and ends the input exactly once). Never both — that is the double close — and never
+            // neither, which would abandon the kept-open pipe with the child waiting on an EOF.
+            //
+            // The INVARIANT is what is asserted, so this can never flake on which side happens to win; the
+            // two orders are each pinned down deterministically by the two tests above (a verb that claimed
+            // first makes a later `TakeStdin` answer `None`; a caller that took it first leaves the pipe
+            // untouched by the verb). Each round races a fresh handle head-on, one thread per path.
+            let rounds = 24
+            let mutable takenWins = 0
+            let mutable verbWins = 0
+
+            for _ in 1..rounds do
+                let config = (Command.create "test" |> Command.keepStdinOpen).Config
+                let pipe = new EndOfInputPipe()
+
+                let host =
+                    { baseHost config with
+                        Stdin = Some(pipe :> Stream) }
+
+                use running = new RunningProcess(host)
+                // A `ref` cell, not a `let mutable`: the racing thread bodies below are closures, which F#
+                // does not let capture a mutable local.
+                let taken = ref false
+                use ready = new CountdownEvent(2)
+                use gate = new ManualResetEventSlim(false)
+
+                let start (body: unit -> unit) =
+                    let t =
+                        Thread(
+                            ThreadStart(fun () ->
+                                ready.Signal() |> ignore
+                                gate.Wait()
+                                body ())
+                        )
+
+                    t.IsBackground <- true
+                    t.Start()
+                    t
+
+                let taker = start (fun () -> taken.Value <- (running.TakeStdin()).IsSome)
+                let verb = start (fun () -> running.WaitAsync().GetAwaiter().GetResult() |> ignore)
+
+                ready.Wait()
+                gate.Set()
+                taker.Join()
+                verb.Join()
+
+                let owned = if taken.Value then 1 else 0
+
+                if not taken.Value then
+                    // The verb won the claim, and its delivery runs off the verb's own thread — wait for it
+                    // rather than sampling a race.
+                    let! ended = Task.WhenAny(pipe.Closed, Task.Delay 5000)
+
+                    Assert.That(
+                        ended,
+                        Is.SameAs pipe.Closed,
+                        "with no TakeStdin winner the verb owns the pipe and must end its input"
+                    )
+
+                    verbWins <- verbWins + 1
+                else
+                    takenWins <- takenWins + 1
+
+                Assert.That(
+                    pipe.Closes + owned,
+                    Is.EqualTo 1,
+                    "exactly one owner: the pipe is either handed to a caller or ended by the verb, never both"
+                )
+
+            Assert.That(takenWins + verbWins, Is.EqualTo rounds, "every round must resolve to exactly one owner")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a terminal verb delivers the whole stdin source before ending the input (T-354)``() : Task =
+        task {
+            // `Stdin(source)` + `KeepStdinOpen`: the background feeder is still the pipe's writer, so the
+            // verb's end of input must wait for it exactly as `TakeStdin` does — otherwise it would race a
+            // second writer on one pipe and cut the child's input short. Deterministic ORDER proof, with no
+            // timing guesswork: the gated source parks BEFORE writing, so while it is parked the input
+            // provably has not been ended; releasing it lets the feed complete, and only then does the end
+            // of input follow the source's bytes.
+            let gated = GatedStdinAsyncLines "SRC"
+
+            let config =
+                (Command.create "test"
+                 |> Command.stdin (Stdin.FromString "x")
+                 |> Command.keepStdinOpen)
+                    .Config
+
+            let pipe = new EndOfInputPipe()
+
+            // Exactly how `ProcessGroup` wires a `KeepStdinOpen` source feed: the feeder leaves the pipe
+            // open when it is done, so the only close that can happen here is the verb's own.
+            let feeder =
+                Pump.feedStdinSource (Some(pipe :> Stream)) (Some(Stdin.FromAsyncLines gated)) true
+
+            let host =
+                { baseHost config with
+                    Stdin = Some(pipe :> Stream)
+                    StdinFeedComplete = fun () -> feeder.Task.GetAwaiter().GetResult() |> ignore }
+
+            use running = new RunningProcess(host)
+
+            let waiting = running.WaitAsync()
+
+            // Wait — on the source's own `Parked` signal, not a delay — until the feed is parked mid-source.
+            let! parked = Task.WhenAny(gated.Parked, Task.Delay 5000)
+            Assert.That(parked, Is.SameAs gated.Parked, "the feed never parked in the source")
+            Assert.That(feeder.Task.IsCompleted, Is.False, "the feed must not complete while the source is parked")
+
+            Assert.That(
+                pipe.Closes,
+                Is.Zero,
+                "the end of input must wait for the source feed: ending it here would truncate the child's input"
+            )
+
+            // Release the source: the feed writes "SRC\n" and completes, and only then may the input end.
+            gated.Release()
+            let! outcome = waiting
+            Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+
+            let! ended = Task.WhenAny(pipe.Closed, Task.Delay 5000)
+            Assert.That(ended, Is.SameAs pipe.Closed, "the input must be ended once the source feed has finished")
+
+            Assert.That(
+                Encoding.UTF8.GetString(pipe.ToArray()),
+                Is.EqualTo "SRC\n",
+                "the whole source must reach the child before its end of input"
+            )
+
+            Assert.That(pipe.Closes, Is.EqualTo 1, "the kept-open pipe must be ended exactly once")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a terminal verb ends a POSIX PTY stdin with the terminal's own end-of-input character (T-354)``
+        ()
+        : Task =
+        task {
+            // The parent side of a POSIX PTY run's stdin is `Native.Posix.PtyStdinStream`, a NON-owning view
+            // over the shared pty master: closing it releases nothing and takes no terminal with it, so a
+            // plain `Dispose` here would leave the child waiting on an EOF that can never arrive. The verb
+            // must therefore go through the same `IStdinFinisher` delivery `ProcessStdin.FinishAsync` uses —
+            // the terminal's own `termios.c_cc[VEOF]` character, twice. Driven over the native write seam, so
+            // it is exercised on every platform.
+            let written = ResizeArray<byte>()
+
+            let delivered =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let deliveredTask: Task = delivered.Task
+
+            Native.Posix.ptyWriteForTests <-
+                Some(fun _ ptr count ->
+                    let buffer = Array.zeroCreate<byte> (int count)
+                    Marshal.Copy(ptr, buffer, 0, buffer.Length)
+
+                    let total =
+                        lock written (fun () ->
+                            written.AddRange buffer
+                            written.Count)
+
+                    if total >= 2 then
+                        delivered.TrySetResult() |> ignore
+
+                    nativeint buffer.Length)
+
+            try
+                let config = (Command.create "test" |> Command.keepStdinOpen).Config
+
+                use stdin =
+                    new Native.Posix.PtyStdinStream(new SafeFileHandle(IntPtr.Zero, ownsHandle = false), 4uy)
+
+                let host =
+                    { baseHost config with
+                        Stdin = Some(stdin :> Stream) }
+
+                use running = new RunningProcess(host)
+
+                let! outcome = running.WaitAsync()
+                Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+
+                let! got = Task.WhenAny(deliveredTask, Task.Delay 5000)
+
+                Assert.That(
+                    got,
+                    Is.SameAs deliveredTask,
+                    "a completion verb must deliver the pty's own end-of-input character, not close the master view"
+                )
+
+                Assert.That(lock written (fun () -> written.ToArray()), Is.EqualTo<byte[]>([| 4uy; 4uy |]))
+            finally
+                Native.Posix.ptyWriteForTests <- None
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a terminal verb ends a ConPTY stdin with Ctrl-Z + Enter and leaves the session pipe open (T-354)``
+        ()
+        : Task =
+        task {
+            // The Windows counterpart: a ConPTY run's stdin writer is a non-owning view over the SESSION's
+            // host-input pipe, so ending the input is the console's own Ctrl-Z + Enter gesture — closing that
+            // pipe would end the child's console instead of its input. Managed code over a `Stream`, so this
+            // runs on every platform.
+            let pipe = new EndOfInputPipe()
+            let keepalive = new Native.Windows.ConPtyInputKeepalive(pipe :> Stream)
+            use stdin = new Native.Windows.ConPtyStdinStream(keepalive)
+            let config = (Command.create "test" |> Command.keepStdinOpen).Config
+
+            let host =
+                { baseHost config with
+                    Stdin = Some(stdin :> Stream) }
+
+            use running = new RunningProcess(host)
+
+            let! outcome = running.WaitAsync()
+            Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+
+            let! delivered = Task.WhenAny(pipe.FirstWrite, Task.Delay 5000)
+
+            Assert.That(
+                delivered,
+                Is.SameAs pipe.FirstWrite,
+                "a completion verb must deliver the console's end-of-input gesture to an untaken ConPTY stdin"
+            )
+
+            Assert.That(pipe.ToArray(), Is.EqualTo<byte[]>([| 0x1Auy; 0x0Duy |]))
+            Assert.That(stdin.IsFinished, Is.True)
+
+            Assert.That(
+                pipe.Closes,
+                Is.Zero,
+                "ending stdin must not close the session's host-input pipe, which belongs to the run"
             )
         }
         :> Task

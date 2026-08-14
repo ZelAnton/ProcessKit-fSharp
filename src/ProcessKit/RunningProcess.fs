@@ -786,6 +786,89 @@ type RunningProcess
             else
                 None, None)
 
+    // The once-only interactive-stdin claim, shared by BOTH ways this run's kept-open stdin can find an
+    // owner: `TakeStdin`/`TakeStdinAsync` (the caller takes the writer) and `finishUnclaimedStdin` below
+    // (a terminal verb ends the child's input because nobody took it). Taken under `stateLock`, and the
+    // one `stdinTaken` flag serves both, so two concurrent claimants — of either kind — can never both
+    // observe `not stdinTaken`: whoever wins sets it, every later claim answers `None`. That is what makes
+    // `TakeStdin` racing a terminal verb resolve to EXACTLY ONE owner of the pipe, with no double close and
+    // no kept-open pipe abandoned behind a lost race.
+    //
+    // `host.Stdin` is `Some` exactly when the pipe is kept open: `KeepStdinOpen` with no source, or
+    // `KeepStdinOpen` WITH a source (a source WITHOUT `KeepStdinOpen` closes the pipe after draining, so
+    // its `host.Stdin` is `None`). Deliberately claims WITHOUT waiting for the source feeder: the wait must
+    // happen outside `stateLock`, and each caller below picks how to serve it.
+    let claimInteractiveStdin () : Stream option =
+        lock stateLock (fun () ->
+            match host.Stdin with
+            | Some stream when config.KeepStdinOpen && not stdinTaken ->
+                stdinTaken <- true
+                Some stream
+            | _ -> None)
+
+    // End the child's input on behalf of a caller that kept stdin open (`Command.KeepStdinOpen`) and then
+    // drove this run through a TERMINAL/consuming verb without ever taking the writer. Past such a verb
+    // nobody can write that pipe any more — the buffered verbs run the child to completion, and the
+    // high-level `RunAsync`/Parse/JSON/`FirstLine` verbs never hand the `RunningProcess` out at all — so a
+    // child that reads its stdin to EOF would otherwise wait forever for an end of input that can no longer
+    // come, and the verb would hang with it (to its timeout, or indefinitely without one).
+    //
+    // Deliberately NOT called on the ordinary `StartAsync` live-handle path: a caller holding the handle
+    // still has `TakeStdin`, so streaming stdout/stderr, the readiness probes and the interactive sessions
+    // leave the pipe exactly as they found it. Only a verb that ENDS the run claims here.
+    let finishUnclaimedStdin () : unit =
+        match claimInteractiveStdin () with
+        | None ->
+            // Nothing outstanding: this run keeps no stdin pipe open, or the caller already owns the writer
+            // (`TakeStdin`/`TakeStdinAsync`, a `PtySession`/`ContentLengthSession`) and ends its own input
+            // through `ProcessStdin.FinishAsync` — a verb must never close a handle it has given away, so
+            // completion simply waits for that owner's own `FinishAsync`, exactly as before.
+            ()
+        | Some stream ->
+            // The very handle `TakeStdin` would have returned, so the end of input goes out through the ONE
+            // existing platform path (`ProcessStdin.FinishAsync`): a plain pipe end is closed, while a
+            // stream that owns no handle to close delivers its terminal's own end-of-input gesture through
+            // `Native.Common.IStdinFinisher` — the POSIX pty master view sends `termios.c_cc[VEOF]`, the
+            // Windows ConPTY writer sends Ctrl-Z + Enter and leaves the session's host-input pipe open. A
+            // bespoke `Dispose` here would release nothing on either PTY transport and leave the child
+            // waiting on an EOF that can never arrive (see `Native.Common.IStdinFinisher`).
+            let writer = ProcessStdin(stream, config.StdinEncoding, stdinTarget)
+
+            let deliverEndOfInput () : Task =
+                task {
+                    try
+                        // Symmetric with `TakeStdin`'s blocking claim: on a `Stdin(source)` + `KeepStdinOpen`
+                        // run the background feeder is still this pipe's writer, so the child must receive
+                        // the WHOLE source before its end of input — two writers on one pipe is forbidden,
+                        // and ending it early would truncate the very input the caller asked to be fed.
+                        // A no-op for an interactive-only run (no source, nothing to feed).
+                        host.StdinFeedComplete()
+                        do! writer.FinishAsync()
+                    with _ ->
+                        // Swallowed deliberately, and only here. This delivery is a courtesy made FOR a
+                        // caller that never took the writer, on a detached task nothing awaits: there is no
+                        // honest channel to report it through, and it must never displace the run's real
+                        // result (an outcome, a capture, a stdin-SOURCE failure) with a fault of its own.
+                        // `ProcessStdin.FinishAsync` already completes successfully for the two cases where
+                        // the end of input is moot rather than lost — the child hung up its terminal, or
+                        // this run's own teardown released the stream first — so what lands here is a
+                        // genuine, rare delivery failure whose only effect is that the child keeps waiting
+                        // for input exactly as it did before this helper existed; the verb's own
+                        // timeout/cancellation/kill and `reapGuard` teardown still bound the run.
+                        ()
+                }
+                :> Task
+
+            // Detached onto the thread pool, never awaited by the verb that started it. `StdinFeedComplete`
+            // is blocking (the host exposes no async form) and a feeder can only finish once the child
+            // consumes what it is being fed — which needs the verb's own drains to be running — so awaiting
+            // this inline would make a verb's progress depend on work that depends on the verb: exactly the
+            // deadlock the detachment avoids. It also means the helper adds no new wait window to bound
+            // (KB K-149) and never touches the shared exit wait / reap-once gate (KB K-016): the child's
+            // exit is still observed by `ensureBufferedWait` alone. The claim itself is synchronous, so
+            // ownership is decided before this returns even though the delivery is not.
+            Task.Run(deliverEndOfInput) |> ignore
+
     // The live monotonic time since THIS handle's spawn (`host.StartedTimestamp`) — the clock every
     // DEADLINE on this handle is measured against (`waitWithTimeout`), and the completion clock for
     // every handle that is not replaying a recording.
@@ -1603,20 +1686,6 @@ type RunningProcess
                 Some stream
             | false, _ -> None)
 
-    // The once-only interactive-stdin claim shared by `TakeStdin` and `TakeStdinAsync`. Taken under
-    // `stateLock` so two concurrent callers can't both observe `not stdinTaken` and hand out the same
-    // stream twice. `host.Stdin` is `Some` exactly when the pipe is kept open: `KeepStdinOpen` with no
-    // source, or `KeepStdinOpen` WITH a source (a source WITHOUT `KeepStdinOpen` closes the pipe after
-    // draining, so its `host.Stdin` is `None`). Deliberately claims WITHOUT waiting for the source
-    // feeder: the wait must happen outside `stateLock`, and each caller below picks how to serve it.
-    member private _.ClaimInteractiveStdin() : Stream option =
-        lock stateLock (fun () ->
-            match host.Stdin with
-            | Some stream when config.KeepStdinOpen && not stdinTaken ->
-                stdinTaken <- true
-                Some stream
-            | _ -> None)
-
     /// Take the interactive stdin handle — `Some` only when the command kept stdin open
     /// (`Command.KeepStdinOpen`), and only once. With **no** source it is available immediately; with a
     /// `Command.Stdin(source)` it is available once the background feeder has finished draining that source
@@ -1625,8 +1694,8 @@ type RunningProcess
     /// thread, classic ASP.NET): the source feeder runs detached on the thread pool (see
     /// `Pump.feedStdin`'s `backgroundTask`), so it always makes progress while this thread is blocked here
     /// and is never waiting to post a continuation back to it.
-    member this.TakeStdin() : ProcessStdin option =
-        match this.ClaimInteractiveStdin() with
+    member _.TakeStdin() : ProcessStdin option =
+        match claimInteractiveStdin () with
         | Some stream ->
             // Wait — OUTSIDE `stateLock`, so it never blocks other verbs — for the source feeder to finish
             // before handing the stream over. A no-op when there is no source (interactive-only) or nothing
@@ -1648,8 +1717,8 @@ type RunningProcess
     /// loop parks on a full channel whose only consumer is `FramesAsync()`, which the caller cannot reach
     /// until the constructor returns; the child then blocks writing stdout, stops reading stdin, and the
     /// very feeder this waits for never finishes.
-    member internal this.TakeStdinAsync() : Task<ProcessStdin option> =
-        match this.ClaimInteractiveStdin() with
+    member internal _.TakeStdinAsync() : Task<ProcessStdin option> =
+        match claimInteractiveStdin () with
         | Some stream ->
             task {
                 // The same blocking `host.StdinFeedComplete()` `TakeStdin` performs (it has no async form),
@@ -1660,6 +1729,17 @@ type RunningProcess
                 return Some(ProcessStdin(stream, host.Config.StdinEncoding, stdinTarget))
             }
         | None -> Task.FromResult None
+
+    /// End the child's input for a `Command.KeepStdinOpen` writer this run's caller never took — the same
+    /// once-only claim `TakeStdin` makes, resolved in favour of whichever arrives first, followed by the
+    /// platform's own end-of-input delivery on a detached task (see `finishUnclaimedStdin`). A no-op when
+    /// stdin was not kept open or the caller already owns the writer.
+    ///
+    /// Internal, for the terminal verbs that live OUTSIDE this type and never hand the `RunningProcess` to
+    /// the caller — `Runner.firstLine`, which starts stdout streaming on a handle nobody else can reach, so
+    /// a child needing EOF before its first line would never produce one. Every terminal verb ON this type
+    /// calls the helper directly.
+    member internal _.FinishUnclaimedStdin() : unit = finishUnclaimedStdin ()
 
     /// Signal the process tree to die without waiting (fire-and-forget, like `Process.Kill()`); the
     /// tree is fully reaped when the handle is disposed. For a blocking kill, dispose the handle.
@@ -1929,6 +2009,11 @@ type RunningProcess
                 use _reap = reapGuard ()
                 let stdoutTask = pumpStdoutBuffer ()
                 let stderrTask = pumpStderrBuffer ()
+                // This verb runs the child to completion, so no caller can write its stdin past here: end
+                // the input of a `KeepStdinOpen` writer nobody took, or a child reading to EOF never exits.
+                // A no-op when there is none (see `finishUnclaimedStdin`). After the pumps, so the drains
+                // that keep the child moving are already in place when its input ends.
+                finishUnclaimedStdin ()
                 // Observe BOTH buffer pumps before reading either, so a throwing line handler in one
                 // never orphans the other as an unobserved task (mirrors the streaming path's WhenAll);
                 // `awaitBufferedOutcome` additionally guarantees this even if the exit wait itself faults.
@@ -2005,6 +2090,9 @@ type RunningProcess
                 let stdoutTask = captureRawStdout ()
 
                 let stderrTask = pumpStderrBuffer ()
+                // As on the text verb above: nobody can write this child's stdin past a completion verb, so
+                // an untaken `KeepStdinOpen` writer's input ends here (a no-op when there is none).
+                finishUnclaimedStdin ()
                 // Observe both pumps before reading either, so a throwing stderr handler (or a raw-drain
                 // I/O fault) can't orphan the other as an unobserved task; `awaitBufferedOutcome`
                 // additionally guarantees this even if the exit wait itself faults.
@@ -2057,6 +2145,9 @@ type RunningProcess
             // Drain both pipes (so the child never blocks on a full buffer) without retaining.
             let stdoutTask = drainDiscardReporting stdoutStream
             let stderrTask = drainDiscardReporting stderrStream
+            // As on the capture verbs above: nobody can write this child's stdin past a completion verb, so
+            // an untaken `KeepStdinOpen` writer's input ends here (a no-op when there is none).
+            finishUnclaimedStdin ()
             // Observe both drains together so an I/O fault on one can't orphan the other;
             // `awaitBufferedOutcome` additionally guarantees this even if the exit wait itself faults.
             let! outcome = awaitBufferedOutcome (ensureBufferedWait ()) [| stdoutTask; stderrTask |]
@@ -2128,6 +2219,10 @@ type RunningProcess
 
             let stdoutTask = drainDiscardReporting stdoutStream
             let stderrTask = drainDiscardReporting stderrStream
+
+            // As on the capture verbs above: nobody can write this child's stdin past a completion verb, so
+            // an untaken `KeepStdinOpen` writer's input ends here (a no-op when there is none).
+            finishUnclaimedStdin ()
 
             // Capture a fault rather than letting it escape immediately, so the sampler is ALWAYS
             // cancelled and awaited before its CTS is disposed at scope exit — never left running as
@@ -3119,6 +3214,14 @@ type RunningProcess
 
                             let stderrDrain =
                                 Pump.drainDiscardOrEmptyUntilDone stderrStream CancellationToken.None
+
+                            // This handle reached WaitAny/WaitAll as its OWN terminal consumer (the claim
+                            // just above), so — exactly as for a buffered verb — nobody can write its stdin
+                            // any more: end an untaken `KeepStdinOpen` writer's input, or a raced child that
+                            // reads to EOF never exits and never completes this wait. A no-op when there is
+                            // none, and never on the branches above, where the owning consumer answers for
+                            // the pipe instead.
+                            finishUnclaimedStdin ()
 
                             // `ensureBufferedWait()`, not `waitWithTimeout()`: a readiness probe may already
                             // own the one shared exit wait (see the doc comment above), and `consumption`
