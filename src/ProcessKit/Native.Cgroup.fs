@@ -959,8 +959,8 @@ module internal Cgroup =
             None
 
     /// cgroup accounting for `stats`: cumulative CPU (`cpu.stat` `usage_usec`), peak memory
-    /// (`memory.peak`), peak process count (`pids.peak`), and aggregate block I/O (`io.stat`), each
-    /// `None` when its file is unavailable.
+    /// (`memory.peak`), peak task count (`pids.peak`), and aggregate block I/O (`io.stat`), each `None`
+    /// when its file is unavailable.
     let cgroupStats (cgroupPath: string) : TimeSpan option * int64 option * int64 option * ProcessIoCounters option =
         let cpu =
             try

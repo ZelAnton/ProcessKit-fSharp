@@ -956,12 +956,16 @@ Console.WriteLine((group.Stats()) switch
 `PeakProcessCount` (`int64 option`), `TotalCpuTime` (`TimeSpan option`),
 `PeakMemoryBytes` (`int64 option`), and four `int64 option` I/O counters:
 `IoReadBytes`, `IoWriteBytes`, `IoReadOperations`, and `IoWriteOperations`. Linux
-cgroup v2 supplies `PeakProcessCount` from the kernel's lifetime `pids.peak` counter;
-it is `None` on Windows and the POSIX fallback, never estimated from caller-driven
-`Stats()` samples. Windows Job Object accounting and Linux cgroup v2 provide the
-other tree aggregates (cgroup bytes/operations come from block-device `io.stat`
-when the I/O controller is delegated to that hierarchy). On the POSIX process-group
-backend only the live count is reported and all optional metrics stay `None`.
+cgroup v2 supplies `PeakProcessCount` from the kernel's lifetime `pids.peak` counter
+only when `MaxProcesses` is configured and the kernel is version 6.6 or later. This
+is the peak number of kernel tasks (processes and their threads), so it is not
+directly comparable with `ActiveProcessCount`, which counts process leaders. The
+peak is `None` on Windows and the POSIX fallback, and is never estimated from
+caller-driven `Stats()` samples. Windows Job Object accounting and Linux cgroup v2
+provide the other tree aggregates (cgroup bytes/operations come from block-device
+`io.stat` when the I/O controller is delegated to that hierarchy). On the POSIX
+process-group backend only the live count is reported and all optional metrics stay
+`None`.
 
 `MemberStats()` provides the per-member view when a tree aggregate is not enough:
 

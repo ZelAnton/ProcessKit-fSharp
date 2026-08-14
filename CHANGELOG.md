@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `ProcessGroupStats.PeakProcessCount` exposes Linux cgroup v2's native lifetime `pids.peak` counter and returns `None` on Windows, the POSIX process-group fallback, or when the controller file is unavailable.
+- `ProcessGroupStats.PeakProcessCount` exposes Linux cgroup v2's native lifetime peak task count (processes and threads) when `MaxProcesses` is configured on Linux 6.6+, and returns `None` on Windows, the POSIX process-group fallback, or when `pids.peak` is unavailable.
 - Opt-in non-interactive jj editor configuration: `scripts/setup-jj-noninteractive.ps1` sets a repository-wide guard that makes editor-driven jj commands fail with clear guidance instead of blocking on an interactive prompt, with an advisory check in `scripts/check-env.ps1` and setup guidance in `CONTRIBUTING.md`.
 - The diagnostic result returned by `RunningProcess.FinishAsync` now exposes `Finished.Truncated`; for a single streaming process it is `true` when the stdout line or chunk stream dropped items or captured stderr was shortened by its `OutputBuffer` policy.
 - `Exec.outputAllWithPolicy` / `outputAllBytesWithPolicy` add an explicit `BatchPolicy` to the batch fan-out verbs: `BatchPolicy.CollectAll` behaves exactly like `outputAll`/`outputAllBytes` (the default, unchanged), while `BatchPolicy.FailFast` stops starting any command still waiting for a concurrency slot and cancels every command already running on the batch's first `Error`, while every element still gets a `Result` in input order and a command's own `Retry` policy sees the cancellation exactly like the caller's own `CancellationToken`.

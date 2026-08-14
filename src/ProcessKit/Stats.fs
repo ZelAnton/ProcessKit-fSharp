@@ -34,8 +34,10 @@ type ProcessGroupStats
     /// processes; with a Job Object (or cgroup) it is the exact process count.
     member _.ActiveProcessCount = activeProcessCount
 
-    /// Maximum number of processes that have simultaneously belonged to the group over its lifetime,
-    /// if the containment mechanism exposes a native counter. Linux cgroup v2 reports `pids.peak`;
+    /// Maximum number of kernel tasks (processes and their threads) charged to the group at once over
+    /// its lifetime, if the containment mechanism exposes a native counter. Linux cgroup v2 reports
+    /// `pids.peak` only when `MaxProcesses` is configured and the kernel is version 6.6 or later. This
+    /// task count is not directly comparable with `ActiveProcessCount`, which counts process leaders.
     /// Windows Job Objects and the POSIX process-group fallback return `None`.
     member _.PeakProcessCount = peakProcessCount
 

@@ -296,15 +296,18 @@ are reported.
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
 |---|:---:|:---:|:---:|
 | `ActiveProcessCount` | ✅ | ✅ | ✅ |
-| `PeakProcessCount` | ❌ `None` | ✅ `pids.peak` | ❌ `None` |
+| `PeakProcessCount` | ❌ `None` | 🟡 `pids.peak` with `MaxProcesses`, Linux 6.6+ | ❌ `None` |
 | `TotalCpuTime` + `PeakMemoryBytes` | ✅ | ✅ | ❌ active count only |
 | `IoReadBytes` / `IoWriteBytes` + operation counts | ✅ Job aggregate | 🟡 `io.stat` when I/O is delegated | ❌ `None` |
 
 On the POSIX process-group mechanism, all optional `ProcessGroupStats` metrics are `None` — only the
 live process count is available. Windows reads Job Object accounting but has no lifetime peak-process
-counter. The cgroup mechanism reads `pids.peak`, `cpu.stat`, `memory.peak`, and, when that controller is
-delegated, block-device counters from `io.stat`; an unavailable controller file yields `None` rather
-than a fabricated zero or a sampled estimate.
+counter. On Linux cgroup v2, `pids.peak` is available only when `MaxProcesses` is configured (which
+delegates the `pids` controller) and the kernel is version 6.6 or later. It measures the peak number of
+kernel tasks, including both processes and their threads, and is therefore not directly comparable
+with `ActiveProcessCount`, which counts process leaders. The cgroup mechanism also reads `cpu.stat`,
+`memory.peak`, and, when that controller is delegated, block-device counters from `io.stat`; an
+unavailable controller file yields `None` rather than a fabricated zero or a sampled estimate.
 
 **Resource limits (`ProcessGroupOptions`)**
 
