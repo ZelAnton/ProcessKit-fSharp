@@ -1054,10 +1054,17 @@ module internal Posix =
         /// The process GROUP answers: deliver to the whole tree with `killpg`, exactly as before.
         | Group
         /// The group number does not (yet) name a group, but the tracked leader pid is still our own
-        /// live, identity-matched child: deliver to that ONE pid with `kill`. The pre-`setsid()` PTY
-        /// window (see `processAlive`); never a substitute for the group delivery once the group exists.
+        /// live, identity-matched child: reach that ONE pid with `kill`. The pre-`setsid()` PTY window
+        /// (see `processAlive`); never a substitute for the group delivery once the group exists, which
+        /// is why the delivery primitives still consider the group as well (see `signalLeaderPid` and
+        /// `killTracked`) — this verdict was probed a moment BEFORE the delivery, and by the time the
+        /// delivery lands the child may own that group after all.
         | LeaderPid
-        /// Gone by BOTH probes (or recycled by a stranger): deliver nothing and prune the record.
+        /// Nothing of ours is at that number: deliver nothing and prune the record. THREE ways to get
+        /// here, not two — `ESRCH` from both probes; a positive recycle proof (a live number whose
+        /// current start-time token differs from the captured one); and a live number the exact-leader
+        /// route cannot vouch for because a known, matching token is missing on either side (see
+        /// `leaderPidStillTracked`, which spells out that deliberately fail-closed third case).
         | Gone
 
     // Is the exact tracked pid still the very process we captured `identity` for? Deliberately STRICTER
@@ -1075,6 +1082,16 @@ module internal Posix =
     // reaped, its number was recycled, and a stranger now holds it. That is what the identity read
     // settles: the stranger reads back a different start time (or none at all), so it is reported `Gone`
     // and never signalled — the wrong-target kill T-084 closes, unchanged by this route.
+    //
+    // What that strictness COSTS, stated plainly rather than glossed over. When no token is known on
+    // either side — a host with no identity reader, or a read that failed at track time — a live pid
+    // whose group answers `ESRCH` is reported `Gone` too, so the record is pruned and a child that is
+    // actually alive drops out of the container exactly as it did before this route existed. That is the
+    // fail-closed choice: the alternative is to deliver on the strength of a bare pid NUMBER, which is
+    // the wrong-target kill itself, and losing a live child from tracking is the lesser harm of the two.
+    // It is not a hypothetical the code silently assumes away, and it is not "only `ESRCH` from both
+    // probes prunes an entry": the reachable third case is documented here, on `TrackedTarget.Gone`, and
+    // in `docs/internals/architecture.md`, and it is pinned by tests.
     let private leaderPidStillTracked (id: int) (identity: uint64 option) : bool =
         match identity, readProcessIdentity id with
         | Some captured, Some current -> captured = current
@@ -1097,9 +1114,15 @@ module internal Posix =
     /// number equals its pid does not exist yet. Reporting that as gone would drop a live child from
     /// tracking and skip its kill/signal entirely. So the exact pid is probed too, and while it is still
     /// our identity-matched child the verdict is `LeaderPid`: the record STAYS tracked and the operation
-    /// is delivered directly to the pid (see `signalTracked`/`killTracked`). Only `ESRCH` from BOTH
-    /// probes — or a positive recycle proof — is `Gone`. After `setsid()` the group exists (pgid == pid)
-    /// and the verdict is `Group` again, so the whole-tree `killpg` delivery is unchanged.
+    /// reaches that pid (see `signalTracked`/`killTracked`). After `setsid()` the group exists
+    /// (pgid == pid) and the verdict is `Group` again, so the whole-tree `killpg` delivery is unchanged.
+    ///
+    /// `Gone` — the ONE verdict that prunes a record — is reached three ways, not two: `ESRCH` from both
+    /// probes; a positive recycle proof; and a live pid the exact-leader route cannot vouch for, because
+    /// a known, matching start-time token is missing on either side. That last case keeps a bare pid
+    /// NUMBER from ever being a delivery gate (T-084) at the price of dropping a live child from
+    /// tracking when its identity cannot be read at all — deliberately fail-closed, spelled out on
+    /// `leaderPidStillTracked` and `TrackedTarget.Gone`.
     let trackedTarget (id: int) (identity: uint64 option) : TrackedTarget =
         if processGroupAlive id then
             if identity.IsNone then
@@ -1205,33 +1228,67 @@ module internal Posix =
         observeGroupDelivery pid
         kill (pid, SIGKILL) |> ignore
 
-    // The exact-leader half of the `TrackedTarget.LeaderPid` route: `kill(pid, …)` on the ONE tracked
-    // leader, with the same non-deliverable-number refusal the group primitive applies (so signal 0 can
-    // never masquerade as a delivered signal here either). Both observers fire: the shared one records
-    // that the target was reached, the leader-pid one records that it was reached by this route.
+    // The delivery half of the `TrackedTarget.LeaderPid` route for an OBSERVABLE signal, with the same
+    // non-deliverable-number refusal the group primitive applies (so signal 0 can never masquerade as a
+    // delivered signal here either).
+    //
+    // The verdict is not the delivery. `trackedTarget` probed a moment ago and found no group carrying
+    // this number; by the time this call runs, the child may have completed the very `setsid()` the
+    // probe caught it before — and a `setsid`ed pty leader is exactly the kind of child that goes on to
+    // fork a subtree. So the GROUP is tried first, and the exact pid is used only when `killpg` answers
+    // `ESRCH`: proof that nothing was delivered because no such group exists, which is the pre-`setsid()`
+    // window this route was built for. Two alternatives, never both — an observable signal (a SIGTERM
+    // handler, a SIGSTOP/SIGCONT pair) must not be delivered twice. `killTracked` inverts that trade for
+    // SIGKILL, where a duplicate is invisible to the target and the tree guarantee is worth more.
+    //
+    // Trying `killpg` here does NOT widen the wrong-target window T-084 closes. A process group numbered
+    // `pid` can be created only by the process `pid` itself (`setsid()`, or a `setpgid` naming it), the
+    // group probe just answered that no such group existed, and the pid probe just answered that `pid`
+    // is our own live, identity-matched child — so a group appearing at that number in between can only
+    // be that child's own. Note this is the mirror image of, not a contradiction with, `signalTracked`'s
+    // refusal to retry a `Group` verdict's `TargetGone` against the pid: there the group drained because
+    // the child exited and the number may already be recycled, and no pid probe ever vouched for it.
+    //
+    // Both observers fire on the exact-pid delivery: the shared one records that the target was reached
+    // (it fires once per native delivery ATTEMPT, so the `killpg` above records one of its own), the
+    // leader-pid one records that it was reached by this route.
     let private signalLeaderPid (pid: int) (signalNum: int) : SignalDelivery =
         if not (isDeliverableSignal signalNum) then
             SignalDelivery.DeliveryFailed(
                 EINVAL,
-                $"signal {signalNum} is a liveness probe / non-signal, not a deliverable signal — refused before kill"
+                $"signal {signalNum} is a liveness probe / non-signal, not a deliverable signal — refused before "
+                + "kill/killpg"
             )
         else
-            observeLeaderPidDelivery pid
-            observeGroupDelivery pid
-            classifySignalDelivery (kill (pid, signalNum))
+            match signalProcessGroup pid signalNum with
+            | SignalDelivery.TargetGone ->
+                // No group carries that number after all: the pre-`setsid()` window is real, and the one
+                // live process at this number is our identity-matched child. Reach it directly.
+                observeLeaderPidDelivery pid
+                observeGroupDelivery pid
+                classifySignalDelivery (kill (pid, signalNum))
+            | groupOutcome ->
+                // The group existed and answered (delivered, or a failure worth reporting). Do not also
+                // hit the pid: that is the double delivery this ordering exists to avoid. A `killpg`
+                // that failed for permission is no reason to try the pid either — the group's leader IS
+                // that pid, so a permission that stops the group stops the single-pid kill as well.
+                groupOutcome
 
     /// Deliver `signalNum` to a tracked id, ROUTED by the verdict `trackedTarget` returned for it: to the
-    /// whole process group (`killpg` — the normal path, unchanged), or directly to the exact leader pid
-    /// while its group does not exist yet (the pre-`setsid()` pty window). `Gone` delivers nothing and
-    /// reports `TargetGone`: the two halves of that verdict — keeping the record and reaching it — must
-    /// stay together, or a live entry would remain tracked and never receive anything.
+    /// whole process group (`killpg` — the normal path, unchanged), or through the exact-leader route
+    /// while that group does not exist yet (the pre-`setsid()` pty window — see `signalLeaderPid`, which
+    /// still tries the group first and falls back to the pid only on `ESRCH`, because the probe ran
+    /// before this delivery and the child may own its group by now). `Gone` delivers nothing and reports
+    /// `TargetGone`: the two halves of that verdict — keeping the record and reaching it — must stay
+    /// together, or a live entry would remain tracked and never receive anything.
     ///
-    /// The route is decided by the probe, BEFORE the delivery, and a `TargetGone` from a `Group` delivery
-    /// is deliberately NOT retried against the pid. That retry would fire on the ordinary, common case —
-    /// a group that drained because the child exited — and would follow it with a by-number probe of a
-    /// pid the OS may already have recycled, resting the wrong-target guarantee on the identity read
-    /// alone in a path that today needs no such trust. Deciding first keeps the exact-pid route confined
-    /// to the case it exists for: a group number that never named a group at all.
+    /// The asymmetry between the two live verdicts is deliberate. A `TargetGone` from a `Group` delivery
+    /// is NOT retried against the pid: that retry would fire on the ordinary, common case — a group that
+    /// drained because the child exited — and would follow it with a by-number probe of a pid the OS may
+    /// already have recycled, resting the wrong-target guarantee on the identity read alone in a path
+    /// that today needs no such trust. The `LeaderPid` route is the opposite situation and carries the
+    /// opposite risk: its pid has just been proven ours and alive, and it is the GROUP whose absence
+    /// might be stale by the time the signal lands, so there the group is what gets tried first.
     let signalTracked (target: TrackedTarget) (id: int) (signalNum: int) : SignalDelivery =
         match target with
         | TrackedTarget.Group -> signalProcessGroup id signalNum
@@ -1252,15 +1309,37 @@ module internal Posix =
         | TrackedTarget.LeaderPid -> signalLeaderPid id sigCont
         | TrackedTarget.Gone -> SignalDelivery.TargetGone
 
-    /// Hard-kill a tracked target (SIGKILL), routed exactly like `signalTracked`: the whole process group,
-    /// or the exact leader pid while that group does not exist yet. `Gone` kills nothing — the point of
-    /// the verdict is that a recycled or vanished number is never the thing we SIGKILL.
+    /// Hard-kill a tracked target (SIGKILL), routed like `signalTracked` — the whole process group, or an
+    /// exact leader pid whose group does not exist yet — with ONE deliberate difference: the exact-leader
+    /// route delivers BOTH halves, `kill(pid)` and then `killpg(pid)`, never just one. `Gone` kills
+    /// nothing: the point of the verdict is that a recycled or vanished number is never the thing we
+    /// SIGKILL.
+    ///
+    /// Why both, and why that order. The verdict was probed BEFORE this call, and `LeaderPid` is by
+    /// definition the answer from the narrow window in which the child is about to call `setsid()` — a
+    /// managed call, a P/Invoke and one preemption of this thread are enough for it to become the leader
+    /// of group `pid` and (for a pty-wrapped shell, the very case this route exists for) fork a subtree
+    /// under it. A lone `kill(pid)` would then kill the leader and leave that subtree running, reparented
+    /// to init, with the teardown's `children.Drain()` erasing the record right behind it — no second
+    /// pass, and precisely the whole-tree kill-on-drop guarantee lost. The direct kill goes FIRST because
+    /// after it the child can no longer create a group or fork into one; the `killpg` behind it then
+    /// sweeps whatever it did manage to create beforehand. Delivering both is what the spawn-fault path
+    /// in this file (`postSpawnTeardown`) has always done for this same window, and a duplicate SIGKILL
+    /// costs nothing — it is invisible to the target, unlike the observable signals `signalLeaderPid`
+    /// keeps to exactly one route.
+    ///
+    /// The added `killpg` does not weaken the T-084 wrong-target gate. Only the process `pid` itself can
+    /// create a process group numbered `pid`; the group probe has just answered that no such group
+    /// existed, and the pid probe that `pid` is our own live, identity-matched child. A group found at
+    /// that number can therefore only be that child's own — this reaches strictly further into OUR tree,
+    /// never onto a stranger.
     let killTracked (target: TrackedTarget) (id: int) : unit =
         match target with
         | TrackedTarget.Group -> killProcessGroup id
         | TrackedTarget.LeaderPid ->
             observeLeaderPidDelivery id
             killProcess id
+            killProcessGroup id
         | TrackedTarget.Gone -> ()
 
     // A connected AF_UNIX SOCK_STREAM socket pair for one piped stdio channel, used instead of a bare
@@ -3646,7 +3725,9 @@ module internal Posix =
                     // spawn-fault path with a direct single-pid kill (below); on the NORMAL path the
                     // containment backend closes it through the shared `trackedTarget` choke, whose
                     // `LeaderPid` verdict keeps the freshly-spawned leader tracked on that `ESRCH` and
-                    // routes its kill/signal straight to the pid until the group exists.
+                    // reaches it by pid until the group exists — a hard kill in that window still sweeps
+                    // the group as well (`killTracked`), because the child may have won the race to
+                    // `setsid()` between the probe and the kill.
                     let groupFlag =
                         if config.Pty.IsSome then 0s
                         elif config.Setsid then posixSpawnSetsid

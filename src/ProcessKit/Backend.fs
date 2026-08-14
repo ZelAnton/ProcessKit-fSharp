@@ -90,9 +90,13 @@ module internal PosixReap =
     /// recycled stranger. A matching or unknown token falls back to the by-number kill exactly as before
     /// (a leader reaped while descendants keep the pgid alive is still cleaned up), and a leader whose
     /// GROUP does not exist yet — a pty child between `posix_spawn` and its helper's `setsid()` — is
-    /// SIGKILLed directly by pid (`TrackedTarget.LeaderPid`) instead of being skipped as gone, which is
-    /// what used to strand a just-spawned pty child on teardown. The bounded reap's `waitpid` only ever
-    /// reaps our OWN child, so a recycled pid there is a harmless `ECHILD` — it needs no gate.
+    /// SIGKILLed through the exact-leader route (`TrackedTarget.LeaderPid`: the pid itself, then a
+    /// `killpg` sweep behind it, in case the child won the race to `setsid()` since the probe) instead of
+    /// being skipped as gone, which is what used to strand a just-spawned pty child on teardown. This is
+    /// the LAST chance to reach that subtree — the drain erases the tracking record straight afterwards
+    /// — which is why the kill here reaches both halves rather than the leader alone. The bounded reap's
+    /// `waitpid` only ever reaps our OWN child, so a recycled pid there is a harmless `ECHILD` — it needs
+    /// no gate.
     ///
     /// Routing the kill changes nothing about the REAP: there is still exactly one `reap` call per
     /// leader here and no second `waitpid` path (K-016). Which primitive delivered the SIGKILL is not
@@ -1085,8 +1089,10 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
         member _.KillChild(spawned) =
             // Hard-kill this one child's group — but only while it is still OURS. A recycled pgid
             // (identity differs) must never be SIGKILLed (wrong-target kill); gate it through the choke
-            // and prune it instead. A pty leader whose group does not exist yet is SIGKILLed by pid
-            // rather than skipped, so an immediate kill after the spawn cannot leave it running.
+            // and prune it instead. A pty leader whose group does not exist yet is SIGKILLed by pid (and
+            // swept by `killpg` behind it, for the case it became a group leader between the probe and
+            // the kill) rather than skipped, so an immediate kill after the spawn cannot leave it — or a
+            // subtree it just forked — running.
             let pgid = int spawned.Handle
             let target = targetOf pgid
 
@@ -1123,7 +1129,9 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
 
             // All three phases route through the SAME snapshotted-token verdict: what is delivered, and
             // where it is delivered, are one decision per phase (never a liveness answer from one probe
-            // paired with a delivery to a different target).
+            // paired with a delivery to a different target). The verdict is re-probed per phase — only
+            // the identity TOKEN is snapshotted (K-086) — so a child that becomes a group leader during
+            // the grace period is escalated against its group, not its bare pid.
             let targetSnap (pgid: int) : Native.Posix.TrackedTarget =
                 match Map.tryFind pgid identitySnapshot with
                 | Some token -> Native.Posix.trackedTarget pgid token
@@ -1133,6 +1141,9 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                 pgids |> List.exists (fun pgid -> not (TrackedTargets.isGone (targetSnap pgid)))
 
             GracefulTeardown.poll
+                // The soft sweep: `signalTracked` sends an OBSERVABLE signal, so a `LeaderPid` verdict
+                // reaches exactly one of the two targets — the group if it exists by now, the pid only on
+                // its `ESRCH` — never both. No child is asked to handle the same stop signal twice.
                 (fun () ->
                     for pgid in pgids do
                         let target = targetSnap pgid
@@ -1141,6 +1152,11 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                             Native.Posix.signalTracked target pgid (Native.Posix.signalNumber signal)
                             |> ignore)
                 anyChildAliveSnap
+                // The escalation. `killTracked` is what makes this whole-tree even for a child still in
+                // its pre-`setsid()` window: the `LeaderPid` route SIGKILLs the pid and sweeps `killpg`
+                // behind it, so a subtree the child forked between the probe and this kill goes with it.
+                // This sweep stands on its own — a graceful `Stop` need not be followed by a
+                // `HardRelease` (the group may keep running), so it cannot borrow teardown's kill.
                 (fun () ->
                     for pgid in pgids do
                         let target = targetSnap pgid
@@ -1254,9 +1270,11 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
             // Passing each pgid's captured identity to `PosixReap.leader` gates AND routes its kill
             // through the choke, so teardown never SIGKILLs a pgid recycled since it was tracked (a
             // wrong-target kill) and still reaches a leader whose group does not exist yet (a pty child
-            // before its `setsid()`, SIGKILLed by pid). Drain (atomic take-and-clear), not Snapshot: a
-            // Snapshot would leave the tracking list populated after teardown, and a concurrent per-child
-            // cleanup (a run's `Release`) could still see (and re-reap) the same pgid — after the first
+            // before its `setsid()`: SIGKILLed by pid, with a `killpg` sweep behind it so a subtree it
+            // forked in the meantime cannot outlive the record this call is about to erase — after the
+            // drain there is no later pass). Drain (atomic take-and-clear), not Snapshot: a Snapshot
+            // would leave the tracking list populated after teardown, and a concurrent per-child cleanup
+            // (a run's `Release`) could still see (and re-reap) the same pgid — after the first
             // killpg/waitpid the OS may reuse that pid, so a second killpg would land on an unrelated
             // process group (wrong-target kill).
             //

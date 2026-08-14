@@ -17,12 +17,13 @@ open ProcessKit
 ///
 /// The `/proc/<pid>/stat` field-22 parser is unit-tested directly with synthetic lines. The
 /// reuse/non-regression behavior is driven through `Native.Posix`'s process-wide identity/liveness/
-/// delivery seams (`readProcessIdentityForTests`, `processGroupAliveForTests`,
-/// `groupDeliveryObserverForTests`) so a recycled number can be simulated deterministically rather than
-/// racing a real OS pid recycle. The seams are set and reset in a `finally`; the fixture runs
-/// sequentially (no `[Parallelizable]`), so they never race a concurrent probe. The synthetic pgid
-/// numbers are far above any real pid, so the delivery primitives' own (still real) `killpg`/`waitpid`
-/// calls are harmless `ESRCH`/`ECHILD` no-ops.
+/// delivery seams (`readProcessIdentityForTests`, `processGroupAliveForTests`, `processAliveForTests`,
+/// `groupDeliveryObserverForTests`, `leaderPidDeliveryObserverForTests`) so a recycled number — or the
+/// pre-`setsid()` pty window — can be simulated deterministically rather than racing a real OS pid
+/// recycle. The seams are set and reset in a `finally`; the fixture runs sequentially (no
+/// `[Parallelizable]`), so they never race a concurrent probe. The synthetic pgid numbers are far above
+/// any real pid, so the delivery primitives' own (still real) `kill`/`killpg`/`waitpid` calls are
+/// harmless `ESRCH`/`ECHILD` no-ops.
 [<TestFixture>]
 type PosixIdentityReuseTests() =
 
@@ -101,6 +102,12 @@ type PosixIdentityReuseTests() =
             Native.Posix.readProcessIdentityForTests <- None
             Native.Posix.groupDeliveryObserverForTests <- None
             Native.Posix.leaderPidDeliveryObserverForTests <- None
+
+    // How many deliveries an observer recorded for `id`. Both observers fire once per native delivery
+    // ATTEMPT, so the count is what tells a single delivery apart from the exact-leader hard kill's two
+    // halves (the pid itself, then the `killpg` sweep behind it).
+    let deliveries (observed: ResizeArray<int>) (id: int) : int =
+        observed |> Seq.filter ((=) id) |> Seq.length
 
     [<Test>]
     member _.``liveness seam keeps permission-denied groups tracked and prunes missing groups``() =
@@ -697,6 +704,122 @@ type PosixIdentityReuseTests() =
                 Is.Empty,
                 "with a live group, delivery must go through killpg so the whole tree is reached"
             ))
+
+    [<Test>]
+    member _.``a hard kill in the pre-setsid window sweeps the group as well as the exact pid``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // The verdict is probed BEFORE the delivery, and `LeaderPid` is by definition the answer from the
+        // instant in which the child is about to call `setsid()`: preemption between the probe and the
+        // delivery is enough for it to become the leader of group `pid` and fork a subtree under it (a
+        // pty-wrapped shell does exactly that). A kill delivered to the pid alone would take the leader
+        // and leave that subtree running — with teardown's drain erasing the tracking record right
+        // behind it, so nothing would ever come back for it. The exact-leader route therefore delivers
+        // BOTH halves: the pid, then a `killpg` sweep behind it.
+        runWithPreSetsidSeams (fun current live delivered direct ->
+            let pid = 2_000_000_340
+            current[pid] <- Some 7_400UL
+            live.Add pid |> ignore
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.Track(spawnedFor pid) |> ignore
+
+            backend.KillChild(spawnedFor pid)
+
+            Assert.That(deliveries direct pid, Is.EqualTo 1, "the exact-pid route must be taken, exactly once")
+
+            Assert.That(
+                deliveries delivered pid,
+                Is.EqualTo 2,
+                "a hard kill here must reach the exact pid AND sweep the group the child may have created since the probe"
+            )
+
+            // Non-regression on the ordinary route: once the group exists there is nothing to sweep
+            // twice, so a kill is one delivery to the group and never touches the exact-pid route.
+            delivered.Clear()
+            direct.Clear()
+            Native.Posix.processGroupAliveForTests <- Some(fun _ -> true)
+
+            backend.KillChild(spawnedFor pid)
+
+            Assert.That(deliveries delivered pid, Is.EqualTo 1, "a live group is killed by one killpg, as before")
+            Assert.That(direct, Is.Empty, "and never through the exact-pid route"))
+
+    [<Test>]
+    member _.``the graceful stop reaches a pre-setsid child with both its soft signal and its escalation``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // `GracefulKillTree` re-routes all three of its phases through the same verdict — the soft-signal
+        // sweep, the liveness question driving the poll, and the final SIGKILL sweep — so the pre-setsid
+        // window has to hold for a `Stop`, not just for a `Kill`. Deterministic, not timing-dependent:
+        // the seams keep the child alive for the whole grace, so the poll ALWAYS runs to its escalation;
+        // the grace only bounds how long that takes.
+        runWithPreSetsidSeams (fun current live delivered direct ->
+            let pid = 2_000_000_350
+            current[pid] <- Some 7_500UL
+            live.Add pid |> ignore
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.Track(spawnedFor pid) |> ignore
+
+            let graceful =
+                backend.GracefulKillTree Signal.Term (TimeSpan.FromMilliseconds 150.0)
+
+            Assert.That(
+                graceful.Wait(TimeSpan.FromSeconds 30.0),
+                Is.True,
+                "a graceful stop over a live pre-setsid child must still finish within its own grace"
+            )
+
+            // Two exact-pid deliveries: the soft signal, then the escalation. The second one is also the
+            // proof that the poll did NOT read the empty process group as "no children left" and skip its
+            // force-kill — that phase only runs while the liveness question still answers alive.
+            Assert.That(
+                deliveries direct pid,
+                Is.EqualTo 2,
+                "the soft signal and the escalation must BOTH reach the exact pid of a live pre-setsid child"
+            )
+
+            // Four delivery attempts in all: the soft phase tries the group and falls back to the pid,
+            // and the escalation kills the pid and sweeps the group behind it.
+            Assert.That(
+                deliveries delivered pid,
+                Is.EqualTo 4,
+                "the soft signal is delivered once (group, then pid on its ESRCH); the escalation delivers both halves"
+            )
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Does.Contain pid, "a graceful stop must not drop a live child")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}")
+
+    [<Test>]
+    member _.``a graceful stop over a child gone by both probes delivers nothing and does not sit out the grace``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // The negative half of the same path: nothing of ours is at that number, so no phase delivers
+        // anything — and the poll must fall straight through rather than waiting out a grace that has
+        // nothing to wait for. The grace is deliberately far longer than the bound asserted below, so a
+        // regression that polls it out fails the assertion instead of merely running slowly.
+        runWithPreSetsidSeams (fun current _live delivered direct ->
+            let gone = 2_000_000_360
+            current[gone] <- Some 7_600UL
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.Track(spawnedFor gone) |> ignore
+
+            let graceful = backend.GracefulKillTree Signal.Term (TimeSpan.FromSeconds 10.0)
+
+            Assert.That(
+                graceful.Wait(TimeSpan.FromSeconds 5.0),
+                Is.True,
+                "a graceful stop with nothing alive must fall through its poll, not wait out the whole grace"
+            )
+
+            Assert.That(delivered, Is.Empty, "a target gone by both probes must receive neither signal nor kill")
+            Assert.That(direct, Is.Empty, "least of all through the exact-pid route"))
 
     [<Test>]
     member _.``a live pty child whose process group probes gone is still killed by the group teardown``() : Task =
