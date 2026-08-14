@@ -39,8 +39,8 @@ dotnet test ProcessKit.slnx --filter "Category=Stress"
 dotnet test ProcessKit.slnx --filter "Category=Interleaving"
 ```
 
-The weekly and manually dispatched CI jobs use those same category filters and
-require a non-zero executed test count. Run a single ordinary test with:
+The weekly and manually dispatched CI jobs use those same category filters to
+run the opt-in suites. Run a single ordinary test with:
 
 ```sh
 dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"

@@ -62,12 +62,28 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: dotnet build "$GITHUB_WORKSPACE/ProcessKit.slnx" --no-restore --configuration Release
 
-      - name: Test F# API
+      - name: Test regular F# API
         shell: bash
         working-directory: ${{ runner.temp }}
         run: >-
           dotnet test "$GITHUB_WORKSPACE/tests/ProcessKit.Tests/ProcessKit.Tests.fsproj"
-          --no-build --configuration Release
+          --no-build --configuration Release --filter "Category!=Stress&Category!=Interleaving"
+
+      # Exercise the NUnit Explicit concurrency categories against the preview SDK rather than
+      # relying on the filterless run, which intentionally skips them.
+      - name: Test F# Stress category
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: >-
+          dotnet test "$GITHUB_WORKSPACE/tests/ProcessKit.Tests/ProcessKit.Tests.fsproj"
+          --no-build --configuration Release --filter "Category=Stress"
+
+      - name: Test F# Interleaving category
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: >-
+          dotnet test "$GITHUB_WORKSPACE/tests/ProcessKit.Tests/ProcessKit.Tests.fsproj"
+          --no-build --configuration Release --filter "Category=Interleaving"
 
       - name: Test C# API
         shell: bash

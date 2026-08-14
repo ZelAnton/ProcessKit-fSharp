@@ -27,7 +27,8 @@
 
 .PARAMETER Filter
     Optional `dotnet test --filter` expression
-    (e.g. "FullyQualifiedName~greet").
+    (e.g. "FullyQualifiedName~greet"). When omitted, the regular, Stress, and
+    Interleaving test groups run separately so the Explicit fixtures are included.
 
 .PARAMETER Rebuild
     Run `dotnet clean` before the tests.
@@ -118,9 +119,13 @@ if ($Rebuild) {
 $bashLines += "dotnet build -c $Configuration -p:TargetFrameworks=net10.0"
 $testCmd = "dotnet test --no-build -c $Configuration --framework net10.0 tests/ProcessKit.Tests/ProcessKit.Tests.fsproj"
 if ($Filter) {
-    $testCmd += " --filter `"$Filter`""
+    $bashLines += "$testCmd --filter `"$Filter`""
 }
-$bashLines += $testCmd
+else {
+    $bashLines += "$testCmd --filter `"Category!=Stress&Category!=Interleaving`""
+    $bashLines += "$testCmd --filter `"Category=Stress`""
+    $bashLines += "$testCmd --filter `"Category=Interleaving`""
+}
 $bashScript = $bashLines -join "`n"
 
 # Anonymous volumes shadow the host bin/obj folders inside the container so

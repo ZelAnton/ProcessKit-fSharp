@@ -596,7 +596,7 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration Release
 
-      # Selecting the category is the NUnit Explicit opt-in and must execute a non-zero test count.
+      # Selecting the category is the NUnit Explicit opt-in and runs tests matching this filter.
       - name: Stress test
         run: >-
           dotnet test --no-build --configuration Release --filter "Category=Stress"
@@ -644,7 +644,7 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration Release
 
-      # Selecting the category is the NUnit Explicit opt-in and must execute a non-zero test count.
+      # Selecting the category is the NUnit Explicit opt-in and runs tests matching this filter.
       - name: Interleaving test
         run: >-
           dotnet test --no-build --configuration Release --filter "Category=Interleaving"

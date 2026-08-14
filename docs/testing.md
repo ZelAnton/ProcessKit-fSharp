@@ -71,7 +71,7 @@ dotnet test ProcessKit.slnx --filter "Category=Interleaving"
 
 The main CI test job and `scripts/verify-all.ps1` retain the same explicit
 `Category!=Stress&Category!=Interleaving` filter. Weekly and manually dispatched
-CI jobs select each opt-in category and verify it executes tests.
+CI jobs select and run each opt-in category.
 
 ## The `IProcessRunner` seam
 

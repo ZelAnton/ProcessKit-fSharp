@@ -20,8 +20,11 @@ pwsh ./scripts/test-linux.ps1
 ```
 
 The script mounts the repo into `mcr.microsoft.com/dotnet/sdk:10.0` and runs
-`dotnet build` + `dotnet test` for the `net10.0` target framework (that image
-carries only the net10 runtime; CI exercises both `net8.0` and `net10.0`). The host's `bin/` and `obj/` folders are
+`dotnet build` plus separate regular, `Stress`, and `Interleaving` test groups
+for the `net10.0` target framework. The separate category filters opt the NUnit
+`Explicit` fixtures in; passing `-Filter` instead runs only the selected slice.
+The image carries only the net10 runtime; CI exercises both `net8.0` and
+`net10.0`. The host's `bin/` and `obj/` folders are
 shadowed inside the container with anonymous volumes, so the Linux build
 neither sees the Windows IDE artifacts nor writes back into the host tree.
 A named volume (`ProcessKit-nuget`) caches NuGet packages between runs.

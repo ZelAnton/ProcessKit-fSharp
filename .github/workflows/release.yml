@@ -296,8 +296,20 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration Release /p:Version=${{ steps.version.outputs.version }}
 
-      - name: Test
-        run: dotnet test --no-build --configuration Release
+      # Keep the regular suite and both NUnit Explicit categories as separate release gates so
+      # publishing cannot silently omit the concurrency-sensitive tests.
+      - name: Test regular suites
+        run: dotnet test --no-build --configuration Release --filter "Category!=Stress&Category!=Interleaving"
+
+      - name: Test Stress category
+        run: >-
+          dotnet test tests/ProcessKit.Tests/ProcessKit.Tests.fsproj
+          --no-build --configuration Release --filter "Category=Stress"
+
+      - name: Test Interleaving category
+        run: >-
+          dotnet test tests/ProcessKit.Tests/ProcessKit.Tests.fsproj
+          --no-build --configuration Release --filter "Category=Interleaving"
 
       - name: Pack
         run: dotnet pack src/ProcessKit/ProcessKit.fsproj --no-build --configuration Release --output ./artifacts /p:Version=${{ steps.version.outputs.version }}
