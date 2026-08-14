@@ -172,8 +172,9 @@ module internal PipelineStageGuard =
 /// **Whole-chain semantics.** The stream is the final stage's stdout, but `FinishAsync`/`StopAsync`
 /// reap and classify the ENTIRE chain: the returned `Finished.Outcome` is the pipefail representative
 /// (the rightmost checked stage that did not exit with an accepted code, or a `TimedOut`/`Cancelled`
-/// for the whole chain), and `Finished.Stderr` is that representative stage's stderr — identical to what
-/// `Pipeline.RunAsync` would report, never a final-stage-only view. Stopping or disposing tears down
+/// for the whole chain); when no checked stage failed, it is the final stage's real outcome, including
+/// an accepted unchecked non-zero exit. `Finished.Stderr` is that representative stage's stderr —
+/// identical to what `Pipeline.RunAsync` would report. Stopping or disposing tears down
 /// EVERY stage (including a partially started chain), never just the last. A genuine read failure in an
 /// upstream inter-stage relay is returned by `FinishAsync` as `ProcessError.Io`, even if the downstream
 /// stage observed the resulting EOF and exited successfully; a downstream broken pipe remains routine.
@@ -309,7 +310,9 @@ type PipelineSession
 /// pipeline analogue of `Command.StartAsync` → `RunningProcess`. The exit
 /// status follows shell **pipefail**: the rightmost stage that did not exit with an accepted code
 /// (its `Command.OkCodes`, `{0}` by default) determines the result, unless that stage opted out with
-/// `Command.UncheckedInPipe`.
+/// `Command.UncheckedInPipe`. When no checked stage failed, the final stage's real outcome and diagnostics
+/// are returned; an unchecked voluntary exit remains successful because its actual code is included in
+/// the result's accepted codes, not because the outcome is rewritten.
 ///
 /// Per-stage I/O config that applies inside a pipeline: each stage's `OkCodes` (pipefail) and
 /// `UncheckedInPipe`, the last stage's `StdoutEncoding`, `StdoutTee`, and `OutputBuffer` **byte** cap

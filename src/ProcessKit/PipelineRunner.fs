@@ -74,10 +74,10 @@ module internal PipelineClassify =
     let copyError (capture: PipelineCapture) : ProcessError option = capture.CopyError
 
     /// The representative stage carrying the program/outcome/stderr for the verb result: pipefail's
-    /// rightmost *checked* stage that did not exit with an accepted code; if every checked stage
-    /// succeeded, the last checked stage stands (so an unchecked, failed final stage does not fail the
-    /// pipeline). With no checked stages at all the pipeline is a success. A timed-out pipeline reports
-    /// `TimedOut` against the last stage.
+    /// rightmost *checked* stage that did not exit with an accepted code; if no checked stage failed,
+    /// the real last stage stands. An unchecked voluntary exit is made successful by adding its actual
+    /// code to the representative's accepted codes, never by replacing its outcome. A timed-out pipeline
+    /// reports `TimedOut` against the last stage.
     let representative (capture: PipelineCapture) : PipelineStage =
         let last = List.last capture.Stages
 
@@ -108,19 +108,16 @@ module internal PipelineClassify =
             match culprit with
             | Some stage -> stage // the checked failure the pipeline failed at
             | None ->
-                // No checked stage failed: the pipeline succeeded. Report the last checked stage
-                // (its accepted exit).
-                match List.tryLast checkedStages with
-                | Some stage -> stage
-                | None ->
-                    // Every stage opted out of pipefail (`UncheckedInPipe`): nothing can fail the
-                    // pipeline, so report success against the last stage regardless of its raw exit
-                    // (otherwise an all-unchecked chain with a failing last stage would wrongly fail
-                    // `RunAsync`/`ExitCodeAsync`). Use the last stage's own first accepted code.
-                    let okCode = last.OkCodes |> List.tryHead |> Option.defaultValue 0
-
+                // No checked stage failed: publish the last stage's REAL program/outcome/stderr. An
+                // unchecked voluntary non-zero exit still counts as pipeline success, but acceptance is
+                // metadata: retain that code and add it to `OkCodes` instead of fabricating `Exited 0`
+                // (or publishing an earlier checked stage). Signals, timeouts, and unobserved outcomes
+                // have no code to accept and therefore remain failures.
+                match last.Unchecked, last.Outcome with
+                | true, Outcome.Exited code when not (List.contains code last.OkCodes) ->
                     { last with
-                        Outcome = Outcome.Exited okCode }
+                        OkCodes = last.OkCodes @ [ code ] }
+                | _ -> last
 
     /// A genuine stage-0 stdin source failure surfaces as `ProcessError.Stdin` — uniformly with a single
     /// command — but only on an otherwise-successful pipeline (the pipefail representative exited with an

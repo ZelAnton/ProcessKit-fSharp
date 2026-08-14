@@ -314,6 +314,10 @@ type PipelineTests() =
         else
             shell (lines |> List.map (sprintf "echo %s") |> String.concat "; ")
 
+    let failWithStderr (message: string) (code: int) =
+        let separator = if isWindows then " & " else "; "
+        shell $"echo {message} 1>&2{separator}exit {code}"
+
     // Any non-clean exit is a genuine checked failure for the `observeStages` observation tests below
     // (a stage's OkCodes default to {0}, so anything but `Exited 0` is a blame-worthy failure).
     let checkedFailure = (fun (_: int) (o: Outcome) -> o <> Outcome.Exited 0)
@@ -843,6 +847,111 @@ type PipelineTests() =
             match! pipeline.RunAsync() with
             | Ok _ -> Assert.Pass()
             | Error error -> Assert.Fail $"expected success (last stage unchecked), got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``checked success followed by unchecked exit 141 preserves the real successful result``() : Task =
+        task {
+            let failingLast = (failWithStderr "unchecked-last-error" 141).UncheckedInPipe()
+
+            let pipeline = sortStage.Pipe failingLast
+
+            match! pipeline.OutputStringAsync() with
+            | Error error -> Assert.Fail $"expected unchecked exit 141 as successful data, got {error}"
+            | Ok result ->
+                Assert.That(result.IsSuccess, Is.True)
+                Assert.That(result.Program, Is.EqualTo failingLast.Program)
+                Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 141))
+                Assert.That(result.Stderr, Does.Contain "unchecked-last-error")
+                CollectionAssert.Contains(result.AcceptedCodes, 141)
+
+            match! pipeline.ExitCodeAsync() with
+            | Ok code -> Assert.That(code, Is.EqualTo 141)
+            | Error error -> Assert.Fail $"expected the real unchecked exit code, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``all-unchecked pipeline preserves the last exit code``() : Task =
+        task {
+            let pipeline =
+                (shell "exit 3").UncheckedInPipe().Pipe((shell "exit 7").UncheckedInPipe())
+
+            match! pipeline.OutputStringAsync() with
+            | Error error -> Assert.Fail $"expected all-unchecked success, got {error}"
+            | Ok result ->
+                Assert.That(result.IsSuccess, Is.True)
+                Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 7))
+                CollectionAssert.Contains(result.AcceptedCodes, 7)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``checked failure still wins over a later unchecked exit``() : Task =
+        task {
+            let checkedFailure = failWithStderr "checked-error" 3
+            let uncheckedLast = (shell "exit 7").UncheckedInPipe()
+
+            match! checkedFailure.Pipe(uncheckedLast).OutputStringAsync() with
+            | Error error -> Assert.Fail $"expected the checked exit as result data, got {error}"
+            | Ok result ->
+                Assert.That(result.Program, Is.EqualTo checkedFailure.Program)
+                Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited 3))
+                Assert.That(result.Stderr, Does.Contain "checked-error")
+                Assert.That(result.IsSuccess, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``unchecked last stage accepts only voluntary exits``() =
+        let stage program actual unchecked =
+            { Program = program
+              Outcome = actual
+              Unchecked = unchecked
+              Stderr = "last-error"
+              OkCodes = [ 0 ]
+              StderrTruncated = false
+              StderrTooLarge = false
+              StderrTotalBytes = 0
+              TornDown = false }
+
+        for outcome in
+            [ Outcome.Signalled(Some 13)
+              Outcome.TimedOut
+              Outcome.Unobserved "status unavailable" ] do
+            let last = stage "last" outcome true
+
+            let capture =
+                { LastStdout = Array.empty
+                  LastStdoutTruncated = false
+                  LastStdoutTooLarge = false
+                  LastStdoutTotalBytes = 0
+                  Stages = [ stage "first" (Outcome.Exited 0) false; last ]
+                  Duration = TimeSpan.Zero
+                  TimedOut = false
+                  Stdin0Error = None
+                  CopyError = None }
+
+            let representative = PipelineClassify.representative capture
+            Assert.That(representative.Program, Is.EqualTo last.Program)
+            Assert.That(representative.Outcome, Is.EqualTo outcome)
+            Assert.That(representative.Stderr, Is.EqualTo last.Stderr)
+            Assert.That(representative.Outcome.IsAcceptedBy representative.OkCodes, Is.False)
+
+    [<Test>]
+    member _.``streaming pipeline preserves a successful unchecked final exit``() : Task =
+        task {
+            let pipeline = sortStage.Pipe((shell "exit 141").UncheckedInPipe())
+
+            match! pipeline.StartAsync() with
+            | Error error -> Assert.Fail $"start failed: {error}"
+            | Ok session ->
+                use session = session
+
+                match! session.FinishAsync() with
+                | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 141))
+                | Error error -> Assert.Fail $"expected successful streamed completion, got {error}"
         }
         :> Task
 

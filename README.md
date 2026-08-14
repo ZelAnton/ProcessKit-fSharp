@@ -673,10 +673,10 @@ Console.WriteLine(await pipeline.OutputStringAsync() switch
 ```
 
 The outcome is **pipefail**: `Stdout` is the last stage's output, while the exit code, stderr, and
-reported program come from the first stage that didn't exit cleanly (or the last stage when all
-succeed). For a consumer that legitimately stops reading early (the `producer | head -1` shape),
-mark that stage `Command.uncheckedInPipe` and pipefail skips it. `Pipeline.Timeout` bounds the
-whole chain.
+reported program come from the rightmost checked failure, or from the real last stage when there is
+none. For a consumer that legitimately stops reading early (the `producer | head -1` shape), mark
+that stage `Command.uncheckedInPipe` and pipefail skips its voluntary non-zero exit when deciding
+success without replacing the result's real exit code. `Pipeline.Timeout` bounds the whole chain.
 
 A genuine failure while reading an upstream stage's stdout in the inter-stage relay is returned as
 `ProcessError.Io`, even if the downstream stage receives a truncated EOF and exits successfully. This

@@ -359,13 +359,13 @@ Console.WriteLine(await first.RunAsync() switch
 
 The rules:
 
-- An unchecked stage's unclean exit — a non-zero code, or a broken-pipe death from a
-  consumer that closed early (a failed write on Windows; `SIGPIPE` on POSIX where the OS
-  delivers it) — is **skipped** when the chain decides what to report.
+- An unchecked stage's voluntary non-zero exit is **skipped** when the chain decides whether
+  a checked stage failed. A signal, timeout, or unobserved outcome is never made acceptable.
 - A **checked** failure always trumps an unchecked one, regardless of position:
   `uncheckedInPipe` never shields another stage's real failure.
-- A chain whose only failures are unchecked reports **success** — the last stage's stdout
-  and code `0`.
+- When no checked stage failed, the result preserves the real last stage's program, outcome,
+  stderr, and exit code. If that last stage is unchecked and exited voluntarily, its actual
+  code is included in `AcceptedCodes`, so the result is successful without rewriting it to `0`.
 - `uncheckedInPipe` forgives exit *status* only — never a whole-chain
   [`Pipeline.Timeout`](#timeouts-and-cancellation) — and it has no effect on a `Command`
   run outside a pipeline, where a single run's status is already plain data in its
