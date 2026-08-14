@@ -449,8 +449,21 @@ batch wrapper reintroduces a shell, arguments are quoted for `cmd.exe`'s own gra
 ordinary argv rules — a metacharacter such as `&`, `|`, `<`, `>`, or `"` is delivered literally,
 never executed (the "BatBadBut" class, CVE-2024-24576). An argument `cmd.exe` cannot escape at all —
 a `%`, a `!`, or a line break — fails the spawn with a typed `ProcessError.Spawn` rather than
-launching unsafely. A `.exe` match, a path-form program, and anything on POSIX are unaffected (POSIX
-has no `PATHEXT`; the OS resolves them exactly as before).
+launching unsafely. A `.exe` match on an unchanged child `PATH` (see the next entry), a path-form
+program, and anything on POSIX are unaffected (POSIX has no `PATHEXT`; the OS resolves them exactly
+as before).
+
+**Windows resolves a bare name against the `PATH` the command sets for the child.** The OS's own
+bare-name search runs in the *parent's* context — it walks the calling process's `PATH`, never the
+environment block the child is given — so a command that overrides or clears the child's `PATH`
+(`Env("PATH", …)`, `EnvClear`) would otherwise launch a same-named executable from the process's own
+`PATH`. ProcessKit resolves such a command against its effective child `PATH` and substitutes the
+resolved absolute path into the launch, on every Windows launch path (ordinary, `Pty`/ConPTY, and
+`LaunchDetached`), so the executable that runs is the one `Command.ResolveProgram()` reports; if that
+`PATH` holds no such program, the launch fails `ProcessError.NotFound` with the same `Searched`
+before any process is created, rather than falling back to the process's `PATH`. A command that
+leaves the child's `PATH` alone keeps the OS's richer application/current/system-directory search
+unchanged. POSIX resolves a bare name through `posix_spawnp` and is unaffected.
 
 **`Command.WindowsRawArg` is Windows-only.** It appends a trusted fragment verbatim after all
 ordinarily quoted arguments for children with a non-MSVCRT parser. POSIX has an argv vector rather

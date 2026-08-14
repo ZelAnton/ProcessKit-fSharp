@@ -138,7 +138,8 @@ bare-name search appends only `.exe`, so it would report such a program as *not
 found* even though `Exec.which` locates it (both use the same `PATHEXT`-aware
 lookup). ProcessKit closes that gap: for a bare name it substitutes the resolved
 absolute path into the launch, and routes a `.cmd`/`.bat` through `cmd.exe /d /c`
-(a batch file is not a directly-launchable image). A `.exe` match, a path-form
+(a batch file is not a directly-launchable image). For a command that leaves the
+child's `PATH` alone (see the next paragraph), a `.exe` match, a path-form
 program, and a name that resolves to nothing are all launched exactly as before —
 the OS's richer bare-name search is never overridden. Arguments to a `.cmd`/`.bat`
 wrapper are quoted for `cmd.exe`'s own grammar (not just the ordinary argv rules),
@@ -146,6 +147,20 @@ so a metacharacter like `&`, `|`, `<`, `>`, or `"` in an argument is delivered a
 a literal, never executed (the "BatBadBut" class, CVE-2024-24576). An argument
 carrying a character `cmd.exe` cannot escape at all — a `%`, a `!`, or a line
 break — is an honest `ProcessError.Spawn` refusal rather than an unsafe launch.
+
+**Windows: a `PATH` you set for the child is the one that decides.** Windows
+resolves a bare program name in the *parent's* context — the OS searches the
+current process's `PATH`, not the environment block the child is handed — so a
+command that sets or clears the child's `PATH` (`Env("PATH", …)`, `EnvClear`)
+would otherwise launch whatever the *process's* `PATH` happens to hold under that
+name. ProcessKit resolves such a command against its own effective child `PATH`
+and hands the OS the resolved absolute path, so what runs is the executable
+`ResolveProgram()` names; and when that `PATH` holds no such program the run fails
+`NotFound` — carrying the same `Searched` — before anything is spawned, instead of
+falling back to a same-named executable from the process's `PATH`. A command that
+leaves the child's `PATH` alone is unaffected: the OS's own bare-name search reads
+the very `PATH` the resolver walked, so it still applies in full. POSIX is
+unaffected either way (the launch resolves a bare name through `posix_spawnp`).
 
 ### Preferring a project-local tool (`PreferLocal`)
 
