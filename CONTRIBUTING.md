@@ -154,6 +154,21 @@ reads the summary ReportGenerator already produced, so it needs a full set of ma
 cannot say anything useful about a local single platform run; its exit codes are 0 for honoured or
 skipped, 1 for a real regression, and 2 for a broken baseline or summary file.
 
+## Automation and non-interactive mode
+
+On Windows, jj defaults to Notepad for commit-description editing, which can leave an unattended
+run blocked on a GUI window. Before automated or otherwise non-interactive work, opt in to the
+repository-local guard:
+
+```sh
+pwsh ./scripts/setup-jj-noninteractive.ps1
+```
+
+The script changes only this checkout's `.jj/repo/config.toml`; it does not change your user-level
+jj configuration. Run `pwsh ./scripts/check-env.ps1` to verify the setup: it should no longer print
+the `ui.editor` warning. Commands that provide their message inline, such as
+`jj describe -m "Description"`, work the same before and after setup.
+
 ## Mutation testing
 
 Coverage answers "was this line executed". The mutation tier answers the harder question: **would the
