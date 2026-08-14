@@ -339,8 +339,11 @@ type private SaveLockAttempt =
 /// A record/replay `IProcessRunner`.
 ///
 /// **Record** mode wraps a real inner runner, captures each completed call to a JSON cassette
-/// (written on `Save`, or best-effort on dispose), and returns the live result. A call that ends in a
-/// typed failure this format can rebuild exactly — `NotFound`, `Spawn`, `Stdin`, `Exit`, `Signalled`,
+/// (written on `Save`, or best-effort on dispose once `Complete` has declared the recording finished —
+/// a recorder disposed before that writes nothing, an exception unwinding the stack past it included,
+/// while one disposed after it flushes however the scope ended, so complete last), and returns the live
+/// result. A call that ends in a typed failure this format can rebuild exactly — `NotFound`, `Spawn`,
+/// `Stdin`, `Exit`, `Signalled`,
 /// `Timeout`, `OutputTooLarge`, `Parse`, `JsonRpc` — is recorded as that failure and replays as it,
 /// so an expected failure is as reproducible as an expected success. Any other error (a cancellation,
 /// or one whose payload this format cannot carry) is returned to the caller and records nothing.
@@ -366,8 +369,9 @@ type private SaveLockAttempt =
 /// recording, so streaming/readiness consumers replay too). A one-shot stdin source (`FromStream` /
 /// `FromLines` / `FromAsyncLines`) cannot be keyed and errors.
 ///
-/// **Auto** mode (`Auto`) replays what the cassette holds and records+persists any miss, so a cassette
-/// is easy to grow. Record-mode `SpawnAsync` is unsupported (a live stream cannot be captured without
+/// **Auto** mode (`Auto`) replays what the cassette holds and records any miss, persisting it on the
+/// same terms record mode does (`Save`, or a dispose after `Complete`), so a cassette is easy to grow.
+/// Record-mode `SpawnAsync` is unsupported (a live stream cannot be captured without
 /// racing the consumer) — record a streaming call through a capture verb, then replay it as a stream.
 [<Sealed>]
 type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplayOptions) =
@@ -1111,8 +1115,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         attempt ()
 
     // How long the best-effort drop-time flush may wait for another writer's save to finish before
-    // giving up. `Save` itself never waits; a dispose does, briefly, because a momentary overlap should
-    // not silently drop a recording that nothing else will write.
+    // giving up. `Save` itself never waits; a completed recording's dispose does, briefly, because a
+    // momentary overlap should not silently drop a recording that nothing else will write.
     static let disposeFlushLockWait = TimeSpan.FromMilliseconds 250.0
 
     // Write the cassette atomically and owner-only: serialize into a UNIQUELY named sibling temp file,
@@ -1196,6 +1200,15 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // for a few instructions at a time) so an in-flight capture never waits on disk I/O. Lock order is
     // always `saveGate` → `gate`, never the reverse.
     let saveGate = obj ()
+
+    // Has the caller declared the recording finished (`Complete`)? This is the gate the drop-time flush
+    // sits behind, and it starts closed: `Dispose` runs both on a normal scope exit and while the stack
+    // unwinds out of a thrown exception or a failed assertion, and .NET hands it nothing to tell those
+    // apart (there is no portable equivalent of Rust's `thread::panicking()`), so the recorder asks for
+    // the signal it cannot observe rather than guessing — and a wrong guess writes verbatim argv/output
+    // to disk as a side effect of the crash. One-way, and read/written under `gate`, the same lock
+    // `dirty` is read under, so a `Complete` on one thread is visible to a dispose on another.
+    let completed = ref false
 
     // Apply the optional record-time redaction hook to captured text (coalescing a null return to "").
     let redactText (text: string) : string =
@@ -1823,7 +1836,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
     /// Replay a cassette at `path`, recording and persisting any invocation that **misses** (VCR "new
     /// episodes"): existing entries replay hermetically, a first-seen call is delegated to `inner`,
-    /// recorded, and grown into the cassette on `Save`/dispose. A missing file starts an empty cassette.
+    /// recorded, and grown into the cassette on `Save` — or on dispose, once `Complete` has declared the
+    /// recording finished, exactly as in record mode. A missing file starts an empty cassette.
     static member Auto(path: string, inner: IProcessRunner) : Result<RecordReplayRunner, ProcessError> =
         RecordReplayRunner.Auto(path, inner, RecordReplayOptions())
 
@@ -1856,6 +1870,40 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 )
             )
 
+    /// Declare the recording **finished**, so disposing this recorder may flush what it captured. Until
+    /// this is called, `Dispose` writes nothing at all: no cassette is created at `path`, and one already
+    /// there is left byte for byte as it was.
+    ///
+    /// This is the `TransactionScope.Complete()` shape, and for the same reason. `Dispose` runs both when
+    /// a scope ends normally and while the stack unwinds out of a thrown exception or a failed assertion,
+    /// and .NET gives it no way to tell those apart (there is no portable equivalent of Rust's
+    /// `thread::panicking()`) — so a dispose that flushed unconditionally left a cassette behind as a
+    /// side effect of the *crash*, and `program`, `args`, `cwd`, and captured `stdout`/`stderr` are
+    /// stored verbatim and can carry secrets. Marking completion moves that decision to the only place
+    /// that knows the answer: your own code, on the path it reaches only when the recording ran to the
+    /// end you intended.
+    ///
+    /// **Call it last — after everything in the scope that can throw, assertions included.** This mark is
+    /// the whole of the gate: dispose reads it and nothing else, and is never told how the scope ended.
+    /// So a scope that throws *before* this call writes no cassette at all, while a scope that throws
+    /// *after* it is flushed exactly as a normal exit would be — the verbatim argv and captured output of
+    /// the failed run reach disk. Completing before the assertions therefore hands a failing test the very
+    /// file this gate exists to withhold. If a recording must never be written by anything but a call you
+    /// can point at, do not complete at all and `Save()` where you want the file: without the mark,
+    /// dispose writes nothing however the scope ends.
+    ///
+    /// It only marks — no I/O, it never throws, and it is safe to call from any thread and more than once
+    /// — so the write still happens at dispose, best-effort and silent (a failure to write is not
+    /// reported), and it covers everything recorded by the time that dispose runs, including anything
+    /// captured after this call. `Save()` remains the durability path: it writes immediately and returns
+    /// the I/O error, and the two are independent in both directions — saving does not mark the recording
+    /// complete, and completing it does not save. A no-op in replay mode, which records nothing.
+    member _.Complete() : unit =
+        match mode with
+        | ReplayMode _ -> ()
+        | RecordMode _
+        | AutoMode _ -> lock gate (fun () -> completed.Value <- true)
+
     /// Write the recorded cassette to its path (owner-only `0600` on Unix). A no-op in replay mode.
     ///
     /// **Durable and atomic.** The whole cassette is written to a uniquely named sibling temp, flushed to
@@ -1874,6 +1922,11 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     /// rather than overwriting what that writer just saved. Failing loud beats last-writer-wins, which is
     /// silent. On a filesystem that cannot arbitrate advisory locks at all, cross-process serialization is
     /// not available and the save proceeds with only this recorder's own ordering guarantee.
+    ///
+    /// **Unconditional, and independent of `Complete()`.** A save writes whatever has been recorded at
+    /// the moment it is called, whether or not the recording has been declared finished, and it does not
+    /// declare it finished either — only the best-effort flush at dispose sits behind `Complete()`. This
+    /// is the call to make when a cassette must be on disk and a write failure must be seen.
     member _.Save() : Result<unit, ProcessError> =
         match mode with
         | ReplayMode _ -> Ok()
@@ -2123,12 +2176,18 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     interface IDisposable with
         member _.Dispose() =
             match mode with
+            // Two conditions, and the completion mark is the one carrying the safety. The shape of the
+            // scope exit is not consulted at all — it cannot be (see `Complete` for why detecting an
+            // unwind is not an option) — so what keeps a crashed test's recording off disk is that such a
+            // test never reached its `Complete`. An uncompleted recording is dropped rather than written
+            // (the cassette at `path`, if any, is not even opened); a completed one is flushed however the
+            // scope ended, unwind included; and `Save` persists one regardless, either way.
             | RecordMode(_, recorded, dirty)
-            | AutoMode(_, _, recorded, dirty) when lock gate (fun () -> dirty.Value) ->
+            | AutoMode(_, _, recorded, dirty) when lock gate (fun () -> completed.Value && dirty.Value) ->
                 try
                     // Same serialized, atomic write path as `Save`, but best-effort in every direction: a
                     // busy sibling lock is waited on only briefly and then given up on, and a write error
-                    // is returned rather than raised (an explicit `Save` is what surfaces one). The new
+                    // is returned rather than raised (an explicit `Save` is what surfaces one). The
                     // locking must not turn a drop-time flush into a throwing dispose.
                     saveUnderLocks recorded dirty disposeFlushLockWait |> ignore
                 with _ ->
