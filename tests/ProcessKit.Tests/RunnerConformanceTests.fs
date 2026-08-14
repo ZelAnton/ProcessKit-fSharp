@@ -351,7 +351,7 @@ type RunnerConformanceFixtureBase() =
                     |> Command.pty
 
                 match! this.Runner.OutputStringAsync(command, CancellationToken.None) with
-                | Error(ProcessError.Unsupported message) ->
+                | Error(ProcessError.Unsupported message) when (this :? RealRunnerConformanceFixtureBase) ->
                     // SupportsOsBackedPty=true is an OS-family assumption (Windows or Linux — see
                     // `ConformanceCapabilities`'s `OsBackedPty` row), not a probed host fact: a real host
                     // can still lack the concrete prerequisite (ConPTY needs Windows 10 1809+; POSIX
@@ -360,6 +360,14 @@ type RunnerConformanceFixtureBase() =
                     // `Command.Pty` promises for that gap, never a silent downgrade — skip here rather
                     // than fail, mirroring the same prerequisite-gap handling `PtyTests.fs`'s real PTY
                     // tests already do (e.g. its "requires Windows 10 1809" / missing-ctty-helper cases).
+                    //
+                    // Scoped to `RealRunnerConformanceFixtureBase` on purpose: the in-memory doubles
+                    // (`ScriptedRunner`/`DryRunRunner`, and `FaultInjectingRunner` wrapping one) simulate
+                    // `Command.Pty` unconditionally via `FakeProcess.WithPty()` with no host dependency at
+                    // all (see this type's `OsBackedPty` doc comment above), so they can NEVER legitimately
+                    // land here — if one ever did, that would be a regression in the double's PTY
+                    // simulation, not a prerequisite gap, and must fail loudly (the `Error error` branch
+                    // below), not be swallowed by this fallback.
                     Assert.Ignore $"host lacks a Command.Pty prerequisite despite OS-family support: {message}"
                 | Error error -> Assert.Fail $"unexpected error under Command.Pty: {error.Message}"
                 | Ok result ->
@@ -377,8 +385,13 @@ type RunnerConformanceFixtureBase() =
 /// Shared command-building over a real subprocess shell, reused by every real-runner-backed conformance
 /// fixture (`JobRunnerConformanceTests`, `RecordReplayRunnerConformanceTests`). Mirrors the `shell`
 /// helper already established by `JobRunnerTests`/`CorrectnessBugTests`.
-[<AbstractClass>]
-type RealRunnerConformanceFixtureBase() =
+///
+/// Declared `and`-recursive with `RunnerConformanceFixtureBase` (rather than as a separate `type` below
+/// it) because the shared PTY test above does a `this :? RealRunnerConformanceFixtureBase` type test to
+/// scope its `ProcessError.Unsupported` fallback to real runners only — that reference needs this type in
+/// scope at that point, which plain top-to-bottom compile order cannot give a type declared later in the
+/// same file.
+and [<AbstractClass>] RealRunnerConformanceFixtureBase() =
     inherit RunnerConformanceFixtureBase()
 
     // Static, shared across every subclass: the "Windows or Linux" platform assumption documented on
