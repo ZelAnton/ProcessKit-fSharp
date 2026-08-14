@@ -552,15 +552,19 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     /// Require a successful pipefail exit and return the last stage's stdout, trailing whitespace
     /// trimmed. Any checked stage that did not exit 0 fails the pipeline. Output a bounded
     /// `OutputBuffer` byte cap truncated (`DropOldest`/`DropNewest` on the captured last-stage stdout,
-    /// or on the representative stage's stderr) is refused with `ProcessError.OutputTooLarge` instead of
+    /// or on the stderr this result publishes) is refused with `ProcessError.OutputTooLarge` instead of
     /// being returned as if whole — `OutputStringAsync` is the lenient path, handing back the bounded
     /// payload with `ProcessResult.Truncated` set.
     ///
-    /// That refusal names the **pipefail representative** stage (the program on the result it judged) and
-    /// quotes the **last** stage's byte ceiling — the only ceiling a verb applied to the chain's captured
-    /// stdout can name. On an ordinary chain they are the same stage; they differ when the last stage opts
-    /// out of pipefail (`UncheckedInPipe`), which makes an earlier stage the representative, so a
-    /// truncation of THAT stage's stderr is reported against its program alongside the last stage's cap.
+    /// That refusal always names the **last** stage and quotes that same stage's byte ceiling — the only
+    /// ceiling a verb applied to the chain's captured stdout can name. The two cannot come apart here:
+    /// an earlier stage is the pipefail representative only when it is a CHECKED FAILURE
+    /// (`PipelineClassify.representative`), and the success check above has already turned such a chain
+    /// into its own `Exit`/`Signalled`/`Timeout` error before truncation is looked at; with no checked
+    /// failure the real last stage stands, whether or not it opted out of pipefail with `UncheckedInPipe`.
+    /// So what this refusal reports is the last stage's own capture — its stdout, or the stderr published
+    /// with it — while a clipped stderr on any other stage stays local to diagnostics the result does not
+    /// publish (`PipelineClassify.resultTruncated`).
     member this.RunAsync([<Optional>] cancellationToken: CancellationToken) : Task<Result<string, ProcessError>> =
         // Only the byte ceiling is quoted: a pipeline captures raw bytes, so the last stage's `MaxLines`
         // never applies to it — the same convention `PipelineClassify.outputTooLargeError` follows for

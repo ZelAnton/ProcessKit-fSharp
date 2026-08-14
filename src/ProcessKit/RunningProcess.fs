@@ -786,12 +786,22 @@ type RunningProcess
             else
                 None, None)
 
-    // A cassette handle represents an already-completed run, so its completion clock must stay frozen
+    // The live monotonic time since THIS handle's spawn (`host.StartedTimestamp`) — the clock every
+    // DEADLINE on this handle is measured against (`waitWithTimeout`), and the completion clock for
+    // every handle that is not replaying a recording.
+    let sinceSpawn () =
+        Stopwatch.GetElapsedTime host.StartedTimestamp
+
+    // A cassette handle represents an already-completed run, so its COMPLETION clock must stay frozen
     // at the recorded value while ordinary live/fake handles continue reading their own stopwatch.
+    // Completion metadata only — `Elapsed`, `ProcessResult.Duration`, `RunProfile`, telemetry: never a
+    // deadline input. A frozen clock cannot bound anything (it does not advance, so every wait created
+    // on such a handle would re-arm the same `Timeout - recordedDuration` remainder instead of resolving
+    // to one absolute deadline), which is why `waitWithTimeout` reads `sinceSpawn ()` above and not this.
     let elapsed () =
         match recordedCompletion with
         | Some(duration, _) -> duration
-        | None -> Stopwatch.GetElapsedTime host.StartedTimestamp
+        | None -> sinceSpawn ()
 
     let recordedTruncated =
         match recordedCompletion with
@@ -1113,8 +1123,9 @@ type RunningProcess
     // exit wait underneath is `boundedExitWait`, so the reap after ANY hard kill on this handle stays
     // bounded (the timeout race bounds its own post-kill reap too, see `Timeouts.raceTimeoutWithCts`).
     //
-    // The TOTAL deadline is anchored at SPAWN (`host.StartedTimestamp`, the same monotonic stamp
-    // `elapsed ()` and `ProcessResult.Duration` are measured from), not at this call: this exit wait is
+    // The TOTAL deadline is anchored at SPAWN (`host.StartedTimestamp`, read through `sinceSpawn ()` —
+    // the live monotonic clock, deliberately NOT the completion clock `elapsed ()`, which a replayed
+    // cassette handle freezes at its recorded duration), not at this call: this exit wait is
     // created LAZILY by whichever consumer gets here first — a buffered verb through
     // `ensureBufferedWait`, a streaming/event session, a readiness probe, `WaitAnyAsync`/`WaitAllAsync`
     // — and on a live `StartAsync` handle that can be long after the child started. Re-issuing the full
@@ -1144,10 +1155,10 @@ type RunningProcess
             }
             :> Task
 
-        // Read the elapsed time BEFORE starting the wait, so the budget is never widened by the work of
-        // starting it (the two are microseconds apart; erring towards the smaller remainder is the
+        // Read the time since spawn BEFORE starting the wait, so the budget is never widened by the work
+        // of starting it (the two are microseconds apart; erring towards the smaller remainder is the
         // honest direction for a deadline).
-        let total = Timeouts.totalDeadline config.Timeout (elapsed ())
+        let total = Timeouts.totalDeadline config.Timeout (sinceSpawn ())
 
         Timeouts.raceTimeout config.Logger config.Program runId total idleTimer onTimeout (boundedExitWait ())
 

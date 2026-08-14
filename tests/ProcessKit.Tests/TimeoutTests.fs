@@ -79,11 +79,16 @@ type TimeoutTests() =
     /// plumbing hop (pidfd/kqueue readiness, `RegisterWaitForSingleObject` → thread pool) that a
     /// deadline armed for a mere sliver of leftover budget can otherwise beat. It applies only to an
     /// `alreadyExited` child; a killed one still publishes at once.
-    let backdatedProcessPublishing
+    ///
+    /// `recordedCompletion` builds the handle the way a replayed cassette entry does (T-348): its
+    /// completion metadata is frozen at the recorded duration/truncation instead of measured. `None` —
+    /// every fixture below but the replay one — is an ordinary live handle.
+    let backdatedProcessCore
         (config: CommandConfig)
         (age: TimeSpan)
         (alreadyExited: bool)
         (publishDelay: TimeSpan)
+        (recordedCompletion: (TimeSpan * bool) option)
         (exit: Outcome)
         =
         let calls = HostCalls()
@@ -132,12 +137,40 @@ type TimeoutTests() =
               TreeStats = None
               Teardown = fun () -> ValueTask() }
 
-        new RunningProcess(host), calls
+        let running =
+            match recordedCompletion with
+            | Some(recordedDuration, recordedTruncated) -> new RunningProcess(host, recordedDuration, recordedTruncated)
+            | None -> new RunningProcess(host)
+
+        running, calls
+
+    /// A live handle over a synthetic host spawned `age` ago, with the publishing hop modelled.
+    let backdatedProcessPublishing
+        (config: CommandConfig)
+        (age: TimeSpan)
+        (alreadyExited: bool)
+        (publishDelay: TimeSpan)
+        (exit: Outcome)
+        =
+        backdatedProcessCore config age alreadyExited publishDelay None exit
 
     /// The plain fixture: an already-finished child's status is there for the asking, so nothing about
     /// a test using it depends on the plumbing hop `backdatedProcessPublishing` can model.
     let backdatedProcess (config: CommandConfig) (age: TimeSpan) (alreadyExited: bool) (exit: Outcome) =
         backdatedProcessPublishing config age alreadyExited TimeSpan.Zero exit
+
+    /// The same host behind a REPLAY handle: one carrying a cassette entry's recorded completion (T-348),
+    /// so `RunningProcess.Elapsed` / `ProcessResult.Duration` report `recordedDuration` however long this
+    /// handle has really existed. Its child has always already finished (that is what a recording is), so
+    /// its status is published `publishDelay` after the exit wait starts.
+    let replayedProcess
+        (config: CommandConfig)
+        (age: TimeSpan)
+        (publishDelay: TimeSpan)
+        (recordedDuration: TimeSpan)
+        (exit: Outcome)
+        =
+        backdatedProcessCore config age true publishDelay (Some(recordedDuration, false)) exit
 
     /// The command every backdated-handle test below is built from: a 2-second total deadline, long
     /// enough that "the whole budget was re-issued" (2s) is unmistakably distinguishable from "only
@@ -968,6 +1001,53 @@ type TimeoutTests() =
 
                 Assert.That(outcome, Is.EqualTo(Outcome.Exited 3), "no deadline may be invented by a late consumer")
                 Assert.That(calls.Kills, Is.Zero, "nothing to kill without a deadline")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a replayed handle's frozen completion clock never feeds the deadline (T-356 x T-348)``() : Task =
+        task {
+            // Two clocks on one handle, and they must not be confused. A replayed cassette handle freezes
+            // its COMPLETION clock (`Elapsed`/`ProcessResult.Duration`) at the entry's recorded duration,
+            // while the total deadline is measured from this handle's own monotonic spawn stamp. Reading
+            // the frozen one as the deadline's clock would re-arm `Timeout - recordedDuration` on every
+            // wait instead of resolving to one absolute deadline — and for a recording at least as long as
+            // the timeout it arms nothing at all, so the deadline fires inside the settle window and
+            // reports a `TimedOut` that was in neither the recording nor the elapsed time.
+            //
+            // Spawned NOW with a 2s deadline over a 5s recording, the status arriving 600 ms into the wait:
+            // far inside the real remaining budget, far outside the ~0 the frozen clock would have left.
+            let recorded = TimeSpan.FromSeconds 5.0
+
+            let running, calls =
+                replayedProcess
+                    twoSecondTimeout
+                    TimeSpan.Zero
+                    (TimeSpan.FromMilliseconds 600.0)
+                    recorded
+                    (Outcome.Exited 0)
+
+            use _ = running
+
+            match! running.OutputStringAsync() with
+            | Ok result ->
+                Assert.That(
+                    result.Outcome,
+                    Is.EqualTo(Outcome.Exited 0),
+                    "the run's real outcome, not a deadline armed from a clock that cannot advance"
+                )
+
+                Assert.That(result.IsTimedOut, Is.False)
+
+                Assert.That(
+                    result.Duration,
+                    Is.EqualTo recorded,
+                    "the recorded duration is still exactly what the result reports (T-348)"
+                )
+            | Error error -> Assert.Fail $"{error}"
+
+            Assert.That(running.Elapsed, Is.EqualTo recorded, "the completion clock stays frozen at the recording")
+            Assert.That(calls.Kills, Is.Zero, "there is no live tree behind a recording to kill")
         }
         :> Task
 

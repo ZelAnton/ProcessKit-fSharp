@@ -267,11 +267,14 @@ The two ends of the chain behave like a single `Command`:
   the last stage's byte ceiling) rather than presenting a tail or head as the chain's whole output,
   while `OutputStringAsync`/`OutputBytesAsync` hand it back with `Truncated` set and `RunUnitAsync`
   stays successful — see [Which verb you use decides what a drop means](commands.md#which-verb-you-use-decides-what-a-drop-means).
-  The refusal names the **pipefail representative** stage and quotes the **last** stage's byte ceiling
-  (the only ceiling that applies to the chain's captured stdout). Those are the same stage on an
-  ordinary chain; they differ when the last stage sets `UncheckedInPipe` and an earlier stage becomes
-  the representative — a truncation of that stage's stderr is then reported against its program while
-  the quoted cap is still the last stage's.
+  The refusal names the **last** stage and quotes that same stage's byte ceiling (the only ceiling that
+  applies to the chain's captured stdout). Those never come apart: an earlier stage is the pipefail
+  representative only when it is a *checked failure*, and the verb has then already failed with that
+  stage's own `Exit`/`Signalled`/`Timeout` error before truncation is considered — so a refusal means no
+  checked stage failed, which is exactly when the result belongs to the real last stage, `UncheckedInPipe`
+  or not. What it refuses is therefore the last stage's own capture: its stdout, or the stderr published
+  with it. A truncated stderr on any other stage is diagnostics the result never publishes and refuses
+  nothing.
 
 **F#**
 

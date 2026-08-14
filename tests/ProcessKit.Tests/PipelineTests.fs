@@ -836,41 +836,57 @@ type PipelineTests() =
         :> Task
 
     [<Test>]
-    member _.``a truncated stderr on a non-final representative names that stage and the last stage's ceiling``
-        ()
-        : Task =
+    member _.``a truncation refusal names the last stage, including one that opted out of pipefail``() : Task =
         task {
-            // The two halves of a pipeline refusal can legitimately come from DIFFERENT stages: the program
-            // is the pipefail representative's (it is read off `ProcessResult.Program`), while the ceiling is
-            // always the LAST stage's captured-stdout ceiling — the only one `RunAsync` can name before the
-            // capture exists. They coincide on an ordinary chain (the test above); they part when the last
-            // stage opts out of pipefail with `UncheckedInPipe`, making an earlier stage the representative.
-            // Documented in `docs/pipelines.md`; pinned here so the split stays a decision, not an accident.
+            // A truncation refusal always names the LAST stage — both the program it reports and the byte
+            // ceiling it quotes. An earlier stage becomes the pipefail representative only by being a
+            // CHECKED FAILURE (`PipelineClassify.representative`), and `RunAsync`'s success check has
+            // already turned such a chain into its own `Exit`/`Signalled`/`Timeout` error long before
+            // truncation is considered; with no checked failure the real last stage stands, `UncheckedInPipe`
+            // or not. So the refused truncation is the last stage's own capture, and an earlier stage's
+            // clipped stderr — diagnostics the result never publishes — refuses nothing.
             let stageCap = 16
-            let lastCap = 64
+            let lastCap = 4
 
+            // Feeds the chain enough stdout for the last stage's tiny stdout cap to clip, while its OWN
+            // stderr is clipped by `stageCap`: the truncation that must stay invisible to the result.
             let noisyFirst =
-                stderrStage
+                dualStreamStage
+                    [ "banana"; "apple" ]
                     50
                     ((OutputBufferPolicy.Unbounded.WithMaxBytes stageCap).WithOverflow OverflowMode.DropOldest)
 
-            let last =
+            let clippedLast =
                 (sortStage
-                 |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes lastCap))
+                 |> Command.outputBuffer (
+                     (OutputBufferPolicy.Unbounded.WithMaxBytes lastCap).WithOverflow OverflowMode.DropOldest
+                 ))
                     .UncheckedInPipe()
 
-            match! (noisyFirst.Pipe last).RunAsync() with
-            | Error(ProcessError.OutputTooLarge(program, _, byteLimit, _, totalBytes)) ->
-                Assert.That(program, Is.EqualTo noisyFirst.Program, "the pipefail representative names the error")
-
+            match! (noisyFirst.Pipe clippedLast).RunAsync() with
+            | Error(ProcessError.OutputTooLarge(program, lineLimit, byteLimit, _, totalBytes)) ->
                 Assert.That(
-                    byteLimit,
-                    Is.EqualTo(Some lastCap),
-                    "the ceiling quoted is the last stage's, not the named stage's"
+                    program,
+                    Is.EqualTo clippedLast.Program,
+                    "the last stage owns the published capture, so the refusal names it"
                 )
 
-                Assert.That(totalBytes, Is.GreaterThan stageCap, "the real stderr volume, not the retained remainder")
+                Assert.That(lineLimit, Is.EqualTo(None: int option), "a raw byte capture has no line ceiling")
+                Assert.That(byteLimit, Is.EqualTo(Some lastCap), "the ceiling quoted is that same stage's own")
+                Assert.That(totalBytes, Is.GreaterThan lastCap, "the real captured volume, not the retained tail")
+
+                Assert.That(
+                    totalBytes,
+                    Is.LessThan 100,
+                    "an unpublished stage's stderr volume must not be folded into the totals"
+                )
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+
+            // The same clipped stderr on the same non-representative stage, with the published capture whole:
+            // nothing was lost from what the verb hands back, so there is nothing to refuse.
+            match! (noisyFirst.Pipe(sortStage.UncheckedInPipe())).RunAsync() with
+            | Ok output -> Assert.That(lines output, Is.EqualTo(box [ "apple"; "banana" ]))
+            | other -> Assert.Fail $"expected the chain's whole output, got {other}"
         }
         :> Task
 
