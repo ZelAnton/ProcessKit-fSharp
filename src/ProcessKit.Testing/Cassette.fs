@@ -394,6 +394,12 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // has none and is served only where it could honestly have been recorded (see `legacyEntryFits`).
     static let currentFormatVersion = 8
 
+    // Cassette payloads are untrusted input and are materialized as both text and a JSON object graph.
+    // Bound the encoded file bytes (not UTF-16 string characters) to a generous 64 MiB before either
+    // materialization. The bounded read below remains authoritative if the file grows after its length
+    // was observed.
+    static let maximumCassetteSizeBytes = 64L * 1024L * 1024L
+
     static let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
     // Coalesce a possibly-null deserialized field (omitted JSON fields land as null even though the
@@ -811,12 +817,75 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
         loop 0
 
-    // Parse and normalize a cassette file, rejecting a version this build does not understand. Shared by
-    // Replay and Auto (Auto tolerates a missing file — a fresh cassette to grow).
-    static let loadEntries (path: string) : Result<CassetteEntry[], ProcessError> =
+    static let cassetteTooLarge (observedSize: int64) (atLeast: bool) : ProcessError =
+        let qualifier = if atLeast then "at least " else ""
+
+        ProcessError.Io
+            $"cassette size is {qualifier}{observedSize} bytes and exceeds the {maximumCassetteSizeBytes} byte limit"
+
+    // Read no more than the configured byte limit plus the one byte needed to prove the file is too
+    // large. The initial length check makes already-large/sparse files fail without allocating for their
+    // payload; the bounded loop is still required because that metadata can become stale before/during
+    // the read. Decode only after the byte bound has been established, preserving ReadAllText's BOM
+    // detection while applying the limit to encoded bytes rather than UTF-16 characters.
+    static let readCassetteTextWith (openRead: string -> Stream) (path: string) : Result<string, ProcessError> =
+        try
+            use input = openRead path
+            let initialLength = if input.CanSeek then input.Length else 0L
+
+            if input.CanSeek && initialLength > maximumCassetteSizeBytes then
+                Error(cassetteTooLarge initialLength false)
+            else
+                let initialCapacity = if input.CanSeek then int initialLength else 0
+
+                use payload = new MemoryStream(initialCapacity)
+                let buffer = Array.zeroCreate<byte> 81920
+                let mutable totalRead = 0L
+                let mutable finished = false
+                let mutable tooLarge = false
+
+                while not finished && not tooLarge do
+                    let remainingThroughSentinel = maximumCassetteSizeBytes + 1L - totalRead
+                    let requested = int (min (int64 buffer.Length) remainingThroughSentinel)
+                    let read = input.Read(buffer, 0, requested)
+
+                    if read = 0 then
+                        finished <- true
+                    else
+                        totalRead <- totalRead + int64 read
+
+                        if totalRead > maximumCassetteSizeBytes then
+                            tooLarge <- true
+                        else
+                            payload.Write(buffer, 0, read)
+
+                if tooLarge then
+                    Error(cassetteTooLarge totalRead true)
+                else
+                    payload.Position <- 0L
+                    use reader = new StreamReader(payload, Encoding.UTF8, true, 1024)
+                    Ok(reader.ReadToEnd())
+        with ex ->
+            Error(ProcessError.Io ex.Message)
+
+    static let openCassetteReadStream (path: string) : Stream =
+        new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite ||| FileShare.Delete,
+            81920,
+            FileOptions.SequentialScan
+        )
+        :> Stream
+
+    // Parse and normalize already-bounded cassette text, rejecting a version this build does not
+    // understand. Keeping parsing separate lets Auto inspect the same single payload for whitespace
+    // without reopening the file.
+    static let parseEntries (text: string) : Result<CassetteEntry[], ProcessError> =
         try
             let file =
-                match JsonSerializer.Deserialize<CassetteFile>(File.ReadAllText path, jsonOptions) with
+                match JsonSerializer.Deserialize<CassetteFile>(text, jsonOptions) with
                 | null -> { Version = 0; Entries = [||] }
                 | loaded -> loaded
 
@@ -831,6 +900,29 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 arrayOrEmpty file.Entries |> Array.map normalizeEntry |> validateEntries
         with ex ->
             Error(ProcessError.Io ex.Message)
+
+    static let loadEntriesWith (openRead: string -> Stream) (path: string) : Result<CassetteEntry[], ProcessError> =
+        match readCassetteTextWith openRead path with
+        | Error error -> Error error
+        | Ok text -> parseEntries text
+
+    // Parse and normalize a cassette file. Replay requires a file; Auto handles its missing-file
+    // fresh-start contract separately below.
+    static let loadEntries (path: string) : Result<CassetteEntry[], ProcessError> =
+        loadEntriesWith openCassetteReadStream path
+
+    static let loadAutoEntriesWith
+        (fileExists: string -> bool)
+        (openRead: string -> Stream)
+        (path: string)
+        : Result<CassetteEntry[], ProcessError> =
+        if not (fileExists path) then
+            Ok [||]
+        else
+            match readCassetteTextWith openRead path with
+            | Error error -> Error error
+            | Ok text when String.IsNullOrWhiteSpace text -> Ok [||]
+            | Ok text -> parseEntries text
 
     static let O_RDONLY_FOR_DIR_FSYNC = 0
 
@@ -1669,23 +1761,10 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         ArgumentNullException.ThrowIfNull inner
         ArgumentNullException.ThrowIfNull options
 
-        // Auto grows a cassette, so a missing OR empty file is a fresh start (not a load error): a
-        // just-touched path — `Path.GetTempFileName`, a `touch`ed fixture — begins recording cleanly.
-        let loaded =
-            if not (File.Exists path) then
-                Ok [||]
-            else
-                let text =
-                    try
-                        File.ReadAllText path
-                    with _ ->
-                        // Unreadable here surfaces as a load error below; treat as non-empty to reach it.
-                        "?"
-
-                if String.IsNullOrWhiteSpace text then
-                    Ok [||]
-                else
-                    loadEntries path
+        // Auto grows a cassette, so a missing OR whitespace-only file is a fresh start (not a load
+        // error). Existing payloads go through the same bounded read as Replay, and that one text value
+        // serves both the whitespace check and parsing — the file is never reopened for load.
+        let loaded = loadAutoEntriesWith File.Exists openCassetteReadStream path
 
         match loaded with
         | Error error -> Error error
@@ -1726,6 +1805,22 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         | ReplayMode _ -> Ok()
         | RecordMode(_, recorded, dirty)
         | AutoMode(_, _, recorded, dirty) -> saveUnderLocks recorded dirty TimeSpan.Zero
+
+    /// Test seam (`InternalsVisibleTo`): the production byte ceiling, so boundary fixtures cannot drift
+    /// from the loader's documented limit.
+    static member internal MaximumCassetteSizeBytesForTests = maximumCassetteSizeBytes
+
+    /// Test seam (`InternalsVisibleTo`): exercise Replay's exact bounded-read/parser composition with a
+    /// synthetic stream, including growth after stale length metadata, without changing production I/O.
+    static member internal LoadEntriesWithStreamForTests(path: string, openRead: string -> Stream) =
+        loadEntriesWith openRead path
+
+    /// Test seam (`InternalsVisibleTo`): exercise Auto's missing/whitespace/single-read composition with
+    /// an observable stream factory; production Auto calls this same helper with the real filesystem.
+    static member internal LoadAutoEntriesWithStreamForTests
+        (path: string, fileExists: string -> bool, openRead: string -> Stream)
+        =
+        loadAutoEntriesWith fileExists openRead path
 
     /// Test seam (`InternalsVisibleTo`): hold the very lock `Save` takes for `path`, so a test can prove
     /// that a save which loses it is refused rather than clobbering the cassette — exercising the real

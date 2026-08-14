@@ -609,6 +609,14 @@ module Runner =
                 use _registration = effectiveToken.Register(fun () -> running.Kill())
 
                 try
+                    // End the child's input BEFORE streaming its stdout. This verb never hands the
+                    // `RunningProcess` to the caller, so a `Command.KeepStdinOpen` writer is unreachable
+                    // from here on: a child that reads its stdin to EOF before printing anything would
+                    // otherwise never produce the first line this verb waits for. A no-op for every other
+                    // run, and it never touches a writer a caller already took (see
+                    // `RunningProcess.FinishUnclaimedStdin`).
+                    running.FinishUnclaimedStdin()
+
                     let mutable found = None
                     use enumerator = running.StdoutLinesAsync().GetAsyncEnumerator(effectiveToken)
                     let mutable more = true

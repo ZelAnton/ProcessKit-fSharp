@@ -52,6 +52,19 @@ module internal GracefulTeardown =
             forceKill
             grace
 
+/// Small helpers over the shared POSIX liveness + identity verdict (`Native.Posix.TrackedTarget`) that
+/// both POSIX backends gate on, so the mapping from a verdict to "prune this record" is written once.
+module internal TrackedTargets =
+
+    /// Whether the verdict means nothing of ours is at that number any more — the ONE case that prunes a
+    /// tracked record. `LeaderPid` is deliberately NOT gone: it is a live child of ours whose process
+    /// group does not exist yet (a pty leader before its `setsid()`), reachable by pid.
+    let isGone (target: Native.Posix.TrackedTarget) : bool =
+        match target with
+        | Native.Posix.TrackedTarget.Gone -> true
+        | Native.Posix.TrackedTarget.Group
+        | Native.Posix.TrackedTarget.LeaderPid -> false
+
 /// Kill and reap a single POSIX leader we `posix_spawn`ed, in this exact order: `killpg` SIGKILLs its
 /// whole process group (any subtree it backgrounded), then `waitpid` reaps the leader itself (`killpg`
 /// does not reap our own child). Shared by the cgroup and process-group backends' escapee/teardown
@@ -71,13 +84,23 @@ module internal PosixReap =
     /// The order and the gates: a leader the ledger PROVABLY already owns (its captured identity
     /// matches) is left entirely alone — re-killing or re-waiting it would be exactly the second owner
     /// this contract exists to prevent (and, after the pid is reaped, a wrong-target kill). Otherwise
-    /// `killpg` is gated through the shared liveness + identity choke, so a pgid recycled since it was
-    /// tracked is NEVER SIGKILLed (the wrong-target kill T-084 closes): `identity` is the start-time
+    /// the kill is gated AND ROUTED by the shared liveness + identity choke, so a pgid recycled since it
+    /// was tracked is NEVER SIGKILLed (the wrong-target kill T-084 closes): `identity` is the start-time
     /// token captured at track time, and a live number whose current identity differs from it is a
     /// recycled stranger. A matching or unknown token falls back to the by-number kill exactly as before
-    /// (a leader reaped while descendants keep the pgid alive is still cleaned up). The bounded reap's
-    /// `waitpid` only ever reaps our OWN child, so a recycled pid there is a harmless `ECHILD` — it
-    /// needs no gate.
+    /// (a leader reaped while descendants keep the pgid alive is still cleaned up), and a leader whose
+    /// GROUP does not exist yet — a pty child between `posix_spawn` and its helper's `setsid()` — is
+    /// SIGKILLed through the exact-leader route (`TrackedTarget.LeaderPid`: the pid itself, then a
+    /// `killpg` sweep behind it, in case the child won the race to `setsid()` since the probe) instead of
+    /// being skipped as gone, which is what used to strand a just-spawned pty child on teardown. This is
+    /// the LAST chance to reach that subtree — the drain erases the tracking record straight afterwards
+    /// — which is why the kill here reaches both halves rather than the leader alone. The bounded reap's
+    /// `waitpid` only ever reaps our OWN child, so a recycled pid there is a harmless `ECHILD` — it needs
+    /// no gate.
+    ///
+    /// Routing the kill changes nothing about the REAP: there is still exactly one `reap` call per
+    /// leader here and no second `waitpid` path (K-016). Which primitive delivered the SIGKILL is not
+    /// evidence about who owns the wait — only the reap verdict below is.
     ///
     /// The handoff, however, is decided by the REAP's verdict and never by the choke. The choke answers
     /// "is that process group still ours?", and a group stays alive while any member does — including
@@ -90,9 +113,9 @@ module internal PosixReap =
     /// number can fake — transfers the eventual wait/reap to the ledger, turning the old "left for the
     /// host to reap at exit" case into a reap we still observe exactly once.
     let leaderUsing
-        (stillTracked: int -> uint64 option -> bool)
+        (target: int -> uint64 option -> Native.Posix.TrackedTarget)
         (owned: int -> uint64 option -> bool)
-        (killGroup: int -> unit)
+        (killTarget: Native.Posix.TrackedTarget -> int -> unit)
         (reap: bool -> int -> LeaderReap)
         (adopt: int -> uint64 option -> unit)
         (reapNow: bool)
@@ -100,8 +123,12 @@ module internal PosixReap =
         (identity: uint64 option)
         : unit =
         if not (owned id identity) then
-            if stillTracked id identity then
-                killGroup id
+            match target id identity with
+            | Native.Posix.TrackedTarget.Gone ->
+                // Gone by BOTH the group probe and the exact-pid probe, or positively recycled: there is
+                // nothing of ours left to kill, and killing the number anyway is the wrong-target kill.
+                ()
+            | routed -> killTarget routed id
 
             match reap reapNow id with
             | LeaderReap.StillRunning -> adopt id identity
@@ -130,9 +157,9 @@ module internal PosixReap =
     // One leader through the production gates. `reapNow` is threaded from the drain's budget.
     let private leaderWithin (reapNow: bool) (id: int) (identity: uint64 option) =
         leaderUsing
-            Native.Posix.processGroupStillTracked
+            Native.Posix.trackedTarget
             PostKillReap.ownsLeader
-            Native.Posix.killProcessGroup
+            Native.Posix.killTracked
             reapWithin
             adoptLeader
             reapNow
@@ -636,20 +663,22 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
         | true, token -> token
         | false, _ -> None
 
-    // Is `pid` still the SAME tracked child, not a recycled number? Mirrors `ProcessGroupBackend.stillOurs`
-    // (a cgroup child is its own process-group leader — spawned with POSIX_SPAWN_SETPGROUP, pgid == pid —
-    // so the pgid choke applies): gate the by-number liveness probe through the captured start-time
+    // Is `pid` still the SAME tracked child, not a recycled number — and where does an operation on it
+    // go? Mirrors `ProcessGroupBackend.targetOf` (a cgroup child is its own process-group leader —
+    // spawned with POSIX_SPAWN_SETPGROUP, pgid == pid — so the pgid choke applies; a `Command.Pty` child
+    // under this backend runs the same `setsid --ctty` helper, so it too has the pre-`setsid()` window
+    // the `LeaderPid` verdict covers): gate the by-number liveness probe through the captured start-time
     // identity so a pid recycled since it was tracked is reported gone and never SIGKILLed (the
     // wrong-target kill T-084 closes). A matching identity, or an unknown token on either side, defers to
     // the by-number verdict, so no coverage is lost. Used by `KillChild`, the one remaining per-child raw
     // kill path (the per-member signal path is already pidfd-pinned via `Native.Cgroup.deliverIdentitySafe`).
-    let stillOurs (pid: int) : bool =
+    let targetOf (pid: int) : Native.Posix.TrackedTarget =
         let captured =
             match identities.TryGetValue pid with
             | true, token -> token
             | false, _ -> None
 
-        Native.Posix.processGroupStillTracked pid captured
+        Native.Posix.trackedTarget pid captured
 
     new(cgroupPath: string) = CgroupBackend(cgroupPath, ResourceLimits.None)
 
@@ -737,14 +766,16 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
         member _.KillChild(spawned) =
             // Hard-kill this one child — but only while it is still OURS. A recycled pid (identity differs)
             // must never be SIGKILLed (wrong-target kill); gate it through the choke and prune it instead,
-            // keeping `identities` in lockstep with `children`.
+            // keeping `identities` in lockstep with `children`. This kill is by pid on purpose (one child,
+            // not its group), so both live verdicts deliver the same way — the choke's routing matters
+            // here only in that a pre-`setsid()` pty leader is no longer mistaken for a vanished target.
             let pid = int spawned.Handle
 
-            if stillOurs pid then
-                Native.Posix.killProcess pid
-            else
+            if TrackedTargets.isGone (targetOf pid) then
                 identities.TryRemove pid |> ignore
                 children.Remove pid |> ignore
+            else
+                Native.Posix.killProcess pid
 
         member _.KillTree() =
             Native.Cgroup.killCgroup cgroupPath
@@ -765,15 +796,23 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
 
             match Native.Posix.ensureDeliverable signalNum with
             | Error error -> Error error
-            | Ok() when not (stillOurs pid) -> Ok()
             | Ok() ->
-                match Native.Posix.signalProcessGroup pid signalNum with
-                | Native.Common.SignalDelivery.Delivered
-                | Native.Common.SignalDelivery.TargetGone -> Ok()
-                | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
-                    Error(
-                        ProcessError.Io $"failed to deliver signal {signalNum} to this run: {message} (errno {errno})"
-                    )
+                // Route by the choke's verdict: the child's own process group while it has one, the exact
+                // leader pid while it does not yet (a pty child before its `setsid()`), nothing at all for
+                // a target that is gone by both probes.
+                let target = targetOf pid
+
+                if TrackedTargets.isGone target then
+                    Ok()
+                else
+                    match Native.Posix.signalTracked target pid signalNum with
+                    | Native.Common.SignalDelivery.Delivered
+                    | Native.Common.SignalDelivery.TargetGone -> Ok()
+                    | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
+                        Error(
+                            ProcessError.Io
+                                $"failed to deliver signal {signalNum} to this run: {message} (errno {errno})"
+                        )
 
         member _.Members() =
             // `cgroupMembers` already distinguishes "read, and it's empty" from "the read failed" — surface
@@ -940,19 +979,26 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
     let identities = ConcurrentDictionary<int, uint64 option>()
 
     // The single liveness + identity choke every probe/signal/kill path funnels through, so the reuse
-    // check is never duplicated per call site: is `pgid` still the SAME live group we tracked? It gates
-    // the by-number liveness probe through the pgid's captured start-time identity — a recycled pgid (a
-    // live number whose current identity differs from the captured one) is reported NOT ours, so callers
-    // prune it and never signal it. A matching identity, or an unknown token on either side (a leader
-    // reaped while descendants keep the pgid alive, or a platform without a reader), defers to the
-    // by-number verdict, so no platform loses coverage.
-    let stillOurs (pgid: int) : bool =
+    // check is never duplicated per call site: is `pgid` still the SAME live group we tracked, and where
+    // does an operation on it go? It gates the by-number liveness probe through the pgid's captured
+    // start-time identity — a recycled pgid (a live number whose current identity differs from the
+    // captured one) is reported NOT ours, so callers prune it and never signal it. A matching identity,
+    // or an unknown token on either side (a leader reaped while descendants keep the pgid alive, or a
+    // platform without a reader), defers to the by-number verdict, so no platform loses coverage. A
+    // freshly-spawned pty leader whose group does not exist yet answers `LeaderPid`: still ours, still
+    // tracked, reachable by pid until its `setsid()` runs (see `Native.Posix.trackedTarget`).
+    let targetOf (pgid: int) : Native.Posix.TrackedTarget =
         let captured =
             match identities.TryGetValue pgid with
             | true, token -> token
             | false, _ -> None
 
-        Native.Posix.processGroupStillTracked pgid captured
+        Native.Posix.trackedTarget pgid captured
+
+    // The read-only form for membership/stats/pruning questions: is this pgid still ours at all, by
+    // either route? Delivery paths must use `targetOf` itself so they signal the right target.
+    let stillOurs (pgid: int) : bool =
+        not (TrackedTargets.isGone (targetOf pgid))
 
     // Drop a pgid from tracking entirely (both the pgid set and its identity token) — used when the choke
     // finds it drained or recycled. Returns whether this call was the one that removed it.
@@ -960,25 +1006,29 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
         identities.TryRemove pgid |> ignore
         children.Remove pgid
 
-    // Broadcast to every tracked pgid that is still ours; a recycled pgid is pruned instead, so a
-    // control operation can never target an unrelated process group. Continue after failures to give
-    // every remaining group a chance to receive the operation, then report the first delivery failure.
+    // Broadcast to every tracked pgid that is still ours, routed by the choke's verdict (its group, or
+    // the exact leader pid while that group does not exist yet); a recycled or vanished pgid is pruned
+    // instead, so a control operation can never target an unrelated process group. Continue after
+    // failures to give every remaining group a chance to receive the operation, then report the first
+    // delivery failure.
     let sweep
-        (deliver: int -> Native.Common.SignalDelivery)
+        (deliver: Native.Posix.TrackedTarget -> int -> Native.Common.SignalDelivery)
         (describeFailure: int -> string -> string)
         : Result<unit, ProcessError> =
         let mutable firstFailure: (int * string) option = None
 
         for pgid in children.Snapshot() do
-            if stillOurs pgid then
-                match deliver pgid with
+            let target = targetOf pgid
+
+            if TrackedTargets.isGone target then
+                untrack pgid |> ignore
+            else
+                match deliver target pgid with
                 | Native.Common.SignalDelivery.Delivered
                 | Native.Common.SignalDelivery.TargetGone -> ()
                 | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
                     if firstFailure.IsNone then
                         firstFailure <- Some(errno, message)
-            else
-                untrack pgid |> ignore
 
         match firstFailure with
         | None -> Ok()
@@ -1025,7 +1075,9 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
             // A pgid is a whole group; the reaped leader may have left backgrounded members behind, so
             // only stop tracking once the group is actually empty — or the pgid has been recycled by an
             // unrelated process (the choke's identity check), which must likewise stop tracking so a
-            // stranger is never signalled.
+            // stranger is never signalled. An empty GROUP is not on its own proof the child is gone: a
+            // pty leader before its `setsid()` has no group yet, and the choke keeps it tracked (by pid)
+            // rather than dropping a live child from the container.
             let pgid = int spawned.Handle
 
             if not (stillOurs pgid) then
@@ -1037,20 +1089,26 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
         member _.KillChild(spawned) =
             // Hard-kill this one child's group — but only while it is still OURS. A recycled pgid
             // (identity differs) must never be SIGKILLed (wrong-target kill); gate it through the choke
-            // and prune it instead.
+            // and prune it instead. A pty leader whose group does not exist yet is SIGKILLed by pid (and
+            // swept by `killpg` behind it, for the case it became a group leader between the probe and
+            // the kill) rather than skipped, so an immediate kill after the spawn cannot leave it — or a
+            // subtree it just forked — running.
             let pgid = int spawned.Handle
+            let target = targetOf pgid
 
-            if stillOurs pgid then
-                Native.Posix.killProcessGroup pgid
-            else
+            if TrackedTargets.isGone target then
                 untrack pgid |> ignore
+            else
+                Native.Posix.killTracked target pgid
 
         member _.KillTree() =
             for pgid in children.Snapshot() do
-                if stillOurs pgid then
-                    Native.Posix.killProcessGroup pgid
-                else
+                let target = targetOf pgid
+
+                if TrackedTargets.isGone target then
                     untrack pgid |> ignore
+                else
+                    Native.Posix.killTracked target pgid
 
             Ok()
 
@@ -1069,24 +1127,42 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                     | false, _ -> None)
                 |> Map.ofList
 
-            let stillOursSnap (pgid: int) : bool =
+            // All three phases route through the SAME snapshotted-token verdict: what is delivered, and
+            // where it is delivered, are one decision per phase (never a liveness answer from one probe
+            // paired with a delivery to a different target). The verdict is re-probed per phase — only
+            // the identity TOKEN is snapshotted (K-086) — so a child that becomes a group leader during
+            // the grace period is escalated against its group, not its bare pid.
+            let targetSnap (pgid: int) : Native.Posix.TrackedTarget =
                 match Map.tryFind pgid identitySnapshot with
-                | Some token -> Native.Posix.processGroupStillTracked pgid token
-                | None -> false
+                | Some token -> Native.Posix.trackedTarget pgid token
+                | None -> Native.Posix.TrackedTarget.Gone
 
-            let anyChildAliveSnap () = pgids |> List.exists stillOursSnap
+            let anyChildAliveSnap () =
+                pgids |> List.exists (fun pgid -> not (TrackedTargets.isGone (targetSnap pgid)))
 
             GracefulTeardown.poll
+                // The soft sweep: `signalTracked` sends an OBSERVABLE signal, so a `LeaderPid` verdict
+                // reaches exactly one of the two targets — the group if it exists by now, the pid only on
+                // its `ESRCH` — never both. No child is asked to handle the same stop signal twice.
                 (fun () ->
                     for pgid in pgids do
-                        if stillOursSnap pgid then
-                            Native.Posix.signalProcessGroup pgid (Native.Posix.signalNumber signal)
+                        let target = targetSnap pgid
+
+                        if not (TrackedTargets.isGone target) then
+                            Native.Posix.signalTracked target pgid (Native.Posix.signalNumber signal)
                             |> ignore)
                 anyChildAliveSnap
+                // The escalation. `killTracked` is what makes this whole-tree even for a child still in
+                // its pre-`setsid()` window: the `LeaderPid` route SIGKILLs the pid and sweeps `killpg`
+                // behind it, so a subtree the child forked between the probe and this kill goes with it.
+                // This sweep stands on its own — a graceful `Stop` need not be followed by a
+                // `HardRelease` (the group may keep running), so it cannot borrow teardown's kill.
                 (fun () ->
                     for pgid in pgids do
-                        if stillOursSnap pgid then
-                            Native.Posix.killProcessGroup pgid)
+                        let target = targetSnap pgid
+
+                        if not (TrackedTargets.isGone target) then
+                            Native.Posix.killTracked target pgid)
                 grace
 
         member _.SignalChild(spawned, signal) =
@@ -1095,19 +1171,25 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
 
             match Native.Posix.ensureDeliverable signalNum with
             | Error error -> Error error
-            | Ok() when not (stillOurs pgid) -> Ok()
             | Ok() ->
-                match Native.Posix.signalProcessGroup pgid signalNum with
-                | Native.Common.SignalDelivery.Delivered
-                | Native.Common.SignalDelivery.TargetGone -> Ok()
-                | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
-                    Error(
-                        ProcessError.Io $"failed to deliver signal {signalNum} to this run: {message} (errno {errno})"
-                    )
+                let target = targetOf pgid
+
+                if TrackedTargets.isGone target then
+                    Ok()
+                else
+                    match Native.Posix.signalTracked target pgid signalNum with
+                    | Native.Common.SignalDelivery.Delivered
+                    | Native.Common.SignalDelivery.TargetGone -> Ok()
+                    | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
+                        Error(
+                            ProcessError.Io
+                                $"failed to deliver signal {signalNum} to this run: {message} (errno {errno})"
+                        )
 
         member _.Members() =
             // Report only the pgids still ours and alive (choke-gated): a drained or recycled pgid is not
-            // a member of this group. This is a read — it does not prune (a mutating op does that).
+            // a member of this group, while a freshly-spawned pty leader whose group does not exist yet
+            // is (it is a live child of ours). This is a read — it does not prune (a mutating op does).
             Ok(children.Snapshot() |> List.filter stillOurs)
 
         member _.Signal(signal) =
@@ -1120,15 +1202,15 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
             match Native.Posix.ensureDeliverable signalNum with
             | Error error -> Error error
             | Ok() ->
-                sweep (fun pgid -> Native.Posix.signalProcessGroup pgid signalNum) (fun errno message ->
+                sweep (fun target pgid -> Native.Posix.signalTracked target pgid signalNum) (fun errno message ->
                     $"failed to deliver signal {signalNum} to process group: {message} (errno {errno})")
 
         member _.Suspend() =
-            sweep Native.Posix.suspendProcessGroup (fun errno message ->
+            sweep Native.Posix.suspendTracked (fun errno message ->
                 $"failed to suspend process group: {message} (errno {errno})")
 
         member _.Resume() =
-            sweep Native.Posix.resumeProcessGroup (fun errno message ->
+            sweep Native.Posix.resumeTracked (fun errno message ->
                 $"failed to resume process group: {message} (errno {errno})")
 
         member _.Stats() =
@@ -1185,12 +1267,16 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
             // Each pgid's leader is a child we posix_spawned, so we must waitpid it ourselves — `killpg`
             // SIGKILLs the group but does not reap our own children. Reap the leaders we still track (a
             // run verb Releases the ones it already reaped); other group members reparent to init.
-            // Passing each pgid's captured identity to `PosixReap.leader` gates its `killpg` through the
-            // choke, so teardown never SIGKILLs a pgid recycled since it was tracked (a wrong-target
-            // kill). Drain (atomic take-and-clear), not Snapshot: a Snapshot would leave the tracking list
-            // populated after teardown, and a concurrent per-child cleanup (a run's `Release`) could still
-            // see (and re-reap) the same pgid — after the first killpg/waitpid the OS may reuse that pid,
-            // so a second killpg would land on an unrelated process group (wrong-target kill).
+            // Passing each pgid's captured identity to `PosixReap.leader` gates AND routes its kill
+            // through the choke, so teardown never SIGKILLs a pgid recycled since it was tracked (a
+            // wrong-target kill) and still reaches a leader whose group does not exist yet (a pty child
+            // before its `setsid()`: SIGKILLed by pid, with a `killpg` sweep behind it so a subtree it
+            // forked in the meantime cannot outlive the record this call is about to erase — after the
+            // drain there is no later pass). Drain (atomic take-and-clear), not Snapshot: a Snapshot
+            // would leave the tracking list populated after teardown, and a concurrent per-child cleanup
+            // (a run's `Release`) could still see (and re-reap) the same pgid — after the first
+            // killpg/waitpid the OS may reuse that pid, so a second killpg would land on an unrelated
+            // process group (wrong-target kill).
             //
             // The whole drain runs under one bounded budget (`PosixReap.drain`), and the identity tokens
             // are snapshotted WITH the pgids in a single pass before any reaping starts — the same
