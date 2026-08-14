@@ -382,9 +382,16 @@ everywhere:
   fixture recorded from an untrusted or
   credential-bearing run before committing it, and keep secret-bearing cassette
   files out of world-readable locations (on Unix they are written owner-only,
-  `0600`; on Windows a cassette inherits the containing directory's ACL). See
-  [Testing your code → Record and replay](testing.md#record-and-replay) for the
-  full cassette contract.
+  `0600`; on Windows a cassette inherits the containing directory's ACL). A
+  cassette is also never written as a side effect of a **crash**: the best-effort
+  flush a recorder performs when it is disposed happens only after `Complete()`
+  has declared the recording finished, so a scope left by a thrown exception or a
+  failed assertion creates no cassette and modifies none that is already there —
+  the verbatim argv/output of a failed run reaches disk only where your code said
+  it should, or through an explicit `Save()`. See
+  [Testing your code → Record and replay](testing.md#record-and-replay) and
+  [Nothing is written by a crash](testing.md#nothing-is-written-by-a-crash) for
+  the full cassette contract.
 
 ## Putting it together
 

@@ -1020,7 +1020,10 @@ Entries are matched by program + args + cwd + a stdin **source digest**; environ
 `data`, and the `PATH` a `NotFound` searched (the one environment *value* a cassette keeps, an
 `Env("PATH", …)` override included) — *are* stored verbatim and can carry secrets. `WithRedaction`
 scrubs the captured text and every one of those failure fields (`program`/`args` are stored as
-given), so review a fixture before committing it; on Unix the file is written `0600`.
+given), so review a fixture before committing it; on Unix the file is written `0600`. A crash never
+writes one behind your back: the best-effort flush on dispose happens only after `Complete()` marks
+the recording finished, so a scope left by a failed assertion creates no cassette and changes none
+already on disk — `Save()` stays the unconditional, error-reporting way to persist a recording.
 Capture replay and live handles reconstructed by `SpawnAsync` both preserve the recorded duration
 and truncation state; a stricter output-buffer policy on the replay command can additionally mark
 the reconstructed handle's result as truncated.

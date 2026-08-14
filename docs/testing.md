@@ -635,9 +635,11 @@ else if (replayResult is { IsOk: false, ErrorValue: var loadErr })
 
 `Record(path, inner)` wraps `inner` and captures each completed call; `Save()`
 writes the cassette (it is also flushed best-effort on dispose —
-`RecordReplayRunner` is `IDisposable` — but `Save()` is the call that surfaces a
-write error). `Replay(path)` returns a `Result<RecordReplayRunner, ProcessError>`
-loaded from the file.
+`RecordReplayRunner` is `IDisposable` — but only once `Complete()` has declared
+the recording finished, see
+[Nothing is written by a crash](#nothing-is-written-by-a-crash), and `Save()` is
+the call that surfaces a write error). `Replay(path)` returns a
+`Result<RecordReplayRunner, ProcessError>` loaded from the file.
 
 Semantics worth knowing before you commit a cassette:
 
@@ -689,8 +691,9 @@ hermetic.
 
 **Grow a cassette on miss (VCR "new episodes").** `RecordReplayRunner.Auto(path, inner)`
 replays what the cassette already holds and, on a **miss**, delegates to `inner`, records the
-result, and grows the file on `Save()`/dispose — so you build a cassette up incrementally
-instead of curating every entry by hand. Existing entries still replay hermetically; only a
+result, and grows the file on `Save()` (or on a dispose after `Complete()`, like record mode — see
+[Nothing is written by a crash](#nothing-is-written-by-a-crash)) — so you build a cassette up
+incrementally instead of curating every entry by hand. Existing entries still replay hermetically; only a
 first-seen call reaches the real tool. A missing (or empty) file starts a fresh cassette. Use
 strict `Replay(path)` in CI, where a miss should fail loudly. (Like record mode, `Auto` can't
 capture a *streaming* miss — record such a call through a capture verb first.)
@@ -726,6 +729,40 @@ if (RecordReplayRunner.Auto("fixtures/git.json", new JobRunner(), options) is { 
     // recorder replays a hit, records a miss, and grows the cassette on Save()...
 }
 ```
+
+### Nothing is written by a crash
+
+A cassette keeps `program`, `args`, `cwd`, and captured `stdout`/`stderr` verbatim, so the
+recording a *failed* run left behind is exactly what you do not want landing on disk by accident.
+`Dispose` runs both when a scope ends normally and while the stack unwinds out of a thrown
+exception or a failed assertion, and .NET gives it no way to tell those apart — so the drop-time
+flush is gated on `Complete()`, your own statement that the recording finished as intended:
+
+**F#**
+
+```fsharp
+use recorder = RecordReplayRunner.Record("fixtures/git.json", JobRunner())
+// ... the calls you want recorded ...
+recorder.Complete() // reached only if nothing above threw; the write happens on dispose
+```
+
+**C#**
+
+```csharp
+using var recorder = RecordReplayRunner.Record("fixtures/git.json", new JobRunner());
+// ... the calls you want recorded ...
+recorder.Complete(); // reached only if nothing above threw; the write happens on dispose
+```
+
+Until `Complete()` is called, disposing the recorder writes nothing at all: no cassette is created
+at that path, and one already there is left byte for byte as it was. It is the
+`TransactionScope.Complete()` shape, and `Auto` behaves exactly like `Record` here.
+
+`Save()` is unaffected in both directions — it writes immediately and returns the I/O error,
+neither needing nor setting the completion mark — so a recording that must reach disk however the
+scope ends is one you `Save()`. `Complete()` itself only marks: it does no I/O, never throws, and
+the write it enables is still the best-effort, silent one dispose has always done (including
+anything captured after the call, so record first and complete last).
 
 ## CliClient
 

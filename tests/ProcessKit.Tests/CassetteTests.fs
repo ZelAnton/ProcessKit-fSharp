@@ -250,6 +250,29 @@ type CassetteTests() =
                 deleteCassette path
         }
 
+    /// A cassette path in a directory of its own that does **not** exist yet, so "nothing was written"
+    /// is observable as the file's absence — something `withCassette` cannot express, because
+    /// `Path.GetTempFileName` creates the file it hands out. The directory and anything under it
+    /// (cassette, sibling lock file, temps) goes on the way out.
+    let withUnwrittenCassette (body: string -> Task) : Task =
+        task {
+            let directory = Path.Combine(Path.GetTempPath(), $"pk-cassette-{Guid.NewGuid():N}")
+
+            Directory.CreateDirectory directory |> ignore
+
+            try
+                do! body (Path.Combine(directory, "cassette.json"))
+            finally
+                try
+                    Directory.Delete(directory, true)
+                with
+                | :? IOException
+                | :? UnauthorizedAccessException ->
+                    // A temp directory something still holds a handle on: the OS reclaims it later, and
+                    // a cleanup failure must not fail a test that already made its assertions.
+                    ()
+        }
+
     let runner (r: RecordReplayRunner) : IProcessRunner = r
 
     /// The cassette on disk, read through a share mode that tolerates the atomic replace a concurrent
@@ -295,6 +318,67 @@ type CassetteTests() =
                 let! _ = (recorder :> IProcessRunner).OutputStringAsync(command, CancellationToken.None)
                 ()
         }
+
+    /// Build a recorder for the named mode over `path`, so a dispose-time behaviour can be asserted the
+    /// same way for `Record` and `Auto` — the two modes that record, and which share one flush path.
+    let recorderFor (mode: string) (path: string) (inner: IProcessRunner) : RecordReplayRunner =
+        match mode with
+        | "Record" -> RecordReplayRunner.Record(path, inner)
+        | "Auto" ->
+            match RecordReplayRunner.Auto(path, inner) with
+            | Ok auto -> auto
+            | Error error -> failwith $"auto load: {error}"
+        | other -> failwith $"unknown recorder mode '{other}'"
+
+    /// The output the crashed run below captured, named so an assertion can say what a cassette written
+    /// by that crash would be leaking: captured `stdout` is stored verbatim, like `program` and `args`.
+    let crashedRunOutput = "s3cr3t-token-echoed-by-the-crashed-run"
+
+    /// The command the crashed run made — its program is what a leaked cassette would be recognisable by.
+    let crashedRunCommand = Command.create "crashed-run" |> Command.arg "1"
+
+    /// The exception that leaves the recording scope below, standing in for the assertion a test dies on.
+    let unwindFailure = "the test failed before the recording was finished"
+
+    /// `recordThenUnwind`'s two paths, named so its call sites do not read as bare booleans: the scope
+    /// throws before it ever declares the recording finished, or after.
+    let leftIncomplete = false
+
+    let declaredComplete = true
+
+    /// The shape this is all about: a `use recorder = …` scope that records a call and is then left by a
+    /// thrown exception, so `Dispose` runs while the stack unwinds. `complete` decides whether the
+    /// recording is declared finished first — the only difference between the two paths. Hands back the
+    /// exception that escaped, so a test can also prove `Dispose` raised none of its own over it.
+    let recordThenUnwind (make: unit -> RecordReplayRunner) (complete: bool) : Task<exn option> =
+        task {
+            let mutable escaped = None
+
+            try
+                use recorder = make ()
+                let! _ = (runner recorder).OutputStringAsync(crashedRunCommand, CancellationToken.None)
+
+                if complete then
+                    recorder.Complete()
+
+                raise (InvalidOperationException unwindFailure)
+            with ex ->
+                escaped <- Some ex
+
+            return escaped
+        }
+
+    /// Assert that the exception which came out of `recordThenUnwind` is the one the scope threw — a
+    /// `Dispose` that threw during the unwind would surface here instead of it.
+    let assertUnwoundWith (escaped: exn option) : unit =
+        match escaped with
+        | Some ex ->
+            Assert.That(
+                ex.Message,
+                Is.EqualTo unwindFailure,
+                "Dispose must not raise over the exception that is unwinding the stack"
+            )
+        | None -> Assert.Fail "the recording scope must have been left by the thrown exception"
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
 
@@ -744,17 +828,17 @@ type CassetteTests() =
             })
 
     [<Test>]
-    member _.``Dispose flushes the cassette; the bytes verb is rejected``() : Task =
+    member _.``Dispose flushes a completed recording; the bytes verb is rejected``() : Task =
         withCassette (fun path ->
             task {
                 let command = Command.create "tool" |> Command.arg "z"
 
-                // No explicit Save — the drop-time flush must persist the recording.
+                // No explicit Save — the drop-time flush of a recording declared finished must persist it.
                 do!
                     task {
                         use recorder = RecordReplayRunner.Record(path, FixedRunner("byte-output", 0))
                         let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -770,6 +854,167 @@ type CassetteTests() =
                     match! (runner replayer).OutputBytesAsync(command, CancellationToken.None) with
                     | Error(ProcessError.Unsupported _) -> ()
                     | other -> Assert.Fail $"expected the bytes verb to be Unsupported, got {other}"
+            })
+
+    // --- A dispose reached by an exceptional unwind persists nothing (T-355) -----------------------
+    //
+    // `Dispose` runs both on a normal scope exit and while the stack unwinds out of a failed assertion,
+    // and .NET tells it nothing about which one it is — so the drop-time flush is gated on `Complete`,
+    // the caller's own statement that the recording finished as intended. Every test below is run for
+    // both recording modes, because `Record` and `Auto` share that one flush path.
+
+    [<TestCase("Record")>]
+    [<TestCase("Auto")>]
+    member _.``a recorder disposed while an exception unwinds writes no cassette``(mode: string) : Task =
+        withUnwrittenCassette (fun path ->
+            task {
+                let! escaped =
+                    recordThenUnwind
+                        (fun () -> recorderFor mode path (FixedRunner(crashedRunOutput, 0)))
+                        leftIncomplete
+
+                assertUnwoundWith escaped
+
+                Assert.That(
+                    File.Exists path,
+                    Is.False,
+                    $"a crash before Complete must leave no cassette holding the recorded argv/output ({mode})"
+                )
+
+                Assert.That(
+                    File.Exists(path + ".lock"),
+                    Is.False,
+                    $"the flush path must not be entered at all, so its sibling lock file is never created ({mode})"
+                )
+            })
+
+    [<TestCase("Record")>]
+    [<TestCase("Auto")>]
+    member _.``a recorder disposed while an exception unwinds leaves an existing cassette byte for byte``
+        (mode: string)
+        : Task =
+        withCassette (fun path ->
+            task {
+                // A cassette on disk, saved the honest way, that the crashed run below must not touch.
+                do!
+                    task {
+                        use seeded = RecordReplayRunner.Record(path, FixedRunner("committed-output", 0))
+                        do! recordEntries seeded "committed" 1
+
+                        match seeded.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"seed save: {error}"
+                    }
+
+                let before = File.ReadAllBytes path
+
+                let! escaped =
+                    recordThenUnwind
+                        (fun () -> recorderFor mode path (FixedRunner(crashedRunOutput, 0)))
+                        leftIncomplete
+
+                assertUnwoundWith escaped
+
+                CollectionAssert.AreEqual(
+                    before,
+                    File.ReadAllBytes path,
+                    $"a crash before Complete must not rewrite, grow, or truncate the saved cassette ({mode})"
+                )
+            })
+
+    [<TestCase("Record")>]
+    [<TestCase("Auto")>]
+    member _.``a recording completed before the throw is flushed by that same unwinding dispose``(mode: string) : Task =
+        withUnwrittenCassette (fun path ->
+            task {
+                let! escaped =
+                    recordThenUnwind
+                        (fun () -> recorderFor mode path (FixedRunner(crashedRunOutput, 0)))
+                        declaredComplete
+
+                assertUnwoundWith escaped
+
+                // The same scope, the same throw, the same `Dispose` — only the completion mark differs.
+                // That is what makes the two tests above evidence of a flush that was REFUSED rather than
+                // one that never ran, and it is the documented contract: `Complete` says the recording is
+                // finished, so a later failure no longer suppresses it.
+                Assert.That(
+                    File.Exists path,
+                    Is.True,
+                    $"a completed recording must still be flushed on dispose ({mode})"
+                )
+
+                CollectionAssert.AreEqual([| crashedRunCommand.Program |], cassettePrograms path)
+            })
+
+    [<TestCase("Record")>]
+    [<TestCase("Auto")>]
+    member _.``an explicit Save persists without Complete and still reports a write failure``(mode: string) : Task =
+        withUnwrittenCassette (fun path ->
+            task {
+                do!
+                    task {
+                        use recorder = recorderFor mode path (FixedRunner("saved-output", 0))
+                        do! recordEntries recorder "saved" 1
+
+                        // No Complete anywhere: an explicit save is unconditional, which is what keeps it
+                        // the one durability path however the surrounding scope ends.
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error}"
+                    }
+
+                CollectionAssert.AreEqual(
+                    [| "saved" |],
+                    cassettePrograms path,
+                    $"an explicit Save must write without Complete ({mode})"
+                )
+
+                // ...and a save that cannot write still reports that as itself.
+                let unwritable = Path.Combine(path + "-missing-directory", "cassette.json")
+                use blocked = recorderFor mode unwritable (FixedRunner("saved-output", 0))
+                do! recordEntries blocked "saved" 1
+
+                match blocked.Save() with
+                | Ok() -> Assert.Fail "a save into a missing directory must not report success"
+                | Error(ProcessError.Io _) -> ()
+                | Error other -> Assert.Fail $"expected a typed I/O failure, got {other}"
+            })
+
+    [<Test>]
+    member _.``Complete on a replay-mode recorder neither throws nor touches the cassette``() : Task =
+        withCassette (fun path ->
+            task {
+                let command = Command.create "tool" |> Command.arg "z"
+
+                do!
+                    task {
+                        use seeded = RecordReplayRunner.Record(path, FixedRunner("replayed-output", 0))
+                        let! _ = (runner seeded).OutputStringAsync(command, CancellationToken.None)
+
+                        match seeded.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"seed save: {error}"
+                    }
+
+                let before = File.ReadAllBytes path
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    do!
+                        task {
+                            use replayer = replayer
+                            let! _ = (runner replayer).OutputStringAsync(command, CancellationToken.None)
+                            // Replay records nothing, so there is nothing for a completed scope to flush.
+                            replayer.Complete()
+                        }
+
+                    CollectionAssert.AreEqual(
+                        before,
+                        File.ReadAllBytes path,
+                        "a replay session must never write to the cassette it is replaying"
+                    )
             })
 
     [<Test>]
@@ -808,7 +1053,7 @@ type CassetteTests() =
                     task {
                         use recorder = RecordReplayRunner.Record(path, inner)
                         let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -840,7 +1085,7 @@ type CassetteTests() =
                     task {
                         use recorder = RecordReplayRunner.Record(path, inner)
                         let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -897,7 +1142,7 @@ type CassetteTests() =
                     task {
                         use recorder = RecordReplayRunner.Record(path, inner)
                         let! _ = (runner recorder).OutputBytesAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -937,7 +1182,7 @@ type CassetteTests() =
                     task {
                         use recorder = RecordReplayRunner.Record(path, FixedRunner("0123456789", 0))
                         let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -980,7 +1225,7 @@ type CassetteTests() =
                             RecordReplayRunner.Record(path, FixedRunner("terminal output", 0, recordedDuration, true))
 
                         let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -1012,7 +1257,7 @@ type CassetteTests() =
                         use recorder = RecordReplayRunner.Record(path, FixedBytesRunner(raw, "warn", 3))
                         let command = Command.create "tool" |> Command.arg "b" |> Command.okCodes [ 0; 3 ]
                         let! _ = (runner recorder).OutputBytesAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -1059,6 +1304,8 @@ type CassetteTests() =
                         match! (runner recorder).OutputBytesAsync(command, CancellationToken.None) with
                         | Ok result -> assertTextProjections "live recording" result
                         | Error error -> Assert.Fail $"live recording failed: {error}"
+
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -1082,7 +1329,7 @@ type CassetteTests() =
                             RecordReplayRunner.Record(path, FixedBytesRunner(Encoding.UTF8.GetBytes text, "", 0))
 
                         let! _ = (runner recorder).OutputBytesAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -1105,7 +1352,7 @@ type CassetteTests() =
                     task {
                         use recorder = RecordReplayRunner.Record(path, FixedBytesRunner([||], "", 0))
                         let! _ = (runner recorder).OutputBytesAsync(Command.create "tool", CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -1138,7 +1385,7 @@ type CassetteTests() =
                             )
 
                         let! _ = (runner recorder).OutputBytesAsync(Command.create "tool", CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 Assert.That(File.ReadAllText path, Does.Not.Contain "SECRET")
@@ -1166,7 +1413,7 @@ type CassetteTests() =
                         use recorder = RecordReplayRunner.Record(cassette, FixedRunner("ok", 0), options)
                         let command = Command.create "tool" |> Command.stdin (Stdin.FromFile file)
                         let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay(cassette, options) with
@@ -1224,7 +1471,7 @@ type CassetteTests() =
                     task {
                         use recorder = RecordReplayRunner.Record(path, FixedBytesRunner(raw, "", 0))
                         let! _ = (runner recorder).OutputBytesAsync(Command.create "tool", CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay path with
@@ -1273,7 +1520,7 @@ type CassetteTests() =
                             RecordReplayRunner.Record(path, FixedRunner("line1\nline2\nline3", 0))
 
                         let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 // ...then replay it as a *stream*: SpawnAsync reconstructs a live handle from the cassette.
@@ -1344,7 +1591,7 @@ type CassetteTests() =
                         use recorder = RecordReplayRunner.Record(cassette, FixedRunner("fed", 0), options)
                         let command = Command.create "tool" |> Command.stdin (Stdin.FromFile fileA)
                         let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 match RecordReplayRunner.Replay(cassette, options) with
@@ -1382,7 +1629,7 @@ type CassetteTests() =
                             Command.create "tool" |> Command.args [ "--out"; "/tmp/run-aaa"; "build" ]
 
                         let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 // Replay with a normalizer that drops any /tmp/ argument, so a different temp path matches.
@@ -1414,7 +1661,7 @@ type CassetteTests() =
                             RecordReplayRunner.Record(path, FixedRunner("auth token=SECRET123 ok", 0), options)
 
                         let! _ = (runner recorder).OutputStringAsync(Command.create "tool", CancellationToken.None)
-                        ()
+                        recorder.Complete()
                     }
 
                 // The secret never reached disk...
@@ -2840,6 +3087,9 @@ type CassetteTests() =
                     use _holder = holder
                     let second = RecordReplayRunner.Record(path, FixedRunner("second", 0))
                     do! recordEntries second "loser" 1
+                    // Declared finished, so the dispose below really does reach the flush path this test
+                    // is about — an uncompleted recording would skip it and prove nothing about locking.
+                    second.Complete()
 
                     // The drop-time flush is best-effort in both directions: a lock it cannot get within
                     // its short wait is given up on rather than thrown out of `Dispose`, and the cassette
