@@ -48,7 +48,7 @@ whole verb vocabulary for free. (Calling a verb routes through these primitives;
 single raw capture with no retry, call `CaptureStringAsync` directly.)
 
 - [The `IProcessRunner` seam](#the-iprocessrunner-seam)
-- [Running this repository's tests](#running-this-repositorys-tests)
+- [Running the test suite](#running-the-test-suite)
 - [Scripting replies](#scripting-replies)
 - [Verifying calls](#verifying-calls)
 - [Custom doubles and mocking frameworks](#custom-doubles-and-mocking-frameworks)
@@ -57,7 +57,7 @@ single raw capture with no retry, call `CaptureStringAsync` directly.)
 - [CliClient](#cliclient)
 - [Dependency injection](#dependency-injection)
 
-## Running this repository's tests
+## Running the test suite
 
 An ordinary `dotnet test ProcessKit.slnx` runs the regular F# and C# suites on
 both target frameworks. The long-running, concurrency-sensitive `Stress` and
