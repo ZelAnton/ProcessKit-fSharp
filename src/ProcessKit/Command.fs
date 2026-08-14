@@ -893,6 +893,15 @@ type Command internal (config: CommandConfig) =
     /// first, the pipe is left open afterwards, and `TakeStdin` becomes available once that feed has
     /// finished — so the source and the interactive writer never write the pipe concurrently). Rejected
     /// (`ArgumentException`) when `InheritStdin` is already set — an inherited stdin has no pipe to keep open.
+    ///
+    /// **Take the writer before driving the handle to completion.** The kept-open pipe has exactly one
+    /// owner, and `TakeStdin`/`TakeStdinAsync` is not its only claimant: a verb that runs the handle to
+    /// completion while the writer is still untaken ends the child's input itself (`OutputStringAsync`/
+    /// `OutputBytesAsync`/`WaitAsync`/`ProfileAsync`, a `WaitAnyAsync`/`WaitAllAsync`/`StopAsync` that is the
+    /// handle's first consumer, and the verbs that never hand out a `RunningProcess` at all — `RunAsync`/
+    /// `ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/`OutputJsonAsync`/`FirstLineAsync`). That is what keeps a
+    /// child reading stdin to EOF from hanging such a verb, and it is one-way: `TakeStdin` afterwards
+    /// answers `None`. A writer already taken stays the caller's — no verb closes a handle it gave away.
     member _.KeepStdinOpen() =
         CommandConfig.ensureNoStdinInherit config "KeepStdinOpen"
         Command({ config with KeepStdinOpen = true })

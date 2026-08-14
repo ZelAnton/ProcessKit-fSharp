@@ -648,8 +648,9 @@ timeout, and cancellation rules are the ones you already know from `RunningProce
 
 Conversational tools — write a request, read the response, repeat. Keep stdin open
 with `KeepStdinOpen`, then take the writer with `TakeStdin()`, which returns a
-`ProcessStdin option` (`Some` once; `None` if stdin wasn't kept open or was already
-taken):
+`ProcessStdin option` — `Some` once, and `None` if stdin wasn't kept open, was
+already taken, or was ended by a completion verb that found it untaken (see
+[who owns the kept-open writer](#who-owns-the-kept-open-writer) below):
 
 **F#**
 
@@ -701,13 +702,51 @@ write, may already have delivered part of its bytes, so abandon the session rath
 timed-out write). `FinishAsync` is idempotent and uncancellable (it mirrors `DisposeAsync`); bound
 the writes/flush before closing, not the close.
 
+### Who owns the kept-open writer
+
+A kept-open stdin pipe has **exactly one** owner, and your `TakeStdin()` is not its only
+possible claimant. A verb that runs the handle to completion while the writer is still
+untaken ends the child's input itself — nothing could write that pipe afterwards, and a
+child reading stdin to EOF would otherwise wait forever on an end of input nobody can
+deliver. That applies to:
+
+- `OutputStringAsync()`, `OutputBytesAsync()`, `WaitAsync()`, `ProfileAsync()` on the handle;
+- a `WaitAnyAsync`/`WaitAllAsync`/`StopAsync` that is *this handle's first consumer* — when a
+  verb or a streaming session already owns the pipes, these reuse that consumer's own wait and
+  decide nothing about stdin;
+- every verb that never hands you a `RunningProcess` at all — `RunAsync`, `ExitCodeAsync`,
+  `ProbeAsync`, `ParseAsync`/`TryParseAsync`, `OutputJsonAsync`, `FirstLineAsync` (which ends
+  the input before it starts streaming stdout, so a child that answers only after EOF still
+  produces its first line).
+
+So **take the writer before you drive the handle to completion**, not after: the claim is made
+the moment such a verb starts, so from then on `TakeStdin()` returns `None` and the child's end
+of input is already on its way. In particular, "call a buffered verb first, then `TakeStdin()`
+and write" is not a way around the deadlock below — the writer is gone by then, and the child
+answers on the input it has, which for an interactive-only run is none at all.
+
+The other direction is safe and unchanged: a writer you took stays yours. No verb closes a
+handle it gave away, and completion waits for your own `FinishAsync()`/dispose. Streaming
+(`StdoutLinesAsync`/`StdoutChunksAsync`/`OutputEventsAsync` and the `FinishAsync` that concludes
+them), the readiness probes, and a live `StartAsync` handle you have not yet driven to
+completion all leave the pipe exactly as they found it. A `PtySession` or `ContentLengthSession`
+takes the writer for its own send verbs when it is created — that is the "already taken" case,
+and `TakeStdin()` afterwards returns `None` for the same one-owner reason.
+
+On a `Stdin(source)` + `KeepStdinOpen` run the end of input never truncates the source: whoever
+ends it — you or the verb — waits for the background feeder to finish delivering the whole
+source first, exactly as `TakeStdin()` itself does.
+
 **Avoid the full-duplex deadlock.** A child's stdout pipe has a finite OS buffer;
 once it fills, the child blocks *writing* stdout until something reads it. If you
 push a large interactive stdin while nothing drains the child's stdout, the child
 stops reading stdin (blocked on stdout), your `WriteAsync` parks waiting for stdin buffer
 space, and neither side progresses. The `bc` example above is safe because it
 interleaves one small write with one read. When you both feed a sizable stdin **and**
-the child produces output, write stdin from one task and drain stdout from another:
+the child produces output, write stdin from one task and drain stdout from another —
+both halves over the live `StartAsync` handle, with the writer taken up front (reaching
+for a buffered verb to "start the drains" first would end the child's input before you
+could take it, as described above):
 
 **F#**
 

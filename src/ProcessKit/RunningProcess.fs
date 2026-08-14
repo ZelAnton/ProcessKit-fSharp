@@ -1687,8 +1687,19 @@ type RunningProcess
             | false, _ -> None)
 
     /// Take the interactive stdin handle — `Some` only when the command kept stdin open
-    /// (`Command.KeepStdinOpen`), and only once. With **no** source it is available immediately; with a
-    /// `Command.Stdin(source)` it is available once the background feeder has finished draining that source
+    /// (`Command.KeepStdinOpen`), and only once. `None` in every other case: stdin was not kept open (no
+    /// `KeepStdinOpen`, or an `InheritStdin` child), the writer was already taken (an earlier `TakeStdin`,
+    /// or the `PtySession`/`ContentLengthSession` that took it for its own send verbs), or a verb that ran
+    /// this handle to completion found the writer untaken and ended the child's input itself (see
+    /// `FinishUnclaimedStdin` — the same once-only claim, made from the other side). So take the writer
+    /// BEFORE `OutputStringAsync`/`OutputBytesAsync`/`WaitAsync`/`ProfileAsync`, a first-consumer
+    /// `WaitAnyAsync`/`WaitAllAsync`/`StopAsync`, or a runner-level verb that hands out no handle at all:
+    /// such a verb claims as it starts, and a claim lost to it is not recoverable — the child's end of
+    /// input is already on its way. A writer this call hands out stays the caller's: no verb closes a
+    /// handle it gave away, and completion waits for that caller's own `FinishAsync`.
+    ///
+    /// With **no** source the writer is available immediately; with a `Command.Stdin(source)` it is
+    /// available once the background feeder has finished draining that source
     /// (this call blocks until then), so the caller never writes to the pipe while the feeder still is.
     /// That wait is deadlock-safe even on a single-threaded `SynchronizationContext` (a WPF/WinForms UI
     /// thread, classic ASP.NET): the source feeder runs detached on the thread pool (see
@@ -1707,9 +1718,11 @@ type RunningProcess
         | None -> None
 
     /// The non-blocking form of `TakeStdin`: the once-only claim above still happens SYNCHRONOUSLY, before
-    /// this returns (so a racing `TakeStdin` still loses, and a caller that gets a task is genuinely the
-    /// owner), but the wait for a `Command.Stdin(source)` feeder to finish draining moves into the returned
-    /// task — served on the thread pool, where parking a thread is safe, instead of on the caller's.
+    /// this returns (so a racing claimant — another `TakeStdin`, or a terminal verb ending an untaken
+    /// writer's input — loses, and a caller that gets a task is genuinely the owner), but the wait for a
+    /// `Command.Stdin(source)` feeder to finish draining moves into the returned task — served on the
+    /// thread pool, where parking a thread is safe, instead of on the caller's. It answers `None` in
+    /// exactly the cases `TakeStdin` does, including a writer a completion verb has already claimed.
     ///
     /// Internal, for `ContentLengthSession`: its constructor claims stdin right after starting the framed
     /// parse loop, and must return while the frames that loop is already producing are still unread. With a

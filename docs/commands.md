@@ -416,7 +416,14 @@ Console.WriteLine(await sorted.RunAsync() switch
 
 The payload is written on a background task — so a large input can't deadlock
 against the child's own output — and the pipe is closed (EOF) once the source is
-exhausted, unless you also set [`KeepStdinOpen`](#spawn-flags).
+exhausted. [`KeepStdinOpen`](#spawn-flags) holds it open past the source instead,
+for a live `StartAsync` handle whose caller takes the writer with
+`RunningProcess.TakeStdin` — but only until the run reaches a verb that drives it
+to completion: a verb that finds the writer still untaken ends the child's input
+itself, so a child that reads stdin to EOF exits rather than hanging that verb.
+Take the writer before you call such a verb — see
+[Who owns the kept-open writer](streaming.md#who-owns-the-kept-open-writer) for
+the exact rule and the verbs it covers.
 
 The two **in-memory** sources (`FromString` / `FromBytes`) and `FromFile` are
 safe to send again: a retried command (or a record/replay match) re-sends the
@@ -1007,7 +1014,10 @@ await new Command("helper").CreateNoWindow().RunAsync();
   a tool spawned from a GUI app doesn't flash a console window. No effect on Unix.
 - **`KeepStdinOpen`** keeps the child's stdin pipe open after its source is
   exhausted (or with no source at all), so you can write to it interactively via
-  `RunningProcess.TakeStdin` — see [Streaming & interactive I/O](streaming.md).
+  `RunningProcess.TakeStdin`. The writer has exactly one owner: take it before you
+  drive the handle to completion, because a completion verb that finds it untaken
+  ends the child's input itself and a later `TakeStdin` then returns `None` — see
+  [Streaming & interactive I/O](streaming.md#who-owns-the-kept-open-writer).
 
 ### Unix privilege drop & session detach
 
