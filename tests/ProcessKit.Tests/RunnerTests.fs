@@ -205,6 +205,37 @@ module internal BoundedCapture =
     /// The same, for a successful (exit 0) run.
     let runner (text: string) : IProcessRunner = runnerExiting 0 text
 
+    /// A runner answering with a capture the bounded POST-EXIT OUTPUT DRAIN cut short — the shape a live
+    /// handle produces when something that inherited the child's stdout/stderr outlived it: an accepted
+    /// exit, whatever text arrived before the bound, `Truncated` set, and the truncation attributed to
+    /// the drain rather than to a buffer policy. `totalLines` is carried exactly as the real verb carries
+    /// it (the line pump counts unconditionally, cap or no cap), so a refusal that quoted that total
+    /// against a ceiling — T-360's bug — would be visible in the message.
+    let drainCutShort (retained: string) (totalLines: int) : IProcessRunner =
+        { new IProcessRunner with
+            member _.CaptureStringAsync(command, _) =
+                Task.FromResult(
+                    Ok(
+                        ProcessResult<string>(
+                            command.Program,
+                            retained,
+                            "",
+                            Outcome.Exited 0,
+                            TimeSpan.Zero,
+                            true,
+                            [ 0 ],
+                            overflowTotals = (totalLines, 0),
+                            outputDrainBounded = true
+                        )
+                    )
+                )
+
+            member _.CaptureBytesAsync(_, _) =
+                Task.FromResult(Ok(ProcessResult.Success(Array.empty<byte>)))
+
+            member _.SpawnAsync(command, _) =
+                Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
+
     /// A runner answering with a result that reports truncation but carries NO totals — what a replayed
     /// cassette or a third-party double produces, since only the library's own capture paths count.
     let untotalled (retained: string) : IProcessRunner =
@@ -2111,5 +2142,70 @@ line-2"
             | Error(ProcessError.OutputTooLarge("capture", Some 2, None, 0, 0) as error) ->
                 Assert.That(error.Message, Is.EqualTo "'capture' produced too much line output")
             | other -> Assert.Fail $"expected a total-free OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a capture the post-exit drain cut short is refused as incomplete, not as a ceiling breach``() : Task =
+        task {
+            // The OTHER source of truncation (T-360): no ceiling is configured at all — the default
+            // `OutputBuffer` — and the capture is short because something that inherited the child's
+            // stdout/stderr held the pipe open past the post-exit drain window. `run` must still refuse
+            // it (a clipped string must never pass for whole output), but with the error that names THIS
+            // cause. Reusing `OutputTooLarge` here landed in the shared formatter's event branch and told
+            // a plain text run it had "produced too many events (3 events)" — wrong unit, wrong cause,
+            // and a remediation (turn an `OutputBuffer` knob) that cannot work.
+            let! result =
+                Command.create "capture"
+                |> Runner.run (BoundedCapture.drainCutShort "line-1\nline-2\nline-3" 3) CancellationToken.None
+
+            match result with
+            | Error(ProcessError.OutputIncomplete "capture" as error) ->
+                Assert.That(
+                    error.Message,
+                    Is.EqualTo
+                        "'capture' output was cut short: something that inherited its stdout/stderr outlived the run, so the capture is incomplete"
+                )
+
+                // No count and no ceiling anywhere in it — there was no bound for either to be measured
+                // against, which is exactly what distinguishes this refusal from `OutputTooLarge`.
+                Assert.That(error.Message, Does.Not.Contain "3")
+                Assert.That(error.Message, Does.Not.Contain "events")
+                Assert.That(error.Message, Does.Not.Contain "too much")
+            | other -> Assert.Fail $"expected the drain-bound refusal, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a drain-bounded capture is refused as incomplete even under a configured ceiling``() : Task =
+        task {
+            // Both sources can be true of one capture: a bounded buffer dropped output AND the drain cut
+            // the tail. The refusal names the drain — the cause the caller did not configure themselves,
+            // and the one that says the run's own read ends were closed on a pipe a descendant held.
+            let! result =
+                Command.create "capture"
+                |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxLines 2)
+                |> Runner.run (BoundedCapture.drainCutShort "line-1\nline-2" 5) CancellationToken.None
+
+            match result with
+            | Error(ProcessError.OutputIncomplete "capture") -> ()
+            | other -> Assert.Fail $"expected the drain bound to name the refusal, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a buffer-truncated capture is still refused as OutputTooLarge``() : Task =
+        task {
+            // The control for the two above: with no drain bound in play, the ordinary buffer-policy
+            // truncation keeps the error — and the wording — it always had. Splitting the refusal must
+            // not move the common case onto the new case.
+            let! result =
+                BoundedCapture.boundedCommand OverflowMode.DropOldest 2
+                |> Runner.run (BoundedCapture.runner (BoundedCapture.payload 5)) CancellationToken.None
+
+            match result with
+            | Error(ProcessError.OutputTooLarge("capture", Some 2, None, 5, _) as error) ->
+                Assert.That(error.Message, Does.StartWith "'capture' produced too much line output")
+            | other -> Assert.Fail $"expected the buffer-policy OutputTooLarge, got {other}"
         }
         :> Task

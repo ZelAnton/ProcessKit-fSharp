@@ -33,11 +33,30 @@ type internal SeverableStream(inner: Stream, severed: CancellationToken) =
     // per-read linked `CancellationTokenSource`.
     let issueRead (buffer: Memory<byte>) (token: CancellationToken) = inner.ReadAsync(buffer, token)
 
-    // Whether a caught cancellation is the SEVER's and only the sever's. A cancellation the CALLER
-    // asked for stays a cancellation: it is that caller's own signal, and answering it with a silent
-    // short read would report a truncated capture as a complete one.
+    // Whether a caught failure is the SEVER's and only the sever's. A cancellation the CALLER asked for
+    // stays a cancellation: it is that caller's own signal, and answering it with a silent short read
+    // would report a truncated capture as a complete one.
     let severedNotCaller (callerToken: CancellationToken) : bool =
         severed.IsCancellationRequested && not callerToken.IsCancellationRequested
+
+    // How a read the sever aborted comes back is the TRANSPORT's choice, and the transports under these
+    // pipes do not agree: a Windows overlapped handle and a POSIX socket-backed pipe unwind a pending
+    // read as an `OperationCanceledException`, while a stream layered over a raw fd (and .NET's own
+    // `FileStream` on some paths) reports the aborted operation as an `IOException` — the same
+    // `ERROR_OPERATION_ABORTED`/`ECANCELED` in a different wrapper. Both mean exactly one thing here:
+    // the read WE cut. Answering only the first with EOF would leave the second to surface as a
+    // `ProcessError.Io` and fail a verb whose contract is a truncated capture, so both are the sever's
+    // EOF. This never swallows a genuine fault a caller could act on: it applies only once this handle
+    // has already severed its own read ends, at which point the capture is over and reported incomplete
+    // whatever the pipe does next. An `ObjectDisposedException` is included for the narrow race where
+    // teardown disposes the stream just after the sever — likewise not a fault to report.
+    let isSeverUnwind (ex: exn) (callerToken: CancellationToken) : bool =
+        severedNotCaller callerToken
+        && match ex with
+           | :? OperationCanceledException
+           | :? IOException
+           | :? ObjectDisposedException -> true
+           | _ -> false
 
     let readSevering (buffer: Memory<byte>) (callerToken: CancellationToken) : ValueTask<int> =
         if severed.IsCancellationRequested then
@@ -50,7 +69,7 @@ type internal SeverableStream(inner: Stream, severed: CancellationToken) =
 
                     try
                         return! issueRead buffer linked.Token
-                    with :? OperationCanceledException when severedNotCaller callerToken ->
+                    with ex when isSeverUnwind ex callerToken ->
                         return 0
                 }
             )
@@ -64,7 +83,7 @@ type internal SeverableStream(inner: Stream, severed: CancellationToken) =
                     task {
                         try
                             return! pending
-                        with :? OperationCanceledException when severedNotCaller callerToken ->
+                        with ex when isSeverUnwind ex callerToken ->
                             return 0
                     }
                 )

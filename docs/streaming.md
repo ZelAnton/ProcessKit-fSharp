@@ -627,13 +627,19 @@ and the result says it is incomplete:
 
 - `OutputStringAsync`/`OutputBytesAsync` return the partial capture with `ProcessResult.Truncated`
   set — symmetric for text and bytes.
-- A line/chunk/event stream ends where it was cut, and `FinishAsync` reports `Finished.Truncated`.
+- A line or chunk stream ends where it was cut, and `FinishAsync` reports `Finished.Truncated`.
+- An **event** stream (`OutputEventsAsync`) ends where it was cut too, but with no separate signal:
+  `FinishAsync` is not available on an event session (it answers already-consumed), so the enumerator
+  simply ends. If you need to know whether the tail was complete, stream lines or chunks and finish, or
+  capture with `OutputStringAsync`/`OutputBytesAsync`.
 - `WaitAsync`/`ProfileAsync`, which retain nothing anyway, simply conclude.
 - `WaitAnyAsync`/`WaitAllAsync` resolve on the child's own exit.
 - The **checking** verbs — `RunAsync`, `ParseAsync`, `OutputJsonAsync` — present their capture as the
-  whole of stdout, so they refuse a cut-short one with `ProcessError.OutputTooLarge`, exactly as they
-  already refuse one a buffer policy truncated. Use `OutputStringAsync`/`OutputBytesAsync` when you
-  want the partial payload plus `Truncated` instead.
+  whole of stdout, so they refuse a cut-short one with
+  [`ProcessError.OutputIncomplete`](commands.md#errors). That is its own case, not the
+  `OutputTooLarge` a buffer policy's truncation gets: nothing crossed a ceiling here, and no
+  `OutputBuffer` setting would have changed the outcome. Use `OutputStringAsync`/`OutputBytesAsync`
+  when you want the partial payload plus `Truncated` instead.
 
 This is not a timeout: the run's `Outcome` is untouched (it is not turned into `TimedOut`), and
 `Command.Timeout` remains a separate, independent deadline on the run as a whole. It is also not a
@@ -644,6 +650,15 @@ the group until you shut the group down.
 
 If you *want* that descendant's output, it is not this run's stdout to capture — give the descendant
 its own pipe, or have the child wait for it before exiting.
+
+**Scope.** This bound belongs to a run driven through one `RunningProcess` handle — the whole of this
+chapter, and every `Command`/`Exec` capture verb, all of which run through one. A [`Pipeline`](pipelines.md)
+does **not** have it: its buffered verbs wait for the last stage's stdout and for every stage's stderr
+to reach end-of-file, so a stage that leaves a background job holding one of those still waits for that
+job, and the whole-chain `Pipeline.Timeout` does not cover it (the deadline is disarmed once every stage
+is terminal, which is when that wait starts). Cancelling such a run through its `CancellationToken`
+tears the chain's group down, descendants included; keeping the descendant off the stage's own
+stdout/stderr avoids it entirely.
 
 ## Streaming a pipeline's final stage
 

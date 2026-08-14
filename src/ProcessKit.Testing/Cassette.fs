@@ -1389,6 +1389,11 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     //     host- or platform-dependent condition (or, for `Adopt`, one no capture verb produces). Each
     //     says something about the machine that recorded, not about the invocation, so replaying it
     //     elsewhere as a property of the call would be a lie.
+    //   * `OutputIncomplete` — the same reason, in the same spirit: it says a descendant of THAT run
+    //     held THAT pipe open past the post-exit drain window. It is a race with the machine, not a
+    //     property of the command, and a replay would hand every later caller a truncation that never
+    //     happened. (An `OutputTooLarge` IS recorded: a configured ceiling the output crossed is a
+    //     property of the invocation, reproducible by construction.)
     // The redaction hook covers every free-text field here, so the error half of an entry is no less
     // scrubbed than the result half (`Method` is an identifier, kept verbatim like `Program`/`Args`).
     let failureOf (error: ProcessError) : CassetteFailure option =
@@ -1455,6 +1460,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                     Data = redactOptional data }
         | ProcessError.Cancelled _
         | ProcessError.CassetteMiss _
+        | ProcessError.OutputIncomplete _
         | ProcessError.RetryPredicate _
         | ProcessError.Unobserved _
         | ProcessError.NotReady _

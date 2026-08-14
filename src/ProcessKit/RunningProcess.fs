@@ -2241,7 +2241,11 @@ type RunningProcess
                                     config.OkCodes,
                                     ?configuredTimeoutDuration = configuredTimeoutDuration,
                                     stdoutEncoding = config.StdoutEncoding,
-                                    overflowTotals = (totalLines, totalBytes)
+                                    overflowTotals = (totalLines, totalBytes),
+                                    // WHICH of the two truncation sources this was, so a checking verb
+                                    // refusing the capture names the real cause instead of quoting a
+                                    // ceiling that was never configured (`rejectIfTruncated`).
+                                    outputDrainBounded = outputDrainWasBounded ()
                                 )
                             )
             }
@@ -2322,7 +2326,10 @@ type RunningProcess
                                     config.OkCodes,
                                     ?configuredTimeoutDuration = configuredTimeoutDuration,
                                     stdoutEncoding = config.StdoutEncoding,
-                                    overflowTotals = (totalLines, totalBytes)
+                                    overflowTotals = (totalLines, totalBytes),
+                                    // Symmetric with the text verb here too: the refusal a checking verb
+                                    // builds from this result must name the drain bound, not a ceiling.
+                                    outputDrainBounded = outputDrainWasBounded ()
                                 )
                             )
             }

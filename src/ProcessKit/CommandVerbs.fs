@@ -133,7 +133,8 @@ type CommandVerbs =
         Runner.start CommandVerbs.DefaultRunner cancellationToken command
 
     /// Require a zero/accepted exit and return stdout, trailing whitespace trimmed. Output the
-    /// command's `OutputBuffer` policy truncated is refused with `ProcessError.OutputTooLarge` rather
+    /// command's `OutputBuffer` policy truncated is refused with `ProcessError.OutputTooLarge`, and
+    /// output the bounded post-exit drain cut short with `ProcessError.OutputIncomplete`, rather
     /// than returned as if whole — use `OutputStringAsync` for the bounded payload plus `Truncated`.
     [<Extension>]
     static member RunAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
