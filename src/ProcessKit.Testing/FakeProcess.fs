@@ -135,6 +135,17 @@ type FakeProcess
         ArgumentNullException.ThrowIfNull(text, nameof text)
         FakeProcess(template, text, None, stderr, outcome, pid, pty, stdin, signals)
 
+    /// The captured stdout as EXACT bytes, with no text round-trip: the built handle's stdout stream
+    /// carries them verbatim, so a byte-exact observer — a `StdoutTee`, `OutputBytesAsync`,
+    /// `StdoutChunksAsync` — sees what was scripted even when those bytes are not valid in the command's
+    /// stdout encoding. Scripting the same output as *text* would first decode it (turning an invalid
+    /// sequence into U+FFFD) and then re-encode that replacement, which is exactly the loss the bytes
+    /// capture verb exists to avoid. Internal: `RecordReplayRunner` scripts a `byte[]` cassette
+    /// recording (its base64 stdout) with this, so all three replay APIs hand out the recorded bytes.
+    member internal _.WithStdoutBytes(bytes: byte[]) =
+        ArgumentNullException.ThrowIfNull(bytes, nameof bytes)
+        FakeProcess(template, "", Some(Array.copy bytes), stderr, outcome, pid, pty, stdin, signals)
+
     /// The captured stdout as a sequence of lines (joined with `\n`).
     member _.WithStdoutLines(lines: seq<string>) =
         ArgumentNullException.ThrowIfNull(lines, nameof lines)

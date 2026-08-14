@@ -1598,6 +1598,26 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                     )
                 )
 
+    // Script an entry's recorded stdout onto a fake, in the form it was recorded in. A BYTES recording
+    // (base64 present) replays its exact bytes, so every byte-exact observer of a reconstructed
+    // handle — a `StdoutTee`, `OutputBytesAsync`, `StdoutChunksAsync` — sees what was captured even when
+    // it is not valid in the command's stdout encoding; scripting it as text would decode those bytes to
+    // U+FFFD and re-encode the replacement, losing exactly what the bytes verb was used to preserve (and
+    // making a spawned replay disagree with `resultBytes`, which hands back the recorded bytes). A text
+    // recording is scripted as its text. A corrupt base64 payload is the same `Io` error every other
+    // replay path reports.
+    let scriptRecordedStdout
+        (command: Command)
+        (entry: CassetteEntry)
+        (fake: FakeProcess)
+        : Result<FakeProcess, ProcessError> =
+        match entry.StdoutBase64 with
+        | null -> Ok(fake.WithStdout entry.Stdout)
+        | base64 ->
+            match decodeStdoutBase64 command base64 with
+            | Error error -> Error error
+            | Ok bytes -> Ok(fake.WithStdoutBytes bytes)
+
     // Reconstruct a live handle from a recorded entry, reusing the same in-memory `FakeProcess` the
     // scripted double builds — so a replayed stream agrees with a real run on line splitting, encoding,
     // OkCodes, and outcome. A corrupt base64 stdout errors here exactly as it does for the capture verbs,
@@ -1609,21 +1629,69 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         match recordedFailure command entry with
         | Some error -> Error error
         | None ->
-            match stdoutText command entry with
-            | Error error -> Error error
-            | Ok stdout ->
-                let fake =
-                    FakeProcess
-                        .OfCommand(command)
-                        .WithStdout(stdout)
-                        .WithStderr(entry.Stderr)
-                        .WithOutcome(outcomeOf entry)
+            let fake =
+                FakeProcess.OfCommand(command).WithStderr(entry.Stderr).WithOutcome(outcomeOf entry)
 
+            match scriptRecordedStdout command entry fake with
+            | Error error -> Error error
+            | Ok fake ->
                 // A PTY recording (D3) replays as a merged-stream handle: `OutputEventsAsync` yields only
                 // `OutputEvent.Stdout` and `ResizeAsync` is a recorded no-op success. The recorded `Stdout`
                 // is the merged stream; the entry flag is authoritative (independent of the live command).
                 let fake = if entry.Pty then fake.WithPty() else fake
                 Ok(fake.Build(TimeSpan.FromMilliseconds entry.DurationMs, entry.Truncated))
+
+    // Has this call any command-level OUTPUT side effect for a replay to reproduce? A call with none —
+    // the overwhelmingly common case — skips the replay pump below entirely and stays exactly as cheap
+    // as a replay has always been.
+    let hasOutputSideEffects (command: Command) : bool =
+        let config = command.Config
+
+        config.OnStdoutLine.IsSome
+        || config.OnStderrLine.IsSome
+        || config.StdoutTee.IsSome
+        || config.StderrTee.IsSome
+
+    // Reproduce a matched entry's recorded output through the LIVE command's own output side effects —
+    // its `OnStdoutLine`/`OnStderrLine` handlers and its `StdoutTee`/`StderrTee` sinks. A real run drives
+    // those from the capture pumps as the child writes; a directly reconstructed `ProcessResult`
+    // (`resultText`/`resultBytes`) never touches a stream, so without this a progress parser or a log tee
+    // silently observed nothing on a hermetic replay — and an exception one of them raised disappeared
+    // with it, leaving the recorded success looking clean.
+    //
+    // Rather than re-deriving line splitting, decoding, the final unterminated line, per-stream ordering
+    // and the tee flush, this drives the SAME handle `SpawnAsync` replay reconstructs (`spawnFromEntry`)
+    // through the SAME real capture verb the caller asked for (`drive`). So what fires, with what text
+    // and in what order, is decided by `RunningProcess` itself and cannot drift between the three replay
+    // APIs — including the merged-stream PTY case, where the reconstructed handle has no separate stderr
+    // stream at all and therefore invokes no stderr handler or tee.
+    //
+    // The driven verb's own `Result` is deliberately DROPPED: what a replay hands back stays the value
+    // `resultOf` rebuilds from the entry (its recorded duration, truncation flag and exact bytes), so
+    // this reproduces side effects without becoming a second, disagreeing source of results — a live
+    // output-buffer policy, for instance, keeps applying to the recorded result exactly as it did before.
+    // A FAULT is not dropped: a throwing handler, or a tee whose write fails, propagates out of here just
+    // as it does from a real run, so a replay can never report the recorded success while the caller's
+    // own callback blew up.
+    let replayOutputSideEffects (drive: RunningProcess -> Task) (command: Command) (entry: CassetteEntry) : Task =
+        if not (hasOutputSideEffects command) then
+            Task.CompletedTask
+        else
+            task {
+                match spawnFromEntry command entry with
+                | Error _ ->
+                    // Unreachable by construction: the caller runs `recordedFailure` and its own
+                    // `resultOf` first, and every reason this reconstruction can fail (a recorded typed
+                    // failure, a corrupt base64 stdout) has already been reported through one of those.
+                    // Staying silent here is what keeps that single report single.
+                    ()
+                | Ok running ->
+                    // Not disposed here, for the same reason the other in-memory doubles do not dispose
+                    // theirs (`Seam.complete`): a completion verb reaps its own handle through
+                    // `reapGuard`, which for a fake is the disposal of its in-memory streams.
+                    do! drive running
+            }
+            :> Task
 
     // Take the entry this key's cursor is on, in capture order then repeating the last. `accept` is the
     // caller's veto — a candidate it refuses is NOT consumed (the cursor stays put), so a refused
@@ -1840,11 +1908,12 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // cassette (a miss is `CassetteMiss`, never a surprise subprocess); Auto replays a hit and
     // delegates+records a miss (VCR "new episodes").
     // Parameterized over `captureInner` (which of `inner`'s two capture verbs to call),
-    // `entryOf` (how to turn a live result into a `CassetteEntry`), and `resultOf` (how to turn a
-    // replayed entry back into a result — `resultBytes` alone can fail, on a text/pre-v2 entry), so
-    // the text and bytes paths can never drift apart on the mode/lock/dirty discipline itself. A
-    // recorded FAILURE needs no such parameter: it replays identically for both verbs (see
-    // `recordedFailure`).
+    // `entryOf` (how to turn a live result into a `CassetteEntry`), `resultOf` (how to turn a
+    // replayed entry back into a result — `resultBytes` alone can fail, on a text/pre-v2 entry), and
+    // `replayDrive` (which real verb a replay hit re-runs over the reconstructed handle, so the
+    // command's own output side effects fire the way that verb makes them fire), so the text and bytes
+    // paths can never drift apart on the mode/lock/dirty discipline itself. A recorded FAILURE needs no
+    // such parameter: it replays identically for both verbs (see `recordedFailure`).
     member private this.CaptureVia<'a>
         (
             command: Command,
@@ -1852,7 +1921,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             captureInner:
                 IProcessRunner -> Command -> CancellationToken -> Task<Result<ProcessResult<'a>, ProcessError>>,
             entryOf: Command -> ProcessResult<'a> -> string option -> CassetteEntry,
-            resultOf: Command -> CassetteEntry -> Result<ProcessResult<'a>, ProcessError>
+            resultOf: Command -> CassetteEntry -> Result<ProcessResult<'a>, ProcessError>,
+            replayDrive: RunningProcess -> Task
         ) : Task<Result<ProcessResult<'a>, ProcessError>> =
         task {
             use linkedCts =
@@ -1863,12 +1933,23 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             let effectiveToken = linkedCts.Token
 
             // What a matched entry hands back: the typed failure it recorded, or its recorded result
-            // through the verb's own `resultOf`. One place, so the three replay call sites below
-            // (Replay, an Auto hit, and — via `spawnFromEntry` — a replayed handle) cannot disagree.
-            let replayed (entry: CassetteEntry) =
-                match recordedFailure command entry with
-                | Some error -> Error error
-                | None -> resultOf command entry
+            // through the verb's own `resultOf` — plus the command's own output side effects, replayed
+            // through the real verb before that result is returned, exactly as a real run produces them
+            // before it returns (so a handler/tee fault surfaces INSTEAD of the recorded success, never
+            // after it). One place, so the two replay call sites below (Replay and an Auto hit) cannot
+            // disagree with each other, nor with the handle `SpawnAsync` replay reconstructs from the
+            // same entry through the same `spawnFromEntry`.
+            let replayed (entry: CassetteEntry) : Task<Result<ProcessResult<'a>, ProcessError>> =
+                task {
+                    match recordedFailure command entry with
+                    | Some error -> return Error error
+                    | None ->
+                        match resultOf command entry with
+                        | Error error -> return Error error
+                        | Ok result ->
+                            do! replayOutputSideEffects replayDrive command entry
+                            return Ok result
+                }
 
             if effectiveToken.IsCancellationRequested then
                 // Completion verbs honour both their own token and `Command.CancelOn`, including in
@@ -1922,7 +2003,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                             if effectiveToken.IsCancellationRequested then
                                 return Error(ProcessError.Cancelled command.Program)
                             else
-                                return replayed entry
+                                return! replayed entry
                         | Ok None -> return Error(ProcessError.CassetteMiss command.Program)
                     | AutoMode(inner, slots, recorded, dirty) ->
                         let key = keyOf command digest
@@ -1933,7 +2014,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                             if effectiveToken.IsCancellationRequested then
                                 return Error(ProcessError.Cancelled command.Program)
                             else
-                                return replayed entry
+                                return! replayed entry
                         | Ok None ->
                             match! captureInner inner command effectiveToken with
                             | Error error ->
@@ -1965,7 +2046,10 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             cancellationToken,
             (fun inner c t -> inner.CaptureStringAsync(c, t)),
             entryOfText,
-            resultText
+            resultText,
+            // The text verb line-pumps BOTH streams, so a replay hit fires both line handlers and both
+            // tees, per stream and in line order — whatever `OutputStringAsync` itself does.
+            (fun running -> running.OutputStringAsync() :> Task)
         )
 
     member private this.CaptureBytes(command: Command, cancellationToken: CancellationToken) =
@@ -1974,7 +2058,12 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             cancellationToken,
             (fun inner c t -> inner.CaptureBytesAsync(c, t)),
             entryOfBytes,
-            resultBytes
+            resultBytes,
+            // The bytes verb's side effects differ, deliberately: raw stdout has no line structure, so
+            // `StdoutTee` receives its bytes while `OnStdoutLine` is never called — stderr alone is
+            // line-pumped. Driving the real verb keeps a replay honest about that instead of inventing
+            // stdout lines a live bytes capture would never have produced.
+            (fun running -> running.OutputBytesAsync() :> Task)
         )
 
     // Replay a live handle from the cassette. Record mode cannot capture a live stream without racing

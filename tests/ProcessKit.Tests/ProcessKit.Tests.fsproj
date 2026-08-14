@@ -59,6 +59,7 @@
 		<Compile Include="PumpPropertyTests.fs" />
 		<Compile Include="OutputPolicyPropertyTests.fs" />
 		<Compile Include="ArgvEnvRoundTripTests.fs" />
+		<Compile Include="RunnerConformanceTests.fs" />
 		<Compile Include="ApiSurfaceTests.fs" />
 		<Compile Include="StressTests.fs" />
 		<Compile Include="InterleavingTests.fs" />
