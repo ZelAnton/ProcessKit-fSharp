@@ -422,6 +422,17 @@ hidden containment claim: ProcessKit owns the sidecar through the pseudoconsole 
 deterministically with `ClosePseudoConsole` during teardown. The child itself is still born inside
 the Job Object.
 
+**Windows PTY stdio binding on a headless launcher.** A ConPTY child's standard handles always come
+from the pseudoconsole, but the two Windows launch environments need different mechanisms for that:
+a console-attached launcher severs its own console handles in the child's startup information, while
+a headless one (a service-hosted CI step, a redirected test host) instead replaces its own three
+standard-handle slots with null for the length of the `CreateProcess` call and restores them
+immediately afterwards. ProcessKit serializes that short window with all of its own Windows spawn
+paths, so no command it starts — including one inheriting the caller's stdio — can observe the null
+slots; it cannot coordinate code outside ProcessKit, so a concurrent foreign spawn with inherited
+stdio, or a first-time `Console` access on another thread, can still race it. Run PTY sessions from a
+dedicated helper process where that matters. See [PTY → Platform support](pty.md#platform-support).
+
 **Windows PTY echo belongs to the child.** `PtyConfig.Echo = false` clears the POSIX slave terminal's
 `ECHO` bit before spawn, but Windows echo is controlled by the child's `CONIN$` console mode. ConPTY
 does not expose a supported parent-side pre-spawn override, so a Windows credential prompt must

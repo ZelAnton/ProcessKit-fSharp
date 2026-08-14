@@ -375,7 +375,11 @@ everywhere:
   opaquely and is *not* passed through the redactor). A
   PTY recording's merged stream goes through the same `WithRedaction` hook, which
   is how an echoed credential is kept out of a PTY cassette even with
-  `PtyConfig.Echo = true`. Review any fixture recorded from an untrusted or
+  `PtyConfig.Echo = true`. The **output-wiring** fingerprint (the other half of the
+  match key) follows the environment fingerprint's rule rather than the verbatim
+  one: a `StdoutToFile`/`StderrToFile` redirect path is folded in as a SHA-256
+  digest, so a redirect target never reaches the file in clear text. Review any
+  fixture recorded from an untrusted or
   credential-bearing run before committing it, and keep secret-bearing cassette
   files out of world-readable locations (on Unix they are written owner-only,
   `0600`; on Windows a cassette inherits the containing directory's ACL). See
