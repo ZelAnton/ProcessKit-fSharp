@@ -656,6 +656,24 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
     // members are resolved from the point-in-time cgroup membership snapshot below.
     let adoptedIdentities = ConcurrentDictionary<int, uint64 option>()
 
+    // The cgroup DIRECTORY is reclaimed exactly once, however teardown is driven. `ProcessGroup` already
+    // runs `HardRelease` behind its single `claimRelease` transition, so this guard is about the backend
+    // holding on its own — tests drive it directly, and a `Dispose` racing a `ShutdownAsync` must not be
+    // able to do this twice. The kill and the reap drain are safely repeatable (a second pass drains an
+    // already-empty ledger); the `rmdir` is not. A repeat would spend the drain budget again under the
+    // group's lifecycle lock, and — on a path the OS has since handed to a NEW cgroup, since the name
+    // carries this process's pid, which another process inherits once we exit — could remove a directory
+    // that is no longer ours. `ref` rather than a plain mutable so the `Interlocked` claim can take its
+    // address (the convention `PostKillReap`'s counters already follow).
+    let directoryReleased = ref 0
+
+    // How many times the reclaim above actually RAN, and what it concluded if it kept the directory. Both
+    // are per-INSTANCE on purpose: they are what a test asserts its own teardown on, rather than the
+    // process-wide counters in `Native.Cgroup` — which another fixture's cgroup teardown, or a
+    // finalizer-driven one, can move at any moment (K-148).
+    let directoryReclaims = ref 0
+    let mutable retainedDetail: string option = None
+
     // Pull and remove the captured identity for `pid` (defaulting to `None`), so the shared reap can gate
     // its `killpg` on it. Removal keeps `identities` in lockstep with `children`.
     let takeIdentity (pid: int) : uint64 option =
@@ -681,6 +699,17 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
         Native.Posix.trackedTarget pid captured
 
     new(cgroupPath: string) = CgroupBackend(cgroupPath, ResourceLimits.None)
+
+    /// Internal diagnostic (not public API — the `Native.Posix.pidfdActive` convention): how many times
+    /// this backend has actually run the post-kill cgroup-directory reclaim. Never more than one, however
+    /// teardown is driven, because only the claim winner runs it.
+    member _.DirectoryReclaims =
+        System.Threading.Volatile.Read(&directoryReclaims.contents)
+
+    /// Internal diagnostic (not public API): why THIS backend's teardown could not reclaim its cgroup
+    /// directory, or `None` when it did (or has not run yet). Per-instance, so it says what happened to
+    /// this cgroup rather than to whichever one the process last gave up on.
+    member _.RetainedCgroupDetail = retainedDetail
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.CgroupV2
@@ -963,7 +992,30 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             |> PosixReap.drain
 
             adoptedIdentities.Clear()
-            Native.Cgroup.removeCgroup cgroupPath
+
+            // `cgroup.kill` (and the legacy sweep behind it) only START the tree leaving: the kernel drops
+            // a member from the cgroup when that member EXITS, which can land after the kill write has
+            // returned. Removing the directory right then answers `EBUSY` — an error the old best-effort
+            // `rmdir` swallowed whole, leaving an empty-but-permanent cgroup behind on teardown after
+            // teardown until the hierarchy filled up with them. So wait, BOUNDED, for the cgroup to
+            // actually empty and retry the removal inside that same budget (T-363).
+            //
+            // The wait is a membership question, never a reap one, which is what makes it work for an
+            // ADOPTED member too: nothing here may `waitpid` a process that is not our child, and it does
+            // not have to — a member leaves `cgroup.procs` on exit, before anyone reaps it. It is also why
+            // the wait sits AFTER the reap drain above rather than replacing it: by the time it runs, our
+            // own children are usually already gone and the very first probe finds the cgroup drained.
+            if System.Threading.Interlocked.Exchange(&directoryReleased.contents, 1) = 0 then
+                System.Threading.Interlocked.Increment(&directoryReclaims.contents) |> ignore
+
+                match Native.Cgroup.releaseCgroup cgroupPath with
+                | Native.Cgroup.Release.Removed -> ()
+                | Native.Cgroup.Release.Retained detail ->
+                    // `HardRelease` is `unit` by contract and this backend holds no logger, so the honest
+                    // thing left is to record the verdict where it can be inspected rather than hide it: a
+                    // cgroup this teardown could not reclaim is a directory that accumulates.
+                    retainedDetail <- Some detail
+                    Native.Cgroup.noteRetainedCgroup cgroupPath detail
 
 /// POSIX process-group backend (macOS/BSD, or Linux without cgroup delegation). Every `posix_spawn`
 /// forms its own pgid, so a multi-child group holds several; `killpg` is the teardown.

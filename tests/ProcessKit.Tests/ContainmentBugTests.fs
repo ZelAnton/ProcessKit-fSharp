@@ -327,6 +327,36 @@ type ContainmentBugTests() =
                 // Best-effort cleanup of a temp directory; a leftover must not fail the test.
                 ()
 
+    /// Drive the bounded post-kill drain wait (`releaseCgroupUsing`, T-363) over scripted answers on a
+    /// FAKE clock: `probes` and `removals` are consumed in order and their LAST entry repeats, so a
+    /// "persistently populated" cgroup is one entry rather than a guess at the poll count. The clock moves
+    /// only when the loop itself sleeps, which makes "the budget ran out" a deterministic consequence of
+    /// the loop's own bounded arithmetic instead of wall-clock luck — and nothing here sleeps for real.
+    /// Returns the verdict together with what the loop did: how many emptiness probes it took, how many
+    /// removals it attempted, and how long it waited in total.
+    let scriptedRelease (budget: TimeSpan) (probes: Native.Cgroup.Drain list) (removals: Native.Cgroup.Removal list) =
+        let mutable probeCount = 0
+        let mutable removalCount = 0
+        let mutable now = TimeSpan.Zero
+
+        let probe () =
+            let answer = probes[min probeCount (probes.Length - 1)]
+            probeCount <- probeCount + 1
+            answer
+
+        let remove () =
+            let answer = removals[min removalCount (removals.Length - 1)]
+            removalCount <- removalCount + 1
+            answer
+
+        let verdict =
+            Native.Cgroup.releaseCgroupUsing probe remove (fun () -> now) (fun duration -> now <- now + duration) budget
+
+        {| Verdict = verdict
+           Probes = probeCount
+           Removals = removalCount
+           Waited = now |}
+
     [<Test>]
     member _.``spawning into a released group fails fast and is not transient``() : Task =
         task {
@@ -1047,3 +1077,306 @@ type ContainmentBugTests() =
             match Native.Cgroup.killCgroupUsing openPin send ignore dir with
             | Ok() -> ()
             | Error detail -> Assert.Fail $"an empty cgroup is a completed teardown: {detail}")
+
+    // --- T-363: `cgroup.kill` is ASYNCHRONOUS. The kernel SIGKILLs the subtree, but a member only leaves
+    // `cgroup.procs` when it EXITS, which can land well after the kill write returns — so removing the
+    // cgroup directory right then answers `EBUSY`, and that error used to be swallowed whole by a single
+    // best-effort `rmdir`, leaving an empty-but-permanent cgroup behind on teardown after teardown.
+    // Teardown now waits — BOUNDED — for the cgroup to actually empty and retries the removal inside that
+    // same budget. The tests below drive the wait through scripted probes/removals on a fake clock (no
+    // kernel, no real sleeping), and through the real `cgroup.events`/`cgroup.procs` probe over a
+    // synthetic cgroup directory. ---
+
+    [<Test>]
+    member _.``the bounded drain wait removes the cgroup directory once its tree has left (T-363)``() =
+        // The kill has landed but members are still on their way out; the third probe finds the cgroup
+        // empty, and only then is the directory reclaimed.
+        let result =
+            scriptedRelease
+                (TimeSpan.FromMilliseconds 100.0)
+                [ Native.Cgroup.Drain.Populated
+                  Native.Cgroup.Drain.Populated
+                  Native.Cgroup.Drain.Empty ]
+                [ Native.Cgroup.Removal.Removed ]
+
+        match result.Verdict with
+        | Native.Cgroup.Release.Removed -> ()
+        | Native.Cgroup.Release.Retained detail ->
+            Assert.Fail $"a cgroup that drained inside the budget must be reclaimed: {detail}"
+
+        Assert.That(result.Probes, Is.EqualTo 3, "the wait must keep probing until the cgroup actually empties")
+
+        Assert.That(
+            result.Removals,
+            Is.EqualTo 1,
+            "the directory must not be removed while the cgroup is still populated"
+        )
+
+        Assert.That(
+            result.Waited,
+            Is.LessThan(TimeSpan.FromMilliseconds 100.0),
+            "a cgroup that drains early must not spend the whole budget"
+        )
+
+    [<Test>]
+    member _.``a transient EBUSY on the cgroup rmdir is retried inside the same budget (T-363)``() =
+        // The cgroup reads empty, but the kernel is not done letting go of it yet: the first two removals
+        // are refused with EBUSY. That refusal is the kernel's own statement that the cgroup is not drained
+        // after all, so it must re-enter the wait rather than be swallowed after one attempt.
+        let result =
+            scriptedRelease
+                (TimeSpan.FromMilliseconds 100.0)
+                [ Native.Cgroup.Drain.Empty ]
+                [ Native.Cgroup.Removal.Busy "Device or resource busy"
+                  Native.Cgroup.Removal.Busy "Device or resource busy"
+                  Native.Cgroup.Removal.Removed ]
+
+        match result.Verdict with
+        | Native.Cgroup.Release.Removed -> ()
+        | Native.Cgroup.Release.Retained detail ->
+            Assert.Fail $"a transient EBUSY must be retried, not treated as final: {detail}"
+
+        Assert.That(result.Removals, Is.EqualTo 3, "a refused removal must be retried inside the budget")
+
+        Assert.That(
+            result.Waited,
+            Is.LessThan(TimeSpan.FromMilliseconds 100.0),
+            "the retries must fit inside the same bounded budget"
+        )
+
+    [<Test>]
+    member _.``a cgroup that never drains is reported, not silently left behind (T-363)``() =
+        // A fork bomb still out-spawning, or a task wedged in uninterruptible sleep: the cgroup stays
+        // populated for the whole budget. The wait must END (bounded), leave the directory in place, and
+        // say so — the swallowed `EBUSY` this fix removes is exactly what made such a leak invisible.
+        let budget = TimeSpan.FromMilliseconds 100.0
+
+        let result =
+            scriptedRelease
+                budget
+                [ Native.Cgroup.Drain.Populated ]
+                [ Native.Cgroup.Removal.Busy "Device or resource busy" ]
+
+        match result.Verdict with
+        | Native.Cgroup.Release.Removed -> Assert.Fail "a cgroup that never drained must not be reported as reclaimed"
+        | Native.Cgroup.Release.Retained detail ->
+            Assert.That(detail, Does.Contain "populated", "the verdict must say why the directory was kept")
+
+            Assert.That(
+                detail,
+                Does.Contain "refused to remove",
+                "the kernel's own refusal must be reported alongside the state that caused it"
+            )
+
+        Assert.That(result.Waited, Is.EqualTo budget, "the wait must end exactly at its bounded budget")
+
+        Assert.That(
+            result.Removals,
+            Is.EqualTo 1,
+            "a populated cgroup is only worth one final removal attempt, once the budget is spent"
+        )
+
+    [<Test>]
+    member _.``a persistent membership read failure is never reported as a drained cgroup (T-363)``() =
+        // An unreadable `cgroup.procs` (EACCES/EIO) is UNKNOWN membership, not an empty group. It must not
+        // cut the wait short, and it must not be dressed up as a completed teardown when the kernel refuses
+        // the removal too.
+        let budget = TimeSpan.FromMilliseconds 100.0
+
+        let result =
+            scriptedRelease
+                budget
+                [ Native.Cgroup.Drain.Unknown "Permission denied" ]
+                [ Native.Cgroup.Removal.Busy "Device or resource busy" ]
+
+        match result.Verdict with
+        | Native.Cgroup.Release.Removed ->
+            Assert.Fail "a cgroup whose emptiness was never confirmed must not be reported as reclaimed"
+        | Native.Cgroup.Release.Retained detail ->
+            Assert.That(
+                detail,
+                Does.Contain "never confirmed drained",
+                "an unreadable membership must be told apart from a confirmed empty cgroup"
+            )
+
+            Assert.That(detail, Does.Contain "Permission denied", "the verdict must carry the read failure itself")
+
+        Assert.That(result.Probes, Is.GreaterThan 1, "a failed read must not end the bounded wait on the spot")
+        Assert.That(result.Waited, Is.EqualTo budget, "the wait must still end at its bounded budget")
+
+    [<Test>]
+    member _.``an unreadable cgroup is reclaimed only on the kernel's own confirmation (T-363)``() =
+        // The membership never reads, so this loop never claims the cgroup drained. It still attempts the
+        // removal once the budget is spent — cgroupfs refuses to remove a cgroup that holds members, so
+        // that attempt can reclaim a directory whose emptiness could not be READ without ever taking away
+        // one still in use. A `Removed` here is the kernel's answer, never this loop's guess.
+        let budget = TimeSpan.FromMilliseconds 100.0
+
+        let result =
+            scriptedRelease
+                budget
+                [ Native.Cgroup.Drain.Unknown "Input/output error" ]
+                [ Native.Cgroup.Removal.Removed ]
+
+        match result.Verdict with
+        | Native.Cgroup.Release.Removed -> ()
+        | Native.Cgroup.Release.Retained detail ->
+            Assert.Fail $"a directory the kernel itself removed must be reported reclaimed: {detail}"
+
+        Assert.That(
+            result.Removals,
+            Is.EqualTo 1,
+            "an unconfirmed cgroup earns exactly one removal attempt, after the wait"
+        )
+
+        Assert.That(result.Waited, Is.EqualTo budget, "the removal must not be attempted before the wait is over")
+
+    [<Test>]
+    member _.``an already drained cgroup is removed without paying any of the drain budget (T-363)``() =
+        // The ordinary teardown: by the time the directory is reclaimed the tree is long gone. The bounded
+        // wait must not become a fixed latency on that path.
+        let result =
+            scriptedRelease
+                (TimeSpan.FromMilliseconds 100.0)
+                [ Native.Cgroup.Drain.Empty ]
+                [ Native.Cgroup.Removal.Removed ]
+
+        match result.Verdict with
+        | Native.Cgroup.Release.Removed -> ()
+        | Native.Cgroup.Release.Retained detail -> Assert.Fail $"an empty cgroup must be reclaimed at once: {detail}"
+
+        Assert.That(result.Probes, Is.EqualTo 1, "an empty cgroup needs exactly one probe")
+        Assert.That(result.Removals, Is.EqualTo 1, "an empty cgroup needs exactly one removal")
+        Assert.That(result.Waited, Is.EqualTo TimeSpan.Zero, "an already drained cgroup must not wait at all")
+
+    [<Test>]
+    member _.``an adopted member is waited out through cgroup membership, with no reap (T-363)``() =
+        // An ADOPTED process is not our child: nothing may `waitpid` it, so the wait cannot be built on a
+        // reap — and it does not have to be. A process leaves `cgroup.procs` when it EXITS, before anyone
+        // reaps it, which is exactly what this drives: the REAL membership probe over a real cgroup.procs,
+        // with the adopted pid disappearing from the file two polls in, and a removal that models what
+        // cgroupfs does about it (refused while the cgroup holds anyone, granted once it does not).
+        let adoptedPid = 4_248
+        let mutable polls = 0
+        let mutable removals = 0
+        let mutable now = TimeSpan.Zero
+
+        withLegacyCgroup [ adoptedPid ] (fun dir ->
+            let procs = Path.Combine(dir, "cgroup.procs")
+
+            let sleep (duration: TimeSpan) =
+                now <- now + duration
+                polls <- polls + 1
+
+                if polls = 2 then
+                    // The adopted process exits. Nobody reaps it — it is not our child — but the kernel
+                    // takes it out of the cgroup all the same, which is what the wait is watching for.
+                    File.WriteAllText(procs, "")
+
+            let remove () =
+                removals <- removals + 1
+
+                match Native.Cgroup.cgroupMembers dir with
+                | Ok [] -> Native.Cgroup.Removal.Removed
+                | _ -> Native.Cgroup.Removal.Busy "Device or resource busy"
+
+            let verdict =
+                Native.Cgroup.releaseCgroupUsing
+                    (fun () -> Native.Cgroup.cgroupDrainState dir)
+                    remove
+                    (fun () -> now)
+                    sleep
+                    (TimeSpan.FromMilliseconds 100.0)
+
+            match verdict with
+            | Native.Cgroup.Release.Removed -> ()
+            | Native.Cgroup.Release.Retained detail ->
+                Assert.Fail $"the adopted member left, so the cgroup must be reclaimed: {detail}"
+
+            Assert.That(polls, Is.EqualTo 2, "the wait must poll the membership until the adopted member leaves")
+
+            Assert.That(
+                removals,
+                Is.EqualTo 1,
+                "the directory must not be removed while the adopted member is still in the cgroup"
+            ))
+
+    [<Test>]
+    member _.``the drain probe trusts the kernel's populated flag over the membership file (T-363)``() =
+        // `cgroup.events`' `populated` is the kernel's own aggregate — it also counts a DESCENDANT cgroup's
+        // members, which `cgroup.procs` does not, and which `rmdir` refuses on just the same.
+        withLegacyCgroup [] (fun dir ->
+            let events = Path.Combine(dir, "cgroup.events")
+            File.WriteAllText(events, "populated 1\nfrozen 0\n")
+
+            match Native.Cgroup.cgroupDrainState dir with
+            | Native.Cgroup.Drain.Populated -> ()
+            | other -> Assert.Fail $"the kernel's populated flag must decide while cgroup.procs reads empty: {other}"
+
+            File.WriteAllText(events, "populated 0\nfrozen 0\n")
+
+            match Native.Cgroup.cgroupDrainState dir with
+            | Native.Cgroup.Drain.Empty -> ()
+            | other -> Assert.Fail $"populated 0 is the kernel confirming the cgroup drained: {other}")
+
+    [<Test>]
+    member _.``an unreadable membership is unknown to the drain probe, never empty (T-363)``() =
+        // `cgroup.procs` is a directory here, so the membership read throws on any OS. The probe must
+        // report that as UNKNOWN — the distinction the whole bounded wait rests on.
+        withLegacyCgroup [] (fun dir ->
+            let procs = Path.Combine(dir, "cgroup.procs")
+            File.Delete procs
+            Directory.CreateDirectory procs |> ignore
+
+            match Native.Cgroup.cgroupDrainState dir with
+            | Native.Cgroup.Drain.Unknown _ -> ()
+            | other -> Assert.Fail $"a failed membership read must never be reported as a drained cgroup: {other}")
+
+    [<Test>]
+    member _.``releaseCgroup does not wait for a cgroup directory that is already gone (T-363)``() =
+        // Nothing to drain and nothing to remove: teardown of a group whose cgroup never existed (or was
+        // already reclaimed) must not spend a millisecond of the budget on it.
+        let missing = Path.Combine(Path.GetTempPath(), $"pk-gone-cgroup-{Guid.NewGuid():N}")
+
+        let originalBudget = Native.Cgroup.drainBudgetOverrideForTests
+        Native.Cgroup.drainBudgetOverrideForTests <- Some(TimeSpan.FromSeconds 5.0)
+
+        try
+            let stopwatch = Stopwatch.StartNew()
+            let verdict = Native.Cgroup.releaseCgroup missing
+            stopwatch.Stop()
+
+            match verdict with
+            | Native.Cgroup.Release.Removed -> ()
+            | Native.Cgroup.Release.Retained detail ->
+                Assert.Fail $"a cgroup directory that is not there needs no reclaiming: {detail}"
+
+            Assert.That(
+                stopwatch.Elapsed,
+                Is.LessThan(TimeSpan.FromSeconds 1.0),
+                "an absent cgroup directory must not be waited on at all"
+            )
+        finally
+            Native.Cgroup.drainBudgetOverrideForTests <- originalBudget
+
+    [<Test>]
+    member _.``releaseCgroup reports a cgroup directory it could not reclaim (T-363)``() =
+        // End to end on a real filesystem: a still-populated stand-in cgroup. The directory stays (it is
+        // still containing something), and the verdict says so instead of hiding the failure.
+        let originalBudget = Native.Cgroup.drainBudgetOverrideForTests
+        Native.Cgroup.drainBudgetOverrideForTests <- Some(TimeSpan.FromMilliseconds 10.0)
+
+        try
+            withLegacyCgroup [ 4_249 ] (fun dir ->
+                match Native.Cgroup.releaseCgroup dir with
+                | Native.Cgroup.Release.Removed -> Assert.Fail "a populated cgroup must not be reported as reclaimed"
+                | Native.Cgroup.Release.Retained detail ->
+                    Assert.That(
+                        detail,
+                        Does.Contain "populated",
+                        "the verdict must name the state that kept the directory"
+                    )
+
+                Assert.That(Directory.Exists dir, Is.True, "a cgroup that still holds members keeps its directory"))
+        finally
+            Native.Cgroup.drainBudgetOverrideForTests <- originalBudget
