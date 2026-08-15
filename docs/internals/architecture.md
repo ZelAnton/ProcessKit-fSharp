@@ -41,48 +41,50 @@ The files currently compile in this exact order. The headings are architectural 
 27. `RotatingFileSink.fs` — size-rotating tee sink for long-lived logs.
 28. `Command.fs` — immutable command configuration and builder API.
 29. `MemberInfo.fs` — per-member identity snapshot of a contained tree.
-30. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
+30. `ReportJson.fs` — write-only JSON projection of results, stats, run profiles, and member snapshots.
+31. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
 
 ### Native and platform layer
 
-31. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
-32. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, console code page, limits, and accounting calls.
-33. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
-34. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
-35. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
+32. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
+33. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, console code page, limits, and accounting calls.
+34. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
+35. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
+36. `Capabilities.fs` — containment mechanism selection and the three-valued capability snapshot probed from it.
+37. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
 
 ### Backend, pump, and channels
 
-36. `Backend.fs` — containment interface and its three implementations.
-37. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
-38. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
-39. `ProcessStdin.fs` — interactive stdin handle.
-40. `ReadinessProbe.fs` — readiness polling.
-41. `RunningHost.fs` — the spawned-host contract a live handle is built from.
-42. `ConsumptionGate.fs` — consumption-claim state machine and terminal-wait ledger of one handle.
-43. `RunTerminal.fs` — one handle's shared terminal waits, bounds, tokens, and teardown.
-44. `ExpectWindow.fs` — bounded expect window and ANSI filtering for interactive sessions.
-45. `OutputSessions.fs` — one handle's output pumps, streaming channels, and session shapes.
-46. `ReadinessRace.fs` — readiness probing raced against the child's own exit.
-47. `RunningProcess.fs` — the public live-handle facade over the six files above: every verb, composed from the claim gate, the terminal waits, and the output sessions.
+38. `Backend.fs` — containment interface and its three implementations.
+39. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
+40. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
+41. `ProcessStdin.fs` — interactive stdin handle.
+42. `ReadinessProbe.fs` — readiness polling.
+43. `RunningHost.fs` — the spawned-host contract a live handle is built from.
+44. `ConsumptionGate.fs` — consumption-claim state machine and terminal-wait ledger of one handle.
+45. `RunTerminal.fs` — one handle's shared terminal waits, bounds, tokens, and teardown.
+46. `ExpectWindow.fs` — bounded expect window and ANSI filtering for interactive sessions.
+47. `OutputSessions.fs` — one handle's output pumps, streaming channels, and session shapes.
+48. `ReadinessRace.fs` — readiness probing raced against the child's own exit.
+49. `RunningProcess.fs` — the public live-handle facade over the six files above: every verb, composed from the claim gate, the terminal waits, and the output sessions.
 
 ### Runner and verbs
 
-48. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
-49. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
-50. `PtySession.fs` — expect-style interaction over a live handle.
-51. `IProcessRunner.fs` — injectable runner seam.
-52. `Runner.fs` — capture primitives and reusable verbs.
-53. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
-54. `DelegatingProcessRunner.fs` — runner decorator base.
-55. `ProcessGroup.fs` — containment owner and shared-group runner.
-56. `JobRunner.fs` — default private-group runner.
-57. `CommandVerbs.fs` — default-runner `Command` extensions.
-58. `PipelineRunner.fs` — internal pipeline execution.
-59. `Pipeline.fs` — pipeline public API.
-60. `Supervisor.fs` — restart supervision.
-61. `CliClient.fs` — configured command client.
-62. `Exec.fs` — concise execution entry points.
+50. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
+51. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
+52. `PtySession.fs` — expect-style interaction over a live handle.
+53. `IProcessRunner.fs` — injectable runner seam.
+54. `Runner.fs` — capture primitives and reusable verbs.
+55. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
+56. `DelegatingProcessRunner.fs` — runner decorator base.
+57. `ProcessGroup.fs` — containment owner and shared-group runner.
+58. `JobRunner.fs` — default private-group runner.
+59. `CommandVerbs.fs` — default-runner `Command` extensions.
+60. `PipelineRunner.fs` — internal pipeline execution.
+61. `Pipeline.fs` — pipeline public API.
+62. `Supervisor.fs` — restart supervision.
+63. `CliClient.fs` — configured command client.
+64. `Exec.fs` — concise execution entry points.
 
 When adding a file, place it after everything it consumes and before everything that consumes it. Alphabetical sorting or SDK globbing would silently destroy this ordering model.
 
