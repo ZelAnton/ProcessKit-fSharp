@@ -375,7 +375,23 @@ everywhere:
   opaquely and is *not* passed through the redactor). A
   PTY recording's merged stream goes through the same `WithRedaction` hook, which
   is how an echoed credential is kept out of a PTY cassette even with
-  `PtyConfig.Echo = true`. The **output-wiring** fingerprint (the other half of the
+  `PtyConfig.Echo = true`. **`WithRedaction` does not reach `program`/`args`** —
+  a secret in argv (a `--password=…` flag, a token in a URL) is a separate
+  exposure with its own opt-in hook,
+  [`RecordReplayOptions.WithCommandProjection`](testing.md#record-and-replay),
+  which decides what a recording *stores* for those two fields (text, bytes, PTY
+  and typed-failure entries alike). It cannot silently change which call replays:
+  the entry is keyed on a `CommandFingerprint` — a SHA-256 of the **invoked**
+  command line, taken before the projection runs — so a projected cassette
+  replays exactly the calls the unprojected one would, two secrets that project
+  to the same placeholder stay two recordings, and a reader needs no projection
+  configured to replay one. That fingerprint follows the environment
+  fingerprint's rule rather than the verbatim one (it stores a digest, not the
+  command line), with the same caveat: a *low-entropy* argument can be recovered
+  from a digest by brute force, so a projection is a way to keep argv off disk,
+  not a way to make a weak secret safe to commit — and it projects what that
+  recorder records, so a fixture whose rows already hold a secret must be
+  **re-recorded**, not merely reopened with the hook enabled. The **output-wiring** fingerprint (the other half of the
   match key) follows the environment fingerprint's rule rather than the verbatim
   one: a `StdoutToFile`/`StderrToFile` redirect path is folded in as a SHA-256
   digest, so a redirect target never reaches the file in clear text. Review any

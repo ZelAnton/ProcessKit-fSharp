@@ -1700,6 +1700,575 @@ type CassetteTests() =
                     | Error error -> Assert.Fail $"{error}"
             })
 
+    // --- Persisted command projection (cassette format v9) -------------------------------------------
+    //
+    // `WithCommandProjection` decides what a recording STORES for program/args. It deliberately does not
+    // decide what a call MATCHES on: that is a fingerprint of the invoked command line, taken before the
+    // projection runs and stored beside the projected text. These tests pin both halves — the secret
+    // never reaches disk, and matching is unmoved by the projection in either direction.
+
+    [<Test>]
+    member _.``a command projection keeps a secret argument out of the stored command line``() : Task =
+        withCassette (fun path ->
+            task {
+                let options =
+                    RecordReplayOptions()
+                        .WithCommandProjection(fun program args ->
+                            struct (program, args |> Array.map (fun a -> a.Replace("hunter2", "[REDACTED]"))))
+
+                let secretCommand =
+                    Command.create "vault" |> Command.args [ "login"; "--password=hunter2" ]
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("ok", 0), options)
+                        let! _ = (runner recorder).OutputStringAsync(secretCommand, CancellationToken.None)
+                        recorder.Complete()
+                    }
+
+                let onDisk = File.ReadAllText path
+                Assert.That(onDisk, Does.Not.Contain "hunter2", "a projected argument must not reach disk")
+                Assert.That(onDisk, Does.Contain "--password=[REDACTED]", "the projected text is what is stored")
+                Assert.That(onDisk, Does.Contain "\"Version\": 9", "the command fingerprint is a v9 field")
+
+                Assert.That(
+                    onDisk,
+                    Does.Contain "\"CommandFingerprint\"",
+                    "a projected entry carries the key its stored text no longer is"
+                )
+
+                // The very call that was recorded — secret argument and all — still replays.
+                match RecordReplayRunner.Replay(path, options) with
+                | Error error -> Assert.Fail $"a projected cassette must load: {error}"
+                | Ok replayer ->
+                    match! (runner replayer).OutputStringAsync(secretCommand, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "ok")
+                    | Error error -> Assert.Fail $"a projected recording must replay its own call: {error}"
+            })
+
+    [<Test>]
+    member _.``a projected cassette replays for a caller that configures no projection``() : Task =
+        withCassette (fun path ->
+            task {
+                // The projection is a WRITE-side policy: the key is the invoked command line either way,
+                // so a reader needs no matching option to replay what a projected recorder wrote. A
+                // genuinely different call still misses — the projection widens nothing.
+                let options =
+                    RecordReplayOptions()
+                        .WithCommandProjection(fun program args ->
+                            struct (program, args |> Array.map (fun _ -> "[REDACTED]")))
+
+                let recorded = Command.create "vault" |> Command.args [ "--token=hunter2" ]
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("ok", 0), options)
+                        let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
+                        recorder.Complete()
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a projected cassette must load without the projection: {error}"
+                | Ok replayer ->
+                    match! (runner replayer).OutputStringAsync(recorded, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "ok")
+                    | Error error -> Assert.Fail $"the invoked command line must still key the entry: {error}"
+
+                    let other = Command.create "vault" |> Command.args [ "--token=other" ]
+
+                    match! (runner replayer).OutputStringAsync(other, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss _) -> ()
+                    | other -> Assert.Fail $"a different command line must still miss, got {other}"
+            })
+
+    [<Test>]
+    member _.``two calls whose projections collide stay two distinct recordings``() : Task =
+        withCassette (fun path ->
+            task {
+                // The security-critical half: a projection that maps two DIFFERENT secrets onto the same
+                // stored text must not merge the two calls into one key. Keying on the invoked command
+                // line is what keeps each replay honest — a projection can never fabricate a hit.
+                let options =
+                    RecordReplayOptions()
+                        .WithCommandProjection(fun program args ->
+                            struct (program, args |> Array.map (fun _ -> "--token=[REDACTED]")))
+
+                let first = Command.create "vault" |> Command.args [ "--token=aaa" ]
+                let second = Command.create "vault" |> Command.args [ "--token=bbb" ]
+
+                let perSecret =
+                    { new IProcessRunner with
+                        member _.CaptureStringAsync(cmd, _ct) =
+                            let stdout =
+                                if Seq.contains "--token=aaa" cmd.Arguments then
+                                    "first"
+                                else
+                                    "second"
+
+                            Task.FromResult(
+                                Ok(
+                                    ProcessResult<string>(
+                                        cmd.Program,
+                                        stdout,
+                                        "",
+                                        Outcome.Exited 0,
+                                        TimeSpan.Zero,
+                                        false,
+                                        [ 0 ]
+                                    )
+                                )
+                            )
+
+                        member _.CaptureBytesAsync(_cmd, _ct) =
+                            Task.FromResult<Result<ProcessResult<byte[]>, ProcessError>>(
+                                Error(ProcessError.Unsupported "unused")
+                            )
+
+                        member _.SpawnAsync(_cmd, _ct) =
+                            Task.FromResult<Result<RunningProcess, ProcessError>>(
+                                Error(ProcessError.Unsupported "unused")
+                            ) }
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, perSecret, options)
+                        let! _ = (runner recorder).OutputStringAsync(first, CancellationToken.None)
+                        let! _ = (runner recorder).OutputStringAsync(second, CancellationToken.None)
+                        recorder.Complete()
+                    }
+
+                let onDisk = File.ReadAllText path
+                Assert.That(onDisk, Does.Not.Contain "--token=aaa", "neither secret may reach disk")
+                Assert.That(onDisk, Does.Not.Contain "--token=bbb")
+
+                match RecordReplayRunner.Replay(path, options) with
+                | Error error -> Assert.Fail $"load: {error}"
+                | Ok replayer ->
+                    for command, expected in [ first, "first"; second, "second" ] do
+                        match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                        | Ok result ->
+                            Assert.That(result.Stdout, Is.EqualTo expected, "each secret replays its own recording")
+                        | Error error -> Assert.Fail $"a colliding projection must not merge two calls: {error}"
+
+                    // ...and the placeholder itself is not a command anyone recorded, so asking for it as
+                    // a real argument misses rather than picking up whichever entry stored that text.
+                    let placeholder = Command.create "vault" |> Command.args [ "--token=[REDACTED]" ]
+
+                    match! (runner replayer).OutputStringAsync(placeholder, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss _) -> ()
+                    | other -> Assert.Fail $"the stored placeholder must not match as a command line, got {other}"
+            })
+
+    [<Test>]
+    member _.``without a projection the command line is stored as invoked and no fingerprint is written``() : Task =
+        withCassette (fun path ->
+            task {
+                // The default is unchanged, byte for byte: raw program/args on disk, no `CommandFingerprint`
+                // field at all — so an entry keeps being re-keyed from its own stored text at load, which
+                // is what lets a normalizer be introduced or changed after the recording was made.
+                let recorded = Command.create "tool" |> Command.args [ "build"; "--out"; "/tmp/x" ]
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("done", 0))
+                        let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
+                        recorder.Complete()
+                    }
+
+                let onDisk = File.ReadAllText path
+                Assert.That(onDisk, Does.Contain "\"/tmp/x\"", "the raw arguments are still stored verbatim")
+
+                Assert.That(
+                    onDisk,
+                    Does.Not.Contain "CommandFingerprint",
+                    "an unprojected recording writes no fingerprint field"
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"load: {error}"
+                | Ok replayer ->
+                    match! (runner replayer).OutputStringAsync(recorded, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "done")
+                    | Error error -> Assert.Fail $"an unprojected recording must replay as before: {error}"
+            })
+
+    [<Test>]
+    member _.``a normalizer still decides matching while a projection decides what is stored``() : Task =
+        withCassette (fun path ->
+            task {
+                // The two hooks are orthogonal by construction: the normalizer is folded into the key
+                // (before the projection runs), the projection into the file. Both applied at once, a
+                // volatile argument still matches and the secret still never lands.
+                let options =
+                    RecordReplayOptions()
+                        .WithArgNormalizer(fun args -> args |> Array.filter (fun a -> not (a.StartsWith "/tmp/")))
+                        .WithCommandProjection(fun program args ->
+                            struct (program, args |> Array.map (fun a -> a.Replace("hunter2", "[REDACTED]"))))
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("done", 0), options)
+
+                        let recorded =
+                            Command.create "vault"
+                            |> Command.args [ "--out"; "/tmp/run-aaa"; "--password=hunter2" ]
+
+                        let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
+                        recorder.Complete()
+                    }
+
+                Assert.That(File.ReadAllText path, Does.Not.Contain "hunter2", "the projection still scrubs")
+
+                match RecordReplayRunner.Replay(path, options) with
+                | Error error -> Assert.Fail $"load: {error}"
+                | Ok replayer ->
+                    let live =
+                        Command.create "vault"
+                        |> Command.args [ "--out"; "/tmp/run-bbb"; "--password=hunter2" ]
+
+                    match! (runner replayer).OutputStringAsync(live, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "done")
+                    | Error error ->
+                        Assert.Fail $"a normalized volatile arg must still match under a projection: {error}"
+            })
+
+    [<Test>]
+    member _.``a projection covers text, bytes, PTY, and typed-failure recordings alike``() : Task =
+        task {
+            // Every entry is built from one invocation half, so all four recording shapes must be
+            // projected on identical terms — and each must still replay for the call that made it.
+            let options =
+                RecordReplayOptions()
+                    .WithCommandProjection(fun program args ->
+                        struct (program, args |> Array.map (fun a -> a.Replace("hunter2", "[REDACTED]"))))
+
+            let secretArgs = [ "login"; "--password=hunter2" ]
+
+            // text
+            do!
+                withCassette (fun path ->
+                    task {
+                        let command = Command.create "vault" |> Command.args secretArgs
+
+                        do!
+                            task {
+                                use recorder = RecordReplayRunner.Record(path, FixedRunner("text", 0), options)
+                                let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+                                recorder.Complete()
+                            }
+
+                        Assert.That(File.ReadAllText path, Does.Not.Contain "hunter2", "text recording")
+
+                        match RecordReplayRunner.Replay(path, options) with
+                        | Error error -> Assert.Fail $"text load: {error}"
+                        | Ok replayer ->
+                            match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                            | Ok result -> Assert.That(result.Stdout, Is.EqualTo "text")
+                            | Error error -> Assert.Fail $"a projected text recording must replay: {error}"
+                    })
+
+            // bytes
+            do!
+                withCassette (fun path ->
+                    task {
+                        let command = Command.create "vault" |> Command.args secretArgs
+
+                        do!
+                            task {
+                                use recorder =
+                                    RecordReplayRunner.Record(
+                                        path,
+                                        FixedBytesRunner([| 0uy; 1uy; 2uy |], "", 0),
+                                        options
+                                    )
+
+                                let! _ = (runner recorder).OutputBytesAsync(command, CancellationToken.None)
+                                recorder.Complete()
+                            }
+
+                        Assert.That(File.ReadAllText path, Does.Not.Contain "hunter2", "bytes recording")
+
+                        match RecordReplayRunner.Replay(path, options) with
+                        | Error error -> Assert.Fail $"bytes load: {error}"
+                        | Ok replayer ->
+                            match! (runner replayer).OutputBytesAsync(command, CancellationToken.None) with
+                            | Ok result -> CollectionAssert.AreEqual([| 0uy; 1uy; 2uy |], result.Stdout)
+                            | Error error -> Assert.Fail $"a projected bytes recording must replay: {error}"
+                    })
+
+            // PTY (a merged-stream recording keys and projects exactly like any other)
+            do!
+                withCassette (fun path ->
+                    task {
+                        let command = Command.create "vault" |> Command.args secretArgs |> Command.pty
+
+                        do!
+                            task {
+                                use recorder = RecordReplayRunner.Record(path, FixedRunner("frame", 0), options)
+                                let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+                                recorder.Complete()
+                            }
+
+                        let onDisk = File.ReadAllText path
+                        Assert.That(onDisk, Does.Not.Contain "hunter2", "PTY recording")
+                        Assert.That(onDisk, Does.Contain "\"Pty\": true")
+
+                        match RecordReplayRunner.Replay(path, options) with
+                        | Error error -> Assert.Fail $"pty load: {error}"
+                        | Ok replayer ->
+                            match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                            | Ok result -> Assert.That(result.Stdout, Is.EqualTo "frame")
+                            | Error error -> Assert.Fail $"a projected PTY recording must replay: {error}"
+                    })
+
+            // typed failure
+            do!
+                withCassette (fun path ->
+                    task {
+                        let command = Command.create "vault" |> Command.args secretArgs
+
+                        do!
+                            task {
+                                use recorder =
+                                    RecordReplayRunner.Record(
+                                        path,
+                                        ErrorRunner [ ProcessError.Exit("vault", 3, "", "denied") ],
+                                        options
+                                    )
+
+                                let! _ = (runner recorder).CaptureStringAsync(command, CancellationToken.None)
+                                recorder.Complete()
+                            }
+
+                        Assert.That(File.ReadAllText path, Does.Not.Contain "hunter2", "failure recording")
+
+                        match RecordReplayRunner.Replay(path, options) with
+                        | Error error -> Assert.Fail $"failure load: {error}"
+                        | Ok replayer ->
+                            match! (runner replayer).CaptureStringAsync(command, CancellationToken.None) with
+                            | Error(ProcessError.Exit(program, 3, _, stderr)) ->
+                                Assert.That(program, Is.EqualTo "vault", "a replayed failure names the LIVE program")
+                                Assert.That(stderr, Is.EqualTo "denied")
+                            | other -> Assert.Fail $"a projected failure must replay as itself, got {other}"
+                    })
+        }
+
+    [<Test>]
+    member _.``Auto grows a projected cassette and replays it, in session and after a reload``() : Task =
+        withCassette (fun path ->
+            task {
+                let options =
+                    RecordReplayOptions()
+                        .WithCommandProjection(fun program args ->
+                            struct (program, args |> Array.map (fun a -> a.Replace("hunter2", "[REDACTED]"))))
+
+                let command = Command.create "vault" |> Command.args [ "--password=hunter2" ]
+
+                let mutable calls = 0
+
+                let counting =
+                    { new IProcessRunner with
+                        member _.CaptureStringAsync(cmd, _ct) =
+                            calls <- calls + 1
+
+                            Task.FromResult(
+                                Ok(
+                                    ProcessResult<string>(
+                                        cmd.Program,
+                                        "live",
+                                        "",
+                                        Outcome.Exited 0,
+                                        TimeSpan.Zero,
+                                        false,
+                                        [ 0 ]
+                                    )
+                                )
+                            )
+
+                        member _.CaptureBytesAsync(_cmd, _ct) =
+                            Task.FromResult<Result<ProcessResult<byte[]>, ProcessError>>(
+                                Error(ProcessError.Unsupported "unused")
+                            )
+
+                        member _.SpawnAsync(_cmd, _ct) =
+                            Task.FromResult<Result<RunningProcess, ProcessError>>(
+                                Error(ProcessError.Unsupported "unused")
+                            ) }
+
+                match RecordReplayRunner.Auto(path, counting, options) with
+                | Error error -> Assert.Fail $"auto load: {error}"
+                | Ok auto ->
+                    use auto = auto
+
+                    let! _ = (runner auto).OutputStringAsync(command, CancellationToken.None)
+                    // The freshly recorded (and projected) entry joins the live index under the same key
+                    // the live call computes, so the repeat replays instead of reaching the inner runner.
+                    let! _ = (runner auto).OutputStringAsync(command, CancellationToken.None)
+
+                    Assert.That(calls, Is.EqualTo 1, "a projected Auto entry must replay within the session")
+
+                    match auto.Save() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"save: {error}"
+
+                Assert.That(File.ReadAllText path, Does.Not.Contain "hunter2", "an Auto miss is projected too")
+
+                // Reloaded from disk, the grown cassette replays the same call without delegating.
+                match RecordReplayRunner.Auto(path, counting, options) with
+                | Error error -> Assert.Fail $"auto reload: {error}"
+                | Ok reloaded ->
+                    use reloaded = reloaded
+
+                    match! (runner reloaded).OutputStringAsync(command, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "live")
+                    | Error error -> Assert.Fail $"a reloaded projected entry must replay: {error}"
+
+                    Assert.That(calls, Is.EqualTo 1, "the reloaded entry must not reach the inner runner")
+            })
+
+    [<Test>]
+    member _.``a projection that blanks the program stores a placeholder and still loads and replays``() : Task =
+        withCassette (fun path ->
+            task {
+                // The format requires an entry to name a program (a blank one is rejected at load), so a
+                // projection that returns none gets a fixed marker rather than an unloadable cassette.
+                // Matching is unaffected either way — it never reads the stored name.
+                let options =
+                    RecordReplayOptions().WithCommandProjection(fun _ _ -> struct ("", [||]))
+
+                let command =
+                    Command.create "/tmp/hunter2-build/vault"
+                    |> Command.args [ "--password=hunter2" ]
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("ok", 0), options)
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+                        recorder.Complete()
+                    }
+
+                let onDisk = File.ReadAllText path
+                Assert.That(onDisk, Does.Not.Contain "hunter2", "not even the program path may reach disk")
+                Assert.That(onDisk, Does.Contain "(redacted)", "a blank projected program is stored as a marker")
+
+                match RecordReplayRunner.Replay(path, options) with
+                | Error error -> Assert.Fail $"a fully projected cassette must load: {error}"
+                | Ok replayer ->
+                    match! (runner replayer).OutputStringAsync(command, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "ok")
+                    | Error error -> Assert.Fail $"a fully projected entry must still replay: {error}"
+            })
+
+    [<Test>]
+    member _.``turning a projection on replays an existing cassette and projects only the rows it records``() : Task =
+        withCassette (fun path ->
+            task {
+                // The realistic upgrade path: a cassette recorded before the hook existed, opened by an
+                // Auto session that now has one. Its rows still replay (they key on their own verbatim
+                // args, which are the invoked ones), and only what THIS session records is projected —
+                // a projection is not a retroactive scrub of a file already on disk, so a fixture that
+                // already carries a secret has to be re-recorded, not merely reopened.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 8, "Entries": [ { "Program": "vault", "Args": ["--password=hunter2"], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "OutputWiring": "1|o:pipe|e:pipe", "Stdout": "old", "Stderr": "", "Code": 0 } ] }"""
+                )
+
+                let options =
+                    RecordReplayOptions()
+                        .WithCommandProjection(fun program args ->
+                            struct (program, args |> Array.map (fun a -> a.Replace("hunter2", "[REDACTED]"))))
+
+                let mutable calls = 0
+
+                let counting =
+                    { new IProcessRunner with
+                        member _.CaptureStringAsync(cmd, _ct) =
+                            calls <- calls + 1
+
+                            Task.FromResult(
+                                Ok(
+                                    ProcessResult<string>(
+                                        cmd.Program,
+                                        "fresh",
+                                        "",
+                                        Outcome.Exited 0,
+                                        TimeSpan.Zero,
+                                        false,
+                                        [ 0 ]
+                                    )
+                                )
+                            )
+
+                        member _.CaptureBytesAsync(_cmd, _ct) =
+                            Task.FromResult<Result<ProcessResult<byte[]>, ProcessError>>(
+                                Error(ProcessError.Unsupported "unused")
+                            )
+
+                        member _.SpawnAsync(_cmd, _ct) =
+                            Task.FromResult<Result<RunningProcess, ProcessError>>(
+                                Error(ProcessError.Unsupported "unused")
+                            ) }
+
+                match RecordReplayRunner.Auto(path, counting, options) with
+                | Error error -> Assert.Fail $"auto load: {error}"
+                | Ok auto ->
+                    use auto = auto
+
+                    let existing = Command.create "vault" |> Command.args [ "--password=hunter2" ]
+
+                    match! (runner auto).OutputStringAsync(existing, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "old")
+                    | Error error -> Assert.Fail $"an existing row must replay under a new projection: {error}"
+
+                    Assert.That(calls, Is.EqualTo 0, "the existing row must not reach the inner runner")
+
+                    let fresh = Command.create "vault" |> Command.args [ "--password=hunter2"; "renew" ]
+
+                    let! _ = (runner auto).OutputStringAsync(fresh, CancellationToken.None)
+                    Assert.That(calls, Is.EqualTo 1, "the new call is a miss and is recorded")
+
+                    match auto.Save() with
+                    | Ok() -> ()
+                    | Error error -> Assert.Fail $"save: {error}"
+
+                let onDisk = File.ReadAllText path
+
+                Assert.That(
+                    onDisk,
+                    Does.Contain "\"--password=hunter2\"",
+                    "a row recorded before the projection is preserved as it was, not retroactively scrubbed"
+                )
+
+                Assert.That(onDisk, Does.Contain "[REDACTED]", "the freshly recorded row is projected")
+            })
+
+    [<Test>]
+    member _.``a pre-v9 entry keeps keying on its own verbatim program and args``() : Task =
+        withCassette (fun path ->
+            task {
+                // Back-compat for the arguments specifically: an entry recorded before the fingerprint
+                // existed carries none, so it is keyed from the program/args it stores — the invoked ones.
+                File.WriteAllText(
+                    path,
+                    """{ "Version": 8, "Entries": [ { "Program": "tool", "Args": ["build", "--flag"], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "OutputWiring": "1|o:pipe|e:pipe", "Stdout": "old", "Stderr": "", "Code": 0 } ] }"""
+                )
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"a v8 cassette must load: {error}"
+                | Ok replayer ->
+                    let matching = Command.create "tool" |> Command.args [ "build"; "--flag" ]
+
+                    match! (runner replayer).OutputStringAsync(matching, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "old")
+                    | Error error -> Assert.Fail $"a legacy entry must replay for its own args: {error}"
+
+                    let different = Command.create "tool" |> Command.args [ "build"; "--other" ]
+
+                    match! (runner replayer).OutputStringAsync(different, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss _) -> ()
+                    | other -> Assert.Fail $"different args must still miss, got {other}"
+            })
+
     [<Test>]
     member _.``Auto records a miss, replays a hit, and grows the cassette``() : Task =
         withCassette (fun path ->
@@ -2107,7 +2676,7 @@ type CassetteTests() =
                     }
 
                 let onDisk = File.ReadAllText path
-                Assert.That(onDisk, Does.Contain "\"Version\": 8", "a PTY recording writes the current format")
+                Assert.That(onDisk, Does.Contain "\"Version\": 9", "a PTY recording writes the current format")
                 Assert.That(onDisk, Does.Contain "\"Pty\": true")
                 // PtyConfig.Default geometry is 80x24.
                 Assert.That(onDisk, Does.Contain "\"PtyCols\": 80")
@@ -2115,14 +2684,15 @@ type CassetteTests() =
             })
 
     [<Test>]
-    member _.``pre-v8 cassettes v1 through v7 still load and replay as recorded results under the v8 build``() : Task =
+    member _.``pre-v9 cassettes v1 through v8 still load and replay as recorded results under the v9 build``() : Task =
         task {
-            // One hand-crafted fixture per legacy version. Each must load under the v8 build (a missing
+            // One hand-crafted fixture per legacy version. Each must load under the v9 build (a missing
             // Pty field defaults to false / non-PTY, a missing Signalled field preserves legacy signal
-            // behavior, a missing Failure keeps the entry the recorded RESULT it always was, and a
-            // missing OutputWiring keys the entry as a legacy one served to a call that captures its
-            // output) and replay its recorded stdout, proving the whole v1→v8 back-compat load path, not
-            // just the newest predecessor.
+            // behavior, a missing Failure keeps the entry the recorded RESULT it always was, a missing
+            // OutputWiring keys the entry as a legacy one served to a call that captures its output, and
+            // a missing CommandFingerprint keys the entry from its own verbatim program/args) and replay
+            // its recorded stdout, proving the whole v1→v9 back-compat load path, not just the newest
+            // predecessor.
             let fixtures =
                 [ 1,
                   "legacy1",
@@ -2151,7 +2721,11 @@ type CassetteTests() =
                   7,
                   "legacy7",
                   "seven",
-                  """{ "Version": 7, "Entries": [ { "Program": "legacy7", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "seven", "Stderr": "", "Pty": false, "Signalled": false, "Code": 0, "Failure": null } ] }""" ]
+                  """{ "Version": 7, "Entries": [ { "Program": "legacy7", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "Stdout": "seven", "Stderr": "", "Pty": false, "Signalled": false, "Code": 0, "Failure": null } ] }"""
+                  8,
+                  "legacy8",
+                  "eight",
+                  """{ "Version": 8, "Entries": [ { "Program": "legacy8", "Args": [], "HasStdin": false, "EnvNames": [], "EnvFingerprint": "1|default", "OutputWiring": "1|o:pipe|e:pipe", "Stdout": "eight", "Stderr": "", "Pty": false, "Signalled": false, "Code": 0, "Failure": null } ] }""" ]
 
             for version, program, expected, json in fixtures do
                 let path = Path.GetTempFileName()
@@ -2160,7 +2734,7 @@ type CassetteTests() =
                     File.WriteAllText(path, json)
 
                     match RecordReplayRunner.Replay path with
-                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v8 build: {error}"
+                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v9 build: {error}"
                     | Ok replayer ->
                         match! (runner replayer).OutputStringAsync(Command.create program, CancellationToken.None) with
                         | Ok result ->
@@ -2406,7 +2980,7 @@ type CassetteTests() =
                     }
 
                 let onDisk = File.ReadAllText path
-                Assert.That(onDisk, Does.Contain "\"Version\": 8", "a recorded failure writes the current format")
+                Assert.That(onDisk, Does.Contain "\"Version\": 9", "a recorded failure writes the current format")
                 Assert.That(onDisk, Does.Contain "\"Kind\": \"NotFound\"", "the discriminant names the error case")
                 Assert.That(onDisk, Does.Contain "\"Searched\": \"/usr/bin\"", "the payload keeps the searched path")
 
@@ -3430,7 +4004,7 @@ type CassetteTests() =
                         }
 
                     let onDisk = File.ReadAllText path
-                    Assert.That(onDisk, Does.Contain "\"Version\": 8", "the wiring fingerprint is a v8 field")
+                    Assert.That(onDisk, Does.Contain "\"Version\": 9", "a recording writes the current format")
                     Assert.That(onDisk, Does.Contain "\"OutputWiring\"", "every recording stores its own wiring")
                     Assert.That(onDisk, Does.Contain "o:file:", "a redirect keys as a file destination")
 

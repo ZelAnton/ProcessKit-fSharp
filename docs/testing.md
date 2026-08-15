@@ -662,7 +662,7 @@ Semantics worth knowing before you commit a cassette:
 
 | Aspect | Behaviour |
 |---|---|
-| Match key | program + args + a stdin **source digest** (plus whether stdin was present). In-memory bytes hash their content; a `Stdin.FromFile` source hashes its path (opt into hashing its **contents** with `RecordReplayOptions.WithFileStdinContentHashing`). The working directory does **not** participate by default — a cassette recorded in one `cwd` still replays from another — opt in with `RecordReplayOptions.WithCwdMatching()` |
+| Match key | program + args + a stdin **source digest** (plus whether stdin was present). In-memory bytes hash their content; a `Stdin.FromFile` source hashes its path (opt into hashing its **contents** with `RecordReplayOptions.WithFileStdinContentHashing`). The working directory does **not** participate by default — a cassette recorded in one `cwd` still replays from another — opt in with `RecordReplayOptions.WithCwdMatching()`. Program and args reach the key through a fingerprint of the **invoked** command line, which is what lets `RecordReplayOptions.WithCommandProjection` change what the file *stores* for them without changing what matches |
 | Environment | now part of the match key through a redacting **fingerprint** of the effective environment — the `EnvClear` flag plus the net effect of the `Env`/`EnvRemove` overrides (removals and last-write-wins included; env-name case is insensitive on Windows, sensitive on POSIX), while repeated/no-op overrides with the same final effect still match. Override **values never reach the file through it** — only the variable names and a versioned SHA-256 fingerprint — so an env secret can't leak through the match key, yet a call with a different value, name, removal, or `EnvClear` no longer replays an unrelated recording. (The one place an env value *is* stored is a recorded `NotFound`'s searched `PATH` — see the secrets note below the table.) |
 | Output wiring | also part of the match key, through a **fingerprint of the effective wiring**: where the child's stdout and stderr went (`Piped`, `Null`, `Inherit`, or a direct `StdoutToFile`/`StderrToFile` redirect *with* its append flag), whether stderr was folded into stdout (`MergeStderr`), and whether the run was a `Pty`. Only a piped (or PTY) stream reaches the parent at all, so a recording made over a pipe is no longer handed to a call whose stdout goes to `Null`, to an inherited console, or straight to a file — nor the reverse, where an empty non-capturing recording would hide a piped call's real output. A knob the spawn ignores does not split the key (a PTY's `Stdout`/`Stderr` mode, a merged run's stderr mode). A redirect **path** is folded in as a SHA-256 digest, never stored in clear text, and keyed verbatim — two spellings of one path are two wirings, which costs a miss rather than a wrong hit |
 | Miss | an unmatched call is `ProcessError.CassetteMiss` (distinct from a missing program) — replay never spawns a surprise subprocess; a stale cassette fails loudly |
@@ -672,7 +672,7 @@ Semantics worth knowing before you commit a cassette:
 | Fidelity | a recording's **truncation** flag and wall-clock **duration** survive both direct capture replay and a live handle reconstructed by `SpawnAsync`, including PTY handles. Buffered `OutputStringAsync` / `OutputBytesAsync` results carry both values; streaming `FinishAsync` carries the truncation flag and the handle's `Elapsed` remains the recorded duration. A replay command's current output-buffer policy still applies to the reconstructed payload, so its final truncation state is the recorded flag OR any truncation caused by that policy |
 | Typed failures | **recorded and replayed** (schema v7): a call that ended in `NotFound`, `Spawn`, `Stdin`, `Exit`, `Signalled`, `Timeout`, `OutputTooLarge`, `Parse`, or `JsonRpc` is stored as that failure with its payload and replays as the same `ProcessError` case — through the capture verbs and `SpawnAsync` alike — so an expected failure is as reproducible as an expected success, and Auto stops re-running the real tool for it. An error the format cannot rebuild exactly, or would be lying to replay (`Cancelled`, `CassetteMiss`, `RetryPredicate`, `Io`, `Unsupported`, `ResourceLimit`, `Unobserved`, `NotReady`, `Adopt`, `OutputIncomplete` — that last one is a race with the recording machine, not a property of the command), is returned to the caller and recorded nowhere, as is any failure that arrives once the run's token is already cancelled. A non-zero exit and a captured timeout are *results*, not failures, and are recorded as results |
 | One-shot stdin | `Stdin.FromStream` / `FromLines` / `FromAsyncLines` can't be keyed without consuming them, so recording or replaying such a call errors |
-| Format | a versioned JSON envelope — `{ "Version", "Entries" }` (current version **8**); a cassette **newer** than this build understands is rejected on load, while every older version (1–7) still loads with its missing fields defaulting — a pre-v3 entry with no env fingerprint keys as the default, un-customized environment; a pre-v4 entry with no `Pty` flag loads as a non-PTY recording; a pre-v7 entry has no failure half and stays the recorded result it always was; a pre-v8 entry, which recorded no wiring, is served only where it could honestly have been recorded (its PTY shape must match, and an entry holding captured stdout/stderr is not replayed for a call that captures none — that is an ordinary miss, so re-record it; an entry that captured *nothing* is served either way, since a pre-v8 file cannot say which wiring produced it and an empty capture invents nothing). A partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
+| Format | a versioned JSON envelope — `{ "Version", "Entries" }` (current version **9**); a cassette **newer** than this build understands is rejected on load, while every older version (1–8) still loads with its missing fields defaulting — a pre-v3 entry with no env fingerprint keys as the default, un-customized environment; a pre-v4 entry with no `Pty` flag loads as a non-PTY recording; a pre-v7 entry has no failure half and stays the recorded result it always was; a pre-v8 entry, which recorded no wiring, is served only where it could honestly have been recorded (its PTY shape must match, and an entry holding captured stdout/stderr is not replayed for a call that captures none — that is an ordinary miss, so re-record it; an entry that captured *nothing* is served either way, since a pre-v8 file cannot say which wiring produced it and an empty capture invents nothing); a pre-v9 entry has no `CommandFingerprint` and is keyed from its own stored program/args, which for an unprojected recording are the invoked ones. A partial/crafted entry (omitted fields) is normalized so replay can't trip on a missing value |
 | PTY | a [`Command.Pty`](#pseudo-terminal-pty-doubles) recording carries a `Pty` flag and its geometry (`PtyCols`/`PtyRows`) and replays as a **merged-stream** handle (only `OutputEvent.Stdout`). Because a PTY captures one merged stream, the [`WithRedaction`](#record-and-replay) hook scrubs that whole stream — an echoed credential is scrubbed before it lands in the cassette |
 | Concurrent saves | saves of one recorder run **one at a time and in order**, so a slower earlier `Save()` can never put an older recording back over a newer one. Saves from *different* recorders or processes to the same path are serialized by an advisory lock on a sibling `<path>.lock` file (a deny-share open on Windows, `flock` on Unix); it is taken **without waiting**, so a writer that loses it gets a transient `ProcessError.Io` (`IsTransient` — retry when the other save finishes) rather than overwriting what the winner just saved. The lock file is a 0-byte rendezvous that saves never delete — a crash releases the OS lock by itself — so it holds no recording and is worth adding to `.gitignore` next to the fixtures |
 
@@ -693,7 +693,9 @@ detail, JSON-RPC `data`, and — the one exception to the env-values rule, an
 output), so review a fixture before committing it. The
 [`WithRedaction`](#record-and-replay) hook covers the captured text (a string
 capture's stdout/stderr, a bytes capture's stderr) and every one of those failure
-fields; `program` and `args` are recorded as given. On Unix the file is written
+fields; `program` and `args` are recorded as given **unless** you add the opt-in
+[`WithCommandProjection`](#record-and-replay) hook, which decides what those two
+fields carry on disk without touching what the entry matches on. On Unix the file is written
 **atomically and owner-only** (`0600` from creation — a temp file renamed into
 place, so it is never briefly world-readable); on Windows it inherits the
 containing directory's ACL, so keep secret-bearing fixtures out of world-readable
@@ -734,11 +736,30 @@ since they change how invocations are keyed):
   key, so two otherwise-identical invocations that ran in different directories are treated as
   distinct recordings. `CassetteEntry.Cwd` always stores the working directory verbatim for
   inspection regardless of this setting; only its participation in *matching* is opt-in.
+- `WithCommandProjection((program, args) -> (program, args))` — project the **persisted** command
+  line: what this hook returns is what the recording stores in `CassetteEntry.Program`/`Args`, so a
+  secret that lives in argv (a `--password=…` flag, a token in a URL) is kept off disk the way
+  `WithRedaction` keeps one out of captured output. It cannot break replay, because matching does
+  not go through it: the entry is keyed on a `CommandFingerprint` — a SHA-256 of the **invoked**
+  program and its (normalized) arguments, taken *before* the projection runs and stored beside the
+  projected text. So two calls whose projections collide stay two recordings, and a **reader** needs
+  no projection configured to replay a projected cassette (this is a write-side policy). Two things
+  to know: with the raw arguments gone from the file the match key is frozen at record time, so
+  changing `WithArgNormalizer` afterwards needs a re-record; and the fingerprint is a hash of the
+  real command line, so a *low-entropy* secret argument (a short PIN) is still brute-forcible from
+  it — the same caveat the environment fingerprint carries. A blank projected program is stored as
+  `(redacted)` (the format requires an entry to name one); `Cwd` and captured output are not touched
+  here. It projects what *this* recorder records — an `Auto` session that grows an older cassette
+  rewrites none of the rows already in it, so a fixture that already carries a secret needs
+  re-recording, not just reopening.
 
 ```csharp
 var options = new RecordReplayOptions()
     .WithArgNormalizer(args => args.Where(a => !a.StartsWith("/tmp/")).ToArray())
-    .WithRedaction(text => text.Replace(token, "[REDACTED]"));
+    .WithRedaction(text => text.Replace(token, "[REDACTED]"))
+    // Stored argv only — matching still keys on the real command line.
+    .WithCommandProjection((program, args) =>
+        (program, args.Select(a => a.Replace(token, "[REDACTED]")).ToArray()));
 
 // Auto (like Replay) returns a Result — it can fail to load an existing cassette.
 if (RecordReplayRunner.Auto("fixtures/git.json", new JobRunner(), options) is { IsOk: true, ResultValue: var recorder })

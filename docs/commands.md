@@ -367,7 +367,11 @@ fingerprint of the effective environment. The one exception is a cassette that
 records a `NotFound` failure: it keeps the search path that lookup walked — the
 child's effective `PATH`, including one you set here with `Env("PATH", …)` —
 verbatim, so scrub such a fixture with `RecordReplayOptions.WithRedaction` or
-review it before committing it (see
+review it before committing it. A secret in the **command line** is a different
+exposure: `program` and `args` are stored as invoked by default, and the opt-in
+`RecordReplayOptions.WithCommandProjection` hook is what rewrites them on disk —
+the cassette then keys on a hashed fingerprint of the invoked command line
+instead, so scrubbing what is stored never changes what replays (see
 [record and replay](testing.md#record-and-replay) and
 [Hardening → Secrets in logs, traces, metrics, and cassettes](hardening.md#secrets-in-logs-traces-metrics-and-cassettes)).
 
