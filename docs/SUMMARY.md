@@ -33,6 +33,7 @@
 - [Supervision](supervision.md)
 - [Testing your code](testing.md)
 - [Observability](observability.md)
+- [JSONL reports](jsonl-reports.md)
 - [Dependency injection](dependency-injection.md)
 - [Platform support](platform-support.md)
 - [Hardening untrusted children](hardening.md)

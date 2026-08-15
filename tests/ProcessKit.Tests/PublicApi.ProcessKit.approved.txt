@@ -1073,6 +1073,22 @@ class ProcessKit.PtySessionOptions
   property TranscriptChars : System.Int32 { get }
   property WindowChars : System.Int32 { get }
 
+module ProcessKit.ReportJson
+  property MemberInfoTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.MemberInfo> { get }
+  property OutcomeTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.Outcome> { get }
+  property ProcessGroupStatsTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.ProcessGroupStats> { get }
+  property ProcessResultBytesTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.ProcessResult<System.Byte[]>> { get }
+  property ProcessResultStringTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.ProcessResult<System.String>> { get }
+  property RunProfileTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.RunProfile> { get }
+
+class ProcessKit.ReportJsonExtensions
+  static member ToReportJson(ProcessKit.MemberInfo) : System.String
+  static member ToReportJson(ProcessKit.Outcome) : System.String
+  static member ToReportJson(ProcessKit.ProcessGroupStats) : System.String
+  static member ToReportJson(ProcessKit.ProcessResult<System.Byte[]>) : System.String
+  static member ToReportJson(ProcessKit.ProcessResult<System.String>) : System.String
+  static member ToReportJson(ProcessKit.RunProfile) : System.String
+
 class ProcessKit.ResourceLimits
   member WithCpuAffinity(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.ResourceLimits
   member WithCpuQuota(System.Double) : ProcessKit.ResourceLimits

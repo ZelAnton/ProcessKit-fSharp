@@ -35,6 +35,7 @@
 		<Compile Include="MemberInfoTests.fs" />
 		<Compile Include="ErgonomicsTests.fs" />
 		<Compile Include="StatsTests.fs" />
+		<Compile Include="ReportJsonTests.fs" />
 		<Compile Include="LimitsTests.fs" />
 		<Compile Include="CassetteTests.fs" />
 		<Compile Include="CassetteRobustnessTests.fs" />

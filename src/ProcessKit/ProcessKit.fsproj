@@ -68,6 +68,7 @@
 		<Compile Include="RotatingFileSink.fs" />
 		<Compile Include="Command.fs" />
 		<Compile Include="MemberInfo.fs" />
+		<Compile Include="ReportJson.fs" />
 		<Compile Include="DetachedProcess.fs" />
 		<Compile Include="Native.Common.fs" />
 		<Compile Include="Native.Windows.fs" />
