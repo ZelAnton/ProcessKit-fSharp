@@ -79,6 +79,16 @@
 		<Compile Include="StreamChannel.fs" />
 		<Compile Include="ProcessStdin.fs" />
 		<Compile Include="ReadinessProbe.fs" />
+		<!-- RunningProcess's own internals, split by lifecycle axis. Each is consumed only by the
+		     files below it: the host record every one of them takes, then the claim state machine,
+		     the shared terminal waits/teardown, the expect window an interactive session fills, the
+		     pumps/sessions, the readiness-vs-exit race, and finally the public facade. -->
+		<Compile Include="RunningHost.fs" />
+		<Compile Include="ConsumptionGate.fs" />
+		<Compile Include="RunTerminal.fs" />
+		<Compile Include="ExpectWindow.fs" />
+		<Compile Include="OutputSessions.fs" />
+		<Compile Include="ReadinessRace.fs" />
 		<Compile Include="RunningProcess.fs" />
 		<Compile Include="ContentLengthSession.fs" />
 		<Compile Include="JsonRpcSession.fs" />
