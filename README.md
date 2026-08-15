@@ -1024,8 +1024,10 @@ Entries are matched by program + args + cwd + a stdin **source digest**; environ
 `args`, `stdout`, `stderr`, and a recorded **failure**'s own text — its streams, detail, JSON-RPC
 `data`, and the `PATH` a `NotFound` searched (the one environment *value* a cassette keeps, an
 `Env("PATH", …)` override included) — *are* stored verbatim and can carry secrets. `WithRedaction`
-scrubs the captured text and every one of those failure fields (`program`/`args` are stored as
-given), so review a fixture before committing it; on Unix the file is written `0600`. A crash writes
+scrubs the captured text and every one of those failure fields; `program`/`args` are stored as given
+unless you add the opt-in `WithCommandProjection`, which decides what the file keeps for those two
+(matching still keys on a fingerprint of the *invoked* command line, so a projected cassette replays
+what an unprojected one would). Review a fixture before committing it; on Unix the file is written `0600`. A crash writes
 no cassette behind your back *until you declare the recording finished*: the best-effort flush on
 dispose happens only after `Complete()` marks it so, and a scope left by a failed assertion before
 that call creates no cassette and changes none already on disk. That mark is the whole gate — dispose

@@ -9,9 +9,10 @@ class ProcessKit.Testing.CassetteEntry
   member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
   member ToString() : System.String
   new()
-  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double, System.Boolean, System.Nullable<System.Int32>, System.Nullable<System.Int32>, ProcessKit.Testing.CassetteFailure, System.String)
+  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double, System.Boolean, System.Nullable<System.Int32>, System.Nullable<System.Int32>, ProcessKit.Testing.CassetteFailure, System.String, System.String)
   property Args : System.String[] { get; set }
   property Code : System.Nullable<System.Int32> { get; set }
+  property CommandFingerprint : System.String { get; set }
   property Cwd : System.String { get; set }
   property DurationMs : System.Double { get; set }
   property EnvFingerprint : System.String { get; set }
@@ -116,6 +117,7 @@ class ProcessKit.Testing.FaultInjection
 
 class ProcessKit.Testing.RecordReplayOptions
   member WithArgNormalizer(System.Func<System.String[], System.String[]>) : ProcessKit.Testing.RecordReplayOptions
+  member WithCommandProjection(System.Func<System.String, System.String[], System.ValueTuple<System.String, System.String[]>>) : ProcessKit.Testing.RecordReplayOptions
   member WithCwdMatching() : ProcessKit.Testing.RecordReplayOptions
   member WithFileStdinContentHashing() : ProcessKit.Testing.RecordReplayOptions
   member WithRedaction(System.Func<System.String, System.String>) : ProcessKit.Testing.RecordReplayOptions

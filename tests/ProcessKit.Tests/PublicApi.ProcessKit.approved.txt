@@ -23,6 +23,47 @@ module ProcessKit.BatchPolicy+Tags
   field literal CollectAll : System.Int32
   field literal FailFast : System.Int32
 
+class ProcessKit.Capability
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.Capability>
+  member Equals(ProcessKit.Capability) : System.Boolean
+  member Equals(ProcessKit.Capability, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsAvailable() : System.Boolean
+  member get_IsQualified() : System.Boolean
+  member get_IsUnsupported() : System.Boolean
+  member get_Tag() : System.Int32
+  property Available : ProcessKit.Capability { get }
+  property Detail : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property IsAvailable : System.Boolean { get }
+  property IsQualified : System.Boolean { get }
+  property IsUnsupported : System.Boolean { get }
+  property Tag : System.Int32 { get }
+  static member NewQualified(System.String) : ProcessKit.Capability
+  static member NewUnsupported(System.String) : ProcessKit.Capability
+  static member get_Available() : ProcessKit.Capability
+
+class ProcessKit.Capability+Qualified : ProcessKit.Capability
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.Capability>
+  member get_Qualification() : System.String
+  property Qualification : System.String { get }
+
+module ProcessKit.Capability+Tags
+  field literal Available : System.Int32
+  field literal Qualified : System.Int32
+  field literal Unsupported : System.Int32
+
+class ProcessKit.Capability+Unsupported : ProcessKit.Capability
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.Capability>
+  member get_Requires() : System.String
+  property Requires : System.String { get }
+
 class ProcessKit.CliClient
   member Command(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
   member EnsureAvailableAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
@@ -194,6 +235,18 @@ class ProcessKit.CommandVerbs
 
 module ProcessKit.ConsoleEncoding
   static member current() : System.Text.Encoding
+
+class ProcessKit.ContainmentCapabilities
+  property Adoption : ProcessKit.Capability { get }
+  property Creation : ProcessKit.Capability { get }
+  property Helpers : System.Collections.Generic.IReadOnlyList<ProcessKit.PlatformHelper> { get }
+  property KillOnParentDeath : ProcessKit.Capability { get }
+  property KillOnParentDeathScope : ProcessKit.KillOnParentDeathScope { get }
+  property Mechanism : Microsoft.FSharp.Core.FSharpOption<ProcessKit.Mechanism> { get }
+  property Pty : ProcessKit.Capability { get }
+  property PtyResize : ProcessKit.Capability { get }
+  property ResourceLimits : ProcessKit.ResourceLimitCapabilities { get }
+  property Signals : ProcessKit.SignalCapabilities { get }
 
 class ProcessKit.ContentLengthSession
   member FinishInputAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
@@ -570,6 +623,11 @@ class ProcessKit.PipelineSession
   member StopAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.Outcome>
   member WaitForLineAsync(System.Func<System.String, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
 
+class ProcessKit.PlatformHelper
+  property Availability : ProcessKit.Capability { get }
+  property Name : System.String { get }
+  property Purpose : System.String { get }
+
 class ProcessKit.Priority
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.Priority>
@@ -904,6 +962,8 @@ class ProcessKit.ProcessGroup
   member UpdateLimits(ProcessKit.ResourceLimits) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   property Mechanism : ProcessKit.Mechanism { get }
   property Options : ProcessKit.ProcessGroupOptions { get }
+  static member Capabilities() : ProcessKit.ContainmentCapabilities
+  static member Capabilities(ProcessKit.ProcessGroupOptions) : ProcessKit.ContainmentCapabilities
   static member Create() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroup, ProcessKit.ProcessError>
   static member Create(ProcessKit.ProcessGroupOptions) : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroup, ProcessKit.ProcessError>
 
@@ -1088,6 +1148,17 @@ class ProcessKit.ReportJsonExtensions
   static member ToReportJson(ProcessKit.ProcessResult<System.Byte[]>) : System.String
   static member ToReportJson(ProcessKit.ProcessResult<System.String>) : System.String
   static member ToReportJson(ProcessKit.RunProfile) : System.String
+
+class ProcessKit.ResourceLimitCapabilities
+  property CpuAffinity : ProcessKit.Capability { get }
+  property CpuQuota : ProcessKit.Capability { get }
+  property CpuTimeMax : ProcessKit.Capability { get }
+  property IoMax : ProcessKit.Capability { get }
+  property LiveUpdate : ProcessKit.Capability { get }
+  property MaxProcesses : ProcessKit.Capability { get }
+  property MemoryMax : ProcessKit.Capability { get }
+  property OomGroupKill : ProcessKit.Capability { get }
+  property UiRestrictions : ProcessKit.Capability { get }
 
 class ProcessKit.ResourceLimits
   member WithCpuAffinity(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.ResourceLimits
@@ -1323,6 +1394,11 @@ module ProcessKit.Signal+Tags
   field literal Term : System.Int32
   field literal Usr1 : System.Int32
   field literal Usr2 : System.Int32
+
+class ProcessKit.SignalCapabilities
+  property Arbitrary : ProcessKit.Capability { get }
+  property Kill : ProcessKit.Capability { get }
+  property SoftStop : ProcessKit.Capability { get }
 
 class ProcessKit.Stdin
   property Empty : ProcessKit.Stdin { get }

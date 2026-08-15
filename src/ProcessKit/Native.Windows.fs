@@ -92,6 +92,18 @@ module internal Windows =
     let private systemCmdExe =
         lazy (Path.Combine(Environment.SystemDirectory, "cmd.exe"))
 
+    /// Whether the system `cmd.exe` above is actually present — the capability snapshot's honest answer for
+    /// the `.cmd`/`.bat` shim host, read from the very path the wrapper would launch (never `PATH`). Probed
+    /// on each call rather than cached: it is a point-in-time observation, like every other fact the
+    /// snapshot reports. An unreadable/denied system directory is simply "not available here" — the same
+    /// answer the launch itself would end at.
+    let systemCmdExeAvailable () : bool =
+        try
+            File.Exists systemCmdExe.Value
+        with _ ->
+            // A denied or torn-down system directory is not a usable shim host; a probe must not throw.
+            false
+
     /// The `cmd.exe` command-parser metacharacters neutralized by a leading caret when NOT inside cmd's
     /// own quotes: the quote itself, the caret, command chaining, redirection, and grouping.
     let private isCmdMetacharacter (c: char) =

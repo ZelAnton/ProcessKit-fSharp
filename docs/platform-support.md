@@ -10,6 +10,7 @@ return a typed `ProcessError`, never a silent downgrade. This page collects ever
 mechanism, capability matrix, and caveat in one place.
 
 - [Containment mechanisms](#containment-mechanisms)
+- [Capability snapshot](#capability-snapshot)
 - [Target frameworks](#target-frameworks)
 - [Trimming and NativeAOT](#trimming-and-nativeaot)
 - [Capability matrices](#capability-matrices)
@@ -79,6 +80,97 @@ Console.WriteLine(group.Mechanism switch
 
 The `Mechanism.IsJobObject` / `IsCgroupV2` / `IsProcessGroup` properties are the same check in
 boolean form, convenient from C#.
+
+## Capability snapshot
+
+`ProcessGroup.Mechanism` answers only once a group exists. A long-lived orchestrator that has to
+pick a portable policy *before* the first spawn would otherwise have to create a group and try each
+operation to find out what it gets. `ProcessGroup.Capabilities()` — or `Capabilities(options)` for a
+specific `ProcessGroupOptions` — answers the same questions up front, as an immutable
+`ContainmentCapabilities` snapshot:
+
+**F#**
+
+```fsharp
+let capabilities = ProcessGroup.Capabilities(ProcessGroupOptions().WithMemoryMax(512L * 1024L * 1024L))
+
+match capabilities.Mechanism, capabilities.Creation with
+| Some mechanism, _ -> printfn $"a limited group here is contained by {mechanism}"
+| None, Capability.Unsupported requires -> printfn $"these options cannot be honoured here; they need {requires}"
+| None, _ -> ()
+
+match capabilities.ResourceLimits.CpuAffinity with
+| Capability.Available -> printfn "the tree can be pinned to cores"
+| Capability.Qualified qualification -> printfn $"pinning works, but: {qualification}"
+| Capability.Unsupported requires -> printfn $"no pinning here; it needs {requires}"
+```
+
+**C#**
+
+```csharp
+var capabilities = ProcessGroup.Capabilities();
+
+if (capabilities.Adoption is Capability.Unsupported noAdopt)
+{
+    Console.WriteLine($"this host cannot adopt an external process: it needs {noAdopt.Requires}");
+}
+
+foreach (var helper in capabilities.Helpers)
+{
+    Console.WriteLine($"{helper.Name} ({helper.Purpose}): {helper.Availability}");
+}
+```
+
+**Nothing is created.** Taking a snapshot starts no process, creates no group, and touches no
+container; it reads no argv and no environment value, and reports none.
+
+### What each axis answers
+
+Every axis is a `Capability`, which is deliberately three-valued rather than a `bool`: `Available`,
+`Qualified` (available under a stated qualification), or `Unsupported` (with the precondition that is
+missing). `Capability.Detail` reads the qualification or the precondition without matching on the
+case. There is no bare "no" anywhere in the snapshot — an axis that is not plainly available always
+says why, and the matching verb still refuses with its own typed `ProcessError`.
+
+| Member | Answers | Matrix |
+|---|---|---|
+| `Mechanism` | the primitive `Create(options)` would select, or `None` when these options cannot be honoured here | [Containment mechanisms](#containment-mechanisms) |
+| `Creation` | whether `Create(options)` can succeed, and under what qualification | [When each mechanism is chosen](#when-each-mechanism-is-chosen) |
+| `ResourceLimits` | one `Capability` per `ResourceLimits` dimension (`MemoryMax`, `OomGroupKill`, `MaxProcesses`, `CpuQuota`, `CpuTimeMax`, `CpuAffinity`, `IoMax`, `UiRestrictions`, and `LiveUpdate` for `UpdateLimits`) | [Resource limits](#capability-matrices) |
+| `Signals` | `Kill`, `SoftStop` (`Signal.Int`/`Signal.Term`), and `Arbitrary` (every other signal) | [Signals](#capability-matrices) |
+| `Adoption` | `ProcessGroup.Adopt` | [Adopting an external process](#capability-matrices) |
+| `Pty` / `PtyResize` | `Command.Pty`, and `RunningProcess.ResizeAsync` on such a run | [PTY capabilities](#pseudo-terminal-pty-capabilities) |
+| `KillOnParentDeath` / `KillOnParentDeathScope` | `Command.KillOnParentDeath`, and how far its cleanup reaches | [Reaping on sudden parent death](#capability-matrices) |
+| `Helpers` | the external binaries this platform's spawn paths load (`setpriv`, `setsid`, `/bin/sh`; `cmd.exe` on Windows), what each is for, and whether this host holds it | [Caveats](#caveats) |
+
+Two reading rules keep the answers honest, and are worth knowing before you branch on them:
+
+- **The limit dimensions answer for the host, not for the mechanism these options select.** On Linux,
+  *asking* for a whole-tree cap is itself what selects the cgroup v2 mechanism, so reporting
+  `MemoryMax` as unsupported for a limit-free options set would understate a host that can enforce it
+  the moment it is requested. `Mechanism` and `Creation` are the members that answer for the options
+  as they stand; `Adoption` and `Signals` follow the mechanism those options select.
+- **A mounted cgroup v2 hierarchy is reported as `Qualified`, not `Available`.** Enabling the
+  controllers a cap needs is permitted only at the *real* hierarchy root, and a cgroup namespace root
+  (an ordinary container, a systemd scope) is indistinguishable from it without attempting the write —
+  which a snapshot must not do. "The hierarchy exists" and "the cap can be enforced" are neighbouring
+  facts, and the snapshot reports them as such rather than merging them into one claim. This is not a
+  disagreement with the ✅ the [matrices below](#capability-matrices) give cgroup v2 for those caps:
+  a matrix row answers "does this *mechanism* support the cap" (it does, fully), while the snapshot
+  answers "can this *host* give me that mechanism with the cap enforced" — which is only settled when
+  `ProcessGroup.Create` attempts the delegation.
+
+### What it does not promise
+
+It is a snapshot, not a guarantee. Each value is read from the platform facts in force at the moment
+of the call — a mounted cgroup v2 hierarchy, a helper present in a trusted directory, the ConPTY
+entry point exported by this Windows build — and a host can gain or lose any of them afterwards. So
+the answer is the answer for *now*: the verb itself stays the authority at the moment it runs, and
+still returns its own typed `ProcessError` if the ground moved. Nothing is cached for exactly that
+reason, and the spawn and creation paths keep resolving every fact themselves rather than trusting a
+snapshot. The one thing the snapshot is guaranteed to agree with is the *decision*: the mechanism it
+reports comes from the very selection `ProcessGroup.Create` dispatches on, and each capability from
+the very probe the corresponding spawn path consults.
 
 ## Target frameworks
 

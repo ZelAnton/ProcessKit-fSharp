@@ -42,6 +42,26 @@ module internal Cgroup =
     /// non-empty) — including the systemd hybrid mount at /sys/fs/cgroup/unified when it has controllers.
     let cgroupV2Available () = (cgroupRoot ()).IsSome
 
+    /// True when the usable hierarchy advertises `controller` in its root `cgroup.controllers` — the
+    /// kernel's own list of what this hierarchy carries at all. `cpuset` is the one a hierarchy most
+    /// often lacks entirely, and (unlike `memory`/`pids`/`cpu`) its presence is not implied by cgroup v2
+    /// being mounted.
+    ///
+    /// Deliberately a NARROW question: it says the controller exists here, NOT that a cap using it can be
+    /// enforced — enabling it in the parent's `cgroup.subtree_control` is a separate act the kernel
+    /// permits only at the real hierarchy root. Those are neighbouring facts and must not be conflated.
+    let cgroupControllerAvailable (controller: string) =
+        match cgroupRoot () with
+        | None -> false
+        | Some root ->
+            try
+                File
+                    .ReadAllText(Path.Combine(root, "cgroup.controllers"))
+                    .Split([| ' '; '\n'; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.contains controller
+            with _ ->
+                false
+
     /// True when the usable hierarchy advertises the cgroup v2 `io` controller. A mounted v2
     /// hierarchy without `io` is a real but unsupported configuration for `io.max`, not a reason to
     /// fall back to the unbounded process-group backend.
@@ -53,17 +73,7 @@ module internal Cgroup =
     let cgroupIoAvailable () =
         match cgroupIoAvailableForTests with
         | Some available -> available
-        | None ->
-            match cgroupRoot () with
-            | None -> false
-            | Some root ->
-                try
-                    File
-                        .ReadAllText(Path.Combine(root, "cgroup.controllers"))
-                        .Split([| ' '; '\n'; '\t' |], StringSplitOptions.RemoveEmptyEntries)
-                    |> Array.contains "io"
-                with _ ->
-                    false
+        | None -> cgroupControllerAvailable "io"
 
     // This process's own cgroup path (the `0::<path>` line of /proc/self/cgroup), defaulting to "/".
     let private selfCgroupRelative () =

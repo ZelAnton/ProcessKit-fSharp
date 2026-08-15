@@ -132,7 +132,10 @@ type CassetteFailure =
 /// `EnvFingerprint` of the effective environment (the lone exception is a recorded `NotFound`
 /// failure's searched `PATH`, see `CassetteFailure.Searched`); `program`, `args`, `cwd`, `stdout`,
 /// `stderr`, and a recorded `Failure`'s own text are verbatim and can carry secrets — review a
-/// cassette before committing it.
+/// cassette before committing it. `Program`/`Args` are verbatim *by default*: the opt-in
+/// `RecordReplayOptions.WithCommandProjection` hook decides what those two fields carry on disk
+/// (a scrubbed `--password=…`, say) without changing how the entry is matched — see
+/// `CommandFingerprint`.
 [<CLIMutable>]
 type CassetteEntry =
     {
@@ -223,6 +226,18 @@ type CassetteEntry =
         /// wiring recorded): such an entry is served only to a call it could honestly have been recorded
         /// for (see `RecordReplayRunner`).
         OutputWiring: string | null
+        /// A stable, versioned fingerprint of the **invoked** program and its (normalized) arguments —
+        /// the part of the replay match key that `Program`/`Args` carry themselves in an ordinary
+        /// recording. It is written only when a `RecordReplayOptions.WithCommandProjection` projection
+        /// is in force, which is exactly when `Program`/`Args` above hold the *projected* command rather
+        /// than the invoked one: matching then keys on this fingerprint, so scrubbing the stored command
+        /// line cannot change which call replays. `null` otherwise — and in every pre-v9 cassette —
+        /// where the same fingerprint is recomputed at load from the entry's own verbatim
+        /// `Program`/`Args`, so a cassette recorded without a projection keys exactly as it always did.
+        /// The program and arguments are hashed into it (SHA-256), never stored in clear text — but a
+        /// low-entropy argument (a short token/PIN) can be recovered from the digest by brute force, so
+        /// a cassette recorded from a secret-bearing command line stays sensitive even with a projection.
+        CommandFingerprint: string | null
     }
 
 /// The on-disk cassette envelope: a format `version` (so a format newer than this build understands is
@@ -240,10 +255,11 @@ type CassetteFile =
     }
 
 /// Optional knobs for a `RecordReplayRunner` — matching customization (a stdin file-content digest, an
-/// argument normalizer, opt-in `cwd` matching) and a record-time redaction hook. Immutable and fluent;
-/// the same instance must be used at record and replay time, since it changes how invocations are keyed.
-/// Default: path-only stdin-file matching, verbatim args, no redaction, and the working directory does
-/// **not** participate in matching (see `WithCwdMatching`).
+/// argument normalizer, opt-in `cwd` matching), a record-time redaction hook, and an opt-in projection
+/// of the persisted command line. Immutable and fluent; the same instance must be used at record and
+/// replay time, since it changes how invocations are keyed.
+/// Default: path-only stdin-file matching, verbatim args, no redaction, the command line stored as
+/// invoked, and the working directory does **not** participate in matching (see `WithCwdMatching`).
 [<Sealed>]
 type RecordReplayOptions
     private
@@ -251,33 +267,37 @@ type RecordReplayOptions
         hashFileStdinContents: bool,
         argNormalizer: (string[] -> string[]) option,
         redaction: (string -> string) option,
-        matchCwd: bool
+        matchCwd: bool,
+        commandProjection: (string -> string[] -> string * string[]) option
     ) =
 
     /// The defaults: a `Stdin.FromFile` source is keyed by its **path** (not contents), arguments are
-    /// matched verbatim, captured output is stored as-is, and the working directory is **not** part of
-    /// the match key (see `WithCwdMatching`).
-    new() = RecordReplayOptions(false, None, None, false)
+    /// matched verbatim, captured output and the command line are stored as-is, and the working
+    /// directory is **not** part of the match key (see `WithCwdMatching`).
+    new() = RecordReplayOptions(false, None, None, false, None)
 
     member internal _.HashFileStdinContents = hashFileStdinContents
     member internal _.ArgNormalizer = argNormalizer
     member internal _.Redaction = redaction
     member internal _.MatchCwd = matchCwd
+    member internal _.CommandProjection = commandProjection
 
     /// Key a `Stdin.FromFile` source by its **contents** (a SHA-256 of the file's bytes) rather than its
     /// path, so a cassette matches on what was actually fed to the child. Opt-in: reading the file has a
     /// cost, and the file must exist at both record and replay time (an unreadable file surfaces
     /// `ProcessError.Stdin`). A content digest matches a `Stdin.FromBytes` of the same bytes.
     member _.WithFileStdinContentHashing() =
-        RecordReplayOptions(true, argNormalizer, redaction, matchCwd)
+        RecordReplayOptions(true, argNormalizer, redaction, matchCwd, commandProjection)
 
     /// Normalize the argument list before it is used to match an invocation, so a volatile argument (a
     /// temp directory, a nonce) no longer defeats the match — e.g. drop it, or rewrite it to a stable
     /// placeholder. Applied to both the recorded and the live command, so keying stays symmetric; the
-    /// **raw** arguments are still stored verbatim in the cassette for inspection.
+    /// **raw** arguments are still stored verbatim in the cassette for inspection (unless a
+    /// `WithCommandProjection` decides otherwise — that hook changes what is *stored*, this one changes
+    /// what is *matched*, and the two never interfere).
     member _.WithArgNormalizer(normalizer: Func<string[], string[]>) =
         ArgumentNullException.ThrowIfNull normalizer
-        RecordReplayOptions(hashFileStdinContents, Some normalizer.Invoke, redaction, matchCwd)
+        RecordReplayOptions(hashFileStdinContents, Some normalizer.Invoke, redaction, matchCwd, commandProjection)
 
     /// Scrub captured **text** before it is written to the cassette, so a secret echoed to stdout/stderr
     /// (a token, a password) never reaches disk. Applied at record time to the stdout and stderr text of
@@ -287,7 +307,37 @@ type RecordReplayOptions
     /// `NotFound` searched — so the error half of an entry is no less scrubbed than the result half.
     member _.WithRedaction(redact: Func<string, string>) =
         ArgumentNullException.ThrowIfNull redact
-        RecordReplayOptions(hashFileStdinContents, argNormalizer, Some redact.Invoke, matchCwd)
+        RecordReplayOptions(hashFileStdinContents, argNormalizer, Some redact.Invoke, matchCwd, commandProjection)
+
+    /// Project the **persisted** command line: the program and arguments this hook returns are what a
+    /// recording stores in `CassetteEntry.Program`/`Args`, so a secret that lives in argv (a
+    /// `--password=…` flag, a token in a URL) can be kept off disk the way `WithRedaction` keeps one out
+    /// of captured output. Opt-in; without it the command line is stored exactly as invoked, as it
+    /// always has been.
+    ///
+    /// **It cannot break replay, because matching does not go through it.** The invocation is keyed on a
+    /// `CassetteEntry.CommandFingerprint` — a SHA-256 of the *invoked* program and its (normalized)
+    /// arguments, computed before the projection runs and stored alongside the projected text — so a
+    /// projected cassette replays for the same calls the unprojected one would, and a reader needs no
+    /// projection configured to replay it (this is a **write-side** policy). The one thing that does
+    /// move: with the raw arguments gone from the file, the match key is frozen at record time, so
+    /// changing `WithArgNormalizer` afterwards needs a re-record rather than taking effect at load.
+    ///
+    /// Receives the program and the raw argument array (never `null`) and returns the pair to store; the
+    /// array may be reordered, shortened, or replaced outright. A `null` array reads as empty and a
+    /// `null`/blank program is stored as `(redacted)`, since the format requires an entry to name one —
+    /// neither affects matching. `Cwd`, captured output and a recorded failure's own text are not
+    /// touched here (`WithRedaction` covers the text; `CassetteEntry.Cwd` stays verbatim). It applies to
+    /// what *this* recorder records, so an `Auto` session that grows an older cassette projects only its
+    /// own new rows: a fixture that already carries a secret needs re-recording, not just reopening.
+    member _.WithCommandProjection(project: Func<string, string[], struct (string * string[])>) =
+        ArgumentNullException.ThrowIfNull project
+
+        let projection program args =
+            let struct (projectedProgram, projectedArgs) = project.Invoke(program, args)
+            projectedProgram, projectedArgs
+
+        RecordReplayOptions(hashFileStdinContents, argNormalizer, redaction, matchCwd, Some projection)
 
     /// Restore the working directory (`Command.CurrentDir`) as part of the replay match key, so two
     /// otherwise-identical invocations that ran in different directories are treated as distinct
@@ -300,14 +350,16 @@ type RecordReplayOptions
     /// setting. Must be applied symmetrically — the same setting used to record a cassette must be used
     /// to replay it, or the match key will silently disagree between the two.
     member _.WithCwdMatching() =
-        RecordReplayOptions(hashFileStdinContents, argNormalizer, redaction, true)
+        RecordReplayOptions(hashFileStdinContents, argNormalizer, redaction, true, commandProjection)
 
-// Match key: program + args + cwd (only when `RecordReplayOptions.WithCwdMatching` is set; `None`
-// otherwise, so `cwd` never distinguishes two entries by default) + whether-stdin + stdin digest +
-// effective-environment fingerprint + effective-output-wiring fingerprint (so a recording made over a
-// pipe cannot answer a call whose stdout never reaches the parent). F# tuple/list have structural
-// equality, so this works as a Dictionary key.
-type private Key = string * string list * string option * bool * string option * string * string
+// Match key: a command fingerprint (program + normalized args, hashed — see `commandFingerprint`, which
+// is what keeps keying independent of whatever a `WithCommandProjection` chose to STORE for those two
+// fields) + cwd (only when `RecordReplayOptions.WithCwdMatching` is set; `None` otherwise, so `cwd`
+// never distinguishes two entries by default) + whether-stdin + stdin digest + effective-environment
+// fingerprint + effective-output-wiring fingerprint (so a recording made over a pipe cannot answer a
+// call whose stdout never reaches the parent). F# tuples have structural equality, so this works as a
+// Dictionary key.
+type private Key = string * string option * bool * string option * string * string
 
 // One key's entries in capture order, with the order-then-repeat-last cursor. `Entries` is mutable so
 // Auto mode can append a freshly-recorded (missed) entry to an existing key's group.
@@ -361,8 +413,11 @@ type private SaveLockAttempt =
 /// call that captures none), and anything else is an ordinary miss; the working directory does
 /// **not** participate in the key by default (a cassette recorded in one `cwd` replays from another),
 /// though `CassetteEntry.Cwd` still stores it verbatim for inspection — opt into cwd-sensitive matching
-/// with `RecordReplayOptions.WithCwdMatching()`, applied symmetrically at record and replay time;
-/// duplicates replay in capture order then repeat the last; an unmatched call is
+/// with `RecordReplayOptions.WithCwdMatching()`, applied symmetrically at record and replay time. The
+/// program and arguments reach the key as a fingerprint of the **invoked** command line, so an opt-in
+/// `RecordReplayOptions.WithCommandProjection` can scrub what the file stores for them without changing
+/// which calls match (a projected cassette replays for a caller that configures no projection at all).
+/// Duplicates replay in capture order then repeat the last; an unmatched call is
 /// `ProcessError.CassetteMiss` (never a surprise subprocess). Covers the
 /// text and **bytes** capture verbs (`CaptureStringAsync` / `CaptureBytesAsync`, the latter reproducing
 /// exact bytes from a bytes recording) and `SpawnAsync` (a live handle is reconstructed from the
@@ -396,7 +451,14 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // output-wiring fingerprint that joins the match key so a piped recording cannot answer a call whose
     // stdout never reaches the parent (`Null`/`Inherit`/a file redirect) or the reverse; a pre-v8 entry
     // has none and is served only where it could honestly have been recorded (see `legacyEntryFits`).
-    static let currentFormatVersion = 8
+    // v9 adds `CommandFingerprint`, written only by a recording whose persisted program/args went
+    // through a `RecordReplayOptions.WithCommandProjection`, so those two fields can be scrubbed without
+    // the match key moving with them. A pre-v9 entry (and any v9 one recorded without a projection) has
+    // none and keys on its own verbatim program/args, exactly as every version before it did — but a v8
+    // build must NOT read a v9 file, because it would key a projected entry on the projected text and
+    // could group two genuinely different calls under one placeholder, which is precisely why the format
+    // version gates the file as a whole.
+    static let currentFormatVersion = 9
 
     // Cassette payloads are untrusted input and are materialized as both text and a JSON object graph.
     // Bound the encoded file bytes (not UTF-16 string characters) to a generous 64 MiB before either
@@ -509,6 +571,55 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 []
             else
                 List.ofArray result
+
+    // The command-fingerprint scheme version, independent of the cassette FILE version: it tags the
+    // string below so a fingerprint from an older scheme can never silently compare equal to a newer
+    // one. Bump it if the canonical serialization changes.
+    static let commandFingerprintScheme = 1
+
+    // A stable, versioned fingerprint of the INVOKED command line: the program plus its arguments as
+    // they are matched (i.e. after any `WithArgNormalizer`). This — not the program/args text an entry
+    // happens to store — is what the replay key is built from, which is the whole reason a persisted
+    // command line can be projected (scrubbed) without moving the key: the fingerprint is taken from the
+    // real invocation, before the projection runs, and stored beside the projected text.
+    //
+    // Hashed rather than kept in clear text, on the same terms as an env value or a redirect path: an
+    // argument can carry a secret, and a key is not a place to keep one. Each field is length-prefixed
+    // (`<charCount>:<text>`), a self-delimiting (netstring-style) form, so no program name or argument —
+    // whatever characters it holds — can straddle a boundary and let two distinct command lines encode
+    // to the same bytes. A `null` element (which only a user-supplied normalizer can produce) folds to
+    // the empty string rather than faulting the capture verb that is keying the call.
+    static let commandFingerprint (program: string) (args: string list) : string =
+        let sb = StringBuilder()
+
+        sb.Append(commandFingerprintScheme).Append('|') |> ignore
+
+        let appendField (text: string | null) =
+            let value = stringOrEmpty text
+            sb.Append(value.Length).Append(':').Append(value) |> ignore
+
+        appendField program
+
+        for arg in args do
+            appendField arg
+
+        let digest =
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())))
+
+        $"{commandFingerprintScheme}|{digest}"
+
+    // The command fingerprint an entry is keyed under: the recorded one when it has it (a projected
+    // recording, whose stored program/args are no longer the invoked ones), otherwise one recomputed
+    // from its own stored program/args — which for every unprojected and every pre-v9 entry ARE the
+    // invoked ones. So keying never depends on whether a projection was applied, in either direction: a
+    // legacy cassette keys exactly as it always did, and a projected cassette replays for a caller that
+    // has no projection configured at all. A stored value from a newer scheme (a hand-edited or
+    // future-build string) simply keys as itself and never matches — a miss, the safe direction for a
+    // fingerprint nothing here can interpret.
+    static let entryCommandFingerprint (normalizer: (string[] -> string[]) option) (entry: CassetteEntry) : string =
+        match entry.CommandFingerprint with
+        | null -> commandFingerprint entry.Program (applyNormalizer normalizer entry.Args)
+        | fingerprint -> fingerprint
 
     // Clamp a crafted/corrupted millisecond count into `TimeSpan`'s range (and a NaN/∞ to 0), so a
     // later `TimeSpan.FromMilliseconds` can't overflow-throw on a hand-edited cassette. Shared by the
@@ -733,7 +844,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     // Build a replay index from cassette entries, grouping duplicates of a key in capture order and
     // freezing each group to an immutable array once (not `Array.append` per duplicate, which is O(n²)).
     // The key uses the same argument normalizer (and the same cwd-matching setting) that a live match
-    // will, so the two sides stay symmetric.
+    // will, so the two sides stay symmetric — for an entry that recorded its own command fingerprint
+    // (a projected recording) the normalizer was already folded in when that fingerprint was written.
     static let buildSlots
         (normalizer: (string[] -> string[]) option)
         (matchCwd: bool)
@@ -743,8 +855,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
         for entry in entries do
             let key =
-                entry.Program,
-                applyNormalizer normalizer entry.Args,
+                entryCommandFingerprint normalizer entry,
                 (if matchCwd then Option.ofObj entry.Cwd else None),
                 entry.HasStdin,
                 Option.ofObj entry.StdinDigest,
@@ -1268,8 +1379,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     let keyWith (command: Command) (digest: string option) (wiring: string) : Key =
         let args = applyNormalizer options.ArgNormalizer (Seq.toArray command.Arguments)
 
-        command.Program,
-        args,
+        commandFingerprint command.Program args,
         (if options.MatchCwd then command.WorkingDirectory else None),
         command.Config.StdinSource.IsSome,
         digest,
@@ -1306,15 +1416,48 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         | Some pty -> true, Nullable pty.Cols, Nullable pty.Rows
         | None -> false, Nullable(), Nullable()
 
+    // What a projection stores for a program it declined to name. The format requires an entry to carry
+    // one (`validateEntry` rejects a blank `Program`, and an entry that cannot load is worse than one
+    // that names nothing), and matching does not read it — a projected entry keys on its recorded
+    // `CommandFingerprint` — so a fixed marker costs nothing and keeps the file loadable.
+    let redactedProgramPlaceholder = "(redacted)"
+
+    // The program/args a recording PERSISTS: as invoked by default, or whatever the opt-in projection
+    // hook returns. This is the only place the hook runs, so every recorded entry — text, bytes, PTY,
+    // and a typed failure alike — is projected on identical terms; and it is deliberately NOT the place
+    // the match key is built (see `keyWith`/`commandFingerprint`), which is what lets the stored command
+    // line be scrubbed without replay moving. A `null` array or a blank program from the hook is
+    // coalesced rather than trusted: a user-supplied `Func` can return either, and neither may turn into
+    // an unloadable cassette or a `NullReferenceException` inside a capture verb.
+    let persistedCommand (program: string) (args: string[]) : string * string[] =
+        match options.CommandProjection with
+        | None -> program, args
+        | Some project ->
+            let projectedProgram, projectedArgs = project program args
+
+            let persistedProgram =
+                if String.IsNullOrWhiteSpace projectedProgram then
+                    redactedProgramPlaceholder
+                else
+                    projectedProgram
+
+            persistedProgram,
+            (if obj.ReferenceEquals(projectedArgs, null) then
+                 [||]
+             else
+                 Array.map stringOrEmpty projectedArgs)
+
     // The INVOCATION half of an entry — every field that keys or describes the call — with the result
     // half left at the "nothing recorded" defaults an omitted field loads as. The three builders below
     // (text result, bytes result, typed failure) each fill only their own half on top of it, so the
     // keying fields can never drift apart between them.
     let entryOfInvocation (command: Command) (digest: string option) : CassetteEntry =
         let pty, ptyCols, ptyRows = ptyFieldsOf command
+        let invokedArgs = Seq.toArray command.Arguments
+        let program, args = persistedCommand command.Program invokedArgs
 
-        { Program = command.Program
-          Args = Seq.toArray command.Arguments
+        { Program = program
+          Args = args
           Cwd = Option.toObj command.WorkingDirectory
           StdinDigest = Option.toObj digest
           HasStdin = command.Config.StdinSource.IsSome
@@ -1333,7 +1476,16 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
           PtyCols = ptyCols
           PtyRows = ptyRows
           Failure = null
-          OutputWiring = outputWiring command }
+          OutputWiring = outputWiring command
+          // Written ONLY under a projection, and for a reason: without one the stored program/args are
+          // the invoked ones, so the fingerprint is recomputed from them at load and storing it would
+          // merely freeze the record-time normalizer into the file, costing a later `WithArgNormalizer`
+          // change the re-keying it gets today. With one, the stored text no longer identifies the call
+          // and this is what does.
+          CommandFingerprint =
+            match options.CommandProjection with
+            | None -> null
+            | Some _ -> commandFingerprint command.Program (applyNormalizer options.ArgNormalizer invokedArgs) }
 
     // Record a text capture: stdout/stderr are the decoded strings (redacted); no base64. For a PTY run
     // (D3) `Stdout` IS the single merged stream, so the redaction hook that scrubs it covers the whole

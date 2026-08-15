@@ -993,7 +993,8 @@ else
 
 Cassettes also cover the `byte[]` capture and streaming (`SpawnAsync`) verbs,
 `RecordReplayRunner.Auto` grows a cassette by recording on a miss, and
-`RecordReplayOptions` adds arg-normalizer / redaction / file-content-stdin matching —
+`RecordReplayOptions` adds arg-normalizer / redaction / file-content-stdin matching and a
+projection of the stored command line (`WithCommandProjection`, for a secret that lives in argv) —
 see [testing.md → Record and replay](testing.md#record-and-replay).
 
 ---
