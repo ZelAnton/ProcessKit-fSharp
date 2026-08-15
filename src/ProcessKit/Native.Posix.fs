@@ -4862,3 +4862,39 @@ module internal Posix =
                         | Ok dropping -> spawnDetachedPosixCore dropping |> remapSetprivNotFound command
                 else
                     spawnDetachedPosixCore command
+
+    // ----------------------------------------------------------------------------------
+    // Capability probes — read-only, no spawn, no side effects
+    // ----------------------------------------------------------------------------------
+    //
+    // The seam `ContainmentCapabilities` (ProcessGroup.Capabilities) reads to answer what this host can do
+    // BEFORE anything is started. Each one exposes the very resolution the corresponding spawn path
+    // already performs above, rather than a second opinion about the same question — so a reported
+    // capability cannot drift from what a real spawn would do here. None of them spawns, opens, or writes
+    // anything, and none reads an argv or environment value.
+    //
+    // Every probe answers for the MOMENT it is called and nothing is cached: a helper can be installed or
+    // removed at any time, so its verdict is evidence about now, never a guarantee about a later spawn —
+    // exactly the reason the spawn paths keep resolving it themselves instead of trusting a snapshot.
+
+    /// Whether the `setpriv` privilege-drop / `--pdeathsig` helper resolves in a trusted system directory
+    /// (never `PATH`, so a copy found only there is honestly reported missing — the spawn refuses it too).
+    let privilegeDropHelperAvailable () : bool =
+        (trustedHelperPath setprivHelper).IsSome
+
+    /// Whether the `setsid` controlling-terminal helper resolves in a trusted system directory. This is the
+    /// helper's presence alone; `ptyHostSupport` is the full `Command.Pty` gate.
+    let controllingTerminalHelperAvailable () : bool = (trustedHelperPath cttyHelper).IsSome
+
+    /// Whether `/bin/sh` is present and directly executable — the interpreter the cgroup v2 self-migrating
+    /// launcher, the `CpuTimeMax` (`RLIMIT_CPU`) shim, and the `KillOnParentDeath` pre-arm guard all `exec`
+    /// by absolute path.
+    let systemShellAvailable () : bool = (parentDeathGuardShell ()).IsSome
+
+    /// The trusted directories the security helpers are searched in, as an error message spells them — so a
+    /// reported precondition names the list that was really searched (test seam included).
+    let trustedHelperDirectoriesInUseText () : string = trustedHelperDirectoriesText ()
+
+    /// The typed refusal a `Command.Pty` spawn would give on this host up front, or `None` when it can
+    /// honour a PTY. This IS the spawn's own dispatch gate (`ptyHostUnsupported`), not a copy of it.
+    let ptyHostSupport () : ProcessError option = ptyHostUnsupported ()

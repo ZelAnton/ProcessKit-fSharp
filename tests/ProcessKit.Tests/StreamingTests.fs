@@ -1075,6 +1075,71 @@ type StreamingTests() =
         }
         :> Task
 
+    // --- T-364: the same latch/gate pair, exercised directly in the module that now owns it ---------
+
+    [<Test>]
+    member _.``the claim gate refuses a line enumerator a terminal discard latched between its two acquisitions``() =
+        // `StdoutLinesAsync` takes the claim lock TWICE — once to claim (or rejoin) the stdout session,
+        // once to hand out its ONE enumerator — and a terminal `FinishAsync` can land in between, see no
+        // enumerator handed out, and latch the retain-nothing sink. Driving `ConsumptionGate` directly is
+        // what makes that interleaving deterministic; through the public verbs it is a race window, so
+        // the sibling tests above can only cover the sequential shape of the same invariant (KB K-163).
+        let gate = ConsumptionGate(None, [])
+        let mutable sessionsStarted = 0
+        let startSession () = sessionsStarted <- sessionsStarted + 1
+
+        // 1. The streaming caller passes the gate — `StdoutLinesAsync`'s FIRST acquisition.
+        let claimed = gate.TryClaimStdoutStreaming(false, startSession)
+        Assert.That(claimed, Is.True)
+        Assert.That(sessionsStarted, Is.EqualTo 1, "the session is built once, under the claiming lock")
+        Assert.That(gate.DiscardingStdoutStream, Is.False)
+
+        // 2. A terminal `FinishAsync` rejoins that same session with no enumerator handed out yet, so it
+        //    latches the discard — and closes the paired claim gate with it, under that one lock.
+        let terminalClaim = gate.TryClaimStdoutStreaming(true, startSession)
+        Assert.That(terminalClaim, Is.True)
+        Assert.That(sessionsStarted, Is.EqualTo 1, "rejoining an existing session must not build a second")
+        Assert.That(gate.DiscardingStdoutStream, Is.True)
+
+        // 3. The streaming caller now reaches its SECOND acquisition. Nothing fills that channel any
+        //    more, so the enumerator must be refused rather than handed out to run dry.
+        Assert.That(
+            gate.TryTakeStdoutLinesEnumerator(),
+            Is.False,
+            "a latched discard must close the enumerator claim in the second acquisition too"
+        )
+
+        // Every later non-terminal stdout-line caller (`StdoutLinesAsync`, `WaitForLineAsync`) is refused
+        // at the gate itself, while the terminal hand-off stays the idempotent one it is for a streamed
+        // session.
+        let lateStreamer = gate.TryClaimStdoutStreaming(false, startSession)
+        Assert.That(lateStreamer, Is.False)
+        let repeatTerminal = gate.TryClaimStdoutStreaming(true, startSession)
+        Assert.That(repeatTerminal, Is.True)
+        Assert.That(sessionsStarted, Is.EqualTo 1)
+
+    [<Test>]
+    member _.``the claim gate keeps queueing for a line enumerator that was handed out before the terminal verb``() =
+        // The contrapositive of the test above, and the reason the latch is conditional: a stream that
+        // WAS handed out has an owner, so the terminal hand-off must keep every line queued for it.
+        let gate = ConsumptionGate(None, [])
+        let startSession () = ()
+
+        let claimed = gate.TryClaimStdoutStreaming(false, startSession)
+        Assert.That(claimed, Is.True)
+        Assert.That(gate.TryTakeStdoutLinesEnumerator(), Is.True)
+
+        let terminalClaim = gate.TryClaimStdoutStreaming(true, startSession)
+        Assert.That(terminalClaim, Is.True)
+
+        Assert.That(
+            gate.DiscardingStdoutStream,
+            Is.False,
+            "a stream with an owner keeps queueing through the terminal hand-off"
+        )
+
+        Assert.That(gate.TryTakeStdoutLinesEnumerator(), Is.False, "the one enumerator is handed out once")
+
     [<Test>]
     member _.``ExitTask releases an unread bounded event stream and preserves the exit outcome``() : Task =
         task {
