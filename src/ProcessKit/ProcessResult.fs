@@ -22,7 +22,7 @@ type ProcessResult<'T>
         okCodes: int list,
         ?configuredTimeoutDuration: TimeSpan,
         ?stdoutEncoding: Encoding,
-        ?overflowTotals: int * int,
+        ?overflowTotals: int option * int option,
         ?outputDrainBounded: bool
     ) =
 
@@ -62,14 +62,14 @@ type ProcessResult<'T>
     /// The cumulative line/byte totals this run's captures SAW — retained plus dropped — carried
     /// internally so a verb that refuses a truncated capture (`ProcessResult.rejectIfTruncated`, behind
     /// `run`/`parse`/JSON) can report the real volume in its `ProcessError.OutputTooLarge` instead of a
-    /// fabricated one. `None` where the producer counted nothing (a replayed cassette, a test double);
-    /// a `0` inside a `Some` means that unit was not counted for this capture (a raw byte capture has no
-    /// lines, and the line pump skips its UTF-8 byte scan unless a byte cap or the fail-loud ceiling is
-    /// configured) — the same "not reported" convention `ProcessError.OutputTooLarge` documents. Kept
+    /// fabricated one. Each dimension has its own availability: `None` means that unit was not counted
+    /// (a raw pipeline capture has no line structure, while a line pump skips its UTF-8 byte scan unless
+    /// a byte cap or the fail-loud ceiling is configured); `Some 0` is an actual measured zero. Kept
     /// internal deliberately: the public signal that output was lost is `Truncated` plus the typed
-    /// error, and a public total would force every producer that cannot count (test doubles, replay) to
+    /// error, and public totals would force every producer that cannot count (test doubles, replay) to
     /// publish a zero that reads like a measurement.
-    member internal _.OverflowTotals: (int * int) option = overflowTotals
+    member internal _.OverflowTotals: int option * int option =
+        defaultArg overflowTotals (None, None)
 
     /// Why this capture is incomplete, for the ONE consumer that has to tell the two sources apart:
     /// `true` when the bounded post-exit output drain cut the tail short (something that inherited the
@@ -207,9 +207,17 @@ module ProcessResult =
         elif result.OutputDrainBounded then
             Error(ProcessError.OutputIncomplete result.Program)
         else
-            let totalLines, totalBytes = result.OverflowTotals |> Option.defaultValue (0, 0)
+            let totalLines, totalBytes = result.OverflowTotals
 
-            Error(ProcessError.OutputTooLarge(result.Program, lineLimit, byteLimit, totalLines, totalBytes))
+            Error(
+                ProcessError.OutputTooLarge(
+                    result.Program,
+                    lineLimit,
+                    byteLimit,
+                    Option.defaultValue 0 totalLines,
+                    Option.defaultValue 0 totalBytes
+                )
+            )
 
     // Test factories: build a `ProcessResult<'T>` directly (no real process), to unit-test code that
     // consumes one. Generic over the captured-stdout type, so C# infers it (`ProcessResult.Success("x")`,

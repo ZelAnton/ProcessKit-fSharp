@@ -98,7 +98,7 @@ type ReportJsonTests() =
                 TimeSpan.FromSeconds 1.5,
                 false,
                 [ 0; 3 ],
-                overflowTotals = (0, 0)
+                overflowTotals = (Some 0, Some 0)
             )
 
         let json = result.ToReportJson()
@@ -136,6 +136,25 @@ type ReportJsonTests() =
         Assert.That(root.GetProperty("total_bytes").ValueKind, Is.EqualTo JsonValueKind.Null)
 
     [<Test>]
+    member _.``ProcessResult reports availability independently for each overflow total``() =
+        let result =
+            ProcessResult<string>(
+                "tool",
+                "out",
+                "err",
+                Outcome.Exited 0,
+                TimeSpan.Zero,
+                false,
+                [ 0 ],
+                overflowTotals = (Some 0, None)
+            )
+
+        use doc = JsonDocument.Parse(result.ToReportJson())
+        let root = doc.RootElement
+        Assert.That(root.GetProperty("total_lines").GetInt32(), Is.EqualTo 0)
+        Assert.That(root.GetProperty("total_bytes").ValueKind, Is.EqualTo JsonValueKind.Null)
+
+    [<Test>]
     member _.``a timed-out run reports no exit code and no success``() =
         let result =
             ProcessResult<string>("tool", "", "", Outcome.TimedOut, TimeSpan.FromMilliseconds 500.0, false, [ 0 ])
@@ -156,7 +175,7 @@ type ReportJsonTests() =
                 TimeSpan.FromMilliseconds 250.0,
                 true,
                 [ 0 ],
-                overflowTotals = (12, 2048)
+                overflowTotals = (Some 12, Some 2048)
             )
 
         let json = bytes.ToReportJson()

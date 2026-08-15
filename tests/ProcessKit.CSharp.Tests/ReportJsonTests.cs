@@ -1,5 +1,6 @@
 using System;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using NUnit.Framework;
 using ProcessKit;
 
@@ -51,8 +52,22 @@ public class ReportJsonTests
     [Test]
     public void ReportJson_deserialization_is_refused_by_every_converter()
     {
-        Assert.Throws<NotSupportedException>(() =>
-            JsonSerializer.Deserialize("""{"kind":"exited","code":0,"signal_number":null}""", ReportJson.OutcomeTypeInfo)
-        );
+        AssertWriteOnly(ReportJson.OutcomeTypeInfo);
+        AssertWriteOnly(ReportJson.ProcessResultStringTypeInfo);
+        AssertWriteOnly(ReportJson.ProcessResultBytesTypeInfo);
+        AssertWriteOnly(ReportJson.ProcessGroupStatsTypeInfo);
+        AssertWriteOnly(ReportJson.RunProfileTypeInfo);
+        AssertWriteOnly(ReportJson.MemberInfoTypeInfo);
+    }
+
+    [Test]
+    public void Outcome_ToReportJson_rejects_null()
+    {
+        Assert.Throws<ArgumentNullException>(() => ((Outcome)null!).ToReportJson());
+    }
+
+    private static void AssertWriteOnly<T>(JsonTypeInfo<T> typeInfo)
+    {
+        Assert.Throws<NotSupportedException>(() => JsonSerializer.Deserialize("null", typeInfo));
     }
 }

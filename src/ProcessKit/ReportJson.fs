@@ -78,6 +78,8 @@ module internal ReportJsonWrite =
 type internal OutcomeJsonConverter() =
     inherit JsonConverter<Outcome>()
 
+    override _.HandleNull = true
+
     override _.Read(_reader, _typeToConvert, _options) : Outcome =
         raise (
             NotSupportedException
@@ -96,6 +98,8 @@ type internal OutcomeJsonConverter() =
 [<Sealed>]
 type internal ProcessResultJsonConverter<'T>() =
     inherit JsonConverter<ProcessResult<'T>>()
+
+    override _.HandleNull = true
 
     override _.Read(_reader, _typeToConvert, _options) : ProcessResult<'T> =
         raise (
@@ -120,15 +124,15 @@ type internal ProcessResultJsonConverter<'T>() =
         writer.WriteNumber("duration_secs", value.Duration.TotalSeconds)
         writer.WriteBoolean("truncated", value.Truncated)
 
-        match value.OverflowTotals with
-        | Some(totalLines, totalBytes) ->
-            writer.WriteNumber("total_lines", totalLines)
-            writer.WriteNumber("total_bytes", totalBytes)
-        | None ->
-            // Not counted for this producer (a replayed cassette, a third-party runner) — the same
-            // "not reported" convention `ProcessError.OutputTooLarge` documents, never a fabricated 0.
-            writer.WriteNull "total_lines"
-            writer.WriteNull "total_bytes"
+        let totalLines, totalBytes = value.OverflowTotals
+
+        match totalLines with
+        | Some measured -> writer.WriteNumber("total_lines", measured)
+        | None -> writer.WriteNull "total_lines"
+
+        match totalBytes with
+        | Some measured -> writer.WriteNumber("total_bytes", measured)
+        | None -> writer.WriteNull "total_bytes"
 
         writer.WriteEndObject()
 
@@ -138,6 +142,8 @@ type internal ProcessResultJsonConverter<'T>() =
 [<Sealed>]
 type internal ProcessGroupStatsJsonConverter() =
     inherit JsonConverter<ProcessGroupStats>()
+
+    override _.HandleNull = true
 
     override _.Read(_reader, _typeToConvert, _options) : ProcessGroupStats =
         raise (
@@ -164,6 +170,8 @@ type internal ProcessGroupStatsJsonConverter() =
 [<Sealed>]
 type internal RunProfileJsonConverter() =
     inherit JsonConverter<RunProfile>()
+
+    override _.HandleNull = true
 
     override _.Read(_reader, _typeToConvert, _options) : RunProfile =
         raise (
@@ -194,6 +202,8 @@ type internal RunProfileJsonConverter() =
 [<Sealed>]
 type internal MemberInfoJsonConverter() =
     inherit JsonConverter<MemberInfo>()
+
+    override _.HandleNull = true
 
     override _.Read(_reader, _typeToConvert, _options) : MemberInfo =
         raise (
@@ -297,6 +307,7 @@ type ReportJsonExtensions =
     /// This outcome as one JSONL report line (`ReportJson.OutcomeTypeInfo`).
     [<Extension>]
     static member ToReportJson(outcome: Outcome) : string =
+        ArgumentNullException.ThrowIfNull outcome
         JsonSerializer.Serialize(outcome, ReportJson.OutcomeTypeInfo)
 
     /// This result as one JSONL report line (`ReportJson.ProcessResultStringTypeInfo`) — never the

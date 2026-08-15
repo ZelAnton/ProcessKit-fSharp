@@ -36,10 +36,10 @@ platform or the run could not report it. Time is always a number of **fractional
 | `member_info` | `MemberInfo` | `pid`, `ppid`, `exe_name`, `start_time` (ISO-8601) |
 
 An embedded `Outcome` (inside `process_result` / `run_profile`) is the same tagged object as the top-level
-one, under the `outcome` key. A `process_result` line's `total_lines`/`total_bytes` are `null` for a
-producer that never counted them (a replayed cassette, a third-party runner) — the same "not reported"
-convention `ProcessError.OutputTooLarge` uses — and `success` is the run's own `Command.OkCodes` verdict,
-so a consumer never has to re-derive it from `outcome`/`ok_codes` itself.
+one, under the `outcome` key. Each of a `process_result` line's `total_lines` and `total_bytes` fields is
+independently `null` when that dimension was not counted (for example, raw pipeline captures count bytes
+but not lines); a measured zero remains `0`. `success` is the run's own `Command.OkCodes` verdict, so a
+consumer never has to re-derive it from `outcome`/`ok_codes` itself.
 
 Example: a run whose exit code `3` is in its own accepted-code set, as one line —
 

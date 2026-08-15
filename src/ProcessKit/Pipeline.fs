@@ -311,10 +311,10 @@ module internal PipelineTotals =
     /// The captured totals for a result built from `capture` with `stage` as the pipefail representative:
     /// the last stage's captured stdout bytes plus that representative's stderr bytes, saturating at
     /// `Int32.MaxValue` like the buffers' own counters. Both captures are raw byte streams with no line
-    /// structure, so no line total is counted — reported as `0`, which `ProcessError.OutputTooLarge`
-    /// renders as "not reported" rather than as a measured zero.
-    let forResult (capture: PipelineCapture) (stage: PipelineStage) : int * int =
-        (0, int (min (int64 capture.LastStdoutTotalBytes + int64 stage.StderrTotalBytes) (int64 Int32.MaxValue)))
+    /// structure, so the line total is unavailable while the byte total is measured independently.
+    let forResult (capture: PipelineCapture) (stage: PipelineStage) : int option * int option =
+        (None,
+         Some(int (min (int64 capture.LastStdoutTotalBytes + int64 stage.StderrTotalBytes) (int64 Int32.MaxValue))))
 
 /// An immutable left-to-right chain of commands wired stdout -> stdin, with **no shell** involved:
 /// each stage's standard output feeds the next stage's standard input directly. The whole chain

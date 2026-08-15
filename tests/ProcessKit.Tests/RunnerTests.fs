@@ -224,7 +224,7 @@ module internal BoundedCapture =
                             TimeSpan.Zero,
                             true,
                             [ 0 ],
-                            overflowTotals = (totalLines, 0),
+                            overflowTotals = (Some totalLines, None),
                             outputDrainBounded = true
                         )
                     )
