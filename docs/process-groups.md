@@ -132,6 +132,43 @@ Because the mechanism is reported rather than assumed, a weaker backend is never
 a silent downgrade — you can branch on `Mechanism` if a capability matters. The
 full per-OS matrix lives in [platform-support.md](platform-support.md).
 
+### Asking before you create one
+
+`group.Mechanism` answers only once a group exists. To pick a portable policy
+*before* the first spawn, `ProcessGroup.Capabilities()` (or
+`Capabilities(options)`) returns a `ContainmentCapabilities` snapshot: the
+mechanism `Create` would select for those options, plus, per axis — resource
+limits, signals, adoption, PTY and its resize, kill-on-parent-death, and the
+platform helper binaries — either a real availability or a typed
+`Capability.Unsupported` naming the precondition that is missing:
+
+**F#**
+
+```fsharp
+let capabilities = ProcessGroup.Capabilities()
+
+match capabilities.Adoption with
+| Capability.Available -> printfn "Adopt() can pull an external process in here"
+| Capability.Qualified qualification -> printfn $"Adopt() works, with a caveat: {qualification}"
+| Capability.Unsupported requires -> printfn $"no Adopt() on this host; it needs {requires}"
+```
+
+**C#**
+
+```csharp
+var capabilities = ProcessGroup.Capabilities(options);
+
+if (capabilities.ResourceLimits.MemoryMax is Capability.Unsupported noMemoryCap)
+{
+    Console.WriteLine($"this host cannot cap the tree's memory; it needs {noMemoryCap.Requires}");
+}
+```
+
+It creates nothing — no process, no group, no container — and reads neither argv
+nor environment. See
+[Capability snapshot](platform-support.md#capability-snapshot) for what each axis
+answers and what the snapshot does and does not promise.
+
 ## Putting processes in
 
 A `ProcessGroup` **is itself an `IProcessRunner`**, so the same run/capture

@@ -73,6 +73,7 @@
 		<Compile Include="Native.Windows.fs" />
 		<Compile Include="Native.Posix.fs" />
 		<Compile Include="Native.Cgroup.fs" />
+		<Compile Include="Capabilities.fs" />
 		<Compile Include="ConsoleEncoding.fs" />
 		<Compile Include="Backend.fs" />
 		<Compile Include="Pump.fs" />

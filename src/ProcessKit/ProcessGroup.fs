@@ -107,85 +107,58 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
         let withBackend (backend: IContainmentBackend) = Ok(new ProcessGroup(backend, options))
 
-        if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
-            if limits.OomGroupKill then
-                Error(
-                    ProcessError.Unsupported
-                        "whole-tree OOM kill is a Linux cgroup v2 memory.oom.group policy; Windows Job Objects have no equivalent"
-                )
-            elif options.StopSignal <> Signal.Term then
-                Error(
-                    ProcessError.Unsupported
-                        $"ProcessGroupOptions.StopSignal({options.StopSignal}) on Windows; only the default Signal.Term contract maps to the existing WM_CLOSE/CTRL+BREAK graceful path"
-                )
-            else
-                match Native.Windows.createWindowsJob () with
-                | Error error -> Error error
-                | Ok job ->
-                    if limits.Any then
-                        match Native.Windows.applyWindowsJobLimits job limits with
-                        | Ok() -> withBackend (JobObjectBackend(job, limits))
-                        | Error message ->
-                            Native.Windows.closeWindowsHandle job
+        // WHICH mechanism these options select here — and the typed refusal when they cannot be honoured
+        // at all — is decided by `MechanismSelection`, the one place that owns that decision. It is shared
+        // with `ProcessGroup.Capabilities` so a snapshot can never predict a mechanism this call would not
+        // actually pick, or call a refusal survivable. Everything BELOW the decision stays here: creating
+        // the native container is exactly the part that has side effects and its own failures, which is
+        // why a capability probe cannot run it.
+        match MechanismSelection.choose options with
+        | MechanismChoice.Refused error -> Error error
+        | MechanismChoice.Selected Mechanism.JobObject ->
+            match Native.Windows.createWindowsJob () with
+            | Error error -> Error error
+            | Ok job ->
+                if limits.Any then
+                    match Native.Windows.applyWindowsJobLimits job limits with
+                    | Ok() -> withBackend (JobObjectBackend(job, limits))
+                    | Error message ->
+                        Native.Windows.closeWindowsHandle job
 
-                            if limits.IoMax.IsSome && Native.Windows.isIoRateControlUnsupported message then
-                                Error(ProcessError.Unsupported message)
-                            else
-                                Error(ProcessError.ResourceLimit message)
-                    else
-                        withBackend (JobObjectBackend(job, limits))
-        else
-            // Job Object UI restrictions are refused before any other off-Windows dispatch: unlike the
-            // resource caps — which a cgroup v2 hierarchy CAN enforce, and whose absence is therefore a
-            // `ResourceLimit` — a clipboard/desktop/exit-Windows restriction has no analogue in any POSIX
-            // primitive at all, so `Unsupported` is the honest classification. Never a group that silently
-            // runs its tree unrestricted.
-            match limits.UiRestrictionsUnsupported with
-            | Some error -> Error error
-            | None when limits.IoMax.IsSome && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux) ->
-                Error(
-                    ProcessError.Unsupported
-                        "whole-tree disk I/O rate limits require Linux cgroup v2 io.max or a Windows Job Object I/O rate controller"
-                )
-            | None when limits.OomGroupKill && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux) ->
-                Error(
-                    ProcessError.Unsupported
-                        "whole-tree OOM kill is a Linux cgroup v2 memory.oom.group policy; this platform has no equivalent"
-                )
-            | None ->
-                if RuntimeInformation.IsOSPlatform OSPlatform.Linux && limits.WholeTreeAny then
-                    if
-                        Native.Cgroup.cgroupV2Available ()
-                        && limits.IoMax.IsSome
-                        && not (Native.Cgroup.cgroupIoAvailable ())
-                    then
-                        Error(
-                            ProcessError.Unsupported
-                                "the Linux cgroup v2 hierarchy does not expose the io controller required by io.max"
-                        )
-                    elif Native.Cgroup.cgroupV2Available () then
-                        match Native.Cgroup.createCgroup limits with
-                        | Ok path -> withBackend (CgroupBackend(path, limits))
-                        | Error message -> Error(ProcessError.ResourceLimit message)
-                    elif limits.OomGroupKill then
-                        Error(
-                            ProcessError.Unsupported
-                                "whole-tree OOM kill requires an available Linux cgroup v2 memory.oom.group mechanism"
-                        )
-                    else
-                        Error(
-                            ProcessError.ResourceLimit
-                                "cgroup v2 is not mounted; whole-tree resource limits need a Windows Job Object or Linux cgroup v2"
-                        )
-                elif limits.WholeTreeAny then
-                    // macOS / BSD, or Linux without cgroup v2 — no whole-tree limit primitive.
-                    Error(
-                        ProcessError.ResourceLimit
-                            "this platform has no whole-tree resource-limit primitive (needs a Windows Job Object or Linux cgroup v2)"
-                    )
+                        if limits.IoMax.IsSome && Native.Windows.isIoRateControlUnsupported message then
+                            Error(ProcessError.Unsupported message)
+                        else
+                            Error(ProcessError.ResourceLimit message)
                 else
-                    // No limits: the POSIX group forms when children are spawned (each becomes its own pgid).
-                    withBackend (ProcessGroupBackend limits)
+                    withBackend (JobObjectBackend(job, limits))
+        | MechanismChoice.Selected Mechanism.CgroupV2 ->
+            match Native.Cgroup.createCgroup limits with
+            | Ok path -> withBackend (CgroupBackend(path, limits))
+            | Error message -> Error(ProcessError.ResourceLimit message)
+        | MechanismChoice.Selected Mechanism.ProcessGroup ->
+            // No whole-tree limits: the POSIX group forms when children are spawned (each becomes its own
+            // pgid). A CPU-time-only cap rides along per child through `RLIMIT_CPU`.
+            withBackend (ProcessGroupBackend limits)
+
+    /// What process containment can actually do on **this** host, for the default options — a
+    /// side-effect-free snapshot taken WITHOUT creating a group or spawning anything. See the
+    /// `ProcessGroupOptions` overload.
+    static member Capabilities() : ContainmentCapabilities =
+        ProcessGroup.Capabilities(ProcessGroupOptions())
+
+    /// What process containment can actually do on **this** host for `options` — the mechanism
+    /// `Create(options)` would select, and, per axis, either a real availability or a typed
+    /// `Capability.Unsupported` naming the precondition that is missing. Taken WITHOUT creating a group,
+    /// spawning a process, or touching any container, so a long-lived orchestrator can choose a portable
+    /// policy *before* the first spawn instead of creating a group and probing each operation.
+    ///
+    /// The mechanism it reports comes from the very decision `Create` dispatches on, and each capability
+    /// from the very probe the corresponding spawn path consults, so the snapshot cannot drift from what
+    /// the real calls do. It is a point-in-time report and deliberately not cached — see
+    /// `ContainmentCapabilities` for what that does and does not promise.
+    static member Capabilities(options: ProcessGroupOptions) : ContainmentCapabilities =
+        ArgumentNullException.ThrowIfNull options
+        CapabilityProbe.current options
 
     /// Test-only seam: wrap an arbitrary containment backend so the lifecycle guard (spawn / control /
     /// stat versus release) can be exercised against a synthetic backend, with no real OS handles.
