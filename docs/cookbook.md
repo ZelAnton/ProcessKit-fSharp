@@ -820,6 +820,72 @@ var commands = files.Select(f => new Command("gzip").Arg(f));
 var results = await Exec.outputAllWithPolicy(4, runner, commands, BatchPolicy.FailFast, CancellationToken.None);
 ```
 
+### Each result as it lands
+
+`Exec.outputStream` / `Exec.outputStreamBytes` run that same bounded fan-out but hand back an
+`IAsyncEnumerable` of `BatchItem`s in **completion order**, so a fast command never waits behind a
+slow sibling. Each item carries its command's `Index` — its position in `commands`, which is how a
+result stays traceable once arrival order stops matching input order — and that command's own
+`Result`, with the same meaning as one element of `outputAll` (an `Error` is a genuine run failure; a
+non-zero exit is `Ok` data). Nothing starts until you begin enumerating.
+
+**F#**
+
+```fsharp
+task {
+    let runner = JobRunner() :> IProcessRunner
+    let commands = files |> List.map (fun f -> Command.create "gzip" |> Command.arg f)
+    use e = (Exec.outputStream 4 runner commands CancellationToken.None).GetAsyncEnumerator()
+    let mutable go = true
+
+    while go do
+        match! e.MoveNextAsync() with
+        | true ->
+            let item = e.Current
+
+            match item.Result with
+            | Ok result -> printfn $"#{item.Index} exited {result.Code}"
+            | Error err -> printfn $"#{item.Index} failed: {err.Message}"
+        | false -> go <- false
+}
+```
+
+**C#**
+
+```csharp
+var runner = new JobRunner();
+var commands = files.Select(f => new Command("gzip").Arg(f));
+
+await foreach (var item in Exec.outputStream(4, runner, commands, CancellationToken.None))
+{
+    if (item.Result.IsOk)
+        Console.WriteLine($"#{item.Index} exited {item.Result.ResultValue.Code}");
+    else
+        Console.WriteLine($"#{item.Index} failed: {item.Result.ErrorValue.Message}");
+}
+```
+
+Three contract details worth knowing before you reach for it:
+
+- **Cancellation is data, not an exception.** The batch's `CancellationToken` — and the one a consumer
+  passes to `WithCancellation` / `GetAsyncEnumerator`, which is honoured identically — cancels every
+  in-flight capture and stops any command still waiting for a concurrency slot from ever starting, but
+  it does *not* truncate the stream: every command still yields exactly one item, and one that never
+  started yields `ProcessError.Cancelled`. Enumerate to the end to collect them. Items already handed
+  over are yours, unlike `outputAll`'s array, which materializes only once the whole batch is done.
+- **Abandoning the stream is the teardown.** Breaking out of the loop disposes the enumerator, which
+  cancels the in-flight captures (with a `JobRunner`, that kills each live process tree) and leaves
+  every still-queued command unstarted. Disposal waits for that teardown rather than detaching it.
+- **No `BatchPolicy` on the streaming verbs.** They never short-circuit, and there is no `policy`
+  parameter to pass rather than one quietly ignored — a consumer that wants to stop on the first
+  failure just stops enumerating, and the bullet above does the rest. For the fail-fast contract *with*
+  an input-ordered array, use `outputAllWithPolicy` / `outputAllBytesWithPolicy`.
+
+The hand-off is bounded at the same `concurrency` cap, and a finished command frees its slot only once
+its item has been taken, so a slow consumer throttles the fan-out — once the buffer and the live
+commands are full, nothing further starts — instead of letting it run the whole batch ahead into
+memory.
+
 ## Preflight: is a program installed?
 
 `Exec.which` resolves a program to a full path without running it — a `doctor` check for an

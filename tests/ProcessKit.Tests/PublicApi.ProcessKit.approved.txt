@@ -1,3 +1,7 @@
+class ProcessKit.BatchItem`1
+  property Index : System.Int32 { get }
+  property Result : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<T>, ProcessKit.ProcessError> { get }
+
 class ProcessKit.BatchPolicy
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.BatchPolicy>
@@ -278,6 +282,8 @@ module ProcessKit.Exec
   static member outputAllBytesWithPolicy(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, ProcessKit.BatchPolicy, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>[]>
   static member outputAllWithPolicy(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, ProcessKit.BatchPolicy, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>[]>
   static member outputBytes(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>
+  static member outputStream(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, System.Threading.CancellationToken) : System.Collections.Generic.IAsyncEnumerable<ProcessKit.BatchItem<System.String>>
+  static member outputStreamBytes(System.Int32, ProcessKit.IProcessRunner, System.Collections.Generic.IEnumerable<ProcessKit.Command>, System.Threading.CancellationToken) : System.Collections.Generic.IAsyncEnumerable<ProcessKit.BatchItem<System.Byte[]>>
   static member outputString(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.String>, ProcessKit.ProcessError>>
   static member run(System.String, System.Collections.Generic.IEnumerable<System.String>) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
   static member which(System.String) : Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>
