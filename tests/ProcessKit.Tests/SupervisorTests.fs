@@ -171,6 +171,31 @@ module private SessionTestHelpers =
         : RunningProcess =
         buildRunningProcessWithStdout command pid (new MemoryStream()) wait graceful startKill
 
+    /// Drain a supervision event stream to its end, in order. The stream closes when supervision ends,
+    /// so this returns exactly the events that session published — no polling, no timing assumption.
+    let drainEvents (events: IAsyncEnumerable<SupervisionEvent>) : Task<SupervisionEvent list> =
+        task {
+            let collected = ResizeArray<SupervisionEvent>()
+            let enumerator = events.GetAsyncEnumerator CancellationToken.None
+            let mutable moving = true
+
+            while moving do
+                let! moved = enumerator.MoveNextAsync()
+
+                if moved then
+                    collected.Add enumerator.Current
+                else
+                    moving <- false
+
+            do! enumerator.DisposeAsync()
+            return List.ofSeq collected
+        }
+
+    /// The stable machine identifiers of a drained event sequence — what an assertion failure should
+    /// read as ("restart_scheduled" beats a bare enum ordinal).
+    let eventNames (events: SupervisionEvent list) =
+        events |> List.map (fun event -> event.Name)
+
     /// Poll `predicate` until it holds or a generous deadline elapses, failing the test loudly on a
     /// timeout so a wedged supervision loop surfaces as a clear assertion rather than a hung test.
     let waitUntil (description: string) (predicate: unit -> bool) : Task =
@@ -2747,3 +2772,495 @@ type SupervisorTests() =
         let policy = Supervision.defaultCapture explicit
         Assert.That(policy.MaxLines, Is.EqualTo(Some 50)) // explicit cap respected
         Assert.That(policy.Overflow, Is.EqualTo OverflowMode.Error)
+
+    // ----- live event stream (Supervisor.Events / SupervisionSession.EventsAsync) -----
+
+    [<Test>]
+    member _.``the event stream reports a spawn-capable runner's whole lifecycle in order``() : Task =
+        task {
+            let runner = CrashLoopRunner()
+
+            let supervisor =
+                Supervisor(Command.create "worker")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .MaxRestarts(1)
+                    .Events(64)
+
+            let! session = supervisor.StartAsync()
+
+            // The stream closes when supervision ends, so draining it IS the synchronization — there is
+            // nothing to poll and no delay to wait out.
+            let! events = drainEvents (session.EventsAsync())
+            let! outcome = session.Completion
+
+            Assert.That(
+                eventNames events,
+                Is.EqualTo<string list>(
+                    [ "incarnation_started"
+                      "incarnation_finished"
+                      "restart_scheduled"
+                      "incarnation_started"
+                      "incarnation_finished"
+                      "stopped" ]
+                )
+            )
+
+            Assert.That(events |> List.forall (fun event -> event.Program = "worker"))
+
+            let started = events[0]
+            Assert.That(started.Kind, Is.EqualTo SupervisionEventKind.IncarnationStarted)
+            Assert.That(started.Attempt, Is.EqualTo(Some 1))
+            Assert.That(started.Pid, Is.EqualTo(Some 999), "a live handle publishes the child's pid")
+
+            let finished = events[1]
+            Assert.That(finished.Attempt, Is.EqualTo(Some 1))
+            Assert.That(finished.Outcome, Is.EqualTo(Some(Outcome.Exited 1)))
+            Assert.That(finished.IsSuccess, Is.EqualTo(Some false))
+            Assert.That(finished.Duration.IsSome)
+
+            let restart = events[2]
+            Assert.That(restart.Restart, Is.EqualTo(Some 1))
+            Assert.That(restart.Delay, Is.EqualTo(Some TimeSpan.Zero))
+            Assert.That(restart.Cause, Is.EqualTo(Some RestartCause.Exit))
+
+            Assert.That(events[3].Attempt, Is.EqualTo(Some 2), "the second incarnation is attempt 2")
+
+            let stopped = events[5]
+            Assert.That(stopped.Kind, Is.EqualTo SupervisionEventKind.Stopped)
+            Assert.That(stopped.Reason, Is.EqualTo(Some StopReason.RestartsExhausted))
+
+            Assert.That(session.DroppedEventCount, Is.Zero, "a drained stream drops nothing")
+
+            match outcome with
+            | Ok result -> Assert.That(result.Stopped, Is.EqualTo StopReason.RestartsExhausted)
+            | Error error -> Assert.Fail $"expected Ok, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a capture-only runner publishes the same lifecycle, with no pid``() : Task =
+        task {
+            // A capture-only double (its `SpawnAsync` raises the `NotSupportedException` capability
+            // marker) has no live handle: the transitions must still be reported, on the same terms.
+            let supervisor = supervise([ failWith 1; failWith 1 ]).MaxRestarts(1).Events(64)
+
+            let! session = supervisor.StartAsync()
+            let! events = drainEvents (session.EventsAsync())
+
+            Assert.That(
+                eventNames events,
+                Is.EqualTo<string list>(
+                    [ "incarnation_started"
+                      "incarnation_finished"
+                      "restart_scheduled"
+                      "incarnation_started"
+                      "incarnation_finished"
+                      "stopped" ]
+                )
+            )
+
+            Assert.That(
+                events
+                |> List.filter (fun event -> event.Kind = SupervisionEventKind.IncarnationStarted)
+                |> List.forall (fun event -> event.Pid.IsNone),
+                Is.True,
+                "a runner with no live handle reports no pid"
+            )
+
+            Assert.That(events[1].Outcome, Is.EqualTo(Some(Outcome.Exited 1)))
+            Assert.That(events[5].Reason, Is.EqualTo(Some StopReason.RestartsExhausted))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a ScriptedRunner double publishes the same lifecycle as a real runner``() : Task =
+        task {
+            // The shipped test double consumers actually use (ProcessKit.Testing) drives incarnations
+            // through the spawn path, so its stream must match the real runner's shape event for event.
+            let runner = ScriptedRunner().Fallback(Reply.Fail(1, "boom"))
+
+            let supervisor =
+                Supervisor(Command.create "scripted")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .MaxRestarts(1)
+                    .Events(64)
+
+            let! session = supervisor.StartAsync()
+            let! events = drainEvents (session.EventsAsync())
+
+            Assert.That(
+                eventNames events,
+                Is.EqualTo<string list>(
+                    [ "incarnation_started"
+                      "incarnation_finished"
+                      "restart_scheduled"
+                      "incarnation_started"
+                      "incarnation_finished"
+                      "stopped" ]
+                )
+            )
+
+            Assert.That(events[1].Outcome, Is.EqualTo(Some(Outcome.Exited 1)))
+            Assert.That(events[1].IsSuccess, Is.EqualTo(Some false))
+            Assert.That(events[2].Cause, Is.EqualTo(Some RestartCause.Exit))
+            Assert.That(events[5].Reason, Is.EqualTo(Some StopReason.RestartsExhausted))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a bounded stream drops the oldest events and reports the gap exactly``() : Task =
+        task {
+            // Six events (two incarnations plus the restart and the terminal reason) into a buffer of
+            // two, with nothing reading until supervision has ended: deterministic by construction, no
+            // race between producer and consumer to reason about.
+            let supervisor = supervise([ failWith 1; failWith 1 ]).MaxRestarts(1).Events(2)
+
+            let! session = supervisor.StartAsync()
+            let! _ = session.Completion
+
+            Assert.That(session.DroppedEventCount, Is.EqualTo 4L, "six events emitted, two retained")
+
+            let! events = drainEvents (session.EventsAsync())
+
+            Assert.That(
+                eventNames events,
+                Is.EqualTo<string list>([ "events_dropped"; "incarnation_finished"; "stopped" ]),
+                "the gap marker precedes the oldest event that survived it"
+            )
+
+            Assert.That(events[0].Kind, Is.EqualTo SupervisionEventKind.EventsDropped)
+            Assert.That(events[0].DroppedEvents, Is.EqualTo(Some 4L))
+            Assert.That(events[0].Program, Is.EqualTo "fake")
+
+            Assert.That(events[1].Attempt, Is.EqualTo(Some 2), "drop-OLDEST keeps the newest events")
+            Assert.That(events[2].Reason, Is.EqualTo(Some StopReason.RestartsExhausted))
+
+            Assert.That(session.DroppedEventCount, Is.EqualTo 4L, "the lifetime total survives being reported in band")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a keeping-up consumer receives events while supervision is still running``() : Task =
+        task {
+            let runner = GatedCaptureRunner()
+
+            let supervisor =
+                Supervisor(Command.create "worker")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .Events(64)
+
+            let! session = supervisor.StartAsync()
+            let enumerator = session.EventsAsync().GetAsyncEnumerator CancellationToken.None
+
+            // The gated runner parks its only incarnation until this test releases it, so awaiting the
+            // first event is a synchronization on observable state, not on a delay: it can only resolve
+            // while supervision is still live.
+            let! moved = enumerator.MoveNextAsync()
+
+            Assert.That(moved, Is.True)
+            Assert.That(enumerator.Current.Name, Is.EqualTo "incarnation_started")
+            Assert.That(session.Status.IsActive, Is.True, "the event arrived mid-supervision")
+            Assert.That(session.Completion.IsCompleted, Is.False)
+
+            runner.Release(ok ())
+
+            let! moved = enumerator.MoveNextAsync()
+            Assert.That(moved, Is.True)
+            Assert.That(enumerator.Current.Name, Is.EqualTo "incarnation_finished")
+            Assert.That(enumerator.Current.IsSuccess, Is.EqualTo(Some true))
+
+            let! moved = enumerator.MoveNextAsync()
+            Assert.That(moved, Is.True)
+            Assert.That(enumerator.Current.Name, Is.EqualTo "stopped")
+            Assert.That(enumerator.Current.Reason, Is.EqualTo(Some StopReason.PolicySatisfied))
+
+            let! moved = enumerator.MoveNextAsync()
+            Assert.That(moved, Is.False, "the stream ends when supervision does")
+
+            do! enumerator.DisposeAsync()
+            Assert.That(session.DroppedEventCount, Is.Zero)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``liveness and give-up decisions are published to the stream``() : Task =
+        task {
+            let runner = LivenessChildRunner()
+
+            // Always-unhealthy predicate: after one failed attempt the monitor stops the live child, the
+            // ordinary restart path takes over, and the classifier then declares the crash permanent.
+            let supervisor =
+                Supervisor(Command.create "hung")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .LivenessCheck(Func<Task<bool>>(fun () -> Task.FromResult false), TimeSpan.FromMilliseconds 10.0)
+                    .LivenessFailures(1)
+                    .LivenessTimeout(TimeSpan.FromMilliseconds 40.0)
+                    .LivenessGrace(TimeSpan.FromMilliseconds 50.0)
+                    .GiveUpWhen(fun _ -> true)
+                    .Events(64)
+
+            let! session = supervisor.StartAsync()
+            let! events = drainEvents (session.EventsAsync())
+
+            Assert.That(
+                eventNames events,
+                Is.EqualTo<string list>(
+                    [ "incarnation_started"
+                      "health_check_failed"
+                      "incarnation_finished"
+                      "gave_up"
+                      "stopped" ]
+                )
+            )
+
+            let health = events[1]
+            Assert.That(health.Attempt, Is.EqualTo(Some 1), "the health verdict names its incarnation")
+
+            Assert.That(
+                health.IsTerminal,
+                Is.EqualTo(Some false),
+                "an unhealthy streak is not terminal — the ordinary policy decides what happens next"
+            )
+
+            Assert.That(events[3].Attempt, Is.EqualTo(Some 1), "the give-up names the classified attempt")
+            Assert.That(events[4].Reason, Is.EqualTo(Some StopReason.GaveUp))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a terminal failure is published with its coarse failure class``() : Task =
+        task {
+            // `NotFound` is not transient, so the first incarnation's failure ends supervision.
+            let supervisor = supervise([ notFoundErr () ]).Events(64)
+
+            let! session = supervisor.StartAsync()
+            let! events = drainEvents (session.EventsAsync())
+
+            Assert.That(
+                eventNames events,
+                Is.EqualTo<string list>([ "incarnation_started"; "incarnation_failed"; "supervision_failed" ])
+            )
+
+            Assert.That(events[1].Attempt, Is.EqualTo(Some 1))
+            Assert.That(events[1].FailureKind, Is.EqualTo(Some "not_found"))
+            Assert.That(events[2].FailureKind, Is.EqualTo(Some "not_found"))
+            Assert.That(events[2].Reason, Is.EqualTo None, "a failure has no StopReason to report")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``cancelling the session reports the cancellation and closes the stream``() : Task =
+        task {
+            use cts = new CancellationTokenSource()
+            let runner = PendingCaptureRunner()
+
+            let supervisor =
+                Supervisor(Command.create "worker")
+                    .WithRunner(runner)
+                    .Backoff(TimeSpan.Zero, 1.0)
+                    .Jitter(false)
+                    .Events(64)
+
+            let! session = supervisor.StartAsync cts.Token
+            do! runner.Started
+
+            cts.Cancel()
+
+            // The stream's own end is the session's: cancelling the supervision token closes it after
+            // the terminal event, so draining terminates without any consumer-side timeout.
+            let! events = drainEvents (session.EventsAsync())
+            let! outcome = session.Completion
+
+            Assert.That(
+                eventNames events,
+                Is.EqualTo<string list>([ "incarnation_started"; "incarnation_failed"; "supervision_failed" ])
+            )
+
+            Assert.That(events[1].FailureKind, Is.EqualTo(Some "cancelled"))
+            Assert.That(events[2].FailureKind, Is.EqualTo(Some "cancelled"))
+
+            match outcome with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected a cancelled supervision, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a storm pause is published before the restart it delays``() : Task =
+        task {
+            let clock = FakeClock()
+
+            // Zero backoff -> zero decay: scores 1, 2, 3; the third crash crosses 2.5 and pauses.
+            let supervisor =
+                supervise([ failWith 1; failWith 1; failWith 1; failWith 1 ])
+                    .MaxRestarts(3)
+                    .StormPause(TimeSpan.FromSeconds 30.0)
+                    .FailureThreshold(2.5)
+                    .FailureDecay(TimeSpan.FromSeconds 1000.0)
+                    .Events(64)
+                |> withClock clock
+
+            let! session = supervisor.StartAsync()
+            let! events = drainEvents (session.EventsAsync())
+            let names = eventNames events
+
+            Assert.That(names |> List.filter (fun name -> name = "storm_paused") |> List.length, Is.EqualTo 1)
+
+            let pauseIndex = names |> List.findIndex (fun name -> name = "storm_paused")
+            let pause = events[pauseIndex]
+
+            Assert.That(pause.StormPause, Is.EqualTo(Some 1))
+            Assert.That(pause.Delay, Is.EqualTo(Some(TimeSpan.FromSeconds 30.0)))
+
+            Assert.That(
+                names[pauseIndex + 1],
+                Is.EqualTo "restart_scheduled",
+                "the pause is reported before the restart it delays"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``events carry no captured output, argv, or error detail``() : Task =
+        task {
+            let secret = "SUPER-SECRET-VALUE"
+
+            let leakyResult =
+                Ok(
+                    ProcessResult<string>(
+                        "fake",
+                        $"stdout {secret}",
+                        $"stderr {secret}",
+                        Outcome.Exited 1,
+                        TimeSpan.Zero,
+                        false,
+                        [ 0 ]
+                    )
+                )
+
+            let leakyError = Error(ProcessError.Spawn("fake", $"detail {secret}"))
+
+            let collect (replies: Result<ProcessResult<string>, ProcessError> list) =
+                task {
+                    // `MaxRestarts(0)` ends supervision on the first incarnation either way.
+                    let! session = supervise(replies).MaxRestarts(0).Events(64).StartAsync()
+                    return! drainEvents (session.EventsAsync())
+                }
+
+            let! fromResult = collect [ leakyResult ]
+            let! fromError = collect [ leakyError ]
+            let events = fromResult @ fromError
+
+            Assert.That(events, Is.Not.Empty)
+
+            let rendered =
+                events
+                |> List.collect (fun event ->
+                    event.GetType().GetProperties(BindingFlags.Public ||| BindingFlags.Instance)
+                    |> Array.toList
+                    |> List.map (fun property ->
+                        match property.GetValue event with
+                        | null -> ""
+                        | value -> string value))
+
+            Assert.That(
+                rendered |> List.forall (fun text -> not (text.Contains secret)),
+                Is.True,
+                "no event property may carry captured output or an error's detail text"
+            )
+
+            Assert.That(
+                fromError |> List.exists (fun event -> event.FailureKind = Some "spawn"),
+                Is.True,
+                "the failure is still reported — as its coarse class"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the event stream is additive: callbacks, status, and the outcome are unchanged``() : Task =
+        task {
+            let restarts = ResizeArray<SupervisorRestartEvent>()
+
+            let supervisor =
+                supervise([ failWith 1; ok () ]).OnRestart(fun event -> restarts.Add event).Events(64)
+
+            let! session = supervisor.StartAsync()
+            let! events = drainEvents (session.EventsAsync())
+            let! streamed = session.Completion
+
+            // The same supervision with no stream configured must reach the same outcome.
+            let! plain = supervise([ failWith 1; ok () ]).OnRestart(fun _ -> ()).RunAsync()
+
+            match streamed, plain with
+            | Ok withStream, Ok withoutStream ->
+                Assert.That(withStream.Stopped, Is.EqualTo withoutStream.Stopped)
+                Assert.That(withStream.Restarts, Is.EqualTo withoutStream.Restarts)
+            | _ -> Assert.Fail $"expected both runs to succeed, got {streamed} and {plain}"
+
+            Assert.That(restarts.Count, Is.EqualTo 1, "the OnRestart callback still fires")
+
+            let restartEvent =
+                events
+                |> List.find (fun event -> event.Kind = SupervisionEventKind.RestartScheduled)
+
+            Assert.That(restartEvent.Restart, Is.EqualTo(Some restarts[0].Restart))
+            Assert.That(restartEvent.Delay, Is.EqualTo(Some restarts[0].Delay))
+            Assert.That(restartEvent.Cause, Is.EqualTo(Some restarts[0].Cause))
+            Assert.That(session.Status.IsActive, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a session without the opt-in publishes no stream``() : Task =
+        task {
+            let! session = supervise([ ok () ]).StartAsync()
+            let! _ = session.Completion
+
+            let error =
+                Assert.Throws<InvalidOperationException>(Action(fun () -> session.EventsAsync() |> ignore))
+
+            match error with
+            | null -> Assert.Fail "a session with no configured stream must refuse EventsAsync"
+            | error -> Assert.That(error.Message, Does.Contain "Supervisor.Events")
+
+            Assert.That(session.DroppedEventCount, Is.Zero, "a session with no stream drops nothing")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the event stream has exactly one consumer``() : Task =
+        task {
+            let! session = supervise([ ok () ]).Events(64).StartAsync()
+            let first = session.EventsAsync()
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> session.EventsAsync() |> ignore))
+            |> ignore
+
+            let! events = drainEvents first
+
+            Assert.That(
+                eventNames events |> List.contains "stopped",
+                Is.True,
+                "the first consumer still receives the whole stream"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Events rejects a non-positive capacity``() =
+        let supervisor = Supervisor(Command.create "fake")
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> supervisor.Events 0 |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> supervisor.Events -1 |> ignore))
+        |> ignore

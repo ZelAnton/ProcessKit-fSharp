@@ -571,6 +571,112 @@ one a liveness probe forced, so a health check can alert on a wedged service dis
 ordinary crash. Both callbacks are purely additive — they never change `SupervisionOutcome`'s final
 `Restarts`/`StormPauses`/`Stopped` semantics.
 
+### The event stream
+
+The two callbacks *push* two specific transitions into your code. `Events(capacity)` opts in to the
+whole lifecycle as a *pull*-based stream instead: a live `SupervisionSession` then hands out an
+`IAsyncEnumerable<SupervisionEvent>` from `EventsAsync()`, which you drain concurrently with
+`Completion`/`StopAsync`. It is a third additive view — enabling it changes no restart decision, no
+delay, and no outcome, and the callbacks and `Status` keep working exactly as before.
+
+Enable it on the builder, not on the session: the session has to be retaining events from its very
+first incarnation, which starts as soon as `StartAsync` returns. Without the opt-in a session
+allocates no buffer and builds no event at all, so `RunAsync` pays nothing.
+
+**F#**
+
+```fsharp
+task {
+    let supervisor =
+        (Supervisor.create (Command.create "worker"))
+            .Restart(RestartPolicy.Always)
+            .Events(256) // opt in; keep at most 256 unread events
+
+    let! session = supervisor.StartAsync()
+    let e = session.EventsAsync().GetAsyncEnumerator()
+
+    try
+        let mutable go = true
+
+        while go do
+            match! e.MoveNextAsync() with
+            | true ->
+                let event = e.Current
+
+                match event.Kind, event.Restart, event.Delay, event.DroppedEvents with
+                | SupervisionEventKind.RestartScheduled, Some restart, Some delay, _ ->
+                    printfn $"restart {restart} in {delay}"
+                | SupervisionEventKind.EventsDropped, _, _, Some lost -> printfn $"fell behind: {lost} events lost"
+                | _ -> printfn $"{event.Name}"
+            | false -> go <- false // the stream ends when supervision does
+    finally
+        e.DisposeAsync().AsTask().Wait()
+}
+```
+
+**C#**
+
+```csharp
+var supervisor = new Supervisor(new Command("worker"))
+    .Restart(RestartPolicy.Always)
+    .Events(256); // opt in; keep at most 256 unread events
+
+var session = await supervisor.StartAsync();
+
+await foreach (var e in session.EventsAsync())
+{
+    if (e.Kind == SupervisionEventKind.RestartScheduled && e.Restart is { Value: var restart })
+        Console.WriteLine($"restart {restart} in {e.Delay?.Value}");
+    else if (e.Kind == SupervisionEventKind.EventsDropped && e.DroppedEvents is { Value: var lost })
+        Console.WriteLine($"fell behind: {lost} events lost");
+    else
+        Console.WriteLine(e.Name);
+}
+```
+
+Read `Kind` first: it says which transition an event is, and therefore which payload properties carry
+a value (every other one is `None`). `Name` is the same fact as a stable lowercase identifier —
+`incarnation_started`, `restart_scheduled`, … — for a log field or a metric label.
+
+| `Kind` / `Name` | Reported when | Payload |
+|---|---|---|
+| `IncarnationStarted` / `incarnation_started` | a child was launched | `Attempt`, `Pid` (`None` for a runner with no live handle) |
+| `IncarnationFinished` / `incarnation_finished` | an incarnation produced a result | `Attempt`, `Outcome`, `Duration`, `IsSuccess` |
+| `IncarnationFailed` / `incarnation_failed` | an incarnation produced no result at all | `Attempt`, `FailureKind` |
+| `RestartScheduled` / `restart_scheduled` | before each backoff delay | `Restart`, `Delay`, `Cause` |
+| `StormPaused` / `storm_paused` | before each [failure-storm](#failure-storms) pause | `StormPause`, `Delay` |
+| `HealthCheckFailed` / `health_check_failed` | a [liveness](#liveness-probes) probe ended the incarnation | `Attempt`, `IsTerminal` |
+| `GaveUp` / `gave_up` | `GiveUpWhen` declared a failure permanent | `Attempt` |
+| `Stopped` / `stopped` | supervision ended with an outcome (last event) | `Reason` |
+| `SupervisionFailed` / `supervision_failed` | supervision ended with an error (last event) | `FailureKind` |
+| `EventsDropped` / `events_dropped` | the consumer fell behind (see below) | `DroppedEvents` |
+
+Every event also carries `Program`. `Attempt` is the 1-based incarnation number (so it runs one ahead
+of `SupervisionOutcome.Restarts`), and `HealthCheckFailed.IsTerminal` separates "the unhealthy streak
+tripped, the ordinary policy decides what happens next" (`false`) from "the probe itself failed and
+supervision is ending" (`true`).
+
+**Bounded, and honest about it.** A supervisor must never pace itself against its observer, so the
+stream does **not** apply backpressure. The session retains at most `capacity` unread events; a
+consumer that keeps up loses nothing, and one that falls behind (or never reads) makes the supervisor
+discard the *oldest* unread events to make room for newer ones. Every such gap is reported rather than
+silently swallowed: the next event the consumer sees is an `EventsDropped` carrying exactly how many
+were lost, immediately before the oldest event that survived, and `session.DroppedEventCount` keeps the
+lifetime total (the supervision analogue of
+[`RunningProcess.DroppedStreamLineCount`](streaming.md)). `Events()` with no argument uses a default
+capacity of 128 — one crash-restart cycle costs three events, so an ordinary consumer never lags.
+
+**One consumer.** Reading the buffer is destructive, so a second consumer would steal events from the
+first: `EventsAsync()` hands the stream out once and throws `InvalidOperationException` on a repeat
+call (and on a session whose supervisor never called `Events`).
+
+**Non-secret by construction.** Events carry lifecycle facts only — counters, a pid, an `Outcome`,
+durations, the program name, and coarse failure/stop classifications. They never carry argv,
+environment values, captured stdout/stderr, or a `ProcessError`'s message; a launch failure is reported
+as its stable class (`spawn`, `not_found`, `io`, …) rather than as the error itself. That is what makes
+it safe to forward the whole stream to a log or metrics sink, and it matches the taxonomy
+[`MemberInfo` and the library's own logging](observability.md) already follow.
+
 ## Supervising inside a shared group
 
 The supervisor runs every incarnation through an `IProcessRunner` — the default is a private
