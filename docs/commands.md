@@ -163,12 +163,14 @@ argv array with an independent first element). It is refused with the same typed
 error — at spawn time, on POSIX — when combined with a knob whose spawn path
 re-`exec`s the target **by name** through a helper that has no CLI seam of its
 own for a distinct `argv[0]`: a `Uid`/`Gid`/`Groups`/`KillOnParentDeath` drop
-(the `setpriv` helper, below), `Pty` (the `setsid --ctty` helper), or a run under
-`ProcessGroup`'s Linux cgroup backend (the `/bin/sh` migration launcher).
+(the `setpriv` helper, below), `Pty` (the `setsid --ctty` helper), a run under
+`ProcessGroup`'s Linux cgroup backend (the `/bin/sh` migration launcher), or a
+`ResourceLimits.CpuTimeMax` run on the POSIX process-group mechanism (the
+`/bin/sh` `RLIMIT_CPU` shim — see [Resource limits](process-groups.md)).
 Honouring the override there would mean either applying it to the *wrong*
 process (the helper's own `argv[0]`) or inventing a new native shim — refused
 loudly instead. A lone `Setsid` (no privilege drop) does not route through
-either helper, so it composes with `Arg0` normally.
+any such helper, so it composes with `Arg0` normally.
 
 Test doubles and record/replay cassettes reflect the override wherever they
 already reflect the program and its arguments: `DryRunRunner` renders it as

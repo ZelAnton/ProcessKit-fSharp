@@ -681,8 +681,11 @@ exec "$sp" --pdeathsig=SIGKILL /bin/sh -c "$g" sh "$e" "$@"
     // combined with either is refused with a typed `ProcessError.Unsupported` — never silently applied
     // to the WRONG process (the helper's own `argv[0]`). Checked before the up-front non-root drop
     // precheck, so these do not need root to exercise. A lone `Setsid` does not route through either
-    // helper, so it composes with `Arg0` normally — covered by the round-trip test in
-    // `ArgvEnvRoundTripTests`, which pins the same `sh -c` observation trick this file already relies on.
+    // helper, so it composes with `Arg0` normally — covered by
+    // `` `Arg0 composes normally with a lone Setsid (POSIX_SPAWN_SETSID, no privilege drop)` `` in
+    // `ArgvEnvRoundTripTests` (T-376/R-03), which pins the same `sh -c` observation trick this file
+    // already relies on and actually exercises `Setsid` (a different `posix_spawnattr` flag,
+    // `POSIX_SPAWN_SETSID`, from the plain spawn path).
 
     [<Test>]
     member _.``Arg0 combined with a Uid drop is a typed Unsupported, not a silent misapplication``() : Task =

@@ -458,6 +458,7 @@ process-group mechanism (macOS/BSD, or Linux without cgroup v2) returns
 | Combined with a `Uid`/`Gid`/`Groups`/`KillOnParentDeath` drop | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (`setpriv` has no `argv[0]` seam) |
 | Combined with `Command.Pty` | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (`setsid --ctty` has no `argv[0]` seam) |
 | Combined with a run under the Linux cgroup backend | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the `/bin/sh` migration launcher has no `argv[0]` seam) |
+| Combined with `ResourceLimits.CpuTimeMax` on the POSIX process-group mechanism | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the `/bin/sh` `RLIMIT_CPU` shim has no `argv[0]` seam) |
 | Combined with a lone `Setsid` (no privilege drop) | ❌ `ProcessError.Unsupported` | ✅ composes normally (no helper involved) |
 
 `Program` alone still drives PATH/`PreferLocal` resolution, preflight, and spawn diagnostics — the
@@ -612,8 +613,10 @@ that is actually launched (multicall binaries, login-shell conventions). Windows
 `ProcessError.Unsupported` — the mirror image of `WindowsRawArg` above. On POSIX it further refuses
 (same typed error, at spawn time) when combined with a knob whose spawn path re-`exec`s the target
 by name through a helper with no seam of its own for a distinct `argv[0]`: a `Uid`/`Gid`/`Groups`/
-`KillOnParentDeath` drop (`setpriv`), `Pty` (`setsid --ctty`), or a run under the Linux cgroup
-backend (the `/bin/sh` migration launcher) — see [Running commands](commands.md#posix-argv0-override-arg0).
+`KillOnParentDeath` drop (`setpriv`), `Pty` (`setsid --ctty`), a run under the Linux cgroup
+backend (the `/bin/sh` migration launcher), or a `ResourceLimits.CpuTimeMax` run on the POSIX
+process-group mechanism (the `/bin/sh` `RLIMIT_CPU` shim) — see
+[Running commands](commands.md#posix-argv0-override-arg0).
 
 **POSIX process groups: a `setsid` child can escape.** The process-group mechanism tracks each
 child's pgid, and teardown signals those pgids. A descendant that deliberately starts a new

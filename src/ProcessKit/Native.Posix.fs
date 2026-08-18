@@ -4211,35 +4211,51 @@ module internal Posix =
     /// `PreferLocal`, PATH lookup, and the typed `NotFound` contract; arguments remain positional (`"$@"`),
     /// so no user value is reparsed as shell text. The soft limit is rounded up to seconds and the hard
     /// limit gets one extra second, allowing the child to observe SIGXCPU before unconditional termination.
+    /// `Command.Arg0` is refused up front (T-376/R-01): the `/bin/sh` shim's own `exec "$@"` has no seam
+    /// for a distinct `argv[0]`, so honouring an override here would misapply it to the SHIM's `argv[0]`
+    /// while the real program (reached only through `exec`) observes its unmodified `resolvedProgram` name
+    /// instead — exactly the silent-misapplication failure `arg0HelperConflict` refuses for `setpriv`/
+    /// `setsid --ctty`, and the same refusal `spawnPosixIntoCgroup` gives its own `/bin/sh` launcher.
     let withCpuTimeLimit (duration: TimeSpan) (command: Command) : Result<Command, ProcessError> =
         let command = applyPreferLocal command
 
-        match resolveCommandProgram command with
-        | Error error -> Error error
-        | Ok resolvedProgram ->
-            let seconds = max 1L (int64 (Math.Ceiling duration.TotalSeconds))
-            let config = command.Config
-
-            let args =
-                seq {
-                    yield "-c"
-
-                    yield
-                        "ulimit -S -t \"$1\" || exit 125; ulimit -H -t \"$(($1 + 1))\" || exit 125; shift; exec \"$@\""
-
-                    yield "processkit-rlimit"
-                    yield string seconds
-                    yield resolvedProgram
-                    yield! config.Args
-                }
-
-            Ok(
-                Command(
-                    { config with
-                        Program = "/bin/sh"
-                        Args = ImmutableList.CreateRange args }
-                )
+        if command.Config.Arg0.IsSome then
+            Error(
+                ProcessError.Unsupported
+                    "Command.Arg0 combined with CpuTimeMax: the /bin/sh RLIMIT_CPU shim re-execs the target by name and has no seam for a distinct argv[0]"
             )
+        else
+            match resolveCommandProgram command with
+            | Error error -> Error error
+            | Ok resolvedProgram ->
+                let seconds = max 1L (int64 (Math.Ceiling duration.TotalSeconds))
+                let config = command.Config
+
+                let args =
+                    seq {
+                        yield "-c"
+
+                        yield
+                            "ulimit -S -t \"$1\" || exit 125; ulimit -H -t \"$(($1 + 1))\" || exit 125; shift; exec \"$@\""
+
+                        yield "processkit-rlimit"
+                        yield string seconds
+                        yield resolvedProgram
+                        yield! config.Args
+                    }
+
+                Ok(
+                    Command(
+                        { config with
+                            Program = "/bin/sh"
+                            Args = ImmutableList.CreateRange args
+                            // Defense in depth: the check above already refuses `Arg0` for a `CpuTimeMax` run,
+                            // so this config should never carry one here — cleared so a caller reaching this
+                            // some other way can never see it silently misapplied to the `/bin/sh` SHIM's own
+                            // `argv[0]` (mirrors `spawnPosixIntoCgroup`'s `launcherConfig.Arg0 = None`).
+                            Arg0 = None }
+                    )
+                )
 
     /// Rewrite a `setpriv`-helper `NotFound` into the same typed `ProcessError.Spawn` against the ORIGINAL
     /// program that an up-front trusted-resolution miss produces (`setprivHelperMissing`), so a caller who
@@ -4288,7 +4304,11 @@ module internal Posix =
     /// separate from the program it execs, so honouring the override there would mean either applying it
     /// to the WRONG process (the helper's own `argv[0]`) or inventing a new native shim — refused loudly
     /// instead, before any child exists. A lone `Setsid` does not route through either helper, so it is
-    /// deliberately not checked here (see `Command.Arg0`).
+    /// deliberately not checked here (see `Command.Arg0`). The cgroup-backend migration launcher and the
+    /// `CpuTimeMax` `RLIMIT_CPU` shim have the same re-`exec`-by-name shape but are refused at their own
+    /// entry points instead — `spawnPosixIntoCgroup`'s unconditional `Arg0` gate and `withCpuTimeLimit`'s
+    /// up-front check — because both rewrite `config.Program` to `/bin/sh` before this function ever sees
+    /// the dispatch, so a check here would be looking at the wrong program by the time it ran.
     let private arg0HelperConflict (config: CommandConfig) : ProcessError option =
         if config.Arg0.IsNone then
             None

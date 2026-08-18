@@ -260,12 +260,12 @@ type internal CommandConfig =
       // in `Native.Posix`); `Program` itself is UNCHANGED and still drives PATH resolution,
       // `PreferLocal`, and every diagnostic (`ProcessError`, logging, cassette matching). A helper
       // that must re-`exec` the target by name — `setpriv` (`Uid`/`Gid`/`Groups`/
-      // `KillOnParentDeath`), the `setsid --ctty` pty shim, or the cgroup migration launcher — has
-      // no CLI seam of its own to carry a distinct `argv[0]`, so combining `Arg0` with any of them
-      // is refused with a typed `ProcessError.Unsupported` rather than silently applying to the
-      // WRONG process (the helper's own `argv[0]`) or being dropped. Windows has no separate
-      // `argv[0]` contract, so a set value there fails the spawn with `ProcessError.Unsupported`
-      // too, never a silent fallback to `Program`.
+      // `KillOnParentDeath`), the `setsid --ctty` pty shim, the cgroup migration launcher, or the
+      // `CpuTimeMax` `RLIMIT_CPU` shim — has no CLI seam of its own to carry a distinct `argv[0]`,
+      // so combining `Arg0` with any of them is refused with a typed `ProcessError.Unsupported`
+      // rather than silently applying to the WRONG process (the helper's own `argv[0]`) or being
+      // dropped. Windows has no separate `argv[0]` contract, so a set value there fails the spawn
+      // with `ProcessError.Unsupported` too, never a silent fallback to `Program`.
       Arg0: string option
       // Opt-in reaping of the child if the PARENT process dies SUDDENLY (SIGKILL / crash /
       // `TerminateProcess`) — a case the deterministic `Dispose`/`DisposeAsync` kill-on-drop cannot
@@ -1523,11 +1523,12 @@ type Command internal (config: CommandConfig) =
     /// POSIX — when combined with a knob that routes the launch through a helper which must re-`exec` the
     /// target BY NAME and has no CLI seam of its own for a distinct `argv[0]`: a `Uid`/`Gid`/`Groups`/
     /// `KillOnParentDeath` privilege/parent-death drop (the `setpriv` helper), `Pty` (the `setsid --ctty`
-    /// helper), or a run under `ProcessGroup`'s Linux cgroup backend (the `/bin/sh` migration launcher).
-    /// Honouring the override there would mean either handing it to the WRONG process (the helper's own
-    /// `argv[0]`, silently discarding what was actually requested) or inventing a new native shim — this
-    /// library does neither; it refuses loudly instead. A lone `Setsid` (no privilege drop) does not route
-    /// through any such helper, so it composes with `Arg0` normally.
+    /// helper), a run under `ProcessGroup`'s Linux cgroup backend (the `/bin/sh` migration launcher), or a
+    /// `ResourceLimits.CpuTimeMax` run on the POSIX process-group mechanism (the `/bin/sh` `RLIMIT_CPU`
+    /// shim). Honouring the override there would mean either handing it to the WRONG process (the helper's
+    /// own `argv[0]`, silently discarding what was actually requested) or inventing a new native shim —
+    /// this library does neither; it refuses loudly instead. A lone `Setsid` (no privilege drop) does not
+    /// route through any such helper, so it composes with `Arg0` normally.
     member _.Arg0(arg0: string) =
         ArgumentNullException.ThrowIfNull arg0
 

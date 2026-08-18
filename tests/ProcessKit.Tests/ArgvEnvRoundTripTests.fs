@@ -380,6 +380,27 @@ return 0;
                 | Error error -> Assert.Fail $"Arg0 round-trip failed for '{case}': {error.Message}"
                 | Ok observed -> Assert.That(observed, Is.EqualTo case, $"case: {case}")
 
+    // A lone `Setsid` does not route through `setpriv`/`setsid --ctty`/a helper launcher, so it is the
+    // one knob `Command.Arg0` composes with normally (T-376/R-03; the matrix row in
+    // docs/platform-support.md and the comment in PosixSpawnCleanupTests.fs both promise this). `Setsid`
+    // is a native `posix_spawn` attribute (`POSIX_SPAWN_SETSID`), a different code path from the plain
+    // spawn the test above already exercises, so this observes the real combination rather than assuming
+    // the two knobs are independent.
+    [<Test>]
+    member _.``Arg0 composes normally with a lone Setsid (POSIX_SPAWN_SETSID, no privilege drop)``() =
+        if isWindows then
+            Assert.Ignore "Arg0/Setsid are both POSIX-only"
+        else
+            let command =
+                Command.create "/bin/sh"
+                |> Command.arg0 "multicall-name"
+                |> Command.setsid
+                |> Command.args [ "-c"; "printf %s \"$0\"" ]
+
+            match command.RunAsync().GetAwaiter().GetResult() with
+            | Error error -> Assert.Fail $"Arg0+Setsid round-trip failed: {error.Message}"
+            | Ok observed -> Assert.That(observed, Is.EqualTo "multicall-name")
+
     [<Test>]
     member _.``Arg0 on Windows is a typed Unsupported, never a silent fallback to Program``() =
         if not isWindows then
